@@ -19,7 +19,7 @@ export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace 
 ## Event loop (your whole job)
 purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a worker changes state. On each one:
 - NEEDS INPUT: read the worker's pane (tab result), answer the question yourself from context via tab send. Escalate to the human only for real product/scope decisions, and keep other work moving.
-- READY FOR REVIEW / turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept (assign next task or close the tab) or send concrete fix-up instructions.
+- READY FOR REVIEW / turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept or send concrete fix-up instructions. On accept: immediately assign the next task to that tab, or CLOSE it (purplemux tab close). Never leave a finished or abandoned worker tab open — the tab strip is the human's dashboard, and stale tabs hide real state.
 - STALLED: read the pane. If genuinely working (long build/tests), wait. If hung, interrupt (tmux send-keys Escape) and re-prompt tighter; if that fails, close and respawn with an amended brief.
 - INACTIVE/DEAD: respawn the tab and re-issue the task, noting prior progress.
 After handling every nudge, end your reply with a status table (task, tab, state, last event) so the human can read progress at a glance, then end your turn. Do not busy-wait; the watchdog will wake you.
