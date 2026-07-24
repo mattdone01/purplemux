@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
-import { History, Plus, Globe } from 'lucide-react';
+import { Crown, History, Plus, Globe } from 'lucide-react';
 import Spinner from '@/components/ui/spinner';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
@@ -17,6 +17,7 @@ import { fetchCodexLaunchCommand } from '@/lib/providers/codex/client';
 import { notifyCodexLaunchFailed } from '@/lib/codex-notifications';
 import useConfigStore from '@/hooks/use-config-store';
 import { useAgentInstallCheck } from '@/hooks/use-agent-install-check';
+import StartOrchestrationDialog from '@/components/features/workspace/start-orchestration-dialog';
 
 interface IPaneNewTabMenuProps {
   paneId: string;
@@ -55,6 +56,8 @@ const defaultKeyForPanelType = (panelType?: TPanelType): string => {
 
 const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IPaneNewTabMenuProps) => {
   const t = useTranslations('terminal');
+  const to = useTranslations('orchestration');
+  const [orchestrateOpen, setOrchestrateOpen] = useState(false);
   const isMac = useIsMac();
   const mod = isMac ? '⌘' : 'Ctrl+';
   const [open, setOpen] = useState(false);
@@ -67,12 +70,13 @@ const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IP
     const all = [
       { key: 'claude', type: 'claude-code' as const, icon: <ClaudeCodeIcon className="h-3.5 w-3.5" />, label: t('claudeNewConversation'), startAgent: 'claude' as const },
       { key: 'codex', type: 'codex-cli' as const, icon: <OpenAIIcon className="h-3.5 w-3.5" />, label: t('codexNewConversation'), startAgent: 'codex' as const },
+      { key: 'orchestrate', type: 'claude-code' as const, icon: <Crown className="h-3.5 w-3.5 text-ui-amber" />, label: to('startOrchestration') },
       { key: 'agent-sessions', type: 'agent-sessions' as const, icon: <History className="h-3.5 w-3.5 text-muted-foreground" />, label: t('sessionList') },
       { key: 'terminal', type: 'terminal' as const, icon: <ProcessIcon className="h-3.5 w-3.5 text-muted-foreground" />, label: 'Terminal' },
       { key: 'web-browser', type: 'web-browser' as const, icon: <Globe className="h-3.5 w-3.5 text-muted-foreground" />, label: 'Web Browser' },
     ];
     return isMobile ? all.filter((item) => item.key !== 'web-browser') : all;
-  }, [isMobile, t]);
+  }, [isMobile, t, to]);
 
   const [activeIndex, setActiveIndex] = useState(0);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -134,6 +138,13 @@ const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IP
   };
 
   const handleSelect = (item: typeof menuItems[number]) => {
+    if (item.key === 'orchestrate') {
+      setOpen(false);
+      void ensureAgentInstalled('claude').then((ok) => {
+        if (ok) setOrchestrateOpen(true);
+      });
+      return;
+    }
     if ('startAgent' in item && item.startAgent) {
       void handleStartAgent(item.startAgent);
       return;
@@ -203,6 +214,14 @@ const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IP
       </Popover>
     </div>
     {installDialogs}
+    {wsId && (
+      <StartOrchestrationDialog
+        open={orchestrateOpen}
+        onOpenChange={setOrchestrateOpen}
+        workspaceId={wsId}
+        paneId={paneId}
+      />
+    )}
     </>
   );
 };

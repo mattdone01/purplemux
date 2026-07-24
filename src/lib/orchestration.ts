@@ -1,0 +1,74 @@
+// Browser-safe orchestration helpers: kickoff template + watchdog nudge text.
+// No node-only imports — the kickoff dialog resolves templates client-side and
+// the StatusManager watchdog builds nudge messages server-side from the same code.
+import type { TOrchestrationNudgeKind } from '@/types/status';
+
+export const NUDGE_PREFIX = '[orchestrator-watchdog]';
+export const NUDGE_DEBOUNCE_MS = 30_000;
+export const MAX_NUDGE_HISTORY = 200;
+export const KICKOFF_FALLBACK_DELAY_MS = 20_000;
+
+export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace "{{WORKSPACE_NAME}}". You delegate all implementation to worker agents in purplemux tabs (see the purplemux CLI section of your system prompt); you never implement work yourself.
+
+## Spawning a worker
+1. Create a tab named after the task (purplemux tab create -w {{WORKSPACE_ID}} -n story-NN -t claude-code, or -t codex-cli).
+2. Send ONE self-contained brief: goal, exact file paths, acceptance criteria, verification commands, and this output protocol:
+   "Work autonomously. Make reasonable assumptions and note them instead of asking, except for destructive or irreversible actions. When finished, end with a line 'DONE: <one-line summary>'. If truly blocked, end with 'BLOCKED: <single specific question>' and stop."
+3. To pick a model for a claude worker, send /model <model> as the tab's first message.
+
+## Event loop (your whole job)
+purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a worker changes state. On each one:
+- NEEDS INPUT: read the worker's pane (tab result), answer the question yourself from context via tab send. Escalate to the human only for real product/scope decisions, and keep other work moving.
+- READY FOR REVIEW / turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept (assign next task or close the tab) or send concrete fix-up instructions.
+- STALLED: read the pane. If genuinely working (long build/tests), wait. If hung, interrupt (tmux send-keys Escape) and re-prompt tighter; if that fails, close and respawn with an amended brief.
+- INACTIVE/DEAD: respawn the tab and re-issue the task, noting prior progress.
+After handling every nudge, end your reply with a status table (task, tab, state, last event) so the human can read progress at a glance, then end your turn. Do not busy-wait; the watchdog will wake you.
+
+## Rules
+- Max {{MAX_WORKERS}} concurrent workers. One task per worker tab.
+- Never assume a worker's state — capture its pane before acting.
+
+## The work
+{{TASK}}
+
+Begin: break the work down, then spawn workers for the first tasks.`;
+
+export interface IKickoffTemplateVars {
+  workspaceId: string;
+  workspaceName: string;
+  task?: string;
+  maxWorkers?: number;
+}
+
+export const resolveKickoffTemplate = (template: string, vars: IKickoffTemplateVars): string =>
+  template
+    .replaceAll('{{WORKSPACE_ID}}', vars.workspaceId)
+    .replaceAll('{{WORKSPACE_NAME}}', vars.workspaceName)
+    .replaceAll('{{MAX_WORKERS}}', String(vars.maxWorkers ?? 3))
+    .replaceAll('{{TASK}}', vars.task ?? '(described in the next message)');
+
+export const buildNudgeMessage = (kind: TOrchestrationNudgeKind, tabId: string, tabName: string, workspaceId: string): string => {
+  const who = `worker ${tabId} (${tabName || 'unnamed'})`;
+  const capture = `Read it with: purplemux tab result -w ${workspaceId} ${tabId}`;
+  switch (kind) {
+    case 'needs-input':
+      return `${NUDGE_PREFIX} ${who} NEEDS INPUT. ${capture} — then answer via tab send.`;
+    case 'ready-for-review':
+      return `${NUDGE_PREFIX} ${who} is READY FOR REVIEW. ${capture} — verify, then accept or send follow-up work.`;
+    case 'turn-ended':
+      return `${NUDGE_PREFIX} ${who} finished its turn. ${capture} — verify, then accept or send follow-up work.`;
+    case 'inactive':
+      return `${NUDGE_PREFIX} ${who} is INACTIVE (agent process gone). Respawn the tab or mark its task blocked.`;
+    case 'stuck':
+      return `${NUDGE_PREFIX} ${who} has been busy with no activity for a long time — possibly stalled. ${capture} — decide: keep waiting, interrupt and re-prompt, or respawn.`;
+  }
+};
+
+export const nudgeKindForTransition = (prevState: string | undefined, newState: string, silent: boolean): TOrchestrationNudgeKind | null => {
+  if (newState === 'inactive') return prevState && prevState !== 'unknown' ? 'inactive' : null;
+  if (silent) return null;
+  if (newState === 'needs-input') return 'needs-input';
+  if (newState === 'ready-for-review') return 'ready-for-review';
+  if (newState === 'idle' && prevState === 'busy') return 'turn-ended';
+  return null;
+};

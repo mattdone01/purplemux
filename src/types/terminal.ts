@@ -74,11 +74,18 @@ export interface ILayoutData {
   updatedAt: string;
 }
 
+export interface IWorkspaceOrchestration {
+  enabled: boolean;
+  orchestratorTabId: string | null;
+  kickoffTemplate?: string | null;
+}
+
 export interface IWorkspace {
   id: string;
   name: string;
   directories: string[];
   groupId?: string | null;
+  orchestration?: IWorkspaceOrchestration;
 }
 
 export interface IWorkspaceGroup {

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { X, Globe, GitCompareArrows, History } from 'lucide-react';
+import { X, Globe, GitCompareArrows, History, Crown } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
@@ -8,6 +8,15 @@ import ProcessIcon from '@/components/icons/process-icon';
 import { cn } from '@/lib/utils';
 import type { ITab } from '@/types/terminal';
 import TabStatusIndicator from '@/components/features/workspace/tab-status-indicator';
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from '@/components/ui/context-menu';
+import { useLayoutStore } from '@/hooks/use-layout';
+import useWorkspaceStore from '@/hooks/use-workspace-store';
+import { patchWorkspaceOrchestration } from '@/lib/orchestration-client';
 
 interface IPaneTabItemProps {
   tab: ITab;
@@ -45,6 +54,11 @@ const PaneTabItem = ({
   onDragLeave,
 }: IPaneTabItemProps) => {
   const t = useTranslations('terminal');
+  const to = useTranslations('orchestration');
+  const wsId = useLayoutStore((s) => s.workspaceId);
+  const orchestration = useWorkspaceStore((s) => s.workspaces.find((w) => w.id === wsId)?.orchestration);
+  const isAgentTab = tab.panelType === 'claude-code' || tab.panelType === 'codex-cli';
+  const isOrchestrator = !!orchestration?.enabled && orchestration.orchestratorTabId === tab.id;
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -71,7 +85,17 @@ const PaneTabItem = ({
   const typeDisplayName = tab.panelType === 'agent-sessions' ? t('sessionList') : '';
   const displayName = tab.name || typeDisplayName || displayTitle || '';
 
-  return (
+  const handleToggleOrchestrator = () => {
+    if (!wsId) return;
+    void patchWorkspaceOrchestration(
+      wsId,
+      isOrchestrator
+        ? { enabled: false, orchestratorTabId: null }
+        : { enabled: true, orchestratorTabId: tab.id },
+    );
+  };
+
+  const tabEl = (
     <div
       data-tab-id={tab.id}
       role="tab"
@@ -116,6 +140,9 @@ const PaneTabItem = ({
       ) : (
         <>
           <TabStatusIndicator tabId={tab.id} panelType={tab.panelType} />
+          {isOrchestrator && (
+            <Crown className="h-3 w-3 shrink-0 text-ui-amber" aria-label={to('orchestratorBadge')} />
+          )}
           {tab.panelType === 'claude-code' ? (
             <ClaudeCodeIcon className="mx-0.5 h-3 w-3 shrink-0" />
           ) : tab.panelType === 'codex-cli' ? (
@@ -162,6 +189,20 @@ const PaneTabItem = ({
         <div className="absolute top-1 right-0 bottom-1 w-0.5 bg-ui-blue" />
       )}
     </div>
+  );
+
+  if (!isAgentTab) return tabEl;
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger render={tabEl} />
+      <ContextMenuContent>
+        <ContextMenuItem onClick={handleToggleOrchestrator}>
+          <Crown className="mr-2 h-3.5 w-3.5" />
+          {isOrchestrator ? to('unsetOrchestrator') : to('setAsOrchestrator')}
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 };
 

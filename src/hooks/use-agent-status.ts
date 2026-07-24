@@ -3,6 +3,7 @@ import useTabStore from '@/hooks/use-tab-store';
 import useTabMetadataStore from '@/hooks/use-tab-metadata-store';
 import useRateLimitsStore from '@/hooks/use-rate-limits-store';
 import useSessionHistoryStore from '@/hooks/use-session-history-store';
+import useOrchestrationStore from '@/hooks/use-orchestration-store';
 import useGitStatusStore from '@/hooks/use-git-status-store';
 import { useLayoutStore } from '@/hooks/use-layout';
 import { formatTabTitle } from '@/lib/tab-title';
@@ -132,6 +133,10 @@ const useAgentStatus = () => {
 
             case 'session-history:update':
               useSessionHistoryStore.getState().upsertEntry(msg.entry);
+              break;
+
+            case 'orchestration:nudge':
+              useOrchestrationStore.getState().addNudge(msg.nudge);
               break;
           }
         } catch {

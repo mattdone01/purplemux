@@ -1,7 +1,7 @@
 import { WebSocket } from 'ws';
-import { getWorkspaces } from '@/lib/workspace-store';
+import { getWorkspaces, getWorkspaceById } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, setLayoutReconciler } from '@/lib/layout-store';
-import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
+import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid, hasSession, sendBracketedPaste } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
@@ -21,7 +21,8 @@ import { parsePermissionOptions } from '@/lib/permission-prompt';
 import type { IPaneInfo } from '@/lib/tmux';
 import type { ITab } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
-import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent } from '@/types/status';
+import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind } from '@/types/status';
+import { buildNudgeMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS } from '@/lib/orchestration';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
 import webpush from 'web-push';
@@ -80,6 +81,10 @@ class StatusManager {
   private lastRateLimits: IRateLimitsCache | null = null;
   private jsonlWatchers = new Map<string, { watcher: FSWatcher; jsonlPath: string; debounceTimer: ReturnType<typeof setTimeout> | null }>();
   private compactStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private orchestrationNudges: IOrchestrationNudge[] = [];
+  private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
+  private stuckNudgedTabs = new Set<string>();
+  private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
 
   async init(): Promise<void> {
     if (this.initialized) return;
@@ -400,6 +405,12 @@ class StatusManager {
             this.broadcastUpdate(tab.id, existing);
             continue;
           }
+          if (!this.stuckNudgedTabs.has(tab.id) && !(await this.hasRecentJsonlActivity(existing, now))) {
+            this.stuckNudgedTabs.add(tab.id);
+            this.nudgeOrchestrator(tab.id, existing, 'stuck').catch((err) => {
+              log.warn(`stuck nudge failed: ${err instanceof Error ? err.message : err}`);
+            });
+          }
         }
 
         if (provider && AGENT_GUARDED_STATES.has(existing.cliState)) {
@@ -436,6 +447,9 @@ class StatusManager {
       if (!knownTabIds.has(tabId) && this.tabs.has(tabId)) {
         this.stopJsonlWatch(tabId);
         this.tabs.delete(tabId);
+        this.lastNudgeByTab.delete(tabId);
+        this.stuckNudgedTabs.delete(tabId);
+        this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
       }
     }
@@ -513,6 +527,102 @@ class StatusManager {
       this.startJsonlWatch(tabId, entry.jsonlPath!);
     } else if (!shouldWatch && !keepForFinalRead && this.jsonlWatchers.has(tabId)) {
       this.stopJsonlWatch(tabId);
+    }
+
+    if (newState !== 'busy') this.stuckNudgedTabs.delete(tabId);
+    if (newState === 'idle' && this.pendingKickoffs.has(tabId)) {
+      this.deliverKickoff(tabId);
+    }
+    const nudgeKind = nudgeKindForTransition(prevState, newState, !!opts.silent);
+    if (nudgeKind) {
+      this.nudgeOrchestrator(tabId, entry, nudgeKind).catch((err) => {
+        log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+  }
+
+  private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind): Promise<void> {
+    if (entry.panelType !== 'claude-code' && entry.panelType !== 'codex-cli') return;
+    const ws = await getWorkspaceById(entry.workspaceId);
+    const orch = ws?.orchestration;
+    if (!ws || !orch?.enabled || !orch.orchestratorTabId || orch.orchestratorTabId === tabId) return;
+
+    const now = Date.now();
+    const last = this.lastNudgeByTab.get(tabId);
+    if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return;
+    this.lastNudgeByTab.set(tabId, { kind, at: now });
+
+    const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id);
+    const target = this.tabs.get(orch.orchestratorTabId);
+    let delivered = false;
+    if (target && await hasSession(target.tmuxSession)) {
+      try {
+        await sendBracketedPaste(target.tmuxSession, message);
+        delivered = true;
+      } catch (err) {
+        log.warn(`orchestrator nudge delivery failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    const nudge: IOrchestrationNudge = {
+      id: nanoid(8),
+      workspaceId: ws.id,
+      tabId,
+      tabName: entry.tabName,
+      kind,
+      message,
+      at: now,
+      delivered,
+    };
+    this.orchestrationNudges.push(nudge);
+    if (this.orchestrationNudges.length > MAX_NUDGE_HISTORY) {
+      this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
+    }
+    this.broadcast({ type: 'orchestration:nudge', nudge });
+    log.info({ tabId, kind, delivered }, 'orchestrator nudge');
+  }
+
+  getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
+    return this.orchestrationNudges.filter((n) => n.workspaceId === workspaceId);
+  }
+
+  queueKickoffPrompt(tabId: string, prompt: string): void {
+    this.clearPendingKickoff(tabId);
+    const timer = setTimeout(() => this.deliverKickoff(tabId), KICKOFF_FALLBACK_DELAY_MS);
+    this.pendingKickoffs.set(tabId, { prompt, timer });
+  }
+
+  private clearPendingKickoff(tabId: string): void {
+    const pending = this.pendingKickoffs.get(tabId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingKickoffs.delete(tabId);
+  }
+
+  // TUI가 뜬 직후 붙여넣으면 입력이 유실될 수 있어 800ms 정착 후 전송한다.
+  private deliverKickoff(tabId: string): void {
+    const pending = this.pendingKickoffs.get(tabId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingKickoffs.delete(tabId);
+    const entry = this.tabs.get(tabId);
+    if (!entry) return;
+    setTimeout(() => {
+      sendBracketedPaste(entry.tmuxSession, pending.prompt).catch((err) => {
+        log.warn(`kickoff prompt delivery failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }, 800);
+  }
+
+  private async hasRecentJsonlActivity(entry: ITabStatusEntry, now: number): Promise<boolean> {
+    if (!entry.jsonlPath) return false;
+    const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
+    if (!provider) return false;
+    try {
+      const snapshot = await provider.readRuntimeSnapshot(entry.jsonlPath);
+      return snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS;
+    } catch {
+      return false;
     }
   }
 

@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useState } from 'react';
+import { useMemo, useCallback, useState, useEffect } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useShallow } from 'zustand/react/shallow';
 import { useTranslations } from 'next-intl';
@@ -29,6 +29,8 @@ import { cn } from '@/lib/utils';
 import useTabStore from '@/hooks/use-tab-store';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import useSessionHistoryStore from '@/hooks/use-session-history-store';
+import useOrchestrationStore from '@/hooks/use-orchestration-store';
+import { fetchOrchestrationNudges } from '@/lib/orchestration-client';
 import { dismissTab } from '@/hooks/use-agent-status';
 import { navigateToTab, navigateToTabOrCreate, useLayoutStore } from '@/hooks/use-layout';
 import { findPane } from '@/lib/layout-tree';
@@ -438,8 +440,25 @@ const NotificationItem = ({
 
 export const NotificationPanel = ({ onNavigated, className }: { onNavigated?: () => void; className?: string }) => {
   const t = useTranslations('notification');
+  const tOrch = useTranslations('orchestration');
   const tabs = useTabStore((s) => s.tabs);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const allNudges = useOrchestrationStore((s) => s.nudges);
+  const orchestrationWorkspaceIds = useMemo(
+    () => workspaces.filter((w) => w.orchestration?.enabled).map((w) => w.id),
+    [workspaces],
+  );
+  useEffect(() => {
+    for (const id of orchestrationWorkspaceIds) {
+      fetchOrchestrationNudges(id)
+        .then((fetched) => useOrchestrationStore.getState().mergeNudges(fetched))
+        .catch(() => {});
+    }
+  }, [orchestrationWorkspaceIds]);
+  const nudges = useMemo(
+    () => allNudges.filter((n) => orchestrationWorkspaceIds.includes(n.workspaceId)),
+    [allNudges, orchestrationWorkspaceIds],
+  );
   const { id: activeTabId, agentSessionId: activeAgentSessionId, providerId: activeProviderId } = useActiveTab();
   const historyEntries = useSessionHistoryStore((s) => s.entries);
   const liveSessionKey = (providerId: TSessionHistoryProvider, agentSessionId: string | null): string =>
@@ -534,7 +553,7 @@ export const NotificationPanel = ({ onNavigated, className }: { onNavigated?: ()
     }
   }, [onNavigated]);
 
-  const isEmpty = busyItems.length === 0 && needsInputItems.length === 0 && reviewItems.length === 0 && dateGroups.length === 0;
+  const isEmpty = busyItems.length === 0 && needsInputItems.length === 0 && reviewItems.length === 0 && dateGroups.length === 0 && nudges.length === 0;
 
   return (
     <div className={cn('flex-1 overflow-y-auto', className)} style={{ scrollbarWidth: 'none' }}>
@@ -624,8 +643,39 @@ export const NotificationPanel = ({ onNavigated, className }: { onNavigated?: ()
             </section>
           )}
 
-          {dateGroups.length > 0 && (
+          {nudges.length > 0 && (
             <section className={busyItems.length > 0 || needsInputItems.length > 0 || reviewItems.length > 0 ? 'mt-4' : ''}>
+              <h3 className="mb-2 text-xs font-medium text-muted-foreground">
+                {tOrch('watchdogSection', { count: nudges.length })}
+              </h3>
+              <div className="flex flex-col gap-1">
+                {nudges.slice(-8).reverse().map((nudge) => (
+                  <button
+                    key={nudge.id}
+                    className="flex w-full flex-col gap-0.5 rounded-md border border-border/60 px-2 py-1.5 text-left hover:bg-accent"
+                    onClick={() => handleNavigate(nudge.workspaceId, nudge.tabId)}
+                  >
+                    <span className="flex items-center gap-1.5 text-xs text-foreground">
+                      <span className={cn(
+                        'block h-1.5 w-1.5 shrink-0 rounded-full',
+                        nudge.kind === 'needs-input' ? 'bg-ui-amber'
+                          : nudge.kind === 'stuck' || nudge.kind === 'inactive' ? 'bg-destructive'
+                          : 'bg-claude-active',
+                      )} />
+                      <span className="min-w-0 flex-1 truncate">{nudge.tabName || nudge.tabId}</span>
+                      <span className="shrink-0 text-[10px] text-muted-foreground">{dayjs(nudge.at).format('HH:mm')}</span>
+                    </span>
+                    <span className="truncate pl-3 text-[11px] text-muted-foreground">
+                      {tOrch(`kind_${nudge.kind}`)}{nudge.delivered ? '' : ` · ${tOrch('notDelivered')}`}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {dateGroups.length > 0 && (
+            <section className={busyItems.length > 0 || needsInputItems.length > 0 || reviewItems.length > 0 || nudges.length > 0 ? 'mt-4' : ''}>
               <h3 className="mb-2 text-xs font-medium text-muted-foreground">
                 {t('doneSection', { count: historyEntries.length >= 200 ? '200+' : historyEntries.length })}
               </h3>

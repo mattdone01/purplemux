@@ -4,8 +4,35 @@ How to run an epic with a Fable orchestrator delegating to worker agents
 (Opus 4.8 claude-code tabs, Codex codex-cli tabs) inside purplemux, without
 things silently stalling.
 
-Fork basis: `subicura/purplemux` (installed 0.4.5). Everything here uses the
-CLI/HTTP API (`purplemux help`, `purplemux api-guide`).
+Fork basis: `subicura/purplemux` (installed 0.4.5).
+
+## Built-in orchestration (UI) — preferred
+
+The fork now has orchestration built into the app; no CLI or scripts needed:
+
+1. **Start**: pane **+** menu → **Start orchestration…** (crown icon). Describe
+   the epic/goal, optionally pick an orchestrator model and edit the kickoff
+   template, hit Start. purplemux creates the orchestrator tab, launches
+   claude, waits for it to boot, and injects the kickoff prompt automatically.
+2. **Watchdog**: runs inside the purplemux server (no external process). On
+   every worker state change — `needs-input`, `ready-for-review`, turn ended,
+   agent died, or busy >10 min with no jsonl activity — it pastes a
+   `[orchestrator-watchdog]` nudge into the orchestrator tab, waking it.
+   Nudges are debounced (30s per tab+kind) and stuck alerts fire once per
+   busy episode.
+3. **Designate manually**: right-click any claude/codex tab → *Set as
+   orchestrator* (crown badge appears on the tab). Same menu removes the role.
+4. **Visibility**: the notification panel (bell) shows a *Watchdog activity*
+   section with recent nudges (click to jump to the worker tab); tab strip
+   shows per-tab state dots and the crown on the orchestrator.
+
+Settings persist per workspace in `workspaces.json` under `orchestration:
+{ enabled, orchestratorTabId, kickoffTemplate }`. API: `PATCH
+/api/workspace/:id` (orchestration object), `POST /api/workspace/:id/orchestrate`,
+`GET /api/workspace/:id/orchestration`.
+
+Everything below is the original CLI/script flow — still valid as a headless
+fallback (e.g. driving purplemux from outside the app).
 
 ## How purplemux actually tracks agents (why things stall today)
 

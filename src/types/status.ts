@@ -126,7 +126,25 @@ export interface IStatusHookEventMessage {
   event: ILastEvent;
 }
 
-export type TStatusServerMessage = IStatusSyncMessage | IStatusUpdateMessage | IRateLimitsUpdateMessage | ISessionHistorySyncMessage | ISessionHistoryUpdateMessage | IStatusHookEventMessage;
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck';
+
+export interface IOrchestrationNudge {
+  id: string;
+  workspaceId: string;
+  tabId: string;
+  tabName: string;
+  kind: TOrchestrationNudgeKind;
+  message: string;
+  at: number;
+  delivered: boolean;
+}
+
+export interface IOrchestrationNudgeMessage {
+  type: 'orchestration:nudge';
+  nudge: IOrchestrationNudge;
+}
+
+export type TStatusServerMessage = IStatusSyncMessage | IStatusUpdateMessage | IRateLimitsUpdateMessage | ISessionHistorySyncMessage | ISessionHistoryUpdateMessage | IStatusHookEventMessage | IOrchestrationNudgeMessage;
 
 export interface IStatusTabDismissedMessage {
   type: 'status:tab-dismissed';

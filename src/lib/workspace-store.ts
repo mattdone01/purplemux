@@ -18,7 +18,7 @@ import {
 import type { ICreateLayoutOptions } from '@/lib/layout-store';
 import { listProviders } from '@/lib/providers/registry';
 import { getVisuallyOrderedWorkspaces } from '@/lib/workspace-order';
-import type { IWorkspace, IWorkspaceGroup, IWorkspacesData, ILayoutData } from '@/types/terminal';
+import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
 
 const log = createLogger('workspace');
 
@@ -402,6 +402,25 @@ export const updateWorkspaceDirectories = async (workspaceId: string, directorie
     ws.directories = directories;
     await writeWorkspacesFile(data);
     await writeWorkspacePrompts(ws);
+  });
+
+export const updateWorkspaceOrchestration = async (
+  workspaceId: string,
+  patch: Partial<IWorkspaceOrchestration>,
+): Promise<IWorkspace | null> =>
+  withLock(async () => {
+    const data = await readWorkspacesFile();
+    if (!data) return null;
+    const ws = data.workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return null;
+    const current: IWorkspaceOrchestration = ws.orchestration ?? { enabled: false, orchestratorTabId: null };
+    ws.orchestration = {
+      enabled: patch.enabled ?? current.enabled,
+      orchestratorTabId: patch.orchestratorTabId !== undefined ? patch.orchestratorTabId : current.orchestratorTabId,
+      kickoffTemplate: patch.kickoffTemplate !== undefined ? patch.kickoffTemplate : current.kickoffTemplate,
+    };
+    await writeWorkspacesFile(data);
+    return ws;
   });
 
 export interface IReorderItem {

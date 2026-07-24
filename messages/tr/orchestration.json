@@ -1,0 +1,23 @@
+{
+  "startOrchestration": "Start orchestration…",
+  "dialogTitle": "Start orchestration",
+  "taskLabel": "What should be orchestrated?",
+  "taskPlaceholder": "Describe the epic or goal: context, file paths, constraints, definition of done…",
+  "modelLabel": "Orchestrator model (optional)",
+  "modelPlaceholder": "default",
+  "editTemplate": "Edit kickoff template",
+  "hideTemplate": "Hide kickoff template",
+  "templateHint": "Placeholders (wrapped in double curly braces): WORKSPACE_ID, WORKSPACE_NAME, TASK, MAX_WORKERS",
+  "start": "Start",
+  "startFailed": "Failed to start orchestration",
+  "setAsOrchestrator": "Set as orchestrator",
+  "unsetOrchestrator": "Remove orchestrator role",
+  "orchestratorBadge": "Workspace orchestrator",
+  "watchdogSection": "Watchdog activity ({count})",
+  "notDelivered": "not delivered",
+  "kind_needs-input": "needs input — orchestrator nudged",
+  "kind_ready-for-review": "ready for review — orchestrator nudged",
+  "kind_turn-ended": "turn ended — orchestrator nudged",
+  "kind_inactive": "agent inactive — orchestrator nudged",
+  "kind_stuck": "possibly stalled — orchestrator nudged"
+}
