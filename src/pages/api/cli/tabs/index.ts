@@ -1,11 +1,14 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { verifyCliToken } from '@/lib/cli-token';
-import { getLayout, addTabToPane } from '@/lib/layout-store';
+import { getLayout, addTabToPane, isAgentPanelType } from '@/lib/layout-store';
 import { collectPanes } from '@/lib/layout-tree';
 import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
 import { resolveFirstPaneId } from '@/lib/cli-utils';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
+import { buildClaudeFlags, isValidModelName } from '@/lib/claude-command';
+import { codexProvider } from '@/lib/providers/codex';
+import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import type { TPanelType } from '@/types/terminal';
 
@@ -55,10 +58,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
+      model?: string;
+      reasoning?: string;
+      launch?: boolean;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
@@ -82,10 +88,47 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (!availability.ok) {
       return res.status(availability.status).json(toAgentAvailabilityError(availability));
     }
+    if (model !== undefined && !isValidModelName(model)) {
+      return res.status(400).json({ error: 'Invalid model' });
+    }
+    if (reasoning !== undefined && !/^(minimal|low|medium|high)$/.test(String(reasoning))) {
+      return res.status(400).json({ error: 'Invalid reasoning (minimal|low|medium|high)' });
+    }
+
+    // Agent tabs launch their CLI by default (mirrors UI tab creation) —
+    // a bare shell made `tab send` briefs land in bash, not the agent.
+    const shouldLaunch = launch !== false && isAgentPanelType(resolvedType);
+    let command: string | undefined;
+    if (shouldLaunch) {
+      if (resolvedType === 'claude-code') {
+        command = `claude ${await buildClaudeFlags(workspaceId, { model })}`;
+      } else {
+        command = await codexProvider.buildLaunchCommand({ workspaceId });
+        if (model) command += ` --model ${model}`;
+        if (reasoning) command += ` -c model_reasoning_effort=${reasoning}`;
+      }
+    }
 
     try {
-      const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType);
+      const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType, command);
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
+
+      if (tab.panelType !== 'web-browser') {
+        const provider = getProviderByPanelType(tab.panelType);
+        getStatusManager().registerTab(tab.id, {
+          cliState: 'inactive',
+          workspaceId,
+          tabName: tab.name,
+          tmuxSession: tab.sessionName,
+          panelType: tab.panelType,
+          agentProviderId: provider?.id,
+          agentSessionId: provider?.readSessionId(tab) ?? null,
+          lastEvent: null,
+          eventSeq: 0,
+        });
+        if (command) getStatusManager().markAgentLaunch(tab.id);
+      }
+
       return res.status(201).json({
         tabId: tab.id,
         workspaceId,
@@ -95,6 +138,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         panelType: tab.panelType,
         agentProviderId: null,
         agentSessionId: null,
+        launched: !!command,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'unknown error';

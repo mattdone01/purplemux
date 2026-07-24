@@ -17,10 +17,15 @@ GET /api/cli/tabs?workspaceId=WS
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId" }] }
 
 POST /api/cli/tabs
-  Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "agent-sessions" | "web-browser" | "diff" }
+  Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "agent-sessions" | "web-browser" | "diff",
+          "model"?: "...", "reasoning"?: "minimal" | "low" | "medium" | "high", "launch"?: boolean }
   Invalid panelType returns HTTP 400 with validPanelTypes.
-  Creates a tab in the first pane of the workspace.
-  Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId" }
+  Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli)
+  auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
+  receive prompts via send immediately. "model" sets the agent model (claude --model /
+  codex --model); "reasoning" sets codex model_reasoning_effort; "launch": false keeps
+  the old bare-shell behavior.
+  Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched" }
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
   Tab info.

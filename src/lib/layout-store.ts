@@ -171,7 +171,7 @@ const syncWorkspaceDirectories = (wsId: string, root: TLayoutNode): void => {
   }
 };
 
-const isAgentPanelType = (panelType: TPanelType | undefined): boolean =>
+export const isAgentPanelType = (panelType: TPanelType | undefined): boolean =>
   panelType === 'claude-code' || panelType === 'codex-cli';
 
 export const crossCheckLayout = async (

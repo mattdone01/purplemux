@@ -88,11 +88,17 @@ const cmdTabCreate = async (args) => {
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
   const name = flagValue(args, '--name') || flagValue(args, '-n');
   const panelType = flagValue(args, '--type') || flagValue(args, '-t');
+  const model = flagValue(args, '--model') || flagValue(args, '-m');
+  const reasoning = flagValue(args, '--reasoning') || flagValue(args, '-r');
+  const noLaunch = args.includes('--no-launch');
   if (!wsId) die('--workspace is required');
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
     ...(name ? { name } : {}),
     ...(panelType ? { panelType } : {}),
+    ...(model ? { model } : {}),
+    ...(reasoning ? { reasoning } : {}),
+    ...(noLaunch ? { launch: false } : {}),
   });
   out(body);
 };
@@ -103,13 +109,25 @@ const resolveWsForTab = (args) => {
   return wsId;
 };
 
+const readStdin = () => new Promise((resolve, reject) => {
+  let data = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => { data += chunk; });
+  process.stdin.on('end', () => resolve(data));
+  process.stdin.on('error', reject);
+});
+
 const cmdTabSend = async (args) => {
   requireEnv();
-  const rest = stripFlags(args, ['--workspace', '-w']);
+  const file = flagValue(args, '--file') || flagValue(args, '-f');
+  const rest = stripFlags(args, ['--workspace', '-w', '--file', '-f']);
   const tabId = rest[0];
-  const content = rest.slice(1).join(' ');
+  let content = rest.slice(1).join(' ');
   if (!tabId) die('tab ID is required');
-  if (!content) die('content is required');
+  if (file) {
+    content = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
+  }
+  if (!content) die('content is required (args, -f FILE, or -f - for stdin)');
   const wsId = resolveWsForTab(args);
   const { body } = await api(
     'POST',
@@ -265,7 +283,10 @@ Commands:
   workspaces                               List workspaces
   tab list [-w WS]                         List tabs (optionally scoped to workspace)
   tab create -w WS [-n NAME] [-t TYPE]     Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
-  tab send -w WS TAB_ID CONTENT...         Send input to a tab
+             [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
+             [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior
+  tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter)
+           [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status
   tab result -w WS TAB_ID                  Capture tab pane content
   tab close -w WS TAB_ID                   Close a tab
