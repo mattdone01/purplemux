@@ -46,6 +46,17 @@ GET /api/cli/tabs/<tabId>/result?workspaceId=WS
   Capture the current pane content.
   Response: { "content": "..." }
 
+## Orchestration
+
+GET /api/cli/workspaces/<workspaceId>/orchestration
+  Response: { "orchestration": { "enabled", "orchestratorTabId", "kickoffTemplate"? }, "nudges": [...] }
+
+PATCH /api/cli/workspaces/<workspaceId>/orchestration
+  Body: { "enabled"?: boolean, "orchestratorTabId"?: string | null, "kickoffTemplate"?: string | null }
+  Orchestrators use this to designate themselves (enabled + own tabId) and to turn
+  orchestration off when the epic is finished — this stops watchdog nudges and idle
+  heartbeats for the workspace.
+
 ## Web-browser tabs
 
 These endpoints only work when the tab's panelType is "web-browser" and the webview

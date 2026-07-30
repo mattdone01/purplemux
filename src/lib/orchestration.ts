@@ -10,8 +10,27 @@ export const KICKOFF_FALLBACK_DELAY_MS = 20_000;
 export const ORCH_IDLE_HEARTBEAT_MS = 10 * 60 * 1000;
 export const ORCH_MAX_HEARTBEATS = 3;
 
-export const buildHeartbeatMessage = (idleMinutes: number): string =>
-  `${NUDGE_PREFIX} heartbeat: you have been idle ~${idleMinutes} min with NO active workers and nothing pending that will wake you. Re-read your epic state and act on the next step now (dispatch workers, run the next phase, or report). If the epic is finished or genuinely waiting on a human, say so explicitly and ask the human to disable orchestration for this workspace.`;
+export const buildHeartbeatMessage = (idleMinutes: number, workspaceId: string): string =>
+  `${NUDGE_PREFIX} heartbeat: you have been idle ~${idleMinutes} min with NO active workers and nothing pending that will wake you. Re-read your epic state and act on the next step now (dispatch workers, run the next phase, or report). If the epic is finished or genuinely waiting on a human, post your final summary and then turn these heartbeats off yourself: purplemux orchestration off -w ${workspaceId}`;
+
+export const parseOrchestrationPatch = (raw: unknown): Partial<import('@/types/terminal').IWorkspaceOrchestration> | null => {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const body = raw as Record<string, unknown>;
+  const patch: Partial<import('@/types/terminal').IWorkspaceOrchestration> = {};
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== 'boolean') return null;
+    patch.enabled = body.enabled;
+  }
+  if (body.orchestratorTabId !== undefined) {
+    if (body.orchestratorTabId !== null && typeof body.orchestratorTabId !== 'string') return null;
+    patch.orchestratorTabId = body.orchestratorTabId;
+  }
+  if (body.kickoffTemplate !== undefined) {
+    if (body.kickoffTemplate !== null && typeof body.kickoffTemplate !== 'string') return null;
+    patch.kickoffTemplate = body.kickoffTemplate;
+  }
+  return patch;
+};
 
 export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace "{{WORKSPACE_NAME}}". You delegate all implementation to worker agents in purplemux tabs (see the purplemux CLI section of your system prompt); you never implement work yourself.
 
@@ -27,7 +46,7 @@ purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a wo
 - READY FOR REVIEW / turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept or send concrete fix-up instructions. On accept: immediately assign the next task to that tab, or CLOSE it (purplemux tab close). Never leave a finished or abandoned worker tab open — the tab strip is the human's dashboard, and stale tabs hide real state.
 - STALLED: read the pane. If genuinely working (long build/tests), wait. If hung, interrupt (tmux send-keys Escape) and re-prompt tighter; if that fails, close and respawn with an amended brief.
 - INACTIVE/DEAD: respawn the tab and re-issue the task, noting prior progress.
-After handling every nudge, end your reply with a status table (task, tab, state, last event) so the human can read progress at a glance, then end your turn. Do not busy-wait; the watchdog will wake you.
+After handling every nudge, end your reply with a status table (task, tab, state, last event) so the human can read progress at a glance, then end your turn. Do not busy-wait; the watchdog will wake you. When the epic is FINISHED (or hard-blocked on a human): post the final summary, close remaining worker tabs, then run: purplemux orchestration off -w {{WORKSPACE_ID}} — this stops the idle heartbeats so you are not woken all night for nothing.
 
 ## Rules
 - Max {{MAX_WORKERS}} concurrent workers. One task per worker tab.
@@ -67,7 +86,7 @@ export const buildNudgeMessage = (kind: TOrchestrationNudgeKind, tabId: string, 
     case 'stuck':
       return `${NUDGE_PREFIX} ${who} has been busy with no activity for a long time — possibly stalled. ${capture} — decide: keep waiting, interrupt and re-prompt, or respawn.`;
     case 'heartbeat':
-      return buildHeartbeatMessage(0);
+      return buildHeartbeatMessage(0, workspaceId);
   }
 };
 

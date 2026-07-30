@@ -83,6 +83,38 @@ const cmdTabList = async (args) => {
   out(body);
 };
 
+const deriveOwnTabId = () => {
+  try {
+    const session = require('child_process').execSync("tmux display-message -p '#{session_name}'", { encoding: 'utf8' }).trim();
+    const m = session.match(/^pt-ws-.*-(tab-.+)$/);
+    return m ? m[1] : null;
+  } catch { return null; }
+};
+
+const cmdOrchestration = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  if (sub === 'status') {
+    const { body } = await api('GET', `/api/cli/workspaces/${wsId}/orchestration`);
+    return out(body);
+  }
+  if (sub === 'off') {
+    const { body } = await api('PATCH', `/api/cli/workspaces/${wsId}/orchestration`, { enabled: false });
+    return out(body);
+  }
+  if (sub === 'on') {
+    const positional = stripFlags(rest, ['--workspace', '-w']);
+    const tabId = positional[0] || deriveOwnTabId();
+    if (!tabId) die('TAB_ID required (or run inside a purplemux tab to self-designate)');
+    const { body } = await api('PATCH', `/api/cli/workspaces/${wsId}/orchestration`, { enabled: true, orchestratorTabId: tabId });
+    return out(body);
+  }
+  die("usage: orchestration status|on|off -w WS [TAB_ID]");
+};
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -298,6 +330,9 @@ Commands:
   tab browser network -w WS TAB_ID         Read recent network entries, or with --request ID to fetch body
                           [--since MS] [--method M] [--url SUBSTR] [--status CODE] [--request ID]
   tab browser eval -w WS TAB_ID EXPR       Evaluate JS expression inside the tab; returns serialized value
+  orchestration status -w WS               Orchestration config + recent watchdog nudges for a workspace
+  orchestration on -w WS [TAB_ID]          Enable orchestration; TAB_ID omitted = self-designate the calling tab
+  orchestration off -w WS                  Disable orchestration (stops watchdog nudges + idle heartbeats)
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -315,6 +350,7 @@ const main = async () => {
 
   switch (cmd) {
     case 'workspaces':
+      case 'orchestration': return cmdOrchestration(rest);
       return cmdWorkspaces();
     case 'tab':
       switch (sub) {

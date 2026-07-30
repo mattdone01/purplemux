@@ -497,7 +497,7 @@ class StatusManager {
       if (state.beats >= ORCH_MAX_HEARTBEATS) continue;
 
       const idleMinutes = Math.round((now - state.idleSince) / 60_000);
-      const message = buildHeartbeatMessage(idleMinutes);
+      const message = buildHeartbeatMessage(idleMinutes, ws.id);
       let delivered = false;
       if (await hasSession(entry.tmuxSession)) {
         try {
