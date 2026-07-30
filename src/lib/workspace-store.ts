@@ -302,6 +302,14 @@ export const getWorkspaceById = async (wsId: string): Promise<IWorkspace | undef
   return data?.workspaces.find((w) => w.id === wsId);
 };
 
+// Chat/session stores (claude, codex) are keyed by DIRECTORY, not workspace —
+// two workspaces sharing a directory share conversation history and resume
+// lists. Enforce one-directory-one-workspace so contexts can never cross.
+const findDirectoryOwner = (data: IWorkspacesData, dir: string, excludeWsId?: string): IWorkspace | undefined => {
+  const norm = path.resolve(dir);
+  return data.workspaces.find((w) => w.id !== excludeWsId && w.directories.some((d) => path.resolve(d) === norm));
+};
+
 export const createWorkspace = async (directory: string, name?: string, layoutOptions?: ICreateLayoutOptions): Promise<IWorkspace> =>
   withLock(async () => {
     let stat;
@@ -316,6 +324,11 @@ export const createWorkspace = async (directory: string, name?: string, layoutOp
     }
 
     const data = (await readWorkspacesFile()) ?? emptyState();
+
+    const owner = findDirectoryOwner(data, directory);
+    if (owner) {
+      throw new Error(`Directory already belongs to workspace "${owner.name}" — workspaces must have unique directories (shared directories share agent chat history)`);
+    }
 
     const wsId = `ws-${nanoid(6)}`;
     const wsName = name?.trim() || nextWorkspaceName(data.workspaces);
@@ -397,6 +410,12 @@ export const updateWorkspaceDirectories = async (workspaceId: string, directorie
     if (!data) return;
     const ws = data.workspaces.find((w) => w.id === workspaceId);
     if (!ws) return;
+    for (const dir of directories) {
+      const owner = findDirectoryOwner(data, dir, workspaceId);
+      if (owner) {
+        throw new Error(`Directory ${dir} already belongs to workspace "${owner.name}" — workspaces must have unique directories`);
+      }
+    }
     const current = JSON.stringify(ws.directories);
     if (current === JSON.stringify(directories)) return;
     ws.directories = directories;
