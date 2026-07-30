@@ -126,7 +126,7 @@ export interface IStatusHookEventMessage {
   event: ILastEvent;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck';
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat';
 
 export interface IOrchestrationNudge {
   id: string;

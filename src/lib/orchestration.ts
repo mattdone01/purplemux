@@ -7,6 +7,11 @@ export const NUDGE_PREFIX = '[orchestrator-watchdog]';
 export const NUDGE_DEBOUNCE_MS = 30_000;
 export const MAX_NUDGE_HISTORY = 200;
 export const KICKOFF_FALLBACK_DELAY_MS = 20_000;
+export const ORCH_IDLE_HEARTBEAT_MS = 10 * 60 * 1000;
+export const ORCH_MAX_HEARTBEATS = 3;
+
+export const buildHeartbeatMessage = (idleMinutes: number): string =>
+  `${NUDGE_PREFIX} heartbeat: you have been idle ~${idleMinutes} min with NO active workers and nothing pending that will wake you. Re-read your epic state and act on the next step now (dispatch workers, run the next phase, or report). If the epic is finished or genuinely waiting on a human, say so explicitly and ask the human to disable orchestration for this workspace.`;
 
 export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace "{{WORKSPACE_NAME}}". You delegate all implementation to worker agents in purplemux tabs (see the purplemux CLI section of your system prompt); you never implement work yourself.
 
@@ -61,6 +66,8 @@ export const buildNudgeMessage = (kind: TOrchestrationNudgeKind, tabId: string, 
       return `${NUDGE_PREFIX} ${who} is INACTIVE (agent process gone). Respawn the tab or mark its task blocked.`;
     case 'stuck':
       return `${NUDGE_PREFIX} ${who} has been busy with no activity for a long time — possibly stalled. ${capture} — decide: keep waiting, interrupt and re-prompt, or respawn.`;
+    case 'heartbeat':
+      return buildHeartbeatMessage(0);
   }
 };
 

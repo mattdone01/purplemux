@@ -22,7 +22,7 @@ import type { IPaneInfo } from '@/lib/tmux';
 import type { ITab } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind } from '@/types/status';
-import { buildNudgeMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS } from '@/lib/orchestration';
+import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
 import webpush from 'web-push';
@@ -82,6 +82,7 @@ class StatusManager {
   private jsonlWatchers = new Map<string, { watcher: FSWatcher; jsonlPath: string; debounceTimer: ReturnType<typeof setTimeout> | null }>();
   private compactStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private orchestrationNudges: IOrchestrationNudge[] = [];
+  private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number }>();
   private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
   private stuckNudgedTabs = new Set<string>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
@@ -457,6 +458,72 @@ class StatusManager {
     const newInterval = this.getPollingInterval();
     if (this.pollingTimer && newInterval !== this.currentInterval) {
       this.startPolling();
+    }
+
+    await this.runOrchestratorKeeper().catch((err) => {
+      log.warn(`orchestrator keeper failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
+  // idle로 잠들면 아무것도 깨우지 못한다 — 그 유일한 사각을 keeper가 메운다.
+  private async runOrchestratorKeeper(): Promise<void> {
+    const { workspaces } = await getWorkspaces();
+    const now = Date.now();
+    for (const ws of workspaces) {
+      const orch = ws.orchestration;
+      if (!orch?.enabled || !orch.orchestratorTabId) { this.orchKeeper.delete(ws.id); continue; }
+      const entry = this.tabs.get(orch.orchestratorTabId);
+      if (!entry) { this.orchKeeper.delete(ws.id); continue; }
+
+      const state = this.orchKeeper.get(ws.id) ?? { idleSince: null, beats: 0, lastBeatAt: 0 };
+      const workersActive = [...this.tabs.entries()].some(([id, t]) =>
+        id !== orch.orchestratorTabId && t.workspaceId === ws.id
+        && (t.panelType === 'claude-code' || t.panelType === 'codex-cli')
+        && (t.cliState === 'busy' || t.cliState === 'needs-input' || t.cliState === 'ready-for-review'));
+
+      // busy = working; needs-input = waiting on the HUMAN (web push already fired) — don't nag.
+      if (entry.cliState === 'busy' || entry.cliState === 'needs-input' || workersActive) {
+        this.orchKeeper.set(ws.id, { idleSince: null, beats: 0, lastBeatAt: 0 });
+        continue;
+      }
+      if (entry.cliState !== 'idle' && entry.cliState !== 'ready-for-review') continue;
+
+      if (state.idleSince === null) {
+        this.orchKeeper.set(ws.id, { ...state, idleSince: now });
+        continue;
+      }
+      if (now - state.idleSince < ORCH_IDLE_HEARTBEAT_MS || now - state.lastBeatAt < ORCH_IDLE_HEARTBEAT_MS) continue;
+      if (state.beats >= ORCH_MAX_HEARTBEATS) continue;
+
+      const idleMinutes = Math.round((now - state.idleSince) / 60_000);
+      const message = buildHeartbeatMessage(idleMinutes);
+      let delivered = false;
+      if (await hasSession(entry.tmuxSession)) {
+        try {
+          await sendBracketedPaste(entry.tmuxSession, message);
+          delivered = true;
+        } catch (err) {
+          log.warn(`orchestrator heartbeat delivery failed: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      this.orchKeeper.set(ws.id, { ...state, beats: state.beats + 1, lastBeatAt: now });
+      const nudge: IOrchestrationNudge = {
+        id: nanoid(8),
+        workspaceId: ws.id,
+        tabId: orch.orchestratorTabId,
+        tabName: entry.tabName,
+        kind: 'heartbeat',
+        message,
+        at: now,
+        delivered,
+      };
+      this.orchestrationNudges.push(nudge);
+      if (this.orchestrationNudges.length > MAX_NUDGE_HISTORY) {
+        this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
+      }
+      this.broadcast({ type: 'orchestration:nudge', nudge });
+      log.info({ workspaceId: ws.id, beats: state.beats + 1, delivered }, 'orchestrator heartbeat');
     }
   }
 

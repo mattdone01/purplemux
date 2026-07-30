@@ -19,5 +19,6 @@
   "kind_ready-for-review": "ready for review — orchestrator nudged",
   "kind_turn-ended": "turn ended — orchestrator nudged",
   "kind_inactive": "agent inactive — orchestrator nudged",
-  "kind_stuck": "possibly stalled — orchestrator nudged"
+  "kind_stuck": "possibly stalled — orchestrator nudged",
+  "kind_heartbeat": "orchestrator idle — heartbeat sent"
 }
