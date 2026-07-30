@@ -350,8 +350,9 @@ const main = async () => {
 
   switch (cmd) {
     case 'workspaces':
-      case 'orchestration': return cmdOrchestration(rest);
       return cmdWorkspaces();
+    case 'orchestration':
+      return cmdOrchestration(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);
