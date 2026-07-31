@@ -305,9 +305,12 @@ export const getWorkspaceById = async (wsId: string): Promise<IWorkspace | undef
 // Chat/session stores (claude, codex) are keyed by DIRECTORY, not workspace —
 // two workspaces sharing a directory share conversation history and resume
 // lists. Enforce one-directory-one-workspace so contexts can never cross.
-const findDirectoryOwner = (data: IWorkspacesData, dir: string, excludeWsId?: string): IWorkspace | undefined => {
+// Only the PRIMARY directory (directories[0]) keys chat context: it is the cwd
+// for new tabs and thus the claude/codex conversation store. Secondary entries
+// are navigation shortcuts (often a shared repo root) and may overlap freely.
+const findPrimaryDirOwner = (data: IWorkspacesData, dir: string, excludeWsId?: string): IWorkspace | undefined => {
   const norm = path.resolve(dir);
-  return data.workspaces.find((w) => w.id !== excludeWsId && w.directories.some((d) => path.resolve(d) === norm));
+  return data.workspaces.find((w) => w.id !== excludeWsId && w.directories[0] && path.resolve(w.directories[0]) === norm);
 };
 
 export const createWorkspace = async (directory: string, name?: string, layoutOptions?: ICreateLayoutOptions): Promise<IWorkspace> =>
@@ -325,9 +328,9 @@ export const createWorkspace = async (directory: string, name?: string, layoutOp
 
     const data = (await readWorkspacesFile()) ?? emptyState();
 
-    const owner = findDirectoryOwner(data, directory);
+    const owner = findPrimaryDirOwner(data, directory);
     if (owner) {
-      throw new Error(`Directory already belongs to workspace "${owner.name}" — workspaces must have unique directories (shared directories share agent chat history)`);
+      throw new Error(`Directory is already workspace "${owner.name}"'s primary directory — primary directories must be unique (they key agent chat history)`);
     }
 
     const wsId = `ws-${nanoid(6)}`;
@@ -410,10 +413,10 @@ export const updateWorkspaceDirectories = async (workspaceId: string, directorie
     if (!data) return;
     const ws = data.workspaces.find((w) => w.id === workspaceId);
     if (!ws) return;
-    for (const dir of directories) {
-      const owner = findDirectoryOwner(data, dir, workspaceId);
+    if (directories[0]) {
+      const owner = findPrimaryDirOwner(data, directories[0], workspaceId);
       if (owner) {
-        throw new Error(`Directory ${dir} already belongs to workspace "${owner.name}" — workspaces must have unique directories`);
+        throw new Error(`Directory ${directories[0]} is already workspace "${owner.name}"'s primary directory — primary directories must be unique`);
       }
     }
     const current = JSON.stringify(ws.directories);
