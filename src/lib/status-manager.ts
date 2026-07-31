@@ -577,15 +577,11 @@ class StatusManager {
     }
 
     if (newState === 'ready-for-review' && !opts.silent) {
-      this.sendWebPush(tabId, entry, 'review').catch((err) => {
-        log.warn('Web push failed: %s', err);
-      });
+      void this.maybeSendWebPush(tabId, entry, 'review');
     }
 
     if (newState === 'needs-input' && !opts.silent) {
-      this.sendWebPush(tabId, entry, 'needs-input').catch((err) => {
-        log.warn('Web push failed: %s', err);
-      });
+      void this.maybeSendWebPush(tabId, entry, 'needs-input');
     }
 
     const shouldWatch = (newState === 'busy' || newState === 'needs-input') && entry.jsonlPath;
@@ -605,6 +601,19 @@ class StatusManager {
       this.nudgeOrchestrator(tabId, entry, nudgeKind).catch((err) => {
         log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
       });
+    }
+  }
+
+  // Orchestrated workspace: worker-tab pushes are noise — the orchestrator
+  // handles workers. Only the orchestrator tab's own transitions notify the human.
+  private async maybeSendWebPush(tabId: string, entry: ITabStatusEntry, kind: 'review' | 'needs-input'): Promise<void> {
+    try {
+      const ws = await getWorkspaceById(entry.workspaceId);
+      const orch = ws?.orchestration;
+      if (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId) return;
+      await this.sendWebPush(tabId, entry, kind);
+    } catch (err) {
+      log.warn('Web push failed: %s', err);
     }
   }
 
