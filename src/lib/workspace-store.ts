@@ -330,7 +330,7 @@ export const createWorkspace = async (directory: string, name?: string, layoutOp
 
     const owner = findPrimaryDirOwner(data, directory);
     if (owner) {
-      throw new Error(`Directory is already workspace "${owner.name}"'s primary directory — primary directories must be unique (they key agent chat history)`);
+      log.warn(`workspace isolation: ${directory} is also workspace "${owner.name}"'s primary directory — these workspaces will SHARE agent chat history. Repoint one to a dedicated worktree for full isolation.`);
     }
 
     const wsId = `ws-${nanoid(6)}`;
