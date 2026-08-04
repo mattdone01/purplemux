@@ -407,12 +407,12 @@ export const updateActive = async (updates: {
     await writeWorkspacesFile(data);
   });
 
-export const updateWorkspaceDirectories = async (workspaceId: string, directories: string[]): Promise<void> =>
+export const updateWorkspaceDirectories = async (workspaceId: string, directories: string[]): Promise<boolean> =>
   withLock(async () => {
     const data = await readWorkspacesFile();
-    if (!data) return;
+    if (!data) return false;
     const ws = data.workspaces.find((w) => w.id === workspaceId);
-    if (!ws) return;
+    if (!ws) return false;
     if (directories[0]) {
       const owner = findPrimaryDirOwner(data, directories[0], workspaceId);
       if (owner) {
@@ -420,10 +420,11 @@ export const updateWorkspaceDirectories = async (workspaceId: string, directorie
       }
     }
     const current = JSON.stringify(ws.directories);
-    if (current === JSON.stringify(directories)) return;
+    if (current === JSON.stringify(directories)) return true;
     ws.directories = directories;
     await writeWorkspacesFile(data);
     await writeWorkspacePrompts(ws);
+    return true;
   });
 
 export const updateWorkspaceOrchestration = async (
