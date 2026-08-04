@@ -166,7 +166,9 @@ const syncWorkspaceDirectories = (wsId: string, root: TLayoutNode): void => {
   )];
   if (cwds.length > 0) {
     import('@/lib/workspace-store').then(({ updateWorkspaceDirectories }) => {
-      updateWorkspaceDirectories(wsId, cwds).catch(() => {});
+      updateWorkspaceDirectories(wsId, cwds).catch((err) => {
+        log.warn(`Workspace ${wsId}: directory sync to [${cwds.join(', ')}] skipped: ${err instanceof Error ? err.message : err}`);
+      });
     }).catch(() => {});
   }
 };
