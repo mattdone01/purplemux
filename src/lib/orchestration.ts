@@ -71,10 +71,22 @@ export const resolveKickoffTemplate = (template: string, vars: IKickoffTemplateV
     .replaceAll('{{MAX_WORKERS}}', String(vars.maxWorkers ?? 3))
     .replaceAll('{{TASK}}', vars.task ?? '(described in the next message)');
 
-export const buildNudgeMessage = (kind: TOrchestrationNudgeKind, tabId: string, tabName: string, workspaceId: string): string => {
+export const buildNudgeMessage = (
+  kind: TOrchestrationNudgeKind,
+  tabId: string,
+  tabName: string,
+  workspaceId: string,
+  detail?: string,
+): string => {
   const who = `worker ${tabId} (${tabName || 'unnamed'})`;
   const capture = `Read it with: purplemux tab result -w ${workspaceId} ${tabId}`;
   switch (kind) {
+    // Signal nudges arrive DURING a turn, not after it. The worker is still
+    // running, so correcting it now is what saves the wasted work.
+    case 'off-scope':
+      return `${NUDGE_PREFIX} ${who} is WORKING OFF-SCOPE: ${detail ?? 'edits fall outside its declared scope'}. It is still running — decide now: send a correction with tab send, or interrupt it. Waiting for the turn to end wastes the rest of it.`;
+    case 'thrash':
+      return `${NUDGE_PREFIX} ${who} is THRASHING: ${detail ?? 'the same command keeps failing'}. It is still running — send a different approach with tab send, or interrupt it.`;
     case 'needs-input':
       return `${NUDGE_PREFIX} ${who} NEEDS INPUT. ${capture} — then answer via tab send.`;
     case 'ready-for-review':

@@ -123,6 +123,10 @@ const cmdTabCreate = async (args) => {
   const model = flagValue(args, '--model') || flagValue(args, '-m');
   const reasoning = flagValue(args, '--reasoning') || flagValue(args, '-r');
   const noLaunch = args.includes('--no-launch');
+  // Comma-separated path globs the tab is expected to edit. purplemux reports
+  // edits outside them; it never infers the list.
+  const scopeRaw = flagValue(args, '--scope');
+  const scope = scopeRaw ? scopeRaw.split(',').map((s) => s.trim()).filter(Boolean) : null;
   if (!wsId) die('--workspace is required');
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
@@ -131,6 +135,7 @@ const cmdTabCreate = async (args) => {
     ...(model ? { model } : {}),
     ...(reasoning ? { reasoning } : {}),
     ...(noLaunch ? { launch: false } : {}),
+    ...(scope && scope.length ? { scope } : {}),
   });
   out(body);
 };
@@ -314,7 +319,9 @@ Usage: purplemux <command> [args...]
 Commands:
   workspaces                               List workspaces
   tab list [-w WS]                         List tabs (optionally scoped to workspace)
-  tab create -w WS [-n NAME] [-t TYPE]     Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+  tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
+                                           Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+                                           --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
              [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior
   tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter)

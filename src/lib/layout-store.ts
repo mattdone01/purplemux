@@ -290,7 +290,7 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string): Promise<ITab | null> =>
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[] }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -312,7 +312,8 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const nextOrder = pane.tabs.length > 0 ? Math.max(...pane.tabs.map((t) => t.order)) + 1 : 0;
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}) };
+    const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}) };
 
     pane.tabs.push(tab);
     pane.activeTabId = tabId;

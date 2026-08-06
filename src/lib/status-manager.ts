@@ -23,6 +23,8 @@ import type { ITab } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind } from '@/types/status';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
+import { getSignalEngine } from '@/lib/signal-engine';
+import type { IAgentSignal, IToolActivity } from '@/types/signals';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
 import webpush from 'web-push';
@@ -53,6 +55,10 @@ const INPUT_REQUESTING_NOTIFICATION_TYPES = new Set(['permission_prompt', 'worke
 
 const COMPACT_STALE_MS = 60_000;
 
+// A tab's scope is set at creation and effectively never changes, so a long TTL
+// keeps the layout read off the per-tool-call path.
+const TAB_SCOPE_TTL_MS = 5 * 60_000;
+
 const POLL_INTERVAL_SMALL = 30_000;
 const POLL_INTERVAL_MEDIUM = 45_000;
 const POLL_INTERVAL_LARGE = 60_000;
@@ -82,6 +88,10 @@ class StatusManager {
   private jsonlWatchers = new Map<string, { watcher: FSWatcher; jsonlPath: string; debounceTimer: ReturnType<typeof setTimeout> | null }>();
   private compactStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private orchestrationNudges: IOrchestrationNudge[] = [];
+
+  // Scope/cwd are read from the layout file, which is far too slow to touch per
+  // tool call. Cached with a short TTL and refreshed off the hot path.
+  private tabScopeCache = new Map<string, { scope?: string[]; cwd?: string; at: number }>();
   private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number }>();
   private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
   private stuckNudgedTabs = new Set<string>();
@@ -90,6 +100,8 @@ class StatusManager {
   async init(): Promise<void> {
     if (this.initialized) return;
     this.initialized = true;
+
+    getSignalEngine().setEmitter((signal) => this.deliverSignal(signal));
 
     await this.scanAll();
     this.startPolling();
@@ -617,7 +629,47 @@ class StatusManager {
     }
   }
 
-  private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind): Promise<void> {
+  /**
+   * Feed one mutating tool call to the signal engine.
+   *
+   * Runs on every Edit/Write/Bash a worker makes, so it must stay allocation-
+   * light and must never await the layout on the hot path — scope and cwd come
+   * from a short-lived cache instead.
+   */
+  handleToolActivity(providerId: string, tmuxSession: string, activity: IToolActivity): void {
+    const tabId = this.findTabIdBySession(tmuxSession);
+    if (!tabId) return;
+    const entry = this.tabs.get(tabId);
+    if (!entry) return;
+    const expectedProvider = getProviderByPanelType(entry.panelType);
+    if (expectedProvider && expectedProvider.id !== providerId) return;
+
+    const meta = this.tabScopeCache.get(tabId);
+    if (!meta || Date.now() - meta.at > TAB_SCOPE_TTL_MS) {
+      // Refresh out of band; this call uses whatever is cached, including
+      // nothing on the very first tool call of a tab.
+      this.refreshTabScope(tabId, entry).catch(() => {});
+    }
+    getSignalEngine().record(tabId, activity, meta?.scope, meta?.cwd);
+  }
+
+  private async refreshTabScope(tabId: string, entry: ITabStatusEntry): Promise<void> {
+    const layout = await readLayoutFile(resolveLayoutFile(entry.workspaceId));
+    if (!layout) return;
+    const tab = collectAllTabs(layout.root).find((t) => t.id === tabId);
+    this.tabScopeCache.set(tabId, { scope: tab?.scope, cwd: tab?.cwd, at: Date.now() });
+  }
+
+  private deliverSignal(signal: IAgentSignal): void {
+    const entry = this.tabs.get(signal.tabId);
+    if (!entry) return;
+    const evidence = signal.evidence.length ? ` (${signal.evidence.join(', ')})` : '';
+    this.nudgeOrchestrator(signal.tabId, entry, signal.kind, `${signal.detail}${evidence}`).catch((err) => {
+      log.warn(`signal nudge failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<void> {
     if (entry.panelType !== 'claude-code' && entry.panelType !== 'codex-cli') return;
     const ws = await getWorkspaceById(entry.workspaceId);
     const orch = ws?.orchestration;
@@ -628,7 +680,7 @@ class StatusManager {
     if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return;
     this.lastNudgeByTab.set(tabId, { kind, at: now });
 
-    const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id);
+    const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
     const target = this.tabs.get(orch.orchestratorTabId);
     let delivered = false;
     if (target && await hasSession(target.tmuxSession)) {

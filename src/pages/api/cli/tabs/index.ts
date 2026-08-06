@@ -58,16 +58,20 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
       model?: string;
       reasoning?: string;
       launch?: boolean;
+      scope?: unknown;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
+    }
+    if (scope !== undefined && (!Array.isArray(scope) || scope.some((s) => typeof s !== 'string'))) {
+      return res.status(400).json({ error: 'scope must be an array of path globs' });
     }
     const ws = await getWorkspaceById(workspaceId);
     if (!ws) {
@@ -110,7 +114,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     }
 
     try {
-      const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType, command);
+      const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType, command, {
+        scope: scope as string[] | undefined,
+      });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
 
       if (tab.panelType !== 'web-browser') {

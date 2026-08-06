@@ -4,10 +4,23 @@ import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import { isRequestAllowed } from '@/lib/access-filter';
 import { translateClaudeHookEvent } from '@/lib/providers/claude/hook-handler';
+import { parseClaudeToolActivity } from '@/lib/providers/claude/tool-activity';
 import { processCodexHookPayload, shouldEmitCodexHookEvent } from '@/lib/providers/codex/hook-handler';
 import { codexHookEvents } from '@/lib/providers/codex/hook-events';
 
 const log = createLogger('hooks');
+
+const handleClaudeToolHook = (req: NextApiRequest, res: NextApiResponse) => {
+  const session = typeof req.query.session === 'string' ? req.query.session : '';
+  if (!session) return res.status(204).end();
+  const activity = parseClaudeToolActivity(req.body);
+  if (!activity) {
+    log.debug({ session }, 'tool hook payload not recognised, ignoring');
+    return res.status(204).end();
+  }
+  getStatusManager().handleToolActivity('claude', session, activity);
+  return res.status(204).end();
+};
 
 const handleClaudeHook = (req: NextApiRequest, res: NextApiResponse) => {
   const { event, session, notificationType } = req.body ?? {};
@@ -76,6 +89,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   const provider = typeof req.query.provider === 'string' ? req.query.provider : 'claude';
   if (provider === 'codex') return handleCodexHook(req, res);
+  if (req.query.kind === 'tool') return handleClaudeToolHook(req, res);
   return handleClaudeHook(req, res);
 };
 

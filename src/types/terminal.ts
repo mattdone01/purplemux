@@ -44,6 +44,13 @@ export interface ITab {
   claudeSummary?: string | null;
   lastUserMessage?: string | null;
   lastCommand?: string | null;
+  /**
+   * Path globs this tab is expected to edit, relative to its cwd. The signal
+   * engine reports an edit outside them as off-scope. purplemux never derives
+   * this — a caller supplies it at tab create, so no workflow convention leaks
+   * in here. Absent means the off-scope detector stays inert for this tab.
+   */
+  scope?: string[];
   cliState?: TCliState;
   dismissedAt?: number | null;
   webUrl?: string | null;
