@@ -154,6 +154,29 @@ const readStdin = () => new Promise((resolve, reject) => {
   process.stdin.on('error', reject);
 });
 
+// Same shape as tab send, but interrupts the current turn first so a busy
+// worker reads the correction now instead of after its tangent finishes.
+const cmdTabSteer = async (args) => {
+  requireEnv();
+  const file = flagValue(args, '--file') || flagValue(args, '-f');
+  const noInterrupt = args.includes('--no-interrupt');
+  const rest = stripFlags(args, ['--workspace', '-w', '--file', '-f', '--no-interrupt']);
+  const tabId = rest[0];
+  let content = rest.slice(1).join(' ');
+  if (!tabId) die('tab ID is required');
+  if (file) {
+    content = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
+  }
+  if (!content) die('content is required (args, -f FILE, or -f - for stdin)');
+  const wsId = resolveWsForTab(args);
+  const { body } = await api(
+    'POST',
+    `/api/cli/tabs/${tabId}/steer?workspaceId=${encodeURIComponent(wsId)}`,
+    { content, ...(noInterrupt ? { interrupt: false } : {}) },
+  );
+  out(body);
+};
+
 const cmdTabSend = async (args) => {
   requireEnv();
   const file = flagValue(args, '--file') || flagValue(args, '-f');
@@ -324,6 +347,7 @@ Commands:
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
              [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior
+  tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter)
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status
@@ -365,6 +389,7 @@ const main = async () => {
         case 'list': return cmdTabList(rest);
         case 'create': return cmdTabCreate(rest);
         case 'send': return cmdTabSend(rest);
+        case 'steer': return cmdTabSteer(rest);
         case 'status': return cmdTabStatus(rest);
         case 'result': return cmdTabResult(rest);
         case 'close': return cmdTabClose(rest);

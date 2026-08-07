@@ -325,6 +325,20 @@ export const exitCopyMode = async (sessionName: string): Promise<void> => {
   ).catch(() => {});
 };
 
+/**
+ * Send a bare Escape. Both agent CLIs read it as "stop this turn, keep the
+ * session", which is what makes a mid-turn correction possible without an
+ * agent-side control API.
+ */
+export const sendEscape = async (sessionName: string): Promise<void> => {
+  await exitCopyMode(sessionName);
+  await execFile(
+    'tmux',
+    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Escape'],
+    { timeout: CMD_TIMEOUT },
+  );
+};
+
 export const sendKeys = async (
   sessionName: string,
   command: string,
