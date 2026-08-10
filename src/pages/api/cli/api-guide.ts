@@ -10,6 +10,20 @@ All endpoints require header \`x-pmux-token: <PMUX_TOKEN>\`.
 GET /api/cli/workspaces
   Response: { "workspaces": [{ "id": "...", "name": "...", "directories": [...] }] }
 
+GET /api/cli/workspaces/<workspaceId>/directories
+  Response: { "workspaceId", "name", "directories": [...] }
+
+PATCH /api/cli/workspaces/<workspaceId>/directories
+  Body: { "directories": ["/abs/path", ...] }   non-empty; replaces the whole list
+  Repoint a workspace at different directories. directories[0] is the PRIMARY: it is
+  the cwd for new tabs and it keys the claude/codex chat store, so it must be unique
+  across workspaces (409 if another workspace already claims it). Later entries are
+  navigation shortcuts and may overlap freely. Paths must be absolute and must exist
+  (400 otherwise) — they are resolved on the server, not against your cwd.
+  Existing tabs keep the cwd their tmux session was created with; only tabs created
+  after the change land in the new primary directory.
+  Response: { "workspaceId", "name", "directories": [...] }
+
 ## Tabs
 
 GET /api/cli/tabs?workspaceId=WS

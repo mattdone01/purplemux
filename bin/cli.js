@@ -83,6 +83,28 @@ const cmdTabList = async (args) => {
   out(body);
 };
 
+const cmdWorkspaceDirs = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const path = `/api/cli/workspaces/${wsId}/directories`;
+  if (sub === 'show') {
+    const { body } = await api('GET', path);
+    return out(body);
+  }
+  if (sub === 'set') {
+    // Resolve here, not server-side: a relative path would otherwise be
+    // resolved against the server's cwd rather than the caller's.
+    const directories = stripFlags(rest, ['--workspace', '-w']).map((d) => require('path').resolve(d));
+    if (!directories.length) die('at least one DIR is required');
+    const { body } = await api('PATCH', path, { directories });
+    return out(body);
+  }
+  die('usage: workspace dirs show|set -w WS [DIR...]');
+};
+
 const deriveOwnTabId = () => {
   try {
     const session = require('child_process').execSync("tmux display-message -p '#{session_name}'", { encoding: 'utf8' }).trim();
@@ -341,6 +363,11 @@ Usage: purplemux <command> [args...]
 
 Commands:
   workspaces                               List workspaces
+  workspace dirs show -w WS                Show a workspace's directories
+  workspace dirs set -w WS DIR [DIR...]    Repoint a workspace. The first DIR is the primary: it is the cwd for
+                                           new tabs and keys the agent chat store, and must be unique across
+                                           workspaces. Later DIRs are navigation shortcuts and may overlap.
+                                           Paths are resolved against your cwd; existing tabs keep their old cwd
   tab list [-w WS]                         List tabs (optionally scoped to workspace)
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
@@ -382,6 +409,12 @@ const main = async () => {
   switch (cmd) {
     case 'workspaces':
       return cmdWorkspaces();
+    case 'workspace':
+      switch (sub) {
+        case 'dirs': return cmdWorkspaceDirs(rest);
+        default: die(`unknown workspace command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
+      }
+      break;
     case 'orchestration':
       return cmdOrchestration(args.slice(1));
     case 'tab':

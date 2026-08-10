@@ -1,24 +1,12 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import {
   deleteWorkspace,
-  getWorkspaceById,
   renameWorkspace,
   setWorkspaceGroup,
-  updateWorkspaceDirectories,
   updateWorkspaceOrchestration,
-  validateDirectory,
 } from '@/lib/workspace-store';
+import { applyDirectoriesPatch } from '@/lib/workspace-patch';
 import type { IWorkspaceOrchestration } from '@/types/terminal';
-
-export const parseDirectoriesPatch = (raw: unknown): string[] | null => {
-  if (!Array.isArray(raw) || raw.length === 0) return null;
-  const directories: string[] = [];
-  for (const entry of raw) {
-    if (typeof entry !== 'string' || !entry.trim()) return null;
-    directories.push(entry.trim());
-  }
-  return directories;
-};
 
 const parseOrchestrationPatch = (raw: unknown): Partial<IWorkspaceOrchestration> | null => {
   if (typeof raw !== 'object' || raw === null) return null;
@@ -54,24 +42,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const { name, groupId, orchestration, directories } = req.body ?? {};
 
     if (directories !== undefined) {
-      const parsed = parseDirectoriesPatch(directories);
-      if (!parsed) {
-        return res.status(400).json({ error: 'directories must be a non-empty array of paths' });
-      }
-      for (const dir of parsed) {
-        const check = await validateDirectory(dir);
-        if (!check.valid) {
-          return res.status(400).json({ error: `${dir}: ${check.error}` });
-        }
-      }
-      try {
-        const found = await updateWorkspaceDirectories(workspaceId, parsed);
-        if (!found) return res.status(404).json({ error: 'Workspace not found' });
-      } catch (err) {
-        return res.status(409).json({ error: err instanceof Error ? err.message : 'Directory conflict' });
+      const result = await applyDirectoriesPatch(workspaceId, directories);
+      if (result.status !== 200) {
+        return res.status(result.status).json({ error: result.error });
       }
       if (name === undefined && groupId === undefined && orchestration === undefined) {
-        return res.status(200).json(await getWorkspaceById(workspaceId));
+        return res.status(200).json(result.workspace);
       }
     }
 
