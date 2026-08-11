@@ -1,14 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import handler from '@/pages/api/cli/workspaces/[workspaceId]/directories';
-import { verifyCliToken } from '@/lib/cli-token';
+import { authorizeWorkspace } from '@/lib/cli-utils';
 import {
   getWorkspaceById,
   updateWorkspaceDirectories,
   validateDirectory,
 } from '@/lib/workspace-store';
 
-vi.mock('@/lib/cli-token', () => ({ verifyCliToken: vi.fn() }));
+vi.mock('@/lib/cli-utils', () => ({ authorizeWorkspace: vi.fn() }));
 
 vi.mock('@/lib/workspace-store', () => ({
   getWorkspaceById: vi.fn(),
@@ -52,14 +52,19 @@ const run = async (method: string, body?: unknown): Promise<IFakeResponse> => {
 describe('/api/cli/workspaces/[workspaceId]/directories', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(verifyCliToken).mockReturnValue(true);
+    vi.mocked(authorizeWorkspace).mockResolvedValue({ type: 'admin' });
     vi.mocked(validateDirectory).mockResolvedValue({ valid: true });
     vi.mocked(updateWorkspaceDirectories).mockResolvedValue(true);
     vi.mocked(getWorkspaceById).mockResolvedValue({ id: 'ws-test', name: 'test', directories: ['/a', '/b'] });
   });
 
-  it('rejects an unauthenticated request before touching the store', async () => {
-    vi.mocked(verifyCliToken).mockReturnValue(false);
+  it('rejects an out-of-scope caller before touching the store', async () => {
+    // authorizeWorkspace writes the 403 itself and returns null
+    vi.mocked(authorizeWorkspace).mockImplementation(async (_req, res) => {
+      (res as unknown as { status: (n: number) => { json: (b: unknown) => void } })
+        .status(403).json({ error: 'out of scope' });
+      return null;
+    });
     const { statusCode } = await run('PATCH', { directories: ['/a'] });
     expect(statusCode).toBe(403);
     expect(updateWorkspaceDirectories).not.toHaveBeenCalled();

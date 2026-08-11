@@ -1,12 +1,12 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { verifyCliToken } from '@/lib/cli-token';
+import { authorizeWorkspace } from '@/lib/cli-utils';
 import { getWorkspaceById, updateWorkspaceOrchestration } from '@/lib/workspace-store';
 import { getStatusManager } from '@/lib/status-manager';
 import { parseOrchestrationPatch } from '@/lib/orchestration';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!verifyCliToken(req)) return res.status(403).json({ error: 'Forbidden' });
   const workspaceId = req.query.workspaceId as string;
+  if (!(await authorizeWorkspace(req, res, workspaceId))) return;
   const ws = await getWorkspaceById(workspaceId);
   if (!ws) return res.status(404).json({ error: 'Workspace not found' });
 

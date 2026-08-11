@@ -105,6 +105,25 @@ const cmdWorkspaceDirs = async (args) => {
   die('usage: workspace dirs show|set -w WS [DIR...]');
 };
 
+const cmdWorkspacePeers = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const path = `/api/cli/workspaces/${wsId}/peers`;
+  if (sub === 'show') {
+    const { body } = await api('GET', path);
+    return out(body);
+  }
+  if (sub === 'set') {
+    const allowedPeers = stripFlags(rest, ['--workspace', '-w']);
+    const { body } = await api('PATCH', path, { allowedPeers });
+    return out(body);
+  }
+  die('usage: workspace peers show|set -w WS [PEER_WS_ID...]');
+};
+
 const deriveOwnTabId = () => {
   try {
     const session = require('child_process').execSync("tmux display-message -p '#{session_name}'", { encoding: 'utf8' }).trim();
@@ -368,7 +387,11 @@ Commands:
                                            new tabs and keys the agent chat store, and must be unique across
                                            workspaces. Later DIRs are navigation shortcuts and may overlap.
                                            Paths are resolved against your cwd; existing tabs keep their old cwd
-  tab list [-w WS]                         List tabs (optionally scoped to workspace)
+  workspace peers show -w WS               Show which workspaces may reach into WS
+  workspace peers set -w WS [PEER...]      Replace that list (global token only — an agent cannot
+                                           widen its own scope). Grants are one-directional; pass
+                                           no PEER to revoke all
+  tab list [-w WS]                         List tabs (only those your token may act on)
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
@@ -412,6 +435,7 @@ const main = async () => {
     case 'workspace':
       switch (sub) {
         case 'dirs': return cmdWorkspaceDirs(rest);
+        case 'peers': return cmdWorkspacePeers(rest);
         default: die(`unknown workspace command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
       }
       break;

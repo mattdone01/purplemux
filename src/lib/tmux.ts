@@ -5,6 +5,8 @@ import path from 'path';
 import { nanoid } from 'nanoid';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { buildShellLaunchCommand } from '@/lib/shell-env';
+import { ensureWorkspaceClaudeHome } from '@/lib/workspace-home';
+import { getWorkspaceToken } from '@/lib/workspace-token';
 import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
 import { getProcessArgs } from '@/lib/process-utils';
@@ -34,6 +36,37 @@ export const listSessions = async (): Promise<string[]> => {
   }
 };
 
+// Session names are `pt-<wsId>-<paneId>-<tabId>`, so the owning workspace is
+// recoverable here without threading it through every caller. Names that are not
+// workspace-shaped (the ad-hoc `defaultSessionName`) yield null and get the
+// unscoped environment, exactly as before.
+const workspaceIdFromSessionName = (name: string): string | null =>
+  name.match(/^pt-(ws-.+?)-pane-/)?.[1] ?? null;
+
+/**
+ * Per-workspace environment for a pane's login shell.
+ *
+ * CLAUDE_CONFIG_DIR gives the workspace its own session store, so two workspaces
+ * launched from the same directory no longer share conversation history or
+ * resume lists. PMUX_TOKEN confines the CLI in this pane to its own workspace —
+ * `bin/cli.js` already prefers the env var over the global token file.
+ */
+const workspaceEnv = async (sessionName: string): Promise<Record<string, string>> => {
+  const wsId = workspaceIdFromSessionName(sessionName);
+  if (!wsId) return {};
+  try {
+    return {
+      CLAUDE_CONFIG_DIR: await ensureWorkspaceClaudeHome(wsId),
+      PMUX_TOKEN: getWorkspaceToken(wsId),
+    };
+  } catch (err) {
+    // A pane that starts without isolation is far better than a pane that does
+    // not start, but this must be visible — it is a silent loss of a guarantee.
+    log.error(`workspace env for ${wsId} failed, launching unscoped: ${err instanceof Error ? err.message : err}`);
+    return {};
+  }
+};
+
 export const createSession = async (
   name: string,
   cols: number,
@@ -42,7 +75,7 @@ export const createSession = async (
 ): Promise<void> => {
   // tmux 서버 global env cache를 우회하기 위해 `env -i $SHELL -l`을 명령으로 직접 넘긴다.
   // execFile의 env 옵션은 tmux 서버가 이미 떠있는 경우 무시되므로 의존하지 않는다.
-  const shellCmd = buildShellLaunchCommand();
+  const shellCmd = buildShellLaunchCommand(await workspaceEnv(name));
   await execFile(
     'tmux',
     [
