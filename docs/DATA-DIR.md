@@ -16,7 +16,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │   └── {wsId}/
 │       ├── layout.json           # pane/tab tree
 │       ├── message-history.json  # per-workspace input history
-│       └── claude-prompt.md      # --append-system-prompt-file content
+│       ├── claude-prompt.md      # --append-system-prompt-file content
+│       └── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
 ├── hooks.json               # Claude Code hook + statusline config (generated)
 ├── status-hook.sh           # hook → POST /api/status/hook (generated, 0755)
 ├── statusline.sh            # statusline → POST /api/status/statusline (generated, 0755)
@@ -170,6 +171,10 @@ Per-workspace input history for Claude tabs. Capped at 500 entries. Locks are ke
 
 The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change. Contains workspace ID + CLI quick-reference.
 
+### `claude-home/` — `src/lib/workspace-home.ts`
+
+The workspace's private `CLAUDE_CONFIG_DIR`, set on every pane at launch (`src/lib/tmux.ts`). `projects/` and `sessions/` are real per-workspace directories — this is what keeps conversation history and resume lists separate for workspaces sharing one project root — while credentials, settings, commands, hooks, rules and plugins are symlinks back into `~/.claude`, recreated on each launch. Session detection, session lists, and timeline jsonl resolution all resolve against this directory for workspace panes (`~/.claude` remains the home for non-workspace sessions).
+
 ---
 
 ## `logs/`
@@ -198,7 +203,7 @@ Images attached via the chat input bar (drag/drop, paste, paperclip). Saved as `
 
 ## `stats/`
 
-Claude usage statistics cache. Derived from `~/.claude/projects/**/*.jsonl` — purplemux only reads that directory.
+Claude usage statistics cache. Derived from `{home}/projects/**/*.jsonl` across every claude home (`~/.claude` plus each workspace `claude-home/`) — purplemux only reads those directories. Each transcript lives in exactly one home, so the union cannot double-count.
 
 | File | Contents |
 | --- | --- |

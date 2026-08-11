@@ -5,7 +5,7 @@ import path from 'path';
 import { nanoid } from 'nanoid';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { buildShellLaunchCommand } from '@/lib/shell-env';
-import { ensureWorkspaceClaudeHome } from '@/lib/workspace-home';
+import { ensureWorkspaceClaudeHome, workspaceIdFromSessionName } from '@/lib/workspace-home';
 import { getWorkspaceToken } from '@/lib/workspace-token';
 import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
@@ -35,13 +35,6 @@ export const listSessions = async (): Promise<string[]> => {
     return [];
   }
 };
-
-// Session names are `pt-<wsId>-<paneId>-<tabId>`, so the owning workspace is
-// recoverable here without threading it through every caller. Names that are not
-// workspace-shaped (the ad-hoc `defaultSessionName`) yield null and get the
-// unscoped environment, exactly as before.
-const workspaceIdFromSessionName = (name: string): string | null =>
-  name.match(/^pt-(ws-.+?)-pane-/)?.[1] ?? null;
 
 /**
  * Per-workspace environment for a pane's login shell.

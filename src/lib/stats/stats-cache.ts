@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import readline from 'readline';
 import dayjs from 'dayjs';
+import { listClaudeProjectsDirs } from '@/lib/workspace-home';
 import type {
   IStatsCache,
   IStatsCacheDailyActivity,
@@ -16,7 +17,6 @@ import type {
 const CACHE_VERSION = 3;
 const CACHE_DIR = path.join(os.homedir(), '.purplemux', 'stats');
 const CACHE_PATH = path.join(CACHE_DIR, 'cache.json');
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const CONCURRENCY_LIMIT = 10;
 
 // --- Cache types ---
@@ -54,16 +54,18 @@ interface IStatsFileCache {
 export const collectJsonlFiles = async (): Promise<string[]> => {
   const result: string[] = [];
   try {
-    const projectDirs = await fs.readdir(PROJECTS_DIR);
-    for (const dir of projectDirs) {
-      const projectPath = path.join(PROJECTS_DIR, dir);
-      const stat = await fs.stat(projectPath).catch(() => null);
-      if (!stat?.isDirectory()) continue;
+    for (const projectsRoot of await listClaudeProjectsDirs()) {
+      const projectDirs = await fs.readdir(projectsRoot).catch(() => [] as string[]);
+      for (const dir of projectDirs) {
+        const projectPath = path.join(projectsRoot, dir);
+        const stat = await fs.stat(projectPath).catch(() => null);
+        if (!stat?.isDirectory()) continue;
 
-      const files = await fs.readdir(projectPath).catch(() => []);
-      for (const file of files) {
-        if (file.endsWith('.jsonl') && !/^agent-/.test(file)) {
-          result.push(path.join(projectPath, file));
+        const files = await fs.readdir(projectPath).catch(() => []);
+        for (const file of files) {
+          if (file.endsWith('.jsonl') && !/^agent-/.test(file)) {
+            result.push(path.join(projectPath, file));
+          }
         }
       }
     }

@@ -1,13 +1,12 @@
 import fs from 'fs/promises';
 import { createReadStream } from 'fs';
 import path from 'path';
-import os from 'os';
 import readline from 'readline';
 import type { IProjectStats, ISessionStats, TPeriod } from '@/types/stats';
+import { listClaudeProjectsDirs } from '@/lib/workspace-home';
 import { isWithinPeriod } from './period-filter';
 import { shortenCwd } from './daily-report-builder';
 
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const CONCURRENCY_LIMIT = 10;
 
 interface IRawSessionAgg {
@@ -27,10 +26,10 @@ const isAgentFile = (filename: string): boolean => /^agent-/.test(filename);
 
 const collectJsonlFiles = async (): Promise<{ filePath: string; project: string }[]> => {
   const result: { filePath: string; project: string }[] = [];
-  try {
-    const projectDirs = await fs.readdir(PROJECTS_DIR);
+  for (const projectsRoot of await listClaudeProjectsDirs()) {
+    const projectDirs = await fs.readdir(projectsRoot).catch(() => [] as string[]);
     for (const dir of projectDirs) {
-      const projectPath = path.join(PROJECTS_DIR, dir);
+      const projectPath = path.join(projectsRoot, dir);
       const stat = await fs.stat(projectPath).catch(() => null);
       if (!stat?.isDirectory()) continue;
 
@@ -40,8 +39,6 @@ const collectJsonlFiles = async (): Promise<{ filePath: string; project: string 
         result.push({ filePath: path.join(projectPath, file), project: dir });
       }
     }
-  } catch {
-    // projects dir doesn't exist
   }
   return result;
 };

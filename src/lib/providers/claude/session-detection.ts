@@ -7,6 +7,7 @@ import { promisify } from 'util';
 import type { ISessionInfo } from '@/types/timeline';
 import type { ISessionWatcher } from '@/lib/providers/types';
 import { getShellPath } from '@/lib/preflight';
+import { listWorkspaceClaudeHomes } from '@/lib/workspace-home';
 import {
   getChildPids,
   getProcessArgs,
@@ -17,12 +18,20 @@ import {
 const execFile = promisify(execFileCb);
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const SESSIONS_DIR = path.join(CLAUDE_DIR, 'sessions');
-const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const CLAUDE_KNOWN_PATHS = [path.join(os.homedir(), '.local', 'bin', 'claude')];
 const PID_POLL_INTERVAL = 10_000;
 const SESSION_DIR_DEBOUNCE = 200;
-const INSTALL_CHECK_INTERVAL = 60_000;
+const WATCH_SYNC_INTERVAL = 60_000;
+
+// A pane launched with a workspace CLAUDE_CONFIG_DIR (src/lib/tmux.ts) writes
+// its session pid file and transcripts into that workspace's claude-home; a
+// pane launched unscoped writes into ~/.claude. Session pid files name their
+// process, so scanning every home and matching on pid cannot attribute a
+// session to the wrong pane.
+const candidateClaudeHomes = async (): Promise<string[]> => [
+  CLAUDE_DIR,
+  ...(await listWorkspaceClaudeHomes()),
+];
 
 interface IPidFileData {
   pid: number;
@@ -112,6 +121,59 @@ export const isClaudeRunning = async (panePid: number, preloadedChildPids?: numb
   return false;
 };
 
+const findSessionInHome = async (
+  home: string,
+  childPidSet: Set<number>,
+): Promise<ISessionInfo | null> => {
+  const sessionsDir = path.join(home, 'sessions');
+  const projectsDir = path.join(home, 'projects');
+
+  let pidFiles: string[];
+  try {
+    pidFiles = await fs.readdir(sessionsDir);
+  } catch {
+    return null;
+  }
+
+  for (const file of pidFiles.filter((f) => f.endsWith('.json'))) {
+    const data = await readPidFile(path.join(sessionsDir, file));
+    if (!data) continue;
+    if (!childPidSet.has(data.pid)) continue;
+
+    const processArgs = await getProcessArgs(data.pid);
+    if (processArgs === null || !processArgs.includes('claude')) {
+      try { await fs.unlink(path.join(sessionsDir, file)); } catch {}
+      continue;
+    }
+
+    const projectDir = path.join(projectsDir, toClaudeProjectName(data.cwd));
+    let jsonlPath = await findJsonlPath(projectDir, data.sessionId);
+    let effectiveSessionId = data.sessionId;
+
+    if (!jsonlPath) {
+      const resumeMatch = processArgs.match(/--resume\s+([0-9a-f-]{36})/);
+      if (resumeMatch) {
+        const resumeJsonlPath = await findJsonlPath(projectDir, resumeMatch[1]);
+        if (resumeJsonlPath) {
+          jsonlPath = resumeJsonlPath;
+          effectiveSessionId = resumeMatch[1];
+        }
+      }
+    }
+
+    return {
+      status: 'running',
+      sessionId: effectiveSessionId,
+      jsonlPath,
+      pid: data.pid,
+      startedAt: data.startedAt,
+      cwd: data.cwd,
+    };
+  }
+
+  return null;
+};
+
 export const detectActiveSession = async (panePid: number, preloadedChildPids?: number[]): Promise<ISessionInfo> => {
   try {
     await fs.access(CLAUDE_DIR);
@@ -133,72 +195,28 @@ export const detectActiveSession = async (panePid: number, preloadedChildPids?: 
   const allPids = [...directChildPids, ...grandchildPids];
   const childPidSet = new Set(allPids);
 
-  try {
-    const pidFiles = await fs.readdir(SESSIONS_DIR);
-    const jsonFiles = pidFiles.filter((f) => f.endsWith('.json'));
-
-    for (const file of jsonFiles) {
-      const data = await readPidFile(path.join(SESSIONS_DIR, file));
-      if (!data) continue;
-      if (!childPidSet.has(data.pid)) continue;
-
-      const processArgs = await getProcessArgs(data.pid);
-      if (processArgs === null) {
-        try { await fs.unlink(path.join(SESSIONS_DIR, file)); } catch {}
-        continue;
-      }
-
-      if (!processArgs.includes('claude')) {
-        try { await fs.unlink(path.join(SESSIONS_DIR, file)); } catch {}
-        continue;
-      }
-
-      const projectName = toClaudeProjectName(data.cwd);
-      const projectDir = path.join(PROJECTS_DIR, projectName);
-      let jsonlPath = await findJsonlPath(projectDir, data.sessionId);
-      let effectiveSessionId = data.sessionId;
-
-      if (!jsonlPath) {
-        const resumeMatch = processArgs.match(/--resume\s+([0-9a-f-]{36})/);
-        if (resumeMatch) {
-          const resumeSessionId = resumeMatch[1];
-          const resumeJsonlPath = await findJsonlPath(projectDir, resumeSessionId);
-          if (resumeJsonlPath) {
-            jsonlPath = resumeJsonlPath;
-            effectiveSessionId = resumeSessionId;
-          }
-        }
-      }
-
-      return {
-        status: 'running',
-        sessionId: effectiveSessionId,
-        jsonlPath,
-        pid: data.pid,
-        startedAt: data.startedAt,
-        cwd: data.cwd,
-      };
-    }
-  } catch {
-    // sessions dir doesn't exist yet
+  const homes = await candidateClaudeHomes();
+  for (const home of homes) {
+    const info = await findSessionInHome(home, childPidSet);
+    if (info) return info;
   }
 
   const fromArgs = await getClaudeSessionFromArgs(allPids);
-  if (fromArgs) {
-    const cwd = fromArgs.cwd;
-    if (cwd) {
-      const projectName = toClaudeProjectName(cwd);
-      const projectDir = path.join(PROJECTS_DIR, projectName);
-      const jsonlPath = await findJsonlPath(projectDir, fromArgs.sessionId);
-      return {
-        status: 'running',
-        sessionId: fromArgs.sessionId,
-        jsonlPath,
-        pid: fromArgs.pid,
-        startedAt: null,
-        cwd,
-      };
+  if (fromArgs?.cwd) {
+    const projectName = toClaudeProjectName(fromArgs.cwd);
+    let jsonlPath: string | null = null;
+    for (const home of homes) {
+      jsonlPath = await findJsonlPath(path.join(home, 'projects', projectName), fromArgs.sessionId);
+      if (jsonlPath) break;
     }
+    return {
+      status: 'running',
+      sessionId: fromArgs.sessionId,
+      jsonlPath,
+      pid: fromArgs.pid,
+      startedAt: null,
+      cwd: fromArgs.cwd,
+    };
   }
 
   return { status: 'not-running', sessionId: null, jsonlPath: null, pid: null, startedAt: null, cwd: null };
@@ -209,10 +227,10 @@ export const watchSessionsDir = (
   onChange: (info: ISessionInfo) => void,
   options?: { skipInitial?: boolean },
 ): ISessionWatcher => {
-  let watcher: FSWatcher | null = null;
+  const watchers = new Map<string, FSWatcher>();
   let pidPollTimer: ReturnType<typeof setInterval> | null = null;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  let installCheckTimer: ReturnType<typeof setInterval> | null = null;
+  let syncTimer: ReturnType<typeof setInterval> | null = null;
   let currentPid: number | null = null;
   let stopped = false;
 
@@ -237,32 +255,43 @@ export const watchSessionsDir = (
     }, SESSION_DIR_DEBOUNCE);
   };
 
-  const tryWatch = () => {
+  const dirExists = (dir: string) => fs.access(dir).then(() => true).catch(() => false);
+
+  // Sessions dirs can appear after the watch starts (the first claude run
+  // creates ~/.claude/sessions, a repointed workspace recreates its
+  // claude-home), so watches are reconciled periodically instead of being
+  // established once. A dir that gains its watch late may already contain the
+  // session file, hence the re-detect after adding.
+  const syncWatchers = async (initial = false) => {
     if (stopped) return;
-    try {
-      watcher = watch(SESSIONS_DIR, handleSessionDirChange);
-      watcher.on('error', () => {});
-      if (installCheckTimer) {
-        clearInterval(installCheckTimer);
-        installCheckTimer = null;
-      }
-    } catch {
-      if (!installCheckTimer) {
-        installCheckTimer = setInterval(async () => {
-          if (stopped) return;
-          try {
-            await fs.access(SESSIONS_DIR);
-            tryWatch();
-            const info = await detectActiveSession(panePid);
-            if (info.pid) currentPid = info.pid;
-            onChange(info);
-          } catch {}
-        }, INSTALL_CHECK_INTERVAL);
+    const dirs = (await candidateClaudeHomes()).map((home) => path.join(home, 'sessions'));
+    const wanted = new Set(dirs);
+
+    for (const [dir, watcher] of watchers) {
+      if (wanted.has(dir) && await dirExists(dir)) continue;
+      watcher.close();
+      watchers.delete(dir);
+    }
+
+    if (stopped) return;
+    let added = false;
+    for (const dir of dirs) {
+      if (watchers.has(dir)) continue;
+      try {
+        const watcher = watch(dir, handleSessionDirChange);
+        watcher.on('error', () => {});
+        watchers.set(dir, watcher);
+        added = true;
+      } catch {
+        // dir does not exist yet; the next sync retries
       }
     }
+
+    if (added && !initial) handleSessionDirChange();
   };
 
-  tryWatch();
+  void syncWatchers(true);
+  syncTimer = setInterval(() => void syncWatchers(), WATCH_SYNC_INTERVAL);
   pidPollTimer = setInterval(pollPid, PID_POLL_INTERVAL);
 
   if (!options?.skipInitial) {
@@ -276,10 +305,11 @@ export const watchSessionsDir = (
   return {
     stop: () => {
       stopped = true;
-      if (watcher) watcher.close();
+      for (const watcher of watchers.values()) watcher.close();
+      watchers.clear();
       if (pidPollTimer) clearInterval(pidPollTimer);
       if (debounceTimer) clearTimeout(debounceTimer);
-      if (installCheckTimer) clearInterval(installCheckTimer);
+      if (syncTimer) clearInterval(syncTimer);
     },
   };
 };

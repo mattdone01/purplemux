@@ -154,7 +154,8 @@ tmux pane (shell PID)
     └─ pgrep -P {panePid} → list of child PIDs
         ├─ no children → { status: 'none' }
         └─ has children
-            ├─ [primary] match against PIDs in ~/.claude/sessions/*.json
+            ├─ [primary] match against PIDs in {home}/sessions/*.json,
+            │   for every candidate claude home (see below)
             │   └─ ps -p {pid} -o args= → confirm 'claude' is in the args
             │       ├─ matched → { status: 'active', sessionId, jsonlPath, ... }
             │       └─ mismatch → delete the PID file (stale cleanup)
@@ -166,11 +167,17 @@ tmux pane (shell PID)
 
 ### Claude CLI Directories Referenced
 
+Workspace panes run claude with `CLAUDE_CONFIG_DIR` set to the workspace's own
+claude-home (see [DATA-DIR.md](./DATA-DIR.md)), so detection scans every
+candidate home: `~/.claude` plus each
+`~/.purplemux/workspaces/{wsId}/claude-home`. Session PID files name their
+process, so the pid match keeps cross-workspace confusion impossible.
+
 | Path | Contents |
 | --- | --- |
-| `~/.claude/` | Claude CLI root |
-| `~/.claude/sessions/` | Active session PID files (`{uuid}.json`) |
-| `~/.claude/projects/{projectName}/` | Session JSONL files (`{sessionId}.jsonl`) |
+| `{home}/` | A candidate claude home (`~/.claude` or a workspace claude-home) |
+| `{home}/sessions/` | Active session PID files (`{pid}.json`) |
+| `{home}/projects/{projectName}/` | Session JSONL files (`{sessionId}.jsonl`) |
 
 PID file format:
 ```json
@@ -188,9 +195,9 @@ Combines polling and `fs.watch` to detect session changes in real time:
 
 | Watch target | Method | Interval / condition |
 | --- | --- | --- |
-| `~/.claude/sessions/` directory changes | `fs.watch` | 200ms debounce |
+| Every candidate `{home}/sessions/` directory | `fs.watch` | 200ms debounce |
 | Active Claude PID liveness | `ps -p {pid}` polling | 10s interval |
-| `~/.claude` existence (when uninstalled) | Periodic access check | 60s interval |
+| Candidate home set (new/removed claude-homes, first claude run) | Watch reconciliation | 60s interval |
 
 When a change is detected, `detectActiveSession` is re-run and the result is delivered to the callback.
 

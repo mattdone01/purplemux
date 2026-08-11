@@ -11,13 +11,52 @@ const CLAUDE_STATE_FILE = path.join(os.homedir(), '.claude.json');
 // and tmux calls in here on every session create, which would close a cycle.
 const WORKSPACES_FILE = path.join(os.homedir(), '.purplemux', 'workspaces.json');
 
+const WORKSPACES_DIR = path.join(os.homedir(), '.purplemux', 'workspaces');
+
 // Claude Code keys its session store by cwd (`<config>/projects/<encoded-cwd>/`),
 // so two workspaces launched from the same directory share conversation history
 // and resume lists. Giving each workspace its own CLAUDE_CONFIG_DIR decouples
 // session identity from location, which is what lets several workspaces run from
 // one project root.
 const workspaceHomeDir = (wsId: string): string =>
-  path.join(os.homedir(), '.purplemux', 'workspaces', wsId, 'claude-home');
+  path.join(WORKSPACES_DIR, wsId, 'claude-home');
+
+// Session names are `pt-<wsId>-<paneId>-<tabId>`, so the owning workspace is
+// recoverable anywhere a tmux session name is at hand, without threading it
+// through every caller. Names that are not workspace-shaped (the ad-hoc
+// `defaultSessionName`) yield null and run unscoped against ~/.claude.
+export const workspaceIdFromSessionName = (name: string): string | null =>
+  name.match(/^pt-(ws-.+?)-pane-/)?.[1] ?? null;
+
+export const claudeHomeForSession = (sessionName: string): string | null => {
+  const wsId = workspaceIdFromSessionName(sessionName);
+  return wsId ? workspaceHomeDir(wsId) : null;
+};
+
+/**
+ * Every workspace claude-home that exists on disk. A pane launched with a
+ * workspace CLAUDE_CONFIG_DIR registers its session pid file and transcripts
+ * inside its claude-home, not under ~/.claude — session detection must scan
+ * both. Pid matching keeps cross-workspace confusion impossible, so listing
+ * every home is safe.
+ */
+export const listWorkspaceClaudeHomes = async (): Promise<string[]> => {
+  let entries;
+  try {
+    entries = await fs.readdir(WORKSPACES_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const homes = await Promise.all(
+    entries
+      .filter((e) => e.isDirectory())
+      .map(async (e) => {
+        const home = path.join(WORKSPACES_DIR, e.name, 'claude-home');
+        return (await fs.access(home).then(() => true).catch(() => false)) ? home : null;
+      }),
+  );
+  return homes.filter((h): h is string => h !== null);
+};
 
 // Symlinked back to the real ~/.claude: credentials, settings, and the command
 // surface must stay common to every workspace. Recreated on each launch so a
@@ -132,9 +171,14 @@ export const ensureWorkspaceClaudeHome = async (wsId: string): Promise<string> =
   return home;
 };
 
+// Transcript roots for anything that aggregates across every claude session on
+// this machine (usage stats). Each transcript lives in exactly one home, so
+// walking all roots cannot double-count.
+export const listClaudeProjectsDirs = async (): Promise<string[]> => [
+  path.join(CLAUDE_HOME, 'projects'),
+  ...(await listWorkspaceClaudeHomes()).map((home) => path.join(home, 'projects')),
+];
+
 export const removeWorkspaceClaudeHome = async (wsId: string): Promise<void> => {
-  await fs.rm(path.join(os.homedir(), '.purplemux', 'workspaces', wsId, 'claude-home'), {
-    recursive: true,
-    force: true,
-  });
+  await fs.rm(workspaceHomeDir(wsId), { recursive: true, force: true });
 };

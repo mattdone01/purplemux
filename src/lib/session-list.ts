@@ -3,6 +3,7 @@ import { createReadStream } from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { toClaudeProjectName } from '@/lib/providers/claude/session-detection';
+import { claudeHomeForSession } from '@/lib/workspace-home';
 import { getSessionCwd } from '@/lib/tmux';
 import { createLogger } from '@/lib/logger';
 import { createMetaCache } from '@/lib/session-meta-cache';
@@ -10,7 +11,7 @@ import type { ISessionMeta } from '@/types/timeline';
 
 const log = createLogger('session-list');
 
-const PROJECTS_DIR = path.join(
+const GLOBAL_PROJECTS_DIR = path.join(
   process.env.HOME || process.env.USERPROFILE || '/',
   '.claude',
   'projects',
@@ -20,9 +21,15 @@ const MAX_FIRST_MESSAGE_LENGTH = 200;
 
 const metaCache = createMetaCache();
 
-export const cwdToProjectPath = (cwd: string): string => {
-  const projectName = toClaudeProjectName(cwd);
-  return path.join(PROJECTS_DIR, projectName);
+// A workspace-shaped tmux session runs claude with the workspace's own
+// CLAUDE_CONFIG_DIR (src/lib/tmux.ts), so its transcripts live in that
+// claude-home — resolving against ~/.claude there would list sessions the
+// scoped claude cannot see, let alone resume. Sessions without a workspace
+// resolve to the global store, as before.
+export const cwdToProjectPath = (cwd: string, tmuxSession?: string): string => {
+  const home = tmuxSession ? claudeHomeForSession(tmuxSession) : null;
+  const projectsDir = home ? path.join(home, 'projects') : GLOBAL_PROJECTS_DIR;
+  return path.join(projectsDir, toClaudeProjectName(cwd));
 };
 
 const runWithConcurrency = async <T>(
@@ -156,7 +163,7 @@ export const listSessions = async (tmuxSession: string, cwdHint?: string): Promi
   const cwd = cwdHint || await getSessionCwd(tmuxSession);
   if (!cwd) throw new Error('cwd-lookup-failed');
 
-  const projectDir = cwdToProjectPath(cwd);
+  const projectDir = cwdToProjectPath(cwd, tmuxSession);
 
   let files: string[];
   try {

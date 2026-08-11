@@ -512,7 +512,7 @@ const watchForJsonlFile = (
 ) => {
   cancelJsonlWatcher(sessionName);
 
-  const projectDir = cwdToProjectPath(cwd);
+  const projectDir = cwdToProjectPath(cwd, sessionName);
   const jsonlFilename = `${sessionId}.jsonl`;
   const expectedJsonlPath = path.join(projectDir, jsonlFilename);
 
@@ -630,7 +630,7 @@ const resolveJsonlPath = async (
 
   const cwd = await getSessionCwd(tmuxSession);
   if (!cwd) return null;
-  const projectDir = cwdToProjectPath(cwd);
+  const projectDir = cwdToProjectPath(cwd, tmuxSession);
   const jsonlPath = path.join(projectDir, `${sessionId}.jsonl`);
   return existsSync(jsonlPath) ? jsonlPath : null;
 };
