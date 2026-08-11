@@ -1,0 +1,13 @@
+{
+ "title": "스탠드업",
+ "needsYou": "확인 필요",
+ "stale": "오래됨",
+ "blockers": "차단 요소",
+ "needs": "필요",
+ "next": "다음",
+ "stateOnTrack": "순조로움",
+ "stateAtRisk": "위험",
+ "stateBlocked": "차단됨",
+ "stateAwaitingHuman": "대기 중",
+ "stateDone": "완료"
+}

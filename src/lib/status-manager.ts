@@ -21,7 +21,8 @@ import { parsePermissionOptions } from '@/lib/permission-prompt';
 import type { IPaneInfo } from '@/lib/tmux';
 import type { ITab } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
-import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind } from '@/types/status';
+import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup } from '@/types/status';
+import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
@@ -88,6 +89,7 @@ class StatusManager {
   private jsonlWatchers = new Map<string, { watcher: FSWatcher; jsonlPath: string; debounceTimer: ReturnType<typeof setTimeout> | null }>();
   private compactStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private orchestrationNudges: IOrchestrationNudge[] = [];
+  private standups = new Map<string, IWorkspaceStandup>();
 
   // Scope/cwd are read from the layout file, which is far too slow to touch per
   // tool call. Cached with a short TTL and refreshed off the hot path.
@@ -102,6 +104,15 @@ class StatusManager {
     this.initialized = true;
 
     getSignalEngine().setEmitter((signal) => this.deliverSignal(signal));
+
+    // Standups are file-backed so "where are things at" survives a restart;
+    // ticks posted while hydration is in flight win via the at-comparison.
+    readAllLatestStandups().then((latest) => {
+      for (const [wsId, standup] of Object.entries(latest)) {
+        const current = this.standups.get(wsId);
+        if (!current || current.at < standup.at) this.standups.set(wsId, standup);
+      }
+    }).catch(() => {});
 
     await this.scanAll();
     this.startPolling();
@@ -712,6 +723,21 @@ class StatusManager {
 
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
     return this.orchestrationNudges.filter((n) => n.workspaceId === workspaceId);
+  }
+
+  async reportStandup(standup: IWorkspaceStandup): Promise<void> {
+    const current = this.standups.get(standup.workspaceId);
+    if (current && current.at > standup.at) return;
+    this.standups.set(standup.workspaceId, standup);
+    await addStandup(standup).catch((err) => {
+      log.warn(`standup persist failed: ${err instanceof Error ? err.message : err}`);
+    });
+    this.broadcast({ type: 'standup:update', standup });
+    log.info({ workspaceId: standup.workspaceId, state: standup.state, needsHuman: standup.needsHuman }, 'standup tick');
+  }
+
+  getStandupsForClient(): Record<string, IWorkspaceStandup> {
+    return Object.fromEntries(this.standups);
   }
 
   queueKickoffPrompt(tabId: string, prompt: string): void {

@@ -17,6 +17,7 @@ import useTabStore, { selectWorkspacePortsLabel } from '@/hooks/use-tab-store';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import useInlineEdit from '@/hooks/use-inline-edit';
 import WorkspaceStatusIndicator from '@/components/features/workspace/workspace-status-indicator';
+import WorkspaceStandup from '@/components/features/workspace/workspace-standup';
 
 interface IWorkspaceItemProps {
   workspace: IWorkspace;
@@ -140,6 +141,7 @@ const WorkspaceItem = ({
             {portsLabel}
           </span>
         )}
+        <WorkspaceStandup workspaceId={workspace.id} />
         <WorkspaceStatusIndicator workspaceId={workspace.id} tabs={tabs} />
       </ContextMenuTrigger>
       <ContextMenuContent>

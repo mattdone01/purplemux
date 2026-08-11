@@ -17,6 +17,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── layout.json           # pane/tab tree
 │       ├── message-history.json  # per-workspace input history
 │       ├── claude-prompt.md      # --append-system-prompt-file content
+│       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       └── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
 ├── hooks.json               # Claude Code hook + statusline config (generated)
 ├── status-hook.sh           # hook → POST /api/status/hook (generated, 0755)
@@ -170,6 +171,12 @@ Per-workspace input history for Claude tabs. Capped at 500 entries. Locks are ke
 ### `claude-prompt.md` — `src/lib/claude-prompt.ts`
 
 The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change. Contains workspace ID + CLI quick-reference.
+
+### `standups.json` — `src/lib/standup-store.ts`
+
+Orchestrator standup ticks, newest first, capped at 50. The latest tick renders in the
+workspace sidebar; `StatusManager` hydrates from this file on boot so "where are things
+at" survives a server restart. See STATUS.md → Standup Ticks for the full flow.
 
 ### `claude-home/` — `src/lib/workspace-home.ts`
 

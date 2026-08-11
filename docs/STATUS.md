@@ -528,7 +528,8 @@ With `hooks=debug` you see, for example:
 | File | Description |
 | --- | --- |
 | `src/hooks/use-tab-store.ts` | Zustand tab store, `applyHookEvent`, `selectTabDisplayStatus` |
-| `src/hooks/use-claude-status.ts` | Status WebSocket, `status:hook-event` / `status:update` handling, `dismissTab` |
+| `src/hooks/use-agent-status.ts` | Status WebSocket, `status:hook-event` / `status:update` / `standup:update` handling, `dismissTab` |
+| `src/hooks/use-standup-store.ts` | Zustand standup store (latest tick per workspace) |
 | `src/hooks/use-timeline.ts` | Timeline WS data (no cliState derivation) |
 | `src/hooks/use-web-input.ts` | Input mode decision (`unknown` allows input) |
 | `src/hooks/use-native-notification.ts` | Desktop native notifications |
@@ -543,8 +544,47 @@ With `hooks=debug` you see, for example:
 | `src/components/features/mobile/mobile-workspace-tab-bar.tsx` | Mobile tab bar |
 | `src/components/features/timeline/permission-prompt-item.tsx` | Permission prompt UI (`lastEvent.seq` subscriber) |
 | `src/components/features/workspace/notification-sheet.tsx` | Notification sheet + `useNotificationCount` |
+| `src/components/features/workspace/workspace-standup.tsx` | Sidebar standup chip + popover panel |
 
 ---
+
+## Standup Ticks
+
+Orchestrators post a structured "standup tick" per workspace — a mini-standup answering
+"where are things at, are we progressing, any blockers, am I needed" without opening a pane.
+
+### Data flow
+
+```
+orchestrator tab
+  purplemux standup report -w WS --json '{...}'
+    → POST /api/cli/workspaces/{wsId}/standup   (authorizeWorkspace: own-workspace token suffices)
+    → parseStandupReport (src/lib/standup.ts — clamps text, drops malformed rows)
+    → StatusManager.reportStandup
+        ├─ standups map (in-memory, keyed by wsId, newest-at wins)
+        ├─ standup-store.addStandup → ~/.purplemux/workspaces/{wsId}/standups.json (history, cap 50)
+        └─ broadcast { type: 'standup:update', standup }
+             → use-agent-status.ts → useStandupStore
+             → workspace-standup.tsx (sidebar chip + popover)
+```
+
+`status:sync` carries `standups` (latest per workspace) so a fresh client starts populated;
+`StatusManager.init` hydrates the map from disk so ticks survive a server restart.
+
+### When ticks are posted
+
+The kickoff template (`DEFAULT_KICKOFF_TEMPLATE`) instructs the orchestrator to post one
+after every nudge it handles, and the idle keeper heartbeat asks for one on every beat —
+each heartbeat is thereby a standup tick. A final tick (state `done` or `awaiting-human`)
+is requested before `orchestration off`.
+
+### Shape
+
+`IWorkspaceStandup` (`src/types/status.ts`): `state` (`on-track | at-risk | blocked |
+awaiting-human | done`), `headline`, `items[]` (`label`, `status: done | active | blocked |
+todo`, `note?`), `blockers[]` (`what`, `needs` — the exact input that clears it),
+`needsHuman`, `next[]`. The sidebar chip shows the state dot, done-count, and headline;
+ticks older than `STANDUP_STALE_MS` (20 min) render as stale.
 
 ## Notification System
 

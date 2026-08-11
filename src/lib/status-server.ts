@@ -13,6 +13,7 @@ export const handleStatusConnection = (ws: WebSocket) => {
   const syncMsg: IStatusSyncMessage = {
     type: 'status:sync',
     tabs: manager.getAllForClient(),
+    standups: manager.getStandupsForClient(),
   };
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(syncMsg));
@@ -42,6 +43,7 @@ export const handleStatusConnection = (ws: WebSocket) => {
           const sync: IStatusSyncMessage = {
             type: 'status:sync',
             tabs: manager.getAllForClient(),
+            standups: manager.getStandupsForClient(),
           };
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(sync));

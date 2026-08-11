@@ -4,6 +4,7 @@ import useTabMetadataStore from '@/hooks/use-tab-metadata-store';
 import useRateLimitsStore from '@/hooks/use-rate-limits-store';
 import useSessionHistoryStore from '@/hooks/use-session-history-store';
 import useOrchestrationStore from '@/hooks/use-orchestration-store';
+import useStandupStore from '@/hooks/use-standup-store';
 import useGitStatusStore from '@/hooks/use-git-status-store';
 import { useLayoutStore } from '@/hooks/use-layout';
 import { formatTabTitle } from '@/lib/tab-title';
@@ -81,6 +82,7 @@ const useAgentStatus = () => {
           switch (msg.type) {
             case 'status:sync': {
               useTabStore.getState().syncAllFromServer(msg.tabs);
+              if (msg.standups) useStandupStore.getState().syncFromServer(msg.standups);
               for (const [tabId, entry] of Object.entries(msg.tabs)) {
                 if (entry.panelType === 'agent-sessions') continue;
                 if (entry.paneTitle && !useTabMetadataStore.getState().metadata[tabId]?.title) {
@@ -137,6 +139,10 @@ const useAgentStatus = () => {
 
             case 'orchestration:nudge':
               useOrchestrationStore.getState().addNudge(msg.nudge);
+              break;
+
+            case 'standup:update':
+              useStandupStore.getState().setStandup(msg.standup);
               break;
           }
         } catch {

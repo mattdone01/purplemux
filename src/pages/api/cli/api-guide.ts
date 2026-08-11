@@ -86,6 +86,22 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   orchestration off when the epic is finished — this stops watchdog nudges and idle
   heartbeats for the workspace.
 
+## Standup ticks
+
+POST /api/cli/workspaces/<workspaceId>/standup
+  Body: { "state": "on-track" | "at-risk" | "blocked" | "awaiting-human" | "done",
+          "headline": "<one line: where things stand>",
+          "items"?: [{ "label", "status": "done" | "active" | "blocked" | "todo", "note"? }],
+          "blockers"?: [{ "what", "needs": "<the exact input that clears it>" }],
+          "needsHuman"?: boolean, "next"?: ["<upcoming step>"] }
+  Orchestrators post one after every nudge they handle and on every heartbeat. The
+  latest tick renders in the workspace sidebar — it is how the human reads progress,
+  blockers, and whether they are needed, without opening any pane. "state" and
+  "headline" are required; everything else may be omitted.
+
+GET /api/cli/workspaces/<workspaceId>/standup
+  Response: { "latest": { ... } | null, "history": [...] }
+
 ## Web-browser tabs
 
 These endpoints only work when the tab's panelType is "web-browser" and the webview

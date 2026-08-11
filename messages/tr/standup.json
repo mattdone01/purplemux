@@ -1,0 +1,13 @@
+{
+ "title": "Standup",
+ "needsYou": "size ihtiyaç var",
+ "stale": "bayat",
+ "blockers": "Engeller",
+ "needs": "gerekli",
+ "next": "Sıradaki",
+ "stateOnTrack": "yolunda",
+ "stateAtRisk": "riskli",
+ "stateBlocked": "engellendi",
+ "stateAwaitingHuman": "sizi bekliyor",
+ "stateDone": "tamamlandı"
+}

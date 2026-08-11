@@ -156,6 +156,26 @@ const cmdOrchestration = async (args) => {
   die("usage: orchestration status|on|off -w WS [TAB_ID]");
 };
 
+const cmdStandup = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  if (sub === 'show') {
+    const { body } = await api('GET', `/api/cli/workspaces/${wsId}/standup`);
+    return out(body);
+  }
+  if (sub === 'report') {
+    const raw = flagValue(rest, '--json') || await readStdin();
+    let report;
+    try { report = JSON.parse(raw); } catch { die("standup report must be valid JSON — pass --json '{...}' or pipe JSON on stdin"); }
+    const { body } = await api('POST', `/api/cli/workspaces/${wsId}/standup`, report);
+    return out(body);
+  }
+  die("usage: standup report -w WS --json '{...}' | standup show -w WS");
+};
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -414,6 +434,12 @@ Commands:
   orchestration status -w WS               Orchestration config + recent watchdog nudges for a workspace
   orchestration on -w WS [TAB_ID]          Enable orchestration; TAB_ID omitted = self-designate the calling tab
   orchestration off -w WS                  Disable orchestration (stops watchdog nudges + idle heartbeats)
+  standup report -w WS --json '{...}'      Post a standup tick (or pipe JSON on stdin). Shown in the sidebar so
+                                           the human can read progress at a glance. Shape:
+                                           {"state":"on-track|at-risk|blocked|awaiting-human|done","headline":"...",
+                                            "items":[{"label":"...","status":"done|active|blocked|todo","note":"..."}],
+                                            "blockers":[{"what":"...","needs":"..."}],"needsHuman":false,"next":["..."]}
+  standup show -w WS                       Latest standup + history for a workspace
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -441,6 +467,8 @@ const main = async () => {
       break;
     case 'orchestration':
       return cmdOrchestration(args.slice(1));
+    case 'standup':
+      return cmdStandup(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

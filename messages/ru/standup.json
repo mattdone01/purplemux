@@ -1,0 +1,13 @@
+{
+ "title": "Стендап",
+ "needsYou": "нужны вы",
+ "stale": "устарело",
+ "blockers": "Блокеры",
+ "needs": "нужно",
+ "next": "Далее",
+ "stateOnTrack": "по плану",
+ "stateAtRisk": "под угрозой",
+ "stateBlocked": "заблокировано",
+ "stateAwaitingHuman": "ждёт вас",
+ "stateDone": "готово"
+}

@@ -1,0 +1,13 @@
+{
+ "title": "スタンドアップ",
+ "needsYou": "要対応",
+ "stale": "古い",
+ "blockers": "ブロッカー",
+ "needs": "必要",
+ "next": "次へ",
+ "stateOnTrack": "順調",
+ "stateAtRisk": "リスクあり",
+ "stateBlocked": "ブロック中",
+ "stateAwaitingHuman": "対応待ち",
+ "stateDone": "完了"
+}
