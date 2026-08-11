@@ -5,6 +5,21 @@ const GUIDE = `# purplemux CLI HTTP API
 
 All endpoints require header \`x-pmux-token: <PMUX_TOKEN>\`.
 
+## Workspace scope
+
+Every agent tab launches with a token scoped to ITS OWN workspace (\`PMUX_TOKEN\` in
+the pane environment). Naming a different workspace returns 403 — you cannot list,
+read, drive, or create tabs anywhere but your own workspace, and an unscoped
+\`GET /api/cli/tabs\` returns only tabs you may already act on.
+
+Cross-workspace access is deliberate and rare: the TARGET workspace must name your
+workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
+add one rather than working around a 403.
+
+Each workspace also gets its own agent session store (\`CLAUDE_CONFIG_DIR\`), so
+several workspaces can share one project root without sharing conversation
+history or resume lists.
+
 ## Workspaces
 
 GET /api/cli/workspaces

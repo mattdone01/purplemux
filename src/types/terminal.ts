@@ -93,6 +93,12 @@ export interface IWorkspace {
   directories: string[];
   groupId?: string | null;
   orchestration?: IWorkspaceOrchestration;
+  /**
+   * Workspace ids permitted to reach INTO this one over the CLI API. Empty or
+   * absent means no cross-workspace access, which is the default: an agent's
+   * token is confined to the workspace whose tab it runs in.
+   */
+  allowedPeers?: string[];
 }
 
 export interface IWorkspaceGroup {

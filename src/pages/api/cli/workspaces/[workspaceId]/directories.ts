@@ -1,11 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { verifyCliToken } from '@/lib/cli-token';
+import { authorizeWorkspace } from '@/lib/cli-utils';
 import { getWorkspaceById } from '@/lib/workspace-store';
 import { applyDirectoriesPatch } from '@/lib/workspace-patch';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!verifyCliToken(req)) return res.status(403).json({ error: 'Forbidden' });
   const workspaceId = req.query.workspaceId as string;
+  if (!(await authorizeWorkspace(req, res, workspaceId))) return;
 
   if (req.method === 'GET') {
     const ws = await getWorkspaceById(workspaceId);

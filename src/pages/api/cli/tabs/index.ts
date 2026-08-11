@@ -1,9 +1,9 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { verifyCliToken } from '@/lib/cli-token';
 import { getLayout, addTabToPane, isAgentPanelType } from '@/lib/layout-store';
 import { collectPanes } from '@/lib/layout-tree';
 import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
-import { resolveFirstPaneId } from '@/lib/cli-utils';
+import { authorizeWorkspace, canAccessWorkspace, resolveFirstPaneId } from '@/lib/cli-utils';
+import { resolveCliScope } from '@/lib/workspace-token';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { buildClaudeFlags, isValidModelName } from '@/lib/claude-command';
@@ -17,12 +17,14 @@ const log = createLogger('api:cli:tabs');
 const VALID_PANEL_TYPES: TPanelType[] = ['terminal', 'claude-code', 'codex-cli', 'agent-sessions', 'web-browser', 'diff'];
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!verifyCliToken(req)) {
+  const cliScope = resolveCliScope(req);
+  if (!cliScope) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
   if (req.method === 'GET') {
     const wsId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : undefined;
+    if (wsId && !(await authorizeWorkspace(req, res, wsId))) return;
     const tabs: Array<{
       tabId: string;
       workspaceId: string;
@@ -33,7 +35,15 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentSessionId: string | null;
     }> = [];
 
-    const workspaceIds = wsId ? [wsId] : (await getWorkspaces()).workspaces.map((w) => w.id);
+    // An unscoped list must not become a directory of every other epic's
+    // workers: a workspace-scoped caller sees only what it may already act on.
+    const allWorkspaceIds = (await getWorkspaces()).workspaces.map((w) => w.id);
+    const visibleIds = wsId
+      ? [wsId]
+      : (await Promise.all(
+          allWorkspaceIds.map(async (id) => ((await canAccessWorkspace(cliScope, id)) ? id : null)),
+        )).filter((id): id is string => id !== null);
+    const workspaceIds = visibleIds;
 
     for (const id of workspaceIds) {
       const ws = await getWorkspaceById(id);
@@ -70,6 +80,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
     }
+    if (!(await authorizeWorkspace(req, res, workspaceId))) return;
     if (scope !== undefined && (!Array.isArray(scope) || scope.some((s) => typeof s !== 'string'))) {
       return res.status(400).json({ error: 'scope must be an array of path globs' });
     }
