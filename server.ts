@@ -19,6 +19,7 @@ import { getCliToken } from './src/lib/cli-token';
 import { acquireLock, releaseLock, registerLockCleanup } from './src/lib/lock';
 import { scanSessions, applyConfig } from './src/lib/tmux';
 import { initWorkspaceStore, getWorkspaces, writeAllWorkspacePrompts } from './src/lib/workspace-store';
+import { startCredentialForkSync } from './src/lib/workspace-home';
 import { autoResumeOnStartup } from './src/lib/auto-resume';
 import { initAuthCredentials } from './src/lib/auth-credentials';
 import { initConfigStore, getConfig } from './src/lib/config-store';
@@ -368,6 +369,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await scanSessions();
   await applyConfig();
   await initWorkspaceStore();
+  startCredentialForkSync();
   await autoResumeOnStartup();
   await getStatusManager().init();
 
