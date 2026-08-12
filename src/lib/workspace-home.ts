@@ -77,6 +77,11 @@ const SHARED_ENTRIES = [
 // Real directories, private to the workspace — the isolation itself.
 const PRIVATE_DIRS = ['projects', 'sessions'];
 
+// Login and onboarding state live at the TOP level of ~/.claude.json, not in
+// .credentials.json — without these a fresh CLAUDE_CONFIG_DIR greets every new
+// workspace with the login/onboarding flow despite valid shared credentials.
+const INHERITED_ROOT_KEYS = ['oauthAccount', 'hasCompletedOnboarding', 'lastOnboardingVersion'];
+
 // Decisions worth inheriting from the user's real config. Telemetry (lastCost,
 // history, lastAPIDuration) is deliberately left behind.
 const INHERITED_PROJECT_KEYS = [
@@ -120,6 +125,13 @@ const seedProjectDecisions = async (home: string, directories: string[]): Promis
   const projects = (current.projects ?? {}) as Record<string, Record<string, unknown>>;
 
   let changed = false;
+  const root: Record<string, unknown> = {};
+  for (const key of INHERITED_ROOT_KEYS) {
+    if (current[key] === undefined && source[key] !== undefined) {
+      root[key] = source[key];
+      changed = true;
+    }
+  }
   for (const dir of directories) {
     if (projects[dir]) continue;
     const inherited = sourceProjects[dir] ?? sourceProjects[path.resolve(dir)];
@@ -134,7 +146,7 @@ const seedProjectDecisions = async (home: string, directories: string[]): Promis
   }
 
   if (!changed && Object.keys(current).length > 0) return;
-  await writeJsonAtomic(target, { ...current, projects });
+  await writeJsonAtomic(target, { ...current, ...root, projects });
 };
 
 const workspaceDirectories = async (wsId: string): Promise<string[]> => {
