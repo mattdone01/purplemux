@@ -3,12 +3,12 @@ import path from 'path';
 import os from 'os';
 import { existsSync } from 'fs';
 import { createLogger } from '@/lib/logger';
+import { listClaudeProjectsDirs } from '@/lib/workspace-home';
 import type { ISessionStats } from '@/types/timeline';
 
 const log = createLogger('session-stats');
 
 const SESSION_STATS_DIR = path.join(os.homedir(), '.purplemux', 'session-stats');
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -77,17 +77,19 @@ const listStatsSessionIds = async (): Promise<string[]> => {
 const listJsonlSessionIds = async (): Promise<Set<string>> => {
   const ids = new Set<string>();
   try {
-    const projectDirs = await fs.readdir(PROJECTS_DIR);
-    for (const dir of projectDirs) {
-      const projectPath = path.join(PROJECTS_DIR, dir);
-      const stat = await fs.stat(projectPath).catch(() => null);
-      if (!stat?.isDirectory()) continue;
+    for (const projectsRoot of await listClaudeProjectsDirs()) {
+      const projectDirs = await fs.readdir(projectsRoot).catch(() => [] as string[]);
+      for (const dir of projectDirs) {
+        const projectPath = path.join(projectsRoot, dir);
+        const stat = await fs.stat(projectPath).catch(() => null);
+        if (!stat?.isDirectory()) continue;
 
-      const files = await fs.readdir(projectPath).catch(() => []);
-      for (const file of files) {
-        if (!file.endsWith('.jsonl')) continue;
-        const id = file.slice(0, -6);
-        if (isValidSessionId(id)) ids.add(id);
+        const files = await fs.readdir(projectPath).catch(() => []);
+        for (const file of files) {
+          if (!file.endsWith('.jsonl')) continue;
+          const id = file.slice(0, -6);
+          if (isValidSessionId(id)) ids.add(id);
+        }
       }
     }
   } catch {

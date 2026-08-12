@@ -26,6 +26,20 @@ PORT=$(cat "$PORT_FILE")
 TOKEN=$(cat "$TOKEN_FILE")
 SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""
 
+# Tool activity feeds the signal engine, not the work-state machine. Forward the
+# raw hook JSON so the server parses it — sed cannot survive a command string
+# containing quotes. Detached, because this fires on every mutating tool call
+# and no edit should wait on the round trip.
+if [ "$EVENT" = "post-tool" ]; then
+  BODY=$(cat)
+  [ -n "$BODY" ] || exit 0
+  curl -s -X POST -o /dev/null --max-time 2 \\
+    -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
+    -d "$BODY" \\
+    "http://localhost:\${PORT}/api/status/hook?kind=tool&session=\${SESSION}" >/dev/null 2>&1 &
+  exit 0
+fi
+
 NOTIFICATION_TYPE=""
 if [ "$EVENT" = "notification" ]; then
   NOTIFICATION_TYPE=$(sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
@@ -59,9 +73,9 @@ curl -sS -X POST -o /dev/null \\
 exit 0
 `;
 
-const hookEntry = (event: string, timeout = 3) => [
+const hookEntry = (event: string, timeout = 3, matcher = '') => [
   {
-    matcher: '',
+    matcher,
     hooks: [
       {
         type: 'command',
@@ -72,6 +86,11 @@ const hookEntry = (event: string, timeout = 3) => [
   },
 ];
 
+// Only the tools that can produce a signal. Read/Grep/Glob dominate a session's
+// tool calls and can never put an edit out of scope or fail repeatedly, so
+// matching them would multiply hook invocations for nothing.
+const SIGNAL_TOOLS = 'Edit|Write|MultiEdit|NotebookEdit|Bash';
+
 const buildHookSettings = () => ({
   hooks: {
     SessionStart: hookEntry('session-start'),
@@ -81,6 +100,7 @@ const buildHookSettings = () => ({
     StopFailure: hookEntry('stop'),
     PreCompact: hookEntry('pre-compact'),
     PostCompact: hookEntry('post-compact'),
+    PostToolUse: hookEntry('post-tool', 2, SIGNAL_TOOLS),
   },
   statusLine: {
     type: 'command' as const,

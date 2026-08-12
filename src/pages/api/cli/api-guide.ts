@@ -5,10 +5,39 @@ const GUIDE = `# purplemux CLI HTTP API
 
 All endpoints require header \`x-pmux-token: <PMUX_TOKEN>\`.
 
+## Workspace scope
+
+Every agent tab launches with a token scoped to ITS OWN workspace (\`PMUX_TOKEN\` in
+the pane environment). Naming a different workspace returns 403 — you cannot list,
+read, drive, or create tabs anywhere but your own workspace, and an unscoped
+\`GET /api/cli/tabs\` returns only tabs you may already act on.
+
+Cross-workspace access is deliberate and rare: the TARGET workspace must name your
+workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
+add one rather than working around a 403.
+
+Each workspace also gets its own agent session store (\`CLAUDE_CONFIG_DIR\`), so
+several workspaces can share one project root without sharing conversation
+history or resume lists.
+
 ## Workspaces
 
 GET /api/cli/workspaces
   Response: { "workspaces": [{ "id": "...", "name": "...", "directories": [...] }] }
+
+GET /api/cli/workspaces/<workspaceId>/directories
+  Response: { "workspaceId", "name", "directories": [...] }
+
+PATCH /api/cli/workspaces/<workspaceId>/directories
+  Body: { "directories": ["/abs/path", ...] }   non-empty; replaces the whole list
+  Repoint a workspace at different directories. directories[0] is the PRIMARY: it is
+  the cwd for new tabs and it keys the claude/codex chat store, so it must be unique
+  across workspaces (409 if another workspace already claims it). Later entries are
+  navigation shortcuts and may overlap freely. Paths must be absolute and must exist
+  (400 otherwise) — they are resolved on the server, not against your cwd.
+  Existing tabs keep the cwd their tmux session was created with; only tabs created
+  after the change land in the new primary directory.
+  Response: { "workspaceId", "name", "directories": [...] }
 
 ## Tabs
 
@@ -56,6 +85,22 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   Orchestrators use this to designate themselves (enabled + own tabId) and to turn
   orchestration off when the epic is finished — this stops watchdog nudges and idle
   heartbeats for the workspace.
+
+## Standup ticks
+
+POST /api/cli/workspaces/<workspaceId>/standup
+  Body: { "state": "on-track" | "at-risk" | "blocked" | "awaiting-human" | "done",
+          "headline": "<one line: where things stand>",
+          "items"?: [{ "label", "status": "done" | "active" | "blocked" | "todo", "note"? }],
+          "blockers"?: [{ "what", "needs": "<the exact input that clears it>" }],
+          "needsHuman"?: boolean, "next"?: ["<upcoming step>"] }
+  Orchestrators post one after every nudge they handle and on every heartbeat. The
+  latest tick renders in the workspace sidebar — it is how the human reads progress,
+  blockers, and whether they are needed, without opening any pane. "state" and
+  "headline" are required; everything else may be omitted.
+
+GET /api/cli/workspaces/<workspaceId>/standup
+  Response: { "latest": { ... } | null, "history": [...] }
 
 ## Web-browser tabs
 

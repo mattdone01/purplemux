@@ -1,0 +1,13 @@
+{
+ "title": "站會",
+ "needsYou": "需要你",
+ "stale": "已過期",
+ "blockers": "阻塞項",
+ "needs": "需要",
+ "next": "下一步",
+ "stateOnTrack": "正常推進",
+ "stateAtRisk": "有風險",
+ "stateBlocked": "已阻塞",
+ "stateAwaitingHuman": "等待處理",
+ "stateDone": "已完成"
+}

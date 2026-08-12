@@ -1,0 +1,13 @@
+{
+ "title": "Standup",
+ "needsYou": "precisa de você",
+ "stale": "desatualizado",
+ "blockers": "Bloqueios",
+ "needs": "precisa",
+ "next": "Próximo",
+ "stateOnTrack": "no caminho",
+ "stateAtRisk": "em risco",
+ "stateBlocked": "bloqueado",
+ "stateAwaitingHuman": "aguardando você",
+ "stateDone": "concluído"
+}

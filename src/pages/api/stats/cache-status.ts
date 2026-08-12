@@ -3,23 +3,21 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { countCodexJsonlFiles } from '@/lib/stats/jsonl-parser-codex';
+import { listClaudeProjectsDirs } from '@/lib/workspace-home';
 
 const CACHE_PATH = path.join(os.homedir(), '.purplemux', 'stats', 'cache.json');
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
 const countJsonlFiles = async (): Promise<number> => {
   let count = 0;
-  try {
-    const dirs = await fs.readdir(PROJECTS_DIR);
+  for (const projectsRoot of await listClaudeProjectsDirs()) {
+    const dirs = await fs.readdir(projectsRoot).catch(() => [] as string[]);
     for (const dir of dirs) {
-      const dirPath = path.join(PROJECTS_DIR, dir);
+      const dirPath = path.join(projectsRoot, dir);
       const stat = await fs.stat(dirPath).catch(() => null);
       if (!stat?.isDirectory()) continue;
       const files = await fs.readdir(dirPath).catch(() => []);
       count += files.filter((f) => f.endsWith('.jsonl') && !/^agent-/.test(f)).length;
     }
-  } catch {
-    // ignore
   }
   return count;
 };

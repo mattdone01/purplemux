@@ -83,6 +83,47 @@ const cmdTabList = async (args) => {
   out(body);
 };
 
+const cmdWorkspaceDirs = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const path = `/api/cli/workspaces/${wsId}/directories`;
+  if (sub === 'show') {
+    const { body } = await api('GET', path);
+    return out(body);
+  }
+  if (sub === 'set') {
+    // Resolve here, not server-side: a relative path would otherwise be
+    // resolved against the server's cwd rather than the caller's.
+    const directories = stripFlags(rest, ['--workspace', '-w']).map((d) => require('path').resolve(d));
+    if (!directories.length) die('at least one DIR is required');
+    const { body } = await api('PATCH', path, { directories });
+    return out(body);
+  }
+  die('usage: workspace dirs show|set -w WS [DIR...]');
+};
+
+const cmdWorkspacePeers = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const path = `/api/cli/workspaces/${wsId}/peers`;
+  if (sub === 'show') {
+    const { body } = await api('GET', path);
+    return out(body);
+  }
+  if (sub === 'set') {
+    const allowedPeers = stripFlags(rest, ['--workspace', '-w']);
+    const { body } = await api('PATCH', path, { allowedPeers });
+    return out(body);
+  }
+  die('usage: workspace peers show|set -w WS [PEER_WS_ID...]');
+};
+
 const deriveOwnTabId = () => {
   try {
     const session = require('child_process').execSync("tmux display-message -p '#{session_name}'", { encoding: 'utf8' }).trim();
@@ -115,6 +156,26 @@ const cmdOrchestration = async (args) => {
   die("usage: orchestration status|on|off -w WS [TAB_ID]");
 };
 
+const cmdStandup = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  if (sub === 'show') {
+    const { body } = await api('GET', `/api/cli/workspaces/${wsId}/standup`);
+    return out(body);
+  }
+  if (sub === 'report') {
+    const raw = flagValue(rest, '--json') || await readStdin();
+    let report;
+    try { report = JSON.parse(raw); } catch { die("standup report must be valid JSON — pass --json '{...}' or pipe JSON on stdin"); }
+    const { body } = await api('POST', `/api/cli/workspaces/${wsId}/standup`, report);
+    return out(body);
+  }
+  die("usage: standup report -w WS --json '{...}' | standup show -w WS");
+};
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -123,6 +184,10 @@ const cmdTabCreate = async (args) => {
   const model = flagValue(args, '--model') || flagValue(args, '-m');
   const reasoning = flagValue(args, '--reasoning') || flagValue(args, '-r');
   const noLaunch = args.includes('--no-launch');
+  // Comma-separated path globs the tab is expected to edit. purplemux reports
+  // edits outside them; it never infers the list.
+  const scopeRaw = flagValue(args, '--scope');
+  const scope = scopeRaw ? scopeRaw.split(',').map((s) => s.trim()).filter(Boolean) : null;
   if (!wsId) die('--workspace is required');
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
@@ -131,6 +196,7 @@ const cmdTabCreate = async (args) => {
     ...(model ? { model } : {}),
     ...(reasoning ? { reasoning } : {}),
     ...(noLaunch ? { launch: false } : {}),
+    ...(scope && scope.length ? { scope } : {}),
   });
   out(body);
 };
@@ -148,6 +214,29 @@ const readStdin = () => new Promise((resolve, reject) => {
   process.stdin.on('end', () => resolve(data));
   process.stdin.on('error', reject);
 });
+
+// Same shape as tab send, but interrupts the current turn first so a busy
+// worker reads the correction now instead of after its tangent finishes.
+const cmdTabSteer = async (args) => {
+  requireEnv();
+  const file = flagValue(args, '--file') || flagValue(args, '-f');
+  const noInterrupt = args.includes('--no-interrupt');
+  const rest = stripFlags(args, ['--workspace', '-w', '--file', '-f', '--no-interrupt']);
+  const tabId = rest[0];
+  let content = rest.slice(1).join(' ');
+  if (!tabId) die('tab ID is required');
+  if (file) {
+    content = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
+  }
+  if (!content) die('content is required (args, -f FILE, or -f - for stdin)');
+  const wsId = resolveWsForTab(args);
+  const { body } = await api(
+    'POST',
+    `/api/cli/tabs/${tabId}/steer?workspaceId=${encodeURIComponent(wsId)}`,
+    { content, ...(noInterrupt ? { interrupt: false } : {}) },
+  );
+  out(body);
+};
 
 const cmdTabSend = async (args) => {
   requireEnv();
@@ -313,10 +402,22 @@ Usage: purplemux <command> [args...]
 
 Commands:
   workspaces                               List workspaces
-  tab list [-w WS]                         List tabs (optionally scoped to workspace)
-  tab create -w WS [-n NAME] [-t TYPE]     Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+  workspace dirs show -w WS                Show a workspace's directories
+  workspace dirs set -w WS DIR [DIR...]    Repoint a workspace. The first DIR is the primary: it is the cwd for
+                                           new tabs and keys the agent chat store, and must be unique across
+                                           workspaces. Later DIRs are navigation shortcuts and may overlap.
+                                           Paths are resolved against your cwd; existing tabs keep their old cwd
+  workspace peers show -w WS               Show which workspaces may reach into WS
+  workspace peers set -w WS [PEER...]      Replace that list (global token only — an agent cannot
+                                           widen its own scope). Grants are one-directional; pass
+                                           no PEER to revoke all
+  tab list [-w WS]                         List tabs (only those your token may act on)
+  tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
+                                           Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+                                           --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
              [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior
+  tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter)
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status
@@ -333,6 +434,12 @@ Commands:
   orchestration status -w WS               Orchestration config + recent watchdog nudges for a workspace
   orchestration on -w WS [TAB_ID]          Enable orchestration; TAB_ID omitted = self-designate the calling tab
   orchestration off -w WS                  Disable orchestration (stops watchdog nudges + idle heartbeats)
+  standup report -w WS --json '{...}'      Post a standup tick (or pipe JSON on stdin). Shown in the sidebar so
+                                           the human can read progress at a glance. Shape:
+                                           {"state":"on-track|at-risk|blocked|awaiting-human|done","headline":"...",
+                                            "items":[{"label":"...","status":"done|active|blocked|todo","note":"..."}],
+                                            "blockers":[{"what":"...","needs":"..."}],"needsHuman":false,"next":["..."]}
+  standup show -w WS                       Latest standup + history for a workspace
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -351,13 +458,23 @@ const main = async () => {
   switch (cmd) {
     case 'workspaces':
       return cmdWorkspaces();
+    case 'workspace':
+      switch (sub) {
+        case 'dirs': return cmdWorkspaceDirs(rest);
+        case 'peers': return cmdWorkspacePeers(rest);
+        default: die(`unknown workspace command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
+      }
+      break;
     case 'orchestration':
       return cmdOrchestration(args.slice(1));
+    case 'standup':
+      return cmdStandup(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);
         case 'create': return cmdTabCreate(rest);
         case 'send': return cmdTabSend(rest);
+        case 'steer': return cmdTabSteer(rest);
         case 'status': return cmdTabStatus(rest);
         case 'result': return cmdTabResult(rest);
         case 'close': return cmdTabClose(rest);

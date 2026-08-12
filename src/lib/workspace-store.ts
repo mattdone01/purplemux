@@ -18,6 +18,8 @@ import {
 import type { ICreateLayoutOptions } from '@/lib/layout-store';
 import { listProviders } from '@/lib/providers/registry';
 import { getVisuallyOrderedWorkspaces } from '@/lib/workspace-order';
+import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
+import { revokeWorkspaceToken } from '@/lib/workspace-token';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
 
 const log = createLogger('workspace');
@@ -302,12 +304,12 @@ export const getWorkspaceById = async (wsId: string): Promise<IWorkspace | undef
   return data?.workspaces.find((w) => w.id === wsId);
 };
 
-// Chat/session stores (claude, codex) are keyed by DIRECTORY, not workspace —
-// two workspaces sharing a directory share conversation history and resume
-// lists. Enforce one-directory-one-workspace so contexts can never cross.
-// Only the PRIMARY directory (directories[0]) keys chat context: it is the cwd
-// for new tabs and thus the claude/codex conversation store. Secondary entries
-// are navigation shortcuts (often a shared repo root) and may overlap freely.
+// Claude keys its session store by cwd, which used to mean two workspaces in one
+// directory shared conversation history and resume lists — so this file enforced
+// one-directory-one-workspace, and every concurrent epic needed its own worktree.
+// Each workspace now launches with its own CLAUDE_CONFIG_DIR (see
+// lib/workspace-home.ts), so session identity no longer follows location and
+// several workspaces can share a project root. Kept only to report the overlap.
 const findPrimaryDirOwner = (data: IWorkspacesData, dir: string, excludeWsId?: string): IWorkspace | undefined => {
   const norm = path.resolve(dir);
   return data.workspaces.find((w) => w.id !== excludeWsId && w.directories[0] && path.resolve(w.directories[0]) === norm);
@@ -330,7 +332,7 @@ export const createWorkspace = async (directory: string, name?: string, layoutOp
 
     const owner = findPrimaryDirOwner(data, directory);
     if (owner) {
-      log.warn(`workspace isolation: ${directory} is also workspace "${owner.name}"'s primary directory — these workspaces will SHARE agent chat history. Repoint one to a dedicated worktree for full isolation.`);
+      log.info(`${directory} is also workspace "${owner.name}"'s primary directory; sessions stay separate via per-workspace CLAUDE_CONFIG_DIR`);
     }
 
     const wsId = `ws-${nanoid(6)}`;
@@ -374,6 +376,8 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
     data.workspaces.splice(idx, 1);
 
     await writeWorkspacesFile(data);
+    await removeWorkspaceClaudeHome(workspaceId).catch(() => {});
+    revokeWorkspaceToken(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;
   });
@@ -416,7 +420,7 @@ export const updateWorkspaceDirectories = async (workspaceId: string, directorie
     if (directories[0]) {
       const owner = findPrimaryDirOwner(data, directories[0], workspaceId);
       if (owner) {
-        throw new Error(`Directory ${directories[0]} is already workspace "${owner.name}"'s primary directory — primary directories must be unique`);
+        log.info(`${directories[0]} is also workspace "${owner.name}"'s primary directory; sessions stay separate via per-workspace CLAUDE_CONFIG_DIR`);
       }
     }
     const current = JSON.stringify(ws.directories);
@@ -425,6 +429,26 @@ export const updateWorkspaceDirectories = async (workspaceId: string, directorie
     await writeWorkspacesFile(data);
     await writeWorkspacePrompts(ws);
     return true;
+  });
+
+/**
+ * Replace the set of workspaces allowed to reach into this one. Admin-only at the
+ * API layer: a workspace-scoped agent must never be able to widen its own reach.
+ */
+export const updateWorkspaceAllowedPeers = async (
+  workspaceId: string,
+  peers: string[],
+): Promise<IWorkspace | null> =>
+  withLock(async () => {
+    const data = await readWorkspacesFile();
+    if (!data) return null;
+    const ws = data.workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return null;
+    const known = new Set(data.workspaces.map((w) => w.id));
+    ws.allowedPeers = [...new Set(peers)].filter((id) => id !== workspaceId && known.has(id));
+    await writeWorkspacesFile(data);
+    log.info(`${workspaceId} allowedPeers = [${ws.allowedPeers.join(', ')}]`);
+    return { ...ws };
   });
 
 export const updateWorkspaceOrchestration = async (

@@ -31,6 +31,8 @@ purplemux tab send -w ${ws.id} TAB_ID CONTENT...      # send input to a tab
 purplemux tab status -w ${ws.id} TAB_ID               # tab status
 purplemux tab result -w ${ws.id} TAB_ID               # capture current pane content
 purplemux tab close -w ${ws.id} TAB_ID                # close a tab
+purplemux standup report -w ${ws.id} --json '{...}'   # post a standup tick — the human-readable progress digest
+purplemux standup show -w ${ws.id}                    # latest standup + history
 \`\`\`
 
 For the full HTTP API reference (including endpoint paths and payloads),

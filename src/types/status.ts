@@ -58,6 +58,7 @@ export type IClientTabStatusEntry = Omit<ITabStatusEntry, 'tmuxSession' | 'jsonl
 export interface IStatusSyncMessage {
   type: 'status:sync';
   tabs: Record<string, IClientTabStatusEntry>;
+  standups?: Record<string, IWorkspaceStandup>;
 }
 
 export interface IStatusUpdateMessage {
@@ -126,7 +127,38 @@ export interface IStatusHookEventMessage {
   event: ILastEvent;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat';
+export type TStandupState = 'on-track' | 'at-risk' | 'blocked' | 'awaiting-human' | 'done';
+
+export type TStandupItemStatus = 'done' | 'active' | 'blocked' | 'todo';
+
+export interface IStandupItem {
+  label: string;
+  status: TStandupItemStatus;
+  note?: string;
+}
+
+export interface IStandupBlocker {
+  what: string;
+  needs: string;
+}
+
+export interface IWorkspaceStandup {
+  workspaceId: string;
+  at: number;
+  state: TStandupState;
+  headline: string;
+  items: IStandupItem[];
+  blockers: IStandupBlocker[];
+  needsHuman: boolean;
+  next: string[];
+}
+
+export interface IStandupUpdateMessage {
+  type: 'standup:update';
+  standup: IWorkspaceStandup;
+}
+
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash';
 
 export interface IOrchestrationNudge {
   id: string;
@@ -144,7 +176,7 @@ export interface IOrchestrationNudgeMessage {
   nudge: IOrchestrationNudge;
 }
 
-export type TStatusServerMessage = IStatusSyncMessage | IStatusUpdateMessage | IRateLimitsUpdateMessage | ISessionHistorySyncMessage | ISessionHistoryUpdateMessage | IStatusHookEventMessage | IOrchestrationNudgeMessage;
+export type TStatusServerMessage = IStatusSyncMessage | IStatusUpdateMessage | IRateLimitsUpdateMessage | ISessionHistorySyncMessage | ISessionHistoryUpdateMessage | IStatusHookEventMessage | IOrchestrationNudgeMessage | IStandupUpdateMessage;
 
 export interface IStatusTabDismissedMessage {
   type: 'status:tab-dismissed';

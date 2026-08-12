@@ -4,7 +4,7 @@ export const MESSAGE_NAMESPACES = [
   'reset', 'reports', 'timeline',
   'notification', 'session', 'messageHistory', 'webBrowser',
   'mobile', 'toolsRequired', 'diff', 'shortcuts',
-  'orchestration',
+  'orchestration', 'standup',
 ] as const;
 
 export type TMessageNamespace = (typeof MESSAGE_NAMESPACES)[number];

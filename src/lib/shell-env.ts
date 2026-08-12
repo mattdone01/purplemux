@@ -58,8 +58,8 @@ export const defaultShell = (): string =>
 // 셸이 실제 터미널과 동일하게 rebuild하도록 한다. 새 펜 생성 경로를 추가할 때도 반드시 이
 // 함수를 거쳐야 한다 — split-window 등을 env -i 없이 직접 호출하면 서버 env(resolved PATH)를
 // 상속해 순서 문제가 재발한다.
-export const buildShellLaunchCommand = (): string => {
-  const env = { ...collectShellEnv(), PATH: LOGIN_SHELL_BASE_PATH };
+export const buildShellLaunchCommand = (extraEnv: Record<string, string> = {}): string => {
+  const env = { ...collectShellEnv(), PATH: LOGIN_SHELL_BASE_PATH, ...extraEnv };
   const envArgs = Object.entries(env)
     .map(([k, v]) => `${k}=${shQuote(v)}`)
     .join(' ');
