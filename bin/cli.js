@@ -17,8 +17,40 @@ const readFileOrNull = (file) => {
 };
 
 const PORT = process.env.PMUX_PORT || readFileOrNull(path.join(os.homedir(), '.purplemux', 'port'));
-const TOKEN = process.env.PMUX_TOKEN || readFileOrNull(path.join(os.homedir(), '.purplemux', 'cli-token'));
+const ENV_TOKEN = process.env.PMUX_TOKEN || null;
+const ADMIN_TOKEN = readFileOrNull(path.join(os.homedir(), '.purplemux', 'cli-token'));
 const BASE = `http://localhost:${PORT}`;
+
+/**
+ * The token to present for a request against `requestPath`.
+ *
+ * `send` and `steer` accept ONLY a token scoped to the target workspace, so
+ * that a tab cannot type into another epic's worker. That rule would also
+ * catch a human shell, which holds the global token and belongs to no
+ * workspace — so when nothing scoped us, resolve the token of the workspace
+ * the command already named in `-w` and present that.
+ *
+ * The order is the whole point. `PMUX_TOKEN` wins whenever it is set, which is
+ * exactly the case of a command running INSIDE a tab: it stays confined to its
+ * own workspace and never picks up a neighbour's token from disk. The lookup
+ * below is reached only by a caller that was never scoped to begin with.
+ */
+const workspaceTokenFor = (workspaceId) => {
+  if (!workspaceId) return null;
+  try {
+    const file = path.join(os.homedir(), '.purplemux', 'workspace-tokens.json');
+    return JSON.parse(fs.readFileSync(file, 'utf-8'))[workspaceId] || null;
+  } catch {
+    return null;
+  }
+};
+
+const tokenFor = (requestPath) => {
+  if (ENV_TOKEN) return ENV_TOKEN;
+  const match = /[?&]workspaceId=([^&]+)/.exec(requestPath || '');
+  const workspaceId = match ? decodeURIComponent(match[1]) : null;
+  return workspaceTokenFor(workspaceId) || ADMIN_TOKEN;
+};
 
 const die = (msg) => {
   process.stderr.write(`error: ${msg}\n`);
@@ -27,7 +59,7 @@ const die = (msg) => {
 
 const requireEnv = () => {
   if (!PORT) die('PMUX_PORT not set and ~/.purplemux/port missing (is the server running?)');
-  if (!TOKEN) die('PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
+  if (!ENV_TOKEN && !ADMIN_TOKEN) die('PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
 };
 
 const out = (body) => {
@@ -38,7 +70,7 @@ const api = async (method, path, data) => {
   const url = `${BASE}${path}`;
   const opts = {
     method,
-    headers: { 'X-Pmux-Token': TOKEN, 'Content-Type': 'application/json' },
+    headers: { 'X-Pmux-Token': tokenFor(path), 'Content-Type': 'application/json' },
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
   const resp = await fetch(url, opts);
@@ -56,7 +88,7 @@ const apiRaw = async (method, path) => {
   const url = `${BASE}${path}`;
   const resp = await fetch(url, {
     method,
-    headers: { 'X-Pmux-Token': TOKEN },
+    headers: { 'X-Pmux-Token': tokenFor(path) },
   });
   if (!resp.ok) {
     const ct = resp.headers.get('content-type') || '';
@@ -369,7 +401,7 @@ const cmdTabBrowser = async (args) => {
 const cmdApiGuide = async () => {
   requireEnv();
   const resp = await fetch(`${BASE}/api/cli/api-guide`, {
-    headers: { 'X-Pmux-Token': TOKEN },
+    headers: { 'X-Pmux-Token': tokenFor(path) },
   });
   if (!resp.ok) die(`HTTP ${resp.status}`);
   process.stdout.write((await resp.text()) + '\n');

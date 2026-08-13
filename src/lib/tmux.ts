@@ -501,6 +501,42 @@ export const killServer = async (): Promise<void> => {
   }
 };
 
+/**
+ * Whether `content` is still sitting UNSUBMITTED in the composer of
+ * `sessionName`, best-effort.
+ *
+ * `sendBracketedPaste` pastes and then presses Enter, but an agent TUI that is
+ * mid-turn can swallow that Enter: the text stays in the composer and the send
+ * reports success. What the operator sees later is a line they did not type
+ * waiting in a worker's input box — and the next Enter from ANY source submits
+ * it. That is how a stray `commit this` reaches a worker that was told never to
+ * run git.
+ *
+ * Detection is deliberately narrow. It looks only at the bottom of the pane,
+ * and only at lines carrying a composer marker (`>`, `❯`, or the box rule a
+ * TUI draws around its input), so a copy of the message echoed into the
+ * transcript above does not read as pending. It answers false when it cannot
+ * tell — a capture failure is not evidence of a stranded paste.
+ */
+export const isPaneShowingPendingContent = (pane: string, content: string): boolean => {
+  // The first line is what a multi-line paste leaves visible on the prompt row.
+  const needle = content.trim().split('\n')[0].trim().slice(0, 40);
+  if (needle.length < 3) return false;
+  return pane
+    .split('\n')
+    .slice(-8)
+    .some((line) => /[>❯│|]/.test(line) && line.includes(needle));
+};
+
+export const isContentPendingInComposer = async (
+  sessionName: string,
+  content: string,
+): Promise<boolean> => {
+  const pane = await capturePaneContent(sessionName);
+  if (!pane) return false;
+  return isPaneShowingPendingContent(pane, content);
+};
+
 export const capturePaneContent = async (sessionName: string): Promise<string | null> => {
   try {
     const { stdout } = await execFile(

@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { authorizeWorkspace, findTab } from '@/lib/cli-utils';
-import { sendBracketedPaste, hasSession } from '@/lib/tmux';
+import { authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
+import { sendBracketedPaste, hasSession, isContentPendingInComposer } from '@/lib/tmux';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'POST') {
@@ -13,7 +13,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!workspaceId) {
     return res.status(400).json({ error: 'workspaceId is required' });
   }
-  if (!(await authorizeWorkspace(req, res, workspaceId))) return;
+  if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
 
   const { content } = req.body as { content?: string };
   if (!content) {
@@ -27,7 +27,14 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!alive) return res.status(409).json({ error: 'Tab session is not running' });
 
   await sendBracketedPaste(found.tab.sessionName, content);
-  return res.status(200).json({ status: 'sent' });
+
+  // Report delivery, not just dispatch. A paste that lands while the agent is
+  // mid-turn can have its Enter swallowed and sit in the composer until
+  // somebody else's keystroke submits it, so a caller that reads only
+  // `status` cannot tell a queued message from a stranded one. `pending` is
+  // best-effort and never fatal: the send DID happen either way.
+  const pending = await isContentPendingInComposer(found.tab.sessionName, content).catch(() => false);
+  return res.status(200).json({ status: 'sent', submitted: !pending });
 };
 
 export default handler;

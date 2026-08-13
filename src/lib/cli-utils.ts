@@ -26,6 +26,31 @@ export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string):
 };
 
 /**
+ * Whether `scope` may INJECT INPUT into a tab of `workspaceId`. A strictly
+ * narrower question than {@link canAccessWorkspace}, which governs reads.
+ *
+ * Driving a tab means typing into somebody else's agent, so it is confined to
+ * the workspace the caller itself lives in. Two crossings that reads allow are
+ * refused here on purpose:
+ *
+ * - **The global token gets no bypass.** It is a file every process running as
+ *   this user can read, so `admin` is not evidence of belonging to a workspace.
+ *   Under it one epic's orchestrator can type into another epic's worker, and
+ *   with several epics running at once that is indistinguishable from the
+ *   worker's own operator talking to it.
+ * - **`allowedPeers` does not carry.** A peer grant exists so a neighbouring
+ *   workspace can READ. It has never meant "may take the keyboard", and
+ *   silently widening it to input would make the grant far more dangerous than
+ *   the thing it was added for.
+ *
+ * A human shell keeps working because `bin/cli.js` resolves the token for the
+ * `-w` workspace before falling back to the global one; a tab keeps its own
+ * `PMUX_TOKEN` and therefore stays confined.
+ */
+export const canDriveWorkspace = (scope: TCliScope, workspaceId: string): boolean =>
+  scope.type === 'workspace' && scope.workspaceId === workspaceId;
+
+/**
  * Resolve the caller and confirm it may act on `workspaceId`, writing the
  * response and returning null when it may not. A denial is a 403 naming the
  * caller's own workspace — a confused orchestrator should learn it reached out
@@ -46,6 +71,37 @@ export const authorizeWorkspace = async (
       error: `Workspace ${workspaceId} is out of scope for this tab (scoped to ${
         scope.type === 'workspace' ? scope.workspaceId : 'admin'
       }). Ask the human to add it to that workspace's allowedPeers if cross-workspace access is intended.`,
+    });
+    return null;
+  }
+  return scope;
+};
+
+/**
+ * The {@link authorizeWorkspace} counterpart for the input-injecting routes
+ * (`send`, `steer`). Same resolve-then-check shape, the stricter predicate.
+ *
+ * The denial names the fix rather than the rule, because the caller that trips
+ * this is usually a human shell holding the global token, one export away from
+ * being correct.
+ */
+export const authorizeWorkspaceInput = async (
+  req: NextApiRequest,
+  res: NextApiResponse,
+  workspaceId: string,
+): Promise<TCliScope | null> => {
+  const scope = resolveCliScope(req);
+  if (!scope) {
+    res.status(403).json({ error: 'Forbidden' });
+    return null;
+  }
+  if (!canDriveWorkspace(scope, workspaceId)) {
+    res.status(403).json({
+      error:
+        `Sending input to a tab in ${workspaceId} requires that workspace's own token (caller is ${
+          scope.type === 'workspace' ? `scoped to ${scope.workspaceId}` : 'using the global token'
+        }). Reads are unaffected. Set PMUX_TOKEN to the ${workspaceId} token to drive its tabs; ` +
+        'allowedPeers deliberately does not grant input.',
     });
     return null;
   }
