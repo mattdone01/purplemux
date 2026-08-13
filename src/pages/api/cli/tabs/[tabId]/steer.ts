@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { authorizeWorkspace, findTab } from '@/lib/cli-utils';
+import { authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
 import { steerSession } from '@/lib/agent-steer';
 
 /**
@@ -17,7 +17,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!workspaceId) {
     return res.status(400).json({ error: 'workspaceId is required' });
   }
-  if (!(await authorizeWorkspace(req, res, workspaceId))) return;
+  if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
 
   const { content, interrupt } = req.body as { content?: string; interrupt?: boolean };
   if (!content) {

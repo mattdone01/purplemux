@@ -58,9 +58,78 @@ export const listWorkspaceClaudeHomes = async (): Promise<string[]> => {
   return homes.filter((h): h is string => h !== null);
 };
 
+const CREDENTIALS_FILE = '.credentials.json';
+const GLOBAL_CREDENTIALS = path.join(CLAUDE_HOME, CREDENTIALS_FILE);
+const CREDENTIAL_SYNC_INTERVAL_MS = 30_000;
+
+/**
+ * Claude refreshes OAuth tokens by writing .credentials.json atomically
+ * (tmp + rename), and the rename replaces the shared symlink with a private
+ * regular file — a fork. From that moment the workspace's refreshes stop
+ * reaching ~/.claude, and with refresh-token rotation every other session is
+ * eventually left holding an invalidated lineage ("OAuth session expired and
+ * could not be refreshed"). Promote a fork's tokens back to the shared store
+ * when they are newer, then restore the symlink so every home reads — and the
+ * next refresh anywhere advances — a single lineage again.
+ */
+export const promoteCredentialFork = async (home: string): Promise<void> => {
+  const link = path.join(home, CREDENTIALS_FILE);
+  let st;
+  try {
+    st = await fs.lstat(link);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink()) return;
+
+  let raw: string | null = null;
+  try {
+    raw = await fs.readFile(link, 'utf-8');
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { refreshToken?: unknown } };
+    if (!parsed.claudeAiOauth?.refreshToken) raw = null;
+  } catch {
+    raw = null;
+  }
+
+  const globalSt = await fs.stat(GLOBAL_CREDENTIALS).catch(() => null);
+  if (raw !== null && (!globalSt || st.mtimeMs > globalSt.mtimeMs)) {
+    const tmp = GLOBAL_CREDENTIALS + '.tmp';
+    await fs.writeFile(tmp, raw, { mode: 0o600 });
+    await fs.rename(tmp, GLOBAL_CREDENTIALS);
+    log.info(`promoted refreshed credentials from ${path.basename(path.dirname(home))}`);
+  } else if (!globalSt) {
+    // Nothing shareable to link against; leave the fork alone.
+    return;
+  }
+
+  await fs.rm(link, { force: true });
+  await fs.symlink(GLOBAL_CREDENTIALS, link);
+};
+
+const syncCredentialForks = async (): Promise<void> => {
+  for (const home of await listWorkspaceClaudeHomes()) {
+    await promoteCredentialFork(home).catch((err) => {
+      log.warn(`credential fork sync failed for ${home}: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+};
+
+const g = globalThis as unknown as { __ptCredentialSyncTimer?: ReturnType<typeof setInterval> };
+
+// A fork can sit unnoticed between tab launches while every other session's
+// lineage goes stale, so launch-time promotion alone is not enough — sweep
+// continuously. 30s bounds the fork's lifetime well inside OAuth expiry.
+export const startCredentialForkSync = (): void => {
+  if (g.__ptCredentialSyncTimer) return;
+  g.__ptCredentialSyncTimer = setInterval(() => void syncCredentialForks(), CREDENTIAL_SYNC_INTERVAL_MS);
+  void syncCredentialForks();
+};
+
 // Symlinked back to the real ~/.claude: credentials, settings, and the command
 // surface must stay common to every workspace. Recreated on each launch so a
-// process that replaced a link with a regular file cannot silently fork them.
+// process that replaced a link with a regular file cannot silently fork them —
+// for .credentials.json only after promoteCredentialFork has rescued whatever
+// the fork holds.
 const SHARED_ENTRIES = [
   '.credentials.json',
   'settings.json',
@@ -164,6 +233,12 @@ export const ensureWorkspaceClaudeHome = async (wsId: string): Promise<string> =
   const home = workspaceHomeDir(wsId);
   await fs.mkdir(home, { recursive: true });
   await Promise.all(PRIVATE_DIRS.map((d) => fs.mkdir(path.join(home, d), { recursive: true })));
+
+  // Must run before the SHARED_ENTRIES loop below, which would otherwise
+  // clobber a forked-but-fresher credentials file with a link to stale tokens.
+  await promoteCredentialFork(home).catch((err) => {
+    log.warn(`credential fork rescue failed for ${wsId}: ${err instanceof Error ? err.message : err}`);
+  });
 
   await Promise.all(
     SHARED_ENTRIES.map(async (entry) => {
