@@ -69,7 +69,21 @@ export interface IStatsCache {
 
 // --- API Responses ---
 
+/** Per-vendor usage rollup. The three buckets sum to the response's headline scalars. */
+export interface IProviderUsage {
+  totalCost: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  sessions: number;
+  messages: number;
+}
+
+export type TByProvider = Record<TStatsProvider, IProviderUsage>;
+
 export interface IOverviewResponse {
+  byProvider: TByProvider;
   totalSessions: number;
   totalMessages: number;
   previousSessions: number;

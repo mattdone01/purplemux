@@ -14,6 +14,7 @@ import type {
 } from '@/types/stats';
 import { isDateStringWithinPeriod } from './period-filter';
 import { calculateCostByFullId } from '@/lib/claude-tokens';
+import { addProviderUsage, createEmptyByProvider, sumProviderModelTokens } from './provider-usage';
 
 const STATS_CACHE_PATH = path.join(os.homedir(), '.claude', 'stats-cache.json');
 
@@ -272,7 +273,15 @@ export const buildOverview = (cache: IStatsCache, period: TPeriod): IOverviewRes
     getPreviousPeriodTokens(cache.dailyModelTokens, period),
   );
 
+  const byProvider = addProviderUsage(createEmptyByProvider(), 'claude', {
+    ...sumProviderModelTokens(modelTokens, 'claude'),
+    totalCost,
+    sessions: totalSessions,
+    messages: totalMessages,
+  });
+
   return {
+    byProvider,
     totalSessions,
     totalMessages,
     previousSessions,
