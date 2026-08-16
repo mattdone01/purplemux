@@ -1,0 +1,12 @@
+  Small/Large. Do not explain, do not do anything else first — just call the
+  tool.
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Colour  ☒ Size  ✔ Submit  →
+Review your answers
+ ● Which colour?
+   → Green
+ ● Which size?
+   → Small
+Ready to submit your answers?
+❯ 1. Submit answers
+  2. Cancel

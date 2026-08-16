@@ -1,0 +1,12 @@
+  multiSelect TRUE. Just call the tool.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Configuratn  ☐ Environmnts  ☐ Deploymentz  ☐ Monitoringx  ✔ Submit  →
+Config?
+❯ 1. A
+     Option A for configuration.
+  2. B
+     Option B for configuration.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
