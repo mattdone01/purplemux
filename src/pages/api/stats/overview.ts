@@ -6,6 +6,7 @@ import { parseCodexHistory, parseCodexJsonl, parseCodexSessions } from '@/lib/st
 import { readGrokUsage, type IGrokUsageSummary } from '@/lib/stats/grok-usage';
 import { parsePeriod } from '@/lib/stats/period-filter';
 import { getCached, setCached } from '@/lib/stats/cache';
+import { addProviderUsage, sumProviderModelTokens } from '@/lib/stats/provider-usage';
 import type { IOverviewResponse, IStatsCacheDailyActivity, TPeriod } from '@/types/stats';
 
 type TOverviewModelTokens = IOverviewResponse['modelTokens'][string];
@@ -366,6 +367,12 @@ const mergeCodexOverview = async (
 
   return {
     ...overview,
+    byProvider: addProviderUsage(overview.byProvider, 'codex', {
+      ...sumProviderModelTokens(codexTokenBreakdown.modelTokens, 'codex'),
+      totalCost: codexCost,
+      sessions: codexSessions.length,
+      messages: codexHistory.length,
+    }),
     totalSessions: overview.totalSessions + codexSessions.length,
     totalMessages: overview.totalMessages + codexHistory.length,
     previousSessions: overview.previousSessions + previousSessions,
@@ -431,6 +438,12 @@ const mergeGrokOverview = (
 
   return {
     ...overview,
+    byProvider: addProviderUsage(overview.byProvider, 'grok', {
+      ...sumProviderModelTokens(tokens.modelTokens, 'grok'),
+      totalCost: cost,
+      sessions: usage.sessions.length,
+      messages: usage.messageTimestamps.length,
+    }),
     totalSessions: overview.totalSessions + usage.sessions.length,
     totalMessages: overview.totalMessages + usage.messageTimestamps.length,
     previousSessions: overview.previousSessions + previousSessions,
