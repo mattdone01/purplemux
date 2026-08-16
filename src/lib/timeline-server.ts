@@ -4,7 +4,7 @@ import { watch, type FSWatcher } from 'fs';
 import { existsSync, mkdirSync } from 'fs';
 import { type ISessionWatcher } from '@/lib/providers/types';
 import { readTailEntries, parseIncremental, parseJsonlContent } from './session-parser';
-import { CodexParser, createCodexParser, parseCodexContent, readTailCodexEntries } from './session-parser-codex';
+import { CodexParser, codexSessionIdFromJsonlPath, createCodexParser, parseCodexContent, readTailCodexEntries } from './session-parser-codex';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
 import { isCodexJsonlPath } from './path-validation';
@@ -13,6 +13,8 @@ import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { getSessionPanePid, checkTerminalProcess, sendKeys, getSessionCwd, getPaneTitle } from './tmux';
 import { cwdToProjectPath } from './session-list';
+import { buildSessionKey } from './session-key';
+import { workspaceIdFromSessionName } from './workspace-home';
 import {
   updateTabAgentSessionId,
   updateTabAgentState,
@@ -190,7 +192,9 @@ const readBoundedEntries = async (
     const buf = Buffer.alloc(readSize);
     await handle.read(buf, 0, readSize, from);
     const content = buf.toString('utf-8');
-    return isCodexJsonlPath(filePath) ? parseCodexContent(content) : parseJsonlContent(content);
+    return isCodexJsonlPath(filePath)
+      ? parseCodexContent(content, from, codexSessionIdFromJsonlPath(filePath))
+      : parseJsonlContent(content, from);
   } finally {
     await handle.close();
   }
@@ -446,12 +450,20 @@ const subscribeToFile = async (
   const meta = computeInitMeta(result.entries, result.fileSize, firstTimestamp, result.customTitle);
 
   const resolvedSessionId = sessionId ?? provider.sessionIdFromJsonlPath(jsonlPath) ?? '';
+  const sessionKey = resolvedSessionId
+    ? buildSessionKey({
+      provider: provider.id,
+      workspaceId: workspaceIdFromSessionName(sessionName),
+      sessionId: resolvedSessionId,
+    })
+    : undefined;
   const sessionStats = await readTimelineSessionStats(jsonlPath, resolvedSessionId, Boolean(fw.codexParser));
 
   sendJson(ws, {
     type: 'timeline:init',
     entries: result.entries,
     sessionId: resolvedSessionId,
+    sessionKey,
     totalEntries: result.entries.length,
     startByteOffset: result.startByteOffset,
     hasMore: result.hasMore,
