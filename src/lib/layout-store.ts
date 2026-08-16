@@ -4,6 +4,7 @@ import os from 'os';
 import { nanoid } from 'nanoid';
 import { createSession, hasSession, killSession, resolveExistingDir, sendKeys, workspaceSessionName } from '@/lib/tmux';
 import { broadcastSync } from '@/lib/sync-server';
+import { isAgentPanelType as isAgentPanel } from '@/lib/agent-panel-types';
 import { createLogger } from '@/lib/logger';
 import {
   collectPanes,
@@ -174,7 +175,7 @@ const syncWorkspaceDirectories = (wsId: string, root: TLayoutNode): void => {
 };
 
 export const isAgentPanelType = (panelType: TPanelType | undefined): boolean =>
-  panelType === 'claude-code' || panelType === 'codex-cli';
+  isAgentPanel(panelType);
 
 export const crossCheckLayout = async (
   layout: ILayoutData,

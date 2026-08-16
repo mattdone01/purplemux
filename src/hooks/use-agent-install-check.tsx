@@ -14,7 +14,7 @@ import {
 } from '@/components/ui/alert-dialog';
 import type { IRuntimePreflightResult } from '@/types/preflight';
 
-export type TAgentInstallProvider = 'claude' | 'codex';
+export type TAgentInstallProvider = 'claude' | 'codex' | 'grok';
 
 interface IInstallTarget {
   command: string;
@@ -30,8 +30,11 @@ interface IInstallPrompt {
   label?: string;
 }
 
-const isInstalled = (status: IRuntimePreflightResult, provider: TAgentInstallProvider): boolean =>
-  provider === 'codex' ? status.codex.installed : status.claude.installed;
+const isInstalled = (status: IRuntimePreflightResult, provider: TAgentInstallProvider): boolean => {
+  if (provider === 'codex') return status.codex.installed;
+  if (provider === 'grok') return status.grok.installed;
+  return status.claude.installed;
+};
 
 const fetchRuntimePreflight = async (): Promise<IRuntimePreflightResult | null> => {
   try {
@@ -69,6 +72,15 @@ export const useAgentInstallCheck = () => {
         description: t('codexMissingDescription'),
         confirmLabel: t('codexInstallGuide'),
         action: 'guide',
+      });
+      return false;
+    }
+
+    if (provider === 'grok') {
+      setInstallPrompt({
+        title: t('grokMissingTitle'),
+        description: t('grokMissingDescription'),
+        confirmLabel: tc('close'),
       });
       return false;
     }

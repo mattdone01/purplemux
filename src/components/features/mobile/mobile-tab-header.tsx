@@ -3,6 +3,7 @@ import { X, Plus, GitCompareArrows, Copy, History, MessageSquare, TerminalSquare
 import { useTranslations } from 'next-intl';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
+import GrokIcon from '@/components/icons/grok-icon';
 import TabStatusIndicator from '@/components/features/workspace/tab-status-indicator';
 import CopyPaneDrawer from '@/components/features/workspace/copy-pane-drawer';
 import useTabStore from '@/hooks/use-tab-store';
@@ -14,6 +15,13 @@ import useGitStatusStore, {
 } from '@/hooks/use-git-status-store';
 import type { TGitStatusIndicatorTone } from '@/hooks/use-git-status-store';
 import { getAgentPanelTypeFromProvider, isAgentPanel, tryAgentSwitch } from '@/lib/agent-switch-lock';
+import {
+  AGENT_DISPLAY_NAME,
+  AGENT_PANEL_TYPES,
+  isAgentPanelType,
+  providerIdForPanelType,
+  type TAgentPanelType,
+} from '@/lib/agent-panel-types';
 import {
   Drawer,
   DrawerContent,
@@ -44,19 +52,19 @@ const gitIndicatorToneClass: Record<TGitStatusIndicatorTone, string> = {
 };
 
 type TModeButton = {
-  type: Extract<TPanelType, 'terminal' | 'claude-code' | 'codex-cli'>;
+  type: Extract<TPanelType, 'terminal'> | TAgentPanelType;
   label: string;
   startAction?: boolean;
 };
 
 const canSwitchMode = (panelType: TPanelType) =>
-  panelType === 'terminal' || panelType === 'claude-code' || panelType === 'codex-cli';
+  panelType === 'terminal' || isAgentPanelType(panelType);
 
 const getButtonLabel = (mode: TModeButton) =>
   mode.startAction ? `Start ${mode.label}` : mode.label;
 
 const getAgentLabel = (panelType: TPanelType): string => {
-  if (panelType === 'claude-code' || panelType === 'codex-cli') return 'Chat';
+  if (isAgentPanelType(panelType)) return 'Chat';
   return 'Terminal';
 };
 
@@ -64,7 +72,7 @@ const processMatchesAgent = (panelType: TPanelType | undefined, process: string 
   if (!process) return false;
   const normalized = process.toLowerCase();
   if (panelType === 'claude-code') return normalized === 'claude';
-  if (panelType === 'codex-cli') return normalized === 'codex';
+  if (isAgentPanelType(panelType)) return normalized === providerIdForPanelType(panelType);
   return false;
 };
 
@@ -135,10 +143,11 @@ const MobileTabHeader = ({
           type: visibleAgentPanelType,
           label: getAgentLabel(visibleAgentPanelType),
         }]
-      : [
-          { type: 'claude-code' as const, label: 'Claude', startAction: true },
-          { type: 'codex-cli' as const, label: 'Codex', startAction: true },
-        ]),
+      : AGENT_PANEL_TYPES.map((type) => ({
+          type,
+          label: AGENT_DISPLAY_NAME[type],
+          startAction: true,
+        }))),
   ];
   const processColor = tabEntry?.terminalStatus === 'server'
     ? 'text-ui-green'
@@ -149,6 +158,7 @@ const MobileTabHeader = ({
   const renderTabIcon = () => {
     if (panelType === 'claude-code') return <ClaudeCodeIcon size={16} />;
     if (panelType === 'codex-cli') return <OpenAIIcon size={16} className="shrink-0 text-foreground" aria-label="Codex" />;
+    if (panelType === 'grok-cli') return <GrokIcon size={16} className="shrink-0 text-foreground" aria-label="Grok" />;
     if (panelType === 'diff') return <GitCompareArrows className={cn(iconClassName, 'text-muted-foreground')} />;
     if (panelType === 'agent-sessions') return <History className={cn(iconClassName, 'text-muted-foreground')} />;
     return (
@@ -177,11 +187,11 @@ const MobileTabHeader = ({
       runningAgentPanelType: runtimeAgentPanelType,
     })) return;
     setModeDrawerOpen(false);
-    if (mode.startAction && (mode.type === 'claude-code' || mode.type === 'codex-cli')) {
+    if (mode.startAction && isAgentPanelType(mode.type)) {
       window.dispatchEvent(new CustomEvent('purplemux-start-agent', {
         detail: {
           tabId,
-          provider: mode.type === 'codex-cli' ? 'codex' : 'claude',
+          provider: providerIdForPanelType(mode.type),
         },
       }));
       return;

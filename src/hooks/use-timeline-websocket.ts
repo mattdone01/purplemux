@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { TAgentPanelType } from '@/lib/agent-panel-types';
 import type {
   ITimelineEntry,
   IInitMeta,
@@ -28,7 +29,7 @@ interface IUseTimelineWebSocketOptions {
   sessionName: string;
   agentSessionId?: string | null;
   claudeSessionId?: string | null;
-  panelType?: 'claude-code' | 'codex-cli';
+  panelType?: TAgentPanelType;
   enabled: boolean;
   onInit: (entries: ITimelineEntry[], totalEntries: number, sessionId: string, summary?: string, meta?: IInitMeta, startByteOffset?: number, hasMore?: boolean, jsonlPath?: string | null, isClaudeStarting?: boolean, sessionStats?: ISessionStats | null) => void;
   onAppend: (entries: ITimelineEntry[]) => void;

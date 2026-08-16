@@ -1,7 +1,12 @@
-import type { TPanelType } from '@/types/terminal';
 import useTabStore from '@/hooks/use-tab-store';
+import {
+  isAgentPanelType,
+  providerIdForPanelType,
+  type TAgentPanelType,
+} from '@/lib/agent-panel-types';
 
-export type TAgentPanelType = Extract<TPanelType, 'claude-code' | 'codex-cli'>;
+export type { TAgentPanelType };
+export { isAgentPanelType };
 
 export interface IAgentCheckResponse {
   running?: boolean;
@@ -18,9 +23,6 @@ export interface IAgentCheckOutcome {
   checkedAt: number;
 }
 
-export const isAgentPanelType = (value: unknown): value is TAgentPanelType =>
-  value === 'claude-code' || value === 'codex-cli';
-
 export const applyAgentCheckResult = (
   tabId: string,
   data: IAgentCheckResponse,
@@ -29,7 +31,7 @@ export const applyAgentCheckResult = (
   if (data.running === true && isAgentPanelType(data.providerPanelType)) {
     const providerId = typeof data.providerId === 'string' && data.providerId
       ? data.providerId
-      : data.providerPanelType === 'codex-cli' ? 'codex' : 'claude';
+      : providerIdForPanelType(data.providerPanelType) ?? 'claude';
     const detectedSessionId = typeof data.sessionId === 'string' && data.sessionId ? data.sessionId : undefined;
     useTabStore.getState().setDetectedAgent(tabId, {
       running: true,

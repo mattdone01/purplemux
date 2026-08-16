@@ -4,6 +4,8 @@ import { X, Globe, GitCompareArrows, History, Crown } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
+import GrokIcon from '@/components/icons/grok-icon';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 import ProcessIcon from '@/components/icons/process-icon';
 import { cn } from '@/lib/utils';
 import type { ITab } from '@/types/terminal';
@@ -57,7 +59,7 @@ const PaneTabItem = ({
   const to = useTranslations('orchestration');
   const wsId = useLayoutStore((s) => s.workspaceId);
   const orchestration = useWorkspaceStore((s) => s.workspaces.find((w) => w.id === wsId)?.orchestration);
-  const isAgentTab = tab.panelType === 'claude-code' || tab.panelType === 'codex-cli';
+  const isAgentTab = isAgentPanelType(tab.panelType);
   const isOrchestrator = !!orchestration?.enabled && orchestration.orchestratorTabId === tab.id;
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState('');
@@ -147,6 +149,8 @@ const PaneTabItem = ({
             <ClaudeCodeIcon className="mx-0.5 h-3 w-3 shrink-0" />
           ) : tab.panelType === 'codex-cli' ? (
             <OpenAIIcon className="mx-0.5 h-3 w-3 shrink-0 text-foreground" aria-label="Codex" />
+          ) : tab.panelType === 'grok-cli' ? (
+            <GrokIcon className="mx-0.5 h-3 w-3 shrink-0 text-foreground" aria-label="Grok" />
           ) : tab.panelType === 'web-browser' ? (
             <Globe className="mx-0.5 h-3 w-3 shrink-0 text-muted-foreground" />
           ) : tab.panelType === 'diff' ? (

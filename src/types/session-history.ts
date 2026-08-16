@@ -1,4 +1,4 @@
-export type TSessionHistoryProvider = 'claude' | 'codex';
+export type TSessionHistoryProvider = 'claude' | 'codex' | 'grok';
 
 export interface ISessionHistoryEntry {
   id: string;

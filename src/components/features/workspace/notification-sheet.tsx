@@ -36,6 +36,8 @@ import { navigateToTab, navigateToTabOrCreate, useLayoutStore } from '@/hooks/us
 import { findPane } from '@/lib/layout-tree';
 import type { ITabState } from '@/hooks/use-tab-store';
 import type { ICurrentAction } from '@/types/status';
+import GrokIcon from '@/components/icons/grok-icon';
+import { toSessionHistoryProvider } from '@/lib/agent-panel-types';
 import type { ISessionHistoryEntry, TSessionHistoryProvider } from '@/types/session-history';
 import { stripMarkdown } from '@/lib/strip-markdown';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
@@ -76,7 +78,7 @@ const useActiveTab = (): IActiveTabInfo => {
     if (!pane?.activeTabId) return { id: null, agentSessionId: null, providerId: null };
     const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
     if (!tab) return { id: pane.activeTabId, agentSessionId: null, providerId: null };
-    const providerId: TSessionHistoryProvider = tab.agentState?.providerId === 'codex' ? 'codex' : 'claude';
+    const providerId = toSessionHistoryProvider(tab.agentState?.providerId);
     const agentSessionId = tab.agentState?.sessionId ?? tab.claudeSessionId ?? null;
     return { id: pane.activeTabId, agentSessionId, providerId };
   }));
@@ -187,12 +189,18 @@ const groupHistoryBySession = (entries: ISessionHistoryEntry[]): ISessionHistory
   return groups;
 };
 
+const PROVIDER_BADGE: Record<TSessionHistoryProvider, { Icon: typeof ClaudeCodeIcon; label: string }> = {
+  claude: { Icon: ClaudeCodeIcon, label: 'Claude' },
+  codex: { Icon: OpenAIIcon, label: 'Codex' },
+  grok: { Icon: GrokIcon, label: 'Grok' },
+};
+
 const ProviderBadge = ({ providerId }: { providerId: TSessionHistoryProvider }) => {
-  const Icon = providerId === 'codex' ? OpenAIIcon : ClaudeCodeIcon;
+  const { Icon, label } = PROVIDER_BADGE[providerId] ?? PROVIDER_BADGE.claude;
   return (
     <span
       className="inline-flex items-center gap-1 text-xs text-muted-foreground/60"
-      aria-label={providerId === 'codex' ? 'Codex' : 'Claude'}
+      aria-label={label}
     >
       <Icon className="size-3" />
     </span>
@@ -467,7 +475,7 @@ export const NotificationPanel = ({ onNavigated, className }: { onNavigated?: ()
     const map = new Map<string, string>();
     for (const [tabId, tab] of Object.entries(tabs)) {
       if (!tab.agentSessionId) continue;
-      const provider: TSessionHistoryProvider = tab.agentProviderId === 'codex' ? 'codex' : 'claude';
+      const provider = toSessionHistoryProvider(tab.agentProviderId);
       map.set(liveSessionKey(provider, tab.agentSessionId), tabId);
     }
     return map;
@@ -481,7 +489,7 @@ export const NotificationPanel = ({ onNavigated, className }: { onNavigated?: ()
     const keys = new Set<string>();
     for (const [, tab] of Object.entries(tabs)) {
       if ((tab.cliState === 'busy' || tab.cliState === 'needs-input' || tab.cliState === 'ready-for-review') && tab.agentSessionId) {
-        const provider: TSessionHistoryProvider = tab.agentProviderId === 'codex' ? 'codex' : 'claude';
+        const provider = toSessionHistoryProvider(tab.agentProviderId);
         keys.add(liveSessionKey(provider, tab.agentSessionId));
       }
     }
@@ -491,7 +499,7 @@ export const NotificationPanel = ({ onNavigated, className }: { onNavigated?: ()
     const keys = new Set<string>();
     for (const [, tab] of Object.entries(tabs)) {
       if (tab.cliState === 'ready-for-review' && tab.agentSessionId) {
-        const provider: TSessionHistoryProvider = tab.agentProviderId === 'codex' ? 'codex' : 'claude';
+        const provider = toSessionHistoryProvider(tab.agentProviderId);
         keys.add(liveSessionKey(provider, tab.agentSessionId));
       }
     }

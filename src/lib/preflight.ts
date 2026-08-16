@@ -6,6 +6,7 @@ import { buildShellEnv, defaultShell as resolveDefaultShell } from '@/lib/shell-
 import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { claudeProvider } from '@/lib/providers/claude';
 import { runCodexPreflight, invalidateCodexPreflight } from '@/lib/providers/codex/preflight';
+import { checkGrokApiKey, invalidateGrokPreflight, runGrokPreflight } from '@/lib/providers/grok/preflight';
 import { parseSemanticVersion } from '@/lib/process-utils';
 
 const execFile = promisify(execFileCb);
@@ -147,11 +148,13 @@ export const getCachedPreflightStatus = async (): Promise<IPreflightResult> => {
 
 export const getRuntimePreflightStatus = async (): Promise<IRuntimePreflightResult> => {
   shellPathCache = await resolveShellPathAsync();
-  const [tmux, git, claudeFull, codex] = await Promise.all([
+  const [tmux, git, claudeFull, codex, grok, grokLoggedIn] = await Promise.all([
     checkTool('tmux', ['-V'], parseSemanticVersion),
     checkTool('git', ['--version'], parseSemanticVersion),
     claudeProvider.preflight(),
     runCodexPreflight(),
+    runGrokPreflight(),
+    checkGrokApiKey(),
   ]);
 
   return {
@@ -167,6 +170,12 @@ export const getRuntimePreflightStatus = async (): Promise<IRuntimePreflightResu
       installed: codex.installed,
       version: codex.version,
       binaryPath: codex.binaryPath,
+    },
+    grok: {
+      installed: grok.installed,
+      version: grok.version,
+      binaryPath: grok.binaryPath,
+      loggedIn: grokLoggedIn,
     },
   };
 };
@@ -195,4 +204,5 @@ export const invalidateRuntimeCache = (): void => {
   runtimeCache = null;
   inflightRequest = null;
   invalidateCodexPreflight();
+  invalidateGrokPreflight();
 };

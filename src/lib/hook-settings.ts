@@ -3,18 +3,22 @@ import path from 'path';
 import os from 'os';
 import { createLogger } from '@/lib/logger';
 import { STATUSLINE_SCRIPT_PATH, STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
+import { ensureGrokHookSettings } from '@/lib/providers/grok/hook-config';
 
 const log = createLogger('hooks');
 const codexLog = createLogger('codex-hook');
+const grokLog = createLogger('grok-hook');
 
 const BASE_DIR = path.join(os.homedir(), '.purplemux');
 const HOOKS_FILE = path.join(BASE_DIR, 'hooks.json');
 const PORT_FILE = path.join(BASE_DIR, 'port');
 const HOOK_SCRIPT = path.join(BASE_DIR, 'status-hook.sh');
 const CODEX_HOOK_SCRIPT = path.join(BASE_DIR, 'codex-hook.sh');
+const GROK_HOOK_SCRIPT = path.join(BASE_DIR, 'grok-hook.sh');
 
 export const HOOK_SETTINGS_PATH = HOOKS_FILE;
 export const CODEX_HOOK_SCRIPT_PATH = CODEX_HOOK_SCRIPT;
+export const GROK_HOOK_SCRIPT_PATH = GROK_HOOK_SCRIPT;
 
 const HOOK_SCRIPT_CONTENT = `#!/bin/sh
 EVENT="\${1:-poll}"
@@ -73,6 +77,32 @@ curl -sS -X POST -o /dev/null \\
 exit 0
 `;
 
+/**
+ * grok delivers its hook payload as JSON on stdin (`src/hooks/executor.ts`
+ * pipes it to `sh -c <command>`), so the body is read with `cat` rather than
+ * parsed out of argv. The POST is detached and time-boxed: a hook that blocks
+ * blocks grok's turn, and `PostToolUse` fires on every tool call.
+ */
+const GROK_HOOK_SCRIPT_CONTENT = `#!/bin/sh
+PORT_FILE="$HOME/.purplemux/port"
+TOKEN_FILE="$HOME/.purplemux/cli-token"
+[ -f "$PORT_FILE" ] || exit 0
+[ -f "$TOKEN_FILE" ] || exit 0
+PORT=$(cat "$PORT_FILE")
+TOKEN=$(cat "$TOKEN_FILE")
+SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""
+[ -n "$SESSION" ] || exit 0
+
+BODY=$(cat)
+[ -n "$BODY" ] || exit 0
+
+printf '%s' "$BODY" | curl -s -X POST -o /dev/null --max-time 2 \\
+  -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
+  --data-binary @- \\
+  "http://localhost:\${PORT}/api/status/hook?provider=grok&tmuxSession=\${SESSION}" >/dev/null 2>&1 &
+exit 0
+`;
+
 const hookEntry = (event: string, timeout = 3, matcher = '') => [
   {
     matcher,
@@ -121,6 +151,7 @@ const writeManagedScript = async (target: string, body: string, mode: number): P
 
 export interface IEnsureHookSettingsResult {
   codexHookInstallFailed: boolean;
+  grokHookInstallFailed: boolean;
 }
 
 export const ensureHookSettings = async (port: number): Promise<IEnsureHookSettingsResult> => {
@@ -139,19 +170,28 @@ export const ensureHookSettings = async (port: number): Promise<IEnsureHookSetti
     codexLog.error({ err }, 'codex-hook script write failed');
   }
 
+  let grokHookInstallFailed = false;
+  try {
+    await writeManagedScript(GROK_HOOK_SCRIPT, GROK_HOOK_SCRIPT_CONTENT, 0o700);
+    await ensureGrokHookSettings(GROK_HOOK_SCRIPT);
+  } catch (err) {
+    grokHookInstallFailed = true;
+    grokLog.error({ err }, 'grok hook install failed');
+  }
+
   const settings = buildHookSettings();
   const content = JSON.stringify(settings, null, 2) + '\n';
 
   try {
     const existing = await fs.readFile(HOOKS_FILE, 'utf-8');
-    if (existing === content) return { codexHookInstallFailed };
+    if (existing === content) return { codexHookInstallFailed, grokHookInstallFailed };
   } catch {
     // file doesn't exist yet
   }
 
   await fs.writeFile(HOOKS_FILE, content, { mode: 0o600 });
   log.debug(`${HOOKS_FILE} created`);
-  return { codexHookInstallFailed };
+  return { codexHookInstallFailed, grokHookInstallFailed };
 };
 
 export const removePortFile = async (): Promise<void> => {

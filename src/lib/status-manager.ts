@@ -15,6 +15,8 @@ import { createLogger } from '@/lib/logger';
 import { capturePaneAtWidth } from '@/lib/capture-at-width';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
+import { GROK_PROVIDER_ID } from '@/lib/providers/grok';
+import { isAgentPanelType, toSessionHistoryProvider } from '@/lib/agent-panel-types';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
 import { cacheCodexRateLimitsFromJsonl } from '@/lib/codex-rate-limits-cache';
 import { parsePermissionOptions } from '@/lib/permission-prompt';
@@ -34,6 +36,9 @@ import { getConfig } from '@/lib/config-store';
 import { nanoid } from 'nanoid';
 import fs from 'fs/promises';
 import { watch, type FSWatcher } from 'fs';
+
+const toAlertProvider = (providerId: string | undefined): TAlertProviderId =>
+  providerId === 'codex' || providerId === 'grok' ? providerId : 'claude';
 
 const log = createLogger('status');
 const hookLog = createLogger('hooks');
@@ -203,8 +208,9 @@ class StatusManager {
       return;
     }
 
-    if (provider && entry.jsonlPath) {
-      const { idle, stale, lastAssistantSnippet } = await provider.readRuntimeSnapshot(entry.jsonlPath);
+    const unknownStateHandle = this.runtimeHandle(entry);
+    if (provider && unknownStateHandle) {
+      const { idle, stale, lastAssistantSnippet } = await provider.readRuntimeSnapshot(unknownStateHandle);
       if (idle && !stale && lastAssistantSnippet) {
         this.applyCliState(tabId, entry, 'ready-for-review', { silent: true });
         this.persistToLayout(entry);
@@ -502,7 +508,7 @@ class StatusManager {
       const state = this.orchKeeper.get(ws.id) ?? { idleSince: null, beats: 0, lastBeatAt: 0, stallAlerted: false };
       const workersActive = [...this.tabs.entries()].some(([id, t]) =>
         id !== orch.orchestratorTabId && t.workspaceId === ws.id
-        && (t.panelType === 'claude-code' || t.panelType === 'codex-cli')
+        && isAgentPanelType(t.panelType)
         && (t.cliState === 'busy' || t.cliState === 'needs-input' || t.cliState === 'ready-for-review'));
 
       // busy = working; needs-input = waiting on the HUMAN (the alert already fired) — do not nag.
@@ -567,7 +573,7 @@ class StatusManager {
       workspace: ws,
       workspaceId: ws.id,
       tabName: entry.tabName,
-      providerId: entry.agentProviderId === 'codex' ? 'codex' : 'claude',
+      providerId: toAlertProvider(entry.agentProviderId),
       agentSessionId: entry.agentSessionId,
       detail: `Idle ~${idleMinutes} min with no worker activity after ${ORCH_MAX_HEARTBEATS} heartbeats.`,
     });
@@ -662,7 +668,7 @@ class StatusManager {
         workspace: ws,
         workspaceId: entry.workspaceId,
         tabName: entry.tabName,
-        providerId: entry.agentProviderId === 'codex' ? 'codex' : 'claude',
+        providerId: toAlertProvider(entry.agentProviderId),
         agentSessionId: entry.agentSessionId,
         lastUserMessage: entry.lastUserMessage,
       });
@@ -743,7 +749,7 @@ class StatusManager {
   }
 
   private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<void> {
-    if (entry.panelType !== 'claude-code' && entry.panelType !== 'codex-cli') return;
+    if (!isAgentPanelType(entry.panelType)) return;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
     const orch = ws?.orchestration;
     if (!ws || !orch?.enabled || !orch.orchestratorTabId || orch.orchestratorTabId === tabId) return;
@@ -816,7 +822,7 @@ class StatusManager {
       workspace: ws,
       workspaceId: standup.workspaceId,
       tabName: entry?.tabName ?? '',
-      providerId: entry?.agentProviderId === 'codex' ? 'codex' : 'claude',
+      providerId: toAlertProvider(entry?.agentProviderId),
       agentSessionId: entry?.agentSessionId,
       headline: standup.headline,
     });
@@ -855,23 +861,37 @@ class StatusManager {
   }
 
   private async hasRecentJsonlActivity(entry: ITabStatusEntry, now: number): Promise<boolean> {
-    if (!entry.jsonlPath) return false;
+    const handle = this.runtimeHandle(entry);
+    if (!handle) return false;
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
     if (!provider) return false;
     try {
-      const snapshot = await provider.readRuntimeSnapshot(entry.jsonlPath);
+      const snapshot = await provider.readRuntimeSnapshot(handle);
       return snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS;
     } catch {
       return false;
     }
   }
 
+  /**
+   * The handle a provider reads its runtime view from. File-backed providers
+   * pass a transcript path; grok keeps its transcript in SQLite, so its handle
+   * is the session id.
+   */
+  private runtimeHandle(entry: ITabStatusEntry): string | null {
+    if (entry.agentProviderId === GROK_PROVIDER_ID || entry.panelType === 'grok-cli') {
+      return entry.agentSessionId ?? null;
+    }
+    return entry.jsonlPath ?? null;
+  }
+
   private async saveSessionHistory(tabId: string, entry: ITabStatusEntry, prevBusySince: number | null | undefined, cancelled: boolean): Promise<void> {
     if (!entry.lastUserMessage) return;
 
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
-    const stats = entry.jsonlPath && provider
-      ? await provider.readSessionHistoryStats(entry.jsonlPath)
+    const handle = this.runtimeHandle(entry);
+    const stats = handle && provider
+      ? await provider.readSessionHistoryStats(handle)
       : null;
     const { workspaces } = await getWorkspaces();
     const ws = workspaces.find((w) => w.id === entry.workspaceId);
@@ -882,7 +902,7 @@ class StatusManager {
       ? completedAt - startedAt
       : (stats?.turnDurationMs ?? (completedAt - startedAt));
 
-    const providerId = entry.agentProviderId === 'codex' ? 'codex' : 'claude';
+    const providerId = toSessionHistoryProvider(entry.agentProviderId);
     const historyEntry: ISessionHistoryEntry = {
       id: nanoid(),
       workspaceId: entry.workspaceId,
@@ -1036,15 +1056,16 @@ class StatusManager {
       this.broadcastUpdate(tabId, entry);
     }
 
-    if ((newState === 'busy' || newState === 'needs-input') && !entry.jsonlPath) {
+    if ((newState === 'busy' || newState === 'needs-input') && !entry.jsonlPath && entry.panelType !== 'grok-cli') {
       this.resolveAndWatchJsonl(tabId, tmuxSession).catch(() => {});
     }
 
-    if (eventName === 'stop' && entry.jsonlPath) {
+    const stopHandle = this.runtimeHandle(entry);
+    if (eventName === 'stop' && stopHandle) {
       const refreshSnippet = (force = false) => {
         const provider = getProviderByPanelType(entry.panelType);
         if (!provider) return;
-        provider.readRuntimeSnapshot(entry.jsonlPath!, { force }).then(({ currentAction, lastAssistantSnippet, reset }) => {
+        provider.readRuntimeSnapshot(stopHandle, { force }).then(({ currentAction, lastAssistantSnippet, reset }) => {
           let updated = false;
           if (reset) {
             if (entry.currentAction !== null) { entry.currentAction = null; updated = true; }
@@ -1375,7 +1396,10 @@ class StatusManager {
         const tabProvider = getProviderByPanelType(tab?.panelType);
         const tabSessionId = tab && tabProvider ? tabProvider.readSessionId(tab) : null;
         if (tab && tabProvider && tabSessionId) {
-          if (tabProvider.id === CODEX_PROVIDER_ID) {
+          if (tabProvider.id === GROK_PROVIDER_ID) {
+            // grok keeps its transcript in SQLite; there is no file to resolve.
+            jsonlPath = null;
+          } else if (tabProvider.id === CODEX_PROVIDER_ID) {
             jsonlPath = (await findCodexSessionById(tabSessionId))?.jsonlPath ?? null;
           } else {
             const cwd = await getSessionCwd(tmuxSession);

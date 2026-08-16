@@ -1,4 +1,5 @@
 import { memo, useMemo } from 'react';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 import { GitCompareArrows, Globe } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import useTabStore, { selectTabDisplayStatus } from '@/hooks/use-tab-store';
@@ -15,7 +16,7 @@ interface IWorkspaceStatusIndicatorProps {
 const DotByStatus = ({ status, panelType, terminalStatus, process }: { status: TTabDisplayStatus; panelType?: TPanelType; terminalStatus?: TTerminalStatus; process?: string | null }) => {
   let inner: React.ReactNode;
 
-  if (panelType === 'claude-code' || panelType === 'codex-cli') {
+  if (isAgentPanelType(panelType)) {
     if (status === 'busy') {
       inner = <Spinner className="h-2 w-2 text-muted-foreground" />;
     } else if (status === 'ready-for-review') {

@@ -12,6 +12,8 @@ import {
 import { useTranslations } from 'next-intl';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
+import GrokIcon from '@/components/icons/grok-icon';
+import { isAgentPanelType, providerIdForPanelType } from '@/lib/agent-panel-types';
 import { useRouter } from 'next/router';
 import useSidebarItems from '@/hooks/use-sidebar-items';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
@@ -155,7 +157,7 @@ const MobileNavigationSheet = ({
   const getTabProcess = (tab: ITab) => tabs[tab.id]?.currentProcess;
 
   const getTabAgentSummary = (tab: ITab, panelType: TPanelType): string | null => {
-    if (panelType !== 'claude-code' && panelType !== 'codex-cli') return null;
+    if (!isAgentPanelType(panelType)) return null;
 
     const liveState = tabs[tab.id];
     const clean = (value: string | null | undefined): string | null => {
@@ -166,12 +168,9 @@ const MobileNavigationSheet = ({
     const liveSummary = clean(liveState?.agentSummary);
     if (liveSummary) return liveSummary;
 
-    const agentSummary =
-      tab.agentState &&
-      ((panelType === 'claude-code' && tab.agentState.providerId === 'claude') ||
-        (panelType === 'codex-cli' && tab.agentState.providerId === 'codex'))
-        ? clean(tab.agentState.summary)
-        : null;
+    const agentSummary = tab.agentState && tab.agentState.providerId === providerIdForPanelType(panelType)
+      ? clean(tab.agentState.summary)
+      : null;
     return agentSummary
       ?? clean(panelType === 'claude-code' ? tab.claudeSummary : null)
       ?? clean(liveState?.lastUserMessage)
@@ -222,6 +221,8 @@ const MobileNavigationSheet = ({
               <ClaudeCodeIcon size={16} />
             ) : panelType === 'codex-cli' ? (
               <OpenAIIcon size={16} className="text-foreground" />
+            ) : panelType === 'grok-cli' ? (
+              <GrokIcon size={16} className="text-foreground" />
             ) : panelType === 'web-browser' ? (
               <Globe size={14} className="text-muted-foreground" />
             ) : panelType === 'diff' ? (

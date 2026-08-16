@@ -21,6 +21,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       └── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
 ├── hooks.json               # Claude Code hook + statusline config (generated)
 ├── status-hook.sh           # hook → POST /api/status/hook (generated, 0755)
+├── codex-hook.sh            # Codex hook → POST /api/status/hook?provider=codex (generated, 0700)
+├── grok-hook.sh             # Grok hook → POST /api/status/hook?provider=grok (generated, 0700)
 ├── statusline.sh            # statusline → POST /api/status/statusline (generated, 0755)
 ├── rate-limits.json         # latest statusline JSON written by statusline.sh
 ├── session-history.json     # completed Claude session log (cross-workspace)
@@ -105,15 +107,29 @@ Plus `statusLine.command = sh "~/.purplemux/statusline.sh"`.
 
 See [STATUS.md](./STATUS.md) for the full status-detection flow.
 
-### `status-hook.sh`, `statusline.sh`
+### `status-hook.sh`, `codex-hook.sh`, `grok-hook.sh`, `statusline.sh`
 
-Auto-generated from `HOOK_SCRIPT_CONTENT` (`hook-settings.ts`) and `STATUSLINE_SCRIPT_CONTENT` (`statusline-script.ts`). Both:
+Auto-generated from `HOOK_SCRIPT_CONTENT`, `CODEX_HOOK_SCRIPT_CONTENT` and `GROK_HOOK_SCRIPT_CONTENT` (`hook-settings.ts`) and `STATUSLINE_SCRIPT_CONTENT` (`statusline-script.ts`). All of them:
 
 1. Read `port` and `cli-token` from `~/.purplemux/`
 2. `POST` to the local server with `x-pmux-token` header
 3. Fail silently if the server is down
 
+`grok-hook.sh` reads grok's payload from **stdin** (grok pipes JSON to `sh -c <command>`, it does not pass argv), time-boxes the request with `curl --max-time 2`, backgrounds it, and always exits 0 — a blocking hook would block grok's turn, and `PostToolUse` fires on every tool call.
+
 Do not edit these by hand — they are rewritten on startup when content differs.
+
+### `~/.grok/user-settings.json` (not in this directory)
+
+grok-cli hard-codes `~/.grok` and offers no config-dir override, so purplemux **merges** its hook block into the user's own settings file rather than owning a file of its own (`src/lib/providers/grok/hook-config.ts`, ADR-0005):
+
+- Only purplemux's own entries — the ones whose command names `grok-hook.sh` — are replaced. `apiKey`, `defaultModel`, `subAgents`, `mcp`, `telegram` and any hook the user wrote survive untouched, and re-running the merge changes nothing.
+- The write goes to a sibling temp file and is renamed into place at mode 0600, so a crash mid-write cannot leave the user without an API key.
+- A settings file that exists but does not parse is **left alone** and reported as a startup warning. Overwriting it would destroy the user's API key to install a hook.
+
+Registered events: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `PreCompact`, `PostCompact`, `SessionEnd`, `PostToolUse`. `PostToolUse` carries **no matcher**: grok compares a matcher by exact string equality, so the pipe-separated tool list `hooks.json` uses for Claude would never fire.
+
+grok's transcripts live in `~/.grok/grok.db` (SQLite, WAL). purplemux opens it **read-only** and never writes to it.
 
 ### `rate-limits.json`
 
@@ -248,4 +264,6 @@ All files here are regeneratable — deleting them just triggers a recompute on 
 | Push subscriptions | `push-subscriptions.json` |
 | Stuck "already running" | `pmux.lock` (only if no purplemux process is alive) |
 
-`hooks.json`, `status-hook.sh`, `statusline.sh`, `port`, `cli-token`, `vapid-keys.json` are auto-regenerated on the next startup.
+`hooks.json`, `status-hook.sh`, `codex-hook.sh`, `grok-hook.sh`, `statusline.sh`, `port`, `cli-token`, `vapid-keys.json` are auto-regenerated on the next startup.
+
+Deleting `~/.grok/user-settings.json` deletes the user's grok API key as well as the hook block — remove just the `hooks` entries whose command names `grok-hook.sh` instead.

@@ -51,7 +51,7 @@ Plus
 - **Workspaces & groups** — Save and restore panel layouts, tabs, and working directories. Organize workspaces into groups with drag-and-drop
 - **Git workflow** — Side-by-side / line-by-line diff with syntax highlighting, inline hunk expansion, and a paginated history tab. Fetch / pull / push from the panel with ahead/behind indicators — if sync fails (dirty worktree, conflicts), Ask Claude or Codex in one click
 - **Web browser panel** — Embedded browser for checking dev output (Electron). Drive it from the `purplemux` CLI and switch viewports with a built-in device emulator
-- **Agent tabs** — Start Claude, Codex, or a combined session list from the new-tab menu
+- **Agent tabs** — Start Claude, Codex, Grok, or a combined session list from the new-tab menu
 
 ### Claude Code and Codex integration
 
@@ -64,7 +64,7 @@ Plus
 - **Quick prompts** — Register frequently used prompts and send with one click
 - **Attachments** — Drop images into the chat input, or attach files to insert their paths. Works on mobile
 - **Message history** — Reuse previous messages
-- **Usage analytics** — Claude + Codex tokens, cost, per-project breakdowns, and daily AI reports
+- **Usage analytics** — Claude + Codex + Grok tokens, cost, per-project breakdowns, and daily AI reports
 - **Rate limits** — 5-hour / 7-day remaining usage with reset countdown for supported providers
 
 ### Mobile & accessibility
@@ -108,6 +108,17 @@ npm i -g @openai/codex
 # or
 brew install --cask codex
 ```
+
+Optional for Grok tabs. Install grok-cli and give it an API key before starting a Grok tab:
+
+```bash
+npm i -g grok-dev
+export GROK_API_KEY=...   # or set "apiKey" in ~/.grok/user-settings.json
+```
+
+grok-cli hard-codes `~/.grok` and offers no config-dir override, so every workspace shares one grok
+store. grok keys its own sessions by working directory, so sessions stay separated by project even
+though the store is shared.
 
 ### npx (fastest)
 
@@ -237,7 +248,7 @@ The default is HTTP. Always use HTTPS when exposing the app externally:
 
 **Terminal I/O** — xterm.js connects to node-pty via WebSocket; node-pty attaches to tmux sessions. A binary protocol handles stdin/stdout/resize with backpressure control.
 
-**Status detection** — Agent event hooks deliver instant updates via HTTP POST. Claude Code uses `SessionStart`, `Stop`, and `Notification`; Codex uses `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, and `PermissionRequest`. Polling every 5–15s inspects process trees and analyzes the last 8KB of JSONL files.
+**Status detection** — Agent event hooks deliver instant updates via HTTP POST. Claude Code uses `SessionStart`, `Stop`, and `Notification`; Codex uses `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, and `PermissionRequest`; Grok uses `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd`, `PreCompact`, `PostCompact`, and `PostToolUse`, merged into `~/.grok/user-settings.json`. Polling every 5–15s inspects process trees and analyzes the last 8KB of JSONL files.
 
 **Timeline** — Watches JSONL session logs under `~/.claude/projects/` and `~/.codex/sessions/`, parses new lines on change, and streams structured entries to the browser.
 

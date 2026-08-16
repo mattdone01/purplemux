@@ -445,7 +445,7 @@ Commands:
                                            no PEER to revoke all
   tab list [-w WS]                         List tabs (only those your token may act on)
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
-                                           Create a tab in workspace (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+                                           Create a tab in workspace (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
              [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior

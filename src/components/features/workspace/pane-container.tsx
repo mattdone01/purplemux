@@ -24,6 +24,9 @@ import { sendCodexQuitCommand } from '@/lib/agent-terminal-commands';
 import TerminalContainer from '@/components/features/workspace/terminal-container';
 import ClaudeCodePanel from '@/components/features/workspace/claude-code-panel';
 import CodexPanel from '@/components/features/workspace/codex-panel';
+import GrokPanel from '@/components/features/workspace/grok-panel';
+import { fetchGrokLaunchCommand } from '@/lib/providers/grok/client';
+import { panelTypeForProviderId } from '@/lib/agent-panel-types';
 import AgentSessionsPanel from '@/components/features/workspace/agent-sessions-panel';
 import WebInputBar from '@/components/features/workspace/web-input-bar';
 import QuickPromptBar from '@/components/features/workspace/quick-prompt-bar';
@@ -37,7 +40,7 @@ import useTrustPromptDetector from '@/hooks/use-trust-prompt-detector';
 import useCodexUpdatePromptDetector from '@/hooks/use-codex-update-prompt-detector';
 import useQuickPrompts from '@/hooks/use-quick-prompts';
 import useFileDrop from '@/hooks/use-file-drop';
-import { useAgentInstallCheck } from '@/hooks/use-agent-install-check';
+import { useAgentInstallCheck, type TAgentInstallProvider } from '@/hooks/use-agent-install-check';
 import PaneTabBar from '@/components/features/workspace/pane-tab-bar';
 import { formatTabTitle, parseCurrentCommand, isShellProcess } from '@/lib/tab-title';
 import { isAppShortcut, isClearShortcut, isFocusInputShortcut, isShiftEnter } from '@/lib/keyboard-shortcuts';
@@ -129,8 +132,9 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
   const activePanelType: TPanelType = activeTab?.panelType ?? 'terminal';
   const isClaudeCode = activePanelType === 'claude-code';
   const isCodex = activePanelType === 'codex-cli';
+  const isGrok = activePanelType === 'grok-cli';
   const isAgentSessionList = activePanelType === 'agent-sessions';
-  const isAgentPanel = isClaudeCode || isCodex;
+  const isAgentPanel = isAgentPanelType(activePanelType);
   const isWebBrowser = activePanelType === 'web-browser';
   const isDiff = activePanelType === 'diff';
   const { ensureAgentInstalled, installDialogs } = useAgentInstallCheck();
@@ -897,6 +901,21 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
     sendStdin(`${command}\r`);
   }, [status, sendStdin, activeTabId, buildCodexCommand, ensureAgentInstalled, markAgentLaunch, t]);
 
+  const handleNewGrokSession = useCallback(async () => {
+    if (status !== 'connected' || !activeTabId) return;
+    if (!await ensureAgentInstalled('grok')) return;
+    let command: string;
+    try {
+      command = await fetchGrokLaunchCommand();
+    } catch {
+      toast.error(t('grokLaunchFailed'));
+      return;
+    }
+    markAgentLaunch(activeTabId, { resetAgentSession: true });
+    useTabStore.getState().setSessionView(activeTabId, 'timeline');
+    sendStdin(`${command}\r`);
+  }, [status, sendStdin, activeTabId, ensureAgentInstalled, markAgentLaunch, t]);
+
   const handleNewClaudeFromSessionList = useCallback(async () => {
     if (!await ensureAgentInstalled('claude')) return;
     handleSwitchPanelType('claude-code');
@@ -972,14 +991,14 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
       const detail = (event as CustomEvent<{
         paneId?: string;
         tabId?: string;
-        provider?: TGitAskProvider;
+        provider?: string;
       }>).detail;
       if (detail?.paneId !== paneId || detail.tabId !== activeTabId) return;
-      if (detail.provider !== 'claude' && detail.provider !== 'codex') return;
       const provider = detail.provider;
+      const panelType = panelTypeForProviderId(provider);
+      if (!provider || !panelType) return;
       void (async () => {
-        if (!await ensureAgentInstalled(provider)) return;
-        const panelType = provider === 'codex' ? 'codex-cli' : 'claude-code';
+        if (!await ensureAgentInstalled(provider as TAgentInstallProvider)) return;
         useTabStore.getState().setDetectedAgent(activeTabId, {
           running: true,
           checkedAt: Date.now(),
@@ -991,13 +1010,17 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
           void handleNewCodexSession();
           return;
         }
+        if (provider === 'grok') {
+          void handleNewGrokSession();
+          return;
+        }
         void handleNewClaudeSession();
       })();
     };
 
     window.addEventListener('purplemux-start-agent', handleStartAgentRequest);
     return () => window.removeEventListener('purplemux-start-agent', handleStartAgentRequest);
-  }, [activeTabId, ensureAgentInstalled, handleNewClaudeSession, handleNewCodexSession, handleSwitchPanelType, paneId]);
+  }, [activeTabId, ensureAgentInstalled, handleNewClaudeSession, handleNewCodexSession, handleNewGrokSession, handleSwitchPanelType, paneId]);
 
   const handleSwitchToAgentMode = useCallback(async () => {
     const prompt = agentModePrompt;
@@ -1271,6 +1294,17 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
                   onUpdatePromptResponse={onCodexUpdateResponse}
                   trustPrompt={trustPrompt}
                   onTrustResponse={onTrustResponse}
+                  scrollToBottomRef={scrollToBottomRef}
+                  addPendingMessageRef={addPendingMessageRef}
+                  removePendingMessageRef={removePendingMessageRef}
+                />
+              )}
+              {isGrok && activeTab && !showInitialLoading && activeTabId && (
+                <GrokPanel
+                  key={activeTab.sessionName}
+                  tabId={activeTabId}
+                  sessionName={activeTab.sessionName}
+                  onNewSession={handleNewGrokSession}
                   scrollToBottomRef={scrollToBottomRef}
                   addPendingMessageRef={addPendingMessageRef}
                   removePendingMessageRef={removePendingMessageRef}
