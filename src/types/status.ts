@@ -178,7 +178,7 @@ export interface IOrchestrationNudgeMessage {
 
 export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled';
 
-export type TAlertProviderId = 'claude' | 'codex';
+export type TAlertProviderId = 'claude' | 'codex' | 'grok';
 
 export interface IAlert {
   id: string;

@@ -7,6 +7,13 @@ import { readTailEntries, parseIncremental, parseJsonlContent } from './session-
 import { CodexParser, codexSessionIdFromJsonlPath, createCodexParser, parseCodexContent, readTailCodexEntries } from './session-parser-codex';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
+import { GROK_PROVIDER_ID } from '@/lib/providers/grok';
+import {
+  readGrokTimelineInit,
+  readGrokTimelineTail,
+  watchGrokDb,
+  type IGrokDbWatcher,
+} from '@/lib/providers/grok/timeline-source';
 import { isCodexJsonlPath } from './path-validation';
 import { open as fsOpen } from 'fs/promises';
 import { createReadStream } from 'fs';
@@ -60,6 +67,8 @@ interface ITimelineConnection {
   heartbeatTimer: ReturnType<typeof setInterval>;
   lastHeartbeat: number;
   currentJsonlPath: string | null;
+  /** grok has no transcript file; its subscription is keyed by session id. */
+  currentGrokSessionId: string | null;
   cleaned: boolean;
 }
 
@@ -89,17 +98,26 @@ const gTimeline = globalThis as unknown as {
   __pmuxTimelineFileWatchers?: Map<string, IFileWatcher>;
   __pmuxTimelineSessionWatchers?: Map<string, ISessionWatcher>;
   __pmuxTimelinePendingJsonlWatchers?: Map<string, IJsonlWatcher>;
+  __pmuxTimelineGrokSubscriptions?: Map<string, IGrokSubscription>;
 };
+
+interface IGrokSubscription {
+  watcher: IGrokDbWatcher;
+  connections: Set<WebSocket>;
+  lastMessageSeq: number;
+}
 
 if (!gTimeline.__pmuxTimelineConnections) gTimeline.__pmuxTimelineConnections = new Map();
 if (!gTimeline.__pmuxTimelineFileWatchers) gTimeline.__pmuxTimelineFileWatchers = new Map();
 if (!gTimeline.__pmuxTimelineSessionWatchers) gTimeline.__pmuxTimelineSessionWatchers = new Map();
 if (!gTimeline.__pmuxTimelinePendingJsonlWatchers) gTimeline.__pmuxTimelinePendingJsonlWatchers = new Map();
+if (!gTimeline.__pmuxTimelineGrokSubscriptions) gTimeline.__pmuxTimelineGrokSubscriptions = new Map();
 
 const connections = gTimeline.__pmuxTimelineConnections;
 const fileWatchers = gTimeline.__pmuxTimelineFileWatchers;
 const sessionWatchers = gTimeline.__pmuxTimelineSessionWatchers;
 const pendingJsonlWatchers = gTimeline.__pmuxTimelinePendingJsonlWatchers;
+const grokSubscriptions = gTimeline.__pmuxTimelineGrokSubscriptions;
 
 const canSend = (ws: WebSocket): boolean =>
   ws.readyState === WebSocket.OPEN && ws.bufferedAmount < BACKPRESSURE_LIMIT;
@@ -608,6 +626,90 @@ const watchForJsonlFile = (
   pendingJsonlWatchers.set(sessionName, { stop });
 };
 
+/**
+ * grok's transcript lives in `~/.grok/grok.db`, so its subscription is keyed by
+ * session id and fed by a store watcher instead of a file offset. Everything
+ * else on the wire — `timeline:init`, `timeline:append`, `sessionKey` — is
+ * identical to the JSONL providers.
+ */
+const subscribeToGrokSession = async (
+  ws: WebSocket,
+  sessionId: string,
+  sessionName: string,
+  provider: IAgentProvider,
+): Promise<void> => {
+  const init = readGrokTimelineInit(sessionId, MAX_INIT_ENTRIES);
+
+  let sub = grokSubscriptions.get(sessionId);
+  if (!sub) {
+    if (grokSubscriptions.size >= MAX_WATCHERS) {
+      sendJson(ws, { type: 'timeline:error', code: 'max-watchers', message: 'Too many active watchers' });
+      return;
+    }
+    sub = {
+      watcher: watchGrokDb(() => flushGrokAppend(sessionId)),
+      connections: new Set(),
+      lastMessageSeq: init.lastMessageSeq,
+    };
+    grokSubscriptions.set(sessionId, sub);
+  }
+  sub.connections.add(ws);
+  sub.lastMessageSeq = Math.max(sub.lastMessageSeq, init.lastMessageSeq);
+
+  sendJson(ws, {
+    type: 'timeline:init',
+    entries: init.entries,
+    sessionId,
+    sessionKey: buildSessionKey({
+      provider: provider.id,
+      workspaceId: null,
+      sessionId,
+    }),
+    totalEntries: init.totalEntries,
+    startByteOffset: 0,
+    hasMore: init.hasMore,
+    jsonlPath: null,
+    ...(init.summary ? { summary: init.summary } : {}),
+    meta: init.meta,
+    sessionStats: init.sessionStats,
+  });
+
+  await updateTabAgentState(sessionName, provider, {
+    sessionId,
+    jsonlPath: null,
+    summary: init.summary,
+  }).catch(() => {});
+
+  const lastMsg = findLastUserMessage(init.entries);
+  if (lastMsg && sessionName) {
+    await updateTabLastUserMessage(sessionName, lastMsg).catch(() => {});
+    getStatusManager().notifyLastUserMessage(sessionName, lastMsg);
+  }
+};
+
+const flushGrokAppend = (sessionId: string): void => {
+  const sub = grokSubscriptions.get(sessionId);
+  if (!sub || sub.connections.size === 0) return;
+
+  const { entries, lastMessageSeq } = readGrokTimelineTail(sessionId, sub.lastMessageSeq);
+  if (lastMessageSeq > sub.lastMessageSeq) sub.lastMessageSeq = lastMessageSeq;
+  if (entries.length === 0) return;
+
+  const payload = JSON.stringify({ type: 'timeline:append', entries } satisfies TTimelineServerMessage);
+  for (const ws of sub.connections) {
+    if (canSend(ws)) ws.send(payload);
+  }
+};
+
+const unsubscribeFromGrokSession = (ws: WebSocket, sessionId: string): void => {
+  const sub = grokSubscriptions.get(sessionId);
+  if (!sub) return;
+  sub.connections.delete(ws);
+  if (sub.connections.size > 0) return;
+  sub.watcher.stop();
+  grokSubscriptions.delete(sessionId);
+};
+
 const cleanup = (conn: ITimelineConnection) => {
   if (conn.cleaned) return;
   conn.cleaned = true;
@@ -617,6 +719,10 @@ const cleanup = (conn: ITimelineConnection) => {
 
   if (conn.currentJsonlPath) {
     unsubscribeFromFile(conn.ws, conn.currentJsonlPath);
+  }
+  if (conn.currentGrokSessionId) {
+    unsubscribeFromGrokSession(conn.ws, conn.currentGrokSessionId);
+    conn.currentGrokSessionId = null;
   }
 
   const wsKey = conn.sessionName;
@@ -672,6 +778,14 @@ const handleResumeMessage = async (
     if (parsed) getStatusManager().markAgentLaunch(parsed.tabId);
 
     await updateTabAgentSessionId(conn.sessionName, conn.provider, sessionId).catch(() => {});
+
+    if (conn.provider.id === GROK_PROVIDER_ID) {
+      sendJson(ws, { type: 'timeline:resume-started', sessionId, jsonlPath: null });
+      if (conn.currentGrokSessionId) unsubscribeFromGrokSession(ws, conn.currentGrokSessionId);
+      conn.currentGrokSessionId = sessionId;
+      await subscribeToGrokSession(ws, sessionId, conn.sessionName, conn.provider);
+      return;
+    }
 
     const jsonlPath = await resolveJsonlPath(tmuxSession, sessionId, conn.provider);
 
@@ -750,6 +864,7 @@ export const handleTimelineConnection = async (ws: WebSocket, request: IncomingM
     heartbeatTimer,
     lastHeartbeat,
     currentJsonlPath: null,
+    currentGrokSessionId: null,
     cleaned: false,
   };
 
@@ -831,7 +946,17 @@ export const handleTimelineConnection = async (ws: WebSocket, request: IncomingM
 
   const effectiveSessionId = sessionInfo.sessionId ?? hintSessionId;
 
-  if (sessionInfo.jsonlPath) {
+  if (provider.id === GROK_PROVIDER_ID) {
+    if (effectiveSessionId) {
+      if (sessionInfo.sessionId) {
+        await updateTabAgentSessionId(conn.sessionName, provider, sessionInfo.sessionId).catch(() => {});
+      }
+      conn.currentGrokSessionId = effectiveSessionId;
+      await subscribeToGrokSession(ws, effectiveSessionId, conn.sessionName, provider);
+    } else if (!isAgentStarting) {
+      sendEmptyInit(ws, '', sessionInfo.status === 'running');
+    }
+  } else if (sessionInfo.jsonlPath) {
     conn.currentJsonlPath = sessionInfo.jsonlPath;
     if (sessionInfo.sessionId) {
       await updateTabAgentSessionId(conn.sessionName, provider, sessionInfo.sessionId).catch(() => {});
@@ -859,6 +984,23 @@ export const handleTimelineConnection = async (ws: WebSocket, request: IncomingM
   if (!sessionWatchers.has(wsKey)) {
     const sw = provider.watchSessions(panePid, async (newInfo) => {
       const wsConns = getSessionConnections(sessionName);
+
+      if (provider.id === GROK_PROVIDER_ID) {
+        for (const c of wsConns) {
+          if (!newInfo.sessionId || newInfo.sessionId === c.currentGrokSessionId) continue;
+          if (c.currentGrokSessionId) unsubscribeFromGrokSession(c.ws, c.currentGrokSessionId);
+          c.currentGrokSessionId = newInfo.sessionId;
+          await updateTabAgentSessionId(sessionName, provider, newInfo.sessionId).catch(() => {});
+          sendJson(c.ws, {
+            type: 'timeline:session-changed',
+            newSessionId: newInfo.sessionId,
+            reason: 'new-session-started',
+          });
+          await subscribeToGrokSession(c.ws, newInfo.sessionId, sessionName, provider);
+        }
+        return;
+      }
+
       for (const c of wsConns) {
         if (newInfo.jsonlPath && newInfo.jsonlPath !== c.currentJsonlPath) {
           cancelJsonlWatcher(sessionName);
@@ -927,7 +1069,13 @@ export const handleTimelineConnection = async (ws: WebSocket, request: IncomingM
     sessionWatchers.set(wsKey, sw);
   }
 
-  if (sessionInfo.status === 'running' && !sessionInfo.jsonlPath && sessionInfo.sessionId && sessionInfo.cwd) {
+  if (
+    provider.id !== GROK_PROVIDER_ID
+    && sessionInfo.status === 'running'
+    && !sessionInfo.jsonlPath
+    && sessionInfo.sessionId
+    && sessionInfo.cwd
+  ) {
     watchForJsonlFile(sessionName, sessionInfo.sessionId, sessionInfo.cwd, provider);
   }
 
@@ -942,7 +1090,18 @@ export const handleTimelineConnection = async (ws: WebSocket, request: IncomingM
     if (recheckInfo.status === 'running' && recheckInfo.sessionId && !conn.currentJsonlPath) {
       await updateTabAgentSessionId(sessionName, provider, recheckInfo.sessionId).catch(() => {});
 
-      if (recheckInfo.jsonlPath) {
+      if (provider.id === GROK_PROVIDER_ID) {
+        if (conn.currentGrokSessionId !== recheckInfo.sessionId) {
+          if (conn.currentGrokSessionId) unsubscribeFromGrokSession(ws, conn.currentGrokSessionId);
+          conn.currentGrokSessionId = recheckInfo.sessionId;
+          sendJson(ws, {
+            type: 'timeline:session-changed',
+            newSessionId: recheckInfo.sessionId,
+            reason: 'new-session-started',
+          });
+          await subscribeToGrokSession(ws, recheckInfo.sessionId, sessionName, provider);
+        }
+      } else if (recheckInfo.jsonlPath) {
         conn.currentJsonlPath = recheckInfo.jsonlPath;
         sendJson(ws, {
           type: 'timeline:session-changed',
@@ -982,4 +1141,8 @@ export const gracefulTimelineShutdown = () => {
   for (const [jsonlPath] of fileWatchers) {
     removeFileWatcher(jsonlPath);
   }
+  for (const [, sub] of grokSubscriptions) {
+    sub.watcher.stop();
+  }
+  grokSubscriptions.clear();
 };

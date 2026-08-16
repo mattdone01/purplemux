@@ -1,5 +1,6 @@
 import { memo } from 'react';
 import { useTranslations } from 'next-intl';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 import Spinner from '@/components/ui/spinner';
 import useTabStore, { selectTabDisplayStatus } from '@/hooks/use-tab-store';
 import type { TPanelType } from '@/types/terminal';
@@ -15,7 +16,7 @@ const TabStatusIndicator = ({ tabId, panelType }: ITabStatusIndicatorProps) => {
     (state) => selectTabDisplayStatus(state.tabs, tabId),
   );
 
-  const isAgent = panelType === 'claude-code' || panelType === 'codex-cli';
+  const isAgent = isAgentPanelType(panelType);
   const visible = isAgent && status !== 'idle';
 
   return (

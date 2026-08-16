@@ -2,28 +2,21 @@ import { toast } from 'sonner';
 import { t } from '@/lib/i18n';
 import type { TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
-
-type TAgentPanelType = Extract<TPanelType, 'claude-code' | 'codex-cli'>;
+import {
+  agentDisplayName,
+  isAgentPanelType,
+  panelTypeForProviderId,
+  type TAgentPanelType,
+} from '@/lib/agent-panel-types';
 
 export const isAgentPanel = (
   panelType: TPanelType | undefined,
-): panelType is TAgentPanelType =>
-  panelType === 'claude-code' || panelType === 'codex-cli';
+): panelType is TAgentPanelType => isAgentPanelType(panelType);
 
 export const isAgentRunning = (cliState: TCliState | undefined): boolean =>
   cliState !== undefined && cliState !== 'inactive' && cliState !== 'unknown';
 
-export const getAgentPanelTypeFromProvider = (providerId: string | undefined): TAgentPanelType | undefined => {
-  if (providerId === 'claude') return 'claude-code';
-  if (providerId === 'codex') return 'codex-cli';
-  return undefined;
-};
-
-const agentDisplayName = (panelType: TPanelType | undefined): string => {
-  if (panelType === 'claude-code') return 'Claude';
-  if (panelType === 'codex-cli') return 'Codex';
-  return '';
-};
+export const getAgentPanelTypeFromProvider = panelTypeForProviderId;
 
 interface IAgentSwitchInput {
   current: TPanelType | undefined;

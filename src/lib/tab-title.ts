@@ -23,8 +23,11 @@ export const isShellProcess = (raw: string): boolean => {
   return cmd !== null && SHELL_NAMES.has(cmd);
 };
 
+const GROK_PROCESS_NAMES = new Set(['grok', 'bun']);
+
 const normalizeProcessTitle = (title: string, panelType?: TPanelType): string => {
   if (panelType === 'codex-cli' && CODEX_PROCESS_NAMES.has(title)) return 'Codex';
+  if (panelType === 'grok-cli' && GROK_PROCESS_NAMES.has(title)) return 'Grok';
   return title;
 };
 

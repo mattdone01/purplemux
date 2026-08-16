@@ -27,5 +27,9 @@
   "codexMissingTitle": "Codex CLI is not installed",
   "codexMissingDescription": "Open the Codex CLI install guide, or cancel and install it manually before starting a Codex tab.",
   "preflightFailedTitle": "Could not check agent tools",
-  "preflightFailedDescription": "purplemux could not verify the agent CLI installation. The current action was canceled."
+  "preflightFailedDescription": "purplemux could not verify the agent CLI installation. The current action was canceled.",
+  "grokMissingTitle": "Grok CLI is not installed",
+  "grokMissingDescription": "Install grok-cli, then set GROK_API_KEY or add an apiKey to ~/.grok/user-settings.json.",
+  "grokLabel": "Grok",
+  "grokOptional": "可选"
 }

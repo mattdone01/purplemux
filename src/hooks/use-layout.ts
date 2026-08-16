@@ -10,6 +10,8 @@ import useTabStore from '@/hooks/use-tab-store';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import useTabMetadataStore from '@/hooks/use-tab-metadata-store';
 import { resolveTabNameForPanelTypeChange } from '@/lib/tab-name';
+import { isAgentPanelType, panelTypeForProviderId } from '@/lib/agent-panel-types';
+import type { TSessionHistoryProvider } from '@/types/session-history';
 import {
   collectPanes,
   collectAllTabs,
@@ -614,7 +616,7 @@ const useLayoutStore = create<ILayoutState>((set, get) => ({
         const nextName = resolveTabNameForPanelTypeChange(t.name, t.panelType, panelType);
         const updated: ITab = { ...t, panelType, name: nextName };
         if (nextName !== t.name) resolvedName = nextName;
-        if (panelType === 'codex-cli' && t.panelType === 'claude-code') {
+        if (isAgentPanelType(panelType) && isAgentPanelType(t.panelType) && panelType !== t.panelType) {
           updated.claudeSessionId = null;
           updated.agentState = undefined;
         }
@@ -763,13 +765,15 @@ export const navigateToTabOrCreate = async (
   agentSessionId: string | null,
   workspaceName: string,
   workspaceDir: string | null,
-  providerId: 'claude' | 'codex' = 'claude',
+  providerId: TSessionHistoryProvider = 'claude',
 ): Promise<void> => {
   const wsStore = useWorkspaceStore.getState();
 
-  const panelType: TPanelType = providerId === 'codex' ? 'codex-cli' : 'claude-code';
+  const panelType: TPanelType = panelTypeForProviderId(providerId) ?? 'claude-code';
   const matchSessionId = (tab: ITab): boolean => {
-    if (providerId === 'codex') return tab.agentState?.providerId === 'codex' && tab.agentState.sessionId === agentSessionId;
+    if (providerId !== 'claude') {
+      return tab.agentState?.providerId === providerId && tab.agentState.sessionId === agentSessionId;
+    }
     return tab.agentState?.providerId === 'claude'
       ? tab.agentState.sessionId === agentSessionId
       : tab.claudeSessionId === agentSessionId;

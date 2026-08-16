@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import type { TAgentPanelType } from '@/lib/agent-panel-types';
 import type {
   ITimelineEntry,
   IInitMeta,
@@ -26,7 +27,7 @@ interface IUseTimelineOptions {
   sessionName: string;
   agentSessionId?: string | null;
   claudeSessionId?: string | null;
-  panelType?: 'claude-code' | 'codex-cli';
+  panelType?: TAgentPanelType;
   enabled: boolean;
   resumeCallbacks?: IResumeCallbacks;
   onSync?: (state: ITimelineSyncState) => void;

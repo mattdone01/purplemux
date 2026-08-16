@@ -231,6 +231,13 @@ export const ACTIONS = {
     defaultKey: `${mod}+shift+x`,
     display: { mac: '⌘⇧X', other: 'Ctrl+Shift+X' },
   },
+  'view.mode_grok': {
+    id: 'view.mode_grok',
+    label: 'Switch to Grok mode',
+    category: 'view',
+    defaultKey: `${mod}+shift+g`,
+    display: { mac: '⌘⇧G', other: 'Ctrl+Shift+G' },
+  },
   'view.mode_diff': {
     id: 'view.mode_diff',
     label: 'Toggle Git panel',

@@ -1,5 +1,8 @@
 export type TPeriod = 'today' | '7d' | '30d' | 'all';
 
+/** Providers whose usage the stats surfaces attribute separately. */
+export type TStatsProvider = 'claude' | 'codex' | 'grok';
+
 // --- stats-cache.json ---
 
 export interface IStatsCacheDailyActivity {
@@ -9,8 +12,10 @@ export interface IStatsCacheDailyActivity {
   toolCallCount: number;
   claudeMessageCount?: number;
   codexMessageCount?: number;
+  grokMessageCount?: number;
   claudeSessionCount?: number;
   codexSessionCount?: number;
+  grokSessionCount?: number;
 }
 
 export interface ITokenBreakdown {
@@ -79,7 +84,7 @@ export interface IOverviewResponse {
     cacheCreation5m: number;
     cacheCreation1h: number;
     cost: number;
-    provider?: 'claude' | 'codex';
+    provider?: TStatsProvider;
     model?: string | null;
     cachedInput?: number;
   }>;

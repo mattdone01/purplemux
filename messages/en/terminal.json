@@ -92,6 +92,7 @@
   "copyPaneCopyFailed": "Failed to copy",
   "codexNotInstalled": "Install Codex CLI: npm i -g @openai/codex or brew install --cask codex",
   "codexHookInstallFailed": "Codex hook installation failed. State detection may be inaccurate.",
+  "grokHookInstallFailed": "Grok hook installation failed. State detection may be inaccurate.",
   "codexConfigParseFailed": "Failed to parse ~/.codex/config.toml. Only purplemux hooks applied.",
   "codexLaunchFailed": "Codex launch failed. Check the terminal.",
   "codexResumeFailed": "Codex resume failed.",
@@ -153,5 +154,10 @@
   "codexUpdateRunning": "Updating Codex...",
   "codexUpdateRunningHint": "This can take a few seconds. Codex will restart when the update finishes.",
   "codexUpdateSuccess": "Update finished. Restarting Codex...",
-  "codexUpdateRestarting": "Restarting Codex"
+  "codexUpdateRestarting": "Restarting Codex",
+  "grokNewConversation": "Grok",
+  "grokLaunchFailed": "Failed to start Grok.",
+  "grokNotInstalled": "Install Grok CLI: npm i -g @openai/codex or brew install --cask codex",
+  "grokInactiveMessage": "Grok session is not running",
+  "grokStartSession": "Start Grok"
 }

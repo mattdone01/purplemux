@@ -14,6 +14,9 @@ import TerminalContainer from '@/components/features/workspace/terminal-containe
 import ConnectionStatus from '@/components/features/workspace/connection-status';
 import MobileClaudeCodePanel from '@/components/features/mobile/mobile-claude-code-panel';
 import MobileCodexPanel from '@/components/features/mobile/mobile-codex-panel';
+import MobileGrokPanel from '@/components/features/mobile/mobile-grok-panel';
+import { fetchGrokLaunchCommand } from '@/lib/providers/grok/client';
+import { panelTypeForProviderId } from '@/lib/agent-panel-types';
 import AgentSessionsPanel from '@/components/features/workspace/agent-sessions-panel';
 import MobileTerminalToolbar from '@/components/features/mobile/mobile-terminal-toolbar';
 import PaneAgentModePrompt from '@/components/features/workspace/pane-agent-mode-prompt';
@@ -27,7 +30,7 @@ import useConfigStore, { type TGitAskProvider } from '@/hooks/use-config-store';
 import { resolveLineHeight } from '@/lib/terminal-line-height';
 import useTrustPromptDetector from '@/hooks/use-trust-prompt-detector';
 import useCodexUpdatePromptDetector from '@/hooks/use-codex-update-prompt-detector';
-import { useAgentInstallCheck } from '@/hooks/use-agent-install-check';
+import { useAgentInstallCheck, type TAgentInstallProvider } from '@/hooks/use-agent-install-check';
 import { buildClaudeLaunchCommand } from '@/lib/providers/claude/client';
 import { fetchCodexLaunchCommand } from '@/lib/providers/codex/client';
 import { sendCodexQuitCommand } from '@/lib/agent-terminal-commands';
@@ -113,8 +116,9 @@ const MobileSurfaceView = ({
   const activeTab = tabs.find((tab) => tab.id === activeTabId);
   const isClaudeCode = panelType === 'claude-code';
   const isCodex = panelType === 'codex-cli';
+  const isGrok = panelType === 'grok-cli';
   const isAgentSessionList = panelType === 'agent-sessions';
-  const isAgentPanel = isClaudeCode || isCodex;
+  const isAgentPanel = isAgentPanelType(panelType);
   const usesHiddenTerminal = isAgentPanel || isAgentSessionList;
   const isWebBrowser = panelType === 'web-browser';
   const isDiff = panelType === 'diff';
@@ -508,6 +512,21 @@ const MobileSurfaceView = ({
     sendStdin(`${command}\r`);
   }, [status, sendStdin, activeTabId, buildCodexCommand, ensureAgentInstalled, markAgentLaunch, tt]);
 
+  const handleNewGrokSession = useCallback(async () => {
+    if (status !== 'connected' || !activeTabId) return;
+    if (!await ensureAgentInstalled('grok')) return;
+    let command: string;
+    try {
+      command = await fetchGrokLaunchCommand();
+    } catch {
+      toast.error(tt('grokLaunchFailed'));
+      return;
+    }
+    markAgentLaunch(activeTabId, { resetAgentSession: true });
+    useTabStore.getState().setSessionView(activeTabId, 'timeline');
+    sendStdin(`${command}\r`);
+  }, [status, sendStdin, activeTabId, ensureAgentInstalled, markAgentLaunch, tt]);
+
   const handleNewClaudeFromSessionList = useCallback(async () => {
     if (!activeTabId) return;
     if (!await ensureAgentInstalled('claude')) return;
@@ -584,16 +603,21 @@ const MobileSurfaceView = ({
     const handleStartAgentRequest = (event: Event) => {
       const detail = (event as CustomEvent<{
         tabId?: string;
-        provider?: TGitAskProvider;
+        provider?: string;
       }>).detail;
       if (detail?.tabId !== activeTabId) return;
-      if (detail.provider !== 'claude' && detail.provider !== 'codex') return;
       const provider = detail.provider;
+      const nextPanelType = panelTypeForProviderId(provider);
+      if (!provider || !nextPanelType) return;
       void (async () => {
-        if (!await ensureAgentInstalled(provider)) return;
-        onUpdateTabPanelType(paneId, activeTabId, provider === 'codex' ? 'codex-cli' : 'claude-code');
+        if (!await ensureAgentInstalled(provider as TAgentInstallProvider)) return;
+        onUpdateTabPanelType(paneId, activeTabId, nextPanelType);
         if (provider === 'codex') {
           void handleNewCodexSession();
+          return;
+        }
+        if (provider === 'grok') {
+          void handleNewGrokSession();
           return;
         }
         void handleNewClaudeSession();
@@ -602,7 +626,7 @@ const MobileSurfaceView = ({
 
     window.addEventListener('purplemux-start-agent', handleStartAgentRequest);
     return () => window.removeEventListener('purplemux-start-agent', handleStartAgentRequest);
-  }, [activeTabId, ensureAgentInstalled, handleNewClaudeSession, handleNewCodexSession, onUpdateTabPanelType, paneId]);
+  }, [activeTabId, ensureAgentInstalled, handleNewClaudeSession, handleNewCodexSession, handleNewGrokSession, onUpdateTabPanelType, paneId]);
 
   useEffect(() => {
     if (!pendingRestartRef.current || agentProcess === true) return;
@@ -814,6 +838,20 @@ const MobileSurfaceView = ({
           onUpdatePromptResponse={onCodexUpdateResponse}
           trustPrompt={trustPrompt}
           onTrustResponse={onTrustResponse}
+        />
+      )}
+
+      {isGrok && activeTab && (
+        <MobileGrokPanel
+          tabId={activeTabId ?? undefined}
+          wsId={layoutWsId ?? undefined}
+          sessionName={activeTab.sessionName}
+          sendStdin={sendWebStdin}
+          terminalWsConnected={status === 'connected'}
+          focusTerminal={focus}
+          focusInputRef={focusInputRef}
+          setInputValueRef={setInputValueRef}
+          onNewSession={handleNewGrokSession}
         />
       )}
 

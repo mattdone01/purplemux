@@ -4,6 +4,7 @@ import { Crown, History, Plus, Globe } from 'lucide-react';
 import Spinner from '@/components/ui/spinner';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
+import GrokIcon from '@/components/icons/grok-icon';
 import ProcessIcon from '@/components/icons/process-icon';
 import { cn } from '@/lib/utils';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -14,9 +15,11 @@ import useIsMobile from '@/hooks/use-is-mobile';
 import useIsMac from '@/hooks/use-is-mac';
 import { buildClaudeLaunchCommand } from '@/lib/providers/claude/client';
 import { fetchCodexLaunchCommand } from '@/lib/providers/codex/client';
+import { fetchGrokLaunchCommand } from '@/lib/providers/grok/client';
+import { toast } from 'sonner';
 import { notifyCodexLaunchFailed } from '@/lib/codex-notifications';
 import useConfigStore from '@/hooks/use-config-store';
-import { useAgentInstallCheck } from '@/hooks/use-agent-install-check';
+import { useAgentInstallCheck, type TAgentInstallProvider } from '@/hooks/use-agent-install-check';
 import StartOrchestrationDialog from '@/components/features/workspace/start-orchestration-dialog';
 
 interface IPaneNewTabMenuProps {
@@ -47,6 +50,7 @@ const defaultKeyForPanelType = (panelType?: TPanelType): string => {
     case 'terminal': return 'terminal';
     case 'web-browser': return 'web-browser';
     case 'codex-cli': return 'codex';
+    case 'grok-cli': return 'grok';
     case 'agent-sessions': return 'agent-sessions';
     case 'diff':
     case 'claude-code':
@@ -70,6 +74,7 @@ const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IP
     const all = [
       { key: 'claude', type: 'claude-code' as const, icon: <ClaudeCodeIcon className="h-3.5 w-3.5" />, label: t('claudeNewConversation'), startAgent: 'claude' as const },
       { key: 'codex', type: 'codex-cli' as const, icon: <OpenAIIcon className="h-3.5 w-3.5" />, label: t('codexNewConversation'), startAgent: 'codex' as const },
+      { key: 'grok', type: 'grok-cli' as const, icon: <GrokIcon className="h-3.5 w-3.5" />, label: t('grokNewConversation'), startAgent: 'grok' as const },
       { key: 'orchestrate', type: 'claude-code' as const, icon: <Crown className="h-3.5 w-3.5 text-ui-amber" />, label: to('startOrchestration') },
       { key: 'agent-sessions', type: 'agent-sessions' as const, icon: <History className="h-3.5 w-3.5 text-muted-foreground" />, label: t('sessionList') },
       { key: 'terminal', type: 'terminal' as const, icon: <ProcessIcon className="h-3.5 w-3.5 text-muted-foreground" />, label: 'Terminal' },
@@ -118,8 +123,21 @@ const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IP
     }
   }, [codexI18n, ensureAgentInstalled, onCreateTab, wsId]);
 
-  const handleStartAgent = useCallback(async (agent: 'claude' | 'codex') => {
+  const launchGrokNewConversation = useCallback(async () => {
+    if (!await ensureAgentInstalled('grok')) return;
+    try {
+      onCreateTab('grok-cli', { command: await fetchGrokLaunchCommand() });
+    } catch {
+      toast.error(t('grokLaunchFailed'));
+    }
+  }, [ensureAgentInstalled, onCreateTab, t]);
+
+  const handleStartAgent = useCallback(async (agent: TAgentInstallProvider) => {
     setOpen(false);
+    if (agent === 'grok') {
+      void launchGrokNewConversation();
+      return;
+    }
     if (agent === 'claude') {
       if (!await ensureAgentInstalled('claude')) return;
       const cmd = buildClaudeLaunchCommand({
@@ -130,7 +148,7 @@ const PaneNewTabMenu = ({ paneId, isCreating, activePanelType, onCreateTab }: IP
       return;
     }
     void launchCodexNewConversation();
-  }, [ensureAgentInstalled, launchCodexNewConversation, onCreateTab, wsId]);
+  }, [ensureAgentInstalled, launchCodexNewConversation, launchGrokNewConversation, onCreateTab, wsId]);
 
   const handleOpenList = (item: typeof menuItems[number]) => {
     setOpen(false);

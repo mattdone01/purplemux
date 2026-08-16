@@ -396,6 +396,15 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
       durationMs: 8000,
     });
   }
+  if (hookResult.grokHookInstallFailed) {
+    enqueueSystemToast({
+      type: 'system-toast',
+      key: 'grokHookInstallFailed',
+      variant: 'warning',
+      message: 'Grok hook installation failed. State detection may be inaccurate.',
+      durationMs: 8000,
+    });
+  }
   getCliToken();
   const { workspaces } = await getWorkspaces();
   await writeAllWorkspacePrompts(workspaces);

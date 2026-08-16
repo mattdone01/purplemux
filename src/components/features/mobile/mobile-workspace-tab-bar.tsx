@@ -1,4 +1,5 @@
 import { useRef, useEffect, useMemo } from 'react';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 import { Globe, GitCompareArrows, History } from 'lucide-react';
 import useTabStore, { selectTabDisplayStatus } from '@/hooks/use-tab-store';
 import { cn } from '@/lib/utils';
@@ -82,7 +83,7 @@ const MobileWorkspaceTabBar = ({
             item.workspaceId === activeWorkspaceId &&
             item.paneId === selectedPaneId &&
             item.tabId === selectedTabId;
-          const isAgent = item.panelType === 'claude-code' || item.panelType === 'codex-cli';
+          const isAgent = isAgentPanelType(item.panelType);
           const status = selectTabDisplayStatus(statusTabs, item.tabId);
           const termStatus = statusTabs[item.tabId]?.terminalStatus;
           const currentProcess = statusTabs[item.tabId]?.currentProcess;
