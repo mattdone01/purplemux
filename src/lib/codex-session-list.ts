@@ -246,6 +246,79 @@ export const listCodexSessions = async ({
   return { sessions, scannedDirs, scannedFiles };
 };
 
+export interface ICodexSessionHead {
+  sessionId: string | null;
+  cwd: string | null;
+}
+
+const HEAD_BYTES = 8192;
+
+/**
+ * `session_meta` from the first record, without streaming the rest of the file.
+ * A whole-corpus walk needs the cwd of every rollout to attribute it to a
+ * workspace, and `extractMeta` pays for a full read to count turns.
+ */
+export const readCodexSessionHead = async (jsonlPath: string): Promise<ICodexSessionHead> => {
+  let raw: string;
+  try {
+    const handle = await fs.open(jsonlPath, 'r');
+    try {
+      const buffer = Buffer.alloc(HEAD_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, HEAD_BYTES, 0);
+      raw = buffer.subarray(0, bytesRead).toString('utf-8');
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return { sessionId: null, cwd: null };
+  }
+
+  const newline = raw.indexOf('\n');
+  const firstLine = (newline >= 0 ? raw.slice(0, newline) : raw).trim();
+  if (!firstLine) return { sessionId: null, cwd: null };
+
+  try {
+    const parsed = JSON.parse(firstLine) as { type?: string; payload?: ICodexSessionMetaPayload };
+    if (parsed.type !== 'session_meta' || !parsed.payload) return { sessionId: null, cwd: null };
+    return { sessionId: parsed.payload.id ?? null, cwd: parsed.payload.cwd ?? null };
+  } catch {
+    return { sessionId: null, cwd: null };
+  }
+};
+
+const YEAR_MONTH_DAY_DEPTH = 3;
+
+const walkSessionDir = async (dir: string, depth: number): Promise<string[]> => {
+  let dirents;
+  try {
+    dirents = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  if (depth === 0) {
+    return dirents
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
+      .map((entry) => path.join(dir, entry.name));
+  }
+
+  const nested = await Promise.all(
+    dirents
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => walkSessionDir(path.join(dir, entry.name), depth - 1)),
+  );
+  return nested.flat();
+};
+
+/**
+ * Every rollout under `~/.codex/sessions`, whatever its date. `listCodexSessions`
+ * walks a rolling window of day directories because a session picker only shows
+ * recent work; a search that silently stopped 30 days back would report a wrong
+ * `total`.
+ */
+export const listCodexSessionFiles = async (): Promise<string[]> =>
+  walkSessionDir(SESSIONS_ROOT, YEAR_MONTH_DAY_DEPTH);
+
 export const clearCodexSessionListCache = (): void => {
   cache.clear();
 };
