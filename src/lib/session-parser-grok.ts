@@ -437,14 +437,17 @@ export class GrokParser {
 
   async parseTail(maxEntries: number): Promise<IChunkReadResult> {
     this.reset();
-    let content: string;
+    let bytes: Buffer;
     try {
-      content = await fs.readFile(this.jsonlPath, 'utf-8');
+      // Bytes, never a decoded string: a live `updates.jsonl` normally ends
+      // mid-record, and a cut inside a multi-byte character decodes to U+FFFD,
+      // which re-encodes at 3 bytes. Measuring that decode overshoots the real
+      // size, so the next incremental read would start past bytes it never saw.
+      bytes = await fs.readFile(this.jsonlPath);
     } catch {
       return emptyChunk();
     }
 
-    const bytes = Buffer.from(content, 'utf-8');
     const fileSize = bytes.length;
     const complete = splitCompleteLines(bytes, (line) => tryParse(line) !== undefined);
     const { entries, errorCount, nextOrdinal } = parseGrokLines(complete.content.split('\n'), 0, this.state);
@@ -529,19 +532,22 @@ export const readGrokEntriesBefore = async (
   beforeSeq: number,
   maxEntries: number,
 ): Promise<IChunkReadResult> => {
-  let content: string;
+  let bytes: Buffer;
   try {
-    content = await fs.readFile(jsonlPath, 'utf-8');
+    bytes = await fs.readFile(jsonlPath);
   } catch {
     return emptyChunk();
   }
+  // Same rule as `parseTail`: the size comes off the Buffer, and a trailing
+  // record torn mid-character is held back rather than parsed into U+FFFD.
+  const { content } = splitCompleteLines(bytes, (line) => tryParse(line) !== undefined);
   const all = parseGrokContent(content, grokSessionIdFromJsonlPath(jsonlPath) ?? '');
   const older = all.filter((entry) => (entry.seq ?? 0) < beforeSeq);
   const entries = older.slice(-maxEntries);
   return {
     entries,
     startByteOffset: entries.length > 0 ? entries[0].seq ?? 0 : 0,
-    fileSize: Buffer.byteLength(content, 'utf-8'),
+    fileSize: bytes.length,
     hasMore: older.length > entries.length,
     errorCount: 0,
   };

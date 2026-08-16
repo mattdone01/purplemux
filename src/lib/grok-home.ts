@@ -60,27 +60,46 @@ const exists = async (target: string): Promise<boolean> =>
   fs.access(target).then(() => true).catch(() => false);
 
 /**
+ * Points one shared entry at its counterpart in the real `~/.grok`.
+ *
+ * A shared entry is only linked once `~/.grok` has it, so grok running under
+ * the workspace home can have created a REAL file or directory there first —
+ * `memory/` with the workspace's own notes in it, for example. Only an absent
+ * path or an existing symlink is replaced; anything real is left where it is
+ * and reported, because the alternative is deleting data purplemux never wrote.
+ */
+const linkSharedEntry = async (home: string, wsId: string, entry: string): Promise<void> => {
+  const source = path.join(GROK_HOME, entry);
+  if (!(await exists(source))) return;
+
+  const link = path.join(home, entry);
+  const current = await fs.lstat(link).catch(() => null);
+  if (current && !current.isSymbolicLink()) {
+    log.warn(
+      `${entry} in ${wsId}'s grok home is a real ${current.isDirectory() ? 'directory' : 'file'}; `
+      + `leaving it in place instead of linking it to ${source}`,
+    );
+    return;
+  }
+
+  try {
+    if (current) await fs.rm(link, { force: true });
+    await fs.symlink(source, link);
+  } catch (err) {
+    log.warn(`could not link ${entry} into ${wsId}'s grok home: ${err instanceof Error ? err.message : err}`);
+  }
+};
+
+/**
  * Build (or repair) the workspace's private grok home and return its path for
- * `GROK_HOME`. Idempotent — safe to call on every pane launch. Links are
- * recreated each time so a process that replaced one with a regular file cannot
- * silently fork the shared credentials.
+ * `GROK_HOME`. Idempotent — safe to call on every pane launch. A link that
+ * stopped naming its shared entry is repointed on the next launch.
  */
 export const ensureWorkspaceGrokHome = async (wsId: string): Promise<string> => {
   const home = workspaceGrokHomeDir(wsId);
   await fs.mkdir(home, { recursive: true, mode: 0o700 });
   await Promise.all(PRIVATE_DIRS.map((dir) => fs.mkdir(path.join(home, dir), { recursive: true, mode: 0o700 })));
-
-  await Promise.all(SHARED_ENTRIES.map(async (entry) => {
-    const source = path.join(GROK_HOME, entry);
-    if (!(await exists(source))) return;
-    const link = path.join(home, entry);
-    try {
-      await fs.rm(link, { recursive: true, force: true });
-      await fs.symlink(source, link);
-    } catch (err) {
-      log.warn(`could not link ${entry} into ${wsId}'s grok home: ${err instanceof Error ? err.message : err}`);
-    }
-  }));
+  await Promise.all(SHARED_ENTRIES.map((entry) => linkSharedEntry(home, wsId, entry)));
 
   return home;
 };

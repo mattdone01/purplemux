@@ -78,11 +78,9 @@ exit 0
 `;
 
 /**
- * Grok Build pipes the hook payload as JSON on stdin and sets `GROK_HOOK_EVENT`
- * and `GROK_SESSION_ID` on every hook process (`10-hooks.md`, "Environment
- * Variables"). The body is forwarded verbatim — the server reads its camelCase
- * fields — and the event rides the query string so a hook whose stdin is empty
- * still reports.
+ * Grok Build pipes the hook payload as JSON on stdin. The body is forwarded
+ * verbatim and the route reads its camelCase fields — `hookEventName` included,
+ * so the event needs no query parameter of its own.
  *
  * The POST is detached and time-boxed: a `Stop` hook runs on the turn's
  * critical path, `PostToolUse` fires on every mutating tool call, and neither
@@ -105,7 +103,7 @@ BODY=$(cat)
 printf '%s' "$BODY" | curl -s -X POST -o /dev/null --max-time 2 \\
   -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
   --data-binary @- \\
-  "http://localhost:\${PORT}/api/status/hook?provider=grok&tmuxSession=\${SESSION}&event=\${GROK_HOOK_EVENT}" >/dev/null 2>&1 &
+  "http://localhost:\${PORT}/api/status/hook?provider=grok&tmuxSession=\${SESSION}" >/dev/null 2>&1 &
 exit 0
 `;
 

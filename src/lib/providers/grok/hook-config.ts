@@ -99,10 +99,10 @@ export const writeGrokHookFile = async (home: string, scriptPath: string): Promi
 };
 
 /**
- * The unscoped `~/.grok` (ad-hoc tabs) and every workspace grok home. A home
- * created later is covered on the next boot; `ensureWorkspaceGrokHome` does not
- * install hooks itself, so the launch path stays free of file writes it does
- * not own.
+ * The unscoped `~/.grok` (ad-hoc tabs) and every workspace grok home that exists
+ * at boot. A home created later is covered by the pane launch itself, which
+ * writes the hook file after `ensureWorkspaceGrokHome` (`tmux.ts`); the home
+ * builder does not install hooks, so it stays free of writes it does not own.
  */
 export const ensureGrokHookFiles = async (scriptPath: string): Promise<string[]> => {
   const written: string[] = [];

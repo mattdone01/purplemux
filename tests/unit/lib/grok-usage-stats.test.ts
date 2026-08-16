@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { parseGrokContent } from '@/lib/session-parser-grok';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 
@@ -61,6 +62,49 @@ describe('readGrokTurnTotals', () => {
     const content = await fs.readFile(path.join(FIXTURES, 'grok-session-tools', 'updates.jsonl'), 'utf-8');
 
     expect(usage.readGrokTurnTotals(content).userMessageTimestamps).toHaveLength(1);
+  });
+
+  const chunk = (kind: string, text: string, atMs: number) => JSON.stringify({
+    timestamp: Math.floor(atMs / 1000),
+    method: 'session/update',
+    params: {
+      sessionId: PLAIN,
+      update: { sessionUpdate: kind, content: { type: 'text', text } },
+      _meta: { agentTimestampMs: atMs },
+    },
+  });
+
+  const userMessageCount = (content: string) =>
+    parseGrokContent(content, PLAIN).filter((entry) => entry.type === 'user-message').length;
+
+  it('counts a slow multi-chunk prompt as the one message the transcript shows', async () => {
+    const { usage } = await importFresh();
+    const content = [
+      chunk('user_message_chunk', 'write the ', 1786853300000),
+      chunk('user_message_chunk', 'migration', 1786853305000),
+    ].join('\n');
+
+    expect(usage.readGrokTurnTotals(content).userMessageTimestamps).toHaveLength(userMessageCount(content));
+    expect(usage.readGrokTurnTotals(content).userMessageTimestamps).toHaveLength(1);
+  });
+
+  it('counts two prompts under a second apart as the two messages the transcript shows', async () => {
+    const { usage } = await importFresh();
+    const content = [
+      chunk('user_message_chunk', 'first', 1786853300000),
+      chunk('agent_message_chunk', 'on it', 1786853300100),
+      chunk('user_message_chunk', 'second', 1786853300200),
+    ].join('\n');
+
+    expect(usage.readGrokTurnTotals(content).userMessageTimestamps).toHaveLength(userMessageCount(content));
+    expect(usage.readGrokTurnTotals(content).userMessageTimestamps).toEqual([1786853300000, 1786853300200]);
+  });
+
+  it('does not count a run that carries no text', async () => {
+    const { usage } = await importFresh();
+    const content = chunk('user_message_chunk', '   ', 1786853300000);
+
+    expect(usage.readGrokTurnTotals(content).userMessageTimestamps).toHaveLength(userMessageCount(content));
   });
 });
 

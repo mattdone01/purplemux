@@ -75,17 +75,51 @@ describe('ensureWorkspaceGrokHome', () => {
     await expect(fs.lstat(path.join(grokHome, 'mcp_credentials.json'))).rejects.toThrow();
   });
 
-  it('repairs a link a process replaced with a regular file', async () => {
+  it('leaves a real directory grok wrote under the workspace home alone', async () => {
+    const { home } = await importFresh();
+    const real = await seedRealGrokHome();
+
+    // No ~/.grok/memory yet, so nothing is linked and grok writes a real one.
+    const grokHome = await home.ensureWorkspaceGrokHome(WS);
+    const memory = path.join(grokHome, 'memory');
+    await fs.mkdir(memory, { recursive: true });
+    await fs.writeFile(path.join(memory, 'notes.md'), 'workspace memory');
+
+    // One ad-hoc tab later, the shared entry exists and the link becomes eligible.
+    await fs.mkdir(path.join(real, 'memory'), { recursive: true });
+    await home.ensureWorkspaceGrokHome(WS);
+
+    expect((await fs.lstat(memory)).isSymbolicLink()).toBe(false);
+    expect(await fs.readFile(path.join(memory, 'notes.md'), 'utf-8')).toBe('workspace memory');
+  });
+
+  it('leaves a real file at a shared-entry path alone rather than deleting it', async () => {
     const { home } = await importFresh();
     await seedRealGrokHome();
 
     const grokHome = await home.ensureWorkspaceGrokHome(WS);
     await fs.rm(path.join(grokHome, 'auth.json'));
-    await fs.writeFile(path.join(grokHome, 'auth.json'), '{"token":"forked"}');
+    await fs.writeFile(path.join(grokHome, 'auth.json'), '{"token":"local"}');
 
     await home.ensureWorkspaceGrokHome(WS);
 
-    expect((await fs.lstat(path.join(grokHome, 'auth.json'))).isSymbolicLink()).toBe(true);
+    const stat = await fs.lstat(path.join(grokHome, 'auth.json'));
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(await fs.readFile(path.join(grokHome, 'auth.json'), 'utf-8')).toBe('{"token":"local"}');
+  });
+
+  it('repoints a link that no longer names the shared entry', async () => {
+    const { home } = await importFresh();
+    const real = await seedRealGrokHome();
+
+    const grokHome = await home.ensureWorkspaceGrokHome(WS);
+    const link = path.join(grokHome, 'auth.json');
+    await fs.rm(link);
+    await fs.symlink(path.join(mockHome.value, 'elsewhere.json'), link);
+
+    await home.ensureWorkspaceGrokHome(WS);
+
+    expect(await fs.readlink(link)).toBe(path.join(real, 'auth.json'));
   });
 
   it('never links the private session store away from the workspace', async () => {
