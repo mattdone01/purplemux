@@ -7,6 +7,7 @@ import useWorkspaceStore from '@/hooks/use-workspace-store';
 import useConfigStore from '@/hooks/use-config-store';
 import { navigateToTab, useLayoutStore } from '@/hooks/use-layout';
 import { findPane } from '@/lib/layout-tree';
+import { shouldAlert } from '@/lib/alert-policy';
 
 const truncate = (s: string, n: number): string =>
   s.length <= n ? s : s.slice(0, n).trimEnd() + '…';
@@ -24,7 +25,7 @@ const toastIdFor = (tabId: string) => `tab-complete:${tabId}`;
 const useToastNotification = () => {
   useEffect(() => {
     const unsubTabs = useTabStore.subscribe((state, prev) => {
-      const { toastOnCompleteEnabled, toastDuration } = useConfigStore.getState();
+      const { toastOnCompleteEnabled, toastDuration, alertsOrchestratorOnly } = useConfigStore.getState();
       if (!toastOnCompleteEnabled) return;
       if (typeof document === 'undefined' || document.hidden) return;
 
@@ -38,8 +39,10 @@ const useToastNotification = () => {
         if (focusedTabId === undefined) focusedTabId = getFocusedTabId();
         if (tabId === focusedTabId) continue;
 
-        const wsName = useWorkspaceStore.getState().workspaces.find((w) => w.id === tab.workspaceId)?.name
-          ?? tab.workspaceId;
+        const workspace = useWorkspaceStore.getState().workspaces.find((w) => w.id === tab.workspaceId);
+        if (!shouldAlert({ id: tabId }, workspace, { alertsOrchestratorOnly })) continue;
+
+        const wsName = workspace?.name ?? tab.workspaceId;
         const body = tab.lastUserMessage ? truncate(tab.lastUserMessage, 120) : (tab.tabName || tabId);
         const workspaceId = tab.workspaceId;
         const title = `${t('notification', 'toastCompleteTitle')} · ${wsName}`;

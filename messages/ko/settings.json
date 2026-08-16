@@ -113,6 +113,8 @@
   "notification": {
     "enable": "알림 활성화",
     "enableDescription": "에이전트 작업 완료 시 시스템 알림을 표시합니다.",
+    "orchestratorOnly": "오케스트레이터만 알림",
+    "orchestratorOnlyDescription": "오케스트레이션 중인 워크스페이스의 오케스트레이터 탭만 알립니다. 끄면 모든 에이전트 탭이 알립니다.",
     "permissionDenied": "브라우저 알림 권한이 거부되었습니다. 브라우저 설정에서 허용해주세요.",
     "notSupported": "이 브라우저에서는 Web Push를 지원하지 않습니다.",
     "toastSection": "앱 내 토스트",

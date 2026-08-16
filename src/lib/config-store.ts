@@ -27,6 +27,9 @@ export interface IConfigData {
   editorUrl?: string;
   editorPreset?: TEditorPreset;
   notificationsEnabled?: boolean;
+  // Default true (ALERTS_ORCHESTRATOR_ONLY_DEFAULT in lib/alert-policy.ts): only
+  // the orchestrator tab of an orchestrated workspace raises an alert.
+  alertsOrchestratorOnly?: boolean;
   toastOnCompleteEnabled?: boolean;
   toastDuration?: number;
   toastPositionDesktop?: TToastPosition;

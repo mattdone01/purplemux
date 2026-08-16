@@ -137,6 +137,21 @@ Built-ins (`BUILTIN_PROMPTS`, `BUILTIN_ITEMS`) are defined in code; the disk fil
 
 Web Push state. VAPID keypair is generated on first run (`vapid-keys.ts`) and cached in memory. Subscriptions are managed per-browser via `push-subscriptions.ts`.
 
+`push-subscriptions.json` is an array of records:
+
+```json
+[
+  {
+    "subscription": { "endpoint": "https://…", "keys": { "p256dh": "…", "auth": "…" } },
+    "deviceId": "kQ9…",
+    "label": "Pixel",
+    "createdAt": 1755300000000
+  }
+]
+```
+
+`deviceId` is the browser's `purplemux-device-id` (localStorage, sent by `use-web-push.ts` with the subscription). It is what makes the push visibility gate per-device — a focused desktop no longer mutes the phone. Rows written before this wrapper existed are bare `PushSubscription` objects; `normalizeSubscriptionRecords` wraps them on read with `createdAt: 0` and no `deviceId`, and an unbound row keeps the old "any focused window mutes push" gate until that browser re-subscribes.
+
 ### `cli-token`, `port`
 
 Shared handshake between the server and any CLI/hook that needs to reach it:

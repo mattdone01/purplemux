@@ -113,6 +113,8 @@
   "notification": {
     "enable": "启用通知",
     "enableDescription": "智能体任务完成时显示系统通知。仅在Electron应用中有效。",
+    "orchestratorOnly": "仅编排器提醒",
+    "orchestratorOnlyDescription": "仅在编排工作区的编排器标签页提醒。关闭后所有代理标签页都会提醒。",
     "permissionDenied": "浏览器通知权限被拒绝。请在浏览器设置中允许。",
     "notSupported": "此浏览器不支持 Web Push。",
     "toastSection": "应用内提示",

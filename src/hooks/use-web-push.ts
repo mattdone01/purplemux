@@ -13,6 +13,24 @@ const urlBase64ToUint8Array = (base64String: string): ArrayBuffer => {
   return output.buffer as ArrayBuffer;
 };
 
+const DEVICE_ID_KEY = 'purplemux-device-id';
+
+const getDeviceId = (): string => {
+  let id = localStorage.getItem(DEVICE_ID_KEY);
+  if (!id) {
+    id = nanoid();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+  }
+  return id;
+};
+
+const postSubscription = (subscription: PushSubscriptionJSON) =>
+  fetch('/api/push/subscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ subscription, deviceId: getDeviceId() }),
+  });
+
 const subscribe = async (): Promise<boolean> => {
   try {
     const permission = await Notification.requestPermission();
@@ -21,11 +39,7 @@ const subscribe = async (): Promise<boolean> => {
     const reg = await navigator.serviceWorker.ready;
     const existing = await reg.pushManager.getSubscription();
     if (existing) {
-      await fetch('/api/push/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(existing.toJSON()),
-      });
+      await postSubscription(existing.toJSON());
       return true;
     }
 
@@ -37,11 +51,7 @@ const subscribe = async (): Promise<boolean> => {
       applicationServerKey: urlBase64ToUint8Array(publicKey),
     });
 
-    await fetch('/api/push/subscribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sub.toJSON()),
-    });
+    await postSubscription(sub.toJSON());
 
     return true;
   } catch {
@@ -66,11 +76,16 @@ const unsubscribe = async (): Promise<void> => {
   }
 };
 
-const hasExistingSubscription = async (): Promise<boolean> => {
+// Re-posting the existing subscription binds it to this device, which is what
+// keeps a focused desktop from muting the phone. Subscriptions registered before
+// the binding existed would otherwise stay unbound until the toggle is cycled.
+const syncExistingSubscription = async (): Promise<boolean> => {
   try {
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
-    return sub !== null;
+    if (!sub) return false;
+    await postSubscription(sub.toJSON());
+    return true;
   } catch {
     return false;
   }
@@ -84,17 +99,6 @@ export const getEndpoint = async (): Promise<string | null> => {
   } catch {
     return null;
   }
-};
-
-const DEVICE_ID_KEY = 'purplemux-device-id';
-
-const getDeviceId = (): string => {
-  let id = localStorage.getItem(DEVICE_ID_KEY);
-  if (!id) {
-    id = nanoid();
-    localStorage.setItem(DEVICE_ID_KEY, id);
-  }
-  return id;
 };
 
 const sendVisibility = (visible: boolean) => {
@@ -232,7 +236,7 @@ const useWebPush = () => {
     window.addEventListener('focus', handlePageShow);
 
     // 초기 로드: 기존 구독이 없으면 토글 OFF로 동기화
-    hasExistingSubscription().then((exists) => {
+    syncExistingSubscription().then((exists) => {
       if (!exists) {
         const { notificationsEnabled } = useConfigStore.getState();
         if (notificationsEnabled) {

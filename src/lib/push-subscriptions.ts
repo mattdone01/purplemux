@@ -5,6 +5,24 @@ import type { PushSubscription } from 'web-push';
 const BASE_DIR = path.join(os.homedir(), '.purplemux');
 const SUBS_FILE = path.join(BASE_DIR, 'push-subscriptions.json');
 
+/**
+ * A subscription plus the device that owns it. The `deviceId` binding is what
+ * makes the push visibility gate per-device: a focused desktop must not mute
+ * the phone. Rows written before this wrapper existed are bare
+ * `PushSubscription` objects and migrate on read.
+ */
+export interface IPushSubscriptionRecord {
+  subscription: PushSubscription;
+  deviceId?: string;
+  label?: string;
+  createdAt: number;
+}
+
+export interface IPushSubscriptionMeta {
+  deviceId?: string;
+  label?: string;
+}
+
 const g = globalThis as unknown as { __ptPushLock?: Promise<void> };
 if (!g.__ptPushLock) g.__ptPushLock = Promise.resolve();
 
@@ -21,16 +39,37 @@ const withLock = async <T>(fn: () => Promise<T>): Promise<T> => {
   }
 };
 
-const readSubs = async (): Promise<PushSubscription[]> => {
+export const normalizeSubscriptionRecords = (raw: unknown): IPushSubscriptionRecord[] => {
+  if (!Array.isArray(raw)) return [];
+  const records: IPushSubscriptionRecord[] = [];
+  for (const row of raw) {
+    if (typeof row !== 'object' || row === null) continue;
+    const fields = row as Record<string, unknown>;
+    const isBare = typeof fields.endpoint === 'string';
+    const subscription = (isBare ? fields : fields.subscription) as PushSubscription | undefined;
+    if (!subscription || typeof subscription.endpoint !== 'string' || !subscription.endpoint) continue;
+
+    const record: IPushSubscriptionRecord = {
+      subscription,
+      createdAt: typeof fields.createdAt === 'number' ? fields.createdAt : 0,
+    };
+    if (typeof fields.deviceId === 'string' && fields.deviceId) record.deviceId = fields.deviceId;
+    if (typeof fields.label === 'string' && fields.label) record.label = fields.label;
+    records.push(record);
+  }
+  return records;
+};
+
+const readSubs = async (): Promise<IPushSubscriptionRecord[]> => {
   try {
     const raw = await fs.readFile(SUBS_FILE, 'utf-8');
-    return JSON.parse(raw) as PushSubscription[];
+    return normalizeSubscriptionRecords(JSON.parse(raw));
   } catch {
     return [];
   }
 };
 
-const writeSubs = async (subs: PushSubscription[]): Promise<void> => {
+const writeSubs = async (subs: IPushSubscriptionRecord[]): Promise<void> => {
   await fs.mkdir(BASE_DIR, { recursive: true });
   const tmp = SUBS_FILE + '.tmp';
   try {
@@ -42,19 +81,34 @@ const writeSubs = async (subs: PushSubscription[]): Promise<void> => {
   }
 };
 
-export const getSubscriptions = async (): Promise<PushSubscription[]> => readSubs();
+export const getSubscriptionRecords = async (): Promise<IPushSubscriptionRecord[]> => readSubs();
 
-export const listDeviceEndpoints = async (): Promise<{ endpoint: string }[]> =>
-  (await readSubs()).map((s) => ({ endpoint: s.endpoint }));
+export const listDeviceEndpoints = async (): Promise<{ endpoint: string; deviceId?: string; label?: string; createdAt: number }[]> =>
+  (await readSubs()).map((r) => ({
+    endpoint: r.subscription.endpoint,
+    deviceId: r.deviceId,
+    label: r.label,
+    createdAt: r.createdAt,
+  }));
 
-export const addSubscription = async (sub: PushSubscription): Promise<void> =>
+export const addSubscription = async (sub: PushSubscription, meta: IPushSubscriptionMeta = {}): Promise<void> =>
   withLock(async () => {
     const subs = await readSubs();
-    const idx = subs.findIndex((s) => s.endpoint === sub.endpoint);
+    const idx = subs.findIndex((s) => s.subscription.endpoint === sub.endpoint);
+    const existing = idx >= 0 ? subs[idx] : null;
+    const record: IPushSubscriptionRecord = {
+      subscription: sub,
+      createdAt: existing?.createdAt || Date.now(),
+    };
+    const deviceId = meta.deviceId ?? existing?.deviceId;
+    const label = meta.label ?? existing?.label;
+    if (deviceId) record.deviceId = deviceId;
+    if (label) record.label = label;
+
     if (idx >= 0) {
-      subs[idx] = sub;
+      subs[idx] = record;
     } else {
-      subs.push(sub);
+      subs.push(record);
     }
     await writeSubs(subs);
   });
@@ -62,7 +116,7 @@ export const addSubscription = async (sub: PushSubscription): Promise<void> =>
 export const removeSubscription = async (endpoint: string): Promise<void> =>
   withLock(async () => {
     const subs = await readSubs();
-    const filtered = subs.filter((s) => s.endpoint !== endpoint);
+    const filtered = subs.filter((s) => s.subscription.endpoint !== endpoint);
     if (filtered.length !== subs.length) {
       await writeSubs(filtered);
     }
@@ -81,6 +135,19 @@ export const markDeviceHidden = (deviceId: string): void => {
   visibleDevices.delete(deviceId);
 };
 
+export const isDeviceVisible = (deviceId: string): boolean => {
+  const lastSeen = visibleDevices.get(deviceId);
+  if (lastSeen === undefined) return false;
+  if (Date.now() - lastSeen > VISIBILITY_TTL) {
+    visibleDevices.delete(deviceId);
+    return false;
+  }
+  return true;
+};
+
+// Fallback gate for subscriptions with no device binding — rows that predate the
+// record migration and have not re-subscribed yet. Keeps their pre-existing
+// "any focused window mutes push" behaviour instead of pushing to them blind.
 export const isAnyDeviceVisible = (): boolean => {
   const now = Date.now();
   for (const [deviceId, lastSeen] of visibleDevices) {
