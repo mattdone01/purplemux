@@ -7,6 +7,7 @@ import {
   AGENT_DISPLAY_NAME,
   AGENT_PANEL_TYPES,
   isAgentPanelType,
+  processMatchesPanelType,
   providerIdForPanelType,
   type TAgentPanelType,
 } from '@/lib/agent-panel-types';
@@ -33,11 +34,6 @@ const getButtonLabel = (mode: TModeButton) =>
 const getAgentLabel = (panelType: TPanelType): string =>
   (isAgentPanelType(panelType) ? 'Chat' : 'Terminal');
 
-const processMatchesAgent = (panelType: TPanelType | undefined, process: string | undefined): boolean => {
-  if (!process || !isAgentPanelType(panelType)) return false;
-  return process.toLowerCase() === providerIdForPanelType(panelType);
-};
-
 const getCurrentMode = (panelType: TPanelType): TModeButton => {
   if (isAgentPanelType(panelType)) {
     return { type: panelType, label: getAgentLabel(panelType) };
@@ -59,7 +55,7 @@ const AgentModeSwitcher = ({
     && (
       tabEntry?.agentProcess === true
       || isAgentRunning(tabEntry?.cliState)
-      || processMatchesAgent(runtimeAgentPanelType, tabEntry?.currentProcess)
+      || processMatchesPanelType(runtimeAgentPanelType, tabEntry?.currentProcess)
     );
   const visibleAgentPanelType = isAgentPanel(panelType)
     ? panelType

@@ -20,7 +20,11 @@ import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { getSessionPanePid, checkTerminalProcess, sendKeys, getSessionCwd, getPaneTitle } from './tmux';
 import { cwdToProjectPath } from './session-list';
+import { EMPTY_PENDING } from './buffer-lines';
 import { buildSessionKey } from './session-key';
+import { canLoadOlder } from './timeline-paging';
+import { listSessionScopes, sessionScopeFor } from './session-scope';
+import { readCodexSessionHead } from './codex-session-list';
 import { workspaceIdFromSessionName } from './workspace-home';
 import {
   updateTabAgentSessionId,
@@ -76,7 +80,7 @@ interface IFileWatcher {
   watcher: FSWatcher | null;
   jsonlPath: string;
   offset: number;
-  pendingBuffer: string;
+  pendingBuffer: Buffer;
   connections: Set<WebSocket>;
   debounceTimer: ReturnType<typeof setTimeout> | null;
   retryCount: number;
@@ -430,7 +434,7 @@ const subscribeToFile = async (
       watcher: null,
       jsonlPath,
       offset: 0,
-      pendingBuffer: '',
+      pendingBuffer: EMPTY_PENDING,
       connections: new Set(),
       debounceTimer: null,
       retryCount: 0,
@@ -468,10 +472,18 @@ const subscribeToFile = async (
   const meta = computeInitMeta(result.entries, result.fileSize, firstTimestamp, result.customTitle);
 
   const resolvedSessionId = sessionId ?? provider.sessionIdFromJsonlPath(jsonlPath) ?? '';
+  // Codex keys its rollouts by cwd, so its scope comes from the transcript's own
+  // `session_meta`, not from the tmux session name — the same input search and
+  // sessions-v2 derive from, through the same function.
   const sessionKey = resolvedSessionId
     ? buildSessionKey({
       provider: provider.id,
-      workspaceId: workspaceIdFromSessionName(sessionName),
+      workspaceId: sessionScopeFor({
+        provider: provider.id,
+        scopes: fw.codexParser ? await listSessionScopes() : [],
+        workspaceId: workspaceIdFromSessionName(sessionName),
+        cwd: fw.codexParser ? (await readCodexSessionHead(jsonlPath)).cwd : null,
+      }).workspaceId,
       sessionId: resolvedSessionId,
     })
     : undefined;
@@ -662,12 +674,14 @@ const subscribeToGrokSession = async (
     sessionId,
     sessionKey: buildSessionKey({
       provider: provider.id,
-      workspaceId: null,
+      workspaceId: sessionScopeFor({ provider: provider.id, scopes: [] }).workspaceId,
       sessionId,
     }),
     totalEntries: init.totalEntries,
     startByteOffset: 0,
-    hasMore: init.hasMore,
+    // The tail may well be truncated, but grok has no byte-addressable source to
+    // page it from, so the client is never told there is more to load.
+    hasMore: init.hasMore && canLoadOlder(null, 0),
     jsonlPath: null,
     ...(init.summary ? { summary: init.summary } : {}),
     meta: init.meta,

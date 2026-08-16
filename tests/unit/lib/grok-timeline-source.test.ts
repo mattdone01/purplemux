@@ -77,6 +77,29 @@ describe('readGrokTimelineInit', () => {
     expect(init.lastMessageSeq).toBe(5);
   });
 
+  it('aggregates every usage row of a message instead of keeping the last', () => {
+    const path = fixture([{
+      id: SESSION,
+      messages: [{
+        seq: 0,
+        role: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'two model calls' }] },
+      }],
+      usage: [
+        { messageSeq: 0, model: 'grok-4.20', inputTokens: 100, outputTokens: 10 },
+        { messageSeq: 0, model: 'grok-4.20-fast', inputTokens: 40, outputTokens: 5 },
+      ],
+    }]);
+
+    const [entry] = readGrokTimelineInit(SESSION, 128, path).entries;
+
+    expect(entry).toMatchObject({
+      type: 'assistant-message',
+      model: 'grok-4.20-fast',
+      usage: { input_tokens: 140, output_tokens: 15 },
+    });
+  });
+
   it('reports an empty session rather than throwing', () => {
     const path = fixture([{ id: SESSION }]);
     const init = readGrokTimelineInit(SESSION, 128, path);
@@ -106,6 +129,21 @@ describe('readGrokTimelineTail', () => {
   it('returns nothing when the cursor is already current', () => {
     const path = fixture([{ id: SESSION, messages: [userMessage(0, 'one')] }]);
     expect(readGrokTimelineTail(SESSION, 0, path).entries).toEqual([]);
+  });
+});
+
+describe('the shared grok store handle', () => {
+  it('survives a caller that closes its wrapper — the next get is not a dead handle', async () => {
+    const { getGrokDatabase } = await import('@/lib/providers/grok/db');
+    const path = fixture([{ id: SESSION, messages: [userMessage(0, 'one')] }]);
+
+    const first = getGrokDatabase(path);
+    expect(first).not.toBeNull();
+    first!.close();
+
+    const second = getGrokDatabase(path);
+    expect(second).not.toBeNull();
+    expect(second!.all<{ id: string }>('SELECT id FROM sessions')).toEqual([{ id: SESSION }]);
   });
 });
 

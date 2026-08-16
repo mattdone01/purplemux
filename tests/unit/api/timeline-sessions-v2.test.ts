@@ -216,6 +216,48 @@ describe('GET /api/timeline/sessions-v2', () => {
     expect(caughtUp.sessions[0].lastSeq).toBeLessThanOrEqual(entries[5].seq!);
   });
 
+  it('lists a codex session started in a SUBDIRECTORY of a workspace root', async () => {
+    await writeCodexSession(home, 'codex-nested', {
+      cwd: path.join(WORKSPACE_DIR, 'packages', 'api'),
+      mtimeSeconds: 2_000,
+    });
+
+    const body = await list({ workspaceId: WORKSPACE_ID });
+
+    expect(body.sessions.map((session) => session.sessionKey)).toEqual([`codex:${WORKSPACE_ID}:codex-nested`]);
+    expect(body.sessions[0].workspaceId).toBe(WORKSPACE_ID);
+  });
+
+  it('gives a subdirectory codex session the same key /api/timeline/search does', async () => {
+    await writeCodexSession(home, 'codex-shared', {
+      cwd: path.join(WORKSPACE_DIR, 'packages', 'api'),
+      mtimeSeconds: 2_000,
+    });
+
+    const { sessions } = await list({ workspaceId: WORKSPACE_ID });
+    const { default: search } = await import('@/pages/api/timeline/search');
+    const response = fakeResponse();
+    await search(
+      { method: 'GET', query: { q: 'codex work' } } as unknown as NextApiRequest,
+      response.res,
+    );
+    const { hits } = response.body as { hits: { sessionKey: string }[] };
+
+    expect(sessions).toHaveLength(1);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(new Set(hits.map((hit) => hit.sessionKey))).toEqual(new Set([sessions[0].sessionKey]));
+  });
+
+  it('keys a codex session under no workspace directory global, in the scope that lists it', async () => {
+    await writeCodexSession(home, 'codex-loose', { cwd: '/tmp/unclaimed-project', mtimeSeconds: 2_000 });
+
+    const scoped = await list({ workspaceId: WORKSPACE_ID });
+    const global = await list({ workspaceId: 'global' });
+
+    expect(scoped.sessions.map((session) => session.sessionKey)).toEqual([]);
+    expect(global.sessions.map((session) => session.sessionKey)).toEqual(['codex:global:codex-loose']);
+  });
+
   it('lists ~/.claude sessions for the global scope and keys them global', async () => {
     await writeClaudeSession(globalProjects, 'global-session', { mtimeSeconds: 1_000 });
     await writeClaudeSession(workspaceProjects, 'scoped-session', { mtimeSeconds: 2_000 });

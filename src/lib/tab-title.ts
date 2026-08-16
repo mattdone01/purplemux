@@ -1,7 +1,7 @@
+import { agentDisplayName, processMatchesPanelType } from '@/lib/agent-panel-types';
 import type { TPanelType } from '@/types/terminal';
 
 const SHELL_NAMES = new Set(['zsh', 'bash', 'fish', 'sh', '-zsh', '-bash', '-fish', '-sh']);
-const CODEX_PROCESS_NAMES = new Set(['codex', 'Codex', 'node']);
 
 const extractBasename = (path: string): string => {
   if (path === '~' || path === '/') return path;
@@ -23,13 +23,16 @@ export const isShellProcess = (raw: string): boolean => {
   return cmd !== null && SHELL_NAMES.has(cmd);
 };
 
-const GROK_PROCESS_NAMES = new Set(['grok', 'bun']);
+// Codex and grok ship as bundles and present as their runtime (`node`, `bun`),
+// so the tab shows the agent's name instead. Claude's process name is already
+// what the tab has always displayed, and is left alone.
+const RUNTIME_NAMED_PANEL_TYPES = new Set<TPanelType>(['codex-cli', 'grok-cli']);
 
-const normalizeProcessTitle = (title: string, panelType?: TPanelType): string => {
-  if (panelType === 'codex-cli' && CODEX_PROCESS_NAMES.has(title)) return 'Codex';
-  if (panelType === 'grok-cli' && GROK_PROCESS_NAMES.has(title)) return 'Grok';
-  return title;
-};
+const normalizeProcessTitle = (title: string, panelType?: TPanelType): string => (
+  panelType && RUNTIME_NAMED_PANEL_TYPES.has(panelType) && processMatchesPanelType(panelType, title)
+    ? agentDisplayName(panelType)
+    : title
+);
 
 export const formatTabTitle = (raw: string, panelType?: TPanelType): string => {
   const trimmed = raw.trim();

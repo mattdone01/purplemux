@@ -1,7 +1,7 @@
 # purplemux agent orchestration runbook
 
 How to run an epic with a Fable orchestrator delegating to worker agents
-(Opus 4.8 claude-code tabs, Codex codex-cli tabs) inside purplemux, without
+(Opus 4.8 claude-code tabs, Codex codex-cli tabs, grok grok-cli tabs) inside purplemux, without
 things silently stalling.
 
 Fork basis: `subicura/purplemux` (installed 0.4.5).
@@ -105,7 +105,7 @@ export PMUX_PORT=$(cat ~/.purplemux/port); export PMUX_TOKEN=$(cat ~/.purplemux/
 Workspace: WS_ID. Your own tab: ORCH_TAB_ID (never send to yourself).
 
 purplemux commands you use:
-- purplemux tab create -w WS_ID -n story-NN -t claude-code   (or -t codex-cli)
+- purplemux tab create -w WS_ID -n story-NN -t claude-code   (or -t codex-cli, -t grok-cli)
 - purplemux tab send -w WS_ID TAB_ID "message"                (waits until the tab can accept
   a turn, then submits with Enter; fails with agent-not-ready and pastes nothing if it cannot)
 - purplemux tab status -w WS_ID TAB_ID                        (JSON incl. cliState)

@@ -169,7 +169,7 @@ describe('Claude entry identity', () => {
 
     const firstPass = await parseIncremental(file, (await fs.stat(file)).size - split);
     expect(firstPass.newEntries).toHaveLength(0);
-    expect(firstPass.pendingBuffer).toBe(partial.slice(0, split));
+    expect(firstPass.pendingBuffer.toString('utf-8')).toBe(partial.slice(0, split));
 
     await fs.appendFile(file, `${partial.slice(split)}\n`, 'utf-8');
     const secondPass = await parseIncremental(file, firstPass.newOffset, firstPass.pendingBuffer);

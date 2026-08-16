@@ -340,9 +340,22 @@ export const readGrokEntries = (
     storedResults.set(row.tool_call_id, row);
   }
 
+  // A message can carry several model calls. Keeping only the last row would
+  // under-report the turn in the timeline while the session totals — summed
+  // elsewhere from the same table — stayed right.
   const usageBySeq = new Map<number, IGrokUsageRow>();
   for (const row of db.all<IGrokUsageRow>(USAGE_SQL, sessionId)) {
-    if (row.message_seq !== null) usageBySeq.set(row.message_seq, row);
+    if (row.message_seq === null) continue;
+    const seen = usageBySeq.get(row.message_seq);
+    usageBySeq.set(row.message_seq, seen
+      ? {
+        ...row,
+        input_tokens: seen.input_tokens + row.input_tokens,
+        output_tokens: seen.output_tokens + row.output_tokens,
+        total_tokens: seen.total_tokens + row.total_tokens,
+        cost_micros: seen.cost_micros + row.cost_micros,
+      }
+      : row);
   }
 
   const entries: ITimelineEntry[] = [];

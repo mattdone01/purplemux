@@ -1,15 +1,20 @@
 import fs from 'fs/promises';
-import path from 'path';
 import { listCodexSessionFiles, readCodexSessionHead } from '@/lib/codex-session-list';
 import { entrySearchText, isSearchableEntry, type TSearchableEntryType, type TToolTextLookup } from '@/lib/entry-text';
 import { isAllowedJsonlPath } from '@/lib/path-validation';
 import { getGrokDatabase, type IGrokDatabase } from '@/lib/providers/grok/db';
 import { readSearchDocs, writeSearchDocs, type ISearchDoc } from '@/lib/search-cache';
 import { extractGrokDocs, extractJsonlDocsFromContent, type TSearchProvider } from '@/lib/search-extract';
-import { buildSessionKey, GLOBAL_SESSION_SCOPE } from '@/lib/session-key';
+import { buildSessionKey } from '@/lib/session-key';
 import { listClaudeTranscripts } from '@/lib/session-resolver';
 import { codexSessionIdFromJsonlPath } from '@/lib/session-parser-codex';
-import { listWorkspaceClaudeHomes, listWorkspaceSummaries } from '@/lib/workspace-home';
+import {
+  globalScope,
+  listSessionScopes,
+  scopeForCwd,
+  sessionScopeFor,
+  type ISessionScope,
+} from '@/lib/session-scope';
 import type { ITimelineEntry } from '@/types/timeline';
 
 export const SEARCH_PROVIDERS = ['claude', 'codex', 'grok'] as const;
@@ -139,15 +144,6 @@ export const rankHits = (hits: IRankedHit[]): IRankedHit[] =>
     || a.seq - b.seq
   ));
 
-interface IScope {
-  /** `global` or the workspace id — what a hit reports and what `workspaceId=` selects. */
-  id: string;
-  name: string;
-  /** null for the unscoped `~/.claude` home. */
-  workspaceId: string | null;
-  directories: string[];
-}
-
 type TSourceLoader =
   | { kind: 'jsonl'; jsonlPath: string; provider: TSearchProvider }
   | { kind: 'grok'; db: IGrokDatabase; sessionId: string };
@@ -155,7 +151,7 @@ type TSourceLoader =
 interface ISearchSource {
   cacheId: string;
   fingerprint: string;
-  /** Bytes a cold read of this source costs; 0 for a source held in a database. */
+  /** Bytes a cold read of this source costs, whatever store it lives in. */
   sizeBytes: number;
   sessionKey: string;
   workspaceId: string;
@@ -164,40 +160,7 @@ interface ISearchSource {
   loader: TSourceLoader;
 }
 
-const globalScope = (): IScope => ({
-  id: GLOBAL_SESSION_SCOPE,
-  name: GLOBAL_SESSION_SCOPE,
-  workspaceId: null,
-  directories: [],
-});
-
-/**
- * Every scope a search may read: the unscoped home plus one per workspace. A
- * claude-home left behind by a deleted workspace still holds transcripts, so it
- * is listed under its own id rather than dropped.
- */
-const listScopes = async (): Promise<IScope[]> => {
-  const byId = new Map<string, IScope>();
-
-  for (const summary of await listWorkspaceSummaries()) {
-    byId.set(summary.id, {
-      id: summary.id,
-      name: summary.name,
-      workspaceId: summary.id,
-      directories: summary.directories,
-    });
-  }
-
-  for (const home of await listWorkspaceClaudeHomes()) {
-    const id = path.basename(path.dirname(home));
-    if (byId.has(id)) continue;
-    byId.set(id, { id, name: id, workspaceId: id, directories: [] });
-  }
-
-  return [globalScope(), ...byId.values()];
-};
-
-const claudeSources = async (scopes: IScope[]): Promise<ISearchSource[]> => {
+const claudeSources = async (scopes: ISessionScope[]): Promise<ISearchSource[]> => {
   const perScope = await Promise.all(scopes.map(async (scope) => {
     const transcripts = await listClaudeTranscripts(scope.workspaceId);
     const sources = await Promise.all(transcripts.map(async ({ sessionId, jsonlPath }): Promise<ISearchSource | null> => {
@@ -212,7 +175,11 @@ const claudeSources = async (scopes: IScope[]): Promise<ISearchSource[]> => {
         cacheId: jsonlPath,
         fingerprint: `${stat.mtimeMs}:${stat.size}`,
         sizeBytes: stat.size,
-        sessionKey: buildSessionKey({ provider: 'claude', workspaceId: scope.workspaceId, sessionId }),
+        sessionKey: buildSessionKey({
+          provider: 'claude',
+          workspaceId: sessionScopeFor({ provider: 'claude', scopes, workspaceId: scope.id }).workspaceId,
+          sessionId,
+        }),
         workspaceId: scope.id,
         workspaceName: scope.name,
         lastActivityMs: stat.mtimeMs,
@@ -227,16 +194,15 @@ const claudeSources = async (scopes: IScope[]): Promise<ISearchSource[]> => {
 
 /**
  * Codex and grok key their stores by working directory, not by workspace, so a
- * session belongs to the workspace that lists its cwd. One that matches none is
- * reported under the global scope — the same place its transcript is reachable
- * from.
+ * hit is REPORTED under the workspace that lists its cwd. One that matches none
+ * is reported under the global scope — the same place its transcript is
+ * reachable from. The sessionKey is a separate question, answered for every
+ * route by `sessionScopeFor`.
  */
-const scopeForCwd = (scopes: IScope[], cwd: string | null): IScope | null => {
-  if (!cwd) return null;
-  return scopes.find((scope) => scope.directories.includes(cwd)) ?? null;
-};
-
-const codexSources = async (scopes: IScope[], requestedScope: IScope | null): Promise<ISearchSource[]> => {
+const codexSources = async (
+  scopes: ISessionScope[],
+  requestedScope: ISessionScope | null,
+): Promise<ISearchSource[]> => {
   const files = await listCodexSessionFiles();
 
   const sources = await Promise.all(files.map(async (jsonlPath): Promise<ISearchSource | null> => {
@@ -259,7 +225,11 @@ const codexSources = async (scopes: IScope[], requestedScope: IScope | null): Pr
       cacheId: jsonlPath,
       fingerprint: `${stat.mtimeMs}:${stat.size}`,
       sizeBytes: stat.size,
-      sessionKey: buildSessionKey({ provider: 'codex', workspaceId: scope.workspaceId, sessionId }),
+      sessionKey: buildSessionKey({
+        provider: 'codex',
+        workspaceId: sessionScopeFor({ provider: 'codex', scopes, cwd: head.cwd }).workspaceId,
+        sessionId,
+      }),
       workspaceId: scope.id,
       workspaceName: scope.name,
       lastActivityMs: stat.mtimeMs,
@@ -276,11 +246,14 @@ interface IGrokSessionRow {
   cwd_last: string;
   updated_at: string;
   message_count: number;
+  content_bytes: number;
 }
 
 const GROK_SESSIONS_SQL = `
   SELECT s.id AS id, s.cwd_at_start AS cwd_at_start, s.cwd_last AS cwd_last, s.updated_at AS updated_at,
-         (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count
+         (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+         (SELECT COALESCE(SUM(LENGTH(CAST(m.message_json AS BLOB))), 0)
+            FROM messages m WHERE m.session_id = s.id) AS content_bytes
   FROM sessions s
 `;
 
@@ -292,7 +265,7 @@ const grokSessionRows = (db: IGrokDatabase): IGrokSessionRow[] => {
   }
 };
 
-const grokSources = (scopes: IScope[], requestedScope: IScope | null): ISearchSource[] => {
+const grokSources = (scopes: ISessionScope[], requestedScope: ISessionScope | null): ISearchSource[] => {
   const db = getGrokDatabase();
   if (!db) return [];
 
@@ -305,8 +278,14 @@ const grokSources = (scopes: IScope[], requestedScope: IScope | null): ISearchSo
     sources.push({
       cacheId: `grok:${row.id}`,
       fingerprint: `${row.updated_at}:${row.message_count}`,
-      sizeBytes: 0,
-      sessionKey: buildSessionKey({ provider: 'grok', workspaceId: scope.workspaceId, sessionId: row.id }),
+      // The rows this session's docs are built from. Charged like a file so a
+      // large grok store consumes MAX_SCAN_COST instead of scanning for free.
+      sizeBytes: row.content_bytes,
+      sessionKey: buildSessionKey({
+        provider: 'grok',
+        workspaceId: sessionScopeFor({ provider: 'grok', scopes, cwd: row.cwd_last }).workspaceId,
+        sessionId: row.id,
+      }),
       workspaceId: scope.id,
       workspaceName: scope.name,
       lastActivityMs: Number.isNaN(updatedAt) ? 0 : updatedAt,
@@ -317,8 +296,22 @@ const grokSources = (scopes: IScope[], requestedScope: IScope | null): ISearchSo
   return sources;
 };
 
+export interface ISearchSourceSummary {
+  sessionKey: string;
+  workspaceId: string;
+  sizeBytes: number;
+}
+
+/** The sources one request would scan — exported so the cost accounting is testable. */
+export const collectSearchSources = async (request: ISearchRequest): Promise<ISearchSourceSummary[]> =>
+  (await collectSources(request)).map(({ sessionKey, workspaceId, sizeBytes }) => ({
+    sessionKey,
+    workspaceId,
+    sizeBytes,
+  }));
+
 const collectSources = async (request: ISearchRequest): Promise<ISearchSource[]> => {
-  const scopes = await listScopes();
+  const scopes = await listSessionScopes();
   const requestedScope = request.workspaceId
     ? scopes.find((scope) => scope.id === request.workspaceId) ?? null
     : null;
@@ -465,6 +458,8 @@ export const searchTimeline = async (request: ISearchRequest): Promise<ISearchRe
   return {
     hits: page.map(toWireHit),
     total: ranked.length,
-    truncated: capped || request.offset + page.length < ranked.length,
+    // Budget-stopped, per ADR-0006 — NOT "more pages exist", which `total`
+    // already tells the client.
+    truncated: capped,
   };
 };

@@ -25,10 +25,10 @@ const g = globalThis as unknown as {
   __ptGrokDb?: { path: string; handle: DatabaseSync } | null;
 };
 
-const wrap = (handle: DatabaseSync): IGrokDatabase => ({
+const wrap = (handle: DatabaseSync, onClose: () => void): IGrokDatabase => ({
   all: <T>(sql: string, ...params: TGrokParam[]) => handle.prepare(sql).all(...params) as T[],
   get: <T>(sql: string, ...params: TGrokParam[]) => (handle.prepare(sql).get(...params) ?? null) as T | null,
-  close: () => handle.close(),
+  close: onClose,
 });
 
 /**
@@ -54,7 +54,7 @@ const openReadOnly = (dbPath: string): DatabaseSync | null => {
  */
 export const openGrokDatabase = (dbPath: string): IGrokDatabase | null => {
   const handle = openReadOnly(dbPath);
-  return handle ? wrap(handle) : null;
+  return handle ? wrap(handle, () => handle.close()) : null;
 };
 
 /**
@@ -63,13 +63,16 @@ export const openGrokDatabase = (dbPath: string): IGrokDatabase | null => {
  */
 export const getGrokDatabase = (dbPath: string = GROK_DB_PATH): IGrokDatabase | null => {
   const cached = g.__ptGrokDb;
-  if (cached && cached.path === dbPath) return wrap(cached.handle);
+  // The wrapper is a view on the SHARED handle, so closing it must retire the
+  // cache entry too — otherwise the next caller gets a wrapper over a closed
+  // connection.
+  if (cached && cached.path === dbPath) return wrap(cached.handle, closeGrokDatabase);
   if (cached) closeGrokDatabase();
 
   const handle = openReadOnly(dbPath);
   if (!handle) return null;
   g.__ptGrokDb = { path: dbPath, handle };
-  return wrap(handle);
+  return wrap(handle, closeGrokDatabase);
 };
 
 export const closeGrokDatabase = (): void => {

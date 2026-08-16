@@ -39,6 +39,27 @@ export const panelTypeForProviderId = (providerId: string | undefined): TAgentPa
 export const agentDisplayName = (panelType: TPanelType | undefined): string =>
   isAgentPanelType(panelType) ? AGENT_DISPLAY_NAME[panelType] : '';
 
+/**
+ * The foreground process names a running agent can present as. An agent shipped
+ * as a bundle reports its runtime rather than its own name — grok as `bun`,
+ * codex as `node` — so a check against the provider id alone sees no agent at
+ * all in the common case.
+ */
+export const AGENT_PROCESS_NAMES: Record<TAgentPanelType, readonly string[]> = {
+  'claude-code': ['claude'],
+  'codex-cli': ['codex', 'node'],
+  'grok-cli': ['grok', 'bun'],
+};
+
+export const processMatchesPanelType = (
+  panelType: TPanelType | undefined,
+  process: string | undefined | null,
+): boolean => {
+  if (!process || !isAgentPanelType(panelType)) return false;
+  const normalized = process.toLowerCase();
+  return AGENT_PROCESS_NAMES[panelType].includes(normalized);
+};
+
 /** Narrows a free-form provider id to the ones session history and alerts record. */
 export const toSessionHistoryProvider = (
   providerId: string | undefined | null,

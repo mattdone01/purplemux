@@ -467,7 +467,12 @@ export interface IParseResult {
 export interface IIncrementalResult {
   newEntries: ITimelineEntry[];
   newOffset: number;
-  pendingBuffer: string;
+  /**
+   * Raw bytes of the trailing partial record, carried into the next read. Bytes
+   * rather than text: an append can tear a multi-byte character, and decoding
+   * the remainder would replace its lead bytes with U+FFFD unrecoverably.
+   */
+  pendingBuffer: Buffer;
 }
 
 export interface ISessionMeta {

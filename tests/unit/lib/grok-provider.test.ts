@@ -7,6 +7,7 @@ import {
   agentDisplayName,
   isAgentPanelType,
   panelTypeForProviderId,
+  processMatchesPanelType,
   providerIdForPanelType,
   toSessionHistoryProvider,
 } from '@/lib/agent-panel-types';
@@ -99,6 +100,25 @@ describe('agent panel type table', () => {
     expect(isAgentPanelType('diff')).toBe(false);
     expect(providerIdForPanelType('web-browser')).toBeUndefined();
     expect(panelTypeForProviderId('nope')).toBeUndefined();
+  });
+
+  it('recognises the process names an agent can actually present as', () => {
+    expect(processMatchesPanelType('grok-cli', 'grok')).toBe(true);
+    // grok-cli ships as a bun bundle, so the pane's foreground command is `bun`
+    // (see tab-title.ts) — matching the provider id alone missed every grok tab.
+    expect(processMatchesPanelType('grok-cli', 'bun')).toBe(true);
+    expect(processMatchesPanelType('codex-cli', 'codex')).toBe(true);
+    expect(processMatchesPanelType('codex-cli', 'Node')).toBe(true);
+    expect(processMatchesPanelType('claude-code', 'claude')).toBe(true);
+  });
+
+  it('does not match another agent\'s process, a shell, or a missing one', () => {
+    expect(processMatchesPanelType('grok-cli', 'claude')).toBe(false);
+    expect(processMatchesPanelType('claude-code', 'bun')).toBe(false);
+    expect(processMatchesPanelType('grok-cli', 'zsh')).toBe(false);
+    expect(processMatchesPanelType('grok-cli', undefined)).toBe(false);
+    expect(processMatchesPanelType('terminal', 'grok')).toBe(false);
+    expect(processMatchesPanelType(undefined, 'grok')).toBe(false);
   });
 
   it('narrows grok for session history and alerts', () => {
