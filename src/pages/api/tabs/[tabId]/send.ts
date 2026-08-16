@@ -37,6 +37,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         if (!found) return null;
         return {
           sessionName: found.tab.sessionName,
+          panelType: found.tab.panelType,
           cliState: resolveTabCliState(found.tab, getStatusManager().getAllForClient()[tabId]),
         };
       },

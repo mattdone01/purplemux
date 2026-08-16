@@ -106,7 +106,8 @@ Workspace: WS_ID. Your own tab: ORCH_TAB_ID (never send to yourself).
 
 purplemux commands you use:
 - purplemux tab create -w WS_ID -n story-NN -t claude-code   (or -t codex-cli)
-- purplemux tab send -w WS_ID TAB_ID "message"                (submits with Enter)
+- purplemux tab send -w WS_ID TAB_ID "message"                (waits until the tab can accept
+  a turn, then submits with Enter; fails with agent-not-ready and pastes nothing if it cannot)
 - purplemux tab status -w WS_ID TAB_ID                        (JSON incl. cliState)
 - purplemux tab result -w WS_ID TAB_ID                        (capture pane text)
 - purplemux tab close -w WS_ID TAB_ID

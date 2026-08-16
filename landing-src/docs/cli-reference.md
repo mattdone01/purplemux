@@ -51,7 +51,7 @@ All subcommands require a running server. They read the port from `~/.purplemux/
 | `purplemux workspaces` | List workspaces |
 | `purplemux tab list [-w WS]` | List tabs (optionally scoped to a workspace) |
 | `purplemux tab create -w WS [-n NAME] [-t TYPE]` | Create a new tab |
-| `purplemux tab send -w WS TAB_ID CONTENT...` | Send input to a tab |
+| `purplemux tab send -w WS TAB_ID CONTENT...` | Send input to a tab. Waits up to 60s for an agent tab to be able to accept a turn (`--wait-ms N`, `--no-wait`); on timeout nothing is pasted |
 | `purplemux tab status -w WS TAB_ID` | Inspect a tab's status |
 | `purplemux tab result -w WS TAB_ID` | Capture the tab pane's current content |
 | `purplemux tab close -w WS TAB_ID` | Close a tab |

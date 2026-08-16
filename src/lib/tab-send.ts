@@ -1,4 +1,5 @@
-import type { ITab } from '@/types/terminal';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
+import type { ITab, TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 
 /**
@@ -69,11 +70,100 @@ export const parseSendRequest = (
 export interface ITabSendTarget {
   sessionName: string;
   cliState: TCliState | null;
+  panelType?: TPanelType;
 }
 
-export interface ITabSendDeps {
+/**
+ * How long a send waits for a booting agent before giving up. A cold agent TUI
+ * needs tens of seconds to reach a composer — trust prompt, MCP servers, hooks
+ * — and a caller that dispatches a brief the moment it creates the tab is the
+ * common case, not the exception.
+ */
+export const DEFAULT_SEND_READY_TIMEOUT_MS = 60_000;
+
+export const MAX_SEND_READY_TIMEOUT_MS = 600_000;
+
+export const SEND_READY_POLL_INTERVAL_MS = 500;
+
+export const resolveSendWaitMs = (raw: unknown): number | null => {
+  if (raw === undefined) return DEFAULT_SEND_READY_TIMEOUT_MS;
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) return null;
+  if (raw < 0 || raw > MAX_SEND_READY_TIMEOUT_MS) return null;
+  return raw;
+};
+
+export interface ISendReadinessDeps {
   findTarget: (workspaceId: string, tabId: string) => Promise<ITabSendTarget | null>;
   hasSession: (sessionName: string) => Promise<boolean>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface ISendReadinessRequest {
+  workspaceId: string;
+  tabId: string;
+  timeoutMs: number;
+}
+
+export type TSendReadiness =
+  | { ok: true; target: ITabSendTarget }
+  | { ok: false; reason: 'tab-not-found' }
+  | { ok: false; reason: 'session-not-running'; cliState: TCliState | null }
+  | { ok: false; reason: 'readiness-timeout'; cliState: TCliState | null; waitedMs: number };
+
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Resolve a tab and hold until it can actually accept a paste, or until
+ * `timeoutMs` expires.
+ *
+ * The single readiness definition behind both send routes. It exists because
+ * pasting into an agent that has no composer yet is a silent failure: the text
+ * lands in the TUI's input box, the trailing Enter is swallowed, and the caller
+ * is told the send succeeded while the agent never takes a turn. Refusing —
+ * with nothing pasted — is the only outcome a caller can act on.
+ *
+ * The state is re-resolved on every poll rather than once up front, so a tab
+ * that is closed or whose session dies mid-wait is reported as such instead of
+ * being pasted into at the deadline.
+ *
+ * `timeoutMs: 0` is a plain "answer now": one look, no sleep.
+ */
+export const awaitSendReadiness = async (
+  deps: ISendReadinessDeps,
+  request: ISendReadinessRequest,
+): Promise<TSendReadiness> => {
+  const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? realSleep;
+  const startedAt = now();
+
+  for (;;) {
+    const target = await deps.findTarget(request.workspaceId, request.tabId);
+    if (!target) return { ok: false, reason: 'tab-not-found' };
+
+    // Checked before the composer gate: a dead session never reaches a sendable
+    // state, so waiting one out would trade an immediate diagnosis for a
+    // deadline's worth of silence.
+    if (!(await deps.hasSession(target.sessionName))) {
+      return { ok: false, reason: 'session-not-running', cliState: target.cliState };
+    }
+
+    // The gate guards an agent composer. A terminal pane has no turn to accept
+    // and no cliState to report, so it is delivered to unconditionally.
+    if (!isAgentPanelType(target.panelType) || isSendableCliState(target.cliState)) {
+      return { ok: true, target };
+    }
+
+    const waitedMs = now() - startedAt;
+    const remainingMs = request.timeoutMs - waitedMs;
+    if (remainingMs <= 0) {
+      return { ok: false, reason: 'readiness-timeout', cliState: target.cliState, waitedMs };
+    }
+    await sleep(Math.min(SEND_READY_POLL_INTERVAL_MS, remainingMs));
+  }
+};
+
+export interface ITabSendDeps extends ISendReadinessDeps {
   paste: (sessionName: string, content: string) => Promise<void>;
   pasteWithoutSubmit: (sessionName: string, content: string) => Promise<void>;
   isContentPendingInComposer: (sessionName: string, content: string) => Promise<boolean>;
@@ -88,19 +178,27 @@ export const performTabSend = async (
   deps: ITabSendDeps,
   request: ITabSendRequest,
 ): Promise<TTabSendResult> => {
-  const target = await deps.findTarget(request.workspaceId, request.tabId);
-  if (!target) return { status: 404, body: { error: 'tab-not-found' } };
+  // The cookie-authed route answers a phone waiting on a tap, so it takes the
+  // readiness verdict as it stands rather than holding the request open.
+  const readiness = await awaitSendReadiness(deps, {
+    workspaceId: request.workspaceId,
+    tabId: request.tabId,
+    timeoutMs: 0,
+  });
 
-  if (!isSendableCliState(target.cliState)) {
-    return { status: 409, body: { error: 'agent-not-ready', cliState: target.cliState } };
-  }
-
-  if (!(await deps.hasSession(target.sessionName))) {
+  if (!readiness.ok) {
+    if (readiness.reason === 'tab-not-found') return { status: 404, body: { error: 'tab-not-found' } };
     return {
       status: 409,
-      body: { error: 'agent-not-ready', cliState: target.cliState, detail: 'session-not-running' },
+      body: {
+        error: 'agent-not-ready',
+        cliState: readiness.cliState,
+        ...(readiness.reason === 'session-not-running' ? { detail: 'session-not-running' } : {}),
+      },
     };
   }
+
+  const target = readiness.target;
 
   if (!request.submit) {
     await deps.pasteWithoutSubmit(target.sessionName, request.content);
