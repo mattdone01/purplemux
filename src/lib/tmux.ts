@@ -411,8 +411,11 @@ export const sendRawKeys = async (
   );
 };
 
-/** Send text via bracketed paste mode and press Enter twice (handles Claude Code long input confirmation) */
-export const sendBracketedPaste = async (
+/**
+ * Send text via bracketed paste mode WITHOUT submitting it. The agent TUI keeps
+ * it in the composer, so the operator (or a later Enter) decides when it goes.
+ */
+export const sendBracketedPasteText = async (
   sessionName: string,
   content: string,
 ): Promise<void> => {
@@ -422,6 +425,14 @@ export const sendBracketedPaste = async (
     ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, '-l', `\x1b[200~${content}\x1b[201~`],
     { timeout: CMD_TIMEOUT },
   );
+};
+
+/** Send text via bracketed paste mode and press Enter twice (handles Claude Code long input confirmation) */
+export const sendBracketedPaste = async (
+  sessionName: string,
+  content: string,
+): Promise<void> => {
+  await sendBracketedPasteText(sessionName, content);
   await execFile(
     'tmux',
     ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],
