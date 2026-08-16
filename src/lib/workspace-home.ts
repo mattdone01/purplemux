@@ -18,7 +18,7 @@ const WORKSPACES_DIR = path.join(os.homedir(), '.purplemux', 'workspaces');
 // and resume lists. Giving each workspace its own CLAUDE_CONFIG_DIR decouples
 // session identity from location, which is what lets several workspaces run from
 // one project root.
-const workspaceHomeDir = (wsId: string): string =>
+export const workspaceHomeDir = (wsId: string): string =>
   path.join(WORKSPACES_DIR, wsId, 'claude-home');
 
 // Session names are `pt-<wsId>-<paneId>-<tabId>`, so the owning workspace is
@@ -218,7 +218,7 @@ const seedProjectDecisions = async (home: string, directories: string[]): Promis
   await writeJsonAtomic(target, { ...current, ...root, projects });
 };
 
-const workspaceDirectories = async (wsId: string): Promise<string[]> => {
+export const workspaceDirectories = async (wsId: string): Promise<string[]> => {
   const data = await readJson(WORKSPACES_FILE);
   const workspaces = (data.workspaces ?? []) as Array<{ id: string; directories?: string[] }>;
   return workspaces.find((w) => w.id === wsId)?.directories ?? [];
