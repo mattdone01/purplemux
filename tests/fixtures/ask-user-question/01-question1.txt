@@ -1,0 +1,19 @@
+  ▘▘ ▝▝    ~/code/nomupay
+❯ Call the AskUserQuestion tool RIGHT NOW with exactly two questions and
+  nothing else. Question 1: header 'Colour', question 'Which colour?', options
+  Red/Green/Blue. Question 2: header 'Size', question 'Which size?', options
+  Small/Large. Do not explain, do not do anything else first — just call the
+  tool.
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Colour  ☐ Size  ✔ Submit  →
+Which colour?
+❯ 1. Red
+     Red
+  2. Green
+     Green
+  3. Blue
+     Blue
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

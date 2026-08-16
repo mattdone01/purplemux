@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Colour  ☒ Sizes  ☐ Rollout  ✔ Submit  →
+Which sizes should we stock for the initial run?
+❯ 1. [ ] Small
+  Small
+  2. [✔] Medium
+  Medium
+  3. [ ] Large
+  Large
+  4. [ ] Type something
+     Next
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

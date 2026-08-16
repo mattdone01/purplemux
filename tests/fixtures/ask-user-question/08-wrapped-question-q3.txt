@@ -1,0 +1,16 @@
+  'Rollout', question 'Should we roll this out to every workspace immediately,
+  or stage it behind a flag for a week first so we can watch the error rate
+  before committing?', options Immediately/Staged. Do not explain, do not do
+  anything else — just call the tool.
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Colour  ☐ Sizes  ☐ Rollout  ✔ Submit  →
+Should we roll this out to every workspace immediately, or stage it behind a
+flag for a week first so we can watch the error rate before committing?
+❯ 1. Immediately
+     Roll out to every workspace now.
+  2. Staged
+     Behind a flag for a week, watching the error rate first.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

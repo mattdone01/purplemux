@@ -31,8 +31,14 @@ export const capturePaneAtWidth = async (
     await sleep(PRE_CAPTURE_DELAY_MS);
     return await capturePaneContent(sessionName);
   } finally {
-    resizeSessionPty(sessionName, orig.cols, orig.rows);
-    await sleep(POST_RESTORE_DELAY_MS);
+    // Resume first, then resize. A paused connection DROPS pty output rather
+    // than buffering it, so a restore issued while still paused loses the very
+    // redraw that repaints the client at its own width — the browser keeps a
+    // stale frame and the TUI looks frozen. Both calls are synchronous and share
+    // a tick, so no wide-geometry frame can slip out between them.
     resumeSession(sessionName);
+    const restore = getActiveSessionSize(sessionName) ?? orig;
+    resizeSessionPty(sessionName, restore.cols, restore.rows);
+    await sleep(POST_RESTORE_DELAY_MS);
   }
 };

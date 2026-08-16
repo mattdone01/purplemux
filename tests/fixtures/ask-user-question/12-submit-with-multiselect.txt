@@ -1,0 +1,16 @@
+  'Deploymentz' question 'Deploy?' options A/B. Q4 header 'Monitoringx' question 'Monitor?' options A/B. Q2 must have
+  multiSelect TRUE. Just call the tool.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Configuratn  ☒ Environmnts  ☒ Deploymentz  ☒ Monitoringx  ✔ Submit  →
+Review your answers
+ ● Config?
+   → A
+ ● Env?
+   → B
+ ● Deploy?
+   → A
+ ● Monitor?
+   → A
+Ready to submit your answers?
+❯ 1. Submit answers
+  2. Cancel

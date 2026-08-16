@@ -1,0 +1,16 @@
+  or stage it behind a flag for a week first so we can watch the error rate
+  before committing?', options Immediately/Staged. Do not explain, do not do
+  anything else — just call the tool.
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Colour  ☐ Sizes  ☐ Rollout  ✔ Submit  →
+Which colour?
+❯ 1. Red
+     Red
+  2. Green
+     Green
+  3. Blue
+     Blue
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
