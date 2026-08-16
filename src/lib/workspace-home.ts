@@ -218,11 +218,41 @@ const seedProjectDecisions = async (home: string, directories: string[]): Promis
   await writeJsonAtomic(target, { ...current, ...root, projects });
 };
 
-export const workspaceDirectories = async (wsId: string): Promise<string[]> => {
+export interface IWorkspaceSummary {
+  id: string;
+  name: string;
+  directories: string[];
+}
+
+/**
+ * Id, display name and directories of every configured workspace. Read straight
+ * from the settings file for the same reason as the rest of this module:
+ * workspace-store pulls in tmux, and tmux calls back in here.
+ */
+export const listWorkspaceSummaries = async (): Promise<IWorkspaceSummary[]> => {
   const data = await readJson(WORKSPACES_FILE);
-  const workspaces = (data.workspaces ?? []) as Array<{ id: string; directories?: string[] }>;
-  return workspaces.find((w) => w.id === wsId)?.directories ?? [];
+  const workspaces = (data.workspaces ?? []) as Array<{
+    id?: unknown;
+    name?: unknown;
+    directories?: unknown;
+  }>;
+
+  const summaries: IWorkspaceSummary[] = [];
+  for (const workspace of workspaces) {
+    if (typeof workspace.id !== 'string') continue;
+    summaries.push({
+      id: workspace.id,
+      name: typeof workspace.name === 'string' ? workspace.name : workspace.id,
+      directories: Array.isArray(workspace.directories)
+        ? workspace.directories.filter((dir): dir is string => typeof dir === 'string')
+        : [],
+    });
+  }
+  return summaries;
 };
+
+export const workspaceDirectories = async (wsId: string): Promise<string[]> =>
+  (await listWorkspaceSummaries()).find((workspace) => workspace.id === wsId)?.directories ?? [];
 
 /**
  * Build (or repair) the workspace's private Claude config dir and return its path
