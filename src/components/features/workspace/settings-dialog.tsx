@@ -808,6 +808,8 @@ const NotificationTab = () => {
   const t = useTranslations('settings.notification');
   const notificationsEnabled = useConfigStore((state) => state.notificationsEnabled);
   const setNotificationsEnabled = useConfigStore((state) => state.setNotificationsEnabled);
+  const alertsOrchestratorOnly = useConfigStore((state) => state.alertsOrchestratorOnly);
+  const setAlertsOrchestratorOnly = useConfigStore((state) => state.setAlertsOrchestratorOnly);
   const toastOnCompleteEnabled = useConfigStore((state) => state.toastOnCompleteEnabled);
   const setToastOnCompleteEnabled = useConfigStore((state) => state.setToastOnCompleteEnabled);
   const toastDuration = useConfigStore((state) => state.toastDuration);
@@ -895,6 +897,21 @@ const NotificationTab = () => {
         {showWebPushHint && (
           <p className="text-sm text-muted-foreground">{t('notSupported')}</p>
         )}
+        <div className="flex items-center justify-between">
+          <div className="space-y-0.5">
+            <Label htmlFor="alerts-orchestrator-only" className="text-sm font-medium">
+              {t('orchestratorOnly')}
+            </Label>
+            <p className="text-sm text-muted-foreground">
+              {t('orchestratorOnlyDescription')}
+            </p>
+          </div>
+          <Switch
+            id="alerts-orchestrator-only"
+            checked={alertsOrchestratorOnly}
+            onCheckedChange={setAlertsOrchestratorOnly}
+          />
+        </div>
       </div>
 
       {devices.length > 0 && (

@@ -113,6 +113,8 @@
   "notification": {
     "enable": "Enable Notifications",
     "enableDescription": "Show system notifications when agent tasks complete.",
+    "orchestratorOnly": "Orchestrator alerts only",
+    "orchestratorOnlyDescription": "Alert only for the orchestrator tab of an orchestrated workspace. Turn off to alert for every agent tab.",
     "permissionDenied": "Browser notification permission denied. Please allow in browser settings.",
     "notSupported": "Web Push is not supported in this browser.",
     "toastSection": "In-app Toast",

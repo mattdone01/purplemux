@@ -602,13 +602,41 @@ The `useNotificationCount` hook walks all tabs and aggregates `busy` / `needs-in
 
 Tabs in `unknown` are **excluded** from both attention and busy counts. This is intentional, so the indeterminate state right after a restart does not raise a notification. Only the sidebar badge shows quietly as a gray dot.
 
-### Push Notification Policy
+### Alert Policy (`src/lib/alert-policy.ts`)
 
-Auto-fired from the `applyCliState` call path:
+One predicate decides every alert, for every channel — web push, the `/api/status` socket, the Electron native notification (`use-native-notification.ts`) and the in-app toast (`use-toast-notification.ts`). `alert-policy.ts` is browser-safe, so the hooks import the same function the server calls.
 
-- `newState === 'ready-for-review'` → web push "Task Complete"
-- `newState === 'needs-input'` → web push "Input Required"
+```ts
+shouldAlert({ id: tabId }, workspace, config)
+```
 
-The idempotent guard at the top of the function (`prevState === newState`) blocks duplicate calls, so callers don't have to track state.
+| `alertsOrchestratorOnly` | Workspace | Result |
+| --- | --- | --- |
+| `true` (default) | orchestrated | only the orchestrator tab alerts |
+| `true` | not orchestrated | nothing alerts |
+| `false` | orchestrated | orchestrator alerts, workers stay muted |
+| `false` | not orchestrated | every agent tab alerts (the pre-dispatcher rule) |
 
-"Silent" paths such as `resolveUnknown` / `dismissTab` / busy-stuck safety net / server restart recovery suppress the push by passing `{ silent: true }`.
+`alertsOrchestratorOnly` is a `config.json` key (`ALERTS_ORCHESTRATOR_ONLY_DEFAULT`), toggled in Settings → Notifications.
+
+### Alert Kinds
+
+| Kind | Title | Fired from |
+| --- | --- | --- |
+| `needs-input` | Input Required | `applyCliState` → `needs-input` |
+| `review` | Task Complete | `applyCliState` → `ready-for-review` |
+| `standup-needs-human` | Standup Needs You | `reportStandup` when `needsHuman` (or state `blocked`/`awaiting-human`); addressed to the orchestrator tab, body is the headline |
+| `orchestrator-stalled` | Orchestrator Stalled | `runOrchestratorKeeper` on the `ORCH_MAX_HEARTBEATS` beat, once per stall episode |
+
+The idempotent guard at the top of `applyCliState` (`prevState === newState`) blocks duplicate calls, so callers don't have to track state.
+
+"Silent" paths such as `resolveUnknown` / `dismissTab` / busy-stuck safety net / server restart recovery suppress the alert by passing `{ silent: true }`.
+
+### NotificationDispatcher (`src/lib/notification-dispatcher.ts`)
+
+`getNotificationDispatcher()` (registry on `globalThis.__ptNotificationDispatcher`) fans one alert out to every registered channel. `getStatusManager()` registers both defaults; a failing channel is logged and never blocks the others. Each dispatch stamps the alert with an `id` and a monotonic `seq`.
+
+- **`status-socket`** — broadcasts `{ type: 'notification:alert', alert }` to every `/api/status` client. Always broadcast; clients decide what to show. The web client ignores unknown frame types, so this is safe for older clients.
+- **`web-push`** — sends the VAPID payload. Visibility is checked **per subscription**: a subscription bound to a `deviceId` is muted only when that device reports visible (`POST /api/push/visibility`), so a focused desktop no longer mutes the phone. Unbound legacy rows keep the old global gate. `404`/`410` reap the subscription.
+
+The push payload keeps its existing shape and adds `kind`, `isOrchestrator`, `alertId`, and `agentSessionId`. `claudeSessionId` stays as-is for `public/sw.js` back-compat.

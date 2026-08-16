@@ -113,6 +113,8 @@
   "notification": {
     "enable": "Bildirimleri Etkinleştir",
     "enableDescription": "Ajan görevleri tamamlandığında sistem bildirimleri gösterir. Yalnızca Electron uygulamasında çalışır.",
+    "orchestratorOnly": "Yalnızca orkestratör uyarıları",
+    "orchestratorOnlyDescription": "Yalnızca orkestre edilen çalışma alanının orkestratör sekmesi için uyar. Her ajan sekmesi için uyarmak istiyorsanız kapatın.",
     "permissionDenied": "Tarayıcı bildirim izni reddedildi. Lütfen tarayıcı ayarlarından izin verin.",
     "notSupported": "Web Push bu tarayıcıda desteklenmiyor.",
     "toastSection": "Uygulama içi toast",

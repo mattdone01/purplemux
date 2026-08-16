@@ -3,6 +3,7 @@ import type { TEditorPreset } from '@/lib/editor-url';
 import type { TToastPosition } from '@/lib/toast-position';
 import type { TGitAskProvider, TNoteSummaryProvider } from '@/lib/config-store';
 import { DEFAULT_LINE_HEIGHT } from '@/lib/terminal-line-height';
+import { ALERTS_ORCHESTRATOR_ONLY_DEFAULT } from '@/lib/alert-policy';
 
 export type { TToastPosition } from '@/lib/toast-position';
 export type { TGitAskProvider, TNoteSummaryProvider } from '@/lib/config-store';
@@ -25,6 +26,7 @@ export interface IConfigInitialData {
   editorUrl?: string;
   editorPreset?: TEditorPreset;
   notificationsEnabled?: boolean;
+  alertsOrchestratorOnly?: boolean;
   toastOnCompleteEnabled?: boolean;
   toastDuration?: number;
   toastPositionDesktop?: TToastPosition;
@@ -49,6 +51,7 @@ interface IConfigState {
   editorUrl: string;
   editorPreset: TEditorPreset;
   notificationsEnabled: boolean;
+  alertsOrchestratorOnly: boolean;
   toastOnCompleteEnabled: boolean;
   toastDuration: number;
   toastPositionDesktop: TToastPosition;
@@ -73,6 +76,7 @@ interface IConfigState {
   setEditorUrl: (url: string) => void;
   setEditorPreset: (preset: TEditorPreset) => void;
   setNotificationsEnabled: (enabled: boolean) => void;
+  setAlertsOrchestratorOnly: (enabled: boolean) => void;
   setToastOnCompleteEnabled: (enabled: boolean) => void;
   setToastDuration: (duration: number) => void;
   setToastPositionDesktop: (position: TToastPosition) => void;
@@ -90,6 +94,7 @@ interface IConfigState {
 
 const initialConfig = {
   notificationsEnabled: true,
+  alertsOrchestratorOnly: ALERTS_ORCHESTRATOR_ONLY_DEFAULT,
   toastOnCompleteEnabled: true,
   toastDuration: DEFAULT_TOAST_DURATION,
   toastPositionDesktop: DEFAULT_TOAST_POSITION_DESKTOP,
@@ -131,6 +136,7 @@ const useConfigStore = create<IConfigState>((set, get) => ({
   editorUrl: initialConfig.editorUrl,
   editorPreset: initialConfig.editorPreset,
   notificationsEnabled: initialConfig.notificationsEnabled,
+  alertsOrchestratorOnly: initialConfig.alertsOrchestratorOnly,
   toastOnCompleteEnabled: initialConfig.toastOnCompleteEnabled,
   toastDuration: initialConfig.toastDuration,
   toastPositionDesktop: initialConfig.toastPositionDesktop,
@@ -156,6 +162,7 @@ const useConfigStore = create<IConfigState>((set, get) => ({
       editorUrl: data.editorUrl ?? '',
       editorPreset: data.editorPreset ?? 'code-server',
       notificationsEnabled: data.notificationsEnabled ?? true,
+      alertsOrchestratorOnly: data.alertsOrchestratorOnly ?? ALERTS_ORCHESTRATOR_ONLY_DEFAULT,
       toastOnCompleteEnabled: data.toastOnCompleteEnabled ?? true,
       toastDuration: data.toastDuration ?? DEFAULT_TOAST_DURATION,
       toastPositionDesktop: data.toastPositionDesktop ?? DEFAULT_TOAST_POSITION_DESKTOP,
@@ -209,6 +216,12 @@ const useConfigStore = create<IConfigState>((set, get) => ({
   setNotificationsEnabled: (enabled) => {
     set({ notificationsEnabled: enabled });
     saveConfig({ notificationsEnabled: enabled });
+  },
+
+  setAlertsOrchestratorOnly: (enabled) => {
+    if (get().alertsOrchestratorOnly === enabled) return;
+    set({ alertsOrchestratorOnly: enabled });
+    saveConfig({ alertsOrchestratorOnly: enabled });
   },
 
   setToastOnCompleteEnabled: (enabled) => {
