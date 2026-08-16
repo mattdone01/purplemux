@@ -16,9 +16,9 @@ Cross-workspace access is deliberate and rare: the TARGET workspace must name yo
 workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
 add one rather than working around a 403.
 
-Each workspace also gets its own agent session store (\`CLAUDE_CONFIG_DIR\`), so
-several workspaces can share one project root without sharing conversation
-history or resume lists.
+Each workspace also gets its own agent session store — \`CLAUDE_CONFIG_DIR\` for
+Claude, \`GROK_HOME\` for Grok — so several workspaces can share one project root
+without sharing conversation history or resume lists.
 
 ## Workspaces
 
@@ -46,10 +46,10 @@ GET /api/cli/tabs?workspaceId=WS
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId" }] }
 
 POST /api/cli/tabs
-  Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "agent-sessions" | "web-browser" | "diff",
+  Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
           "model"?: "...", "reasoning"?: "minimal" | "low" | "medium" | "high", "launch"?: boolean }
   Invalid panelType returns HTTP 400 with validPanelTypes.
-  Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli)
+  Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
   codex --model); "reasoning" sets codex model_reasoning_effort; "launch": false keeps
@@ -64,9 +64,15 @@ DELETE /api/cli/tabs/<tabId>?workspaceId=WS
   Close the tab (kills tmux session and removes from layout).
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
-  Body: { "content": "..." }
-  Send text (bracketed paste) to the tab.
-  Response: { "status": "sent" }
+  Body: { "content": "...", "waitMs"?: 0..600000 }
+  Send text (bracketed paste + Enter) to the tab.
+  For an agent tab (claude-code / codex-cli / grok-cli) the send waits until the tab can
+  accept a turn, up to waitMs (default 60000). A booting agent swallows the Enter after a
+  paste, so sending into one reports success over an agent that never starts. waitMs: 0
+  answers with the current state instead of waiting. Terminal and browser tabs are ungated.
+  Response: { "status": "sent", "submitted": boolean, "cliState": string | null }
+  409 { "error": "agent-not-ready", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"? }
+    — nothing was pasted, so a later Enter cannot submit a half-forgotten prompt.
 
 GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   Response: { "tabId", "workspaceId", "alive", "command", "cliState", "agentProviderId", "agentSessionId", "claudeSessionId" }

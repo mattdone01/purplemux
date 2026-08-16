@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import type { TAgentPanelType } from '@/lib/agent-panel-types';
 import type {
   ITimelineEntry,
   IInitMeta,
@@ -8,6 +9,8 @@ import type {
   TTimelineConnectionStatus,
 } from '@/types/timeline';
 import useTimelineWebSocket from '@/hooks/use-timeline-websocket';
+import { prependEntries, upsertEntry } from '@/lib/timeline-merge';
+import { canLoadOlder } from '@/lib/timeline-paging';
 
 interface IResumeCallbacks {
   onResumeStarted?: (payload: { sessionId: string; jsonlPath: string | null }) => void;
@@ -25,7 +28,7 @@ interface IUseTimelineOptions {
   sessionName: string;
   agentSessionId?: string | null;
   claudeSessionId?: string | null;
-  panelType?: 'claude-code' | 'codex-cli';
+  panelType?: TAgentPanelType;
   enabled: boolean;
   resumeCallbacks?: IResumeCallbacks;
   onSync?: (state: ITimelineSyncState) => void;
@@ -137,7 +140,7 @@ const useTimeline = ({
       return [...merged, ...pendings];
     });
     startByteOffsetRef.current = startByteOffset ?? 0;
-    setHasMore(hasMoreInit ?? false);
+    setHasMore((hasMoreInit ?? false) && canLoadOlder(jsonlPath, startByteOffset ?? 0));
     setSessionSummary(summary);
     setInitMeta(meta);
     setSessionStats(initStats ?? null);
@@ -186,7 +189,7 @@ const useTimeline = ({
             }
           }
         }
-        updated.push(entry);
+        upsertEntry(updated, entry);
       }
       return updated;
     });
@@ -287,21 +290,22 @@ const useTimeline = ({
   }, []);
 
   const loadMore = useCallback(async () => {
-    if (!jsonlPathRef.current || isLoadingMoreRef.current || !hasMore) return;
-    if (startByteOffsetRef.current <= 0) {
+    if (isLoadingMoreRef.current || !hasMore) return;
+    const jsonlSource = jsonlPathRef.current;
+    if (!canLoadOlder(jsonlSource, startByteOffsetRef.current)) {
       setHasMore(false);
       return;
     }
     isLoadingMoreRef.current = true;
     try {
       const res = await fetch(
-        `/api/timeline/entries?jsonlPath=${encodeURIComponent(jsonlPathRef.current)}&beforeByte=${startByteOffsetRef.current}&limit=256`,
+        `/api/timeline/entries?jsonlPath=${encodeURIComponent(jsonlSource)}&beforeByte=${startByteOffsetRef.current}&limit=256`,
       );
       if (!res.ok) return;
       const data = await res.json();
       const loadedEntries = data.entries as ITimelineEntry[];
       setEntries((prev) => {
-        if (!data.replaceEntries) return [...loadedEntries, ...prev];
+        if (!data.replaceEntries) return prependEntries(loadedEntries, prev);
 
         const pendings = prev.filter(
           (e): e is ITimelineEntry & { type: 'user-message'; pending: true } =>

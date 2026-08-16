@@ -113,6 +113,8 @@
   "notification": {
     "enable": "Benachrichtigungen aktivieren",
     "enableDescription": "Systembenachrichtigungen anzeigen, wenn Agent-Aufgaben abgeschlossen sind. Funktioniert nur in der Electron-App.",
+    "orchestratorOnly": "Nur Orchestrator-Hinweise",
+    "orchestratorOnlyDescription": "Nur für den Orchestrator-Tab eines orchestrierten Workspace benachrichtigen. Ausschalten, um für jeden Agent-Tab zu benachrichtigen.",
     "permissionDenied": "Browser-Benachrichtigungsberechtigung verweigert. Bitte in den Browser-Einstellungen erlauben.",
     "notSupported": "Web Push wird in diesem Browser nicht unterstützt.",
     "toastSection": "In-App-Toast",

@@ -1,5 +1,5 @@
 import { WebSocket } from 'ws';
-import { getWorkspaces, getWorkspaceById } from '@/lib/workspace-store';
+import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, setLayoutReconciler } from '@/lib/layout-store';
 import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid, hasSession, sendBracketedPaste } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
@@ -15,25 +15,32 @@ import { createLogger } from '@/lib/logger';
 import { capturePaneAtWidth } from '@/lib/capture-at-width';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
+import { GROK_PROVIDER_ID } from '@/lib/providers/grok';
+import { resolveGrokJsonlPath } from '@/lib/providers/grok/session-detection';
+import { isAgentPanelType, toSessionHistoryProvider } from '@/lib/agent-panel-types';
+import { runtimeHandleFor, runtimeProviderId } from '@/lib/agent-runtime-handle';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
 import { cacheCodexRateLimitsFromJsonl } from '@/lib/codex-rate-limits-cache';
 import { parsePermissionOptions } from '@/lib/permission-prompt';
 import type { IPaneInfo } from '@/lib/tmux';
-import type { ITab } from '@/types/terminal';
+import type { ITab, IWorkspace } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
-import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup } from '@/types/status';
+import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
-import webpush from 'web-push';
-import { getSubscriptions, removeSubscription, isAnyDeviceVisible } from '@/lib/push-subscriptions';
-import { getVAPIDKeys } from '@/lib/vapid-keys';
+import { alertFor, isOrchestratorTab, isStallEpisodeEnd, shouldAlert, standupAlertTabId } from '@/lib/alert-policy';
+import { createStatusSocketChannel, createWebPushChannel, getNotificationDispatcher } from '@/lib/notification-dispatcher';
+import { getConfig } from '@/lib/config-store';
 import { nanoid } from 'nanoid';
 import fs from 'fs/promises';
 import { watch, type FSWatcher } from 'fs';
+
+const toAlertProvider = (providerId: string | undefined): TAlertProviderId =>
+  providerId === 'codex' || providerId === 'grok' ? providerId : 'claude';
 
 const log = createLogger('status');
 const hookLog = createLogger('hooks');
@@ -94,7 +101,7 @@ class StatusManager {
   // Scope/cwd are read from the layout file, which is far too slow to touch per
   // tool call. Cached with a short TTL and refreshed off the hot path.
   private tabScopeCache = new Map<string, { scope?: string[]; cwd?: string; at: number }>();
-  private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number }>();
+  private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean }>();
   private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
   private stuckNudgedTabs = new Set<string>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
@@ -203,8 +210,9 @@ class StatusManager {
       return;
     }
 
-    if (provider && entry.jsonlPath) {
-      const { idle, stale, lastAssistantSnippet } = await provider.readRuntimeSnapshot(entry.jsonlPath);
+    const unknownStateHandle = this.runtimeHandle(entry);
+    if (provider && unknownStateHandle) {
+      const { idle, stale, lastAssistantSnippet } = await provider.readRuntimeSnapshot(unknownStateHandle);
       if (idle && !stale && lastAssistantSnippet) {
         this.applyCliState(tabId, entry, 'ready-for-review', { silent: true });
         this.persistToLayout(entry);
@@ -236,12 +244,23 @@ class StatusManager {
         } catch { /* fall through */ }
       }
 
+      // Codex and grok both key their stores by their own index rather than by
+      // the pane's cwd, so a persisted session id resolves to a transcript
+      // without re-detecting the process.
       const persistedSessionId = provider.readSessionId(tab);
-      if (persistedSessionId && provider.id === CODEX_PROVIDER_ID) {
-        const codexSession = await findCodexSessionById(persistedSessionId);
-        if (codexSession?.jsonlPath) {
-          const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(codexSession.jsonlPath);
-          return { lastAssistantSnippet, currentAction, jsonlPath: codexSession.jsonlPath };
+      if (persistedSessionId) {
+        const storeJsonlPath = provider.id === CODEX_PROVIDER_ID
+          ? (await findCodexSessionById(persistedSessionId))?.jsonlPath ?? null
+          : provider.id === GROK_PROVIDER_ID
+            ? await resolveGrokJsonlPath(persistedSessionId)
+            : null;
+        const handle = runtimeHandleFor(provider.id, {
+          jsonlPath: storeJsonlPath,
+          sessionId: persistedSessionId,
+        });
+        if (handle) {
+          const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(handle);
+          return { lastAssistantSnippet, currentAction, jsonlPath: storeJsonlPath };
         }
       }
     }
@@ -491,7 +510,7 @@ class StatusManager {
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
   // idle로 잠들면 아무것도 깨우지 못한다 — 그 유일한 사각을 keeper가 메운다.
   private async runOrchestratorKeeper(): Promise<void> {
-    const { workspaces } = await getWorkspaces();
+    const workspaces = (await getWorkspacesCached())?.workspaces ?? [];
     const now = Date.now();
     for (const ws of workspaces) {
       const orch = ws.orchestration;
@@ -499,15 +518,15 @@ class StatusManager {
       const entry = this.tabs.get(orch.orchestratorTabId);
       if (!entry) { this.orchKeeper.delete(ws.id); continue; }
 
-      const state = this.orchKeeper.get(ws.id) ?? { idleSince: null, beats: 0, lastBeatAt: 0 };
+      const state = this.orchKeeper.get(ws.id) ?? { idleSince: null, beats: 0, lastBeatAt: 0, stallAlerted: false };
       const workersActive = [...this.tabs.entries()].some(([id, t]) =>
         id !== orch.orchestratorTabId && t.workspaceId === ws.id
-        && (t.panelType === 'claude-code' || t.panelType === 'codex-cli')
+        && isAgentPanelType(t.panelType)
         && (t.cliState === 'busy' || t.cliState === 'needs-input' || t.cliState === 'ready-for-review'));
 
-      // busy = working; needs-input = waiting on the HUMAN (web push already fired) — don't nag.
+      // busy = working; needs-input = waiting on the HUMAN (the alert already fired) — do not nag.
       if (entry.cliState === 'busy' || entry.cliState === 'needs-input' || workersActive) {
-        this.orchKeeper.set(ws.id, { idleSince: null, beats: 0, lastBeatAt: 0 });
+        this.orchKeeper.set(ws.id, { idleSince: null, beats: 0, lastBeatAt: 0, stallAlerted: false });
         continue;
       }
       if (entry.cliState !== 'idle' && entry.cliState !== 'ready-for-review') continue;
@@ -530,7 +549,16 @@ class StatusManager {
           log.warn(`orchestrator heartbeat delivery failed: ${err instanceof Error ? err.message : err}`);
         }
       }
-      this.orchKeeper.set(ws.id, { ...state, beats: state.beats + 1, lastBeatAt: now });
+      const beats = state.beats + 1;
+      // Last heartbeat of the episode: the orchestrator slept through every
+      // nudge purplemux can send, so the human is the only one left to ask.
+      const stalled = isStallEpisodeEnd(beats, ORCH_MAX_HEARTBEATS, state.stallAlerted);
+      this.orchKeeper.set(ws.id, { ...state, beats, lastBeatAt: now, stallAlerted: state.stallAlerted || stalled });
+      if (stalled) {
+        void this.dispatchStallAlert(ws, entry, orch.orchestratorTabId, idleMinutes).catch((err) => {
+          log.warn(`orchestrator stall alert failed: ${err instanceof Error ? err.message : err}`);
+        });
+      }
       const nudge: IOrchestrationNudge = {
         id: nanoid(8),
         workspaceId: ws.id,
@@ -546,8 +574,22 @@ class StatusManager {
         this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
       }
       this.broadcast({ type: 'orchestration:nudge', nudge });
-      log.info({ workspaceId: ws.id, beats: state.beats + 1, delivered }, 'orchestrator heartbeat');
+      log.info({ workspaceId: ws.id, beats, delivered }, 'orchestrator heartbeat');
     }
+  }
+
+  private async dispatchStallAlert(ws: IWorkspace, entry: ITabStatusEntry, tabId: string, idleMinutes: number): Promise<void> {
+    if (!shouldAlert({ id: tabId }, ws, await getConfig())) return;
+    await this.dispatchAlert({
+      kind: 'orchestrator-stalled',
+      tabId,
+      workspace: ws,
+      workspaceId: ws.id,
+      tabName: entry.tabName,
+      providerId: toAlertProvider(entry.agentProviderId),
+      agentSessionId: entry.agentSessionId,
+      detail: `Idle ~${idleMinutes} min with no worker activity after ${ORCH_MAX_HEARTBEATS} heartbeats.`,
+    });
   }
 
   getAllForClient(): Record<string, IClientTabStatusEntry> {
@@ -600,11 +642,11 @@ class StatusManager {
     }
 
     if (newState === 'ready-for-review' && !opts.silent) {
-      void this.maybeSendWebPush(tabId, entry, 'review');
+      void this.dispatchTransitionAlert(tabId, entry, 'review');
     }
 
     if (newState === 'needs-input' && !opts.silent) {
-      void this.maybeSendWebPush(tabId, entry, 'needs-input');
+      void this.dispatchTransitionAlert(tabId, entry, 'needs-input');
     }
 
     const shouldWatch = (newState === 'busy' || newState === 'needs-input') && entry.jsonlPath;
@@ -627,17 +669,56 @@ class StatusManager {
     }
   }
 
-  // Orchestrated workspace: worker-tab pushes are noise — the orchestrator
-  // handles workers. Only the orchestrator tab's own transitions notify the human.
-  private async maybeSendWebPush(tabId: string, entry: ITabStatusEntry, kind: 'review' | 'needs-input'): Promise<void> {
+  // Every channel — web push, the status socket, and the client-side Electron
+  // and toast hooks — asks alert-policy the same question. See docs/STATUS.md.
+  private async dispatchTransitionAlert(tabId: string, entry: ITabStatusEntry, kind: 'review' | 'needs-input'): Promise<void> {
     try {
-      const ws = await getWorkspaceById(entry.workspaceId);
-      const orch = ws?.orchestration;
-      if (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId) return;
-      await this.sendWebPush(tabId, entry, kind);
+      const ws = await getWorkspaceByIdCached(entry.workspaceId);
+      if (!shouldAlert({ id: tabId }, ws, await getConfig())) return;
+      await this.dispatchAlert({
+        kind,
+        tabId,
+        workspace: ws,
+        workspaceId: entry.workspaceId,
+        tabName: entry.tabName,
+        providerId: toAlertProvider(entry.agentProviderId),
+        agentSessionId: entry.agentSessionId,
+        lastUserMessage: entry.lastUserMessage,
+      });
     } catch (err) {
-      log.warn('Web push failed: %s', err);
+      log.warn('Alert dispatch failed: %s', err);
     }
+  }
+
+  private async dispatchAlert(params: {
+    kind: TAlertKind;
+    tabId: string;
+    workspace: IWorkspace | undefined;
+    workspaceId: string;
+    tabName: string;
+    providerId: TAlertProviderId;
+    agentSessionId?: string | null;
+    lastUserMessage?: string | null;
+    headline?: string | null;
+    detail?: string | null;
+  }): Promise<void> {
+    const draft = alertFor({
+      kind: params.kind,
+      tabId: params.tabId,
+      workspaceId: params.workspaceId,
+      workspaceName: params.workspace?.name ?? '',
+      tabName: params.tabName,
+      providerId: params.providerId,
+      isOrchestrator: isOrchestratorTab({ id: params.tabId }, params.workspace),
+      at: Date.now(),
+      lastUserMessage: params.lastUserMessage,
+      headline: params.headline,
+      detail: params.detail,
+    });
+    await getNotificationDispatcher().dispatch(draft, {
+      agentSessionId: params.agentSessionId ?? null,
+      workspaceDir: params.workspace?.directories[0] ?? null,
+    });
   }
 
   /**
@@ -681,8 +762,8 @@ class StatusManager {
   }
 
   private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<void> {
-    if (entry.panelType !== 'claude-code' && entry.panelType !== 'codex-cli') return;
-    const ws = await getWorkspaceById(entry.workspaceId);
+    if (!isAgentPanelType(entry.panelType)) return;
+    const ws = await getWorkspaceByIdCached(entry.workspaceId);
     const orch = ws?.orchestration;
     if (!ws || !orch?.enabled || !orch.orchestratorTabId || orch.orchestratorTabId === tabId) return;
 
@@ -734,6 +815,30 @@ class StatusManager {
     });
     this.broadcast({ type: 'standup:update', standup });
     log.info({ workspaceId: standup.workspaceId, state: standup.state, needsHuman: standup.needsHuman }, 'standup tick');
+
+    void this.dispatchStandupAlert(standup).catch((err) => {
+      log.warn(`standup alert failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  // A standup that needs a human is the orchestrator asking for you, so the
+  // alert is addressed to the orchestrator tab rather than to whoever ticked.
+  private async dispatchStandupAlert(standup: IWorkspaceStandup): Promise<void> {
+    const ws = await getWorkspaceByIdCached(standup.workspaceId);
+    const tabId = standupAlertTabId(standup, ws, await getConfig());
+    if (!tabId) return;
+
+    const entry = this.tabs.get(tabId);
+    await this.dispatchAlert({
+      kind: 'standup-needs-human',
+      tabId,
+      workspace: ws,
+      workspaceId: standup.workspaceId,
+      tabName: entry?.tabName ?? '',
+      providerId: toAlertProvider(entry?.agentProviderId),
+      agentSessionId: entry?.agentSessionId,
+      headline: standup.headline,
+    });
   }
 
   getStandupsForClient(): Record<string, IWorkspaceStandup> {
@@ -769,23 +874,32 @@ class StatusManager {
   }
 
   private async hasRecentJsonlActivity(entry: ITabStatusEntry, now: number): Promise<boolean> {
-    if (!entry.jsonlPath) return false;
+    const handle = this.runtimeHandle(entry);
+    if (!handle) return false;
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
     if (!provider) return false;
     try {
-      const snapshot = await provider.readRuntimeSnapshot(entry.jsonlPath);
+      const snapshot = await provider.readRuntimeSnapshot(handle);
       return snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS;
     } catch {
       return false;
     }
   }
 
+  private runtimeHandle(entry: ITabStatusEntry): string | null {
+    return runtimeHandleFor(
+      runtimeProviderId(entry.agentProviderId, entry.panelType),
+      { jsonlPath: entry.jsonlPath, sessionId: entry.agentSessionId },
+    );
+  }
+
   private async saveSessionHistory(tabId: string, entry: ITabStatusEntry, prevBusySince: number | null | undefined, cancelled: boolean): Promise<void> {
     if (!entry.lastUserMessage) return;
 
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
-    const stats = entry.jsonlPath && provider
-      ? await provider.readSessionHistoryStats(entry.jsonlPath)
+    const handle = this.runtimeHandle(entry);
+    const stats = handle && provider
+      ? await provider.readSessionHistoryStats(handle)
       : null;
     const { workspaces } = await getWorkspaces();
     const ws = workspaces.find((w) => w.id === entry.workspaceId);
@@ -796,7 +910,7 @@ class StatusManager {
       ? completedAt - startedAt
       : (stats?.turnDurationMs ?? (completedAt - startedAt));
 
-    const providerId = entry.agentProviderId === 'codex' ? 'codex' : 'claude';
+    const providerId = toSessionHistoryProvider(entry.agentProviderId);
     const historyEntry: ISessionHistoryEntry = {
       id: nanoid(),
       workspaceId: entry.workspaceId,
@@ -954,11 +1068,12 @@ class StatusManager {
       this.resolveAndWatchJsonl(tabId, tmuxSession).catch(() => {});
     }
 
-    if (eventName === 'stop' && entry.jsonlPath) {
+    const stopHandle = this.runtimeHandle(entry);
+    if (eventName === 'stop' && stopHandle) {
       const refreshSnippet = (force = false) => {
         const provider = getProviderByPanelType(entry.panelType);
         if (!provider) return;
-        provider.readRuntimeSnapshot(entry.jsonlPath!, { force }).then(({ currentAction, lastAssistantSnippet, reset }) => {
+        provider.readRuntimeSnapshot(stopHandle, { force }).then(({ currentAction, lastAssistantSnippet, reset }) => {
           let updated = false;
           if (reset) {
             if (entry.currentAction !== null) { entry.currentAction = null; updated = true; }
@@ -1289,7 +1404,9 @@ class StatusManager {
         const tabProvider = getProviderByPanelType(tab?.panelType);
         const tabSessionId = tab && tabProvider ? tabProvider.readSessionId(tab) : null;
         if (tab && tabProvider && tabSessionId) {
-          if (tabProvider.id === CODEX_PROVIDER_ID) {
+          if (tabProvider.id === GROK_PROVIDER_ID) {
+            jsonlPath = await resolveGrokJsonlPath(tabSessionId);
+          } else if (tabProvider.id === CODEX_PROVIDER_ID) {
             jsonlPath = (await findCodexSessionById(tabSessionId))?.jsonlPath ?? null;
           } else {
             const cwd = await getSessionCwd(tmuxSession);
@@ -1439,51 +1556,15 @@ class StatusManager {
     entry.lastUserMessage = message;
     this.broadcastUpdate(parsed.tabId, entry);
   }
-
-  private async sendWebPush(tabId: string, entry: ITabStatusEntry, pushType: 'review' | 'needs-input'): Promise<void> {
-    const subs = await getSubscriptions();
-    if (subs.length === 0) return;
-
-    const keys = await getVAPIDKeys();
-    webpush.setVapidDetails('mailto:noreply@purplemux.app', keys.publicKey, keys.privateKey);
-
-    const title = pushType === 'needs-input' ? 'Input Required' : 'Task Complete';
-    const body = entry.lastUserMessage?.slice(0, 100) || entry.tabName || tabId;
-    const ws = (await getWorkspaces()).workspaces.find((w) => w.id === entry.workspaceId);
-    const providerId = entry.agentProviderId === 'codex' ? 'codex' : 'claude';
-    const payload = JSON.stringify({
-      title,
-      body,
-      tabId,
-      workspaceId: entry.workspaceId,
-      providerId,
-      // Field name kept `claudeSessionId` for SW back-compat: existing service workers
-      // (public/sw.js) read this key and a brief stale-SW window during upgrade would
-      // break notifications if renamed.
-      claudeSessionId: entry.agentSessionId ?? null,
-      workspaceName: ws?.name ?? '',
-      workspaceDir: ws?.directories[0] ?? null,
-    });
-
-    if (isAnyDeviceVisible()) return;
-    for (const sub of subs) {
-      try {
-        await webpush.sendNotification(sub, payload);
-      } catch (err: unknown) {
-        const status = (err as { statusCode?: number }).statusCode;
-        if (status === 410 || status === 404) {
-          await removeSubscription(sub.endpoint);
-        }
-        log.warn('Web push send error: %s', status);
-      }
-    }
-  }
 }
 
 export const getStatusManager = (): StatusManager => {
   if (!g.__ptStatusManager) {
     const manager = new StatusManager();
     g.__ptStatusManager = manager;
+    const dispatcher = getNotificationDispatcher();
+    dispatcher.register(createStatusSocketChannel((frame) => manager.broadcast(frame)));
+    dispatcher.register(createWebPushChannel());
     setLayoutReconciler({
       reconcileWorkspaceTabs: (wsId, validTabIds) => manager.reconcileWorkspaceTabs(wsId, validTabIds),
       removeWorkspaceTabs: (wsId) => manager.removeWorkspaceTabs(wsId),

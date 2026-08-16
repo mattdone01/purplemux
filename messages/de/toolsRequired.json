@@ -27,5 +27,11 @@
   "codexMissingTitle": "Codex CLI is not installed",
   "codexMissingDescription": "Open the Codex CLI install guide, or cancel and install it manually before starting a Codex tab.",
   "preflightFailedTitle": "Could not check agent tools",
-  "preflightFailedDescription": "purplemux could not verify the agent CLI installation. The current action was canceled."
+  "preflightFailedDescription": "purplemux could not verify the agent CLI installation. The current action was canceled.",
+  "grokMissingTitle": "Grok CLI is not installed",
+  "grokMissingDescription": "Install Grok Build with: curl -fsSL https://x.ai/cli/install.sh | bash",
+  "grokNotLoggedInTitle": "Grok Build is not signed in",
+  "grokNotLoggedInDescription": "Run `grok login` on this machine, or `grok login --device-auth` when there is no browser on the box.",
+  "grokLabel": "Grok",
+  "grokOptional": "optional"
 }

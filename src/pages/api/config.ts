@@ -7,7 +7,7 @@ import { isValidEditorPreset } from '@/lib/editor-url';
 import { isValidToastPosition } from '@/lib/toast-position';
 
 const ALLOWED_FIELDS: (keyof Omit<IConfigData, 'updatedAt' | 'authSecret'>)[] = [
-  'appTheme', 'terminalTheme', 'customCSS', 'dangerouslySkipPermissions', 'claudeShowTerminal', 'gitAskProvider', 'noteSummaryProvider', 'editorUrl', 'editorPreset', 'authPassword', 'notificationsEnabled', 'toastOnCompleteEnabled', 'toastDuration', 'toastPositionDesktop', 'toastPositionMobile', 'locale', 'fontSize', 'lineHeight', 'lineHeightCustom', 'terminalKeyBar', 'systemResourcesEnabled', 'networkAccess',
+  'appTheme', 'terminalTheme', 'customCSS', 'dangerouslySkipPermissions', 'claudeShowTerminal', 'gitAskProvider', 'noteSummaryProvider', 'editorUrl', 'editorPreset', 'authPassword', 'notificationsEnabled', 'alertsOrchestratorOnly', 'toastOnCompleteEnabled', 'toastDuration', 'toastPositionDesktop', 'toastPositionMobile', 'locale', 'fontSize', 'lineHeight', 'lineHeightCustom', 'terminalKeyBar', 'systemResourcesEnabled', 'networkAccess',
 ];
 
 const NETWORK_ACCESS_VALUES = ['localhost', 'tailscale', 'all'] as const;
@@ -77,6 +77,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
     if ('toastDuration' in updates && !isValidToastDuration(updates.toastDuration)) {
       return res.status(400).json({ error: 'toastDuration must be a number between 1000 and 60000.' });
+    }
+
+    if ('alertsOrchestratorOnly' in updates && typeof updates.alertsOrchestratorOnly !== 'boolean') {
+      return res.status(400).json({ error: 'alertsOrchestratorOnly must be a boolean.' });
     }
 
     if (typeof updates.authPassword === 'string' && updates.authPassword) {

@@ -113,6 +113,8 @@
   "notification": {
     "enable": "啟用通知",
     "enableDescription": "代理任務完成時顯示系統通知。僅在 Electron 應用程式中有效。",
+    "orchestratorOnly": "僅編排器提醒",
+    "orchestratorOnlyDescription": "僅在編排工作區的編排器分頁提醒。關閉後所有代理分頁都會提醒。",
     "permissionDenied": "瀏覽器通知權限被拒絕。請在瀏覽器設定中允許。",
     "notSupported": "此瀏覽器不支援 Web Push。",
     "toastSection": "應用程式內提示",

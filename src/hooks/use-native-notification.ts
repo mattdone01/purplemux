@@ -1,6 +1,8 @@
 import { useEffect } from 'react';
 import useTabStore from '@/hooks/use-tab-store';
 import useConfigStore from '@/hooks/use-config-store';
+import useWorkspaceStore from '@/hooks/use-workspace-store';
+import { shouldAlert } from '@/lib/alert-policy';
 import { navigateToTab } from '@/hooks/use-layout';
 import isElectron from '@/hooks/use-is-electron';
 
@@ -30,7 +32,7 @@ const useNativeNotification = () => {
     });
 
     const unsubStore = useTabStore.subscribe((state, prev) => {
-      const enabled = useConfigStore.getState().notificationsEnabled;
+      const { notificationsEnabled: enabled, alertsOrchestratorOnly } = useConfigStore.getState();
       let notified = false;
       let attentionCount = 0;
 
@@ -40,6 +42,8 @@ const useNativeNotification = () => {
         if (notified || !enabled) continue;
         const prevTab = prev.tabs[tabId];
         if (!prevTab || prevTab.cliState === tab.cliState) continue;
+        const workspace = useWorkspaceStore.getState().workspaces.find((w) => w.id === tab.workspaceId);
+        if (!shouldAlert({ id: tabId }, workspace, { alertsOrchestratorOnly })) continue;
         const body = tab.lastUserMessage
           ? tab.lastUserMessage.slice(0, 100)
           : tab.tabName || tabId;

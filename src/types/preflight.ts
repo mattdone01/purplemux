@@ -7,6 +7,9 @@ export interface ICodexStatus extends IToolStatus {
   binaryPath: string | null;
 }
 
+/** grok reports the same shape as codex; aliased so the provider reads naturally. */
+export type IGrokStatus = ICodexStatus;
+
 export interface IAgentRuntimeToolStatus extends IToolStatus {
   binaryPath: string | null;
   loggedIn?: boolean;
@@ -24,6 +27,7 @@ export interface IRuntimePreflightResult {
   git: IToolStatus;
   claude: IAgentRuntimeToolStatus;
   codex: IAgentRuntimeToolStatus;
+  grok: IAgentRuntimeToolStatus;
 }
 
 export const isRuntimeOk = (status: IRuntimePreflightResult): boolean =>

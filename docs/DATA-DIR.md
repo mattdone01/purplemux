@@ -18,9 +18,12 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── message-history.json  # per-workspace input history
 │       ├── claude-prompt.md      # --append-system-prompt-file content
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
-│       └── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
+│       ├── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
+│       └── grok-home/            # per-workspace GROK_HOME
 ├── hooks.json               # Claude Code hook + statusline config (generated)
 ├── status-hook.sh           # hook → POST /api/status/hook (generated, 0755)
+├── codex-hook.sh            # Codex hook → POST /api/status/hook?provider=codex (generated, 0700)
+├── grok-hook.sh             # Grok hook → POST /api/status/hook?provider=grok (generated, 0700)
 ├── statusline.sh            # statusline → POST /api/status/statusline (generated, 0755)
 ├── rate-limits.json         # latest statusline JSON written by statusline.sh
 ├── session-history.json     # completed Claude session log (cross-workspace)
@@ -105,15 +108,47 @@ Plus `statusLine.command = sh "~/.purplemux/statusline.sh"`.
 
 See [STATUS.md](./STATUS.md) for the full status-detection flow.
 
-### `status-hook.sh`, `statusline.sh`
+### `status-hook.sh`, `codex-hook.sh`, `grok-hook.sh`, `statusline.sh`
 
-Auto-generated from `HOOK_SCRIPT_CONTENT` (`hook-settings.ts`) and `STATUSLINE_SCRIPT_CONTENT` (`statusline-script.ts`). Both:
+Auto-generated from `HOOK_SCRIPT_CONTENT`, `CODEX_HOOK_SCRIPT_CONTENT` and `GROK_HOOK_SCRIPT_CONTENT` (`hook-settings.ts`) and `STATUSLINE_SCRIPT_CONTENT` (`statusline-script.ts`). All of them:
 
 1. Read `port` and `cli-token` from `~/.purplemux/`
 2. `POST` to the local server with `x-pmux-token` header
 3. Fail silently if the server is down
 
+`grok-hook.sh` reads Grok Build's payload from **stdin** (grok pipes the event JSON to the hook process; the keys are camelCase and the `hookEventName` VALUE is snake_case), forwards it verbatim, and also passes `GROK_HOOK_EVENT` — which grok injects into every hook process — as a query parameter so an empty stdin still reports. It time-boxes the request with `curl --max-time 2`, backgrounds it, and always exits 0: `Stop` runs on the turn's critical path and a non-zero exit there would block grok from finishing.
+
 Do not edit these by hand — they are rewritten on startup when content differs.
+
+### `workspaces/{wsId}/grok-home/` and `$GROK_HOME/hooks/purplemux.json`
+
+Grok Build reads `GROK_HOME` instead of `~/.grok` when it is set, so each workspace pane launches
+with its own store (`src/lib/grok-home.ts`, ADR-0005). Inside a workspace grok home:
+
+- **private, real directories:** `sessions/`, `hooks/`, `logs/` — this is the isolation.
+- **symlinks back to `~/.grok`:** `auth.json`, `config.toml`, `managed_config.toml`,
+  `requirements.toml`, `pager.toml`, `lsp.json`, `trusted_folders.toml`, `mcp_credentials.json`,
+  `skills/`, `commands/`, `rules/`, `memory/`, `agents/`, `plugins/`, `workflows/`. Credentials and
+  configuration stay common, so a workspace tab never asks the user to sign in again. An entry the
+  install does not have is skipped.
+
+Ad-hoc tabs (no workspace) run against the real `~/.grok`.
+
+purplemux owns exactly one file in each grok home: `hooks/purplemux.json`, written at mode 0600 in
+the Claude Code hooks JSON format. Grok merges every `*.json` in that directory, so a hook the user
+wrote alongside it is never touched. The file is rewritten when its content changes — on server boot
+for every existing home, and again at pane launch for a workspace created after boot.
+
+Registered events: `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `StopCancelled`,
+`Notification` (matcher `permission_prompt|idle_prompt|task_complete`), `PreCompact`, `PostCompact`,
+`SessionEnd`, `PostToolUse` (matcher `Edit|Write|MultiEdit|Bash|search_replace|run_terminal_command`
+— grok's matcher is a regular expression and keeps the Claude tool names it aliases, so both
+spellings fire).
+
+purplemux never writes `~/.grok/config.toml`.
+
+grok's transcripts are JSONL: `$GROK_HOME/sessions/<url-encoded cwd>/<session-id>/updates.jsonl`,
+the authoritative ACP session-update stream. purplemux reads it and never writes to a grok store.
 
 ### `rate-limits.json`
 
@@ -136,6 +171,21 @@ Built-ins (`BUILTIN_PROMPTS`, `BUILTIN_ITEMS`) are defined in code; the disk fil
 ### `vapid-keys.json`, `push-subscriptions.json`
 
 Web Push state. VAPID keypair is generated on first run (`vapid-keys.ts`) and cached in memory. Subscriptions are managed per-browser via `push-subscriptions.ts`.
+
+`push-subscriptions.json` is an array of records:
+
+```json
+[
+  {
+    "subscription": { "endpoint": "https://…", "keys": { "p256dh": "…", "auth": "…" } },
+    "deviceId": "kQ9…",
+    "label": "Pixel",
+    "createdAt": 1755300000000
+  }
+]
+```
+
+`deviceId` is the browser's `purplemux-device-id` (localStorage, sent by `use-web-push.ts` with the subscription). It is what makes the push visibility gate per-device — a focused desktop no longer mutes the phone. Rows written before this wrapper existed are bare `PushSubscription` objects; `normalizeSubscriptionRecords` wraps them on read with `createdAt: 0` and no `deviceId`, and an unbound row keeps the old "any focused window mutes push" gate until that browser re-subscribes.
 
 ### `cli-token`, `port`
 
@@ -233,4 +283,8 @@ All files here are regeneratable — deleting them just triggers a recompute on 
 | Push subscriptions | `push-subscriptions.json` |
 | Stuck "already running" | `pmux.lock` (only if no purplemux process is alive) |
 
-`hooks.json`, `status-hook.sh`, `statusline.sh`, `port`, `cli-token`, `vapid-keys.json` are auto-regenerated on the next startup.
+`hooks.json`, `status-hook.sh`, `codex-hook.sh`, `grok-hook.sh`, `statusline.sh`, `port`, `cli-token`, `vapid-keys.json` are auto-regenerated on the next startup.
+
+Deleting `$GROK_HOME/hooks/purplemux.json` is safe — it is regenerated on the next startup, and it is
+the only file in that directory purplemux owns. Deleting a workspace `grok-home/` discards that
+workspace's grok session history; the shared credentials and configuration it links to are untouched.

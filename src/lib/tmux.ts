@@ -5,6 +5,9 @@ import path from 'path';
 import { nanoid } from 'nanoid';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { buildShellLaunchCommand } from '@/lib/shell-env';
+import { ensureWorkspaceGrokHome } from '@/lib/grok-home';
+import { writeGrokHookFile } from '@/lib/providers/grok/hook-config';
+import { GROK_HOOK_SCRIPT_PATH } from '@/lib/providers/grok/paths';
 import { ensureWorkspaceClaudeHome, workspaceIdFromSessionName } from '@/lib/workspace-home';
 import { getWorkspaceToken } from '@/lib/workspace-token';
 import { createLogger } from '@/lib/logger';
@@ -39,17 +42,30 @@ export const listSessions = async (): Promise<string[]> => {
 /**
  * Per-workspace environment for a pane's login shell.
  *
- * CLAUDE_CONFIG_DIR gives the workspace its own session store, so two workspaces
- * launched from the same directory no longer share conversation history or
- * resume lists. PMUX_TOKEN confines the CLI in this pane to its own workspace —
- * `bin/cli.js` already prefers the env var over the global token file.
+ * CLAUDE_CONFIG_DIR and GROK_HOME give the workspace its own session store per
+ * agent, so two workspaces launched from the same directory no longer share
+ * conversation history or resume lists. PMUX_TOKEN confines the CLI in this pane
+ * to its own workspace — `bin/cli.js` already prefers the env var over the
+ * global token file.
+ *
+ * The grok hook file is written here as well as at boot: a workspace created
+ * after the server started has no home yet, and a pane that launched without
+ * hooks would report no work state at all.
  */
 const workspaceEnv = async (sessionName: string): Promise<Record<string, string>> => {
   const wsId = workspaceIdFromSessionName(sessionName);
   if (!wsId) return {};
   try {
+    const [claudeHome, grokHome] = await Promise.all([
+      ensureWorkspaceClaudeHome(wsId),
+      ensureWorkspaceGrokHome(wsId),
+    ]);
+    await writeGrokHookFile(grokHome, GROK_HOOK_SCRIPT_PATH).catch((err) => {
+      log.warn(`grok hook install for ${wsId} failed: ${err instanceof Error ? err.message : err}`);
+    });
     return {
-      CLAUDE_CONFIG_DIR: await ensureWorkspaceClaudeHome(wsId),
+      CLAUDE_CONFIG_DIR: claudeHome,
+      GROK_HOME: grokHome,
       PMUX_TOKEN: getWorkspaceToken(wsId),
     };
   } catch (err) {
@@ -411,8 +427,11 @@ export const sendRawKeys = async (
   );
 };
 
-/** Send text via bracketed paste mode and press Enter twice (handles Claude Code long input confirmation) */
-export const sendBracketedPaste = async (
+/**
+ * Send text via bracketed paste mode WITHOUT submitting it. The agent TUI keeps
+ * it in the composer, so the operator (or a later Enter) decides when it goes.
+ */
+export const sendBracketedPasteText = async (
   sessionName: string,
   content: string,
 ): Promise<void> => {
@@ -422,6 +441,14 @@ export const sendBracketedPaste = async (
     ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, '-l', `\x1b[200~${content}\x1b[201~`],
     { timeout: CMD_TIMEOUT },
   );
+};
+
+/** Send text via bracketed paste mode and press Enter twice (handles Claude Code long input confirmation) */
+export const sendBracketedPaste = async (
+  sessionName: string,
+  content: string,
+): Promise<void> => {
+  await sendBracketedPasteText(sessionName, content);
   await execFile(
     'tmux',
     ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],

@@ -215,11 +215,11 @@ describe('parseCodexContent', () => {
 
       const first = await parser.parseIncremental();
       expect(first.newEntries).toHaveLength(0);
-      expect(first.pendingBuffer).toBe(partial.slice(0, -8));
+      expect(first.pendingBuffer.toString('utf-8')).toBe(partial.slice(0, -8));
 
       await fs.writeFile(jsonlPath, partial + '\n', 'utf-8');
       const second = await parser.parseIncremental();
-      expect(second.pendingBuffer).toBe('');
+      expect(second.pendingBuffer).toHaveLength(0);
       expect(second.newEntries).toHaveLength(1);
       expect(second.newEntries[0]).toMatchObject({
         type: 'user-message',
@@ -255,7 +255,7 @@ describe('parseCodexContent', () => {
       expect(second.newEntries.map((entry) => entry.type === 'user-message' ? entry.text : '')).toEqual([
         'message 9',
       ]);
-      expect(second.pendingBuffer).toBe('');
+      expect(second.pendingBuffer).toHaveLength(0);
       expect(second.newOffset).toBe(Buffer.byteLength(codexUserLine(9) + '\n', 'utf-8'));
     } finally {
       await fs.rm(dir, { recursive: true, force: true });

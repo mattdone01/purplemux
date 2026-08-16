@@ -113,6 +113,8 @@
   "notification": {
     "enable": "Activar notificaciones",
     "enableDescription": "Muestra notificaciones del sistema cuando las tareas del agente se completan. Solo funciona en la aplicación Electron.",
+    "orchestratorOnly": "Solo alertas del orquestador",
+    "orchestratorOnlyDescription": "Alertar solo en la pestaña del orquestador de un espacio orquestado. Desactívalo para alertar en cada pestaña de agente.",
     "permissionDenied": "Permiso de notificaciones del navegador denegado. Permítelo en la configuración del navegador.",
     "notSupported": "Web Push no es compatible con este navegador.",
     "toastSection": "Toast en la aplicación",

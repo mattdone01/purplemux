@@ -1,4 +1,5 @@
 import fs from 'fs/promises';
+import { toSessionHistoryProvider } from '@/lib/agent-panel-types';
 import path from 'path';
 import os from 'os';
 import { createLogger } from '@/lib/logger';
@@ -40,7 +41,7 @@ const migrateLegacyEntry = (raw: unknown): ISessionHistoryEntry | null => {
 
   if (typeof e.id !== 'string' || typeof e.tabId !== 'string') return null;
 
-  const providerId = e.providerId === 'codex' ? 'codex' : 'claude';
+  const providerId = toSessionHistoryProvider(typeof e.providerId === 'string' ? e.providerId : undefined);
   const agentSessionId =
     typeof e.agentSessionId === 'string' || e.agentSessionId === null
       ? (e.agentSessionId as string | null)

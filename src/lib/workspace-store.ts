@@ -18,6 +18,7 @@ import {
 import type { ICreateLayoutOptions } from '@/lib/layout-store';
 import { listProviders } from '@/lib/providers/registry';
 import { getVisuallyOrderedWorkspaces } from '@/lib/workspace-order';
+import { removeWorkspaceGrokHome } from '@/lib/grok-home';
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
@@ -304,6 +305,36 @@ export const getWorkspaceById = async (wsId: string): Promise<IWorkspace | undef
   return data?.workspaces.find((w) => w.id === wsId);
 };
 
+const gMemo = globalThis as unknown as { __ptWorkspacesMemo?: { key: string; data: IWorkspacesData } };
+
+/**
+ * Read-only workspaces snapshot, memoized on the file's mtime+size.
+ *
+ * The alert predicate and the orchestrator nudge both need the workspace on
+ * every agent state transition, and re-parsing workspaces.json per transition
+ * buys nothing. Every writer goes through writeWorkspacesFile, which bumps
+ * mtime and invalidates the memo. Callers must not mutate the result.
+ */
+export const getWorkspacesCached = async (): Promise<IWorkspacesData | null> => {
+  let key: string;
+  try {
+    const stat = await fs.stat(WORKSPACES_FILE);
+    key = `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+
+  const memo = gMemo.__ptWorkspacesMemo;
+  if (memo && memo.key === key) return memo.data;
+
+  const data = await readWorkspacesFile();
+  if (data) gMemo.__ptWorkspacesMemo = { key, data };
+  return data;
+};
+
+export const getWorkspaceByIdCached = async (wsId: string): Promise<IWorkspace | undefined> =>
+  (await getWorkspacesCached())?.workspaces.find((w) => w.id === wsId);
+
 // Claude keys its session store by cwd, which used to mean two workspaces in one
 // directory shared conversation history and resume lists — so this file enforced
 // one-directory-one-workspace, and every concurrent epic needed its own worktree.
@@ -377,6 +408,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
 
     await writeWorkspacesFile(data);
     await removeWorkspaceClaudeHome(workspaceId).catch(() => {});
+    await removeWorkspaceGrokHome(workspaceId).catch(() => {});
     revokeWorkspaceToken(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;

@@ -3,11 +3,19 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import useTabStore from '@/hooks/use-tab-store';
 import { getAgentPanelTypeFromProvider, isAgentPanel, isAgentRunning, tryAgentSwitch } from '@/lib/agent-switch-lock';
 import { applyAgentCheckResult, type IAgentCheckResponse } from '@/lib/agent-check';
+import {
+  AGENT_DISPLAY_NAME,
+  AGENT_PANEL_TYPES,
+  isAgentPanelType,
+  processMatchesPanelType,
+  providerIdForPanelType,
+  type TAgentPanelType,
+} from '@/lib/agent-panel-types';
 import { cn } from '@/lib/utils';
 import type { TPanelType } from '@/types/terminal';
 
 type TModeButton = {
-  type: Extract<TPanelType, 'terminal' | 'claude-code' | 'codex-cli'>;
+  type: Extract<TPanelType, 'terminal'> | TAgentPanelType;
   label: string;
   startAction?: boolean;
 };
@@ -23,27 +31,11 @@ interface IAgentModeSwitcherProps {
 const getButtonLabel = (mode: TModeButton) =>
   mode.startAction ? `Start ${mode.label}` : mode.label;
 
-const getAgentLabel = (panelType: TPanelType): string => {
-  if (panelType === 'claude-code' || panelType === 'codex-cli') return 'Chat';
-  return 'Terminal';
-};
-
-const processMatchesAgent = (panelType: TPanelType | undefined, process: string | undefined): boolean => {
-  if (!process) return false;
-  const normalized = process.toLowerCase();
-  if (panelType === 'claude-code') return normalized === 'claude';
-  if (panelType === 'codex-cli') return normalized === 'codex';
-  return false;
-};
-
-const providerForPanelType = (panelType: TPanelType): 'claude' | 'codex' | undefined => {
-  if (panelType === 'claude-code') return 'claude';
-  if (panelType === 'codex-cli') return 'codex';
-  return undefined;
-};
+const getAgentLabel = (panelType: TPanelType): string =>
+  (isAgentPanelType(panelType) ? 'Chat' : 'Terminal');
 
 const getCurrentMode = (panelType: TPanelType): TModeButton => {
-  if (panelType === 'claude-code' || panelType === 'codex-cli') {
+  if (isAgentPanelType(panelType)) {
     return { type: panelType, label: getAgentLabel(panelType) };
   }
   return { type: 'terminal', label: 'Terminal' };
@@ -63,7 +55,7 @@ const AgentModeSwitcher = ({
     && (
       tabEntry?.agentProcess === true
       || isAgentRunning(tabEntry?.cliState)
-      || processMatchesAgent(runtimeAgentPanelType, tabEntry?.currentProcess)
+      || processMatchesPanelType(runtimeAgentPanelType, tabEntry?.currentProcess)
     );
   const visibleAgentPanelType = isAgentPanel(panelType)
     ? panelType
@@ -78,10 +70,11 @@ const AgentModeSwitcher = ({
           type: visibleAgentPanelType,
           label: getAgentLabel(visibleAgentPanelType),
         }]
-      : [
-          { type: 'claude-code' as const, label: 'Claude', startAction: true },
-          { type: 'codex-cli' as const, label: 'Codex', startAction: true },
-        ]),
+      : AGENT_PANEL_TYPES.map((type) => ({
+          type,
+          label: AGENT_DISPLAY_NAME[type],
+          startAction: true,
+        }))),
   ];
 
   const refreshDetectedAgent = async () => {
@@ -119,16 +112,16 @@ const AgentModeSwitcher = ({
     if (mode.type === 'terminal' && isAgentPanel(panelType)) {
       useTabStore.getState().setDetectedAgent(tabId, {
         running: true,
-        providerId: providerForPanelType(panelType),
+        providerId: providerIdForPanelType(panelType),
         panelType,
       });
     }
-    if (mode.startAction && (mode.type === 'claude-code' || mode.type === 'codex-cli')) {
+    if (mode.startAction && isAgentPanelType(mode.type)) {
       window.dispatchEvent(new CustomEvent('purplemux-start-agent', {
         detail: {
           paneId,
           tabId,
-          provider: mode.type === 'codex-cli' ? 'codex' : 'claude',
+          provider: providerIdForPanelType(mode.type),
         },
       }));
       return;

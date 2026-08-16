@@ -1,7 +1,8 @@
 import fs from 'fs/promises';
-import { nanoid } from 'nanoid';
 import { z } from 'zod';
+import { EMPTY_PENDING, sliceFromNextLine, splitCompleteLines } from '@/lib/buffer-lines';
 import { createLogger } from '@/lib/logger';
+import { PENDING_ENTRY_ID, assignEntryIdentity, entryIdFor, type IEntryOrigin } from '@/lib/entry-identity';
 import { uploadPathToImageUrl } from '@/lib/uploads-store';
 import type {
   IIncrementalResult,
@@ -39,6 +40,15 @@ const CHUNK_SIZE = 256_000; // 256KB
 const STDOUT_BUFFER_LIMIT = 1_048_576;
 const SUMMARY_PREVIEW_LIMIT = 100;
 const TRUNCATED_SUFFIX_TEMPLATE = (total: number) => `\n[... truncated, total ${total} bytes]`;
+
+const SESSION_ID_IN_FILENAME_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+// Derived here rather than imported from the Codex provider: the parser is
+// otherwise free of provider dependencies, and this is one filename pattern.
+export const codexSessionIdFromJsonlPath = (jsonlPath: string): string => {
+  const filename = jsonlPath.replace(/\.jsonl$/i, '').split(/[\\/]/).pop() ?? '';
+  return filename.match(SESSION_ID_IN_FILENAME_RE)?.[1] ?? '';
+};
 
 const warnOnce = (key: string, payload: Record<string, unknown>, message: string) => {
   if (WARN_DEDUP.has(key)) return;
@@ -224,13 +234,20 @@ interface ICodexParseState {
   inFlight: Map<string, TInFlightEntry>;
   staleWarnings: Set<string>;
   suppressedCallIds: Set<string>;
+  syntheticCallIdCount: number;
 }
 
 const createState = (): ICodexParseState => ({
   inFlight: new Map(),
   staleWarnings: new Set(),
   suppressedCallIds: new Set(),
+  syntheticCallIdCount: 0,
 });
+
+// Codex occasionally omits call_id. A per-parse counter keeps the stand-in
+// stable across re-parses of the same bytes, which a random id was not.
+const nextSyntheticCallId = (state: ICodexParseState): string =>
+  `codex-call-${state.syntheticCallIdCount++}`;
 
 const SUPPRESSED_FUNCTION_NAMES = new Set(['exec_command', 'shell', 'bash', 'write_stdin']);
 
@@ -254,7 +271,7 @@ const buildExecEntry = (
   stderr: string | undefined,
   status: TToolStatus,
 ): ITimelineExecCommandStream => ({
-  id: nanoid(),
+  id: PENDING_ENTRY_ID,
   type: 'exec-command-stream',
   timestamp: endTimestamp,
   callId: inFlight.callId,
@@ -281,13 +298,19 @@ const collectInFlightStdout = (entry: IInFlightExec, chunk: string) => {
   entry.stdoutBuffer += TRUNCATED_SUFFIX_TEMPLATE(entry.stdoutBuffer.length + chunk.length);
 };
 
-const flushStaleInFlight = (state: ICodexParseState, timestamp: number, entries: ITimelineEntry[]) => {
+const flushStaleInFlight = (
+  state: ICodexParseState,
+  timestamp: number,
+  entries: ITimelineEntry[],
+  origin: IEntryOrigin,
+) => {
   if (state.inFlight.size === 0) return;
   for (const inflight of state.inFlight.values()) {
     if (state.staleWarnings.has(inflight.callId)) continue;
     state.staleWarnings.add(inflight.callId);
+    const flushedFrom = entries.length;
     entries.push({
-      id: nanoid(),
+      id: PENDING_ENTRY_ID,
       type: 'error-notice',
       timestamp,
       severity: 'warning',
@@ -297,7 +320,7 @@ const flushStaleInFlight = (state: ICodexParseState, timestamp: number, entries:
       entries.push(buildExecEntry(inflight, timestamp, undefined, undefined, undefined, 'error'));
     } else if (inflight.kind === 'web-search') {
       entries.push({
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'web-search',
         timestamp,
         callId: inflight.callId,
@@ -306,7 +329,7 @@ const flushStaleInFlight = (state: ICodexParseState, timestamp: number, entries:
       } satisfies ITimelineWebSearch);
     } else if (inflight.kind === 'mcp') {
       entries.push({
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'mcp-tool-call',
         timestamp,
         callId: inflight.callId,
@@ -317,7 +340,7 @@ const flushStaleInFlight = (state: ICodexParseState, timestamp: number, entries:
       } satisfies ITimelineMcpToolCall);
     } else if (inflight.kind === 'patch') {
       entries.push({
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'patch-apply',
         timestamp,
         callId: inflight.callId,
@@ -327,6 +350,12 @@ const flushStaleInFlight = (state: ICodexParseState, timestamp: number, entries:
         status: 'error',
       } satisfies ITimelinePatchApply);
     }
+    // Keyed on the call id, not on position: a later flush at the same offset
+    // must not reuse the ids of an earlier one.
+    entries.slice(flushedFrom).forEach((entry, index) => {
+      entry.id = entryIdFor(origin, `stale-${inflight.callId}-${index}`);
+      entry.seq = origin.byteOffset + flushedFrom + index;
+    });
   }
   state.inFlight.clear();
 };
@@ -358,7 +387,7 @@ const processResponseItem = (
         typeof payload.encrypted_content === 'string' && payload.encrypted_content.length > 0;
       if (summary.length === 0 && !hasEncryptedContent) return [];
       const entry: ITimelineReasoningSummary = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'reasoning-summary',
         timestamp,
         summary,
@@ -378,7 +407,7 @@ const processResponseItem = (
       const args = typeof argsRaw === 'string' ? tryParseJson(argsRaw) ?? argsRaw : argsRaw;
       const summary = summarizeFunctionCall(name, args);
       const entry: ITimelineToolCall = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'tool-call',
         timestamp,
         toolUseId: callId,
@@ -397,7 +426,7 @@ const processResponseItem = (
       }
       const output = safeString(payload.output);
       const entry: ITimelineToolResult = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'tool-result',
         timestamp,
         toolUseId: callId,
@@ -418,7 +447,7 @@ const processResponseItem = (
           status === 'completed' ? 'success' : status === 'failed' ? 'error' : 'pending';
         state.suppressedCallIds.add(callId);
         const entry: ITimelinePatchApply = {
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'patch-apply',
           timestamp,
           callId,
@@ -431,7 +460,7 @@ const processResponseItem = (
       }
       const summary = summarizeFunctionCall(name, payload.input);
       const entry: ITimelineToolCall = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'tool-call',
         timestamp,
         toolUseId: callId,
@@ -450,7 +479,7 @@ const processResponseItem = (
       }
       const output = safeString(payload.output);
       const entry: ITimelineToolResult = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'tool-result',
         timestamp,
         toolUseId: callId,
@@ -460,10 +489,10 @@ const processResponseItem = (
       return [entry];
     }
     case 'web_search_call': {
-      const callId = safeString(payload.call_id) || nanoid();
+      const callId = safeString(payload.call_id) || nextSyntheticCallId(state);
       const status = safeString(payload.status);
       const entry: ITimelineWebSearch = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'web-search',
         timestamp,
         callId,
@@ -488,7 +517,7 @@ const processEventMsg = (
   const severity = errorSeverityFromType(type);
   if (severity) {
     const entry: ITimelineErrorNotice = {
-      id: nanoid(),
+      id: PENDING_ENTRY_ID,
       type: 'error-notice',
       timestamp,
       severity,
@@ -501,11 +530,11 @@ const processEventMsg = (
 
   const approvalKind = approvalKindFromType(type);
   if (approvalKind) {
-    const callId = safeString(payload.call_id) || nanoid();
+    const callId = safeString(payload.call_id) || nextSyntheticCallId(state);
     const patchesRaw = Array.isArray(payload.patches) ? payload.patches : null;
     const permissionsRaw = Array.isArray(payload.permissions) ? payload.permissions : null;
     const entry: ITimelineApprovalRequest = {
-      id: nanoid(),
+      id: PENDING_ENTRY_ID,
       type: 'approval-request',
       timestamp,
       approvalKind,
@@ -538,7 +567,7 @@ const processEventMsg = (
         .filter((s): s is string => !!s);
       const allImages = [...images, ...localImages];
       const entry: ITimelineUserMessage = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'user-message',
         timestamp,
         text,
@@ -550,7 +579,7 @@ const processEventMsg = (
       const message = safeString(payload.message);
       if (!message) return [];
       const entry: ITimelineAssistantMessage = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'assistant-message',
         timestamp,
         markdown: message,
@@ -560,7 +589,7 @@ const processEventMsg = (
     case 'task_complete':
     case 'TurnComplete': {
       const turn: ITimelineTurnEnd = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'turn-end',
         timestamp,
       };
@@ -569,7 +598,7 @@ const processEventMsg = (
     case 'turn_aborted':
     case 'TurnAborted': {
       const entry: ITimelineInterrupt = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'interrupt',
         timestamp,
       };
@@ -578,7 +607,7 @@ const processEventMsg = (
     case 'shutdown_complete':
     case 'ShutdownComplete': {
       const entry: ITimelineSessionExit = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'session-exit',
         timestamp,
       };
@@ -596,7 +625,7 @@ const processEventMsg = (
         const subject = safeString(obj.subject ?? obj.title ?? obj.description);
         if (!taskId && !subject) continue;
         entries.push({
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'task-progress',
           timestamp,
           action: 'update',
@@ -612,7 +641,7 @@ const processEventMsg = (
     case 'EnteredReviewMode': {
       const description = safeString(payload.description);
       const entry: ITimelinePlan = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'plan',
         timestamp,
         toolUseId: '',
@@ -626,7 +655,7 @@ const processEventMsg = (
       const outcome = safeString(payload.outcome);
       const status: TToolStatus = outcome === 'approved' ? 'success' : outcome === 'rejected' ? 'error' : 'pending';
       const entry: ITimelinePlan = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'plan',
         timestamp,
         toolUseId: '',
@@ -640,10 +669,10 @@ const processEventMsg = (
       const question = safeString(payload.question);
       if (!question) return [];
       const entry: ITimelineAskUserQuestion = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'ask-user-question',
         timestamp,
-        toolUseId: safeString(payload.call_id) || nanoid(),
+        toolUseId: safeString(payload.call_id) || nextSyntheticCallId(state),
         questions: [{ question, header: '', options: [], multiSelect: false }],
         status: 'pending',
       };
@@ -652,7 +681,7 @@ const processEventMsg = (
     case 'context_compacted':
     case 'ContextCompacted': {
       const entry: ITimelineContextCompacted = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'context-compacted',
         timestamp,
         beforeTokens: safeNumber(payload.before_tokens),
@@ -748,7 +777,7 @@ const processEventMsg = (
         resultsRaw.length > 0 ? `${resultsRaw.length} results` : safeString(payload.summary) || undefined;
       state.inFlight.delete(callId);
       const entry: ITimelineWebSearch = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'web-search',
         timestamp,
         callId,
@@ -784,7 +813,7 @@ const processEventMsg = (
       state.inFlight.delete(callId);
       const resultText = JSON.stringify(payload.result ?? '');
       const entry: ITimelineMcpToolCall = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'mcp-tool-call',
         timestamp,
         callId,
@@ -829,7 +858,7 @@ const processEventMsg = (
       const files = existing?.kind === 'patch' ? existing.files : [];
       state.inFlight.delete(callId);
       const entry: ITimelinePatchApply = {
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'patch-apply',
         timestamp,
         callId,
@@ -920,10 +949,16 @@ const mergeToolResults = (entries: ITimelineEntry[]): ITimelineEntry[] => {
   return entries;
 };
 
+interface IParseLinesOptions {
+  /** Absolute byte offset of each line within the session file. */
+  lineOffsets?: number[];
+  sessionId?: string;
+}
+
 const parseLines = (
   lines: string[],
   state: ICodexParseState,
-  lineOffsets?: number[],
+  { lineOffsets, sessionId = '' }: IParseLinesOptions = {},
 ): { entries: ITimelineEntry[]; entryLineOffsets: number[]; summary?: string; errorCount: number } => {
   const entries: ITimelineEntry[] = [];
   const entryLineOffsets: number[] = [];
@@ -954,8 +989,10 @@ const parseLines = (
     }
     const produced = processItem(item, state);
     if (produced.length > 0) {
+      const byteOffset = lineOffsets?.[lineIdx] ?? 0;
+      assignEntryIdentity(produced, { sessionId, byteOffset });
       entries.push(...produced);
-      entryLineOffsets.push(...produced.map(() => lineOffsets?.[lineIdx] ?? 0));
+      entryLineOffsets.push(...produced.map(() => byteOffset));
     }
   }
 
@@ -970,13 +1007,10 @@ const readChunk = async (
   const handle = await fs.open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(readSize);
-    await handle.read(buffer, 0, readSize, from);
-    const raw = buffer.toString('utf-8');
-    if (from === 0) return { content: raw, validFrom: 0 };
-    const firstNewline = raw.indexOf('\n');
-    if (firstNewline < 0) return { content: '', validFrom: to };
-    const validFrom = from + Buffer.byteLength(raw.slice(0, firstNewline + 1), 'utf-8');
-    return { content: raw.slice(firstNewline + 1), validFrom };
+    const { bytesRead } = await handle.read(buffer, 0, readSize, from);
+    const bytes = buffer.subarray(0, bytesRead);
+    if (from === 0) return { content: bytes.toString('utf-8'), validFrom: 0 };
+    return sliceFromNextLine(bytes, from) ?? { content: '', validFrom: to };
   } finally {
     await handle.close();
   }
@@ -1012,9 +1046,10 @@ const parseContentWithOffsets = (
   content: string,
   startOffset: number,
   state: ICodexParseState,
+  sessionId = '',
 ): IParseResult => {
   const { lines, lineOffsets } = splitLinesWithOffsets(content, startOffset);
-  const { entries, entryLineOffsets, summary, errorCount } = parseLines(lines, state, lineOffsets);
+  const { entries, entryLineOffsets, summary, errorCount } = parseLines(lines, state, { lineOffsets, sessionId });
   return {
     entries,
     entryLineOffsets,
@@ -1067,7 +1102,7 @@ const readCodexRange = async (
 
     const { content, validFrom } = await readExactChunk(filePath, from, to);
     const state = createState();
-    const result = parseContentWithOffsets(content, validFrom, state);
+    const result = parseContentWithOffsets(content, validFrom, state, codexSessionIdFromJsonlPath(filePath));
     const displayEntries = result.entries.filter((_, idx) => {
       const entryOffset = result.entryLineOffsets[idx] ?? validFrom;
       return entryOffset >= displayFromByte;
@@ -1087,29 +1122,31 @@ const readCodexRange = async (
 
 export class CodexParser {
   private readonly jsonlPath: string;
+  private readonly sessionId: string;
   private lastOffset = 0;
-  private pendingBuffer = '';
+  private pendingBuffer: Buffer = EMPTY_PENDING;
   private state: ICodexParseState;
 
   constructor(jsonlPath: string) {
     this.jsonlPath = jsonlPath;
+    this.sessionId = codexSessionIdFromJsonlPath(jsonlPath);
     this.state = createState();
   }
 
   reset(): void {
     this.lastOffset = 0;
-    this.pendingBuffer = '';
+    this.pendingBuffer = EMPTY_PENDING;
     this.state = createState();
   }
 
   dispose(): void {
     this.state.inFlight.clear();
-    this.pendingBuffer = '';
+    this.pendingBuffer = EMPTY_PENDING;
   }
 
   async parseAll(): Promise<IParseResult> {
     this.lastOffset = 0;
-    this.pendingBuffer = '';
+    this.pendingBuffer = EMPTY_PENDING;
     this.state = createState();
     let stat: { size: number };
     try {
@@ -1121,7 +1158,7 @@ export class CodexParser {
       return { entries: [], entryLineOffsets: [], lastOffset: 0, totalLines: 0, errorCount: 0 };
     }
     const content = await fs.readFile(this.jsonlPath, 'utf-8');
-    const { entries, entryLineOffsets, summary, errorCount, totalLines } = parseContentWithOffsets(content, 0, this.state);
+    const { entries, entryLineOffsets, summary, errorCount, totalLines } = parseContentWithOffsets(content, 0, this.state, this.sessionId);
     this.lastOffset = Buffer.byteLength(content, 'utf-8');
     return {
       entries,
@@ -1152,10 +1189,10 @@ export class CodexParser {
         }
 
         this.state = createState();
-        const result = parseContentWithOffsets(content, validFrom, this.state);
+        const result = parseContentWithOffsets(content, validFrom, this.state, this.sessionId);
         if (result.entries.length >= maxEntries || from === 0) {
           this.lastOffset = fileSize;
-          this.pendingBuffer = '';
+          this.pendingBuffer = EMPTY_PENDING;
           const fallbackStartByteOffset = from === 0 ? 0 : validFrom;
           return sliceChunkResult(result, fileSize, fallbackStartByteOffset, maxEntries);
         }
@@ -1183,7 +1220,7 @@ export class CodexParser {
         await handle.close();
         this.reset();
         const all = await this.parseAll();
-        return { newEntries: all.entries, newOffset: all.lastOffset, pendingBuffer: '' };
+        return { newEntries: all.entries, newOffset: all.lastOffset, pendingBuffer: EMPTY_PENDING };
       }
 
       if (this.lastOffset >= size) {
@@ -1191,26 +1228,24 @@ export class CodexParser {
       }
 
       const buffer = Buffer.alloc(size - this.lastOffset);
-      await handle.read(buffer, 0, buffer.length, this.lastOffset);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, this.lastOffset);
 
-      const rawContent = this.pendingBuffer + buffer.toString('utf-8');
-      const endsWithNewline = rawContent.endsWith('\n');
-      const segments = rawContent.split('\n');
-      let newPending = '';
-      if (!endsWithNewline) {
-        const lastSegment = segments.pop() ?? '';
-        if (lastSegment) {
-          if (tryParseJson(lastSegment) !== undefined) {
-            segments.push(lastSegment);
-          } else {
-            newPending = lastSegment;
-          }
-        }
-      }
-      const { entries } = parseLines(segments, this.state);
+      // Bytes, not text: the remainder of the previous read may hold the lead
+      // bytes of a character whose continuation only arrives now.
+      const bytes = this.pendingBuffer.length > 0
+        ? Buffer.concat([this.pendingBuffer, buffer.subarray(0, bytesRead)])
+        : buffer.subarray(0, bytesRead);
+      const contentStart = this.lastOffset - this.pendingBuffer.length;
+      const { content, pending } = splitCompleteLines(
+        bytes,
+        (line) => tryParseJson(line) !== undefined,
+      );
+      const { lines: segments, lineOffsets } = splitLinesWithOffsets(content, contentStart);
+
+      const { entries } = parseLines(segments, this.state, { lineOffsets, sessionId: this.sessionId });
       this.lastOffset = size;
-      this.pendingBuffer = newPending;
-      return { newEntries: entries, newOffset: size, pendingBuffer: newPending };
+      this.pendingBuffer = pending;
+      return { newEntries: entries, newOffset: size, pendingBuffer: pending };
     } catch (err) {
       log.warn({ err: err instanceof Error ? err.message : err, path: this.jsonlPath }, 'codex incremental parse failed');
       return { newEntries: [], newOffset: this.lastOffset, pendingBuffer: this.pendingBuffer };
@@ -1225,7 +1260,10 @@ export class CodexParser {
 
   flushStale(timestamp: number = Date.now()): ITimelineEntry[] {
     const entries: ITimelineEntry[] = [];
-    flushStaleInFlight(this.state, timestamp, entries);
+    flushStaleInFlight(this.state, timestamp, entries, {
+      sessionId: this.sessionId,
+      byteOffset: this.lastOffset,
+    });
     return entries;
   }
 
@@ -1240,9 +1278,9 @@ export class CodexParser {
 
 export const createCodexParser = (jsonlPath: string): CodexParser => new CodexParser(jsonlPath);
 
-export const parseCodexContent = (content: string): ITimelineEntry[] => {
+export const parseCodexContent = (content: string, byteBase = 0, sessionId = ''): ITimelineEntry[] => {
   const state = createState();
-  return parseLines(content.split('\n'), state).entries;
+  return parseContentWithOffsets(content, byteBase, state, sessionId).entries;
 };
 
 export const readTailCodexEntries = async (
@@ -1273,7 +1311,7 @@ export const readCodexEntriesBefore = async (
       const { content, validFrom } = await readChunk(filePath, from, currentStart);
       if (content) {
         const state = createState();
-        const result = parseContentWithOffsets(content, validFrom, state);
+        const result = parseContentWithOffsets(content, validFrom, state, codexSessionIdFromJsonlPath(filePath));
         if (result.entries.length >= maxEntries || from === 0) {
           const parseStartByteOffset = from === 0 ? 0 : validFrom;
           const previousPage = sliceChunkResult(

@@ -1,7 +1,8 @@
 import fs from 'fs/promises';
 import { z } from 'zod';
-import { nanoid } from 'nanoid';
 import { diffLines } from 'diff';
+import { EMPTY_PENDING, sliceFromNextLine, splitCompleteLines } from '@/lib/buffer-lines';
+import { PENDING_ENTRY_ID, assignEntryIdentity, entryIdFor, renumberGroupEntries } from '@/lib/entry-identity';
 import type {
   ITimelineEntry,
   ITimelineUserMessage,
@@ -249,7 +250,7 @@ const parseTaskNotification = (text: string, timestamp: number): ITimelineTaskNo
     : undefined;
 
   return {
-    id: nanoid(),
+    id: PENDING_ENTRY_ID,
     type: 'task-notification',
     timestamp,
     taskId,
@@ -302,14 +303,14 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
     for (const content of parsed.data.message.content) {
       if (content.type === 'thinking') {
         entries.push({
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'thinking',
           timestamp,
           thinking: (content as { thinking?: string }).thinking ?? '',
         } satisfies ITimelineThinking);
       } else if (content.type === 'text' && 'text' in content) {
         const entry: ITimelineAssistantMessage = {
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'assistant-message',
           timestamp,
           markdown: (content as { text: string }).text,
@@ -328,7 +329,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
         if (toolName === 'ExitPlanMode' && input.plan != null) {
           const planText = typeof input.plan === 'string' ? input.plan : JSON.stringify(input.plan, null, 2);
           entries.push({
-            id: nanoid(),
+            id: PENDING_ENTRY_ID,
             type: 'plan',
             timestamp,
             toolUseId,
@@ -344,7 +345,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
           } satisfies ITimelinePlan);
         } else if (toolName === 'TaskCreate') {
           entries.push({
-            id: nanoid(),
+            id: PENDING_ENTRY_ID,
             type: 'task-progress',
             timestamp,
             action: 'create',
@@ -359,7 +360,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
             ? (input.status as 'in_progress' | 'completed' | 'blocked')
             : 'pending';
           entries.push({
-            id: nanoid(),
+            id: PENDING_ENTRY_ID,
             type: 'task-progress',
             timestamp,
             action: 'update',
@@ -380,7 +381,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
           } satisfies IAskUserQuestionItem));
 
           entries.push({
-            id: nanoid(),
+            id: PENDING_ENTRY_ID,
             type: 'ask-user-question',
             timestamp,
             toolUseId,
@@ -392,7 +393,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
           const { filePath, diff } = extractDiff(toolName, input);
 
           entries.push({
-            id: nanoid(),
+            id: PENDING_ENTRY_ID,
             type: 'tool-call',
             timestamp,
             toolUseId,
@@ -437,13 +438,13 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
       if (commandName) {
         if (commandName === '/exit') {
           return [{
-            id: nanoid(),
+            id: PENDING_ENTRY_ID,
             type: 'session-exit',
             timestamp,
           } satisfies ITimelineSessionExit];
         }
         entries.push({
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'user-message',
           timestamp,
           text: commandName,
@@ -453,7 +454,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
       const cleaned = stripProtocolTags(content);
       if (cleaned) {
         entries.push({
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'user-message',
           timestamp,
           text: cleaned,
@@ -469,7 +470,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
       (content[0] as { text: string }).text.startsWith(INTERRUPT_PREFIX)
     ) {
       return [{
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'interrupt',
         timestamp,
       } satisfies ITimelineInterrupt];
@@ -490,7 +491,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
     }
     if (userTextParts.length > 0 || userImages.length > 0) {
       entries.push({
-        id: nanoid(),
+        id: PENDING_ENTRY_ID,
         type: 'user-message',
         timestamp,
         text: userTextParts.join('\n'),
@@ -514,7 +515,7 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
         );
 
         entries.push({
-          id: nanoid(),
+          id: PENDING_ENTRY_ID,
           type: 'tool-result',
           timestamp,
           toolUseId: c.tool_use_id,
@@ -532,19 +533,35 @@ const parseSingleEntry = (raw: unknown, base: z.infer<typeof BaseEntrySchema>): 
 const createAgentGroup = (
   rawEntries: IRawEntry[],
   agentHint: { agentType: string; description: string } | null,
+  byteBase: number,
 ): ITimelineAgentGroup => {
   const first = rawEntries[0].base;
   const timestamp = first.timestamp ? new Date(first.timestamp).getTime() : Date.now();
 
   const parsed: ITimelineEntry[] = [];
-  for (const { base, raw } of rawEntries) {
-    parsed.push(...parseSingleEntry(raw, base));
+  for (const { base, raw, lineOffset } of rawEntries) {
+    const produced = parseSingleEntry(raw, base);
+    assignEntryIdentity(produced, {
+      uuid: base.uuid,
+      sessionId: base.sessionId ?? '',
+      byteOffset: byteBase + lineOffset,
+    });
+    parsed.push(...produced);
   }
   const entries = mergeToolResults(parsed);
+  renumberGroupEntries(entries);
+
+  const groupOrigin = {
+    uuid: first.uuid,
+    sessionId: first.sessionId ?? '',
+    byteOffset: byteBase + rawEntries[0].lineOffset,
+  };
+  const groupId = entryIdFor(groupOrigin, 'group');
 
   if (agentHint) {
     return {
-      id: nanoid(),
+      id: groupId,
+      seq: groupOrigin.byteOffset,
       type: 'agent-group',
       timestamp,
       agentType: agentHint.agentType,
@@ -578,7 +595,8 @@ const createAgentGroup = (
   }
 
   return {
-    id: nanoid(),
+    id: groupId,
+    seq: groupOrigin.byteOffset,
     type: 'agent-group',
     timestamp,
     agentType: 'Unknown',
@@ -657,7 +675,13 @@ const mergeToolResults = (entries: ITimelineEntry[]): ITimelineEntry[] => {
 
 // --- Core Parsing ---
 
-const parseContent = (content: string): IParseResult => {
+/**
+ * `byteBase` is the absolute file offset the `content` slice starts at. Entry
+ * ids and `seq` are derived from absolute offsets so a chunked read produces
+ * the same values as a whole-file read; `entryLineOffsets` stays relative to
+ * `content`, which is the shape every caller already expects.
+ */
+const parseContent = (content: string, byteBase = 0): IParseResult => {
   const splitLines = content.split('\n');
   const rawEntries: IRawEntry[] = [];
   let errorCount = 0;
@@ -727,6 +751,21 @@ const parseContent = (content: string): IParseResult => {
 
   const entries: ITimelineEntry[] = [];
   const entryLineOffsets: number[] = [];
+  const emit = (
+    produced: ITimelineEntry[],
+    base: z.infer<typeof BaseEntrySchema>,
+    lineOffset: number,
+  ) => {
+    assignEntryIdentity(produced, {
+      uuid: base.uuid,
+      sessionId: base.sessionId ?? '',
+      byteOffset: byteBase + lineOffset,
+    });
+    for (const entry of produced) {
+      entries.push(entry);
+      entryLineOffsets.push(lineOffset);
+    }
+  };
   let lastAgentHint: { agentType: string; description: string } | null = null;
   let skipNextUser = false;
   let planFilePath: string | null = null;
@@ -743,28 +782,26 @@ const parseContent = (content: string): IParseResult => {
       }
       if (att?.type === 'plan_file_reference' && typeof att.planContent === 'string' && att.planContent.length > 0) {
         const timestamp = base.timestamp ? new Date(base.timestamp).getTime() : Date.now();
-        entries.push({
-          id: nanoid(),
+        emit([{
+          id: PENDING_ENTRY_ID,
           type: 'plan',
           timestamp,
           toolUseId: '',
           markdown: att.planContent,
           filePath: typeof att.planFilePath === 'string' ? att.planFilePath : undefined,
           status: 'success' as TToolStatus,
-        } satisfies ITimelinePlan);
-        entryLineOffsets.push(lineOffset);
+        } satisfies ITimelinePlan], base, lineOffset);
         if (typeof att.planFilePath === 'string') planFilePath = att.planFilePath;
       }
     }
 
     if (base.type === 'system') {
       const timestamp = base.timestamp ? new Date(base.timestamp).getTime() : Date.now();
-      entries.push({
-        id: nanoid(),
+      emit([{
+        id: PENDING_ENTRY_ID,
         type: 'turn-end',
         timestamp,
-      } satisfies ITimelineTurnEnd);
-      entryLineOffsets.push(lineOffset);
+      } satisfies ITimelineTurnEnd], base, lineOffset);
       i++;
       continue;
     }
@@ -776,7 +813,7 @@ const parseContent = (content: string): IParseResult => {
         group.push(rawEntries[i]);
         i++;
       }
-      entries.push(createAgentGroup(group, lastAgentHint));
+      entries.push(createAgentGroup(group, lastAgentHint, byteBase));
       entryLineOffsets.push(groupOffset);
       lastAgentHint = null;
       continue;
@@ -810,10 +847,7 @@ const parseContent = (content: string): IParseResult => {
       }
     }
 
-    for (const entry of parsed) {
-      entries.push(entry);
-      entryLineOffsets.push(lineOffset);
-    }
+    emit(parsed, base, lineOffset);
     i++;
   }
 
@@ -823,6 +857,7 @@ const parseContent = (content: string): IParseResult => {
       if (e.type === 'tool-call' && e.toolName === 'Write' && e.filePath === planFilePath && e.diff?.newString) {
         entries[j] = {
           id: e.id,
+          seq: e.seq,
           type: 'plan',
           timestamp: e.timestamp,
           toolUseId: e.toolUseId,
@@ -872,13 +907,14 @@ const parseTailMode = async (filePath: string, fileSize: number): Promise<IParse
   try {
     const buffer = Buffer.alloc(readSize);
     const offset = fileSize - readSize;
-    await handle.read(buffer, 0, readSize, offset);
+    const { bytesRead } = await handle.read(buffer, 0, readSize, offset);
+    const bytes = buffer.subarray(0, bytesRead);
 
-    const content = buffer.toString('utf-8');
-    const firstNewline = content.indexOf('\n');
-    const validContent = firstNewline >= 0 ? content.slice(firstNewline + 1) : content;
+    const slice = sliceFromNextLine(bytes, offset);
+    const validContent = slice?.content ?? bytes.toString('utf-8');
+    const validFrom = slice?.validFrom ?? offset;
 
-    const result = parseContent(validContent);
+    const result = parseContent(validContent, validFrom);
     result.lastOffset = fileSize;
     return result;
   } finally {
@@ -897,13 +933,10 @@ const readChunk = async (
   const handle = await fs.open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(readSize);
-    await handle.read(buffer, 0, readSize, from);
-    const raw = buffer.toString('utf-8');
-    if (from === 0) return { content: raw, validFrom: 0 };
-    const firstNewline = raw.indexOf('\n');
-    if (firstNewline < 0) return { content: '', validFrom: to };
-    const validFrom = from + Buffer.byteLength(raw.slice(0, firstNewline + 1), 'utf-8');
-    return { content: raw.slice(firstNewline + 1), validFrom };
+    const { bytesRead } = await handle.read(buffer, 0, readSize, from);
+    const bytes = buffer.subarray(0, bytesRead);
+    if (from === 0) return { content: bytes.toString('utf-8'), validFrom: 0 };
+    return sliceFromNextLine(bytes, from) ?? { content: '', validFrom: to };
   } finally {
     await handle.close();
   }
@@ -942,7 +975,7 @@ export const readTailEntries = async (
       const from = Math.max(0, fileSize - chunkSize);
       const { content, validFrom } = await readChunk(filePath, from, fileSize);
       if (!content) { chunkSize *= 2; continue; }
-      const result = parseContent(content);
+      const result = parseContent(content, validFrom);
       if (result.entries.length >= maxEntries || from === 0) {
         const sliced = result.entries.length > maxEntries;
         const sliceStart = sliced ? result.entries.length - maxEntries : 0;
@@ -984,7 +1017,7 @@ export const readEntriesBefore = async (
       const from = Math.max(0, beforeByte - chunkSize);
       const { content, validFrom } = await readChunk(filePath, from, beforeByte);
       if (content) {
-        const result = parseContent(content);
+        const result = parseContent(content, validFrom);
         if (result.entries.length >= maxEntries || from === 0) {
           const sliced = result.entries.length > maxEntries;
           const sliceStart = sliced ? result.entries.length - maxEntries : 0;
@@ -1009,10 +1042,19 @@ export const readEntriesBefore = async (
   }
 };
 
+const isCompleteJsonRecord = (line: string): boolean => {
+  try {
+    JSON.parse(line);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export const parseIncremental = async (
   filePath: string,
   fromOffset: number,
-  pendingBuffer: string = '',
+  pendingBuffer: Buffer = EMPTY_PENDING,
 ): Promise<IIncrementalResult> => {
   try {
     const handle = await fs.open(filePath, 'r');
@@ -1023,7 +1065,7 @@ export const parseIncremental = async (
       await handle.close();
       const content = await fs.readFile(filePath, 'utf-8');
       const result = parseContent(content);
-      return { newEntries: result.entries, newOffset: size, pendingBuffer: '' };
+      return { newEntries: result.entries, newOffset: size, pendingBuffer: EMPTY_PENDING };
     }
 
     if (fromOffset >= size) {
@@ -1032,31 +1074,22 @@ export const parseIncremental = async (
     }
 
     const buffer = Buffer.alloc(size - fromOffset);
-    await handle.read(buffer, 0, buffer.length, fromOffset);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, fromOffset);
     await handle.close();
 
-    const rawContent = pendingBuffer + buffer.toString('utf-8');
-    const endsWithNewline = rawContent.endsWith('\n');
-    const segments = rawContent.split('\n');
-    let newPending = '';
-    if (!endsWithNewline) {
-      const lastSegment = segments.pop() ?? '';
-      if (lastSegment) {
-        try {
-          JSON.parse(lastSegment);
-          segments.push(lastSegment);
-        } catch {
-          newPending = lastSegment;
-        }
-      }
-    }
-    const completeContent = segments.join('\n');
-    const result = parseContent(completeContent);
+    // The carried remainder is prepended as bytes, so a character torn by the
+    // previous append is rejoined here rather than lost to U+FFFD. Its own
+    // length is the byte count — never `Buffer.byteLength` of a decoding.
+    const bytes = pendingBuffer.length > 0
+      ? Buffer.concat([pendingBuffer, buffer.subarray(0, bytesRead)])
+      : buffer.subarray(0, bytesRead);
+    const { content, pending } = splitCompleteLines(bytes, isCompleteJsonRecord);
+    const result = parseContent(content, fromOffset - pendingBuffer.length);
 
     return {
       newEntries: result.entries,
       newOffset: size,
-      pendingBuffer: newPending,
+      pendingBuffer: pending,
     };
   } catch {
     return { newEntries: [], newOffset: fromOffset, pendingBuffer };
@@ -1078,8 +1111,8 @@ export const parseJsonlIncremental = async (
   return { entries: result.newEntries, newOffset: result.newOffset };
 };
 
-export const parseJsonlContent = (content: string): ITimelineEntry[] => {
-  return parseContent(content).entries;
+export const parseJsonlContent = (content: string, byteBase = 0): ITimelineEntry[] => {
+  return parseContent(content, byteBase).entries;
 };
 
 export const countJsonlEntries = async (filePath: string): Promise<number> => {

@@ -7,11 +7,16 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const sub = req.body;
+    const body = req.body ?? {};
+    // Bare PushSubscription bodies are what clients posted before the record
+    // wrapper carried a deviceId; both shapes stay accepted.
+    const sub = body.endpoint ? body : body.subscription;
     if (!sub?.endpoint) {
       return res.status(400).json({ error: 'Invalid subscription' });
     }
-    await addSubscription(sub);
+    const deviceId = typeof body.deviceId === 'string' ? body.deviceId : undefined;
+    const label = typeof body.label === 'string' ? body.label : undefined;
+    await addSubscription(sub, { deviceId, label });
     return res.status(200).json({ ok: true });
   }
 

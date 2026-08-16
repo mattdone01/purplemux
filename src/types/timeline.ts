@@ -45,8 +45,29 @@ export type TTimelineEntryType =
   | 'patch-apply'
   | 'context-compacted';
 
-export interface ITimelineUserMessage {
+/**
+ * Identity shared by every timeline entry.
+ *
+ * `id` is derived from the source record — the Claude record `uuid`
+ * (`<uuid>#<n>` when one record yields several entries) or, when the provider
+ * supplies no record id, `sha1(<sessionId>:<byteOffset>:<ordinal>)`. Parsing
+ * the same bytes twice therefore yields the same id, which is what lets a
+ * client upsert instead of duplicating.
+ *
+ * `seq` orders entries within a session: the absolute byte offset of the
+ * entry's source line plus its ordinal within that record. It starts at 0 for
+ * the first entry and increases strictly in file order, and — unlike a dense
+ * 0,1,2… ordinal — it can be computed from any chunk of the file without
+ * parsing everything before it. Entries nested in an `agent-group` are
+ * numbered 0,1,2… within their group; the group entry itself carries the
+ * parent-session seq. Optional while clients that predate it are still in use.
+ */
+export interface ITimelineEntryBase {
   id: string;
+  seq?: number;
+}
+
+export interface ITimelineUserMessage extends ITimelineEntryBase {
   type: 'user-message';
   timestamp: number;
   text: string;
@@ -56,8 +77,7 @@ export interface ITimelineUserMessage {
   fadingOut?: boolean;
 }
 
-export interface ITimelineAssistantMessage {
-  id: string;
+export interface ITimelineAssistantMessage extends ITimelineEntryBase {
   type: 'assistant-message';
   timestamp: number;
   markdown: string;
@@ -79,8 +99,7 @@ export interface ITimelineAssistantMessage {
   };
 }
 
-export interface ITimelineThinking {
-  id: string;
+export interface ITimelineThinking extends ITimelineEntryBase {
   type: 'thinking';
   timestamp: number;
   thinking: string;
@@ -96,8 +115,7 @@ export interface ITimelineDiff {
   newString: string;
 }
 
-export interface ITimelineToolCall {
-  id: string;
+export interface ITimelineToolCall extends ITimelineEntryBase {
   type: 'tool-call';
   timestamp: number;
   toolUseId: string;
@@ -108,8 +126,7 @@ export interface ITimelineToolCall {
   status: TToolStatus;
 }
 
-export interface ITimelineToolResult {
-  id: string;
+export interface ITimelineToolResult extends ITimelineEntryBase {
   type: 'tool-result';
   timestamp: number;
   toolUseId: string;
@@ -117,8 +134,7 @@ export interface ITimelineToolResult {
   summary: string;
 }
 
-export interface ITimelineAgentGroup {
-  id: string;
+export interface ITimelineAgentGroup extends ITimelineEntryBase {
   type: 'agent-group';
   timestamp: number;
   agentType: string;
@@ -127,8 +143,7 @@ export interface ITimelineAgentGroup {
   entries: ITimelineEntry[];
 }
 
-export interface ITimelineTaskNotification {
-  id: string;
+export interface ITimelineTaskNotification extends ITimelineEntryBase {
   type: 'task-notification';
   timestamp: number;
   taskId: string;
@@ -142,8 +157,7 @@ export interface ITimelineTaskNotification {
   };
 }
 
-export interface ITimelineTaskProgress {
-  id: string;
+export interface ITimelineTaskProgress extends ITimelineEntryBase {
   type: 'task-progress';
   timestamp: number;
   action: 'create' | 'update';
@@ -159,8 +173,7 @@ export interface IPlanAllowedPrompt {
   prompt: string;
 }
 
-export interface ITimelinePlan {
-  id: string;
+export interface ITimelinePlan extends ITimelineEntryBase {
   type: 'plan';
   timestamp: number;
   toolUseId: string;
@@ -182,8 +195,7 @@ export interface IAskUserQuestionItem {
   multiSelect: boolean;
 }
 
-export interface ITimelineAskUserQuestion {
-  id: string;
+export interface ITimelineAskUserQuestion extends ITimelineEntryBase {
   type: 'ask-user-question';
   timestamp: number;
   toolUseId: string;
@@ -192,26 +204,22 @@ export interface ITimelineAskUserQuestion {
   answer?: string;
 }
 
-export interface ITimelineInterrupt {
-  id: string;
+export interface ITimelineInterrupt extends ITimelineEntryBase {
   type: 'interrupt';
   timestamp: number;
 }
 
-export interface ITimelineSessionExit {
-  id: string;
+export interface ITimelineSessionExit extends ITimelineEntryBase {
   type: 'session-exit';
   timestamp: number;
 }
 
-export interface ITimelineTurnEnd {
-  id: string;
+export interface ITimelineTurnEnd extends ITimelineEntryBase {
   type: 'turn-end';
   timestamp: number;
 }
 
-export interface ITimelineReasoningSummary {
-  id: string;
+export interface ITimelineReasoningSummary extends ITimelineEntryBase {
   type: 'reasoning-summary';
   timestamp: number;
   summary: string[];
@@ -220,8 +228,7 @@ export interface ITimelineReasoningSummary {
 
 export type TErrorSeverity = 'error' | 'warning' | 'stream-error' | 'guardian-warning';
 
-export interface ITimelineErrorNotice {
-  id: string;
+export interface ITimelineErrorNotice extends ITimelineEntryBase {
   type: 'error-notice';
   timestamp: number;
   severity: TErrorSeverity;
@@ -232,8 +239,7 @@ export interface ITimelineErrorNotice {
 
 export type TApprovalKind = 'exec' | 'apply-patch' | 'permissions';
 
-export interface ITimelineApprovalRequest {
-  id: string;
+export interface ITimelineApprovalRequest extends ITimelineEntryBase {
   type: 'approval-request';
   timestamp: number;
   approvalKind: TApprovalKind;
@@ -245,8 +251,7 @@ export interface ITimelineApprovalRequest {
   status: TToolStatus;
 }
 
-export interface ITimelineExecCommandStream {
-  id: string;
+export interface ITimelineExecCommandStream extends ITimelineEntryBase {
   type: 'exec-command-stream';
   timestamp: number;
   callId: string;
@@ -261,8 +266,7 @@ export interface ITimelineExecCommandStream {
   status: TToolStatus;
 }
 
-export interface ITimelineWebSearch {
-  id: string;
+export interface ITimelineWebSearch extends ITimelineEntryBase {
   type: 'web-search';
   timestamp: number;
   callId: string;
@@ -272,8 +276,7 @@ export interface ITimelineWebSearch {
   status: TToolStatus;
 }
 
-export interface ITimelineMcpToolCall {
-  id: string;
+export interface ITimelineMcpToolCall extends ITimelineEntryBase {
   type: 'mcp-tool-call';
   timestamp: number;
   callId: string;
@@ -289,8 +292,7 @@ export interface IPatchApplyFile {
   status?: string;
 }
 
-export interface ITimelinePatchApply {
-  id: string;
+export interface ITimelinePatchApply extends ITimelineEntryBase {
   type: 'patch-apply';
   timestamp: number;
   callId: string;
@@ -300,8 +302,7 @@ export interface ITimelinePatchApply {
   status: TToolStatus;
 }
 
-export interface ITimelineContextCompacted {
-  id: string;
+export interface ITimelineContextCompacted extends ITimelineEntryBase {
   type: 'context-compacted';
   timestamp: number;
   beforeTokens?: number;
@@ -362,6 +363,8 @@ export interface ITimelineInitMessage {
   type: 'timeline:init';
   entries: ITimelineEntry[];
   sessionId: string;
+  /** `<provider>:<global|wsId>:<sessionId>` — see `@/lib/session-key`. */
+  sessionKey?: string;
   totalEntries: number;
   startByteOffset: number;
   hasMore: boolean;
@@ -464,7 +467,12 @@ export interface IParseResult {
 export interface IIncrementalResult {
   newEntries: ITimelineEntry[];
   newOffset: number;
-  pendingBuffer: string;
+  /**
+   * Raw bytes of the trailing partial record, carried into the next read. Bytes
+   * rather than text: an append can tear a multi-byte character, and decoding
+   * the remainder would replace its lead bytes with U+FFFD unrecoverably.
+   */
+  pendingBuffer: Buffer;
 }
 
 export interface ISessionMeta {

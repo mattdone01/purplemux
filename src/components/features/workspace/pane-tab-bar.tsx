@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 import { useTranslations } from 'next-intl';
 import { X, ChevronLeft, ChevronRight, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -60,7 +61,7 @@ const PaneTabBar = ({
   const scrollRef = useRef<HTMLDivElement>(null);
   const sortedTabs = useMemo(() => [...tabs].sort((a, b) => a.order - b.order), [tabs]);
   const canSwitchMode = (panelType: TPanelType | undefined) =>
-    !panelType || panelType === 'terminal' || panelType === 'claude-code' || panelType === 'codex-cli';
+    !panelType || panelType === 'terminal' || isAgentPanelType(panelType);
 
   const {
     draggedTabId,

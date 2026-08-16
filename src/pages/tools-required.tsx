@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import AppLogo from '@/components/layout/app-logo';
 import InstallDialog from '@/components/features/login/install-dialog';
 import CodexInstallGuideDialog from '@/components/features/login/codex-install-guide-dialog';
+import GrokIcon from '@/components/icons/grok-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
 import { useRuntimePreflight } from '@/hooks/use-runtime-preflight';
 import { isRuntimeOk } from '@/types/preflight';
@@ -119,6 +120,23 @@ const ToolsRequiredPage = () => {
                           {t('codexInstallGuide')}
                         </button>
                       </>
+                    )}
+                  </div>
+                )}
+                {status && (
+                  <div className="flex items-center gap-2 text-sm">
+                    {status.grok.installed ? (
+                      <Check className="h-4 w-4 shrink-0 text-positive" />
+                    ) : (
+                      <Circle className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <GrokIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="text-muted-foreground">{t('grokLabel')}</span>
+                    {status.grok.installed && status.grok.version && (
+                      <span className="text-xs text-muted-foreground">({status.grok.version})</span>
+                    )}
+                    {!status.grok.installed && (
+                      <span className="text-xs text-muted-foreground">({t('grokOptional')})</span>
                     )}
                   </div>
                 )}

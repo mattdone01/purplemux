@@ -176,7 +176,31 @@ export interface IOrchestrationNudgeMessage {
   nudge: IOrchestrationNudge;
 }
 
-export type TStatusServerMessage = IStatusSyncMessage | IStatusUpdateMessage | IRateLimitsUpdateMessage | ISessionHistorySyncMessage | ISessionHistoryUpdateMessage | IStatusHookEventMessage | IOrchestrationNudgeMessage | IStandupUpdateMessage;
+export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled';
+
+export type TAlertProviderId = 'claude' | 'codex' | 'grok';
+
+export interface IAlert {
+  id: string;
+  seq: number;
+  kind: TAlertKind;
+  tabId: string;
+  workspaceId: string;
+  workspaceName: string;
+  tabName: string;
+  providerId: TAlertProviderId;
+  isOrchestrator: boolean;
+  title: string;
+  body: string;
+  at: number;
+}
+
+export interface INotificationAlertMessage {
+  type: 'notification:alert';
+  alert: IAlert;
+}
+
+export type TStatusServerMessage = IStatusSyncMessage | IStatusUpdateMessage | IRateLimitsUpdateMessage | ISessionHistorySyncMessage | ISessionHistoryUpdateMessage | IStatusHookEventMessage | IOrchestrationNudgeMessage | IStandupUpdateMessage | INotificationAlertMessage;
 
 export interface IStatusTabDismissedMessage {
   type: 'status:tab-dismissed';

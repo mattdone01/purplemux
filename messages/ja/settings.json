@@ -113,6 +113,8 @@
   "notification": {
     "enable": "通知を有効化",
     "enableDescription": "エージェントタスク完了時にシステム通知を表示します。Electronアプリでのみ動作します。",
+    "orchestratorOnly": "オーケストレーターのみ通知",
+    "orchestratorOnlyDescription": "オーケストレーション中のワークスペースではオーケストレータータブのみ通知します。オフにするとすべてのエージェントタブが通知します。",
     "permissionDenied": "ブラウザの通知許可が拒否されました。ブラウザの設定で許可してください。",
     "notSupported": "このブラウザは Web Push に対応していません。",
     "toastSection": "アプリ内トースト",

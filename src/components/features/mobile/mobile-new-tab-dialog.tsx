@@ -4,6 +4,7 @@ import { useTranslations } from 'next-intl';
 import Spinner from '@/components/ui/spinner';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
+import GrokIcon from '@/components/icons/grok-icon';
 import {
   Dialog,
   DialogContent,
@@ -26,6 +27,7 @@ const MobileNewTabDialog = ({ open, onOpenChange, onCreateTab }: IMobileNewTabDi
   const MENU_ITEMS = [
     { key: 'claude', type: 'claude-code' as const, icon: <ClaudeCodeIcon className="h-5 w-5" />, label: tt('claudeNewConversation'), startCommand: 'claude-new' as const },
     { key: 'codex', type: 'codex-cli' as const, icon: <OpenAIIcon className="h-5 w-5" />, label: tt('codexNewConversation'), startCommand: 'codex-new' as const },
+    { key: 'grok', type: 'grok-cli' as const, icon: <GrokIcon className="h-5 w-5" />, label: tt('grokNewConversation'), startCommand: 'grok-new' as const },
     { key: 'agent-sessions', type: 'agent-sessions' as const, icon: <History className="h-5 w-5 text-muted-foreground" />, label: tt('sessionList') },
     { key: 'terminal', type: 'terminal' as const, icon: <Terminal className="h-5 w-5 text-muted-foreground" />, label: 'Terminal' },
   ] as const;
@@ -37,7 +39,7 @@ const MobileNewTabDialog = ({ open, onOpenChange, onCreateTab }: IMobileNewTabDi
     onOpenChange(false);
   };
 
-  const handleStartNew = async (item: Extract<(typeof MENU_ITEMS)[number], { startCommand: 'claude-new' | 'codex-new' }>) => {
+  const handleStartNew = async (item: Extract<(typeof MENU_ITEMS)[number], { startCommand: string }>) => {
     const key = `${item.key}-new`;
     setCreatingKey(key);
     await onCreateTab(item.type, { command: item.startCommand });

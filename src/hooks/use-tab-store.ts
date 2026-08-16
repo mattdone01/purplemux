@@ -5,6 +5,7 @@ import type { ITab, TPanelType } from '@/types/terminal';
 import type { IPermissionRequest } from '@/types/codex-permission';
 import type { ISessionMetaData } from '@/hooks/use-session-meta';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
+import { providerIdForPanelType } from '@/lib/agent-panel-types';
 
 export type TSessionView = 'session-list' | 'check' | 'timeline';
 
@@ -387,8 +388,7 @@ export const selectSessionView = (tabs: Record<string, ITabState>, tabId: string
 
 export const getInitialTabStateFromLayoutTab = (tab: ITab): Partial<ITabState> => {
   const patch: Partial<ITabState> = { panelType: tab.panelType };
-  const providerId = tab.agentState?.providerId
-    ?? (tab.panelType === 'codex-cli' ? 'codex' : tab.panelType === 'claude-code' ? 'claude' : undefined);
+  const providerId = tab.agentState?.providerId ?? providerIdForPanelType(tab.panelType);
   const sessionId = tab.agentState?.sessionId ?? tab.claudeSessionId ?? null;
 
   if (providerId) patch.agentProviderId = providerId;
