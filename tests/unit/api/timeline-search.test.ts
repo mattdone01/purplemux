@@ -284,6 +284,7 @@ describe('GET /api/timeline/search', () => {
     expect(byKey.get('claude:global')?.workspaceName).toBe('global');
     expect(byKey.get(`codex:${WORKSPACE_A}`)?.workspaceName).toBe('Alpha');
     expect(byKey.get(`grok:${WORKSPACE_B}`)?.workspaceName).toBe('Beta');
+    expect(byKey.get(`grok:${WORKSPACE_B}`)?.sessionKey).toBe(`grok:global:${GROK_SESSION}`);
     expect(byKey.get('claude:global')?.sessionKey).toBe(`claude:global:${CLAUDE_GLOBAL_SESSION}`);
   });
 
@@ -300,8 +301,12 @@ describe('GET /api/timeline/search', () => {
     const global = await search({ q: 'chartreuse', workspaceId: 'global' });
     expect(global.hits.map((hit) => hit.sessionKey)).toEqual([`claude:global:${CLAUDE_GLOBAL_SESSION}`]);
 
+    // The hit is ATTRIBUTED to Beta by cwd, but grok has no per-workspace store,
+    // so its key stays global — fork ADR-0005, and the same key the live socket
+    // and sessions-v2 produce.
     const beta = await search({ q: 'chartreuse', workspaceId: WORKSPACE_B });
-    expect(beta.hits.map((hit) => hit.sessionKey)).toEqual([`grok:${WORKSPACE_B}:${GROK_SESSION}`]);
+    expect(beta.hits.map((hit) => hit.sessionKey)).toEqual([`grok:global:${GROK_SESSION}`]);
+    expect(new Set(beta.hits.map((hit) => hit.workspaceId))).toEqual(new Set([WORKSPACE_B]));
   });
 
   it('scans only the requested provider', async () => {
@@ -330,7 +335,9 @@ describe('GET /api/timeline/search', () => {
     for (const offset of ['0', '2', '4']) {
       const page = await search({ q: 'chartreuse', limit: '2', offset });
       expect(page.total).toBe(5);
-      expect(page.truncated).toBe(offset !== '4');
+      // ADR-0006 defines `truncated` as "the scan stopped on its budget", not
+      // "more pages exist" — `total` already says that.
+      expect(page.truncated).toBe(false);
       pages.push(...page.hits);
     }
 
@@ -421,6 +428,22 @@ describe('GET /api/timeline/search', () => {
     expect(total).toBeGreaterThanOrEqual(MAX_SCAN_HITS);
     expect(truncated).toBe(true);
     expect(hits).toHaveLength(100);
+  });
+
+  it('charges a grok session real bytes so it consumes the scan budget', async () => {
+    await writeGrokStore(home);
+    const { collectSearchSources } = await import('@/lib/timeline-search');
+
+    const sources = await collectSearchSources({
+      terms: ['chartreuse'],
+      workspaceId: null,
+      provider: 'grok',
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(sources).toHaveLength(1);
+    expect(sources[0].sizeBytes).toBeGreaterThan(0);
   });
 
   it('sees an appended entry once the transcript grows', async () => {
@@ -577,7 +600,9 @@ describe('search performance', () => {
     for (let pass = 0; pass < 10 && warm.body.total < PERF_CORPUS_MB; pass++) warm = await run();
 
     expect(warm.body.total).toBe(PERF_CORPUS_MB);
-    expect(warm.body.truncated).toBe(true);
+    // Warm sources are charged nothing, so the last pass reaches the end of the
+    // corpus: nothing was dropped, and `truncated` says so.
+    expect(warm.body.truncated).toBe(false);
     expect(warm.body.hits).toHaveLength(100);
     expect(searchCacheStats().sources).toBe(PERF_CORPUS_MB);
     expect(warm.elapsed).toBeLessThanOrEqual(PERF_WARM_BUDGET_MS);

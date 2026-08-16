@@ -1,11 +1,11 @@
 import fs from 'fs/promises';
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { listCodexSessions } from '@/lib/codex-session-list';
+import { listAllCodexSessions } from '@/lib/codex-session-list';
 import { parseSessionMeta } from '@/lib/session-list';
 import { buildSessionKey, GLOBAL_SESSION_SCOPE } from '@/lib/session-key';
 import { listClaudeTranscripts, type TSessionProvider } from '@/lib/session-resolver';
+import { listSessionScopes, sessionScopeFor, type ISessionScope } from '@/lib/session-scope';
 import { readLastSeq } from '@/lib/timeline-history';
-import { workspaceDirectories } from '@/lib/workspace-home';
 
 export const DEFAULT_SESSION_LIMIT = 200;
 export const MAX_SESSION_LIMIT = 500;
@@ -42,6 +42,8 @@ interface ICandidate {
   sessionId: string;
   jsonlPath: string;
   lastActivityMs: number;
+  /** Working directory the session was started in; null for the Claude store. */
+  cwd: string | null;
   /** Codex listing already carries meta; Claude candidates parse theirs per page. */
   codex?: { startedAt: number; firstMessage: string; turnCount: number };
 }
@@ -86,7 +88,7 @@ const claudeCandidates = async (workspaceId: string | null): Promise<ICandidate[
     transcripts.map(async ({ sessionId, jsonlPath }): Promise<ICandidate | null> => {
       try {
         const stat = await fs.stat(jsonlPath);
-        return { provider: 'claude', sessionId, jsonlPath, lastActivityMs: stat.mtimeMs };
+        return { provider: 'claude', sessionId, jsonlPath, lastActivityMs: stat.mtimeMs, cwd: null };
       } catch {
         return null;
       }
@@ -95,25 +97,26 @@ const claudeCandidates = async (workspaceId: string | null): Promise<ICandidate[
   return candidates.filter((candidate): candidate is ICandidate => candidate !== null);
 };
 
-// Codex keys its rollouts by cwd, not by workspace, so a workspace's Codex
-// sessions are the ones started in one of its directories. The global scope has
-// no directory list to match against and stays Claude-only.
-const codexCandidates = async (workspaceId: string | null): Promise<ICandidate[]> => {
-  if (!workspaceId) return [];
-
-  const directories = await workspaceDirectories(workspaceId);
-  const perDirectory = await Promise.all(
-    directories.map(async (cwd) => (await listCodexSessions({ cwd })).sessions),
-  );
-
+// Codex keys its rollouts by cwd, not by workspace. Membership is decided by the
+// same derivation that builds the sessionKey, so a session this route lists is a
+// session whose key names this workspace — including one started in a
+// SUBDIRECTORY of a workspace root, which search has always attributed here.
+const codexCandidates = async (
+  workspaceId: string | null,
+  scopes: ISessionScope[],
+): Promise<ICandidate[]> => {
   const byPath = new Map<string, ICandidate>();
-  for (const entry of perDirectory.flat()) {
+
+  for (const entry of await listAllCodexSessions()) {
     if (byPath.has(entry.jsonlPath)) continue;
+    const scope = sessionScopeFor({ provider: 'codex', scopes, cwd: entry.cwd });
+    if (scope.workspaceId !== workspaceId) continue;
     byPath.set(entry.jsonlPath, {
       provider: 'codex',
       sessionId: entry.sessionId,
       jsonlPath: entry.jsonlPath,
       lastActivityMs: entry.lastActivityAt,
+      cwd: entry.cwd,
       codex: {
         startedAt: entry.startedAt,
         firstMessage: entry.firstUserMessage ?? '',
@@ -127,10 +130,17 @@ const codexCandidates = async (workspaceId: string | null): Promise<ICandidate[]
 const summarize = async (
   candidate: ICandidate,
   workspaceId: string | null,
+  scopes: ISessionScope[],
 ): Promise<ISessionSummary | null> => {
+  const scope = sessionScopeFor({
+    provider: candidate.provider,
+    scopes,
+    workspaceId,
+    cwd: candidate.cwd,
+  });
   const sessionKey = buildSessionKey({
     provider: candidate.provider,
-    workspaceId,
+    workspaceId: scope.workspaceId,
     sessionId: candidate.sessionId,
   });
   const lastSeq = await readLastSeq(candidate.jsonlPath, candidate.provider);
@@ -172,14 +182,15 @@ export const listSessionsV2 = async ({
   limit,
   offset,
 }: ISessionsQuery): Promise<ISessionsPage> => {
+  const scopes = await listSessionScopes();
   const [claude, codex] = await Promise.all([
     claudeCandidates(workspaceId),
-    codexCandidates(workspaceId),
+    codexCandidates(workspaceId, scopes),
   ]);
 
   const candidates = [...claude, ...codex].sort((a, b) => b.lastActivityMs - a.lastActivityMs);
   const page = candidates.slice(offset, offset + limit);
-  const summaries = await Promise.all(page.map((candidate) => summarize(candidate, workspaceId)));
+  const summaries = await Promise.all(page.map((candidate) => summarize(candidate, workspaceId, scopes)));
   const sessions = summaries.filter((session): session is ISessionSummary => session !== null);
 
   return {

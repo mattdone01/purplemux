@@ -197,10 +197,28 @@ interface IListCodexSessionsResult {
   scannedFiles: number;
 }
 
+/**
+ * Every rollout in the scan window, unfiltered. Attribution is the caller's
+ * question — a workspace owns a session started anywhere UNDER one of its
+ * directories, which an equality test on cwd cannot express.
+ */
+export const listAllCodexSessions = async (
+  daysBack: number = DEFAULT_DAYS_BACK,
+): Promise<ICodexSessionEntry[]> => (await scanCodexSessions(daysBack)).sessions;
+
 export const listCodexSessions = async ({
   cwd,
   daysBack = DEFAULT_DAYS_BACK,
 }: IListCodexSessionsOptions): Promise<IListCodexSessionsResult> => {
+  const scanned = await scanCodexSessions(daysBack);
+  return {
+    sessions: scanned.sessions.filter((entry) => entry.cwd === cwd),
+    scannedDirs: scanned.scannedDirs,
+    scannedFiles: scanned.scannedFiles,
+  };
+};
+
+const scanCodexSessions = async (daysBack: number): Promise<IListCodexSessionsResult> => {
   const sessions: ICodexSessionEntry[] = [];
   const today = new Date();
   let scannedDirs = 0;
@@ -237,9 +255,7 @@ export const listCodexSessions = async ({
 
   const results = await Promise.all(allTasks);
   for (const entry of results) {
-    if (!entry) continue;
-    if (entry.cwd !== cwd) continue;
-    sessions.push(entry);
+    if (entry) sessions.push(entry);
   }
 
   sessions.sort((a, b) => b.lastActivityAt - a.lastActivityAt);

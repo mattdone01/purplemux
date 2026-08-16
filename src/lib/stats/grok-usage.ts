@@ -59,12 +59,14 @@ export const readGrokUsage = (
   const sessions = db.all<ISessionRow>(SESSIONS_SQL);
   if (sessions.length === 0) return EMPTY;
 
-  const usageBySession = new Map<string, { input: number; output: number; cost: number; model: string | null }>();
+  // Micros are summed and converted once: dividing each row loses precision the
+  // session total then carries.
+  const usageBySession = new Map<string, { input: number; output: number; costMicros: number; model: string | null }>();
   for (const row of db.all<IUsageRow>(USAGE_SQL)) {
-    const acc = usageBySession.get(row.session_id) ?? { input: 0, output: 0, cost: 0, model: null };
+    const acc = usageBySession.get(row.session_id) ?? { input: 0, output: 0, costMicros: 0, model: null };
     acc.input += row.input_tokens;
     acc.output += row.output_tokens;
-    acc.cost += row.cost_micros / 1_000_000;
+    acc.costMicros += row.cost_micros;
     if (row.model) acc.model = row.model;
     usageBySession.set(row.session_id, acc);
   }
@@ -88,7 +90,7 @@ export const readGrokUsage = (
       model: usage?.model ?? session.model ?? null,
       inputTokens: usage?.input ?? 0,
       outputTokens: usage?.output ?? 0,
-      cost: usage?.cost ?? 0,
+      cost: usage ? usage.costMicros / 1_000_000 : 0,
       messageCount: messageCounts.get(session.id) ?? 0,
     });
   }

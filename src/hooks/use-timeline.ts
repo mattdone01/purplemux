@@ -10,6 +10,7 @@ import type {
 } from '@/types/timeline';
 import useTimelineWebSocket from '@/hooks/use-timeline-websocket';
 import { prependEntries, upsertEntry } from '@/lib/timeline-merge';
+import { canLoadOlder } from '@/lib/timeline-paging';
 
 interface IResumeCallbacks {
   onResumeStarted?: (payload: { sessionId: string; jsonlPath: string | null }) => void;
@@ -139,7 +140,7 @@ const useTimeline = ({
       return [...merged, ...pendings];
     });
     startByteOffsetRef.current = startByteOffset ?? 0;
-    setHasMore(hasMoreInit ?? false);
+    setHasMore((hasMoreInit ?? false) && canLoadOlder(jsonlPath, startByteOffset ?? 0));
     setSessionSummary(summary);
     setInitMeta(meta);
     setSessionStats(initStats ?? null);
@@ -289,15 +290,16 @@ const useTimeline = ({
   }, []);
 
   const loadMore = useCallback(async () => {
-    if (!jsonlPathRef.current || isLoadingMoreRef.current || !hasMore) return;
-    if (startByteOffsetRef.current <= 0) {
+    if (isLoadingMoreRef.current || !hasMore) return;
+    const jsonlSource = jsonlPathRef.current;
+    if (!canLoadOlder(jsonlSource, startByteOffsetRef.current)) {
       setHasMore(false);
       return;
     }
     isLoadingMoreRef.current = true;
     try {
       const res = await fetch(
-        `/api/timeline/entries?jsonlPath=${encodeURIComponent(jsonlPathRef.current)}&beforeByte=${startByteOffsetRef.current}&limit=256`,
+        `/api/timeline/entries?jsonlPath=${encodeURIComponent(jsonlSource)}&beforeByte=${startByteOffsetRef.current}&limit=256`,
       );
       if (!res.ok) return;
       const data = await res.json();

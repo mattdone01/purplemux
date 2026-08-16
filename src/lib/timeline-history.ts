@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import { createHash } from 'crypto';
+import { sliceFromNextLine } from '@/lib/buffer-lines';
 import { parseJsonlContent } from '@/lib/session-parser';
 import { codexSessionIdFromJsonlPath, parseCodexContent } from '@/lib/session-parser-codex';
 import type { TSessionProvider } from '@/lib/session-resolver';
@@ -184,22 +185,21 @@ const readWindow = async (
   fileSize: number,
 ): Promise<{ content: string; validFrom: number }> => {
   const handle = await fs.open(filePath, 'r');
-  let raw: string;
+  let bytes: Buffer;
   try {
     const buffer = Buffer.alloc(to - from);
-    await handle.read(buffer, 0, buffer.length, from);
-    raw = buffer.toString('utf-8');
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, from);
+    bytes = buffer.subarray(0, bytesRead);
   } finally {
     await handle.close();
   }
 
-  let content = raw;
+  let content = bytes.toString('utf-8');
   let validFrom = from;
   if (from > 0) {
-    const newline = raw.indexOf('\n');
-    if (newline < 0) return { content: '', validFrom: to };
-    content = raw.slice(newline + 1);
-    validFrom = from + Buffer.byteLength(raw.slice(0, newline + 1), 'utf-8');
+    const slice = sliceFromNextLine(bytes, from);
+    if (!slice) return { content: '', validFrom: to };
+    ({ content, validFrom } = slice);
   }
   if (to < fileSize) {
     const lastNewline = content.lastIndexOf('\n');
@@ -316,22 +316,21 @@ export const readLastSeq = async (
 
     const from = Math.max(0, stat.size - TAIL_SCAN_BYTES);
     const handle = await fs.open(jsonlPath, 'r');
-    let raw: string;
+    let bytes: Buffer;
     try {
       const buffer = Buffer.alloc(stat.size - from);
-      await handle.read(buffer, 0, buffer.length, from);
-      raw = buffer.toString('utf-8');
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, from);
+      bytes = buffer.subarray(0, bytesRead);
     } finally {
       await handle.close();
     }
 
-    let content = raw;
+    let content = bytes.toString('utf-8');
     let validFrom = from;
     if (from > 0) {
-      const newline = raw.indexOf('\n');
-      if (newline < 0) return -1;
-      content = raw.slice(newline + 1);
-      validFrom = from + Buffer.byteLength(raw.slice(0, newline + 1), 'utf-8');
+      const slice = sliceFromNextLine(bytes, from);
+      if (!slice) return -1;
+      ({ content, validFrom } = slice);
     }
 
     let lastLineOffset = -1;

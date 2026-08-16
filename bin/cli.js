@@ -289,8 +289,13 @@ const cmdTabSend = async (args) => {
     content = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
   }
   if (!content) die('content is required (args, -f FILE, or -f - for stdin)');
-  if (noWait && waitMs) die('--no-wait and --wait-ms are mutually exclusive');
-  if (waitMs && !/^\d+$/.test(waitMs)) die('--wait-ms must be a whole number of milliseconds');
+  const waitMsGiven = args.includes('--wait-ms');
+  if (noWait && waitMsGiven) die('--no-wait and --wait-ms are mutually exclusive');
+  // `--wait-ms` as the last token leaves no value to read; falling back to the
+  // default would silently wait 60s for a caller that asked for something else.
+  if (waitMsGiven && (waitMs === null || !/^\d+$/.test(waitMs))) {
+    die('--wait-ms must be a whole number of milliseconds');
+  }
   const wsId = resolveWsForTab(args);
   const { body } = await api(
     'POST',

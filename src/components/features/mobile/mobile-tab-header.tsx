@@ -19,6 +19,7 @@ import {
   AGENT_DISPLAY_NAME,
   AGENT_PANEL_TYPES,
   isAgentPanelType,
+  processMatchesPanelType,
   providerIdForPanelType,
   type TAgentPanelType,
 } from '@/lib/agent-panel-types';
@@ -66,14 +67,6 @@ const getButtonLabel = (mode: TModeButton) =>
 const getAgentLabel = (panelType: TPanelType): string => {
   if (isAgentPanelType(panelType)) return 'Chat';
   return 'Terminal';
-};
-
-const processMatchesAgent = (panelType: TPanelType | undefined, process: string | undefined): boolean => {
-  if (!process) return false;
-  const normalized = process.toLowerCase();
-  if (panelType === 'claude-code') return normalized === 'claude';
-  if (isAgentPanelType(panelType)) return normalized === providerIdForPanelType(panelType);
-  return false;
 };
 
 interface IMobileTabHeaderProps {
@@ -130,7 +123,7 @@ const MobileTabHeader = ({
   const switchable = canSwitchMode(panelType);
   const runtimeAgentPanelType = getAgentPanelTypeFromProvider(tabEntry?.agentProviderId);
   const hasDetectedAgent = !!runtimeAgentPanelType
-    && (tabEntry?.agentProcess === true || processMatchesAgent(runtimeAgentPanelType, tabEntry?.currentProcess));
+    && (tabEntry?.agentProcess === true || processMatchesPanelType(runtimeAgentPanelType, tabEntry?.currentProcess));
   const visibleAgentPanelType = isAgentPanel(panelType)
     ? panelType
     : hasDetectedAgent

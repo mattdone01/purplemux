@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import { z } from 'zod';
 import { diffLines } from 'diff';
+import { EMPTY_PENDING, sliceFromNextLine, splitCompleteLines } from '@/lib/buffer-lines';
 import { PENDING_ENTRY_ID, assignEntryIdentity, entryIdFor, renumberGroupEntries } from '@/lib/entry-identity';
 import type {
   ITimelineEntry,
@@ -906,14 +907,12 @@ const parseTailMode = async (filePath: string, fileSize: number): Promise<IParse
   try {
     const buffer = Buffer.alloc(readSize);
     const offset = fileSize - readSize;
-    await handle.read(buffer, 0, readSize, offset);
+    const { bytesRead } = await handle.read(buffer, 0, readSize, offset);
+    const bytes = buffer.subarray(0, bytesRead);
 
-    const content = buffer.toString('utf-8');
-    const firstNewline = content.indexOf('\n');
-    const validContent = firstNewline >= 0 ? content.slice(firstNewline + 1) : content;
-    const validFrom = firstNewline >= 0
-      ? offset + Buffer.byteLength(content.slice(0, firstNewline + 1), 'utf-8')
-      : offset;
+    const slice = sliceFromNextLine(bytes, offset);
+    const validContent = slice?.content ?? bytes.toString('utf-8');
+    const validFrom = slice?.validFrom ?? offset;
 
     const result = parseContent(validContent, validFrom);
     result.lastOffset = fileSize;
@@ -934,13 +933,10 @@ const readChunk = async (
   const handle = await fs.open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(readSize);
-    await handle.read(buffer, 0, readSize, from);
-    const raw = buffer.toString('utf-8');
-    if (from === 0) return { content: raw, validFrom: 0 };
-    const firstNewline = raw.indexOf('\n');
-    if (firstNewline < 0) return { content: '', validFrom: to };
-    const validFrom = from + Buffer.byteLength(raw.slice(0, firstNewline + 1), 'utf-8');
-    return { content: raw.slice(firstNewline + 1), validFrom };
+    const { bytesRead } = await handle.read(buffer, 0, readSize, from);
+    const bytes = buffer.subarray(0, bytesRead);
+    if (from === 0) return { content: bytes.toString('utf-8'), validFrom: 0 };
+    return sliceFromNextLine(bytes, from) ?? { content: '', validFrom: to };
   } finally {
     await handle.close();
   }
@@ -1046,10 +1042,19 @@ export const readEntriesBefore = async (
   }
 };
 
+const isCompleteJsonRecord = (line: string): boolean => {
+  try {
+    JSON.parse(line);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export const parseIncremental = async (
   filePath: string,
   fromOffset: number,
-  pendingBuffer: string = '',
+  pendingBuffer: Buffer = EMPTY_PENDING,
 ): Promise<IIncrementalResult> => {
   try {
     const handle = await fs.open(filePath, 'r');
@@ -1060,7 +1065,7 @@ export const parseIncremental = async (
       await handle.close();
       const content = await fs.readFile(filePath, 'utf-8');
       const result = parseContent(content);
-      return { newEntries: result.entries, newOffset: size, pendingBuffer: '' };
+      return { newEntries: result.entries, newOffset: size, pendingBuffer: EMPTY_PENDING };
     }
 
     if (fromOffset >= size) {
@@ -1069,31 +1074,22 @@ export const parseIncremental = async (
     }
 
     const buffer = Buffer.alloc(size - fromOffset);
-    await handle.read(buffer, 0, buffer.length, fromOffset);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, fromOffset);
     await handle.close();
 
-    const rawContent = pendingBuffer + buffer.toString('utf-8');
-    const endsWithNewline = rawContent.endsWith('\n');
-    const segments = rawContent.split('\n');
-    let newPending = '';
-    if (!endsWithNewline) {
-      const lastSegment = segments.pop() ?? '';
-      if (lastSegment) {
-        try {
-          JSON.parse(lastSegment);
-          segments.push(lastSegment);
-        } catch {
-          newPending = lastSegment;
-        }
-      }
-    }
-    const completeContent = segments.join('\n');
-    const result = parseContent(completeContent, fromOffset - Buffer.byteLength(pendingBuffer, 'utf-8'));
+    // The carried remainder is prepended as bytes, so a character torn by the
+    // previous append is rejoined here rather than lost to U+FFFD. Its own
+    // length is the byte count — never `Buffer.byteLength` of a decoding.
+    const bytes = pendingBuffer.length > 0
+      ? Buffer.concat([pendingBuffer, buffer.subarray(0, bytesRead)])
+      : buffer.subarray(0, bytesRead);
+    const { content, pending } = splitCompleteLines(bytes, isCompleteJsonRecord);
+    const result = parseContent(content, fromOffset - pendingBuffer.length);
 
     return {
       newEntries: result.entries,
       newOffset: size,
-      pendingBuffer: newPending,
+      pendingBuffer: pending,
     };
   } catch {
     return { newEntries: [], newOffset: fromOffset, pendingBuffer };

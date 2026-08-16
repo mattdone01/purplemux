@@ -17,6 +17,7 @@ import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
 import { GROK_PROVIDER_ID } from '@/lib/providers/grok';
 import { isAgentPanelType, toSessionHistoryProvider } from '@/lib/agent-panel-types';
+import { runtimeHandleFor, runtimeProviderId } from '@/lib/agent-runtime-handle';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
 import { cacheCodexRateLimitsFromJsonl } from '@/lib/codex-rate-limits-cache';
 import { parsePermissionOptions } from '@/lib/permission-prompt';
@@ -249,6 +250,14 @@ class StatusManager {
           const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(codexSession.jsonlPath);
           return { lastAssistantSnippet, currentAction, jsonlPath: codexSession.jsonlPath };
         }
+      }
+
+      // A store with no transcript file — grok — is reached by session id, the
+      // same handle the polling path uses.
+      const storeHandle = runtimeHandleFor(provider.id, { jsonlPath: null, sessionId: persistedSessionId });
+      if (storeHandle) {
+        const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(storeHandle);
+        return { lastAssistantSnippet, currentAction, jsonlPath: null };
       }
     }
 
@@ -873,16 +882,11 @@ class StatusManager {
     }
   }
 
-  /**
-   * The handle a provider reads its runtime view from. File-backed providers
-   * pass a transcript path; grok keeps its transcript in SQLite, so its handle
-   * is the session id.
-   */
   private runtimeHandle(entry: ITabStatusEntry): string | null {
-    if (entry.agentProviderId === GROK_PROVIDER_ID || entry.panelType === 'grok-cli') {
-      return entry.agentSessionId ?? null;
-    }
-    return entry.jsonlPath ?? null;
+    return runtimeHandleFor(
+      runtimeProviderId(entry.agentProviderId, entry.panelType),
+      { jsonlPath: entry.jsonlPath, sessionId: entry.agentSessionId },
+    );
   }
 
   private async saveSessionHistory(tabId: string, entry: ITabStatusEntry, prevBusySince: number | null | undefined, cancelled: boolean): Promise<void> {

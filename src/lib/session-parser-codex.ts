@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import { z } from 'zod';
+import { EMPTY_PENDING, sliceFromNextLine, splitCompleteLines } from '@/lib/buffer-lines';
 import { createLogger } from '@/lib/logger';
 import { PENDING_ENTRY_ID, assignEntryIdentity, entryIdFor, type IEntryOrigin } from '@/lib/entry-identity';
 import { uploadPathToImageUrl } from '@/lib/uploads-store';
@@ -1006,13 +1007,10 @@ const readChunk = async (
   const handle = await fs.open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(readSize);
-    await handle.read(buffer, 0, readSize, from);
-    const raw = buffer.toString('utf-8');
-    if (from === 0) return { content: raw, validFrom: 0 };
-    const firstNewline = raw.indexOf('\n');
-    if (firstNewline < 0) return { content: '', validFrom: to };
-    const validFrom = from + Buffer.byteLength(raw.slice(0, firstNewline + 1), 'utf-8');
-    return { content: raw.slice(firstNewline + 1), validFrom };
+    const { bytesRead } = await handle.read(buffer, 0, readSize, from);
+    const bytes = buffer.subarray(0, bytesRead);
+    if (from === 0) return { content: bytes.toString('utf-8'), validFrom: 0 };
+    return sliceFromNextLine(bytes, from) ?? { content: '', validFrom: to };
   } finally {
     await handle.close();
   }
@@ -1126,7 +1124,7 @@ export class CodexParser {
   private readonly jsonlPath: string;
   private readonly sessionId: string;
   private lastOffset = 0;
-  private pendingBuffer = '';
+  private pendingBuffer: Buffer = EMPTY_PENDING;
   private state: ICodexParseState;
 
   constructor(jsonlPath: string) {
@@ -1137,18 +1135,18 @@ export class CodexParser {
 
   reset(): void {
     this.lastOffset = 0;
-    this.pendingBuffer = '';
+    this.pendingBuffer = EMPTY_PENDING;
     this.state = createState();
   }
 
   dispose(): void {
     this.state.inFlight.clear();
-    this.pendingBuffer = '';
+    this.pendingBuffer = EMPTY_PENDING;
   }
 
   async parseAll(): Promise<IParseResult> {
     this.lastOffset = 0;
-    this.pendingBuffer = '';
+    this.pendingBuffer = EMPTY_PENDING;
     this.state = createState();
     let stat: { size: number };
     try {
@@ -1194,7 +1192,7 @@ export class CodexParser {
         const result = parseContentWithOffsets(content, validFrom, this.state, this.sessionId);
         if (result.entries.length >= maxEntries || from === 0) {
           this.lastOffset = fileSize;
-          this.pendingBuffer = '';
+          this.pendingBuffer = EMPTY_PENDING;
           const fallbackStartByteOffset = from === 0 ? 0 : validFrom;
           return sliceChunkResult(result, fileSize, fallbackStartByteOffset, maxEntries);
         }
@@ -1222,7 +1220,7 @@ export class CodexParser {
         await handle.close();
         this.reset();
         const all = await this.parseAll();
-        return { newEntries: all.entries, newOffset: all.lastOffset, pendingBuffer: '' };
+        return { newEntries: all.entries, newOffset: all.lastOffset, pendingBuffer: EMPTY_PENDING };
       }
 
       if (this.lastOffset >= size) {
@@ -1230,29 +1228,24 @@ export class CodexParser {
       }
 
       const buffer = Buffer.alloc(size - this.lastOffset);
-      await handle.read(buffer, 0, buffer.length, this.lastOffset);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, this.lastOffset);
 
-      const rawContent = this.pendingBuffer + buffer.toString('utf-8');
-      const contentStart = this.lastOffset - Buffer.byteLength(this.pendingBuffer, 'utf-8');
-      const endsWithNewline = rawContent.endsWith('\n');
-      const { lines: segments, lineOffsets } = splitLinesWithOffsets(rawContent, contentStart);
-      let newPending = '';
-      if (!endsWithNewline) {
-        const lastSegment = segments.pop() ?? '';
-        const lastOffset = lineOffsets.pop();
-        if (lastSegment) {
-          if (tryParseJson(lastSegment) !== undefined) {
-            segments.push(lastSegment);
-            if (lastOffset !== undefined) lineOffsets.push(lastOffset);
-          } else {
-            newPending = lastSegment;
-          }
-        }
-      }
+      // Bytes, not text: the remainder of the previous read may hold the lead
+      // bytes of a character whose continuation only arrives now.
+      const bytes = this.pendingBuffer.length > 0
+        ? Buffer.concat([this.pendingBuffer, buffer.subarray(0, bytesRead)])
+        : buffer.subarray(0, bytesRead);
+      const contentStart = this.lastOffset - this.pendingBuffer.length;
+      const { content, pending } = splitCompleteLines(
+        bytes,
+        (line) => tryParseJson(line) !== undefined,
+      );
+      const { lines: segments, lineOffsets } = splitLinesWithOffsets(content, contentStart);
+
       const { entries } = parseLines(segments, this.state, { lineOffsets, sessionId: this.sessionId });
       this.lastOffset = size;
-      this.pendingBuffer = newPending;
-      return { newEntries: entries, newOffset: size, pendingBuffer: newPending };
+      this.pendingBuffer = pending;
+      return { newEntries: entries, newOffset: size, pendingBuffer: pending };
     } catch (err) {
       log.warn({ err: err instanceof Error ? err.message : err, path: this.jsonlPath }, 'codex incremental parse failed');
       return { newEntries: [], newOffset: this.lastOffset, pendingBuffer: this.pendingBuffer };

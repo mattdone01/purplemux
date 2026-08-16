@@ -19,6 +19,23 @@ afterEach(() => {
 const iso = (offsetMs: number) => new Date(Date.now() - offsetMs).toISOString();
 
 describe('readGrokUsage', () => {
+  it('sums cost in micros and divides once, so per-row rounding cannot drift', () => {
+    // 0.1 + 0.2 in binary floating point is 0.30000000000000004; 300_000 micros
+    // divided once is exactly 0.3.
+    const path = fixture([{
+      id: 'cccccccccccc',
+      createdAt: iso(2_000),
+      usage: [
+        { messageSeq: 1, model: 'grok-4.20', inputTokens: 1, outputTokens: 1, costMicros: 100_000, createdAt: iso(1_000) },
+        { messageSeq: 2, model: 'grok-4.20', inputTokens: 1, outputTokens: 1, costMicros: 200_000, createdAt: iso(1_000) },
+      ],
+    }]);
+
+    const { sessions } = readGrokUsage('all', path);
+
+    expect(sessions[0].cost).toBe(0.3);
+  });
+
   it('aggregates tokens, cost and messages per session', () => {
     const path = fixture([
       {

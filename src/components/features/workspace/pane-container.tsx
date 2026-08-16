@@ -610,7 +610,7 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
 
     connectedSessionRef.current = tab.sessionName;
     const { cols, rows } = fit();
-    const isAgentTab = tab.panelType === 'claude-code' || tab.panelType === 'codex-cli';
+    const isAgentTab = isAgentPanelType(tab.panelType);
     const initialSize = normalizeTerminalSize(
       cols,
       rows,

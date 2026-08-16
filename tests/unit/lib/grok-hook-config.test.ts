@@ -85,10 +85,59 @@ describe('mergeGrokHookSettings', () => {
     expect(entries[0]).toEqual({ hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] });
   });
 
-  it('discards a malformed hook entry instead of propagating it', () => {
+  it('keeps an element it cannot parse and installs its own entry beside it', () => {
     const { settings } = mergeGrokHookSettings({ hooks: { Stop: ['nonsense', 42] } }, SCRIPT);
     const entries = (settings.hooks as Record<string, unknown[]>).Stop;
-    expect(entries).toHaveLength(1);
+
+    expect(entries).toEqual([
+      'nonsense',
+      42,
+      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] },
+    ]);
+  });
+
+  it('keeps a hook value that is not an array at all', () => {
+    const existing = {
+      apiKey: 'xai-secret',
+      hooks: {
+        PostToolUse: { matcher: 'Bash', hooks: [{ type: 'command', command: 'audit.sh' }] },
+        Stop: 'run-my-script',
+      },
+    };
+    const before = JSON.stringify(existing);
+
+    const { settings } = mergeGrokHookSettings(existing, SCRIPT);
+    const hooks = settings.hooks as Record<string, unknown>;
+
+    expect(JSON.stringify(existing)).toBe(before);
+    expect(hooks.PostToolUse).toEqual([
+      { matcher: 'Bash', hooks: [{ type: 'command', command: 'audit.sh' }] },
+      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" PostToolUse`, timeout: 3 }] },
+    ]);
+    expect(hooks.Stop).toEqual([
+      'run-my-script',
+      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] },
+    ]);
+    expect(settings.apiKey).toBe('xai-secret');
+  });
+
+  it('leaves an event purplemux does not write exactly as it found it', () => {
+    const { settings } = mergeGrokHookSettings(
+      { hooks: { SubagentStop: [{ weird: true }], PreToolUse: { legacy: 'shape' } } },
+      SCRIPT,
+    );
+    const hooks = settings.hooks as Record<string, unknown>;
+
+    expect(hooks.SubagentStop).toEqual([{ weird: true }]);
+    expect(hooks.PreToolUse).toEqual({ legacy: 'shape' });
+  });
+
+  it('stays idempotent over settings it could not parse', () => {
+    const first = mergeGrokHookSettings({ hooks: { Stop: ['nonsense'], SubagentStop: 'mine' } }, SCRIPT);
+    const second = mergeGrokHookSettings(first.settings, SCRIPT);
+
+    expect(second.changed).toBe(false);
+    expect(second.settings).toEqual(first.settings);
   });
 });
 

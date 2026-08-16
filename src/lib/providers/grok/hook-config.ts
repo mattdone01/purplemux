@@ -39,7 +39,12 @@ export interface IGrokHookEntry {
   hooks: IGrokHookCommand[];
 }
 
-export type TGrokHookConfig = Record<string, IGrokHookEntry[]>;
+/**
+ * Values are `unknown`, not `IGrokHookEntry[]`: grok's own loader tolerates
+ * shapes this module cannot parse, and a merge must carry those through rather
+ * than replace them with what it understands.
+ */
+export type TGrokHookConfig = Record<string, unknown>;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -80,14 +85,22 @@ export const mergeGrokHookSettings = (
   const existingHooks = isRecord(base.hooks) ? base.hooks : {};
   const nextHooks: TGrokHookConfig = {};
 
+  // Only an entry purplemux itself wrote is dropped. Anything else — an element
+  // this module cannot parse, or a whole event value that is not an array — is
+  // carried through untouched, because a value we do not understand is still the
+  // user's, and grok's loader may understand it.
   for (const [event, value] of Object.entries(existingHooks)) {
-    const entries = Array.isArray(value) ? value.filter(isHookEntry) : [];
-    const foreign = entries.filter((entry) => !ownsCommand(entry, scriptPath));
-    if (foreign.length > 0 || entries.length === 0) nextHooks[event] = foreign;
+    nextHooks[event] = Array.isArray(value)
+      ? value.filter((entry) => !(isHookEntry(entry) && ownsCommand(entry, scriptPath)))
+      : value;
   }
 
+  // A non-array value is only ever wrapped where purplemux has an entry of its
+  // own to add; on an event it does not write, the value stays exactly as found.
   for (const event of GROK_HOOK_EVENTS) {
-    nextHooks[event] = [...(nextHooks[event] ?? []), purplemuxEntry(scriptPath, event)];
+    const kept = nextHooks[event];
+    const carried = Array.isArray(kept) ? kept : kept === undefined ? [] : [kept];
+    nextHooks[event] = [...carried, purplemuxEntry(scriptPath, event)];
   }
 
   base.hooks = nextHooks;
