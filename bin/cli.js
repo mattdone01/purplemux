@@ -253,7 +253,7 @@ const cmdTabSteer = async (args) => {
   requireEnv();
   const file = flagValue(args, '--file') || flagValue(args, '-f');
   const noInterrupt = args.includes('--no-interrupt');
-  const rest = stripFlags(args, ['--workspace', '-w', '--file', '-f', '--no-interrupt']);
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w', '--file', '-f']), ['--no-interrupt']);
   const tabId = rest[0];
   let content = rest.slice(1).join(' ');
   if (!tabId) die('tab ID is required');
@@ -270,10 +270,18 @@ const cmdTabSteer = async (args) => {
   out(body);
 };
 
+// The send waits for the target to reach a state that can accept a turn. An
+// agent TUI that is still booting swallows the Enter after the paste, so a
+// send that does not wait can report success over an agent that never starts.
 const cmdTabSend = async (args) => {
   requireEnv();
   const file = flagValue(args, '--file') || flagValue(args, '-f');
-  const rest = stripFlags(args, ['--workspace', '-w', '--file', '-f']);
+  const waitMs = flagValue(args, '--wait-ms');
+  const noWait = args.includes('--no-wait');
+  const rest = stripBooleanFlags(
+    stripFlags(args, ['--workspace', '-w', '--file', '-f', '--wait-ms']),
+    ['--no-wait'],
+  );
   const tabId = rest[0];
   let content = rest.slice(1).join(' ');
   if (!tabId) die('tab ID is required');
@@ -281,11 +289,13 @@ const cmdTabSend = async (args) => {
     content = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
   }
   if (!content) die('content is required (args, -f FILE, or -f - for stdin)');
+  if (noWait && waitMs) die('--no-wait and --wait-ms are mutually exclusive');
+  if (waitMs && !/^\d+$/.test(waitMs)) die('--wait-ms must be a whole number of milliseconds');
   const wsId = resolveWsForTab(args);
   const { body } = await api(
     'POST',
     `/api/cli/tabs/${tabId}/send?workspaceId=${encodeURIComponent(wsId)}`,
-    { content },
+    { content, ...(noWait ? { waitMs: 0 } : waitMs ? { waitMs: Number(waitMs) } : {}) },
   );
   out(body);
 };
@@ -413,6 +423,10 @@ const flagValue = (args, name) => {
   return args[idx + 1];
 };
 
+// Boolean flags carry no value, so stripFlags — which drops a flag AND the
+// token after it — would eat the first word of the content.
+const stripBooleanFlags = (args, names) => args.filter((arg) => !names.includes(arg));
+
 const stripFlags = (args, names) => {
   const result = [];
   let i = 0;
@@ -450,7 +464,10 @@ Commands:
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
              [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
-  tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter)
+  tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter). Waits up to 60s
+                                           for an agent tab to be able to accept a turn; --wait-ms N changes
+                                           the budget, --no-wait answers immediately. On timeout nothing is
+                                           pasted and the call fails with agent-not-ready.
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status
   tab result -w WS TAB_ID                  Capture tab pane content

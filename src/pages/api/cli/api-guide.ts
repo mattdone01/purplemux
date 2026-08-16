@@ -64,9 +64,15 @@ DELETE /api/cli/tabs/<tabId>?workspaceId=WS
   Close the tab (kills tmux session and removes from layout).
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
-  Body: { "content": "..." }
-  Send text (bracketed paste) to the tab.
-  Response: { "status": "sent" }
+  Body: { "content": "...", "waitMs"?: 0..600000 }
+  Send text (bracketed paste + Enter) to the tab.
+  For an agent tab (claude-code / codex-cli / grok-cli) the send waits until the tab can
+  accept a turn, up to waitMs (default 60000). A booting agent swallows the Enter after a
+  paste, so sending into one reports success over an agent that never starts. waitMs: 0
+  answers with the current state instead of waiting. Terminal and browser tabs are ungated.
+  Response: { "status": "sent", "submitted": boolean, "cliState": string | null }
+  409 { "error": "agent-not-ready", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"? }
+    — nothing was pasted, so a later Enter cannot submit a half-forgotten prompt.
 
 GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   Response: { "tabId", "workspaceId", "alive", "command", "cliState", "agentProviderId", "agentSessionId", "claudeSessionId" }
