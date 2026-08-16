@@ -64,7 +64,20 @@ export const useAgentInstallCheck = () => {
       return false;
     }
 
-    if (isInstalled(status, provider)) return true;
+    if (isInstalled(status, provider)) {
+      // Grok Build signs in with browser OAuth and refuses to start a session
+      // without it, so an installed-but-signed-out binary is the same blocker as
+      // a missing one and gets its own hint.
+      if (provider === 'grok' && !status.grok.loggedIn) {
+        setInstallPrompt({
+          title: t('grokNotLoggedInTitle'),
+          description: t('grokNotLoggedInDescription'),
+          confirmLabel: tc('close'),
+        });
+        return false;
+      }
+      return true;
+    }
 
     if (provider === 'codex') {
       setInstallPrompt({

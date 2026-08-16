@@ -1,7 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { readEntriesBefore } from '@/lib/session-parser';
 import { readCodexEntriesBefore } from '@/lib/session-parser-codex';
-import { isAllowedJsonlPath, isCodexJsonlPath } from '@/lib/path-validation';
+import { readGrokEntriesBefore } from '@/lib/session-parser-grok';
+import { isAllowedJsonlPath, isCodexJsonlPath, isGrokJsonlPath } from '@/lib/path-validation';
 
 const DEFAULT_LIMIT = 256;
 
@@ -31,10 +32,18 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     ? untilByteParam
     : undefined;
 
+  // `beforeByte` is a cursor into the entry stream, not necessarily a byte
+  // offset: grok numbers entries by update ordinal, so the same parameter names
+  // the oldest seq the client already holds.
   const isCodex = isCodexJsonlPath(jsonlPath);
-  const result = isCodex
-    ? await readCodexEntriesBefore(jsonlPath, beforeByte, limit, untilByte)
-    : await readEntriesBefore(jsonlPath, beforeByte, limit);
+  let result;
+  if (isCodex) {
+    result = await readCodexEntriesBefore(jsonlPath, beforeByte, limit, untilByte);
+  } else if (isGrokJsonlPath(jsonlPath)) {
+    result = await readGrokEntriesBefore(jsonlPath, beforeByte, limit);
+  } else {
+    result = await readEntriesBefore(jsonlPath, beforeByte, limit);
+  }
 
   return res.status(200).json({
     entries: result.entries,

@@ -1,12 +1,10 @@
 import { execFile as execFileCb } from 'child_process';
 import fs from 'fs/promises';
-import path from 'path';
 import { promisify } from 'util';
 import { getShellPath } from '@/lib/preflight';
 import { createLogger } from '@/lib/logger';
 import { parseSemanticVersion } from '@/lib/process-utils';
-import { GROK_HOME } from '@/lib/providers/grok/db';
-import { GROK_USER_SETTINGS_PATH } from '@/lib/providers/grok/hook-config';
+import { GROK_AUTH_PATH, GROK_BIN_DIR, GROK_BIN_PATH } from '@/lib/providers/grok/paths';
 import type { IGrokStatus } from '@/types/preflight';
 
 const execFile = promisify(execFileCb);
@@ -15,9 +13,7 @@ const TTL_MS = 60_000;
 
 const log = createLogger('grok-preflight');
 
-/** The install script drops the binary here and does not always touch PATH. */
-export const GROK_BIN_DIR = path.join(GROK_HOME, 'bin');
-export const GROK_BIN_PATH = path.join(GROK_BIN_DIR, 'grok');
+export { GROK_BIN_DIR, GROK_BIN_PATH };
 
 const g = globalThis as unknown as {
   __ptGrokPreflight?: { result: IGrokStatus; checkedAt: number };
@@ -26,6 +22,17 @@ const g = globalThis as unknown as {
 const withGrokBin = (shellPath: string): string =>
   shellPath.split(':').includes(GROK_BIN_DIR) ? shellPath : `${GROK_BIN_DIR}:${shellPath}`;
 
+const exists = async (target: string): Promise<boolean> =>
+  fs.access(target).then(() => true).catch(() => false);
+
+/**
+ * `grok --version` prints `grok 1.0.4 (d846eb93d9)`.
+ *
+ * The install script drops the binary at `~/.grok/bin/grok` and does not always
+ * put that directory on PATH, so it is prepended before probing — and the
+ * absolute path wins when resolving `binaryPath`, because the parked community
+ * `grok-cli` builds a binary of the same name.
+ */
 const probe = async (): Promise<IGrokStatus> => {
   const env = { ...process.env, PATH: withGrokBin(await getShellPath()) };
 
@@ -37,6 +44,8 @@ const probe = async (): Promise<IGrokStatus> => {
     log.debug({ err: err instanceof Error ? err.message : err }, 'grok --version failed');
     return { installed: false, version: null, binaryPath: null };
   }
+
+  if (await exists(GROK_BIN_PATH)) return { installed: true, version, binaryPath: GROK_BIN_PATH };
 
   let binaryPath: string | null = null;
   try {
@@ -63,17 +72,11 @@ export const invalidateGrokPreflight = (): void => {
 };
 
 /**
- * grok resolves its key from `GROK_API_KEY` or `apiKey` in user settings
- * (`src/utils/settings.ts`). Only the presence of a key is read — never its value.
+ * Grok Build signs in through browser OAuth and stores the tokens in
+ * `~/.grok/auth.json` (`02-authentication.md`); `XAI_API_KEY` is the fallback
+ * when no session token exists. Only the presence of either is read.
  */
-export const checkGrokApiKey = async (
-  settingsPath: string = GROK_USER_SETTINGS_PATH,
-): Promise<boolean> => {
-  if (process.env.GROK_API_KEY) return true;
-  try {
-    const parsed = JSON.parse(await fs.readFile(settingsPath, 'utf-8')) as { apiKey?: unknown };
-    return typeof parsed.apiKey === 'string' && parsed.apiKey.length > 0;
-  } catch {
-    return false;
-  }
+export const checkGrokLogin = async (authPath: string = GROK_AUTH_PATH): Promise<boolean> => {
+  if (process.env.XAI_API_KEY) return true;
+  return exists(authPath);
 };

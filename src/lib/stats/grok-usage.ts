@@ -1,14 +1,18 @@
-import { GROK_DB_PATH, getGrokDatabase } from '@/lib/providers/grok/db';
+import fs from 'fs/promises';
+import { GROK_COST_TICKS_PER_USD, parseGrokUpdateLine } from '@/lib/session-parser-grok';
+import { listAllGrokSessions, readGrokSummary } from '@/lib/providers/grok/session-store';
 import { isWithinPeriod } from '@/lib/stats/period-filter';
 import type { TPeriod } from '@/types/stats';
 
 export interface IGrokSessionUsage {
   sessionId: string;
-  /** ISO timestamp of the session's first message. */
+  /** ISO timestamp of the session's creation. */
   startedAt: string;
   model: string | null;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
   cost: number;
   messageCount: number;
 }
@@ -19,81 +23,107 @@ export interface IGrokUsageSummary {
   messageTimestamps: number[];
 }
 
-interface ISessionRow {
-  id: string;
-  model: string | null;
-  created_at: string;
-}
-
-interface IUsageRow {
-  session_id: string;
-  model: string;
-  input_tokens: number;
-  output_tokens: number;
-  cost_micros: number;
-}
-
-interface IMessageRow {
-  session_id: string;
-  created_at: string;
-}
-
-const SESSIONS_SQL = 'SELECT id, model, created_at FROM sessions';
-const USAGE_SQL = 'SELECT session_id, model, input_tokens, output_tokens, cost_micros FROM usage_events';
-const USER_MESSAGES_SQL = "SELECT session_id, created_at FROM messages WHERE role = 'user'";
-
 const EMPTY: IGrokUsageSummary = { sessions: [], messageTimestamps: [] };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+
+interface ITurnTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costTicks: number;
+  model: string | null;
+  userMessageTimestamps: number[];
+}
+
 /**
- * grok's `usage_events` is the whole usage story: tokens and `cost_micros` per
- * model, per message. There are no cache-read or cache-creation counters and no
- * rate-limit windows, so those stay zero rather than being invented.
+ * Token and cost truth for a grok session lives in the `turn_completed` updates
+ * (`usage.{inputTokens,outputTokens,cachedReadTokens,cacheCreationTokens,
+ * costUsdTicks,modelUsage}`), not in `signals.json` — that file carries counts
+ * and context-window figures but no per-turn token or spend totals. Verified
+ * against two recorded sessions; `costUsdTicks / 1e10` reproduced the
+ * `total_cost_usd` the same run printed.
  */
-export const readGrokUsage = (
-  period: TPeriod,
-  dbPath: string = GROK_DB_PATH,
-): IGrokUsageSummary => {
-  const db = getGrokDatabase(dbPath);
-  if (!db) return EMPTY;
+export const readGrokTurnTotals = (content: string): ITurnTotals => {
+  const totals: ITurnTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    costTicks: 0,
+    model: null,
+    userMessageTimestamps: [],
+  };
 
-  const sessions = db.all<ISessionRow>(SESSIONS_SQL);
-  if (sessions.length === 0) return EMPTY;
+  content.split('\n').forEach((line, ordinal) => {
+    if (!line.trim()) return;
+    const update = parseGrokUpdateLine(line, ordinal);
+    if (!update) return;
 
-  // Micros are summed and converted once: dividing each row loses precision the
-  // session total then carries.
-  const usageBySession = new Map<string, { input: number; output: number; costMicros: number; model: string | null }>();
-  for (const row of db.all<IUsageRow>(USAGE_SQL)) {
-    const acc = usageBySession.get(row.session_id) ?? { input: 0, output: 0, costMicros: 0, model: null };
-    acc.input += row.input_tokens;
-    acc.output += row.output_tokens;
-    acc.costMicros += row.cost_micros;
-    if (row.model) acc.model = row.model;
-    usageBySession.set(row.session_id, acc);
-  }
+    if (update.kind === 'user_message_chunk') {
+      // Chunks stream, so only the first of a run marks the message.
+      const previous = totals.userMessageTimestamps[totals.userMessageTimestamps.length - 1];
+      if (previous === undefined || update.timestamp - previous > 1000) {
+        totals.userMessageTimestamps.push(update.timestamp);
+      }
+      return;
+    }
 
-  const messageCounts = new Map<string, number>();
+    if (update.kind !== 'turn_completed') return;
+    const usage = isRecord(update.update.usage) ? update.update.usage : null;
+    if (!usage) return;
+
+    totals.inputTokens += num(usage.inputTokens);
+    totals.outputTokens += num(usage.outputTokens);
+    totals.cacheReadTokens += num(usage.cachedReadTokens);
+    totals.cacheCreationTokens += num(usage.cacheCreationTokens);
+    totals.costTicks += num(usage.costUsdTicks);
+
+    const modelUsage = isRecord(usage.modelUsage) ? usage.modelUsage : {};
+    const model = Object.keys(modelUsage)[0];
+    if (model) totals.model = model;
+  });
+
+  return totals;
+};
+
+/**
+ * Usage across every grok home — the unscoped `~/.grok` and each workspace's
+ * own. Each session lives in exactly one home, so walking all of them cannot
+ * double-count.
+ */
+export const readGrokUsage = async (period: TPeriod): Promise<IGrokUsageSummary> => {
+  const refs = await listAllGrokSessions();
+  if (refs.length === 0) return EMPTY;
+
+  const sessions: IGrokSessionUsage[] = [];
   const messageTimestamps: number[] = [];
-  for (const row of db.all<IMessageRow>(USER_MESSAGES_SQL)) {
-    if (!isWithinPeriod(row.created_at, period)) continue;
-    messageCounts.set(row.session_id, (messageCounts.get(row.session_id) ?? 0) + 1);
-    const ts = Date.parse(row.created_at);
-    if (!Number.isNaN(ts)) messageTimestamps.push(ts);
-  }
 
-  const result: IGrokSessionUsage[] = [];
-  for (const session of sessions) {
-    if (!isWithinPeriod(session.created_at, period)) continue;
-    const usage = usageBySession.get(session.id);
-    result.push({
-      sessionId: session.id,
-      startedAt: new Date(session.created_at).toISOString(),
-      model: usage?.model ?? session.model ?? null,
-      inputTokens: usage?.input ?? 0,
-      outputTokens: usage?.output ?? 0,
-      cost: usage ? usage.costMicros / 1_000_000 : 0,
-      messageCount: messageCounts.get(session.id) ?? 0,
+  for (const ref of refs) {
+    const summary = await readGrokSummary(ref.sessionDir);
+    const startedAt = summary?.createdAt ?? new Date(ref.lastActivityMs).toISOString();
+    if (!isWithinPeriod(startedAt, period)) continue;
+
+    const content = await fs.readFile(ref.jsonlPath, 'utf-8').catch(() => '');
+    const totals = readGrokTurnTotals(content);
+
+    sessions.push({
+      sessionId: ref.sessionId,
+      startedAt: new Date(startedAt).toISOString(),
+      model: totals.model ?? summary?.model ?? null,
+      inputTokens: totals.inputTokens,
+      outputTokens: totals.outputTokens,
+      cacheReadTokens: totals.cacheReadTokens,
+      cacheCreationTokens: totals.cacheCreationTokens,
+      cost: totals.costTicks / GROK_COST_TICKS_PER_USD,
+      messageCount: totals.userMessageTimestamps.length,
     });
+    messageTimestamps.push(...totals.userMessageTimestamps);
   }
 
-  return { sessions: result, messageTimestamps };
+  return { sessions, messageTimestamps };
 };

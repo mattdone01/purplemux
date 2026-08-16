@@ -1,10 +1,12 @@
 /**
  * Whether older entries can actually be fetched for a timeline.
  *
- * `/api/timeline/entries` pages by byte offset into a JSONL transcript, so a
- * source without one — grok, whose transcript lives in SQLite — has nothing to
- * page. Arming the load-older affordance for it leaves a control that can never
- * do anything, so both the init payload and the client guard ask this.
+ * `/api/timeline/entries` pages backwards from a cursor into a JSONL transcript
+ * — a byte offset for Claude and Codex, an update ordinal for grok. A source
+ * with no transcript, or one whose init already starts at the first entry, has
+ * nothing to page, and arming the load-older affordance for it leaves a control
+ * that can never do anything; both the init payload and the client guard ask
+ * this.
  */
 export const canLoadOlder = (
   jsonlPath: string | null | undefined,

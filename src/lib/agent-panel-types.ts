@@ -41,14 +41,15 @@ export const agentDisplayName = (panelType: TPanelType | undefined): string =>
 
 /**
  * The foreground process names a running agent can present as. An agent shipped
- * as a bundle reports its runtime rather than its own name — grok as `bun`,
- * codex as `node` — so a check against the provider id alone sees no agent at
- * all in the common case.
+ * as a bundle reports its runtime rather than its own name — codex as `node` —
+ * so a check against the provider id alone sees no agent at all in the common
+ * case. Grok Build is a single binary and reports itself, under either of the
+ * two names its installer links (`grok` and `agent`).
  */
 export const AGENT_PROCESS_NAMES: Record<TAgentPanelType, readonly string[]> = {
   'claude-code': ['claude'],
   'codex-cli': ['codex', 'node'],
-  'grok-cli': ['grok', 'bun'],
+  'grok-cli': ['grok', 'agent'],
 };
 
 export const processMatchesPanelType = (

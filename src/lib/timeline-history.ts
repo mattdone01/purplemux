@@ -3,6 +3,8 @@ import { createHash } from 'crypto';
 import { sliceFromNextLine } from '@/lib/buffer-lines';
 import { parseJsonlContent } from '@/lib/session-parser';
 import { codexSessionIdFromJsonlPath, parseCodexContent } from '@/lib/session-parser-codex';
+import { parseGrokContent } from '@/lib/session-parser-grok';
+import { grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import type { TSessionProvider } from '@/lib/session-resolver';
 import type { ITimelineEntry } from '@/types/timeline';
 
@@ -53,20 +55,26 @@ interface IRevisionState {
 interface IHistoryStores {
   __ptHistoryIndex?: Map<string, ISnapshot>;
   __ptCodexHistoryState?: Map<string, ISnapshot>;
+  __ptGrokHistoryState?: Map<string, ISnapshot>;
   __ptHistoryRevisions?: Map<string, IRevisionState>;
 }
 
 const g = globalThis as unknown as IHistoryStores;
 if (!g.__ptHistoryIndex) g.__ptHistoryIndex = new Map();
 if (!g.__ptCodexHistoryState) g.__ptCodexHistoryState = new Map();
+if (!g.__ptGrokHistoryState) g.__ptGrokHistoryState = new Map();
 if (!g.__ptHistoryRevisions) g.__ptHistoryRevisions = new Map();
 
 const claudeSnapshots = g.__ptHistoryIndex;
 const codexSnapshots = g.__ptCodexHistoryState;
+const grokSnapshots = g.__ptGrokHistoryState;
 const revisions = g.__ptHistoryRevisions;
 
-const snapshotStore = (provider: TSessionProvider): Map<string, ISnapshot> =>
-  provider === 'codex' ? codexSnapshots : claudeSnapshots;
+const snapshotStore = (provider: TSessionProvider): Map<string, ISnapshot> => {
+  if (provider === 'codex') return codexSnapshots;
+  if (provider === 'grok') return grokSnapshots;
+  return claudeSnapshots;
+};
 
 const touch = <T>(store: Map<string, T>, key: string): T | undefined => {
   const value = store.get(key);
@@ -140,10 +148,11 @@ const parseEntries = (
   byteBase: number,
   provider: TSessionProvider,
   jsonlPath: string,
-): ITimelineEntry[] =>
-  provider === 'codex'
-    ? parseCodexContent(content, byteBase, codexSessionIdFromJsonlPath(jsonlPath))
-    : parseJsonlContent(content, byteBase);
+): ITimelineEntry[] => {
+  if (provider === 'codex') return parseCodexContent(content, byteBase, codexSessionIdFromJsonlPath(jsonlPath));
+  if (provider === 'grok') return parseGrokContent(content, grokSessionIdFromJsonlPath(jsonlPath) ?? '');
+  return parseJsonlContent(content, byteBase);
+};
 
 /**
  * Whole-file parse rather than `parseSessionFile`, which switches to tail mode
@@ -275,7 +284,10 @@ export const readHistoryPage = async ({
   let candidates: ITimelineEntry[];
   let reachedEnd = true;
 
-  if (size <= MAX_FULL_PARSE_BYTES) {
+  // grok numbers entries by update ordinal rather than by byte offset, so a
+  // window cannot be numbered without the lines before it: it always takes the
+  // whole-file path. The snapshot cache still bounds what stays resident.
+  if (size <= MAX_FULL_PARSE_BYTES || provider === 'grok') {
     const { entries: all } = await readSnapshot(jsonlPath, provider, revision, fingerprint);
     const start = all.findIndex((entry) => seqOf(entry) > afterSeq);
     candidates = start === -1 ? [] : all.slice(start);
@@ -313,6 +325,13 @@ export const readLastSeq = async (
   try {
     const stat = await fs.stat(jsonlPath);
     if (stat.size === 0) return -1;
+
+    // grok's seq is an ordinal, so a tail window would number entries from the
+    // wrong base; the whole file is parsed instead.
+    if (provider === 'grok') {
+      const entries = parseEntries(await fs.readFile(jsonlPath, 'utf-8'), 0, provider, jsonlPath);
+      return entries.reduce((max, entry) => Math.max(max, seqOf(entry)), -1);
+    }
 
     const from = Math.max(0, stat.size - TAIL_SCAN_BYTES);
     const handle = await fs.open(jsonlPath, 'r');

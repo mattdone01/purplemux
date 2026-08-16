@@ -2,9 +2,9 @@ import fs from 'fs/promises';
 import { listCodexSessionFiles, readCodexSessionHead } from '@/lib/codex-session-list';
 import { entrySearchText, isSearchableEntry, type TSearchableEntryType, type TToolTextLookup } from '@/lib/entry-text';
 import { isAllowedJsonlPath } from '@/lib/path-validation';
-import { getGrokDatabase, type IGrokDatabase } from '@/lib/providers/grok/db';
+import { listAllGrokSessions } from '@/lib/providers/grok/session-store';
 import { readSearchDocs, writeSearchDocs, type ISearchDoc } from '@/lib/search-cache';
-import { extractGrokDocs, extractJsonlDocsFromContent, type TSearchProvider } from '@/lib/search-extract';
+import { extractJsonlDocsFromContent, type TSearchProvider } from '@/lib/search-extract';
 import { buildSessionKey } from '@/lib/session-key';
 import { listClaudeTranscripts } from '@/lib/session-resolver';
 import { codexSessionIdFromJsonlPath } from '@/lib/session-parser-codex';
@@ -144,9 +144,10 @@ export const rankHits = (hits: IRankedHit[]): IRankedHit[] =>
     || a.seq - b.seq
   ));
 
-type TSourceLoader =
-  | { kind: 'jsonl'; jsonlPath: string; provider: TSearchProvider }
-  | { kind: 'grok'; db: IGrokDatabase; sessionId: string };
+interface ISourceLoader {
+  jsonlPath: string;
+  provider: TSearchProvider;
+}
 
 interface ISearchSource {
   cacheId: string;
@@ -157,7 +158,7 @@ interface ISearchSource {
   workspaceId: string;
   workspaceName: string;
   lastActivityMs: number;
-  loader: TSourceLoader;
+  loader: ISourceLoader;
 }
 
 const claudeSources = async (scopes: ISessionScope[]): Promise<ISearchSource[]> => {
@@ -183,7 +184,7 @@ const claudeSources = async (scopes: ISessionScope[]): Promise<ISearchSource[]> 
         workspaceId: scope.id,
         workspaceName: scope.name,
         lastActivityMs: stat.mtimeMs,
-        loader: { kind: 'jsonl', jsonlPath, provider: 'claude' },
+        loader: { jsonlPath, provider: 'claude' },
       };
     }));
     return sources.filter((source): source is ISearchSource => source !== null);
@@ -233,67 +234,57 @@ const codexSources = async (
       workspaceId: scope.id,
       workspaceName: scope.name,
       lastActivityMs: stat.mtimeMs,
-      loader: { kind: 'jsonl', jsonlPath, provider: 'codex' },
+      loader: { jsonlPath, provider: 'codex' },
     };
   }));
 
   return sources.filter((source): source is ISearchSource => source !== null);
 };
 
-interface IGrokSessionRow {
-  id: string;
-  cwd_at_start: string;
-  cwd_last: string;
-  updated_at: string;
-  message_count: number;
-  content_bytes: number;
-}
+/**
+ * grok isolates by `GROK_HOME`, so a session's workspace is the home it sits
+ * under — not its cwd. The hit is still REPORTED under the workspace that lists
+ * that cwd when the session is unscoped, which is where its transcript is
+ * reachable from.
+ */
+const grokSources = async (
+  scopes: ISessionScope[],
+  requestedScope: ISessionScope | null,
+): Promise<ISearchSource[]> => {
+  const refs = await listAllGrokSessions();
 
-const GROK_SESSIONS_SQL = `
-  SELECT s.id AS id, s.cwd_at_start AS cwd_at_start, s.cwd_last AS cwd_last, s.updated_at AS updated_at,
-         (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
-         (SELECT COALESCE(SUM(LENGTH(CAST(m.message_json AS BLOB))), 0)
-            FROM messages m WHERE m.session_id = s.id) AS content_bytes
-  FROM sessions s
-`;
+  const sources = await Promise.all(refs.map(async (ref): Promise<ISearchSource | null> => {
+    if (!isAllowedJsonlPath(ref.jsonlPath)) return null;
+    let stat;
+    try {
+      stat = await fs.stat(ref.jsonlPath);
+    } catch {
+      return null;
+    }
 
-const grokSessionRows = (db: IGrokDatabase): IGrokSessionRow[] => {
-  try {
-    return db.all<IGrokSessionRow>(GROK_SESSIONS_SQL);
-  } catch {
-    return [];
-  }
-};
+    const owner = ref.workspaceId
+      ? scopes.find((scope) => scope.id === ref.workspaceId)
+      : scopeForCwd(scopes, ref.cwd);
+    const scope = owner ?? globalScope();
+    if (requestedScope && scope.id !== requestedScope.id) return null;
 
-const grokSources = (scopes: ISessionScope[], requestedScope: ISessionScope | null): ISearchSource[] => {
-  const db = getGrokDatabase();
-  if (!db) return [];
-
-  const sources: ISearchSource[] = [];
-  for (const row of grokSessionRows(db)) {
-    const scope = scopeForCwd(scopes, row.cwd_last) ?? scopeForCwd(scopes, row.cwd_at_start) ?? globalScope();
-    if (requestedScope && scope.id !== requestedScope.id) continue;
-
-    const updatedAt = Date.parse(row.updated_at);
-    sources.push({
-      cacheId: `grok:${row.id}`,
-      fingerprint: `${row.updated_at}:${row.message_count}`,
-      // The rows this session's docs are built from. Charged like a file so a
-      // large grok store consumes MAX_SCAN_COST instead of scanning for free.
-      sizeBytes: row.content_bytes,
+    return {
+      cacheId: ref.jsonlPath,
+      fingerprint: `${stat.mtimeMs}:${stat.size}`,
+      sizeBytes: stat.size,
       sessionKey: buildSessionKey({
         provider: 'grok',
-        workspaceId: sessionScopeFor({ provider: 'grok', scopes, cwd: row.cwd_last }).workspaceId,
-        sessionId: row.id,
+        workspaceId: sessionScopeFor({ provider: 'grok', scopes, workspaceId: ref.workspaceId }).workspaceId,
+        sessionId: ref.sessionId,
       }),
       workspaceId: scope.id,
       workspaceName: scope.name,
-      lastActivityMs: Number.isNaN(updatedAt) ? 0 : updatedAt,
-      loader: { kind: 'grok', db, sessionId: row.id },
-    });
-  }
+      lastActivityMs: stat.mtimeMs,
+      loader: { jsonlPath: ref.jsonlPath, provider: 'grok' },
+    };
+  }));
 
-  return sources;
+  return sources.filter((source): source is ISearchSource => source !== null);
 };
 
 export interface ISearchSourceSummary {
@@ -320,11 +311,11 @@ const collectSources = async (request: ISearchRequest): Promise<ISearchSource[]>
   const claudeScopes = requestedScope ? [requestedScope] : scopes;
   const wants = (provider: TSearchProvider) => request.provider === null || request.provider === provider;
 
-  const [claude, codex] = await Promise.all([
+  const [claude, codex, grok] = await Promise.all([
     wants('claude') ? claudeSources(claudeScopes) : Promise.resolve([]),
     wants('codex') ? codexSources(scopes, requestedScope) : Promise.resolve([]),
+    wants('grok') ? grokSources(scopes, requestedScope) : Promise.resolve([]),
   ]);
-  const grok = wants('grok') ? grokSources(scopes, requestedScope) : [];
 
   return [...claude, ...codex, ...grok].sort((a, b) => (
     b.lastActivityMs - a.lastActivityMs
@@ -357,10 +348,6 @@ export const rawContainsAll = (content: string, terms: string[]): boolean =>
   terms.every((term) => new RegExp(escapeRegExp(term), 'i').test(content));
 
 const loadDocs = async (source: ISearchSource, terms: string[]): Promise<ISearchDoc[] | null> => {
-  if (source.loader.kind === 'grok') {
-    return extractGrokDocs(source.loader.db, source.loader.sessionId);
-  }
-
   const { jsonlPath, provider } = source.loader;
   const content = await fs.readFile(jsonlPath, 'utf-8');
   if (canPrefilterRaw(terms) && !rawContainsAll(content, terms)) return null;

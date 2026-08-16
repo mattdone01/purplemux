@@ -1,166 +1,118 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { GROK_HOME } from '@/lib/providers/grok/db';
 import { createLogger } from '@/lib/logger';
+import { listGrokHomes } from '@/lib/grok-home';
+import { grokHooksDir } from '@/lib/providers/grok/paths';
 
-const log = createLogger('grok-config');
-
-export const GROK_USER_SETTINGS_PATH = path.join(GROK_HOME, 'user-settings.json');
+const log = createLogger('grok-hooks');
 
 /**
- * Every event purplemux needs to keep a grok tab's work state honest.
- * `PostToolUse` carries no matcher on purpose: grok matches a matcher by exact
- * string equality (`src/hooks/config.ts` `matchesPattern`), so the
- * pipe-separated tool list the Claude hook block uses would never fire.
+ * purplemux owns exactly this file inside `$GROK_HOME/hooks/`. Grok merges every
+ * `*.json` in that directory (`10-hooks.md`, "Hook Locations"), so writing one
+ * named file leaves the user's own hooks untouched.
  */
-export const GROK_HOOK_EVENTS = [
-  'SessionStart',
-  'UserPromptSubmit',
-  'Stop',
-  'StopFailure',
-  'Notification',
-  'PreCompact',
-  'PostCompact',
-  'SessionEnd',
-  'PostToolUse',
-] as const;
-export type TGrokHookEvent = typeof GROK_HOOK_EVENTS[number];
+export const GROK_HOOK_FILE_NAME = 'purplemux.json';
 
-const HOOK_TIMEOUT_SEC = 3;
+const OBSERVE_TIMEOUT_SEC = 3;
+
+/**
+ * `Notification` types that matter to a host UI: a permission prompt is waiting,
+ * the session settled, or a task finished (`10-hooks.md`, "Hook Events").
+ */
+export const GROK_NOTIFICATION_MATCHER = 'permission_prompt|idle_prompt|task_complete';
+
+/**
+ * Tools whose completion is a signal. grok's own names are
+ * `search_replace` / `run_terminal_command`; a matcher also keeps the Claude
+ * names it aliases them from, so both spellings are listed and either fires.
+ */
+export const GROK_TOOL_MATCHER = 'Edit|Write|MultiEdit|Bash|search_replace|run_terminal_command';
 
 export interface IGrokHookCommand {
   type: 'command';
   command: string;
-  timeout?: number;
+  timeout: number;
 }
 
-export interface IGrokHookEntry {
+export interface IGrokHookGroup {
   matcher?: string;
   hooks: IGrokHookCommand[];
 }
 
-/**
- * Values are `unknown`, not `IGrokHookEntry[]`: grok's own loader tolerates
- * shapes this module cannot parse, and a merge must carry those through rather
- * than replace them with what it understands.
- */
-export type TGrokHookConfig = Record<string, unknown>;
+export type TGrokHookConfig = { hooks: Record<string, IGrokHookGroup[]> };
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const isHookCommand = (value: unknown): value is IGrokHookCommand =>
-  isRecord(value) && value.type === 'command' && typeof value.command === 'string';
-
-const isHookEntry = (value: unknown): value is IGrokHookEntry =>
-  isRecord(value)
-  && Array.isArray(value.hooks)
-  && value.hooks.every(isHookCommand)
-  && (value.matcher === undefined || typeof value.matcher === 'string');
-
-const ownsCommand = (entry: IGrokHookEntry, scriptPath: string): boolean =>
-  entry.hooks.some((hook) => hook.command.includes(scriptPath));
-
-const purplemuxEntry = (scriptPath: string, event: TGrokHookEvent): IGrokHookEntry => ({
-  hooks: [{ type: 'command', command: `sh "${scriptPath}" ${event}`, timeout: HOOK_TIMEOUT_SEC }],
+const command = (scriptPath: string): IGrokHookCommand => ({
+  type: 'command',
+  command: `sh "${scriptPath}"`,
+  timeout: OBSERVE_TIMEOUT_SEC,
 });
 
-export interface IMergeGrokHookSettingsResult {
-  settings: Record<string, unknown>;
-  changed: boolean;
-}
-
 /**
- * Folds purplemux's hook block into grok's user settings.
+ * The five registrations `10-hooks.md` calls "a complete busy and idle
+ * indicator", plus compaction, teardown and tool activity.
  *
- * Everything the user owns — `apiKey`, `defaultModel`, `subAgents`, `mcp`,
- * `telegram`, and any hook entry purplemux did not write — survives untouched.
- * Re-running replaces only purplemux's own entries, so the merge is idempotent.
+ * `Stop` is a gate that re-fires on every continuation round, so a host that
+ * settled on it alone would show a false idle; `idle_prompt` is the documented
+ * backstop and the handler gates the settle on the tab still being busy.
  */
-export const mergeGrokHookSettings = (
-  existing: unknown,
-  scriptPath: string,
-): IMergeGrokHookSettingsResult => {
-  const base: Record<string, unknown> = isRecord(existing) ? { ...existing } : {};
-  const existingHooks = isRecord(base.hooks) ? base.hooks : {};
-  const nextHooks: TGrokHookConfig = {};
-
-  // Only an entry purplemux itself wrote is dropped. Anything else — an element
-  // this module cannot parse, or a whole event value that is not an array — is
-  // carried through untouched, because a value we do not understand is still the
-  // user's, and grok's loader may understand it.
-  for (const [event, value] of Object.entries(existingHooks)) {
-    nextHooks[event] = Array.isArray(value)
-      ? value.filter((entry) => !(isHookEntry(entry) && ownsCommand(entry, scriptPath)))
-      : value;
-  }
-
-  // A non-array value is only ever wrapped where purplemux has an entry of its
-  // own to add; on an event it does not write, the value stays exactly as found.
-  for (const event of GROK_HOOK_EVENTS) {
-    const kept = nextHooks[event];
-    const carried = Array.isArray(kept) ? kept : kept === undefined ? [] : [kept];
-    nextHooks[event] = [...carried, purplemuxEntry(scriptPath, event)];
-  }
-
-  base.hooks = nextHooks;
-  const changed = JSON.stringify(isRecord(existing) ? existing : {}) !== JSON.stringify(base);
-  return { settings: base, changed };
+export const buildGrokHookConfig = (scriptPath: string): TGrokHookConfig => {
+  const observe = [{ hooks: [command(scriptPath)] }];
+  return {
+    hooks: {
+      SessionStart: observe,
+      UserPromptSubmit: observe,
+      Stop: observe,
+      StopFailure: observe,
+      StopCancelled: observe,
+      Notification: [{ matcher: GROK_NOTIFICATION_MATCHER, hooks: [command(scriptPath)] }],
+      PreCompact: observe,
+      PostCompact: observe,
+      SessionEnd: observe,
+      PostToolUse: [{ matcher: GROK_TOOL_MATCHER, hooks: [command(scriptPath)] }],
+    },
+  };
 };
-
-type TReadResult =
-  | { state: 'missing' }
-  | { state: 'parsed'; value: unknown }
-  | { state: 'corrupt' };
-
-const readSettings = async (settingsPath: string): Promise<TReadResult> => {
-  let raw: string;
-  try {
-    raw = await fs.readFile(settingsPath, 'utf-8');
-  } catch {
-    return { state: 'missing' };
-  }
-  try {
-    return { state: 'parsed', value: JSON.parse(raw) };
-  } catch {
-    return { state: 'corrupt' };
-  }
-};
-
-export class GrokSettingsUnreadableError extends Error {
-  constructor(readonly settingsPath: string) {
-    super(`${settingsPath} is not valid JSON; refusing to overwrite it`);
-    this.name = 'GrokSettingsUnreadableError';
-  }
-}
 
 /**
- * Writes grok's settings through a sibling temp file so a crash mid-write can
- * never leave the user without an `apiKey`. A settings file that exists but
- * does not parse is left alone and reported: overwriting it would destroy the
- * user's API key to install a hook.
+ * Writes purplemux's hook file into one grok home. Rewritten on every boot so a
+ * changed script path or event set lands, and skipped when the content already
+ * matches so an unchanged boot does not touch the file's mtime.
  */
-export const ensureGrokHookSettings = async (
-  scriptPath: string,
-  settingsPath: string = GROK_USER_SETTINGS_PATH,
-): Promise<boolean> => {
-  const dir = path.dirname(settingsPath);
+export const writeGrokHookFile = async (home: string, scriptPath: string): Promise<boolean> => {
+  const dir = grokHooksDir(home);
+  const target = path.join(dir, GROK_HOOK_FILE_NAME);
+  const content = `${JSON.stringify(buildGrokHookConfig(scriptPath), null, 2)}\n`;
+
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const existing = await fs.readFile(target, 'utf-8').catch(() => null);
+  if (existing === content) return false;
 
-  const read = await readSettings(settingsPath);
-  if (read.state === 'corrupt') throw new GrokSettingsUnreadableError(settingsPath);
-  const existing = read.state === 'parsed' ? read.value : null;
-  const { settings, changed } = mergeGrokHookSettings(existing, scriptPath);
-  if (!changed) return false;
-
-  const tmpPath = path.join(dir, `.user-settings.${process.pid}.tmp`);
+  const tmp = path.join(dir, `.${GROK_HOOK_FILE_NAME}.${process.pid}.tmp`);
   try {
-    await fs.writeFile(tmpPath, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-    await fs.rename(tmpPath, settingsPath);
+    await fs.writeFile(tmp, content, { mode: 0o600 });
+    await fs.rename(tmp, target);
   } catch (err) {
-    await fs.rm(tmpPath, { force: true }).catch(() => {});
-    log.error({ err: err instanceof Error ? err.message : err, settingsPath }, 'grok user-settings merge failed');
+    await fs.rm(tmp, { force: true }).catch(() => {});
     throw err;
   }
   return true;
+};
+
+/**
+ * The unscoped `~/.grok` (ad-hoc tabs) and every workspace grok home. A home
+ * created later is covered on the next boot; `ensureWorkspaceGrokHome` does not
+ * install hooks itself, so the launch path stays free of file writes it does
+ * not own.
+ */
+export const ensureGrokHookFiles = async (scriptPath: string): Promise<string[]> => {
+  const written: string[] = [];
+  for (const home of await listGrokHomes()) {
+    try {
+      if (await writeGrokHookFile(home, scriptPath)) written.push(home);
+    } catch (err) {
+      log.error({ err: err instanceof Error ? err.message : err, home }, 'grok hook file write failed');
+      throw err;
+    }
+  }
+  return written;
 };

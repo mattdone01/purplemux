@@ -1,7 +1,7 @@
 import { getProviderByPanelType } from '@/lib/providers';
 import type { IAgentProvider } from '@/lib/providers';
 
-export type TAgentAvailabilityFailureCode = 'agent-not-installed' | 'agent-path-missing';
+export type TAgentAvailabilityFailureCode = 'agent-not-installed' | 'agent-path-missing' | 'agent-not-logged-in';
 
 export interface IAgentAvailabilityOk {
   ok: true;
@@ -27,7 +27,22 @@ export const checkAgentAvailabilityForPanelType = async (
   if (!provider) return { ok: true, provider: null };
 
   const status = await provider.preflight();
-  if (status.installed) return { ok: true, provider };
+  if (status.installed) {
+    // Grok Build refuses to open a session without a signed-in token, so
+    // launching one would drop the user into an error screen inside the pane.
+    if (provider.id === 'grok' && !status.loggedIn) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'agent-not-logged-in',
+        providerId: provider.id,
+        providerDisplayName: provider.displayName,
+        panelType: provider.panelType,
+        suggestedCommand: null,
+      };
+    }
+    return { ok: true, provider };
+  }
 
   const isPathMissing = provider.id === 'claude' && !!status.binaryPath;
   return {

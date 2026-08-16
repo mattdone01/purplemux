@@ -1,10 +1,10 @@
 import fs from 'fs/promises';
 import { entrySearchText, isSearchableEntry, type IToolRecordText } from '@/lib/entry-text';
-import type { IGrokDatabase } from '@/lib/providers/grok/db';
-import { readGrokEntries, unwrapGrokToolOutput } from '@/lib/providers/grok/transcript';
 import type { ISearchDoc } from '@/lib/search-cache';
 import { parseJsonlContent } from '@/lib/session-parser';
 import { codexSessionIdFromJsonlPath, parseCodexContent } from '@/lib/session-parser-codex';
+import { parseGrokContent, parseGrokUpdateLine } from '@/lib/session-parser-grok';
+import { grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import type { ITimelineEntry } from '@/types/timeline';
 
 export type TSearchProvider = 'claude' | 'codex' | 'grok';
@@ -90,7 +90,26 @@ const TOOL_RECORD_MARKERS = [
   '"function_call',
   '"custom_tool_call',
   '"local_shell_call"',
+  '"tool_call"',
+  '"tool_call_update"',
 ];
+
+/**
+ * grok carries a tool's arguments on the ACP `tool_call` and its output on the
+ * `tool_call_update` that settles it, both keyed by `toolCallId`.
+ */
+const readGrokToolText = (record: Record<string, unknown>, map: TToolTextMap, ordinal: number): void => {
+  const update = parseGrokUpdateLine(JSON.stringify(record), ordinal);
+  if (!update) return;
+  const callId = typeof update.update.toolCallId === 'string' ? update.update.toolCallId : '';
+  if (!callId) return;
+
+  if (update.kind === 'tool_call') {
+    setToolText(map, callId, { input: JSON.stringify(update.update.rawInput ?? {}) });
+  } else if (update.kind === 'tool_call_update' && update.update.rawOutput !== undefined) {
+    setToolText(map, callId, { output: toolOutputText(update.update.rawOutput) });
+  }
+};
 
 /**
  * Tool input and tool output as the transcript records them.
@@ -104,13 +123,14 @@ const TOOL_RECORD_MARKERS = [
 export const extractToolText = (content: string, provider: TSearchProvider): TToolTextMap => {
   const map: TToolTextMap = new Map();
 
-  for (const line of content.split('\n')) {
-    if (!TOOL_RECORD_MARKERS.some((marker) => line.includes(marker))) continue;
+  content.split('\n').forEach((line, ordinal) => {
+    if (!TOOL_RECORD_MARKERS.some((marker) => line.includes(marker))) return;
     const record = safeParse(line);
-    if (!isRecord(record)) continue;
+    if (!isRecord(record)) return;
     if (provider === 'codex') readCodexToolText(record, map);
+    else if (provider === 'grok') readGrokToolText(record, map, ordinal);
     else readClaudeToolText(record, map);
-  }
+  });
 
   return map;
 };
@@ -129,15 +149,20 @@ const toDocs = (entries: ITimelineEntry[], toolText: TToolTextMap): ISearchDoc[]
   return docs;
 };
 
-/** Whole-file extraction for one JSONL transcript, Claude or Codex. */
+/** Whole-file extraction for one JSONL transcript — Claude, Codex or grok. */
 export const extractJsonlDocsFromContent = (
   content: string,
   jsonlPath: string,
   provider: TSearchProvider,
 ): ISearchDoc[] => {
-  const entries = provider === 'codex'
-    ? parseCodexContent(content, 0, codexSessionIdFromJsonlPath(jsonlPath))
-    : parseJsonlContent(content, 0);
+  let entries: ITimelineEntry[];
+  if (provider === 'codex') {
+    entries = parseCodexContent(content, 0, codexSessionIdFromJsonlPath(jsonlPath));
+  } else if (provider === 'grok') {
+    entries = parseGrokContent(content, grokSessionIdFromJsonlPath(jsonlPath) ?? '');
+  } else {
+    entries = parseJsonlContent(content, 0);
+  }
 
   return toDocs(entries, extractToolText(content, provider));
 };
@@ -147,29 +172,3 @@ export const extractJsonlDocs = async (
   provider: TSearchProvider,
 ): Promise<ISearchDoc[]> =>
   extractJsonlDocsFromContent(await fs.readFile(jsonlPath, 'utf-8'), jsonlPath, provider);
-
-const GROK_TOOL_TEXT_SQL = `
-  SELECT tc.tool_call_id AS tool_call_id, tc.args_json AS args_json, tr.output_json AS output_json
-  FROM tool_calls tc
-  LEFT JOIN tool_results tr ON tr.tool_call_row_id = tc.id
-  WHERE tc.session_id = ?
-`;
-
-interface IGrokToolTextRow {
-  tool_call_id: string;
-  args_json: string;
-  output_json: string | null;
-}
-
-/** grok keeps its transcript in SQLite, so one session is a query rather than a file. */
-export const extractGrokDocs = (db: IGrokDatabase, sessionId: string): ISearchDoc[] => {
-  const toolText: TToolTextMap = new Map();
-  for (const row of db.all<IGrokToolTextRow>(GROK_TOOL_TEXT_SQL, sessionId)) {
-    setToolText(toolText, row.tool_call_id, {
-      input: row.args_json,
-      output: row.output_json ? unwrapGrokToolOutput(safeParse(row.output_json)).text : undefined,
-    });
-  }
-
-  return toDocs(readGrokEntries(db, sessionId, { includeCompactions: false }), toolText);
-};

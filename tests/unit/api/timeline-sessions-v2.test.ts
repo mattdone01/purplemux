@@ -119,6 +119,38 @@ const writeCodexSession = async (
   return file;
 };
 
+const GROK_WS_SESSION = '01a008c1-bb96-71d1-9769-b63ff478fd9f';
+const GROK_GLOBAL_SESSION = '01a008c3-8e98-7220-a0d3-e0b36fa3aa99';
+
+const grokUpdate = (sessionId: string, update: Record<string, unknown>): string => JSON.stringify({
+  timestamp: 1786853311,
+  method: 'session/update',
+  params: { sessionId, update, _meta: { agentTimestampMs: 1786853311000 } },
+});
+
+const writeGrokSession = async (
+  grokHome: string,
+  sessionId: string,
+  { cwd, mtimeSeconds, title }: { cwd: string; mtimeSeconds: number; title: string },
+): Promise<string> => {
+  const dir = path.join(grokHome, 'sessions', encodeURIComponent(cwd), sessionId);
+  await fs.mkdir(dir, { recursive: true });
+  const file = path.join(dir, 'updates.jsonl');
+  await fs.writeFile(file, `${[
+    grokUpdate(sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: title } }),
+    grokUpdate(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } }),
+  ].join('\n')}\n`, 'utf-8');
+  await fs.writeFile(path.join(dir, 'summary.json'), JSON.stringify({
+    info: { id: sessionId, cwd },
+    created_at: '2026-08-16T00:00:00.000Z',
+    updated_at: '2026-08-16T00:00:02.000Z',
+    num_messages: 2,
+    generated_title: title,
+  }));
+  await fs.utimes(file, mtimeSeconds, mtimeSeconds);
+  return file;
+};
+
 const writeWorkspaces = async (home: string, directories: string[]): Promise<void> => {
   const dir = path.join(home, '.purplemux');
   await fs.mkdir(dir, { recursive: true });
@@ -157,6 +189,40 @@ describe('GET /api/timeline/sessions-v2', () => {
     globalProjects = path.join(home, '.claude', 'projects');
     await writeWorkspaces(home, [WORKSPACE_DIR]);
     ({ default: handler } = await import('@/pages/api/timeline/sessions-v2'));
+  });
+
+  it('lists a grok session under the workspace whose GROK_HOME holds it', async () => {
+    const wsGrokHome = path.join(home, '.purplemux', 'workspaces', WORKSPACE_ID, 'grok-home');
+    await writeGrokSession(wsGrokHome, GROK_WS_SESSION, {
+      cwd: WORKSPACE_DIR, mtimeSeconds: 5_000, title: 'scoped grok work',
+    });
+    // Same cwd, unscoped store — an ad-hoc tab. Its key must stay global, which
+    // is the whole point of keying grok by home rather than by cwd.
+    await writeGrokSession(path.join(home, '.grok'), GROK_GLOBAL_SESSION, {
+      cwd: WORKSPACE_DIR, mtimeSeconds: 6_000, title: 'ad-hoc grok work',
+    });
+
+    const scoped = await list({ workspaceId: WORKSPACE_ID });
+    expect(scoped.sessions.map((session) => session.sessionKey))
+      .toEqual([`grok:${WORKSPACE_ID}:${GROK_WS_SESSION}`]);
+    expect(scoped.sessions[0]).toMatchObject({
+      provider: 'grok',
+      firstMessage: 'scoped grok work',
+      turnCount: 2,
+    });
+
+    const global = await list({ workspaceId: 'global' });
+    expect(global.sessions.map((session) => session.sessionKey))
+      .toEqual([`grok:global:${GROK_GLOBAL_SESSION}`]);
+  });
+
+  it('reports a grok session\'s lastSeq as an update ordinal the client can resume from', async () => {
+    await writeGrokSession(path.join(home, '.grok'), GROK_GLOBAL_SESSION, {
+      cwd: '/tmp/anywhere', mtimeSeconds: 5_000, title: 'ordinal check',
+    });
+
+    const body = await list({ workspaceId: 'global' });
+    expect(body.sessions[0].lastSeq).toBe(1);
   });
 
   it('lists a workspace claude-home and its Codex sessions, newest first', async () => {

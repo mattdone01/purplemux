@@ -29,7 +29,9 @@
   "preflightFailedTitle": "Could not check agent tools",
   "preflightFailedDescription": "purplemux could not verify the agent CLI installation. The current action was canceled.",
   "grokMissingTitle": "Grok CLI is not installed",
-  "grokMissingDescription": "Install grok-cli, then set GROK_API_KEY or add an apiKey to ~/.grok/user-settings.json.",
+  "grokMissingDescription": "Install Grok Build with: curl -fsSL https://x.ai/cli/install.sh | bash",
+  "grokNotLoggedInTitle": "Grok Build is not signed in",
+  "grokNotLoggedInDescription": "Run `grok login` on this machine, or `grok login --device-auth` when there is no browser on the box.",
   "grokLabel": "Grok",
   "grokOptional": "選用"
 }

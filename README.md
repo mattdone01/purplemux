@@ -109,16 +109,17 @@ npm i -g @openai/codex
 brew install --cask codex
 ```
 
-Optional for Grok tabs. Install grok-cli and give it an API key before starting a Grok tab:
+Optional for Grok tabs. Install **Grok Build** (xAI's official CLI — subscription auth, no API key)
+and sign in once before starting a Grok tab:
 
 ```bash
-npm i -g grok-dev
-export GROK_API_KEY=...   # or set "apiKey" in ~/.grok/user-settings.json
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok login                 # or: grok login --device-auth  (headless box, no browser)
 ```
 
-grok-cli hard-codes `~/.grok` and offers no config-dir override, so every workspace shares one grok
-store. grok keys its own sessions by working directory, so sessions stay separated by project even
-though the store is shared.
+Each workspace gets its own `GROK_HOME` under `~/.purplemux/workspaces/{wsId}/grok-home`, so two
+workspaces opened on the same project keep separate grok history and resume lists. Credentials,
+configuration, skills and commands stay shared with `~/.grok`.
 
 ### npx (fastest)
 
@@ -248,7 +249,7 @@ The default is HTTP. Always use HTTPS when exposing the app externally:
 
 **Terminal I/O** — xterm.js connects to node-pty via WebSocket; node-pty attaches to tmux sessions. A binary protocol handles stdin/stdout/resize with backpressure control.
 
-**Status detection** — Agent event hooks deliver instant updates via HTTP POST. Claude Code uses `SessionStart`, `Stop`, and `Notification`; Codex uses `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, and `PermissionRequest`; Grok uses `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd`, `PreCompact`, `PostCompact`, and `PostToolUse`, merged into `~/.grok/user-settings.json`. Polling every 5–15s inspects process trees and analyzes the last 8KB of JSONL files.
+**Status detection** — Agent event hooks deliver instant updates via HTTP POST. Claude Code uses `SessionStart`, `Stop`, and `Notification`; Codex uses `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, and `PermissionRequest`; Grok uses `SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `StopCancelled`, `Notification`, `SessionEnd`, `PreCompact`, `PostCompact`, and `PostToolUse`, written to `$GROK_HOME/hooks/purplemux.json`. Polling every 5–15s inspects process trees and analyzes the last 8KB of JSONL files.
 
 **Timeline** — Watches JSONL session logs under `~/.claude/projects/` and `~/.codex/sessions/`, parses new lines on change, and streams structured entries to the browser.
 

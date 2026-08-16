@@ -1,5 +1,6 @@
 import path from 'path';
 import { GLOBAL_SESSION_SCOPE } from '@/lib/session-key';
+import { listWorkspaceGrokHomes } from '@/lib/grok-home';
 import { listWorkspaceClaudeHomes, listWorkspaceSummaries } from '@/lib/workspace-home';
 
 export interface ISessionScope {
@@ -19,9 +20,7 @@ export const globalScope = (): ISessionScope => ({
 });
 
 /**
- * Every scope a session may belong to: the unscoped home plus one per
- * workspace. A claude-home left behind by a deleted workspace still holds
- * transcripts, so it is listed under its own id rather than dropped.
+ * Every scope a session may belong to: the unscoped home plus one per workspace.
  */
 export const listSessionScopes = async (): Promise<ISessionScope[]> => {
   const byId = new Map<string, ISessionScope>();
@@ -35,7 +34,10 @@ export const listSessionScopes = async (): Promise<ISessionScope[]> => {
     });
   }
 
-  for (const home of await listWorkspaceClaudeHomes()) {
+  // A home left behind by a deleted workspace still holds transcripts, so it is
+  // listed under its own id rather than dropped.
+  const orphanHomes = [...await listWorkspaceClaudeHomes(), ...await listWorkspaceGrokHomes()];
+  for (const home of orphanHomes) {
     const id = path.basename(path.dirname(home));
     if (byId.has(id)) continue;
     byId.set(id, { id, name: id, workspaceId: id, directories: [] });
@@ -77,9 +79,13 @@ export const scopeForCwd = (scopes: ISessionScope[], cwd: string | null | undefi
 export interface ISessionScopeInput {
   provider: string;
   scopes: ISessionScope[];
-  /** The workspace a caller already knows owns the session — Claude keys its store per home. */
+  /**
+   * The workspace a caller already knows owns the session. Claude and grok both
+   * key their stores per home, so the home names the workspace; a caller
+   * holding a grok home converts it with `workspaceIdForGrokHome` first.
+   */
   workspaceId?: string | null;
-  /** The directory the session was started in — Codex and grok key their stores by cwd. */
+  /** The directory the session was started in — Codex keys its rollouts by cwd. */
   cwd?: string | null;
 }
 
@@ -91,17 +97,14 @@ export interface ISessionScopeInput {
  * produced it — the phone stores per key, and two keys mean the same session
  * twice on device.
  *
- * - **claude** keys by claude-home, which IS the workspace.
+ * - **claude** keys by claude-home and **grok** by `GROK_HOME`; either home IS
+ *   the workspace, so both read `workspaceId` and neither consults the cwd. A
+ *   grok session under `~/.grok` — an ad-hoc tab — is global.
  * - **codex** keys its rollouts by cwd, so the owning workspace is the one that
  *   lists a directory containing it.
- * - **grok** hard-codes `~/.grok` with no per-workspace store, so it is always
- *   global (fork ADR-0005). Its cwd still attributes a search HIT to a
- *   workspace; it never reaches the key.
  */
 export const sessionScopeFor = ({ provider, scopes, workspaceId, cwd }: ISessionScopeInput): ISessionScope => {
-  if (provider === 'grok') return globalScope();
-
-  if (provider === 'claude') {
+  if (provider === 'claude' || provider === 'grok') {
     if (!workspaceId) return globalScope();
     return scopes.find((scope) => scope.id === workspaceId)
       ?? { id: workspaceId, name: workspaceId, workspaceId, directories: [] };

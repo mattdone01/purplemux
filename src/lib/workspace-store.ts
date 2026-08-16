@@ -18,6 +18,7 @@ import {
 import type { ICreateLayoutOptions } from '@/lib/layout-store';
 import { listProviders } from '@/lib/providers/registry';
 import { getVisuallyOrderedWorkspaces } from '@/lib/workspace-order';
+import { removeWorkspaceGrokHome } from '@/lib/grok-home';
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
@@ -407,6 +408,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
 
     await writeWorkspacesFile(data);
     await removeWorkspaceClaudeHome(workspaceId).catch(() => {});
+    await removeWorkspaceGrokHome(workspaceId).catch(() => {});
     revokeWorkspaceToken(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;

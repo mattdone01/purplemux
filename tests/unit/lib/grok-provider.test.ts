@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { getProvider, getProviderByPanelType, getProviderByProcessName } from '@/lib/providers';
 import { grokProvider } from '@/lib/providers/grok';
-import { extractGrokSessionId, isValidGrokSessionId } from '@/lib/providers/grok/session-detection';
+import { extractGrokCwd, extractGrokSessionId, isValidGrokSessionId } from '@/lib/providers/grok/session-detection';
 import {
   AGENT_PANEL_TYPES,
   agentDisplayName,
@@ -11,7 +11,7 @@ import {
   providerIdForPanelType,
   toSessionHistoryProvider,
 } from '@/lib/agent-panel-types';
-import { GROK_HOOK_EVENTS } from '@/lib/providers/grok/hook-config';
+import { buildGrokHookConfig } from '@/lib/providers/grok/hook-config';
 import type { ITab } from '@/types/terminal';
 
 describe('grok provider registration', () => {
@@ -27,29 +27,41 @@ describe('grok provider registration', () => {
     expect(grokProvider.matchesProcess('claude')).toBe(false);
   });
 
-  it('recognises the argv form the installer produces', () => {
-    expect(grokProvider.matchesProcess('bun', ['/home/dev/.grok/bin/grok', '-d', '/repo'])).toBe(true);
+  it('recognises the second name the installer links the binary under', () => {
+    expect(grokProvider.matchesProcess('agent')).toBe(true);
+  });
+
+  it('recognises the absolute path the launcher spawns', () => {
+    expect(grokProvider.matchesProcess('sh', ['/home/dev/.grok/bin/grok', '--cwd', '/repo'])).toBe(true);
   });
 });
 
+const SESSION_ID = '01a008c1-bb96-71d1-9769-b63ff478fd9f';
+
 describe('grok session ids', () => {
-  it('accepts grok-cli 1.1.7 ids — a uuid stripped of dashes, first 12 chars', () => {
-    expect(isValidGrokSessionId('a1b2c3d4e5f6')).toBe(true);
-    expect(isValidGrokSessionId('A1B2C3D4E5F6')).toBe(false);
-    expect(isValidGrokSessionId('a1b2c3d4e5f')).toBe(false);
-    expect(isValidGrokSessionId('12345678-aaaa-bbbb-cccc-1234567890ab')).toBe(false);
+  it('accepts the UUIDv7 grok mints and the client-supplied UUIDs it also allows', () => {
+    expect(isValidGrokSessionId(SESSION_ID)).toBe(true);
+    expect(isValidGrokSessionId('12345678-AAAA-BBBB-CCCC-1234567890AB')).toBe(true);
+    expect(isValidGrokSessionId('a1b2c3d4e5f6')).toBe(false);
     expect(isValidGrokSessionId(null)).toBe(false);
   });
 
-  it('reads --session and -s off the process args', () => {
-    expect(extractGrokSessionId('grok -d /repo --session a1b2c3d4e5f6')).toBe('a1b2c3d4e5f6');
-    expect(extractGrokSessionId("grok -s 'a1b2c3d4e5f6'")).toBe('a1b2c3d4e5f6');
-    expect(extractGrokSessionId('grok --session=a1b2c3d4e5f6')).toBe('a1b2c3d4e5f6');
-    expect(extractGrokSessionId('grok -d /repo')).toBeNull();
+  it('reads --session-id and --resume off the process args', () => {
+    expect(extractGrokSessionId(`grok --cwd /repo --session-id ${SESSION_ID}`)).toBe(SESSION_ID);
+    expect(extractGrokSessionId(`grok -s '${SESSION_ID}'`)).toBe(SESSION_ID);
+    expect(extractGrokSessionId(`grok --resume=${SESSION_ID}`)).toBe(SESSION_ID);
+    expect(extractGrokSessionId(`grok -r ${SESSION_ID}`)).toBe(SESSION_ID);
+    expect(extractGrokSessionId('grok --cwd /repo')).toBeNull();
   });
 
-  it('treats --session latest as no explicit id', () => {
-    expect(extractGrokSessionId('grok --session latest')).toBeNull();
+  it('ignores a --resume that names a title rather than an id', () => {
+    expect(extractGrokSessionId('grok --resume "fix the parser"')).toBeNull();
+  });
+
+  it('reads the working directory the pane was launched against', () => {
+    expect(extractGrokCwd('grok --cwd /repo/app')).toBe('/repo/app');
+    expect(extractGrokCwd('grok --cwd=/repo/app')).toBe('/repo/app');
+    expect(extractGrokCwd('grok')).toBeNull();
   });
 
   it('refuses to build a resume command for a malformed id', () => {
@@ -60,25 +72,28 @@ describe('grok session ids', () => {
 describe('grok tab agent state', () => {
   it('reads and writes only its own provider slot', () => {
     const tab = { id: 't1', sessionName: 's', name: 'n', order: 0 } as ITab;
-    grokProvider.writeSessionId(tab, 'a1b2c3d4e5f6');
+    grokProvider.writeSessionId(tab, SESSION_ID);
     grokProvider.writeSummary(tab, 'add the provider');
 
     expect(tab.agentState).toEqual({
       providerId: 'grok',
-      sessionId: 'a1b2c3d4e5f6',
+      sessionId: SESSION_ID,
       jsonlPath: null,
       summary: 'add the provider',
     });
-    expect(grokProvider.readSessionId(tab)).toBe('a1b2c3d4e5f6');
+    expect(grokProvider.readSessionId(tab)).toBe(SESSION_ID);
 
     tab.agentState = { providerId: 'codex', sessionId: 'other', jsonlPath: null, summary: null };
     expect(grokProvider.readSessionId(tab)).toBeNull();
   });
 
-  it('never reports a transcript path — grok stores its transcript in SQLite', () => {
+  it('reads the session id back out of the transcript path', () => {
     const tab = { id: 't1', sessionName: 's', name: 'n', order: 0 } as ITab;
-    grokProvider.writeJsonlPath(tab, '/tmp/anything.jsonl');
-    expect(grokProvider.sessionIdFromJsonlPath('/tmp/a1b2c3d4e5f6.jsonl')).toBeNull();
+    const jsonlPath = `/home/dev/.grok/sessions/%2Frepo/${SESSION_ID}/updates.jsonl`;
+    grokProvider.writeJsonlPath(tab, jsonlPath);
+
+    expect(grokProvider.readJsonlPath(tab)).toBe(jsonlPath);
+    expect(grokProvider.sessionIdFromJsonlPath(jsonlPath)).toBe(SESSION_ID);
     expect(grokProvider.parsePaneTitle('✳ working')).toBeNull();
   });
 });
@@ -104,9 +119,8 @@ describe('agent panel type table', () => {
 
   it('recognises the process names an agent can actually present as', () => {
     expect(processMatchesPanelType('grok-cli', 'grok')).toBe(true);
-    // grok-cli ships as a bun bundle, so the pane's foreground command is `bun`
-    // (see tab-title.ts) — matching the provider id alone missed every grok tab.
-    expect(processMatchesPanelType('grok-cli', 'bun')).toBe(true);
+    // The installer links the same binary as `agent` too.
+    expect(processMatchesPanelType('grok-cli', 'agent')).toBe(true);
     expect(processMatchesPanelType('codex-cli', 'codex')).toBe(true);
     expect(processMatchesPanelType('codex-cli', 'Node')).toBe(true);
     expect(processMatchesPanelType('claude-code', 'claude')).toBe(true);
@@ -114,7 +128,7 @@ describe('agent panel type table', () => {
 
   it('does not match another agent\'s process, a shell, or a missing one', () => {
     expect(processMatchesPanelType('grok-cli', 'claude')).toBe(false);
-    expect(processMatchesPanelType('claude-code', 'bun')).toBe(false);
+    expect(processMatchesPanelType('claude-code', 'agent')).toBe(false);
     expect(processMatchesPanelType('grok-cli', 'zsh')).toBe(false);
     expect(processMatchesPanelType('grok-cli', undefined)).toBe(false);
     expect(processMatchesPanelType('terminal', 'grok')).toBe(false);
@@ -131,7 +145,7 @@ describe('agent panel type table', () => {
 
 describe('grok hook event set', () => {
   it('covers every event the work-state machine needs plus tool activity', () => {
-    expect([...GROK_HOOK_EVENTS].sort()).toEqual([
+    expect(Object.keys(buildGrokHookConfig('/tmp/hook.sh').hooks).sort()).toEqual([
       'Notification',
       'PostCompact',
       'PostToolUse',
@@ -139,6 +153,7 @@ describe('grok hook event set', () => {
       'SessionEnd',
       'SessionStart',
       'Stop',
+      'StopCancelled',
       'StopFailure',
       'UserPromptSubmit',
     ]);

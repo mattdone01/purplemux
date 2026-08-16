@@ -29,7 +29,9 @@
   "preflightFailedTitle": "에이전트 도구를 확인할 수 없습니다",
   "preflightFailedDescription": "에이전트 CLI 설치 여부를 확인하지 못했습니다. 현재 작업은 취소되었습니다.",
   "grokMissingTitle": "Grok CLI is not installed",
-  "grokMissingDescription": "Install grok-cli, then set GROK_API_KEY or add an apiKey to ~/.grok/user-settings.json.",
+  "grokMissingDescription": "Install Grok Build with: curl -fsSL https://x.ai/cli/install.sh | bash",
+  "grokNotLoggedInTitle": "Grok Build is not signed in",
+  "grokNotLoggedInDescription": "Run `grok login` on this machine, or `grok login --device-auth` when there is no browser on the box.",
   "grokLabel": "Grok",
   "grokOptional": "선택 사항"
 }

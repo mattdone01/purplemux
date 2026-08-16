@@ -23,9 +23,10 @@ export const isShellProcess = (raw: string): boolean => {
   return cmd !== null && SHELL_NAMES.has(cmd);
 };
 
-// Codex and grok ship as bundles and present as their runtime (`node`, `bun`),
-// so the tab shows the agent's name instead. Claude's process name is already
-// what the tab has always displayed, and is left alone.
+// Codex ships as a bundle and presents as its runtime (`node`), and grok's
+// binary is also linked as `agent`, so the tab shows the agent's display name
+// instead. Claude's process name is already what the tab has always displayed,
+// and is left alone.
 const RUNTIME_NAMED_PANEL_TYPES = new Set<TPanelType>(['codex-cli', 'grok-cli']);
 
 const normalizeProcessTitle = (title: string, panelType?: TPanelType): string => (

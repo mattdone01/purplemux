@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
 import { canLoadOlder } from '@/lib/timeline-paging';
+import { createGrokParser, readGrokEntriesBefore } from '@/lib/session-parser-grok';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
@@ -12,7 +13,7 @@ describe('canLoadOlder', () => {
     expect(canLoadOlder('/home/me/.claude/projects/p/s.jsonl', 0)).toBe(false);
   });
 
-  it('refuses a source with no transcript path — grok pages from no byte offset', () => {
+  it('refuses a source with no transcript path at all', () => {
     expect(canLoadOlder(null, 4096)).toBe(false);
     expect(canLoadOlder(undefined, 4096)).toBe(false);
   });
@@ -21,21 +22,34 @@ describe('canLoadOlder', () => {
 /**
  * F6: a grok session past MAX_INIT_ENTRIES advertised `hasMore: true` with
  * `jsonlPath: null`, so the client armed a load-older control that returned
- * early forever. Both ends now ask the same question.
+ * early forever. Grok Build's transcript is a real file, so the guarantee is
+ * now that init hands back a cursor the older-page route can actually use —
+ * and 0, which disarms the control, whenever there is nothing older.
  */
 describe('grok init never arms an inert load-older affordance', () => {
-  const read = (relative: string) => fs.readFileSync(path.join(ROOT, relative), 'utf-8');
+  const TOOLS = path.join(ROOT, 'tests', 'fixtures', 'grok-session-tools', 'updates.jsonl');
 
-  it('gates the grok init payload on canLoadOlder', () => {
-    const source = read('src/lib/timeline-server.ts');
-    const grokInit = source.slice(source.indexOf('const subscribeToGrokSession'));
+  it('reports no cursor when the whole session fit in the init payload', async () => {
+    const tail = await createGrokParser(TOOLS).parseTail(1000);
 
-    expect(grokInit).toContain('canLoadOlder');
-    expect(grokInit.slice(0, grokInit.indexOf('const flushGrokAppend'))).not.toMatch(/hasMore: init\.hasMore,/);
+    expect(tail.hasMore).toBe(false);
+    expect(tail.startByteOffset).toBe(0);
+    expect(canLoadOlder(TOOLS, tail.startByteOffset)).toBe(false);
+  });
+
+  it('reports a cursor the older-page route can page from when the tail was cut', async () => {
+    const tail = await createGrokParser(TOOLS).parseTail(3);
+
+    expect(tail.hasMore).toBe(true);
+    expect(canLoadOlder(TOOLS, tail.startByteOffset)).toBe(true);
+
+    const older = await readGrokEntriesBefore(TOOLS, tail.startByteOffset, 100);
+    expect(older.entries.length).toBeGreaterThan(0);
+    expect(Math.max(...older.entries.map((entry) => entry.seq ?? 0))).toBeLessThan(tail.startByteOffset);
   });
 
   it('clears hasMore in the client when there is nothing to page', () => {
-    const hook = read('src/hooks/use-timeline.ts');
+    const hook = fs.readFileSync(path.join(ROOT, 'src/hooks/use-timeline.ts'), 'utf-8');
     expect(hook).toContain('canLoadOlder');
   });
 });

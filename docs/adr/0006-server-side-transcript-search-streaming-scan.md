@@ -10,7 +10,12 @@ purplemux had no transcript search. A phone client caches recent sessions on dev
 them locally (mobile ADR-007), but it cannot search what it never synced — the archive on
 ai-server is 2.2 GB across ~950 sessions in three stores: `~/.claude/projects`, one claude-home
 per workspace under `~/.purplemux/workspaces/*/claude-home/projects`, `~/.codex/sessions`, and
-grok's SQLite store at `~/.grok/grok.db`. FR-10/FR-11, NFR-1.
+grok's store. FR-10/FR-11, NFR-1.
+
+> **Note (2026-08-16, story 25):** this ADR was written while the grok provider targeted the
+> community `grok-cli`, whose transcripts were SQLite. Grok Build's transcripts are ACP JSONL
+> (`$GROK_HOME/sessions/**/updates.jsonl`), so grok is now scanned by the same streaming path as
+> Claude and Codex rather than by a separate query loader. The decision below is unchanged.
 
 ## Options
 
