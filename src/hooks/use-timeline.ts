@@ -8,6 +8,7 @@ import type {
   TTimelineConnectionStatus,
 } from '@/types/timeline';
 import useTimelineWebSocket from '@/hooks/use-timeline-websocket';
+import { prependEntries, upsertEntry } from '@/lib/timeline-merge';
 
 interface IResumeCallbacks {
   onResumeStarted?: (payload: { sessionId: string; jsonlPath: string | null }) => void;
@@ -186,7 +187,7 @@ const useTimeline = ({
             }
           }
         }
-        updated.push(entry);
+        upsertEntry(updated, entry);
       }
       return updated;
     });
@@ -301,7 +302,7 @@ const useTimeline = ({
       const data = await res.json();
       const loadedEntries = data.entries as ITimelineEntry[];
       setEntries((prev) => {
-        if (!data.replaceEntries) return [...loadedEntries, ...prev];
+        if (!data.replaceEntries) return prependEntries(loadedEntries, prev);
 
         const pendings = prev.filter(
           (e): e is ITimelineEntry & { type: 'user-message'; pending: true } =>
