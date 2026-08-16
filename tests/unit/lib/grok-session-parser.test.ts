@@ -291,3 +291,99 @@ describe('cost ticks', () => {
     expect(100973200 / GROK_COST_TICKS_PER_USD).toBeCloseTo(0.01009732, 8);
   });
 });
+
+describe('GrokParser — a tail cut inside a multi-byte character', () => {
+  const SESSION = 'sid-1234';
+
+  const line = (kind: string, text: string) => `${JSON.stringify({
+    timestamp: 1,
+    method: 'session/update',
+    params: { sessionId: SESSION, update: { sessionUpdate: kind, content: { type: 'text', text } } },
+  })}\n`;
+
+  const withTornFile = async (
+    char: string,
+    keptBytes: number,
+    fn: (ctx: { jsonlPath: string; whole: Buffer; cut: number }) => Promise<void>,
+  ) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'grok-torn-'));
+    const sessionDir = path.join(dir, SESSION);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const jsonlPath = path.join(sessionDir, 'updates.jsonl');
+
+    const whole = Buffer.from(
+      line('user_message_chunk', 'what is the price') + line('agent_message_chunk', `price 12${char} end`),
+      'utf-8',
+    );
+    const cut = whole.indexOf(Buffer.from(char, 'utf-8')) + keptBytes;
+    await fs.writeFile(jsonlPath, whole.subarray(0, cut));
+
+    try {
+      await fn({ jsonlPath, whole, cut });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  };
+
+  const CASES: Array<[string, string, number]> = [
+    ['a euro sign with 2 of its 3 bytes on disk', '€', 2],
+    ['a euro sign with 1 of its 3 bytes on disk', '€', 1],
+    ['an e-acute with 1 of its 2 bytes on disk', 'é', 1],
+    ['an emoji with 2 of its 4 bytes on disk', '😀', 2],
+  ];
+
+  it.each(CASES)('parseTail reports the real byte size for %s', async (_name, char, keptBytes) => {
+    await withTornFile(char, keptBytes, async ({ jsonlPath, cut }) => {
+      const tail = await createGrokParser(jsonlPath).parseTail(50);
+      expect(tail.fileSize).toBe((await fs.stat(jsonlPath)).size);
+      expect(tail.fileSize).toBe(cut);
+      expect(tail.entries.map((entry) => entry.seq)).toEqual([0]);
+    });
+  });
+
+  it.each(CASES)('the completing append restores the exact text for %s', async (_name, char, keptBytes) => {
+    await withTornFile(char, keptBytes, async ({ jsonlPath, whole, cut }) => {
+      const parser = createGrokParser(jsonlPath);
+      const tail = await parser.parseTail(50);
+
+      await fs.appendFile(jsonlPath, whole.subarray(cut));
+      const live = await parser.parseIncremental();
+
+      const fromWholeFile = parseGrokContent(whole.toString('utf-8'), SESSION);
+      // The socket upserts on (id, seq), so the live timeline is the tail
+      // followed by every incremental batch applied over it.
+      const upserted = new Map(
+        [...tail.entries, ...live.newEntries].map((entry) => [entry.id, entry]),
+      );
+
+      expect(live.newOffset).toBe((await fs.stat(jsonlPath)).size);
+      expect([...upserted.values()]).toEqual(fromWholeFile);
+      expect(upserted.get(`grok:${SESSION}:1`)).toMatchObject({
+        type: 'assistant-message',
+        seq: 1,
+        markdown: `price 12${char} end`,
+      });
+    });
+  });
+
+  it.each(CASES)('readGrokEntriesBefore reports the real byte size for %s', async (_name, char, keptBytes) => {
+    await withTornFile(char, keptBytes, async ({ jsonlPath }) => {
+      const page = await readGrokEntriesBefore(jsonlPath, 99, 10);
+      expect(page.fileSize).toBe((await fs.stat(jsonlPath)).size);
+    });
+  });
+
+  it('never hands a replacement character to the live timeline', async () => {
+    await withTornFile('é', 1, async ({ jsonlPath, whole, cut }) => {
+      const parser = createGrokParser(jsonlPath);
+      const tail = await parser.parseTail(50);
+      await fs.appendFile(jsonlPath, whole.subarray(cut));
+      const live = await parser.parseIncremental();
+
+      const text = [...tail.entries, ...live.newEntries]
+        .map((entry) => JSON.stringify(entry))
+        .join('');
+      expect(text).not.toContain('�');
+    });
+  });
+});

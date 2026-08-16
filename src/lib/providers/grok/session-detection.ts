@@ -5,6 +5,8 @@ import type {
   IAgentSessionWatchOptions,
   ISessionWatcher,
 } from '@/lib/providers/types';
+import { workspaceGrokHomeDir } from '@/lib/grok-home';
+import { workspaceIdFromSessionName } from '@/lib/workspace-home';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
 import { runGrokPreflight } from '@/lib/providers/grok/preflight';
 import {
@@ -93,11 +95,23 @@ export const isGrokRunning = async (
 };
 
 /**
+ * The grok home a pane's agent runs under. `workspaceEnv` sets `GROK_HOME` to
+ * exactly this path for a workspace pane (`tmux.ts`), so the tmux session name
+ * resolves it without reading the process environment. An ad-hoc pane has no
+ * workspace segment and runs against the unscoped `~/.grok`.
+ */
+const paneGrokHome = (tmuxSession: string | undefined): string | undefined => {
+  const wsId = tmuxSession ? workspaceIdFromSessionName(tmuxSession) : null;
+  return wsId ? workspaceGrokHomeDir(wsId) : undefined;
+};
+
+/**
  * Grok groups its sessions by working directory, so the newest session dir for
  * the pane's cwd is the right answer when the process carries no `--session-id`
- * or `--resume`. The lookup walks every grok home — the pane's own `GROK_HOME`
- * is not visible from the pid — and each home is keyed by cwd, so a session
- * cannot be attributed to the wrong workspace.
+ * or `--resume`. Cwd alone does NOT identify a session: the same project opened
+ * in two workspaces has one session dir per home, and the unscoped `~/.grok` is
+ * scanned first. The lookup is therefore pinned to the pane's own home, and
+ * only an ad-hoc pane — which has none — falls back to scanning every home.
  */
 export const detectActiveSession = async (
   panePid: number,
@@ -130,7 +144,7 @@ export const detectActiveSession = async (
   }
 
   if (options.allowCwdFallback && found.cwd) {
-    const ref = await findLatestGrokSessionForCwd(found.cwd);
+    const ref = await findLatestGrokSessionForCwd(found.cwd, paneGrokHome(options.tmuxSession));
     if (ref) return toSessionInfo(found, ref);
   }
 
@@ -179,7 +193,10 @@ export const watchSessions = (
   const poll = async () => {
     if (stopped) return;
     if (!currentPid) {
-      const info = await detectActiveSession(panePid, undefined, { allowCwdFallback: true });
+      const info = await detectActiveSession(panePid, undefined, {
+        allowCwdFallback: true,
+        tmuxSession: watchedSession,
+      });
       rememberInfo(info);
       if (info.sessionId) onChange(info);
       return;
@@ -187,13 +204,16 @@ export const watchSessions = (
     if (!await isProcessRunning(currentPid)) {
       if (stopped) return;
       currentPid = null;
-      const info = await detectActiveSession(panePid);
+      const info = await detectActiveSession(panePid, undefined, { tmuxSession: watchedSession });
       rememberInfo(info);
       onChange(info);
       return;
     }
     if (!currentSessionId) {
-      const info = await detectActiveSession(panePid, undefined, { allowCwdFallback: true });
+      const info = await detectActiveSession(panePid, undefined, {
+        allowCwdFallback: true,
+        tmuxSession: watchedSession,
+      });
       if (info.sessionId !== currentSessionId) {
         rememberInfo(info);
         onChange(info);
@@ -204,7 +224,10 @@ export const watchSessions = (
   const pollTimer = setInterval(poll, PID_POLL_INTERVAL);
 
   if (!options?.skipInitial) {
-    detectActiveSession(panePid, undefined, { allowCwdFallback: true }).then((info) => {
+    detectActiveSession(panePid, undefined, {
+      allowCwdFallback: true,
+      tmuxSession: watchedSession,
+    }).then((info) => {
       if (stopped) return;
       rememberInfo(info);
       onChange(info);

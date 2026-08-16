@@ -246,6 +246,13 @@ const codexSources = async (
  * under — not its cwd. The hit is still REPORTED under the workspace that lists
  * that cwd when the session is unscoped, which is where its transcript is
  * reachable from.
+ *
+ * That leaves a known asymmetry, kept deliberately: an ad-hoc session in
+ * `~/.grok` whose cwd falls inside workspace W is returned by a
+ * `workspaceId=W` SEARCH while its `sessionKey` stays `grok:global:<id>`, so
+ * `sessions-v2?workspaceId=W` — which lists by home — never shows it. Scoping
+ * the key by cwd instead would give grok a second workspace derivation, and
+ * `sessionScopeFor` is deliberately the only one.
  */
 const grokSources = async (
   scopes: ISessionScope[],

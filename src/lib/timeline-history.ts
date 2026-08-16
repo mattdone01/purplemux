@@ -256,13 +256,18 @@ export interface IHistoryPageRequest {
  * A record that yields several entries numbers them consecutively, and the next
  * record always starts further out than that. Ending a page on that run instead
  * of inside it makes `nextSeq = lastSeq + 1` a cursor that cannot skip an entry.
+ *
+ * The extension is capped at twice the limit: grok numbers by update ordinal,
+ * so a whole session is one consecutive run and an unbounded extension would
+ * hand back every entry the client asked to page through.
  */
 const takePage = (
   candidates: ITimelineEntry[],
   limit: number,
 ): { entries: ITimelineEntry[]; truncated: boolean } => {
+  const ceiling = Math.min(candidates.length, limit * 2);
   let end = Math.min(limit, candidates.length);
-  while (end < candidates.length && seqOf(candidates[end]) === seqOf(candidates[end - 1]) + 1) end++;
+  while (end < ceiling && seqOf(candidates[end]) === seqOf(candidates[end - 1]) + 1) end++;
   return { entries: candidates.slice(0, end), truncated: end < candidates.length };
 };
 

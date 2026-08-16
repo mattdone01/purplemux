@@ -18,6 +18,8 @@ export interface IAgentSessionWatchOptions {
 
 export interface IAgentSessionDetectionOptions {
   allowCwdFallback?: boolean;
+  /** The pane's tmux session, which names the workspace its agent home belongs to. */
+  tmuxSession?: string;
 }
 
 export interface ISubscription {

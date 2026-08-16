@@ -8,7 +8,7 @@ import { parseClaudeToolActivity } from '@/lib/providers/claude/tool-activity';
 import { processCodexHookPayload, shouldEmitCodexHookEvent } from '@/lib/providers/codex/hook-handler';
 import { codexHookEvents } from '@/lib/providers/codex/hook-events';
 import { processGrokHookPayload, shouldEmitGrokHookEvent } from '@/lib/providers/grok/hook-handler';
-import { parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
+import { grokHookEvent, parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
 
 const log = createLogger('hooks');
@@ -81,13 +81,14 @@ const handleCodexHook = (req: NextApiRequest, res: NextApiResponse) => {
 const handleGrokHook = (req: NextApiRequest, res: NextApiResponse) => {
   const tmuxSession = req.query.tmuxSession;
   if (typeof tmuxSession !== 'string' || !tmuxSession) {
-    log.warn({ event: req.body?.hook_event_name }, 'grok hook missing tmuxSession');
+    log.warn({ event: req.body?.hookEventName }, 'grok hook missing tmuxSession');
     return res.status(400).json({ error: 'missing tmuxSession' });
   }
   const payload = req.body ?? {};
+  const event = grokHookEvent(payload.hookEventName);
   log.debug(
-    { tmuxSession, event: payload.hook_event_name, source: payload.source },
-    `grok ${payload.hook_event_name ?? 'unknown'}`,
+    { tmuxSession, event: payload.hookEventName, source: payload.source },
+    `grok ${payload.hookEventName ?? 'unknown'}`,
   );
 
   const statusManager = getStatusManager();
@@ -96,7 +97,7 @@ const handleGrokHook = (req: NextApiRequest, res: NextApiResponse) => {
     ? statusManager.applyAgentHookMeta('grok', tmuxSession, translation.meta)
     : null;
   if (!applied) {
-    log.debug({ tmuxSession, event: payload.hook_event_name, reason: 'unknown-session' }, 'grok hook skipped');
+    log.debug({ tmuxSession, event: payload.hookEventName, reason: 'unknown-session' }, 'grok hook skipped');
     return res.status(204).end();
   }
 
@@ -106,13 +107,13 @@ const handleGrokHook = (req: NextApiRequest, res: NextApiResponse) => {
 
   // Tool activity feeds the signal engine, not the work-state machine, so it
   // runs alongside the (absent) state event rather than instead of it.
-  if (payload.hook_event_name === 'PostToolUse') {
+  if (event === 'post_tool_use') {
     const activity = parseGrokToolActivity(payload);
     if (activity) statusManager.handleToolActivity('grok', tmuxSession, activity);
   }
 
   if (!result.ok) {
-    log.debug({ tmuxSession, event: payload.hook_event_name, reason: result.reason }, 'grok hook skipped');
+    log.debug({ tmuxSession, event: payload.hookEventName, reason: result.reason }, 'grok hook skipped');
   }
   if (translation.event && shouldEmitGrokHookEvent(payload, applied.cliState)) {
     statusManager.handleProviderEvent('grok', tmuxSession, translation.event);

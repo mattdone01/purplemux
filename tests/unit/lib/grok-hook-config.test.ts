@@ -159,10 +159,16 @@ describe('the generated grok-hook.sh', () => {
     expect(GROK_HOOK_SCRIPT_CONTENT.trimEnd().endsWith('exit 0')).toBe(true);
   });
 
-  it('reports the event grok injects even when stdin arrives empty', async () => {
+  it('posts a body the route can parse even when stdin arrives empty', async () => {
     const { GROK_HOOK_SCRIPT_CONTENT } = await import('@/lib/hook-settings');
 
-    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('${GROK_HOOK_EVENT}');
     expect(GROK_HOOK_SCRIPT_CONTENT).toContain("[ -z \"$BODY\" ] && BODY='{}'");
+  });
+
+  it('sends no query parameter the route does not read', async () => {
+    const { GROK_HOOK_SCRIPT_CONTENT } = await import('@/lib/hook-settings');
+
+    expect(GROK_HOOK_SCRIPT_CONTENT).not.toContain('GROK_HOOK_EVENT');
+    expect(GROK_HOOK_SCRIPT_CONTENT).not.toContain('&event=');
   });
 });

@@ -1,5 +1,5 @@
 import fs from 'fs/promises';
-import { GROK_COST_TICKS_PER_USD, parseGrokUpdateLine } from '@/lib/session-parser-grok';
+import { GROK_COST_TICKS_PER_USD, parseGrokContent, parseGrokUpdateLine } from '@/lib/session-parser-grok';
 import { listAllGrokSessions, readGrokSummary } from '@/lib/providers/grok/session-store';
 import { isWithinPeriod } from '@/lib/stats/period-filter';
 import type { TPeriod } from '@/types/stats';
@@ -64,15 +64,6 @@ export const readGrokTurnTotals = (content: string): ITurnTotals => {
     const update = parseGrokUpdateLine(line, ordinal);
     if (!update) return;
 
-    if (update.kind === 'user_message_chunk') {
-      // Chunks stream, so only the first of a run marks the message.
-      const previous = totals.userMessageTimestamps[totals.userMessageTimestamps.length - 1];
-      if (previous === undefined || update.timestamp - previous > 1000) {
-        totals.userMessageTimestamps.push(update.timestamp);
-      }
-      return;
-    }
-
     if (update.kind !== 'turn_completed') return;
     const usage = isRecord(update.update.usage) ? update.update.usage : null;
     if (!usage) return;
@@ -87,6 +78,14 @@ export const readGrokTurnTotals = (content: string): ITurnTotals => {
     const model = Object.keys(modelUsage)[0];
     if (model) totals.model = model;
   });
+
+  // A message is what the transcript renders as one, so the count comes from
+  // the parser's own coalescing rather than a second guess at where a streamed
+  // run ends. A gap heuristic disagrees with it in both directions: a slow
+  // multi-chunk prompt counts twice, two fast prompts count once.
+  totals.userMessageTimestamps = parseGrokContent(content)
+    .filter((entry) => entry.type === 'user-message')
+    .map((entry) => entry.timestamp);
 
   return totals;
 };
