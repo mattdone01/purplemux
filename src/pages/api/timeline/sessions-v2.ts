@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { listAllCodexSessions } from '@/lib/codex-session-list';
+import { listAllGrokSessions, readGrokSummary } from '@/lib/providers/grok/session-store';
 import { parseSessionMeta } from '@/lib/session-list';
 import { buildSessionKey, GLOBAL_SESSION_SCOPE } from '@/lib/session-key';
 import { listClaudeTranscripts, type TSessionProvider } from '@/lib/session-resolver';
@@ -44,6 +45,8 @@ interface ICandidate {
   lastActivityMs: number;
   /** Working directory the session was started in; null for the Claude store. */
   cwd: string | null;
+  /** The workspace a home-keyed provider (claude, grok) resolved for itself. */
+  homeWorkspaceId?: string | null;
   /** Codex listing already carries meta; Claude candidates parse theirs per page. */
   codex?: { startedAt: number; firstMessage: string; turnCount: number };
 }
@@ -127,6 +130,35 @@ const codexCandidates = async (
   return [...byPath.values()];
 };
 
+/**
+ * grok isolates by `GROK_HOME`, so membership is decided by which home the
+ * session sits under — not by its cwd. `summary.json` is the session's own index
+ * entry, which is why the listing costs one small read rather than a transcript
+ * scan.
+ */
+const grokCandidates = async (workspaceId: string | null): Promise<ICandidate[]> => {
+  const refs = await listAllGrokSessions();
+  const candidates = await Promise.all(refs.map(async (ref): Promise<ICandidate | null> => {
+    if (ref.workspaceId !== workspaceId) return null;
+    const summary = await readGrokSummary(ref.sessionDir);
+    const startedAt = summary?.createdAt ? Date.parse(summary.createdAt) : ref.lastActivityMs;
+    return {
+      provider: 'grok',
+      sessionId: ref.sessionId,
+      jsonlPath: ref.jsonlPath,
+      lastActivityMs: ref.lastActivityMs,
+      cwd: ref.cwd,
+      homeWorkspaceId: ref.workspaceId,
+      codex: {
+        startedAt: Number.isNaN(startedAt) ? ref.lastActivityMs : startedAt,
+        firstMessage: summary?.title ?? '',
+        turnCount: summary?.messageCount ?? 0,
+      },
+    };
+  }));
+  return candidates.filter((candidate): candidate is ICandidate => candidate !== null);
+};
+
 const summarize = async (
   candidate: ICandidate,
   workspaceId: string | null,
@@ -135,7 +167,7 @@ const summarize = async (
   const scope = sessionScopeFor({
     provider: candidate.provider,
     scopes,
-    workspaceId,
+    workspaceId: candidate.homeWorkspaceId !== undefined ? candidate.homeWorkspaceId : workspaceId,
     cwd: candidate.cwd,
   });
   const sessionKey = buildSessionKey({
@@ -183,12 +215,13 @@ export const listSessionsV2 = async ({
   offset,
 }: ISessionsQuery): Promise<ISessionsPage> => {
   const scopes = await listSessionScopes();
-  const [claude, codex] = await Promise.all([
+  const [claude, codex, grok] = await Promise.all([
     claudeCandidates(workspaceId),
     codexCandidates(workspaceId, scopes),
+    grokCandidates(workspaceId),
   ]);
 
-  const candidates = [...claude, ...codex].sort((a, b) => b.lastActivityMs - a.lastActivityMs);
+  const candidates = [...claude, ...codex, ...grok].sort((a, b) => b.lastActivityMs - a.lastActivityMs);
   const page = candidates.slice(offset, offset + limit);
   const summaries = await Promise.all(page.map((candidate) => summarize(candidate, workspaceId, scopes)));
   const sessions = summaries.filter((session): session is ISessionSummary => session !== null);

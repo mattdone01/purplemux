@@ -329,7 +329,7 @@ describe('GET /api/timeline/history', () => {
     const dotdot = await call({ sessionKey: `claude:${WORKSPACE_ID}:..` });
     expect(dotdot).toMatchObject({ statusCode: 400, body: { error: 'bad-session-key' } });
 
-    const unknownProvider = await call({ sessionKey: `grok:${WORKSPACE_ID}:${CLAUDE_SESSION_ID}` });
+    const unknownProvider = await call({ sessionKey: `gemini:${WORKSPACE_ID}:${CLAUDE_SESSION_ID}` });
     expect(unknownProvider).toMatchObject({ statusCode: 400, body: { error: 'bad-session-key' } });
 
     const shapeless = await call({ sessionKey: 'claude-only' });

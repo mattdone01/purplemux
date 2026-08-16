@@ -14,13 +14,13 @@ describe('runtimeHandleFor', () => {
     expect(runtimeHandleFor('codex', { jsonlPath: JSONL, sessionId: 'sid' })).toBe(JSONL);
   });
 
-  it('hands grok its session id — its transcript is a SQLite row, not a file', () => {
-    expect(runtimeHandleFor('grok', { jsonlPath: null, sessionId: 'grok-session' })).toBe('grok-session');
-    expect(runtimeHandleFor('grok', { jsonlPath: JSONL, sessionId: 'grok-session' })).toBe('grok-session');
+  it('hands grok its transcript path too — Grok Build writes ACP JSONL', () => {
+    const updates = '/home/me/.grok/sessions/%2Frepo/01a008c1-bb96-71d1-9769-b63ff478fd9f/updates.jsonl';
+    expect(runtimeHandleFor('grok', { jsonlPath: updates, sessionId: 'grok-session' })).toBe(updates);
   });
 
-  it('has no handle when the source the provider needs is missing', () => {
-    expect(runtimeHandleFor('grok', { jsonlPath: JSONL, sessionId: null })).toBeNull();
+  it('has no handle when the transcript has not been resolved yet', () => {
+    expect(runtimeHandleFor('grok', { jsonlPath: null, sessionId: 'grok-session' })).toBeNull();
     expect(runtimeHandleFor('claude', { jsonlPath: null, sessionId: 'sid' })).toBeNull();
     expect(runtimeHandleFor(null, {})).toBeNull();
   });

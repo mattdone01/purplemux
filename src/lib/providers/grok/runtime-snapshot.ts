@@ -1,12 +1,23 @@
-import { GROK_DB_PATH, getGrokDatabase, type IGrokDatabase } from '@/lib/providers/grok/db';
-import { readGrokEntries } from '@/lib/providers/grok/transcript';
+import fs from 'fs/promises';
+import path from 'path';
+import { parseGrokContent } from '@/lib/session-parser-grok';
+import { grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import type { IAgentRuntimeSnapshot, IAgentSessionHistoryStats } from '@/lib/providers/types';
 import type { ICurrentAction } from '@/types/status';
 import type { ITimelineEntry } from '@/types/timeline';
 
 const MAX_SNIPPET_LENGTH = 200;
 const STALE_MS = 90_000;
-const TAIL_MESSAGES = 40;
+const MAX_CACHE = 256;
+
+interface ICacheEntry {
+  mtimeMs: number;
+  entries: ITimelineEntry[];
+}
+
+const g = globalThis as unknown as { __ptGrokEntryCache?: Map<string, ICacheEntry> };
+if (!g.__ptGrokEntryCache) g.__ptGrokEntryCache = new Map();
+const cache = g.__ptGrokEntryCache;
 
 const compact = (text: string, limit = MAX_SNIPPET_LENGTH): string => {
   const trimmed = text.replace(/\s+/g, ' ').trim();
@@ -24,23 +35,45 @@ export const emptyGrokSnapshot = (): IAgentRuntimeSnapshot => ({
   interrupted: false,
 });
 
-const tailFrom = (db: IGrokDatabase, sessionId: string): ITimelineEntry[] => {
-  const row = db.get<{ max_seq: number | null }>(
-    'SELECT MAX(seq) AS max_seq FROM messages WHERE session_id = ?',
-    sessionId,
-  );
-  const maxSeq = row?.max_seq ?? null;
-  if (maxSeq === null) return [];
-  const after = Math.max(-1, maxSeq - TAIL_MESSAGES);
-  return readGrokEntries(db, sessionId, { afterMessageSeq: after });
+/**
+ * grok's `seq` is an update ordinal, so a tail window cannot be numbered without
+ * the lines before it and the whole transcript is parsed. The result is cached
+ * on mtime, which keeps a poll on an idle session free.
+ */
+const readEntries = async (jsonlPath: string): Promise<ITimelineEntry[]> => {
+  let mtimeMs: number;
+  try {
+    mtimeMs = (await fs.stat(jsonlPath)).mtimeMs;
+  } catch {
+    return [];
+  }
+
+  const cached = cache.get(jsonlPath);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.entries;
+
+  let content: string;
+  try {
+    content = await fs.readFile(jsonlPath, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  const entries = parseGrokContent(content, grokSessionIdFromJsonlPath(jsonlPath) ?? '');
+  cache.set(jsonlPath, { mtimeMs, entries });
+  while (cache.size > MAX_CACHE) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+  return entries;
 };
 
 /**
- * Derives the same runtime view the JSONL providers derive, from grok's tail of
- * messages. A tool call with no matching result is the action in flight; when
- * the last thing in the session is an assistant message the turn has landed.
+ * The same runtime view the other providers derive, from grok's ACP updates: a
+ * tool call with no terminal update is the action in flight, and a turn that
+ * ended on an assistant message has landed.
  */
-export const summarizeGrokTail = (
+export const summarizeGrokEntries = (
   entries: ITimelineEntry[],
   now: number,
 ): IAgentRuntimeSnapshot => {
@@ -83,18 +116,8 @@ export const summarizeGrokTail = (
   };
 };
 
-/**
- * `handle` is a grok session id, not a path — grok keeps its transcript in
- * SQLite, so the provider interface's file slot carries the session key.
- */
-export const readGrokRuntimeSnapshot = async (
-  handle: string,
-  dbPath: string = GROK_DB_PATH,
-): Promise<IAgentRuntimeSnapshot> => {
-  const db = getGrokDatabase(dbPath);
-  if (!db) return emptyGrokSnapshot();
-  return summarizeGrokTail(tailFrom(db, handle), Date.now());
-};
+export const readGrokRuntimeSnapshot = async (jsonlPath: string): Promise<IAgentRuntimeSnapshot> =>
+  summarizeGrokEntries(await readEntries(jsonlPath), Date.now());
 
 const EMPTY_STATS: IAgentSessionHistoryStats = {
   toolUsage: {},
@@ -106,50 +129,27 @@ const EMPTY_STATS: IAgentSessionHistoryStats = {
   turnDurationMs: null,
 };
 
-const TOOL_USAGE_SQL = `
-  SELECT tool_name, args_json
-  FROM tool_calls
-  WHERE session_id = ?
-  ORDER BY id ASC
-`;
-
-const PATH_KEYS = ['path', 'file_path', 'filePath', 'notebook_path'] as const;
-
-const pathFromArgs = (argsJson: string): string | null => {
-  try {
-    const parsed = JSON.parse(argsJson) as Record<string, unknown>;
-    for (const key of PATH_KEYS) {
-      if (typeof parsed[key] === 'string' && parsed[key]) return parsed[key] as string;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-};
+const PATH_IN_SUMMARY = /(?:^|\s)((?:\/|\.{0,2}\/)?[\w.@/-]+\.[\w]+)(?=\s|$|\))/;
 
 export const readGrokSessionHistoryStats = async (
-  handle: string,
-  dbPath: string = GROK_DB_PATH,
+  jsonlPath: string,
 ): Promise<IAgentSessionHistoryStats> => {
-  const db = getGrokDatabase(dbPath);
-  if (!db) return EMPTY_STATS;
+  const entries = await readEntries(jsonlPath);
+  if (entries.length === 0) return EMPTY_STATS;
 
   const toolUsage: Record<string, number> = {};
   const touchedFiles = new Set<string>();
-  for (const row of db.all<{ tool_name: string; args_json: string }>(TOOL_USAGE_SQL, handle)) {
-    toolUsage[row.tool_name] = (toolUsage[row.tool_name] ?? 0) + 1;
-    const filePath = pathFromArgs(row.args_json);
-    if (filePath) touchedFiles.add(filePath);
-  }
-
-  const entries = readGrokEntries(db, handle, { includeCompactions: false });
   let lastAssistantText: string | null = null;
   let lastUserText: string | null = null;
   let firstUserTs: number | null = null;
   let lastAssistantTs: number | null = null;
 
   for (const entry of entries) {
-    if (entry.type === 'user-message') {
+    if (entry.type === 'tool-call') {
+      toolUsage[entry.toolName] = (toolUsage[entry.toolName] ?? 0) + 1;
+      const filePath = entry.filePath ?? entry.summary.match(PATH_IN_SUMMARY)?.[1];
+      if (filePath) touchedFiles.add(path.normalize(filePath));
+    } else if (entry.type === 'user-message') {
       lastUserText = entry.text;
       if (firstUserTs === null) firstUserTs = entry.timestamp;
     } else if (entry.type === 'assistant-message') {

@@ -2,79 +2,121 @@ import { createHash } from 'crypto';
 import type { TAgentWorkStateEvent } from '@/lib/providers/types';
 import type { IToolActivity } from '@/types/signals';
 
-export type TGrokHookEventName =
-  | 'SessionStart'
-  | 'SessionEnd'
-  | 'UserPromptSubmit'
-  | 'Stop'
-  | 'StopFailure'
-  | 'Notification'
-  | 'PreCompact'
-  | 'PostCompact'
-  | 'PostToolUse';
-
-export type TGrokSessionSource = 'startup' | 'resume';
-
+/**
+ * Grok Build's hook envelope is camelCase throughout (`10-hooks.md`, "Porting
+ * Claude Code stop hooks"), while the VALUE of `hookEventName` is snake_case
+ * (`session_start`, `pre_tool_use`, `stop`). Both spellings are normalised so a
+ * release that switches to the PascalCase event name still routes.
+ */
 export interface IGrokHookPayload {
-  hook_event_name?: string;
-  session_id?: string;
+  hookEventName?: string;
+  sessionId?: string;
   cwd?: string | null;
+  workspaceRoot?: string | null;
+  promptId?: string | null;
+  permissionMode?: string;
   source?: string;
-  user_prompt?: string | null;
-  message?: string | null;
-  error?: string | null;
+  reason?: string;
+  notificationType?: string;
+  /** Present only inside a subagent's own session — never the session's own state. */
+  subagentType?: string;
+  prompt?: string | null;
+  userPrompt?: string | null;
+  toolName?: string;
+  toolInput?: unknown;
+  toolResult?: unknown;
   trigger?: string;
-  tool_name?: string;
-  tool_input?: unknown;
-  tool_output?: unknown;
 }
 
-export const isGrokSessionSource = (value: unknown): value is TGrokSessionSource =>
-  value === 'startup' || value === 'resume';
+export type TGrokHookEvent =
+  | 'session_start'
+  | 'session_end'
+  | 'user_prompt_submit'
+  | 'stop'
+  | 'stop_failure'
+  | 'stop_cancelled'
+  | 'notification'
+  | 'pre_compact'
+  | 'post_compact'
+  | 'post_tool_use';
+
+const CANONICAL_EVENTS: Record<string, TGrokHookEvent> = {
+  sessionstart: 'session_start',
+  sessionend: 'session_end',
+  userpromptsubmit: 'user_prompt_submit',
+  stop: 'stop',
+  stopfailure: 'stop_failure',
+  stopcancelled: 'stop_cancelled',
+  notification: 'notification',
+  precompact: 'pre_compact',
+  postcompact: 'post_compact',
+  posttooluse: 'post_tool_use',
+};
+
+export const grokHookEvent = (raw: unknown): TGrokHookEvent | null => {
+  if (typeof raw !== 'string') return null;
+  return CANONICAL_EVENTS[raw.toLowerCase().replace(/[^a-z]/g, '')] ?? null;
+};
+
+export const GROK_PERMISSION_NOTIFICATION = 'permission_prompt';
+export const GROK_IDLE_NOTIFICATION = 'idle_prompt';
+export const GROK_TASK_COMPLETE_NOTIFICATION = 'task_complete';
 
 /**
- * grok-cli 1.1.7 fires `Notification` from one place only —
- * `consumeBackgroundNotifications()`, which reports a finished background
- * delegation. Its payload carries `message` and nothing else: there is no
- * `notification_type`, and grok has no permission-prompt hook at all. Treating
- * every `Notification` as needs-input would therefore park a still-working tab
- * in the wrong state, so the mapping is gated on the message reading like a
- * request for the operator. Today nothing grok emits matches; the gate exists
- * so a future grok release that adds permission prompts is picked up without a
- * protocol change.
+ * A settle is a turn end grok reports as a state rather than an outcome: the
+ * `idle_prompt` ping (which fires after interrupted and errored turns too) and
+ * `task_complete`. It only moves a tab that is still busy — see
+ * `shouldEmitGrokHookEvent`.
  */
-const PERMISSION_NOTIFICATION_RE = /\b(permission|approval|approve|authorize|confirm)\b/i;
+export const isGrokSettleNotification = (notificationType: string | undefined): boolean =>
+  notificationType === GROK_IDLE_NOTIFICATION || notificationType === GROK_TASK_COMPLETE_NOTIFICATION;
 
-export const isGrokPermissionNotification = (message: string | null | undefined): boolean =>
-  typeof message === 'string' && PERMISSION_NOTIFICATION_RE.test(message);
-
+/**
+ * `hookEventName` → purplemux work-state event.
+ *
+ * `Stop` is a gate that re-fires on each continuation round, but purplemux
+ * registers no blocking gate, so its fire is a genuine turn end.
+ * `StopCancelled` runs INSTEAD of `Stop` on an interrupt, a declined
+ * permission, or a turn limit, which is exactly purplemux's `interrupt`.
+ */
 export const translateGrokHookEvent = (
   payload: IGrokHookPayload,
 ): TAgentWorkStateEvent | null => {
-  switch (payload.hook_event_name) {
-    case 'SessionStart':
+  // A subagent's stop is not the session's; reporting it would settle the tab
+  // while the parent turn is still running (`10-hooks.md`, state script).
+  if (payload.subagentType) return null;
+
+  switch (grokHookEvent(payload.hookEventName)) {
+    case 'session_start':
       return { kind: 'session-start' };
-    case 'UserPromptSubmit':
+    case 'user_prompt_submit':
       return { kind: 'prompt-submit' };
-    case 'Stop':
-    case 'StopFailure':
+    case 'stop':
+    case 'stop_failure':
       return { kind: 'stop' };
-    case 'SessionEnd':
+    case 'stop_cancelled':
+    case 'session_end':
       return { kind: 'interrupt' };
-    case 'PreCompact':
+    case 'pre_compact':
       return { kind: 'pre-compact' };
-    case 'PostCompact':
+    case 'post_compact':
       return { kind: 'post-compact' };
-    case 'Notification':
-      return isGrokPermissionNotification(payload.message)
-        ? { kind: 'notification', notificationType: 'permission_prompt' }
-        : null;
+    case 'notification':
+      if (payload.notificationType === GROK_PERMISSION_NOTIFICATION) {
+        return { kind: 'notification', notificationType: GROK_PERMISSION_NOTIFICATION };
+      }
+      return isGrokSettleNotification(payload.notificationType) ? { kind: 'stop' } : null;
     default:
       return null;
   }
 };
 
-const FILE_PATH_KEYS = ['path', 'file_path', 'filePath', 'notebook_path'] as const;
+export const grokPromptText = (payload: IGrokHookPayload): string | null => {
+  const prompt = payload.prompt ?? payload.userPrompt;
+  return typeof prompt === 'string' && prompt.trim() ? prompt : null;
+};
+
+const FILE_PATH_KEYS = ['file_path', 'target_file', 'path', 'filePath', 'notebook_path'] as const;
 
 const asRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -91,7 +133,7 @@ const collectPaths = (toolInput: Record<string, unknown>): string[] => {
   const edits = toolInput.edits;
   if (Array.isArray(edits)) {
     for (const edit of edits) {
-      const value = asString(asRecord(edit).path) ?? asString(asRecord(edit).file_path);
+      const value = asString(asRecord(edit).file_path) ?? asString(asRecord(edit).path);
       if (value) paths.push(value);
     }
   }
@@ -108,33 +150,32 @@ const previewFor = (command: string): string => {
 };
 
 /**
- * grok reports a tool outcome as the AI-SDK output envelope — `{success, …}`
- * for its own tools, `{type:'error-text'|'error-json', value}` for a thrown
- * one. Anything unrecognised counts as success so a payload change degrades to
- * "no signal" instead of a false failure.
+ * grok's `run_terminal_command` result carries `exit_code`; a tool that threw
+ * reports `type: 'error…'`. Anything unrecognised counts as success so a
+ * payload change degrades to "no signal" instead of a false failure.
  */
-const didFail = (output: unknown): boolean => {
-  const record = asRecord(output);
+const didFail = (result: unknown): boolean => {
+  const record = asRecord(result);
+  const code = record.exit_code ?? record.exitCode;
+  if (typeof code === 'number') return code !== 0;
   if (typeof record.success === 'boolean') return !record.success;
   const kind = asString(record.type);
   if (kind) return kind.startsWith('error');
-  const code = record.exit_code ?? record.exitCode;
-  if (typeof code === 'number') return code !== 0;
   return false;
 };
 
 export const parseGrokToolActivity = (body: unknown): IToolActivity | null => {
   const payload = asRecord(body);
-  const tool = asString(payload.tool_name);
+  const tool = asString(payload.toolName);
   if (!tool) return null;
 
-  const toolInput = asRecord(payload.tool_input);
+  const toolInput = asRecord(payload.toolInput);
   const command = asString(toolInput.command);
 
   return {
     tool,
     paths: collectPaths(toolInput),
-    failed: didFail(payload.tool_output),
+    failed: didFail(payload.toolResult),
     ...(command ? { commandKey: commandKeyFor(command), commandPreview: previewFor(command) } : {}),
   };
 };

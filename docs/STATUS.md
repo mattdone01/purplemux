@@ -237,34 +237,41 @@ After transitioning to `idle`, `applyCliState` stops the JSONL watcher (idle is 
 
 ### Grok Hook Mapping
 
-grok-cli reaches the same endpoint with `?provider=grok`, and its payload is translated by
-`src/lib/providers/grok/hook-payload.ts`. grok has no transcript file, so no `jsonlPath` is ever
-patched — the timeline reads `~/.grok/grok.db` keyed on the session id instead.
+Grok Build reaches the same endpoint with `?provider=grok`, and its payload is translated by
+`src/lib/providers/grok/hook-payload.ts`. The envelope's keys are camelCase (`hookEventName`,
+`sessionId`, `notificationType`, `toolResult`) while the `hookEventName` VALUE is snake_case
+(`session_start`, `stop_cancelled`); the translator normalises both spellings.
 
 | grok hook | Sent event | Result |
 | --- | --- | --- |
 | `SessionStart` | `session-start` | → `idle`, and publishes session info (`sessionId`, `cwd`) |
-| `UserPromptSubmit` | `prompt-submit` | → `busy`; `user_prompt` becomes `lastUserMessage` + the tab summary |
+| `UserPromptSubmit` | `prompt-submit` | → `busy`; the prompt becomes `lastUserMessage` + the tab summary |
 | `Stop` | `stop` | → `ready-for-review` |
 | `StopFailure` | `stop` | → `ready-for-review` |
+| `StopCancelled` | `interrupt` | → `idle` |
 | `SessionEnd` | `interrupt` | → `idle` |
 | `PreCompact` | `pre-compact` | → `compactingSince = now` (cliState unchanged) |
 | `PostCompact` | `post-compact` | → `compactingSince = null` (cliState unchanged) |
 | `PostToolUse` | _(no state event)_ | feeds `handleToolActivity`, like Claude's `post-tool` |
-| `Notification` | _(usually none — see below)_ | → `needs-input` only for a permission-style message |
+| `Notification` `permission_prompt` | `notification` | → `needs-input` |
+| `Notification` `idle_prompt` / `task_complete` | `stop`, **only while the tab is busy** | → `ready-for-review` |
 
-Two differences from the Claude table are deliberate:
+Three rules are specific to grok and are deliberate:
 
-- **grok's `Notification` does not mean needs-input.** grok-cli 1.1.7 fires it from exactly one place,
-  `consumeBackgroundNotifications()`, which reports a finished background delegation. Its payload
-  carries `message` and nothing else — there is no `notification_type`, and grok has no
-  permission-prompt hook at all. Mapping every `Notification` to `needs-input` would park a
-  still-working tab in the wrong state, so the mapping is gated on the message reading like a request
-  to the operator. Nothing grok emits today matches; the gate exists so a future grok release that
-  adds permission prompts is picked up without a protocol change.
-- **A late `SessionStart` never re-idles a busy tab.** grok fires `SessionStart` on the first prompt of
-  a session, not at launch, so `shouldEmitGrokHookEvent` drops it unless the tab is `inactive` or
-  `unknown`. A `resume` source is dropped outright.
+- **`StopCancelled` runs INSTEAD of `Stop`** when a turn ends without completing — a user interrupt,
+  a declined permission prompt, the turn limit, or a no-progress bail-out — so it is the interrupt
+  signal, not a second stop.
+- **`idle_prompt` is a backstop, not a turn end.** grok fires it about a minute after a session
+  settles, after interrupted and errored turns too, and it is the only report for the turns that
+  produce none of the three stop events. Settling on it unconditionally would drag a tab the user has
+  since re-prompted back out of `busy`, so `shouldEmitGrokHookEvent` only lets it through while the
+  tab is still `busy`.
+- **A subagent's events are dropped.** Every event that can fire inside a subagent carries
+  `subagentType`, and a background subagent outlives the parent turn; reporting its stop would settle
+  the tab while the session is still working.
+
+purplemux registers no blocking `Stop` gate, so grok's `Stop` fire is a genuine turn end rather than
+a continuation round.
 
 Codex's TUI-ready detector (`checkCodexTuiReady`) is **not** applied to grok. Whether grok needs the
 same synthetic `session-start` has not been measured on a live tab, and copying it blind would put a

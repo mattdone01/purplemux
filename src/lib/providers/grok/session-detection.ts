@@ -1,3 +1,4 @@
+import path from 'path';
 import type { ISessionInfo } from '@/types/timeline';
 import type {
   IAgentSessionDetectionOptions,
@@ -6,7 +7,12 @@ import type {
 } from '@/lib/providers/types';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
 import { runGrokPreflight } from '@/lib/providers/grok/preflight';
-import { GROK_DB_PATH, getGrokDatabase, grokStoreExists } from '@/lib/providers/grok/db';
+import {
+  findGrokSessionById,
+  findLatestGrokSessionForCwd,
+  isValidGrokSessionId,
+  type IGrokSessionRef,
+} from '@/lib/providers/grok/session-store';
 import {
   getChildPids,
   getProcessArgs,
@@ -16,12 +22,17 @@ import {
 
 const PID_POLL_INTERVAL = 10_000;
 
-/** `createSessionId()` in grok's `src/storage/sessions.ts`: a uuid stripped of dashes, first 12 chars. */
-const GROK_SESSION_ID_RE = /^[0-9a-f]{12}$/;
-const GROK_SESSION_ARG_RE = /(?:^|\s)(?:--session|-s)(?:=|\s+)["']?([0-9a-f]{12}|latest)["']?(?=\s|$)/i;
+export { isValidGrokSessionId };
 
-export const isValidGrokSessionId = (id: unknown): id is string =>
-  typeof id === 'string' && GROK_SESSION_ID_RE.test(id);
+/**
+ * `-s/--session-id` names a NEW session's id; `-r/--resume` resumes one.
+ * `--resume` also accepts a title, so only a UUID-shaped value is taken as an
+ * id (`17-sessions.md`, "Resuming Sessions").
+ */
+const SESSION_ARG_RE =
+  /(?:^|\s)(?:--session-id|-s|--resume|-r)(?:=|\s+)["']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["']?(?=\s|$)/i;
+
+const CWD_ARG_RE = /(?:^|\s)--cwd(?:=|\s+)["']?([^"'\s]+)["']?(?=\s|$)/;
 
 const NOT_RUNNING: ISessionInfo = {
   status: 'not-running',
@@ -32,12 +43,13 @@ const NOT_RUNNING: ISessionInfo = {
   cwd: null,
 };
 
-const matchesGrokArgs = (args: string): boolean => /(^|\/|\s)grok(\s|$)/.test(args);
+/** The binary is `grok`; the install also links it as `agent`. */
+const matchesGrokArgs = (args: string): boolean => /(^|\/|\s)(grok|agent)(\s|$)/.test(args);
 
-export const extractGrokSessionId = (args: string): string | null => {
-  const match = args.match(GROK_SESSION_ARG_RE)?.[1];
-  return match && match !== 'latest' ? match.toLowerCase() : null;
-};
+export const extractGrokSessionId = (args: string): string | null =>
+  args.match(SESSION_ARG_RE)?.[1]?.toLowerCase() ?? null;
+
+export const extractGrokCwd = (args: string): string | null => args.match(CWD_ARG_RE)?.[1] ?? null;
 
 const collectDescendants = async (panePid: number, preloaded?: number[]): Promise<number[]> => {
   const direct = preloaded ?? await getChildPids(panePid);
@@ -52,78 +64,21 @@ const findGrokProcess = async (
   for (const pid of pids) {
     const args = await getProcessArgs(pid);
     if (!args || !matchesGrokArgs(args)) continue;
-    return { pid, cwd: await getProcessCwd(pid), args };
+    return { pid, cwd: extractGrokCwd(args) ?? await getProcessCwd(pid), args };
   }
   return null;
 };
 
-interface IGrokSessionMeta {
-  sessionId: string;
-  cwd: string | null;
-  startedAt: number | null;
-}
-
-const SESSION_BY_CWD_SQL = `
-  SELECT id, cwd_last, created_at
-  FROM sessions
-  WHERE cwd_last = ?
-  ORDER BY updated_at DESC
-  LIMIT 1
-`;
-
-const SESSION_BY_ID_SQL = `
-  SELECT id, cwd_last, created_at
-  FROM sessions
-  WHERE id = ?
-`;
-
-interface ISessionRow {
-  id: string;
-  cwd_last: string | null;
-  created_at: string;
-}
-
-const toMeta = (row: ISessionRow | null): IGrokSessionMeta | null => {
-  if (!row) return null;
-  const startedAt = Date.parse(row.created_at);
-  return {
-    sessionId: row.id,
-    cwd: row.cwd_last,
-    startedAt: Number.isNaN(startedAt) ? null : startedAt,
-  };
-};
-
-/**
- * grok keys its own sessions by cwd (`workspaces`), so the newest session for
- * the tab's directory is the right fallback when the process carries no
- * `--session` flag.
- */
-export const findLatestGrokSessionForCwd = (
-  cwd: string,
-  dbPath: string = GROK_DB_PATH,
-): IGrokSessionMeta | null => {
-  const db = getGrokDatabase(dbPath);
-  return db ? toMeta(db.get<ISessionRow>(SESSION_BY_CWD_SQL, cwd)) : null;
-};
-
-export const findGrokSessionById = (
-  sessionId: string,
-  dbPath: string = GROK_DB_PATH,
-): IGrokSessionMeta | null => {
-  const db = getGrokDatabase(dbPath);
-  return db ? toMeta(db.get<ISessionRow>(SESSION_BY_ID_SQL, sessionId)) : null;
-};
-
-const toRunningSessionInfo = (
+const toSessionInfo = (
   found: { pid: number; cwd: string | null },
-  meta?: IGrokSessionMeta | null,
+  ref: IGrokSessionRef | null,
 ): ISessionInfo => ({
   status: 'running',
-  sessionId: meta?.sessionId ?? null,
-  jsonlPath: null,
+  sessionId: ref?.sessionId ?? null,
+  jsonlPath: ref?.jsonlPath ?? null,
   pid: found.pid,
-  startedAt: meta?.startedAt ?? null,
-  cwd: meta?.cwd ?? found.cwd,
+  startedAt: null,
+  cwd: ref?.cwd ?? found.cwd,
 });
 
 export const isGrokRunning = async (
@@ -137,39 +92,60 @@ export const isGrokRunning = async (
   return false;
 };
 
+/**
+ * Grok groups its sessions by working directory, so the newest session dir for
+ * the pane's cwd is the right answer when the process carries no `--session-id`
+ * or `--resume`. The lookup walks every grok home — the pane's own `GROK_HOME`
+ * is not visible from the pid — and each home is keyed by cwd, so a session
+ * cannot be attributed to the wrong workspace.
+ */
 export const detectActiveSession = async (
   panePid: number,
   preloadedChildPids?: number[],
   options: IAgentSessionDetectionOptions = {},
 ): Promise<ISessionInfo> => {
-  if (!grokStoreExists()) {
-    const { installed } = await runGrokPreflight();
-    const status = installed ? 'not-initialized' : 'not-installed';
-    return { status, sessionId: null, jsonlPath: null, pid: null, startedAt: null, cwd: null };
-  }
-
   const all = await collectDescendants(panePid, preloadedChildPids);
-  if (all.length === 0) return NOT_RUNNING;
+  if (all.length === 0) {
+    const { installed } = await runGrokPreflight();
+    return installed
+      ? NOT_RUNNING
+      : { status: 'not-installed', sessionId: null, jsonlPath: null, pid: null, startedAt: null, cwd: null };
+  }
 
   const found = await findGrokProcess(all);
   if (!found) return NOT_RUNNING;
 
-  const resumeSessionId = extractGrokSessionId(found.args);
-  if (resumeSessionId) {
-    return toRunningSessionInfo(found, findGrokSessionById(resumeSessionId) ?? {
-      sessionId: resumeSessionId,
+  const argSessionId = extractGrokSessionId(found.args);
+  if (argSessionId) {
+    const ref = await findGrokSessionById(argSessionId);
+    return toSessionInfo(found, ref ?? {
+      sessionId: argSessionId,
+      home: '',
+      workspaceId: null,
+      sessionDir: '',
+      jsonlPath: '',
       cwd: found.cwd,
-      startedAt: null,
+      lastActivityMs: 0,
     });
   }
 
   if (options.allowCwdFallback && found.cwd) {
-    const meta = findLatestGrokSessionForCwd(found.cwd);
-    if (meta) return toRunningSessionInfo(found, meta);
+    const ref = await findLatestGrokSessionForCwd(found.cwd);
+    if (ref) return toSessionInfo(found, ref);
   }
 
-  return toRunningSessionInfo(found);
+  return toSessionInfo(found, null);
 };
+
+/**
+ * Resolves the transcript for a session id the hook already told us about. The
+ * hook fires before the first `updates.jsonl` write on a brand-new session, so
+ * a miss here is expected and the poller picks it up.
+ */
+export const resolveGrokJsonlPath = async (sessionId: string): Promise<string | null> =>
+  (await findGrokSessionById(sessionId))?.jsonlPath ?? null;
+
+export const grokSessionDirFromJsonlPath = (jsonlPath: string): string => path.dirname(jsonlPath);
 
 export const watchSessions = (
   panePid: number,
@@ -186,10 +162,16 @@ export const watchSessions = (
     currentSessionId = info.sessionId;
   };
 
-  const handleSessionInfo = (tmuxSession: string, info: ISessionInfo) => {
+  // A hook lands before the transcript file exists, so the id it carries is
+  // resolved to a path here rather than trusted to be complete.
+  const handleSessionInfo = async (tmuxSession: string, info: ISessionInfo) => {
     if (stopped || !watchedSession || tmuxSession !== watchedSession) return;
-    rememberInfo(info);
-    onChange(info);
+    const jsonlPath = info.jsonlPath
+      ?? (info.sessionId ? await resolveGrokJsonlPath(info.sessionId) : null);
+    if (stopped) return;
+    const resolved: ISessionInfo = { ...info, jsonlPath };
+    rememberInfo(resolved);
+    onChange(resolved);
   };
 
   if (watchedSession) grokHookEvents.on('session-info', handleSessionInfo);

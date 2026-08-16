@@ -50,13 +50,25 @@ describe('scopeForCwd', () => {
 });
 
 describe('sessionScopeFor', () => {
-  it('keys every grok session globally, whatever its cwd — fork ADR-0005', () => {
+  // Grok Build isolates by GROK_HOME, so the home names the workspace and the
+  // cwd never reaches the key — an ad-hoc tab under ~/.grok stays global even
+  // when its cwd sits inside a workspace root (fork ADR-0005, revised).
+  it('keys a grok session by the GROK_HOME it was recorded in, not by its cwd', () => {
     for (const cwd of ['/work/alpha', '/work/beta/src', null]) {
-      const resolved = sessionScopeFor({ provider: 'grok', scopes: SCOPES, cwd });
-      expect(resolved.workspaceId).toBeNull();
-      expect(buildSessionKey({ provider: 'grok', workspaceId: resolved.workspaceId, sessionId: 's1' }))
+      const unscoped = sessionScopeFor({ provider: 'grok', scopes: SCOPES, cwd, workspaceId: null });
+      expect(unscoped.workspaceId).toBeNull();
+      expect(buildSessionKey({ provider: 'grok', workspaceId: unscoped.workspaceId, sessionId: 's1' }))
         .toBe('grok:global:s1');
+
+      const scoped = sessionScopeFor({ provider: 'grok', scopes: SCOPES, cwd, workspaceId: 'ws-beta' });
+      expect(buildSessionKey({ provider: 'grok', workspaceId: scoped.workspaceId, sessionId: 's1' }))
+        .toBe('grok:ws-beta:s1');
     }
+  });
+
+  it('names a grok workspace whose scope is no longer configured rather than dropping it', () => {
+    const resolved = sessionScopeFor({ provider: 'grok', scopes: SCOPES, workspaceId: 'ws-deleted' });
+    expect(resolved).toMatchObject({ id: 'ws-deleted', workspaceId: 'ws-deleted' });
   });
 
   it('agrees on a codex session in a subdirectory however the caller reaches it', () => {

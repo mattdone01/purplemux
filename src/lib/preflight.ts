@@ -6,7 +6,7 @@ import { buildShellEnv, defaultShell as resolveDefaultShell } from '@/lib/shell-
 import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { claudeProvider } from '@/lib/providers/claude';
 import { runCodexPreflight, invalidateCodexPreflight } from '@/lib/providers/codex/preflight';
-import { checkGrokApiKey, invalidateGrokPreflight, runGrokPreflight } from '@/lib/providers/grok/preflight';
+import { checkGrokLogin, invalidateGrokPreflight, runGrokPreflight } from '@/lib/providers/grok/preflight';
 import { parseSemanticVersion } from '@/lib/process-utils';
 
 const execFile = promisify(execFileCb);
@@ -154,7 +154,7 @@ export const getRuntimePreflightStatus = async (): Promise<IRuntimePreflightResu
     claudeProvider.preflight(),
     runCodexPreflight(),
     runGrokPreflight(),
-    checkGrokApiKey(),
+    checkGrokLogin(),
   ]);
 
   return {

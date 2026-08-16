@@ -138,12 +138,16 @@ const getGrokTokenBreakdown = (usage: IGrokUsageSummary): {
     const entry = modelTokens[key] as TOverviewModelTokens;
     entry.input += session.inputTokens;
     entry.output += session.outputTokens;
+    entry.cacheRead += session.cacheReadTokens;
+    entry.cacheCreation += session.cacheCreationTokens;
     entry.cost += session.cost;
 
     const date = dayjs(session.startedAt).format('YYYY-MM-DD');
     const day = dailyMap.get(date) ?? { date, input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
     day.input += session.inputTokens;
     day.output += session.outputTokens;
+    day.cacheRead += session.cacheReadTokens;
+    day.cacheCreation += session.cacheCreationTokens;
     dailyMap.set(date, day);
   }
 
@@ -393,18 +397,19 @@ const mergeCodexOverview = async (
 };
 
 /**
- * grok exposes no rate-limit windows and no prompt cache, so cacheRead and
- * cacheCreation stay at zero rather than being back-filled from tokens.
+ * grok exposes no rate-limit windows, but its `turn_completed` updates do carry
+ * cache-read and cache-creation counters and a real per-turn cost, so all four
+ * are reported rather than zeroed.
  */
-const mergeGrokOverview = (
+const mergeGrokOverview = async (
   overview: IOverviewResponse,
   period: TPeriod,
-): IOverviewResponse => {
-  const usage = readGrokUsage(period);
+): Promise<IOverviewResponse> => {
+  const usage = await readGrokUsage(period);
   if (usage.sessions.length === 0 && usage.messageTimestamps.length === 0) return overview;
 
   const needsPrevious = period === '7d' || period === '30d';
-  const allUsage = needsPrevious || period !== 'all' ? readGrokUsage('all') : usage;
+  const allUsage = needsPrevious || period !== 'all' ? await readGrokUsage('all') : usage;
   const tokens = getGrokTokenBreakdown(usage);
   const { hourCounts, dayHourCounts } = getGrokHourCounts(usage);
   const today = dayjs().format('YYYY-MM-DD');
@@ -476,7 +481,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (cached) return res.status(200).json(cached);
 
   const statsCache = await getStatsCache();
-  const overview = mergeGrokOverview(
+  const overview = await mergeGrokOverview(
     await mergeCodexOverview(buildOverview(statsCache, period), period),
     period,
   );

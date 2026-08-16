@@ -3,10 +3,11 @@ import os from 'os';
 import path from 'path';
 import { isAllowedJsonlPath } from '@/lib/path-validation';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
+import { findGrokSessionById } from '@/lib/providers/grok/session-store';
 import { parseSessionKey } from '@/lib/session-key';
 import { workspaceHomeDir } from '@/lib/workspace-home';
 
-export const SESSION_PROVIDERS = ['claude', 'codex'] as const;
+export const SESSION_PROVIDERS = ['claude', 'codex', 'grok'] as const;
 export type TSessionProvider = (typeof SESSION_PROVIDERS)[number];
 
 export type TSessionResolveError = 'bad-session-key' | 'session-not-found' | 'forbidden-path';
@@ -117,9 +118,17 @@ export const resolveSessionKey = async (sessionKey: string): Promise<TSessionRes
   if (!isSafeSegment(sessionId)) return { ok: false, error: 'bad-session-key' };
   if (workspaceId !== null && !isSafeSegment(workspaceId)) return { ok: false, error: 'bad-session-key' };
 
-  const jsonlPath = provider === 'codex'
-    ? (await findCodexSessionById(sessionId))?.jsonlPath ?? null
-    : await findClaudeTranscript(workspaceId, sessionId);
+  // Codex and grok both key by their own store rather than by the scope
+  // segment, so the segment is validated above and then ignored — the same
+  // "advisory scope" the API contract documents.
+  let jsonlPath: string | null;
+  if (provider === 'codex') {
+    jsonlPath = (await findCodexSessionById(sessionId))?.jsonlPath ?? null;
+  } else if (provider === 'grok') {
+    jsonlPath = (await findGrokSessionById(sessionId))?.jsonlPath ?? null;
+  } else {
+    jsonlPath = await findClaudeTranscript(workspaceId, sessionId);
+  }
 
   if (!jsonlPath) return { ok: false, error: 'session-not-found' };
   if (!isAllowedJsonlPath(jsonlPath)) return { ok: false, error: 'forbidden-path' };

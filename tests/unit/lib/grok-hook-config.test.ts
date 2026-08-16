@@ -1,166 +1,168 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  GROK_HOOK_EVENTS,
-  GrokSettingsUnreadableError,
-  ensureGrokHookSettings,
-  mergeGrokHookSettings,
+  GROK_HOOK_FILE_NAME,
+  GROK_NOTIFICATION_MATCHER,
+  GROK_TOOL_MATCHER,
+  buildGrokHookConfig,
+  writeGrokHookFile,
 } from '@/lib/providers/grok/hook-config';
+
+const mockHome = vi.hoisted(() => ({ value: '' }));
+
+vi.mock('os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('os')>();
+  return {
+    ...actual,
+    default: { ...actual, homedir: () => mockHome.value },
+    homedir: () => mockHome.value,
+  };
+});
 
 const SCRIPT = '/home/dev/.purplemux/grok-hook.sh';
 
-const dirs: string[] = [];
+describe('buildGrokHookConfig', () => {
+  const config = buildGrokHookConfig(SCRIPT);
 
-const tmpSettings = (contents?: string): string => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-grok-settings-'));
-  dirs.push(dir);
-  const target = path.join(dir, 'user-settings.json');
-  if (contents !== undefined) fs.writeFileSync(target, contents);
-  return target;
-};
-
-afterEach(() => {
-  while (dirs.length) fs.rmSync(dirs.pop() as string, { recursive: true, force: true });
-});
-
-describe('mergeGrokHookSettings', () => {
-  it('adds every purplemux event to an empty settings file', () => {
-    const { settings, changed } = mergeGrokHookSettings(null, SCRIPT);
-    const hooks = settings.hooks as Record<string, unknown[]>;
-
-    expect(changed).toBe(true);
-    expect(Object.keys(hooks).sort()).toEqual([...GROK_HOOK_EVENTS].sort());
-    expect(hooks.Stop).toEqual([
-      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] },
+  it('emits the Claude hooks JSON format grok reads from $GROK_HOME/hooks/*.json', () => {
+    expect(config.hooks.SessionStart).toEqual([
+      { hooks: [{ type: 'command', command: `sh "${SCRIPT}"`, timeout: 3 }] },
     ]);
   });
 
-  it('leaves PostToolUse unmatched because grok matches a matcher by exact equality', () => {
-    const { settings } = mergeGrokHookSettings(null, SCRIPT);
-    const entries = (settings.hooks as Record<string, Array<{ matcher?: string }>>).PostToolUse;
-    expect(entries[0].matcher).toBeUndefined();
+  it('registers the five events a complete busy/idle indicator needs', () => {
+    for (const event of ['UserPromptSubmit', 'Stop', 'StopFailure', 'StopCancelled', 'Notification']) {
+      expect(config.hooks[event]).toBeDefined();
+    }
   });
 
-  it('preserves the user keys and their own hooks', () => {
-    const existing = {
-      apiKey: 'xai-secret',
-      defaultModel: 'grok-4.20',
-      subAgents: [{ name: 'reviewer', model: 'grok-4.20' }],
-      hooks: {
-        Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }],
-        SubagentStop: [{ hooks: [{ type: 'command', command: 'notify-send hi' }] }],
-      },
-    };
-
-    const { settings } = mergeGrokHookSettings(existing, SCRIPT);
-    const hooks = settings.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
-
-    expect(settings.apiKey).toBe('xai-secret');
-    expect(settings.subAgents).toEqual(existing.subAgents);
-    expect(hooks.SubagentStop).toEqual(existing.hooks.SubagentStop);
-    expect(hooks.Stop.map((entry) => entry.hooks[0].command)).toEqual([
-      'say done',
-      `sh "${SCRIPT}" Stop`,
-    ]);
+  it('matches only the notification types a host UI acts on', () => {
+    expect(config.hooks.Notification[0].matcher).toBe(GROK_NOTIFICATION_MATCHER);
+    expect(GROK_NOTIFICATION_MATCHER.split('|')).toEqual(['permission_prompt', 'idle_prompt', 'task_complete']);
   });
 
-  it('is idempotent — a second merge neither duplicates nor reports a change', () => {
-    const first = mergeGrokHookSettings({ apiKey: 'xai-secret' }, SCRIPT);
-    const second = mergeGrokHookSettings(first.settings, SCRIPT);
-
-    expect(second.changed).toBe(false);
-    expect(second.settings).toEqual(first.settings);
+  it('matches both grok\'s own tool names and the Claude names they alias', () => {
+    expect(config.hooks.PostToolUse[0].matcher).toBe(GROK_TOOL_MATCHER);
+    expect(GROK_TOOL_MATCHER).toContain('search_replace');
+    expect(GROK_TOOL_MATCHER).toContain('run_terminal_command');
+    expect(GROK_TOOL_MATCHER).toContain('Bash');
   });
 
-  it('replaces a stale purplemux entry rather than stacking a second one', () => {
-    const stale = {
-      hooks: { Stop: [{ hooks: [{ type: 'command', command: `sh "${SCRIPT}" stop`, timeout: 9 }] }] },
-    };
-    const { settings } = mergeGrokHookSettings(stale, SCRIPT);
-    const entries = (settings.hooks as Record<string, unknown[]>).Stop;
-
-    expect(entries).toHaveLength(1);
-    expect(entries[0]).toEqual({ hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] });
-  });
-
-  it('keeps an element it cannot parse and installs its own entry beside it', () => {
-    const { settings } = mergeGrokHookSettings({ hooks: { Stop: ['nonsense', 42] } }, SCRIPT);
-    const entries = (settings.hooks as Record<string, unknown[]>).Stop;
-
-    expect(entries).toEqual([
-      'nonsense',
-      42,
-      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] },
-    ]);
-  });
-
-  it('keeps a hook value that is not an array at all', () => {
-    const existing = {
-      apiKey: 'xai-secret',
-      hooks: {
-        PostToolUse: { matcher: 'Bash', hooks: [{ type: 'command', command: 'audit.sh' }] },
-        Stop: 'run-my-script',
-      },
-    };
-    const before = JSON.stringify(existing);
-
-    const { settings } = mergeGrokHookSettings(existing, SCRIPT);
-    const hooks = settings.hooks as Record<string, unknown>;
-
-    expect(JSON.stringify(existing)).toBe(before);
-    expect(hooks.PostToolUse).toEqual([
-      { matcher: 'Bash', hooks: [{ type: 'command', command: 'audit.sh' }] },
-      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" PostToolUse`, timeout: 3 }] },
-    ]);
-    expect(hooks.Stop).toEqual([
-      'run-my-script',
-      { hooks: [{ type: 'command', command: `sh "${SCRIPT}" Stop`, timeout: 3 }] },
-    ]);
-    expect(settings.apiKey).toBe('xai-secret');
-  });
-
-  it('leaves an event purplemux does not write exactly as it found it', () => {
-    const { settings } = mergeGrokHookSettings(
-      { hooks: { SubagentStop: [{ weird: true }], PreToolUse: { legacy: 'shape' } } },
-      SCRIPT,
-    );
-    const hooks = settings.hooks as Record<string, unknown>;
-
-    expect(hooks.SubagentStop).toEqual([{ weird: true }]);
-    expect(hooks.PreToolUse).toEqual({ legacy: 'shape' });
-  });
-
-  it('stays idempotent over settings it could not parse', () => {
-    const first = mergeGrokHookSettings({ hooks: { Stop: ['nonsense'], SubagentStop: 'mine' } }, SCRIPT);
-    const second = mergeGrokHookSettings(first.settings, SCRIPT);
-
-    expect(second.changed).toBe(false);
-    expect(second.settings).toEqual(first.settings);
+  it('does not register a blocking gate — every handler is observe-only', () => {
+    const commands = Object.values(config.hooks).flatMap((groups) => groups.flatMap((group) => group.hooks));
+    expect(commands.every((hook) => hook.type === 'command' && hook.command === `sh "${SCRIPT}"`)).toBe(true);
   });
 });
 
-describe('ensureGrokHookSettings', () => {
-  it('creates the settings file at 0600 and reports the write', async () => {
-    const target = tmpSettings();
-    expect(await ensureGrokHookSettings(SCRIPT, target)).toBe(true);
+describe('writeGrokHookFile', () => {
+  let home: string;
 
-    const written = JSON.parse(fs.readFileSync(target, 'utf-8'));
-    expect(Object.keys(written.hooks).sort()).toEqual([...GROK_HOOK_EVENTS].sort());
-    expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+  beforeEach(async () => {
+    home = await fs.mkdtemp(path.join(os.tmpdir(), 'grok-home-'));
   });
 
-  it('does not rewrite a file that already carries the block', async () => {
-    const target = tmpSettings(JSON.stringify({ apiKey: 'xai-secret' }));
-    expect(await ensureGrokHookSettings(SCRIPT, target)).toBe(true);
-    expect(await ensureGrokHookSettings(SCRIPT, target)).toBe(false);
-    expect(JSON.parse(fs.readFileSync(target, 'utf-8')).apiKey).toBe('xai-secret');
+  afterEach(async () => {
+    await fs.rm(home, { recursive: true, force: true });
   });
 
-  it('refuses to overwrite an unparseable settings file', async () => {
-    const target = tmpSettings('{ this is not json');
-    await expect(ensureGrokHookSettings(SCRIPT, target)).rejects.toBeInstanceOf(GrokSettingsUnreadableError);
-    expect(fs.readFileSync(target, 'utf-8')).toBe('{ this is not json');
+  const hookFile = () => path.join(home, 'hooks', GROK_HOOK_FILE_NAME);
+
+  it('creates the hooks directory and writes owner-only', async () => {
+    expect(await writeGrokHookFile(home, SCRIPT)).toBe(true);
+
+    const stat = await fs.stat(hookFile());
+    expect(stat.mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await fs.readFile(hookFile(), 'utf-8'))).toEqual(buildGrokHookConfig(SCRIPT));
+  });
+
+  it('is idempotent — an unchanged boot does not rewrite the file', async () => {
+    await writeGrokHookFile(home, SCRIPT);
+    expect(await writeGrokHookFile(home, SCRIPT)).toBe(false);
+  });
+
+  it('rewrites when the script path changes', async () => {
+    await writeGrokHookFile(home, SCRIPT);
+    expect(await writeGrokHookFile(home, '/other/grok-hook.sh')).toBe(true);
+    expect(await fs.readFile(hookFile(), 'utf-8')).toContain('/other/grok-hook.sh');
+  });
+
+  it('never touches another hook file in the same directory', async () => {
+    const sibling = path.join(home, 'hooks', 'user-guard.json');
+    await fs.mkdir(path.dirname(sibling), { recursive: true });
+    await fs.writeFile(sibling, '{"hooks":{"PreToolUse":[]}}');
+
+    await writeGrokHookFile(home, SCRIPT);
+
+    expect(await fs.readFile(sibling, 'utf-8')).toBe('{"hooks":{"PreToolUse":[]}}');
+    expect((await fs.readdir(path.join(home, 'hooks'))).sort()).toEqual([GROK_HOOK_FILE_NAME, 'user-guard.json']);
+  });
+});
+
+describe('ensureGrokHookFiles', () => {
+  let home: string;
+
+  beforeEach(async () => {
+    home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-grok-hooks-'));
+    mockHome.value = home;
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    await fs.rm(home, { recursive: true, force: true });
+  });
+
+  it('installs into the unscoped home and into every workspace home', async () => {
+    await fs.mkdir(path.join(home, '.grok'), { recursive: true });
+    const { ensureWorkspaceGrokHome } = await import('@/lib/grok-home');
+    const wsHome = await ensureWorkspaceGrokHome('ws-hooks');
+    const { ensureGrokHookFiles } = await import('@/lib/providers/grok/hook-config');
+
+    const written = await ensureGrokHookFiles(SCRIPT);
+
+    expect(written.sort()).toEqual([path.join(home, '.grok'), wsHome].sort());
+    for (const target of written) {
+      expect(JSON.parse(await fs.readFile(path.join(target, 'hooks', GROK_HOOK_FILE_NAME), 'utf-8')))
+        .toEqual(buildGrokHookConfig(SCRIPT));
+    }
+  });
+
+  it('writes nothing the second time when neither home changed', async () => {
+    await fs.mkdir(path.join(home, '.grok'), { recursive: true });
+    const { ensureGrokHookFiles } = await import('@/lib/providers/grok/hook-config');
+
+    await ensureGrokHookFiles(SCRIPT);
+    expect(await ensureGrokHookFiles(SCRIPT)).toEqual([]);
+  });
+});
+
+/**
+ * The generated script runs on grok's critical path: a `Stop` hook that blocks
+ * or exits non-zero keeps the agent working.
+ */
+describe('the generated grok-hook.sh', () => {
+  it('forwards the camelCase stdin body to the grok branch of the hook route', async () => {
+    const { GROK_HOOK_SCRIPT_CONTENT } = await import('@/lib/hook-settings');
+
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('/api/status/hook?provider=grok&tmuxSession=');
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('x-pmux-token');
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('BODY=$(cat)');
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('--data-binary @-');
+  });
+
+  it('detaches, time-boxes the request and always exits 0', async () => {
+    const { GROK_HOOK_SCRIPT_CONTENT } = await import('@/lib/hook-settings');
+
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('--max-time 2');
+    expect(GROK_HOOK_SCRIPT_CONTENT).toMatch(/>\/dev\/null 2>&1 &\n/);
+    expect(GROK_HOOK_SCRIPT_CONTENT.trimEnd().endsWith('exit 0')).toBe(true);
+  });
+
+  it('reports the event grok injects even when stdin arrives empty', async () => {
+    const { GROK_HOOK_SCRIPT_CONTENT } = await import('@/lib/hook-settings');
+
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain('${GROK_HOOK_EVENT}');
+    expect(GROK_HOOK_SCRIPT_CONTENT).toContain("[ -z \"$BODY\" ] && BODY='{}'");
   });
 });

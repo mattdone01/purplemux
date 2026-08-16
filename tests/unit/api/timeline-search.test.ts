@@ -3,7 +3,6 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { createGrokFixtureDb, removeGrokFixtureDb } from '../../helpers/grok-fixture-db';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 
@@ -174,30 +173,33 @@ const writeCodexSession = async (home: string, lines: string[]): Promise<string>
   return file;
 };
 
-const writeGrokStore = async (home: string): Promise<void> => {
-  const fixture = createGrokFixtureDb([{
-    id: GROK_SESSION,
-    cwd: DIR_B,
-    updatedAt: '2026-08-16T00:30:00.000Z',
-    messages: [
-      { seq: 0, role: 'user', message: { role: 'user', content: 'is the chartreuse ledger loaded?' } },
-      {
-        seq: 1,
-        role: 'assistant',
-        message: {
-          role: 'assistant',
-          content: [
-            { type: 'reasoning', text: 'chartreuse should not be searchable from a reasoning block' },
-            { type: 'text', text: 'Yes, loaded.' },
-          ],
-        },
-      },
-    ],
-  }]);
+/**
+ * An ACP `updates.jsonl` the way Grok Build writes one. `grokHome` selects the
+ * store: `~/.grok` for an ad-hoc tab, a workspace `grok-home` for a scoped one.
+ */
+const grokUpdate = (update: Record<string, unknown>): string => JSON.stringify({
+  timestamp: 1786853311,
+  method: 'session/update',
+  params: { sessionId: GROK_SESSION, update, _meta: { agentTimestampMs: 1786853311000 } },
+});
 
-  await fs.mkdir(path.join(home, '.grok'), { recursive: true });
-  await fs.copyFile(fixture, path.join(home, '.grok', 'grok.db'));
-  removeGrokFixtureDb(fixture);
+const writeGrokStore = async (home: string, grokHome?: string): Promise<string> => {
+  const root = grokHome ?? path.join(home, '.grok');
+  const dir = path.join(root, 'sessions', encodeURIComponent(DIR_B), GROK_SESSION);
+  await fs.mkdir(dir, { recursive: true });
+  const file = path.join(dir, 'updates.jsonl');
+  await fs.writeFile(file, `${[
+    grokUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'is the chartreuse ledger loaded?' } }),
+    grokUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'chartreuse should not be searchable from a reasoning block' } }),
+    grokUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Yes, loaded.' } }),
+  ].join('\n')}\n`, 'utf-8');
+  await fs.writeFile(path.join(dir, 'summary.json'), JSON.stringify({
+    info: { id: GROK_SESSION, cwd: DIR_B },
+    created_at: '2026-08-16T00:30:00.000Z',
+    updated_at: '2026-08-16T00:30:00.000Z',
+    num_messages: 3,
+  }));
+  return file;
 };
 
 type THandler = (req: NextApiRequest, res: NextApiResponse) => Promise<unknown>;
@@ -205,7 +207,6 @@ type THandler = (req: NextApiRequest, res: NextApiResponse) => Promise<unknown>;
 describe('GET /api/timeline/search', () => {
   let home: string;
   let handler: THandler;
-  let closeGrok: () => void;
 
   const call = async (query: Record<string, string>): Promise<IFakeResponse> => {
     const response = fakeResponse();
@@ -225,11 +226,9 @@ describe('GET /api/timeline/search', () => {
     mockHome.value = home;
     await writeWorkspaces(home);
     ({ default: handler } = await import('@/pages/api/timeline/search'));
-    ({ closeGrokDatabase: closeGrok } = await import('@/lib/providers/grok/db'));
   });
 
   afterEach(async () => {
-    closeGrok();
     await fs.rm(home, { recursive: true, force: true });
   });
 
@@ -284,6 +283,8 @@ describe('GET /api/timeline/search', () => {
     expect(byKey.get('claude:global')?.workspaceName).toBe('global');
     expect(byKey.get(`codex:${WORKSPACE_A}`)?.workspaceName).toBe('Alpha');
     expect(byKey.get(`grok:${WORKSPACE_B}`)?.workspaceName).toBe('Beta');
+    // An ad-hoc grok tab runs against ~/.grok, so its key is global even though
+    // the hit is attributed to Beta by cwd.
     expect(byKey.get(`grok:${WORKSPACE_B}`)?.sessionKey).toBe(`grok:global:${GROK_SESSION}`);
     expect(byKey.get('claude:global')?.sessionKey).toBe(`claude:global:${CLAUDE_GLOBAL_SESSION}`);
   });
@@ -301,9 +302,9 @@ describe('GET /api/timeline/search', () => {
     const global = await search({ q: 'chartreuse', workspaceId: 'global' });
     expect(global.hits.map((hit) => hit.sessionKey)).toEqual([`claude:global:${CLAUDE_GLOBAL_SESSION}`]);
 
-    // The hit is ATTRIBUTED to Beta by cwd, but grok has no per-workspace store,
-    // so its key stays global — fork ADR-0005, and the same key the live socket
-    // and sessions-v2 produce.
+    // The hit is ATTRIBUTED to Beta by cwd; the KEY comes from the store the
+    // session sits in, which for an ad-hoc tab is the unscoped ~/.grok — the
+    // same key the live socket and sessions-v2 produce.
     const beta = await search({ q: 'chartreuse', workspaceId: WORKSPACE_B });
     expect(beta.hits.map((hit) => hit.sessionKey)).toEqual([`grok:global:${GROK_SESSION}`]);
     expect(new Set(beta.hits.map((hit) => hit.workspaceId))).toEqual(new Set([WORKSPACE_B]));
@@ -428,6 +429,16 @@ describe('GET /api/timeline/search', () => {
     expect(total).toBeGreaterThanOrEqual(MAX_SCAN_HITS);
     expect(truncated).toBe(true);
     expect(hits).toHaveLength(100);
+  });
+
+  it('keys a workspace grok session by its GROK_HOME, not by its cwd', async () => {
+    const grokHome = path.join(home, '.purplemux', 'workspaces', WORKSPACE_A, 'grok-home');
+    await writeGrokStore(home, grokHome);
+
+    const { hits } = await search({ q: 'chartreuse', provider: 'grok' });
+
+    expect(hits.map((hit) => hit.sessionKey)).toEqual([`grok:${WORKSPACE_A}:${GROK_SESSION}`]);
+    expect(hits.map((hit) => hit.workspaceId)).toEqual([WORKSPACE_A]);
   });
 
   it('charges a grok session real bytes so it consumes the scan budget', async () => {

@@ -16,9 +16,9 @@ Cross-workspace access is deliberate and rare: the TARGET workspace must name yo
 workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
 add one rather than working around a 403.
 
-Each workspace also gets its own agent session store (\`CLAUDE_CONFIG_DIR\`), so
-several workspaces can share one project root without sharing conversation
-history or resume lists.
+Each workspace also gets its own agent session store — \`CLAUDE_CONFIG_DIR\` for
+Claude, \`GROK_HOME\` for Grok — so several workspaces can share one project root
+without sharing conversation history or resume lists.
 
 ## Workspaces
 

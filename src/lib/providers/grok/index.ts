@@ -1,12 +1,14 @@
-import { runGrokPreflight, checkGrokApiKey, GROK_BIN_PATH } from '@/lib/providers/grok/preflight';
+import { getDangerouslySkipPermissions } from '@/lib/config-store';
+import { GROK_BIN_PATH, grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
+import { checkGrokLogin, runGrokPreflight } from '@/lib/providers/grok/preflight';
 import { readGrokRuntimeSnapshot, readGrokSessionHistoryStats } from '@/lib/providers/grok/runtime-snapshot';
 import {
   detectActiveSession as detectGrokSession,
   isGrokRunning,
-  isValidGrokSessionId,
   watchSessions as watchGrokSessions,
 } from '@/lib/providers/grok/session-detection';
-import { GROK_PROVIDER_ID } from '@/lib/providers/grok/transcript';
+import { isValidGrokSessionId } from '@/lib/providers/grok/session-store';
+import { GROK_PROVIDER_ID } from '@/lib/session-parser-grok';
 import type { IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
 import type { IAgentState, ITab } from '@/types/terminal';
 
@@ -39,18 +41,24 @@ const shellSingleQuote = (value: string): string => `'${value.replace(/'/g, `'\\
 
 /**
  * The install script drops grok at `~/.grok/bin/grok` without always putting
- * that directory on PATH, so fall back to the absolute path rather than
- * launching a pane that immediately reports "command not found".
+ * that directory on PATH, and the parked community `grok-cli` builds a binary of
+ * the same name — so the absolute path is preferred and PATH is only the
+ * fallback for an install that lives somewhere else.
  */
 const grokBinary = async (): Promise<string> => {
   const { binaryPath } = await runGrokPreflight();
-  return binaryPath ? 'grok' : shellSingleQuote(GROK_BIN_PATH);
+  return binaryPath ? shellSingleQuote(binaryPath) : shellSingleQuote(GROK_BIN_PATH);
 };
 
-/** grok resolves its workspace from the working directory, so the pane's cwd is the scope. */
-const composeLaunchCommand = async (resumeSessionId?: string): Promise<string> => {
-  const parts = [await grokBinary(), '-d', '"$PWD"'];
-  if (resumeSessionId) parts.push('--session', shellSingleQuote(resumeSessionId));
+/**
+ * The pane's `GROK_HOME` is exported by the login shell (`src/lib/tmux.ts`), so
+ * the command itself only has to name the working directory, the permission
+ * mode and — on a resume — the session.
+ */
+export const composeGrokLaunchCommand = async (resumeSessionId?: string): Promise<string> => {
+  const parts = [await grokBinary(), '--cwd', '"$PWD"'];
+  if (await getDangerouslySkipPermissions()) parts.push('--permission-mode', 'bypassPermissions');
+  if (resumeSessionId) parts.push('--resume', shellSingleQuote(resumeSessionId));
   return parts.join(' ');
 };
 
@@ -60,7 +68,7 @@ const grokAgentPreflight = async (): Promise<IAgentPreflight> => {
     installed: status.installed,
     version: status.version,
     binaryPath: status.binaryPath,
-    loggedIn: status.installed ? await checkGrokApiKey() : false,
+    loggedIn: status.installed ? await checkGrokLogin() : false,
   };
 };
 
@@ -70,7 +78,7 @@ export const grokProvider: IAgentProvider = {
   panelType: 'grok-cli',
 
   matchesProcess: (commandName, args) => {
-    if (commandName === 'grok') return true;
+    if (commandName === 'grok' || commandName === 'agent') return true;
     return Boolean(args?.some((arg) => arg === GROK_BIN_PATH || arg.endsWith('/.grok/bin/grok')));
   },
   isValidSessionId: isValidGrokSessionId,
@@ -79,12 +87,12 @@ export const grokProvider: IAgentProvider = {
   isAgentRunning: (panePid, childPids) => isGrokRunning(panePid, childPids),
   watchSessions: (panePid, onChange, options) => watchGrokSessions(panePid, onChange, options),
 
-  buildLaunchCommand: () => composeLaunchCommand(),
+  buildLaunchCommand: () => composeGrokLaunchCommand(),
   buildResumeCommand: (sessionId) => {
     if (!isValidGrokSessionId(sessionId)) {
       throw new Error(`Invalid grok session ID format: ${sessionId}`);
     }
-    return composeLaunchCommand(sessionId);
+    return composeGrokLaunchCommand(sessionId);
   },
 
   readSessionId: (tab) => readField(tab, 'sessionId'),
@@ -94,10 +102,10 @@ export const grokProvider: IAgentProvider = {
   readSummary: (tab) => readField(tab, 'summary'),
   writeSummary: (tab, summary) => writeField(tab, 'summary', summary),
 
-  /** grok's TUI does not write a pane title, and its store has no path to parse. */
+  /** grok's TUI does not write a pane title. */
   parsePaneTitle: () => null,
-  sessionIdFromJsonlPath: () => null,
-  readRuntimeSnapshot: (handle) => readGrokRuntimeSnapshot(handle),
-  readSessionHistoryStats: (handle) => readGrokSessionHistoryStats(handle),
+  sessionIdFromJsonlPath: grokSessionIdFromJsonlPath,
+  readRuntimeSnapshot: (jsonlPath) => readGrokRuntimeSnapshot(jsonlPath),
+  readSessionHistoryStats: (jsonlPath) => readGrokSessionHistoryStats(jsonlPath),
   preflight: grokAgentPreflight,
 };

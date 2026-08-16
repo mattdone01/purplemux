@@ -29,9 +29,9 @@ interface IMobileGrokPanelProps {
 }
 
 /**
- * Mobile chat face for a grok tab. The message-count sheet reads a transcript
- * path, which grok does not have — its store is `~/.grok/grok.db` — so the
- * sheet shows the counts the timeline itself already carries.
+ * Mobile chat face for a grok tab. The message-count sheet is driven from the
+ * counts the timeline already carries rather than from a separate transcript
+ * read, so it costs nothing on a tab that is already streaming.
  */
 const MobileGrokPanel = ({
   tabId,

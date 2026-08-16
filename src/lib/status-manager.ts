@@ -16,6 +16,7 @@ import { capturePaneAtWidth } from '@/lib/capture-at-width';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
 import { GROK_PROVIDER_ID } from '@/lib/providers/grok';
+import { resolveGrokJsonlPath } from '@/lib/providers/grok/session-detection';
 import { isAgentPanelType, toSessionHistoryProvider } from '@/lib/agent-panel-types';
 import { runtimeHandleFor, runtimeProviderId } from '@/lib/agent-runtime-handle';
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
@@ -243,21 +244,24 @@ class StatusManager {
         } catch { /* fall through */ }
       }
 
+      // Codex and grok both key their stores by their own index rather than by
+      // the pane's cwd, so a persisted session id resolves to a transcript
+      // without re-detecting the process.
       const persistedSessionId = provider.readSessionId(tab);
-      if (persistedSessionId && provider.id === CODEX_PROVIDER_ID) {
-        const codexSession = await findCodexSessionById(persistedSessionId);
-        if (codexSession?.jsonlPath) {
-          const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(codexSession.jsonlPath);
-          return { lastAssistantSnippet, currentAction, jsonlPath: codexSession.jsonlPath };
+      if (persistedSessionId) {
+        const storeJsonlPath = provider.id === CODEX_PROVIDER_ID
+          ? (await findCodexSessionById(persistedSessionId))?.jsonlPath ?? null
+          : provider.id === GROK_PROVIDER_ID
+            ? await resolveGrokJsonlPath(persistedSessionId)
+            : null;
+        const handle = runtimeHandleFor(provider.id, {
+          jsonlPath: storeJsonlPath,
+          sessionId: persistedSessionId,
+        });
+        if (handle) {
+          const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(handle);
+          return { lastAssistantSnippet, currentAction, jsonlPath: storeJsonlPath };
         }
-      }
-
-      // A store with no transcript file — grok — is reached by session id, the
-      // same handle the polling path uses.
-      const storeHandle = runtimeHandleFor(provider.id, { jsonlPath: null, sessionId: persistedSessionId });
-      if (storeHandle) {
-        const { lastAssistantSnippet, currentAction } = await provider.readRuntimeSnapshot(storeHandle);
-        return { lastAssistantSnippet, currentAction, jsonlPath: null };
       }
     }
 
@@ -1060,7 +1064,7 @@ class StatusManager {
       this.broadcastUpdate(tabId, entry);
     }
 
-    if ((newState === 'busy' || newState === 'needs-input') && !entry.jsonlPath && entry.panelType !== 'grok-cli') {
+    if ((newState === 'busy' || newState === 'needs-input') && !entry.jsonlPath) {
       this.resolveAndWatchJsonl(tabId, tmuxSession).catch(() => {});
     }
 
@@ -1401,8 +1405,7 @@ class StatusManager {
         const tabSessionId = tab && tabProvider ? tabProvider.readSessionId(tab) : null;
         if (tab && tabProvider && tabSessionId) {
           if (tabProvider.id === GROK_PROVIDER_ID) {
-            // grok keeps its transcript in SQLite; there is no file to resolve.
-            jsonlPath = null;
+            jsonlPath = await resolveGrokJsonlPath(tabSessionId);
           } else if (tabProvider.id === CODEX_PROVIDER_ID) {
             jsonlPath = (await findCodexSessionById(tabSessionId))?.jsonlPath ?? null;
           } else {

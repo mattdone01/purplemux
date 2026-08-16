@@ -127,6 +127,8 @@ const grokUsage = (): IGrokUsageSummary => ({
       model: 'grok-4.20',
       inputTokens: 400,
       outputTokens: 90,
+      cacheReadTokens: 120,
+      cacheCreationTokens: 0,
       cost: 0.19,
       messageCount: 2,
     },
@@ -155,7 +157,7 @@ vi.mock('@/lib/stats/jsonl-parser-codex', () => ({
 }));
 
 vi.mock('@/lib/stats/grok-usage', () => ({
-  readGrokUsage: () => state.grokUsage,
+  readGrokUsage: async () => state.grokUsage,
 }));
 
 const { default: handler } = await import('@/pages/api/stats/overview');
@@ -280,14 +282,17 @@ describe('GET /api/stats/overview byProvider', () => {
     });
   });
 
-  it('attributes grok tokens with no cache counters', async () => {
+  // Grok Build bills a subscription but still records spend per turn
+  // (`turn_completed.usage.costUsdTicks`), and its usage carries cache-read
+  // counters, so neither is zeroed.
+  it('attributes grok tokens, cache reads and real cost', async () => {
     const body = await callOverview('all');
 
     expect(body.byProvider.grok).toEqual({
       totalCost: 0.19,
       inputTokens: 400,
       outputTokens: 90,
-      cacheReadTokens: 0,
+      cacheReadTokens: 120,
       cacheCreationTokens: 0,
       sessions: 1,
       messages: 2,

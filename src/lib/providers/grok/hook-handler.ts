@@ -1,5 +1,7 @@
 import {
-  isGrokSessionSource,
+  grokHookEvent,
+  grokPromptText,
+  isGrokSettleNotification,
   translateGrokHookEvent,
   type IGrokHookPayload,
 } from '@/lib/providers/grok/hook-payload';
@@ -10,49 +12,58 @@ const SUMMARY_LIMIT = 80;
 
 export interface IHandleGrokHookResult {
   ok: boolean;
-  reason?: 'unknown-event';
+  reason?: 'unknown-event' | 'subagent';
 }
 
 /**
- * Converts grok's hook payload into purplemux's provider-neutral translation.
- * grok has no transcript file, so `jsonlPath` is never patched — the timeline
- * reads `~/.grok/grok.db` keyed on the session id instead.
+ * Converts Grok Build's hook payload into purplemux's provider-neutral
+ * translation. `jsonlPath` is not patched here: the hook carries the session id
+ * and cwd, and the transcript path is resolved from those by session detection.
  */
 export const processGrokHookPayload = (
   payload: IGrokHookPayload,
 ): { result: IHandleGrokHookResult; translation: IAgentHookTranslation } => {
   const meta: NonNullable<IAgentHookTranslation['meta']> = {
-    sessionId: payload.session_id ?? null,
+    sessionId: payload.sessionId ?? null,
   };
 
-  if (payload.hook_event_name === 'UserPromptSubmit' && typeof payload.user_prompt === 'string' && payload.user_prompt) {
-    meta.lastUserMessage = payload.user_prompt;
-    meta.agentSummary = payload.user_prompt.slice(0, SUMMARY_LIMIT);
+  const event = grokHookEvent(payload.hookEventName);
+  const prompt = event === 'user_prompt_submit' ? grokPromptText(payload) : null;
+  if (prompt) {
+    meta.lastUserMessage = prompt;
+    meta.agentSummary = prompt.slice(0, SUMMARY_LIMIT);
   }
 
   const translation: IAgentHookTranslation = { meta };
 
-  if (payload.hook_event_name === 'SessionStart') {
+  if (payload.subagentType) {
+    return { result: { ok: false, reason: 'subagent' }, translation };
+  }
+
+  if (event === 'session_start') {
     translation.sessionInfo = {
       status: 'running',
-      sessionId: payload.session_id ?? null,
+      sessionId: payload.sessionId ?? null,
       jsonlPath: null,
       pid: null,
       startedAt: null,
-      cwd: payload.cwd ?? null,
+      cwd: payload.cwd ?? payload.workspaceRoot ?? null,
     };
   }
 
-  const event = translateGrokHookEvent(payload);
-  translation.event = event;
-  if (!event) return { result: { ok: false, reason: 'unknown-event' }, translation };
+  const workEvent = translateGrokHookEvent(payload);
+  translation.event = workEvent;
+  if (!workEvent) return { result: { ok: false, reason: 'unknown-event' }, translation };
 
   return { result: { ok: true }, translation };
 };
 
 /**
- * grok fires `SessionStart` lazily, on the first prompt of a session rather
- * than at launch, so a late one must not knock a busy tab back to idle.
+ * `idle_prompt` reports a STATE, not an outcome: grok fires it about a minute
+ * after any turn end, including one already settled by `Stop`, and it is the
+ * only signal for the turns that report no stop at all. Settling on it
+ * unconditionally would drag a tab the user has since re-prompted back out of
+ * `busy`, so it only lands while the tab is still busy.
  */
 export const shouldEmitGrokHookEvent = (
   payload: IGrokHookPayload,
@@ -60,9 +71,8 @@ export const shouldEmitGrokHookEvent = (
 ): boolean => {
   const event = translateGrokHookEvent(payload);
   if (!event) return false;
-  if (event.kind === 'session-start') {
-    const source = isGrokSessionSource(payload.source) ? payload.source : 'startup';
-    return source === 'startup' && (cliState === 'inactive' || cliState === 'unknown');
+  if (grokHookEvent(payload.hookEventName) === 'notification' && isGrokSettleNotification(payload.notificationType)) {
+    return cliState === 'busy';
   }
   return true;
 };

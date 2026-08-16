@@ -1,0 +1,1 @@
+{"prompt_index":0,"created_at":"2026-08-16T04:10:28.999713118Z","file_snapshots":{"note.txt":{"path":"note.txt","content":"hello world\n","captured_at":"2026-08-16T04:10:38.043223646Z"}},"after_snapshots":{"note.txt":{"path":"note.txt","content":"hello grok\n","captured_at":"2026-08-16T04:10:44.822764749Z"}}}

@@ -3,7 +3,8 @@ import path from 'path';
 import os from 'os';
 import { createLogger } from '@/lib/logger';
 import { STATUSLINE_SCRIPT_PATH, STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
-import { ensureGrokHookSettings } from '@/lib/providers/grok/hook-config';
+import { ensureGrokHookFiles } from '@/lib/providers/grok/hook-config';
+import { GROK_HOOK_SCRIPT_PATH as GROK_HOOK_SCRIPT } from '@/lib/providers/grok/paths';
 
 const log = createLogger('hooks');
 const codexLog = createLogger('codex-hook');
@@ -14,7 +15,6 @@ const HOOKS_FILE = path.join(BASE_DIR, 'hooks.json');
 const PORT_FILE = path.join(BASE_DIR, 'port');
 const HOOK_SCRIPT = path.join(BASE_DIR, 'status-hook.sh');
 const CODEX_HOOK_SCRIPT = path.join(BASE_DIR, 'codex-hook.sh');
-const GROK_HOOK_SCRIPT = path.join(BASE_DIR, 'grok-hook.sh');
 
 export const HOOK_SETTINGS_PATH = HOOKS_FILE;
 export const CODEX_HOOK_SCRIPT_PATH = CODEX_HOOK_SCRIPT;
@@ -78,12 +78,18 @@ exit 0
 `;
 
 /**
- * grok delivers its hook payload as JSON on stdin (`src/hooks/executor.ts`
- * pipes it to `sh -c <command>`), so the body is read with `cat` rather than
- * parsed out of argv. The POST is detached and time-boxed: a hook that blocks
- * blocks grok's turn, and `PostToolUse` fires on every tool call.
+ * Grok Build pipes the hook payload as JSON on stdin and sets `GROK_HOOK_EVENT`
+ * and `GROK_SESSION_ID` on every hook process (`10-hooks.md`, "Environment
+ * Variables"). The body is forwarded verbatim — the server reads its camelCase
+ * fields — and the event rides the query string so a hook whose stdin is empty
+ * still reports.
+ *
+ * The POST is detached and time-boxed: a `Stop` hook runs on the turn's
+ * critical path, `PostToolUse` fires on every mutating tool call, and neither
+ * may wait on the round trip. Always exits 0, because a non-zero exit from a
+ * `Stop` hook would block grok from finishing its turn.
  */
-const GROK_HOOK_SCRIPT_CONTENT = `#!/bin/sh
+export const GROK_HOOK_SCRIPT_CONTENT = `#!/bin/sh
 PORT_FILE="$HOME/.purplemux/port"
 TOKEN_FILE="$HOME/.purplemux/cli-token"
 [ -f "$PORT_FILE" ] || exit 0
@@ -94,12 +100,12 @@ SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""
 [ -n "$SESSION" ] || exit 0
 
 BODY=$(cat)
-[ -n "$BODY" ] || exit 0
+[ -z "$BODY" ] && BODY='{}'
 
 printf '%s' "$BODY" | curl -s -X POST -o /dev/null --max-time 2 \\
   -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
   --data-binary @- \\
-  "http://localhost:\${PORT}/api/status/hook?provider=grok&tmuxSession=\${SESSION}" >/dev/null 2>&1 &
+  "http://localhost:\${PORT}/api/status/hook?provider=grok&tmuxSession=\${SESSION}&event=\${GROK_HOOK_EVENT}" >/dev/null 2>&1 &
 exit 0
 `;
 
@@ -173,7 +179,7 @@ export const ensureHookSettings = async (port: number): Promise<IEnsureHookSetti
   let grokHookInstallFailed = false;
   try {
     await writeManagedScript(GROK_HOOK_SCRIPT, GROK_HOOK_SCRIPT_CONTENT, 0o700);
-    await ensureGrokHookSettings(GROK_HOOK_SCRIPT);
+    await ensureGrokHookFiles(GROK_HOOK_SCRIPT);
   } catch (err) {
     grokHookInstallFailed = true;
     grokLog.error({ err }, 'grok hook install failed');
