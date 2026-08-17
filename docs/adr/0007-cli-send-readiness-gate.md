@@ -3,7 +3,7 @@
 _Epic story: 22 (see `_output/purplemux-mobile/stories/22-cli-send-readiness-gate.md`)._
 
 ## Status
-Accepted (2026-08-16, epic `purplemux-mobile`, story 22)
+Accepted (2026-08-16, epic `purplemux-mobile`, story 22). Narrowed by ADR-0008: the wait described here belongs to the CLI route only — the cookie-authed route sends to a live session in any state.
 
 ## Context
  `purplemux tab send` delivers with `sendBracketedPaste` — bracketed paste, then Enter — and answered `{"status":"sent","submitted":true}` unconditionally. An agent TUI that is still booting has no composer bound yet: the paste lands in the input box and the Enter is swallowed. On 2026-08-16 three worker tabs of this epic (stories 06, 07, 09) sat in exactly that state for ~50 minutes of wall-clock. Each call reported success, each tab reported `cliState: busy`, and a tab that never starts never changes state, so no downstream signal existed. Recovery was a manual `tmux send-keys -t <session> Enter`. ADR-0003 already built the gate for the cookie-authed twin (`agent-not-ready`, `detail: 'session-not-running'`), but the CLI route — the one orchestrators drive — had none.

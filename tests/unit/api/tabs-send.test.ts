@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiRequest, NextApiResponse } from 'next';
-import type { ITab } from '@/types/terminal';
+import type { ITab, TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 
 const tmux = vi.hoisted(() => ({
@@ -133,36 +133,69 @@ describe('POST /api/tabs/[tabId]/send', () => {
   });
 
   it.each<TCliState>(['busy', 'inactive', 'unknown', 'cancelled'])(
-    'refuses a send while %s and pastes nothing',
+    'delivers a send while %s, exactly as the web client does',
     async (state) => {
       cliUtils.findTab.mockResolvedValue({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab: tabWith(state) });
 
       const response = await call({ content: 'hello' });
 
-      expect(response.statusCode).toBe(409);
-      expect(response.body).toMatchObject({ error: 'agent-not-ready', cliState: state });
-      expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
-      expect(tmux.sendBracketedPasteText).not.toHaveBeenCalled();
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: state });
+      expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'hello');
     },
   );
 
-  it('refuses a send to a tab that has no state at all', async () => {
+  it.each<TPanelType>(['claude-code', 'codex-cli', 'grok-cli'])(
+    'delivers to a busy %s tab',
+    async (panelType) => {
+      cliUtils.findTab.mockResolvedValue({
+        workspaceId: WORKSPACE_ID,
+        paneId: 'pane-1',
+        tab: { ...tabWith('busy'), panelType },
+      });
+
+      const response = await call({ content: 'status?' });
+
+      expect(response.statusCode).toBe(200);
+      expect(tmux.sendBracketedPaste).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('delivers a send to a tab that has no state at all', async () => {
     cliUtils.findTab.mockResolvedValue({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab: tabWith(undefined) });
 
     const response = await call({ content: 'hello' });
 
-    expect(response.statusCode).toBe(409);
-    expect(response.body).toMatchObject({ error: 'agent-not-ready', cliState: null });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toMatchObject({ status: 'sent', cliState: null });
   });
 
-  it('prefers the live status entry over the state persisted in the layout', async () => {
+  it('reports the live status entry rather than the state persisted in the layout', async () => {
     cliUtils.findTab.mockResolvedValue({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab: tabWith('idle') });
     live.entries = { [TAB_ID]: { cliState: 'busy' } };
 
     const response = await call({ content: 'hello' });
 
-    expect(response.statusCode).toBe(409);
-    expect(response.body).toMatchObject({ error: 'agent-not-ready', cliState: 'busy' });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toMatchObject({ status: 'sent', cliState: 'busy' });
+  });
+
+  it('never holds the request open waiting for a busy agent to settle', async () => {
+    cliUtils.findTab.mockResolvedValue({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab: tabWith('busy') });
+
+    const response = await call({ content: 'hello' });
+
+    expect(response.statusCode).toBe(200);
+    expect(cliUtils.findTab).toHaveBeenCalledOnce();
+  });
+
+  it('leaves a busy agent content in the composer when submit is false', async () => {
+    cliUtils.findTab.mockResolvedValue({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab: tabWith('busy') });
+
+    const response = await call({ content: 'draft', submit: false });
+
+    expect(response.statusCode).toBe(200);
+    expect(tmux.sendBracketedPasteText).toHaveBeenCalledWith(SESSION_NAME, 'draft');
   });
 
   it('leaves the content in the composer when submit is false', async () => {
@@ -209,7 +242,22 @@ describe('POST /api/tabs/[tabId]/send', () => {
     const response = await call({ content: 'hello' });
 
     expect(response.statusCode).toBe(409);
-    expect(response.body).toMatchObject({ error: 'agent-not-ready', detail: 'session-not-running' });
+    expect(response.body).toEqual({
+      error: 'agent-not-ready',
+      cliState: 'idle',
+      detail: 'session-not-running',
+    });
+    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+  });
+
+  it('a dead session is the only refusal left — busy included', async () => {
+    tmux.hasSession.mockResolvedValue(false);
+    cliUtils.findTab.mockResolvedValue({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab: tabWith('busy') });
+
+    const response = await call({ content: 'hello' });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toMatchObject({ cliState: 'busy', detail: 'session-not-running' });
     expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
   });
 
@@ -264,20 +312,6 @@ describe('POST /api/tabs/[tabId]/send', () => {
 });
 
 describe('tab-send helpers', () => {
-  it('treats only composer-bearing states as sendable', async () => {
-    const { isSendableCliState } = await import('@/lib/tab-send');
-
-    expect(isSendableCliState('idle')).toBe(true);
-    expect(isSendableCliState('ready-for-review')).toBe(true);
-    expect(isSendableCliState('needs-input')).toBe(true);
-    expect(isSendableCliState('busy')).toBe(false);
-    expect(isSendableCliState('inactive')).toBe(false);
-    expect(isSendableCliState('unknown')).toBe(false);
-    expect(isSendableCliState('cancelled')).toBe(false);
-    expect(isSendableCliState(null)).toBe(false);
-    expect(isSendableCliState(undefined)).toBe(false);
-  });
-
   it('falls back to the persisted state only when there is no live entry', async () => {
     const { resolveTabCliState } = await import('@/lib/tab-send');
 

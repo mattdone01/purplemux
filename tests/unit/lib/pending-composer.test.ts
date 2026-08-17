@@ -66,4 +66,47 @@ describe('isPaneShowingPendingContent', () => {
     // so the detector declines rather than guessing.
     expect(isPaneShowingPendingContent(composer('ok'), 'ok')).toBe(false);
   });
+
+  /**
+   * Captured from a live pane on 2026-08-17 after a send to a BUSY agent
+   * (story 32). Claude Code accepted the prompt and QUEUED it: the echo sits
+   * above the box with a real `❯` marker, and the composer below holds only
+   * the queued-messages placeholder. Read by proximity to the pane bottom this
+   * is a false alarm; read by box region it is not pending at all.
+   */
+  const queued = (text: string) =>
+    [
+      '  1719',
+      '  1720',
+      `  ❯ ${text}`,
+      '',
+      '─'.repeat(60),
+      '❯\u00a0Press up to edit queued messages',
+      '─'.repeat(60),
+      ' '.repeat(60),
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+
+  it('does NOT report a queued message as stranded in the composer', () => {
+    expect(isPaneShowingPendingContent(queued('hello from the phone'), 'hello from the phone'))
+      .toBe(false);
+  });
+
+  it('still flags a real stranded paste in the same TUI layout', () => {
+    const pane = [
+      '  1719',
+      '  1720',
+      '',
+      '─'.repeat(60),
+      '❯\u00a0hello from the phone',
+      '─'.repeat(60),
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(isPaneShowingPendingContent(pane, 'hello from the phone')).toBe(true);
+  });
+
+  it('falls back to the bottom of the pane when the TUI draws no box', () => {
+    const pane = ['some output', '> commit this'].join('\n');
+    expect(isPaneShowingPendingContent(pane, 'commit this')).toBe(true);
+  });
 });

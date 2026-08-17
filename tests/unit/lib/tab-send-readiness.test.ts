@@ -6,8 +6,10 @@ import {
   DEFAULT_SEND_READY_TIMEOUT_MS,
   MAX_SEND_READY_TIMEOUT_MS,
   SEND_READY_POLL_INTERVAL_MS,
+  isComposerReadyCliState,
   resolveSendWaitMs,
   type ITabSendTarget,
+  type TSendGate,
   type TSendReadiness,
 } from '@/lib/tab-send';
 
@@ -26,6 +28,7 @@ interface IStep {
 const runReadiness = async (
   steps: (IStep | null)[],
   timeoutMs: number,
+  gate: TSendGate = 'composer-ready',
 ): Promise<{ result: TSendReadiness; sleeps: number[]; polls: number }> => {
   const sleeps: number[] = [];
   let clock = 0;
@@ -47,7 +50,7 @@ const runReadiness = async (
         clock += ms;
       },
     },
-    { workspaceId: 'ws', tabId: 'tab-1', timeoutMs },
+    { workspaceId: 'ws', tabId: 'tab-1', timeoutMs, gate },
   );
 
   return { result, sleeps, polls };
@@ -59,7 +62,7 @@ const agent = (cliState: TCliState | null, alive = true): IStep => ({
   alive,
 });
 
-describe('awaitSendReadiness', () => {
+describe('awaitSendReadiness on the composer-ready gate', () => {
   it('is ready immediately when the agent already holds a composer', async () => {
     const { result, sleeps, polls } = await runReadiness([agent('idle')], 5_000);
 
@@ -151,6 +154,68 @@ describe('awaitSendReadiness', () => {
 
       expect(result).toMatchObject({ reason: 'readiness-timeout' });
     }
+  });
+});
+
+describe('awaitSendReadiness on the live-session gate', () => {
+  it.each<TCliState>(['idle', 'busy', 'inactive', 'unknown', 'cancelled', 'ready-for-review', 'needs-input'])(
+    'delivers to an agent in %s without waiting',
+    async (state) => {
+      const { result, sleeps, polls } = await runReadiness([agent(state)], 60_000, 'live-session');
+
+      expect(result).toMatchObject({ ok: true, target: { cliState: state } });
+      expect(sleeps).toEqual([]);
+      expect(polls).toBe(1);
+    },
+  );
+
+  it('delivers to a tab whose state is not known at all', async () => {
+    const { result } = await runReadiness([agent(null)], 0, 'live-session');
+
+    expect(result).toMatchObject({ ok: true });
+  });
+
+  it('still refuses a tab whose tmux session is not running', async () => {
+    const { result, sleeps } = await runReadiness([agent('busy', false)], 60_000, 'live-session');
+
+    expect(result).toEqual({ ok: false, reason: 'session-not-running', cliState: 'busy' });
+    expect(sleeps).toEqual([]);
+  });
+
+  it('still refuses a tab that is not in the layout', async () => {
+    const { result } = await runReadiness([null], 0, 'live-session');
+
+    expect(result).toEqual({ ok: false, reason: 'tab-not-found' });
+  });
+
+  it('never reports a readiness timeout, whatever the deadline', async () => {
+    const { result } = await runReadiness([agent('busy')], 0, 'live-session');
+
+    expect(result).toMatchObject({ ok: true });
+  });
+
+  it.each<TPanelType>(['claude-code', 'codex-cli', 'grok-cli', 'terminal'])(
+    'treats a %s panel the same way',
+    async (panelType) => {
+      const { result } = await runReadiness([{ cliState: 'busy', panelType }], 0, 'live-session');
+
+      expect(result).toMatchObject({ ok: true, target: { panelType } });
+    },
+  );
+});
+
+describe('isComposerReadyCliState', () => {
+  it.each<TCliState>(['idle', 'ready-for-review', 'needs-input'])('reports %s ready', (state) => {
+    expect(isComposerReadyCliState(state)).toBe(true);
+  });
+
+  it.each<TCliState>(['busy', 'inactive', 'unknown', 'cancelled'])('reports %s not ready', (state) => {
+    expect(isComposerReadyCliState(state)).toBe(false);
+  });
+
+  it('reports an absent state not ready', () => {
+    expect(isComposerReadyCliState(null)).toBe(false);
+    expect(isComposerReadyCliState(undefined)).toBe(false);
   });
 });
 
