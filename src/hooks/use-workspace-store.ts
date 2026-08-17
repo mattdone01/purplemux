@@ -13,6 +13,9 @@ interface IValidateResponse {
   valid: boolean;
   error?: string;
   suggestedName?: string;
+  exists?: boolean;
+  isDirectory?: boolean;
+  canCreate?: boolean;
 }
 
 export interface IWorkspaceInitialData {

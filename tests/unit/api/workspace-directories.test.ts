@@ -64,7 +64,7 @@ describe('parseDirectoriesPatch', () => {
 describe('PATCH /api/workspace/[workspaceId] directories', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(validateDirectory).mockResolvedValue({ valid: true });
+    vi.mocked(validateDirectory).mockResolvedValue({ valid: true, exists: true, isDirectory: true, canCreate: true });
     vi.mocked(updateWorkspaceDirectories).mockResolvedValue(true);
     vi.mocked(getWorkspaceById).mockResolvedValue({ id: 'ws-test', name: 'test', directories: ['/a'] });
   });
@@ -83,7 +83,7 @@ describe('PATCH /api/workspace/[workspaceId] directories', () => {
   });
 
   it('rejects non-existent paths with 400', async () => {
-    vi.mocked(validateDirectory).mockResolvedValue({ valid: false, error: 'Directory does not exist' });
+    vi.mocked(validateDirectory).mockResolvedValue({ valid: false, error: 'Directory does not exist', exists: false, isDirectory: false, canCreate: false });
     const { statusCode, body } = await run({ directories: ['/nope'] });
     expect(statusCode).toBe(400);
     expect(body).toMatchObject({ error: '/nope: Directory does not exist' });

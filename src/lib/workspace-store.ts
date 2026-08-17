@@ -19,6 +19,13 @@ import type { ICreateLayoutOptions } from '@/lib/layout-store';
 import { listProviders } from '@/lib/providers/registry';
 import { getVisuallyOrderedWorkspaces } from '@/lib/workspace-order';
 import { removeWorkspaceGrokHome } from '@/lib/grok-home';
+import {
+  buildDirectoryValidation,
+  directoryError,
+  planDirectoryCreate,
+  type IDirectoryValidation,
+  type TDirectoryStat,
+} from '@/lib/path-safety';
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
@@ -346,17 +353,42 @@ const findPrimaryDirOwner = (data: IWorkspacesData, dir: string, excludeWsId?: s
   return data.workspaces.find((w) => w.id !== excludeWsId && w.directories[0] && path.resolve(w.directories[0]) === norm);
 };
 
-export const createWorkspace = async (directory: string, name?: string, layoutOptions?: ICreateLayoutOptions): Promise<IWorkspace> =>
-  withLock(async () => {
-    let stat;
-    try {
-      stat = await fs.stat(directory);
-    } catch {
-      throw new Error('Directory does not exist');
-    }
+const statDirectory = async (directory: string): Promise<TDirectoryStat> => {
+  try {
+    const stat = await fs.stat(directory);
+    return stat.isDirectory() ? 'directory' : 'file';
+  } catch {
+    return 'missing';
+  }
+};
 
-    if (!stat.isDirectory()) {
-      throw new Error('Please enter a directory path, not a file');
+export interface ICreateWorkspaceOptions {
+  mkdir?: boolean;
+}
+
+export const createWorkspace = async (
+  directory: string,
+  name?: string,
+  layoutOptions?: ICreateLayoutOptions,
+  options?: ICreateWorkspaceOptions,
+): Promise<IWorkspace> =>
+  withLock(async () => {
+    const plan = planDirectoryCreate({
+      directory,
+      home: os.homedir(),
+      stat: await statDirectory(directory),
+      mkdir: options?.mkdir === true,
+    });
+
+    if (plan.action === 'reject') throw directoryError(plan.error);
+
+    if (plan.action === 'create') {
+      try {
+        await fs.mkdir(directory, { recursive: true });
+      } catch (err) {
+        throw directoryError(`Could not create directory: ${err instanceof Error ? err.message : 'unknown error'}`);
+      }
+      log.info(`Created directory ${directory} for a new workspace`);
     }
 
     const data = (await readWorkspacesFile()) ?? emptyState();
@@ -619,19 +651,9 @@ export const setWorkspaceGroup = async (workspaceId: string, groupId: string | n
     return true;
   });
 
-export const validateDirectory = async (directory: string): Promise<{
-  valid: boolean;
-  error?: string;
-  suggestedName?: string;
-}> => {
-  try {
-    const stat = await fs.stat(directory);
-    if (!stat.isDirectory()) {
-      return { valid: false, error: 'Please enter a directory path, not a file' };
-    }
-  } catch {
-    return { valid: false, error: 'Directory does not exist' };
-  }
-
-  return { valid: true, suggestedName: path.basename(directory) };
-};
+export const validateDirectory = async (directory: string): Promise<IDirectoryValidation> =>
+  buildDirectoryValidation({
+    directory,
+    home: os.homedir(),
+    stat: await statDirectory(directory),
+  });
