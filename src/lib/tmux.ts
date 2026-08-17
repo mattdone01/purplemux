@@ -528,6 +528,31 @@ export const killServer = async (): Promise<void> => {
   }
 };
 
+/** A TUI's horizontal box rule — `────────` in any of the dash characters. */
+const COMPOSER_RULE = /^\s*[─━—\-_]{8,}\s*$/;
+
+/**
+ * The pane lines that belong to the input box, which is the region between the
+ * LAST two box rules a TUI drew.
+ *
+ * Bottom-of-pane proximity is not enough on its own. An agent that queues a
+ * prompt arriving mid-turn echoes it a line or two ABOVE its input box —
+ * `❯ <the message>` with the marker and everything — and the box below still
+ * holds only a placeholder. Read by proximity, that echo is indistinguishable
+ * from a stranded paste; read by region, it is plainly outside the composer.
+ *
+ * Falls back to the bottom of the pane for a TUI that draws no rules at all.
+ */
+const composerRegion = (lines: string[]): string[] => {
+  const rules: number[] = [];
+  for (let i = lines.length - 1; i >= 0 && rules.length < 2; i -= 1) {
+    if (COMPOSER_RULE.test(lines[i])) rules.push(i);
+  }
+  if (rules.length < 2) return lines.slice(-8);
+  const [bottom, top] = rules;
+  return lines.slice(top + 1, bottom);
+};
+
 /**
  * Whether `content` is still sitting UNSUBMITTED in the composer of
  * `sessionName`, best-effort.
@@ -539,19 +564,17 @@ export const killServer = async (): Promise<void> => {
  * it. That is how a stray `commit this` reaches a worker that was told never to
  * run git.
  *
- * Detection is deliberately narrow. It looks only at the bottom of the pane,
- * and only at lines carrying a composer marker (`>`, `❯`, or the box rule a
- * TUI draws around its input), so a copy of the message echoed into the
- * transcript above does not read as pending. It answers false when it cannot
+ * Detection is deliberately narrow. It looks only inside the input box (see
+ * {@link composerRegion}), and only at lines carrying a composer marker (`>`,
+ * `❯`, or the box edge), so neither a transcript echo above nor a queued-message
+ * echo just outside the box reads as pending. It answers false when it cannot
  * tell — a capture failure is not evidence of a stranded paste.
  */
 export const isPaneShowingPendingContent = (pane: string, content: string): boolean => {
   // The first line is what a multi-line paste leaves visible on the prompt row.
   const needle = content.trim().split('\n')[0].trim().slice(0, 40);
   if (needle.length < 3) return false;
-  return pane
-    .split('\n')
-    .slice(-8)
+  return composerRegion(pane.split('\n'))
     .some((line) => /[>❯│|]/.test(line) && line.includes(needle));
 };
 

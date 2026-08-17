@@ -20,6 +20,10 @@ import {
  * route deliberately does NOT live under `/api/cli/**` and implements none of
  * its scope rules (`canDriveWorkspace`, `allowedPeers`); agents keep using the
  * `/api/cli` send route so their confinement stays where it is enforced.
+ *
+ * On the `live-session` gate, so a phone can reach a `busy` agent exactly as
+ * the web client does. The two routes differ in readiness on purpose — see
+ * `TSendGate` in `@/lib/tab-send`.
  */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'POST') {

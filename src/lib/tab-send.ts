@@ -11,20 +11,45 @@ import type { TCliState } from '@/types/timeline';
 export const MAX_SEND_CONTENT_BYTES = 64 * 1024;
 
 /**
- * The states in which an agent has a composer that accepts a paste. Everything
- * else — `busy`, `inactive`, `unknown`, `cancelled` — is refused rather than
- * queued: a paste that lands mid-turn is the stray-input failure
- * `isContentPendingInComposer` exists to detect, and the caller has better
- * options (steer, or open the terminal).
+ * The states in which an agent is known to hold an empty composer.
+ *
+ * A readiness signal, NOT a permission to send. Only the `composer-ready` gate
+ * consults it — see {@link TSendGate}.
  */
-const SENDABLE_STATES: ReadonlySet<TCliState> = new Set<TCliState>([
+const COMPOSER_READY_STATES: ReadonlySet<TCliState> = new Set<TCliState>([
   'idle',
   'ready-for-review',
   'needs-input',
 ]);
 
-export const isSendableCliState = (state: TCliState | null | undefined): boolean =>
-  state != null && SENDABLE_STATES.has(state);
+export const isComposerReadyCliState = (state: TCliState | null | undefined): boolean =>
+  state != null && COMPOSER_READY_STATES.has(state);
+
+/**
+ * Which question a send asks before it pastes. The two callers want different
+ * answers, and conflating them is what stopped the phone talking to a busy
+ * agent — the one tab a person standing outside the house most wants to reach.
+ *
+ * - `live-session` — "is there something on the other end?". A tab whose tmux
+ *   session runs is delivered to, in every `cliState` including `busy`. This is
+ *   what the web client has always done: `POST /api/tmux/send-input` reads no
+ *   `cliState` at all, and an agent TUI queues a prompt that arrives mid-turn.
+ *   Every client driven by a person typing belongs on this gate.
+ *
+ * - `composer-ready` — "is there an empty composer to paste into?". Holds until
+ *   the agent reports a composer, and at the deadline refuses with nothing
+ *   pasted. This is story 22's gate and it must stay: a brief dispatched by
+ *   `purplemux tab send` the instant a tab is created races the TUI's boot, and
+ *   a paste that wins that race has its trailing Enter swallowed — the text
+ *   sits in the input box, the agent never takes a turn, and the caller is told
+ *   `submitted: true`. It cost fifty minutes of an epic once.
+ *
+ * The distinction is boot-race versus mid-turn, not caution versus recklessness.
+ * A person watching the screen sees a swallowed Enter and presses it; an
+ * unattended orchestrator dispatching a brief does not, which is why only that
+ * path waits.
+ */
+export type TSendGate = 'live-session' | 'composer-ready';
 
 /**
  * The live StatusManager entry is the truth; the layout copy is a persisted
@@ -102,7 +127,11 @@ export interface ISendReadinessDeps {
 export interface ISendReadinessRequest {
   workspaceId: string;
   tabId: string;
+
+  /** Ignored on the `live-session` gate, which never has anything to wait for. */
   timeoutMs: number;
+
+  gate: TSendGate;
 }
 
 export type TSendReadiness =
@@ -114,14 +143,11 @@ export type TSendReadiness =
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Resolve a tab and hold until it can actually accept a paste, or until
- * `timeoutMs` expires.
+ * Resolve a tab and decide whether it can be pasted into, per {@link TSendGate}.
  *
- * The single readiness definition behind both send routes. It exists because
- * pasting into an agent that has no composer yet is a silent failure: the text
- * lands in the TUI's input box, the trailing Enter is swallowed, and the caller
- * is told the send succeeded while the agent never takes a turn. Refusing —
- * with nothing pasted — is the only outcome a caller can act on.
+ * Both gates refuse a tab that is gone and a tmux session that is not running —
+ * that is not policy, it is the absence of a recipient. Only `composer-ready`
+ * goes on to wait for a composer, and only it can time out.
  *
  * The state is re-resolved on every poll rather than once up front, so a tab
  * that is closed or whose session dies mid-wait is reported as such instead of
@@ -148,9 +174,14 @@ export const awaitSendReadiness = async (
       return { ok: false, reason: 'session-not-running', cliState: target.cliState };
     }
 
-    // The gate guards an agent composer. A terminal pane has no turn to accept
-    // and no cliState to report, so it is delivered to unconditionally.
-    if (!isAgentPanelType(target.panelType) || isSendableCliState(target.cliState)) {
+    // A live session is the whole bar on the `live-session` gate. Past it, the
+    // composer check guards an agent composer only: a terminal pane has no turn
+    // to accept and no cliState to report.
+    if (
+      request.gate === 'live-session' ||
+      !isAgentPanelType(target.panelType) ||
+      isComposerReadyCliState(target.cliState)
+    ) {
       return { ok: true, target };
     }
 
@@ -172,29 +203,44 @@ export interface ITabSendDeps extends ISendReadinessDeps {
 export type TTabSendResult =
   | { status: 200; body: { status: 'sent'; submitted: boolean; cliState: TCliState | null } }
   | { status: 404; body: { error: 'tab-not-found' } }
-  | { status: 409; body: { error: 'agent-not-ready'; cliState: TCliState | null; detail?: string } };
+  | {
+      status: 409;
+      body: { error: 'agent-not-ready'; cliState: TCliState | null; detail: 'session-not-running' };
+    };
 
+/**
+ * The send behind `POST /api/tabs/[tabId]/send` — the cookie-authed route the
+ * phone uses.
+ *
+ * On the `live-session` gate, so the phone is a peer of the web client rather
+ * than a viewer of it: both can talk to the same tab at the same time, in any
+ * state, which is the entire reason the phone app exists. The only refusal left
+ * is a tab with no running tmux session, and that one is honest — there is
+ * nothing on the other end to queue the prompt.
+ *
+ * `busy` therefore pastes. Whether the agent swallowed the Enter is a question
+ * the response answers separately, in `submitted`.
+ */
 export const performTabSend = async (
   deps: ITabSendDeps,
   request: ITabSendRequest,
 ): Promise<TTabSendResult> => {
-  // The cookie-authed route answers a phone waiting on a tap, so it takes the
-  // readiness verdict as it stands rather than holding the request open.
+  // Nothing to wait for on this gate, so the route never holds a phone's tap
+  // open.
   const readiness = await awaitSendReadiness(deps, {
     workspaceId: request.workspaceId,
     tabId: request.tabId,
     timeoutMs: 0,
+    gate: 'live-session',
   });
 
   if (!readiness.ok) {
     if (readiness.reason === 'tab-not-found') return { status: 404, body: { error: 'tab-not-found' } };
+    // `readiness-timeout` cannot occur on this gate: there is no composer wait
+    // to time out, so a refusal here is always a dead session.
     return {
       status: 409,
-      body: {
-        error: 'agent-not-ready',
-        cliState: readiness.cliState,
-        ...(readiness.reason === 'session-not-running' ? { detail: 'session-not-running' } : {}),
-      },
+      body: { error: 'agent-not-ready', cliState: readiness.cliState, detail: 'session-not-running' },
     };
   }
 

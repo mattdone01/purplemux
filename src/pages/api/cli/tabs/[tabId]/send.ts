@@ -61,7 +61,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       },
       hasSession,
     },
-    { workspaceId, tabId, timeoutMs },
+    // `composer-ready`, not `live-session`: this is the unattended dispatch
+    // path, where a paste that beats the TUI's boot is silently swallowed. The
+    // cookie-authed route a person types into does NOT wait — see TSendGate.
+    { workspaceId, tabId, timeoutMs, gate: 'composer-ready' },
   );
 
   if (!readiness.ok) {
