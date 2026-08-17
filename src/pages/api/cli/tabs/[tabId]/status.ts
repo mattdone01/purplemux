@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, findTab } from '@/lib/cli-utils';
 import { hasSession, getPaneCurrentCommand } from '@/lib/tmux';
 import { getProviderByPanelType } from '@/lib/providers';
+import { getLivenessManager } from '@/lib/liveness-manager';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'GET') {
@@ -22,6 +23,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const provider = getProviderByPanelType(found.tab.panelType);
   const agentSessionId = provider?.readSessionId(found.tab) ?? null;
   const alive = await hasSession(found.tab.sessionName);
+  // Registered liveness watch, so idle-done and idle-holding-dead-work are
+  // distinguishable from the status read alone.
+  const { probes, backgroundJobs } = await getLivenessManager().statusForTab(tabId);
   if (!alive) {
     return res.status(200).json({
       tabId,
@@ -30,6 +34,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentProviderId: provider?.id ?? null,
       agentSessionId,
       claudeSessionId: agentSessionId,
+      probes,
+      backgroundJobs,
     });
   }
 
@@ -44,6 +50,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     agentSessionId,
     // Response key kept as `claudeSessionId` for back-compat with external CLI consumers.
     claudeSessionId: agentSessionId,
+    probes,
+    backgroundJobs,
   });
 };
 

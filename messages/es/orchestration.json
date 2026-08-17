@@ -20,5 +20,10 @@
   "kind_turn-ended": "turn ended — orchestrator nudged",
   "kind_inactive": "agent inactive — orchestrator nudged",
   "kind_stuck": "possibly stalled — orchestrator nudged",
-  "kind_heartbeat": "orchestrator idle — heartbeat sent"
+  "kind_heartbeat": "orchestrator idle — heartbeat sent",
+  "kind_off-scope": "working off-scope — orchestrator nudged",
+  "kind_thrash": "thrashing — orchestrator nudged",
+  "kind_stalled": "work stalled (liveness probe) — orchestrator nudged",
+  "kind_probe-failed": "liveness probe failing — orchestrator nudged",
+  "kind_bg-died": "background job died — orchestrator nudged"
 }

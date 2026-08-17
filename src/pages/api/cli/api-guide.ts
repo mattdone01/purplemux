@@ -75,11 +75,62 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
     — nothing was pasted, so a later Enter cannot submit a half-forgotten prompt.
 
 GET /api/cli/tabs/<tabId>/status?workspaceId=WS
-  Response: { "tabId", "workspaceId", "alive", "command", "cliState", "agentProviderId", "agentSessionId", "claudeSessionId" }
+  Response: { "tabId", "workspaceId", "alive", "command", "cliState", "agentProviderId", "agentSessionId", "claudeSessionId",
+              "probes": [...], "backgroundJobs": [...] }
+  probes/backgroundJobs are the tab's registered liveness watch (see "Liveness watch"),
+  so an idle tab that is HOLDING dead background work is distinguishable from an idle
+  tab that is done.
 
 GET /api/cli/tabs/<tabId>/result?workspaceId=WS
   Capture the current pane content.
   Response: { "content": "..." }
+
+## Liveness watch
+
+Watchers for DELEGATED WORK, not tab state. A tab that is idle while its background
+job is dead looks identical to an idle healthy tab; the built-in watchdog only sees
+pane/turn state. Register a probe (progress freshness) and/or a background pid
+(process death) at dispatch time for any long-running job. Events fire an
+orchestrator nudge (STALLED / LIVENESS PROBE FAILING / BACKGROUND JOB DIED — sent to
+the workspace's orchestrator tab, or to the registering tab itself when there is no
+orchestrator) AND a push alert to the human. Registrations persist across server
+restarts and are dropped when the tab closes.
+
+POST /api/cli/tabs/<tabId>/probe?workspaceId=WS
+  Body: { "command": "...", "stalenessThresholdS": 60..604800, "intervalS"?: 30..604800 (default 60), "label"?: "default" }
+  Requires the workspace's OWN token (registration executes a command server-side).
+  The watchdog runs command every intervalS (bounded below by the status poll, ~30-60s);
+  the LAST line of its stdout must contain seconds-since-last-progress (e.g. a
+  SELECT now()-max(finished_at) or a stat of a progress file). Exit 0 + a number =
+  measured; age > stalenessThresholdS = STALLED (re-alerts every further threshold of
+  silence). Nonzero exit, timeout (15s), or non-numeric output = probe failure; 3
+  consecutive failures fire LIVENESS PROBE FAILING — a broken probe is not a green light.
+  Same tabId+label upserts.
+  Response: { "tabId", "workspaceId", "probe" }
+
+GET /api/cli/tabs/<tabId>/probe?workspaceId=WS
+  Response: { "probes": [{ "label", "command", "stalenessThresholdS", "intervalS",
+              "lastRunAt", "lastAgeS", "stale", "consecutiveFailures", "lastError" }] }
+
+DELETE /api/cli/tabs/<tabId>/probe?workspaceId=WS[&label=L]
+  Remove probes (all for the tab, or one label). Do this when the job completes.
+  Response: { "removed": n }
+
+POST /api/cli/tabs/<tabId>/bg?workspaceId=WS
+  Body: { "pid": N, "label"?: "...", "stderrFile"?: "/abs/path", "exitCodeFile"?: "/abs/path" }
+  Watch a background pid; when it exits, BACKGROUND JOB DIED fires with the exit code
+  (read from exitCodeFile) and the stderr tail (last ~10 lines of stderrFile). Launch
+  pattern that captures both:  ( cmd 2>/tmp/job.err; echo $? > /tmp/job.exit ) & — then
+  register the subshell pid. The registration is one-shot: it is dropped after the
+  death notification.
+  Response: { "tabId", "workspaceId", "job" }
+
+GET /api/cli/tabs/<tabId>/bg?workspaceId=WS
+  Response: { "backgroundJobs": [{ "pid", "label", "alive", "registeredAt", "ageS" }] }
+
+DELETE /api/cli/tabs/<tabId>/bg?workspaceId=WS[&pid=N]
+  Stop watching (all for the tab, or one pid).
+  Response: { "removed": n }
 
 ## Orchestration
 

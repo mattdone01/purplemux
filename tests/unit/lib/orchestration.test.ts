@@ -79,4 +79,38 @@ describe('buildNudgeMessage', () => {
     expect(msg).toContain('unnamed');
     expect(msg).toContain('INACTIVE');
   });
+
+  it('builds liveness nudges with detail and capture command', () => {
+    const stalled = buildNudgeMessage('stalled', 'tab-3', 'drain', 'ws-abc', 'probe "drain" reports no progress for ~19 min (threshold 15 min)');
+    expect(stalled).toContain('STALLED');
+    expect(stalled).toContain('no progress for ~19 min');
+    expect(stalled).toContain('purplemux tab result -w ws-abc tab-3');
+
+    const died = buildNudgeMessage('bg-died', 'tab-3', 'drain', 'ws-abc', 'pid 4242 exited with code 137');
+    expect(died).toContain('BACKGROUND JOB DIED');
+    expect(died).toContain('pid 4242 exited with code 137');
+
+    const failing = buildNudgeMessage('probe-failed', 'tab-3', 'drain', 'ws-abc', 'probe "drain" failed 3x in a row');
+    expect(failing).toContain('PROBE FAILING');
+    expect(failing).toContain('failed 3x');
+    expect(failing).toContain('not a green light');
+  });
+
+  it('falls back to generic detail for liveness nudges', () => {
+    for (const kind of ['stalled', 'probe-failed', 'bg-died'] as const) {
+      const msg = buildNudgeMessage(kind, 'tab-3', 'drain', 'ws-abc');
+      expect(msg).toContain(NUDGE_PREFIX);
+      expect(msg.length).toBeGreaterThan(50);
+    }
+  });
+});
+
+describe('kickoff template liveness doctrine', () => {
+  it('tells the orchestrator to arm both watchers at dispatch', () => {
+    expect(DEFAULT_KICKOFF_TEMPLATE).toContain('TWO watchers AT DISPATCH');
+    expect(DEFAULT_KICKOFF_TEMPLATE).toContain('purplemux tab probe set');
+    expect(DEFAULT_KICKOFF_TEMPLATE).toContain('purplemux tab bg add');
+    expect(DEFAULT_KICKOFF_TEMPLATE).toContain('BACKGROUND JOB DIED');
+    expect(DEFAULT_KICKOFF_TEMPLATE).toContain('needsHuman=true');
+  });
 });

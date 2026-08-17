@@ -344,6 +344,94 @@ const cmdTabClose = async (args) => {
   if (resp.ok) process.stdout.write('ok\n');
 };
 
+// Liveness probes: the watchdog runs --cmd on an interval; its last stdout line
+// must print seconds-since-last-progress. Above --stale-after, the orchestrator
+// gets a STALLED nudge and the human gets a push alert.
+const cmdTabProbe = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = stripFlags(args.slice(1), ['--workspace', '-w', '--cmd', '--stale-after', '--interval', '--label']);
+  const tabId = rest[0];
+  if (!sub) die('probe subcommand required (set | list | clear)');
+  if (!tabId) die('tab ID is required');
+  const wsId = resolveWsForTab(args);
+  const qs = `workspaceId=${encodeURIComponent(wsId)}`;
+
+  switch (sub) {
+    case 'set': {
+      const command = flagValue(args, '--cmd');
+      const staleAfter = flagValue(args, '--stale-after');
+      const interval = flagValue(args, '--interval');
+      const label = flagValue(args, '--label');
+      if (!command) die('--cmd is required');
+      if (!staleAfter || !/^\d+$/.test(staleAfter)) die('--stale-after SECS is required (whole seconds)');
+      if (interval && !/^\d+$/.test(interval)) die('--interval must be whole seconds');
+      const { body } = await api('POST', `/api/cli/tabs/${tabId}/probe?${qs}`, {
+        command,
+        stalenessThresholdS: Number(staleAfter),
+        ...(interval ? { intervalS: Number(interval) } : {}),
+        ...(label ? { label } : {}),
+      });
+      return out(body);
+    }
+    case 'list': {
+      const { body } = await api('GET', `/api/cli/tabs/${tabId}/probe?${qs}`);
+      return out(body);
+    }
+    case 'clear': {
+      const label = flagValue(args, '--label');
+      const path = `/api/cli/tabs/${tabId}/probe?${qs}${label ? `&label=${encodeURIComponent(label)}` : ''}`;
+      const { body } = await api('DELETE', path);
+      return out(body);
+    }
+    default:
+      die(`unknown probe subcommand: ${sub}. Use set | list | clear`);
+  }
+};
+
+// Background job watch: when the pid exits, the orchestrator gets a nudge with
+// the exit code (from --exit-file) and a stderr tail (from --stderr).
+const cmdTabBg = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = stripFlags(args.slice(1), ['--workspace', '-w', '--pid', '--label', '--stderr', '--exit-file']);
+  const tabId = rest[0];
+  if (!sub) die('bg subcommand required (add | list | remove)');
+  if (!tabId) die('tab ID is required');
+  const wsId = resolveWsForTab(args);
+  const qs = `workspaceId=${encodeURIComponent(wsId)}`;
+
+  switch (sub) {
+    case 'add': {
+      const pid = flagValue(args, '--pid');
+      const label = flagValue(args, '--label');
+      const stderrFile = flagValue(args, '--stderr');
+      const exitCodeFile = flagValue(args, '--exit-file');
+      if (!pid || !/^\d+$/.test(pid)) die('--pid N is required');
+      const { body } = await api('POST', `/api/cli/tabs/${tabId}/bg?${qs}`, {
+        pid: Number(pid),
+        ...(label ? { label } : {}),
+        ...(stderrFile ? { stderrFile: require('path').resolve(stderrFile) } : {}),
+        ...(exitCodeFile ? { exitCodeFile: require('path').resolve(exitCodeFile) } : {}),
+      });
+      return out(body);
+    }
+    case 'list': {
+      const { body } = await api('GET', `/api/cli/tabs/${tabId}/bg?${qs}`);
+      return out(body);
+    }
+    case 'remove': {
+      const pid = flagValue(args, '--pid');
+      if (pid && !/^\d+$/.test(pid)) die('--pid must be a whole number');
+      const path = `/api/cli/tabs/${tabId}/bg?${qs}${pid ? `&pid=${pid}` : ''}`;
+      const { body } = await api('DELETE', path);
+      return out(body);
+    }
+    default:
+      die(`unknown bg subcommand: ${sub}. Use add | list | remove`);
+  }
+};
+
 const cmdTabBrowser = async (args) => {
   requireEnv();
   const sub = args[0];
@@ -474,9 +562,24 @@ Commands:
                                            the budget, --no-wait answers immediately. On timeout nothing is
                                            pasted and the call fails with agent-not-ready.
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
-  tab status -w WS TAB_ID                  Tab status
+  tab status -w WS TAB_ID                  Tab status (includes registered probes + background jobs)
   tab result -w WS TAB_ID                  Capture tab pane content
   tab close -w WS TAB_ID                   Close a tab
+  tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
+                                           Register a liveness probe on a tab's delegated work. The watchdog runs
+             [--interval SECS] [--label L] CMD (default every 60s); its last stdout line must print seconds since
+                                           the work last progressed. Age > --stale-after fires a STALLED nudge to
+                                           the orchestrator (or the tab itself) and a push alert to the human.
+                                           3 consecutive probe failures fire a PROBE FAILING nudge — a broken
+                                           probe is never a green light.
+  tab probe list -w WS TAB_ID              Show a tab's probes with last age / staleness / failures
+  tab probe clear -w WS TAB_ID [--label L] Remove probes (all, or one label) — do this when the job completes
+  tab bg add -w WS TAB_ID --pid N          Watch a background pid: on exit, a BACKGROUND JOB DIED nudge fires
+             [--label L] [--stderr FILE]   carrying the exit code (read from --exit-file) and the stderr tail
+             [--exit-file FILE]            (from --stderr). Launch pattern: cmd 2>err.log & echo $! for the pid,
+                                           and wrap with; echo $? > exit.code to capture the code
+  tab bg list -w WS TAB_ID                 Show watched background jobs (pid, alive, age)
+  tab bg remove -w WS TAB_ID [--pid N]     Stop watching (all, or one pid)
   tab browser url -w WS TAB_ID             Current URL + title of a web-browser tab
   tab browser screenshot -w WS TAB_ID      Capture tab screenshot (PNG). Use -o FILE to save, --full for full page
                           [-o FILE] [--full]
@@ -532,6 +635,8 @@ const main = async () => {
         case 'status': return cmdTabStatus(rest);
         case 'result': return cmdTabResult(rest);
         case 'close': return cmdTabClose(rest);
+        case 'probe': return cmdTabProbe(rest);
+        case 'bg': return cmdTabBg(rest);
         case 'browser': return cmdTabBrowser(rest);
         default: die(`unknown tab command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
       }

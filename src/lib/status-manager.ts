@@ -29,6 +29,8 @@ import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatus
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
+import { getLivenessManager } from '@/lib/liveness-manager';
+import type { TLivenessEvent } from '@/types/liveness';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
@@ -505,6 +507,96 @@ class StatusManager {
     await this.runOrchestratorKeeper().catch((err) => {
       log.warn(`orchestrator keeper failed: ${err instanceof Error ? err.message : err}`);
     });
+
+    await getLivenessManager().tick((event) => {
+      this.handleLivenessEvent(event).catch((err) => {
+        log.warn(`liveness event handling failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }).catch((err) => {
+      log.warn(`liveness tick failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  // Milestone watchers are silent during both success-in-progress and total
+  // failure; these events are the freshness watcher that tells them apart.
+  private async handleLivenessEvent(event: TLivenessEvent): Promise<void> {
+    const src = event.kind === 'bg-died' ? event.job : event.probe;
+    const entry = this.tabs.get(src.tabId);
+    const tabName = entry?.tabName ?? '';
+
+    let kind: TOrchestrationNudgeKind;
+    let detail: string;
+    if (event.kind === 'stalled') {
+      kind = 'stalled';
+      detail = `probe "${event.probe.label}" reports no progress for ~${Math.round(event.ageS / 60)} min (threshold ${Math.round(event.probe.stalenessThresholdS / 60)} min)`;
+    } else if (event.kind === 'probe-failed') {
+      kind = 'probe-failed';
+      detail = `probe "${event.probe.label}" failed ${event.failures}x in a row — last error: ${event.error}`;
+    } else {
+      kind = 'bg-died';
+      const label = event.job.label ? `"${event.job.label}" ` : '';
+      const code = event.exitCode !== null ? `code ${event.exitCode}` : 'unknown exit code';
+      detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
+    }
+
+    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail);
+
+    // Registering a probe or pid is an explicit opt-in to being watched, so a
+    // firing always reaches the human too (push), regardless of alert policy —
+    // an escalation that only lands in a log is not an escalation.
+    const ws = await getWorkspaceByIdCached(src.workspaceId);
+    await this.dispatchAlert({
+      kind: kind === 'bg-died' ? 'bg-job-died' : 'work-stalled',
+      tabId: src.tabId,
+      workspace: ws,
+      workspaceId: src.workspaceId,
+      tabName,
+      providerId: toAlertProvider(entry?.agentProviderId),
+      agentSessionId: entry?.agentSessionId,
+      detail,
+    });
+  }
+
+  // Unlike nudgeOrchestrator this may target the registering tab itself: when
+  // the workspace has no orchestrator (or the orchestrator IS the registrant),
+  // the tab whose work died is the actor that must wake up.
+  private async nudgeLiveness(workspaceId: string, tabId: string, tabName: string, kind: TOrchestrationNudgeKind, detail: string): Promise<void> {
+    const now = Date.now();
+    const last = this.lastNudgeByTab.get(tabId);
+    if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return;
+    this.lastNudgeByTab.set(tabId, { kind, at: now });
+
+    const ws = await getWorkspaceByIdCached(workspaceId);
+    const orch = ws?.orchestration;
+    const targetTabId = orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId;
+    const message = buildNudgeMessage(kind, tabId, tabName, workspaceId, detail);
+    const target = this.tabs.get(targetTabId);
+    let delivered = false;
+    if (target && await hasSession(target.tmuxSession)) {
+      try {
+        await sendBracketedPaste(target.tmuxSession, message);
+        delivered = true;
+      } catch (err) {
+        log.warn(`liveness nudge delivery failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    const nudge: IOrchestrationNudge = {
+      id: nanoid(8),
+      workspaceId,
+      tabId,
+      tabName,
+      kind,
+      message,
+      at: now,
+      delivered,
+    };
+    this.orchestrationNudges.push(nudge);
+    if (this.orchestrationNudges.length > MAX_NUDGE_HISTORY) {
+      this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
+    }
+    this.broadcast({ type: 'orchestration:nudge', nudge });
+    log.info({ tabId, kind, targetTabId, delivered }, 'liveness nudge');
   }
 
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
@@ -1218,6 +1310,7 @@ class StatusManager {
 
   removeTab(tabId: string): void {
     const entry = this.tabs.get(tabId);
+    if (entry) getLivenessManager().removeTab(entry.workspaceId, tabId);
     if (entry && (entry.cliState === 'busy' || entry.cliState === 'needs-input') && entry.lastUserMessage) {
       this.saveSessionHistory(tabId, entry, entry.busySince, true).catch((err) => {
         log.warn('Failed to save cancelled session history: %s', err);

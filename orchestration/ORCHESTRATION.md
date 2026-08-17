@@ -159,8 +159,52 @@ Begin: read the epic status, then spawn workers for the first N_PARALLEL stories
 | Worker finished, nothing happens | `cliState=ready-for-review` | Orchestrator reviews + assigns next work |
 | Worker spinning >10 min | watch "STALLED" nudge | Capture pane; wait / Escape+re-prompt / kill+respawn |
 | Worker CLI crashed | `alive=false` / `inactive` | Respawn tab, re-issue story |
+| Worker idle but its background job is dead | registered liveness probe → "work is STALLED" nudge + push alert | Wake the worker with the evidence; restart the job or escalate |
+| Background pid exited | registered bg watch → "BACKGROUND JOB DIED" nudge with exit code + stderr tail | Restart + re-register the new pid, or mark the task blocked |
+| Probe itself keeps erroring | "LIVENESS PROBE FAILING" nudge after 3 consecutive failures | Fix the probe or its environment — a broken probe is not a green light |
 | Orchestrator asked the human | orchestrator tab shows question; watch keeps nudging so other stories still advance | Answer in the orchestrator tab; it merges your answer next turn |
 | Orchestrator went quiet | any next watch nudge re-wakes it | Nothing to do — that's the watchdog's job |
+
+## Liveness watch — probes for delegated background work
+
+Every watcher above watches **tab state** (turns, idleness, process liveness).
+None of them can see a background job a worker launched: a tab that is
+idle-holding while its drain/build/load is dead looks identical to an idle
+healthy tab. That gap once cost 7 silent hours — every ping during the stall
+window looked normal because milestone- and idleness-watchers are silent during
+both success-in-progress and total failure.
+
+The fix is the **two-watcher rule**: at dispatch of any long-running delegated
+job, arm BOTH:
+
+1. **Worker-side bounded supervisor** — the worker restarts its own job on
+   death; N deaths in a window means systematic: stop restarting and report.
+2. **Watchdog-side liveness probe** — registered via the CLI, survives the
+   worker dying with its work (which has happened; the worker's watcher died
+   with the workload):
+
+```bash
+# Probe: the command's last stdout line prints seconds-since-last-progress.
+purplemux tab probe set -w WS TAB --cmd \
+  'psql -tA -c "select extract(epoch from now()-max(finished_at))::int from runs"' \
+  --stale-after 900 --interval 300 --label drain
+
+# Background pid watch: death notifies with exit code + stderr tail.
+( long-job 2>/tmp/job.err; echo $? >/tmp/job.exit ) & echo $!
+purplemux tab bg add -w WS TAB --pid <that pid> --stderr /tmp/job.err --exit-file /tmp/job.exit
+```
+
+Firings deliver an orchestrator nudge (or a nudge to the registering tab itself
+when the workspace has no orchestrator) **and a push alert to the human** —
+an escalation that only lands in a log is not an escalation. `purplemux tab
+status` shows registered probes and jobs with age/staleness, so idle-done and
+idle-holding-dead-work are distinguishable at a glance. Clear registrations
+(`tab probe clear`, `tab bg remove`) when the job completes.
+
+Corollary: **a progress number without a freshness stamp is not a progress
+number.** Probes exist to compute `now - last_progress` mechanically, because
+two humans-in-the-loop each had the stall in hand and did not compare it to the
+wall clock.
 
 ## Preventing stalls at the source
 

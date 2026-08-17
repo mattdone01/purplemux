@@ -158,7 +158,7 @@ export interface IStandupUpdateMessage {
   standup: IWorkspaceStandup;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash';
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-died';
 
 export interface IOrchestrationNudge {
   id: string;
@@ -176,7 +176,7 @@ export interface IOrchestrationNudgeMessage {
   nudge: IOrchestrationNudge;
 }
 
-export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled';
+export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'work-stalled' | 'bg-job-died';
 
 export type TAlertProviderId = 'claude' | 'codex' | 'grok';
 
