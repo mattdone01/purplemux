@@ -25,5 +25,7 @@
   "kind_thrash": "thrashing — orchestrator nudged",
   "kind_stalled": "work stalled (liveness probe) — orchestrator nudged",
   "kind_probe-failed": "liveness probe failing — orchestrator nudged",
-  "kind_bg-died": "background job died — orchestrator nudged"
+  "kind_bg-died": "background job died — orchestrator nudged",
+  "effortLabel": "Orchestrator effort (optional)",
+  "effortPlaceholder": "default — low | medium | high | xhigh | max"
 }

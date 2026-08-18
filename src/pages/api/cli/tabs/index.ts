@@ -106,8 +106,20 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (model !== undefined && !isValidModelName(model)) {
       return res.status(400).json({ error: 'Invalid model' });
     }
-    if (reasoning !== undefined && !/^(minimal|low|medium|high)$/.test(String(reasoning))) {
-      return res.status(400).json({ error: 'Invalid reasoning (minimal|low|medium|high)' });
+    // Each engine has its own effort vocabulary; validate against the one the
+    // tab will actually launch so a typo fails here, not silently at runtime.
+    if (reasoning !== undefined) {
+      const claudeTab = (panelType ?? 'terminal') === 'claude-code';
+      const valid = claudeTab
+        ? /^(low|medium|high|xhigh|max)$/.test(String(reasoning))
+        : /^(minimal|low|medium|high)$/.test(String(reasoning));
+      if (!valid) {
+        return res.status(400).json({
+          error: claudeTab
+            ? 'Invalid reasoning for claude-code (low|medium|high|xhigh|max)'
+            : 'Invalid reasoning (minimal|low|medium|high)',
+        });
+      }
     }
 
     // Agent tabs launch their CLI by default (mirrors UI tab creation) —
@@ -116,7 +128,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     let command: string | undefined;
     if (shouldLaunch) {
       if (resolvedType === 'claude-code') {
-        command = `claude ${await buildClaudeFlags(workspaceId, { model })}`;
+        command = `claude ${await buildClaudeFlags(workspaceId, { model, effort: reasoning })}`;
       } else {
         command = await codexProvider.buildLaunchCommand({ workspaceId });
         if (model) command += ` --model ${model}`;

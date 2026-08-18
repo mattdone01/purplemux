@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { DEFAULT_KICKOFF_TEMPLATE, resolveKickoffTemplate } from '@/lib/orchestration';
 import { startOrchestration } from '@/lib/orchestration-client';
-import { isValidModelName } from '@/lib/claude-command-shared';
+import { isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
 
 interface IStartOrchestrationDialogProps {
   open: boolean;
@@ -37,6 +37,7 @@ const StartOrchestrationDialog = ({
 
   const [task, setTask] = useState('');
   const [model, setModel] = useState('');
+  const [effort, setEffort] = useState('');
   const [showTemplate, setShowTemplate] = useState(false);
   const [template, setTemplate] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -47,6 +48,7 @@ const StartOrchestrationDialog = ({
     if (open) {
       setTask('');
       setModel('');
+      setEffort('');
       setShowTemplate(false);
       setTemplate(null);
       setIsSubmitting(false);
@@ -56,8 +58,10 @@ const StartOrchestrationDialog = ({
 
   const effectiveTemplate = template ?? savedTemplate ?? DEFAULT_KICKOFF_TEMPLATE;
   const trimmedModel = model.trim();
+  const trimmedEffort = effort.trim();
   const canSubmit = task.trim().length > 0
     && (!trimmedModel || isValidModelName(trimmedModel))
+    && (!trimmedEffort || isValidClaudeEffort(trimmedEffort))
     && !isSubmitting;
 
   const handleSubmit = useCallback(async () => {
@@ -73,6 +77,7 @@ const StartOrchestrationDialog = ({
       paneId,
       prompt,
       ...(trimmedModel ? { model: trimmedModel } : {}),
+      ...(trimmedEffort ? { effort: trimmedEffort } : {}),
       ...(template !== null && template !== savedTemplate ? { template } : {}),
     });
     setIsSubmitting(false);
@@ -81,7 +86,7 @@ const StartOrchestrationDialog = ({
     } else {
       setError(t('startFailed'));
     }
-  }, [canSubmit, workspace, effectiveTemplate, workspaceId, task, paneId, trimmedModel, template, savedTemplate, onOpenChange, t]);
+  }, [canSubmit, workspace, effectiveTemplate, workspaceId, task, paneId, trimmedModel, trimmedEffort, template, savedTemplate, onOpenChange, t]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -110,6 +115,16 @@ const StartOrchestrationDialog = ({
               value={model}
               onChange={(e) => setModel(e.target.value)}
               placeholder={t('modelPlaceholder')}
+            />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="orchestration-effort">{t('effortLabel')}</Label>
+            <Input
+              id="orchestration-effort"
+              value={effort}
+              onChange={(e) => setEffort(e.target.value)}
+              placeholder={t('effortPlaceholder')}
             />
           </div>
 

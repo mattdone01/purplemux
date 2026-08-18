@@ -47,12 +47,15 @@ GET /api/cli/tabs?workspaceId=WS
 
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
-          "model"?: "...", "reasoning"?: "minimal" | "low" | "medium" | "high", "launch"?: boolean }
+          "model"?: "...", "reasoning"?: "...", "launch"?: boolean }
   Invalid panelType returns HTTP 400 with validPanelTypes.
   Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
-  codex --model); "reasoning" sets codex model_reasoning_effort; "launch": false keeps
+  codex --model). "reasoning" sets the effort — claude-code: "low" | "medium" | "high" |
+  "xhigh" | "max" (claude --effort; omitted = the launching user's GLOBAL default, so an
+  orchestrator spawning workers should always pin it to the intended tier); codex-cli:
+  "minimal" | "low" | "medium" | "high" (model_reasoning_effort). "launch": false keeps
   the old bare-shell behavior.
   Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched" }
 

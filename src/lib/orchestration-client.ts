@@ -20,6 +20,8 @@ export interface IStartOrchestrationRequest {
   prompt: string;
   name?: string;
   model?: string;
+  /** claude --effort for the orchestrator session; omitted = the user's global default. */
+  effort?: string;
   template?: string;
 }
 
