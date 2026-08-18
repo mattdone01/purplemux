@@ -5,7 +5,7 @@ import { resolveFirstPaneId } from '@/lib/cli-utils';
 import { getStatusManager } from '@/lib/status-manager';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
-import { buildClaudeFlags, isValidModelName } from '@/lib/claude-command';
+import { buildClaudeFlags, isValidClaudeEffort, isValidModelName } from '@/lib/claude-command';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('orchestration');
@@ -20,12 +20,15 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const ws = await getWorkspaceById(workspaceId);
   if (!ws) return res.status(404).json({ error: 'Workspace not found' });
 
-  const { paneId, prompt, name, model, template } = req.body ?? {};
+  const { paneId, prompt, name, model, effort, template } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'prompt field required' });
   }
   if (model !== undefined && !isValidModelName(model)) {
     return res.status(400).json({ error: 'Invalid model' });
+  }
+  if (effort !== undefined && !isValidClaudeEffort(effort)) {
+    return res.status(400).json({ error: 'Invalid effort (low|medium|high|xhigh|max)' });
   }
 
   const availability = await checkAgentAvailabilityForPanelType('claude-code');
@@ -39,7 +42,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!targetPaneId) return res.status(404).json({ error: 'No pane found' });
 
   try {
-    const flags = await buildClaudeFlags(workspaceId, { model });
+    const flags = await buildClaudeFlags(workspaceId, { model, effort });
     const command = `claude ${flags}`;
     const tabName = typeof name === 'string' && name.trim() ? name.trim() : 'orchestrator';
     const tab = await addTabToPane(workspaceId, targetPaneId, tabName, ws.directories[0], 'claude-code', command);

@@ -554,8 +554,10 @@ Commands:
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
-             [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets codex reasoning
-             [--no-launch]                 (minimal|low|medium|high). --no-launch keeps the old bare-shell behavior
+             [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets the
+             [--no-launch]                 reasoning effort — claude-code: low|medium|high|xhigh|max (claude --effort;
+                                           omitted = the user's global default, so orchestrators should ALWAYS pin it);
+                                           codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab (bracketed paste + Enter). Waits up to 60s
                                            for an agent tab to be able to accept a turn; --wait-ms N changes
