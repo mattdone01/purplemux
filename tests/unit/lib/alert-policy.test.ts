@@ -111,6 +111,21 @@ describe('alertFor', () => {
     expect(alert.body).toBe('blocked on a schema decision');
   });
 
+  it('builds liveness alerts from the event detail', () => {
+    const stalled = alertFor({ ...base, kind: 'work-stalled', detail: 'probe "drain" reports no progress for ~19 min' });
+    expect(stalled.title).toBe('Work Stalled');
+    expect(stalled.body).toBe('probe "drain" reports no progress for ~19 min');
+
+    const died = alertFor({ ...base, kind: 'bg-job-died', detail: 'pid 4242 exited with code 137' });
+    expect(died.title).toBe('Background Job Died');
+    expect(died.body).toBe('pid 4242 exited with code 137');
+  });
+
+  it('clamps liveness alert bodies and falls back to the tab name', () => {
+    expect(alertFor({ ...base, kind: 'work-stalled', detail: 'x'.repeat(200) }).body).toHaveLength(100);
+    expect(alertFor({ ...base, kind: 'bg-job-died', detail: null }).body).toBe('orchestrator');
+  });
+
   it('describes a stall with the supplied detail', () => {
     const alert = alertFor({ ...base, kind: 'orchestrator-stalled', detail: 'idle 30 min, no workers' });
     expect(alert.title).toBe('Orchestrator Stalled');
