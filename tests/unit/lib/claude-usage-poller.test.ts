@@ -99,3 +99,68 @@ describe('scoped windows survive both writers', () => {
     expect((await readRateLimitsCache()).codex).toEqual(codex);
   });
 });
+
+describe('createClaudeUsagePoller', () => {
+  it('retries once after a short delay when a tick fails, then resumes the interval', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createClaudeUsagePoller, CLAUDE_USAGE_RETRY_MS, CLAUDE_USAGE_POLL_MS } = await import('@/lib/claude-usage-poller');
+      const results = [false, true, true];
+      const poll = vi.fn(async () => results.shift() ?? true);
+      const poller = createClaudeUsagePoller(poll);
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(poll).toHaveBeenCalledTimes(1);
+
+      // The failed boot tick is retried after CLAUDE_USAGE_RETRY_MS, well before the interval.
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_RETRY_MS);
+      expect(poll).toHaveBeenCalledTimes(2);
+
+      // A successful tick schedules no extra retry; the next call is the interval.
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_RETRY_MS);
+      expect(poll).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_POLL_MS);
+      expect(poll).toHaveBeenCalledTimes(3);
+      poller.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failure streak retries only once, not on every failed tick', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createClaudeUsagePoller, CLAUDE_USAGE_RETRY_MS, CLAUDE_USAGE_POLL_MS } = await import('@/lib/claude-usage-poller');
+      const poll = vi.fn(async () => false);
+      const poller = createClaudeUsagePoller(poll);
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_RETRY_MS);
+      expect(poll).toHaveBeenCalledTimes(2);
+      // Still failing: no second retry inside the interval.
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_RETRY_MS * 2);
+      expect(poll).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_POLL_MS);
+      expect(poll).toHaveBeenCalledTimes(3);
+      poller.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop cancels a pending retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createClaudeUsagePoller, CLAUDE_USAGE_RETRY_MS } = await import('@/lib/claude-usage-poller');
+      const poll = vi.fn(async () => false);
+      const poller = createClaudeUsagePoller(poll);
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      poller.stop();
+      await vi.advanceTimersByTimeAsync(CLAUDE_USAGE_RETRY_MS * 2);
+      expect(poll).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

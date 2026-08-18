@@ -122,22 +122,55 @@ export const pollClaudeUsageOnce = async (): Promise<boolean> => {
   return true;
 };
 
-export const createClaudeUsagePoller = () => {
+export const CLAUDE_USAGE_RETRY_MS = 30_000;
+
+/**
+ * Polls on the interval, and retries once after a short delay when a tick
+ * fails — the boot-time tick in particular can land before the network is
+ * usable, and a poller that then sleeps five minutes shows a stale sidebar
+ * for no good reason. A failure streak is logged once at warn (not per tick,
+ * so a logged-out box does not spam), and its end is logged once at info.
+ */
+export const createClaudeUsagePoller = (poll: () => Promise<boolean> = pollClaudeUsageOnce) => {
   let timer: ReturnType<typeof setInterval> | null = null;
-  const tick = () => {
-    pollClaudeUsageOnce().catch((err) => {
-      log.debug(`usage poll failed: ${err instanceof Error ? err.message : err}`);
-    });
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let failing = false;
+  let stopped = true;
+
+  const tick = async () => {
+    let ok = false;
+    try {
+      ok = await poll();
+    } catch (err) {
+      log.debug(`usage poll threw: ${err instanceof Error ? err.message : err}`);
+    }
+    if (stopped) return;
+    if (ok) {
+      if (failing) log.info('usage poll recovered');
+      failing = false;
+      return;
+    }
+    if (!failing) {
+      failing = true;
+      log.warn(`usage poll failed (no token, non-200, or network) — retrying in ${CLAUDE_USAGE_RETRY_MS / 1000}s, then every ${CLAUDE_USAGE_POLL_MS / 60_000} min`);
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => { retryTimer = null; void tick(); }, CLAUDE_USAGE_RETRY_MS);
+    }
   };
+
   return {
     start: () => {
       if (timer) return;
-      tick();
-      timer = setInterval(tick, CLAUDE_USAGE_POLL_MS);
+      stopped = false;
+      void tick();
+      timer = setInterval(() => { void tick(); }, CLAUDE_USAGE_POLL_MS);
     },
     stop: () => {
+      stopped = true;
       if (timer) clearInterval(timer);
+      if (retryTimer) clearTimeout(retryTimer);
       timer = null;
+      retryTimer = null;
     },
   };
 };
