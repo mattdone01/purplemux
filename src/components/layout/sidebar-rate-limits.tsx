@@ -53,7 +53,7 @@ const barColor = (pct: number): string => {
   return 'bg-ui-teal';
 };
 
-const LimitBar = ({ label, window }: { label: TLimitLabel; window: IRateLimitWindow }) => {
+const LimitBar = ({ label, window, scopeLabel }: { label: TLimitLabel; window: IRateLimitWindow; scopeLabel?: string }) => {
   const { resetsAt, usedPct } = getEffectiveWindow(window, label);
   const pct = Math.min(100, Math.round(usedPct));
   const projectedPct = Math.min(100, Math.round(getProjectedPct(usedPct, resetsAt, label)));
@@ -64,7 +64,7 @@ const LimitBar = ({ label, window }: { label: TLimitLabel; window: IRateLimitWin
     <Tooltip>
       <TooltipTrigger render={<div className="w-full cursor-default space-y-0.5" />}>
         <div className="flex justify-between text-[10px] tabular-nums text-muted-foreground/60">
-          <span>{label}</span>
+          <span>{scopeLabel ? `${label} · ${scopeLabel}` : label}</span>
           <span>
             {remaining} ({pct}%
             {showProjection && (
@@ -89,7 +89,7 @@ const LimitBar = ({ label, window }: { label: TLimitLabel; window: IRateLimitWin
       <TooltipContent side="top" className="max-w-[240px]">
         <div className="flex flex-col gap-0.5 text-left">
           <div>
-            {pct}% used · resets in {remaining}
+            {scopeLabel ? `${scopeLabel} weekly limit: ` : ''}{pct}% used · resets in {remaining}
           </div>
           <div className="opacity-70">
             Projected {projectedPct}% by reset at the current pace
@@ -127,6 +127,9 @@ const ProviderRateLimits = ({ provider, data }: { provider: TRateLimitsProvider;
       <div className="min-w-0 flex-1 space-y-1">
         {data.five_hour && <LimitBar label="5h" window={data.five_hour} />}
         {data.seven_day && <LimitBar label="7d" window={data.seven_day} />}
+        {(data.scoped ?? []).map((scoped) => (
+          <LimitBar key={scoped.label} label="7d" scopeLabel={scoped.label} window={scoped} />
+        ))}
       </div>
     </div>
   );

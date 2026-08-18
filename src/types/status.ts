@@ -92,10 +92,20 @@ export interface IRateLimitWindow {
   resets_at: number;
 }
 
+/**
+ * A weekly limit scoped to one model (e.g. Fable). Claude Code's statusline
+ * payload only carries the account-wide windows; these come from the OAuth
+ * usage endpoint, which reports scoped weekly limits separately.
+ */
+export interface IScopedRateLimitWindow extends IRateLimitWindow {
+  label: string;
+}
+
 export interface IRateLimitsData {
   ts: number;
   five_hour: IRateLimitWindow | null;
   seven_day: IRateLimitWindow | null;
+  scoped?: IScopedRateLimitWindow[];
 }
 
 export type TRateLimitsProvider = 'claude' | 'codex';
