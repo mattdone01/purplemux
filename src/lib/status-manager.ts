@@ -11,6 +11,7 @@ import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
 import { formatTabTitle } from '@/lib/tab-title';
 import { createRateLimitsWatcher } from '@/lib/rate-limits-watcher';
+import { createClaudeUsagePoller } from '@/lib/claude-usage-poller';
 import { createLogger } from '@/lib/logger';
 import { capturePaneAtWidth } from '@/lib/capture-at-width';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
@@ -94,6 +95,7 @@ class StatusManager {
   private clients = new Set<WebSocket>();
   private initialized = false;
   private rateLimitsWatcher: ReturnType<typeof createRateLimitsWatcher> | null = null;
+  private claudeUsagePoller: ReturnType<typeof createClaudeUsagePoller> | null = null;
   private lastRateLimits: IRateLimitsCache | null = null;
   private jsonlWatchers = new Map<string, { watcher: FSWatcher; jsonlPath: string; debounceTimer: ReturnType<typeof setTimeout> | null }>();
   private compactStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -131,6 +133,8 @@ class StatusManager {
       this.broadcast({ type: 'rate-limits:update', data });
     });
     this.rateLimitsWatcher.start();
+    this.claudeUsagePoller = createClaudeUsagePoller();
+    this.claudeUsagePoller.start();
   }
 
   private async scanAll(): Promise<void> {
@@ -1630,6 +1634,7 @@ class StatusManager {
   shutdown(): void {
     this.stopPolling();
     this.rateLimitsWatcher?.stop();
+    this.claudeUsagePoller?.stop();
     for (const tabId of [...this.jsonlWatchers.keys()]) {
       this.stopJsonlWatch(tabId);
     }
