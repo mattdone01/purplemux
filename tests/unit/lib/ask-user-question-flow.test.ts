@@ -473,3 +473,109 @@ describe('a four-question form containing a multiSelect', () => {
     expect(attempt.status).toBe('submitted');
   });
 });
+
+describe('createPaneWatcher', () => {
+  const state = (over: Partial<IAskQuestionPaneState> = {}): IAskQuestionPaneState => ({
+    phase: 'question',
+    activeIndex: 0,
+    answered: [false, false],
+    complete: false,
+    options: ['1. Red', '2. Blue'],
+    answers: [null, null],
+    ...over,
+  });
+
+  const drive = async (ms: number) => {
+    await vi.advanceTimersByTimeAsync(ms);
+  };
+
+  it('heals the mount race: absent before the TUI paints, question on a later tick', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createPaneWatcher, ASK_PANE_POLL_MS } = await import('@/lib/ask-user-question-flow');
+      const reads = [state({ phase: 'absent', activeIndex: -1 }), state()];
+      const read = vi.fn(async () => reads.shift() ?? state());
+      const seen: IAskQuestionPaneState[] = [];
+      const watcher = createPaneWatcher({ read, onState: (s) => seen.push(s) });
+      watcher.start();
+      await drive(0);
+      expect(seen.map((s) => s.phase)).toEqual(['absent']);
+      await drive(ASK_PANE_POLL_MS);
+      expect(seen.map((s) => s.phase)).toEqual(['absent', 'question']);
+      watcher.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('delivers only changes — an unchanged pane does not re-render the card', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createPaneWatcher, ASK_PANE_POLL_MS } = await import('@/lib/ask-user-question-flow');
+      const read = vi.fn(async () => state());
+      const seen: IAskQuestionPaneState[] = [];
+      const watcher = createPaneWatcher({ read, onState: (s) => seen.push(s) });
+      watcher.start();
+      await drive(ASK_PANE_POLL_MS * 3);
+      expect(read.mock.calls.length).toBeGreaterThan(2);
+      expect(seen).toHaveLength(1);
+      watcher.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sees the terminal answering a question while the card is open', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createPaneWatcher, ASK_PANE_POLL_MS } = await import('@/lib/ask-user-question-flow');
+      const reads = [state(), state({ activeIndex: 1, answered: [true, false] })];
+      const read = vi.fn(async () => reads.shift() ?? state({ activeIndex: 1, answered: [true, false] }));
+      const seen: IAskQuestionPaneState[] = [];
+      const watcher = createPaneWatcher({ read, onState: (s) => seen.push(s) });
+      watcher.start();
+      await drive(ASK_PANE_POLL_MS);
+      expect(seen).toHaveLength(2);
+      expect(seen[1].activeIndex).toBe(1);
+      watcher.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('pauses while an answer is in flight and resumes after', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createPaneWatcher, ASK_PANE_POLL_MS } = await import('@/lib/ask-user-question-flow');
+      let paused = true;
+      const read = vi.fn(async () => state());
+      const watcher = createPaneWatcher({ read, onState: () => {}, isPaused: () => paused });
+      watcher.start();
+      await drive(ASK_PANE_POLL_MS * 3);
+      expect(read).not.toHaveBeenCalled();
+      paused = false;
+      await drive(ASK_PANE_POLL_MS);
+      expect(read).toHaveBeenCalled();
+      watcher.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop cancels the loop, including a read already scheduled', async () => {
+    vi.useFakeTimers();
+    try {
+      const { createPaneWatcher, ASK_PANE_POLL_MS } = await import('@/lib/ask-user-question-flow');
+      const read = vi.fn(async () => state());
+      const watcher = createPaneWatcher({ read, onState: () => {} });
+      watcher.start();
+      await drive(0);
+      const calls = read.mock.calls.length;
+      watcher.stop();
+      await drive(ASK_PANE_POLL_MS * 3);
+      expect(read.mock.calls.length).toBe(calls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
