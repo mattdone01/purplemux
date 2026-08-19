@@ -198,3 +198,87 @@ export const answerAndSubmit = async (input: IAnswerAndSubmitInput): Promise<IAt
 
   return [answered, await submitAnswers(input)];
 };
+
+export const ASK_PANE_POLL_MS = 1_500;
+
+export interface IPaneWatcher {
+  start: () => void;
+  stop: () => void;
+}
+
+interface IPaneWatcherInput {
+  read: () => Promise<IAskQuestionPaneState>;
+  /** Called only when the state differs from the previous delivery. */
+  onState: (state: IAskQuestionPaneState) => void;
+  /** While true a tick reads nothing — an in-flight answer drives its own polls. */
+  isPaused?: () => boolean;
+  intervalMs?: number;
+}
+
+const samePaneState = (a: IAskQuestionPaneState | null, b: IAskQuestionPaneState): boolean =>
+  a !== null
+  && a.phase === b.phase
+  && a.activeIndex === b.activeIndex
+  && a.complete === b.complete
+  && a.answered.length === b.answered.length
+  && a.answered.every((v, i) => v === b.answered[i])
+  && a.options.length === b.options.length
+  && a.options.every((v, i) => v === b.options[i])
+  && a.answers.length === b.answers.length
+  && a.answers.every((v, i) => v === b.answers[i]);
+
+/**
+ * Keeps a pending card's pane state fresh.
+ *
+ * A single mount-time read is a race against the TUI painting the form: the
+ * timeline entry lands in the jsonl the moment the tool is called, the form
+ * draws a beat later, and a read that wins the race reports `absent` — which
+ * the card renders as a finished prompt with nothing clickable and no recheck
+ * offered. That dead card is "I have to go to the terminal when there is more
+ * than one question". Polling turns every transient — absent-before-paint, a
+ * capture hiccup, the operator answering in the terminal tab — into a state
+ * the card heals from on the next tick.
+ */
+export const createPaneWatcher = ({
+  read,
+  onState,
+  isPaused,
+  intervalMs = ASK_PANE_POLL_MS,
+}: IPaneWatcherInput): IPaneWatcher => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = true;
+  let last: IAskQuestionPaneState | null = null;
+
+  const schedule = () => {
+    if (stopped) return;
+    timer = setTimeout(tick, intervalMs);
+  };
+
+  const tick = async () => {
+    if (stopped) return;
+    if (isPaused?.()) {
+      schedule();
+      return;
+    }
+    const state = await read();
+    if (stopped) return;
+    if (!samePaneState(last, state)) {
+      last = state;
+      onState(state);
+    }
+    schedule();
+  };
+
+  return {
+    start: () => {
+      if (!stopped) return;
+      stopped = false;
+      void tick();
+    },
+    stop: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+    },
+  };
+};

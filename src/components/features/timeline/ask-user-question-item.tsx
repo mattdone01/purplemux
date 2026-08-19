@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, memo } from 'react';
+import { useState, useEffect, useCallback, useRef, memo } from 'react';
 import type { ReactNode } from 'react';
 import { useTranslations } from 'next-intl';
 import { MessageCircleQuestion, Check, TerminalSquare, AlertTriangle, Send } from 'lucide-react';
@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils';
 import type { IAskQuestionPaneState } from '@/lib/ask-user-question-pane';
 import {
   answerAndSubmit,
+  createPaneWatcher,
   formHasMultiSelect,
   isSingleShotPrompt,
   isWebAnswerable,
@@ -249,17 +250,37 @@ const MultiQuestionPrompt = ({ entry, sessionName }: IAskUserQuestionItemProps) 
     setNotice(next.phase === 'unavailable' ? 'unavailable' : null);
   }, [readPane]);
 
+  // The watcher pauses while an answer is in flight (that flow drives its own
+  // polls); the ref keeps `busy` visible to it without restarting the loop.
+  const busyRef = useRef(busy);
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  // Poll, don't read once: the timeline entry lands in the jsonl the moment
+  // the tool is called and the TUI paints the form a beat later, so a single
+  // mount-time read can win that race, report `absent`, and leave the card
+  // permanently dead ("answered in the terminal") with nothing clickable.
+  // Polling also keeps the card honest when the operator answers some
+  // questions in the terminal tab while this card is open.
   useEffect(() => {
     if (!sessionName || isAnswered) return;
-    let cancelled = false;
-    readPane().then((next) => {
-      if (cancelled) return;
-      setPane(next);
-      if (next.phase === 'unavailable') setNotice('unavailable');
+    const watcher = createPaneWatcher({
+      read: readPane,
+      isPaused: () => busyRef.current,
+      onState: (next) => {
+        setPane(next);
+        // A poll tick only manages the readability notice — an action's own
+        // outcome (no-match, stalled, …) stays until the next action or a
+        // manual recheck clears it.
+        setNotice((current) => {
+          if (next.phase === 'unavailable') return current ?? 'unavailable';
+          return current === 'unavailable' ? null : current;
+        });
+      },
     });
-    return () => {
-      cancelled = true;
-    };
+    watcher.start();
+    return () => watcher.stop();
   }, [sessionName, isAnswered, readPane]);
 
   const activeIndex = pane?.phase === 'question' ? pane.activeIndex : -1;
