@@ -4,6 +4,7 @@ import {
   isDeviceVisible,
   markDeviceHidden,
   markDeviceVisible,
+  isWebPushRecord,
   normalizeSubscriptionRecords,
 } from '@/lib/push-subscriptions';
 
@@ -26,7 +27,7 @@ describe('normalizeSubscriptionRecords', () => {
       sub('https://push/1'),
       { subscription: sub('https://push/2'), deviceId: 'D2', createdAt: 42 },
     ]);
-    expect(records.map((r) => r.subscription.endpoint)).toEqual(['https://push/1', 'https://push/2']);
+    expect(records.filter(isWebPushRecord).map((r) => r.subscription.endpoint)).toEqual(['https://push/1', 'https://push/2']);
     expect(records[0].deviceId).toBeUndefined();
     expect(records[1].deviceId).toBe('D2');
   });

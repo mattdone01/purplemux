@@ -37,6 +37,7 @@ import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
 import { alertFor, isOrchestratorTab, isStallEpisodeEnd, shouldAlert, standupAlertTabId } from '@/lib/alert-policy';
 import { createStatusSocketChannel, createWebPushChannel, getNotificationDispatcher } from '@/lib/notification-dispatcher';
+import { registerFcmChannel } from '@/lib/fcm-channel';
 import { getConfig } from '@/lib/config-store';
 import { nanoid } from 'nanoid';
 import fs from 'fs/promises';
@@ -1663,6 +1664,7 @@ export const getStatusManager = (): StatusManager => {
     const dispatcher = getNotificationDispatcher();
     dispatcher.register(createStatusSocketChannel((frame) => manager.broadcast(frame)));
     dispatcher.register(createWebPushChannel());
+    registerFcmChannel(dispatcher);
     setLayoutReconciler({
       reconcileWorkspaceTabs: (wsId, validTabIds) => manager.reconcileWorkspaceTabs(wsId, validTabIds),
       removeWorkspaceTabs: (wsId) => manager.removeWorkspaceTabs(wsId),
