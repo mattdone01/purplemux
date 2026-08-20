@@ -475,6 +475,34 @@ Removing the `cliState` decision and the `hasPermissionPrompt` check has reduced
   useBrowserTitle            browser tab title
 ```
 
+### Status WS Keepalive (`?keepalive=long`)
+
+Every `/api/status` connection gets its own heartbeat timer. The query string of the upgrade
+request picks the profile:
+
+| Query | Ping interval | Timeout | Client |
+| --- | --- | --- | --- |
+| _(none)_ | 30s | 90s | the web app, and anything that does not ask |
+| `?keepalive=long` | 240s | 600s | the mobile alerts service, which holds the socket around the clock |
+
+A phone on the tailnet pays a radio wakeup for every ping, so the long profile trades
+dead-connection detection latency for battery. An unknown or empty value (`?keepalive=turbo`,
+`?keepalive=`) falls back to the default profile instead of failing the handshake, so a client
+may send the parameter without knowing whether the server understands it.
+
+**Pings pace idle only.** `status:sync`, `status:update`, `status:hook-event`,
+`session-history:*` and `notification:alert` are written to the socket the moment they are
+produced, in both profiles — the heartbeat never buffers or defers a frame. A long keepalive
+therefore does not delay an alert.
+
+A connection is closed with `1001 Heartbeat timeout` on the first tick after its timeout
+elapses with no pong. Pong is answered by the WebSocket implementation (`ws`, and every
+browser), so no client code takes part. The profile is resolved once, inside
+`handleStatusConnection`, which is why one long-keepalive client cannot change the cadence of
+any other connection.
+
+Constants live in `src/lib/status-keepalive.ts`.
+
 ### Terminal WS Path (Process Detection, Independent of cliState)
 
 ```
@@ -557,7 +585,8 @@ With `hooks=debug` you see, for example:
 | File | Description |
 | --- | --- |
 | `src/lib/status-manager.ts` | `deriveStateFromEvent`, `updateTabFromHook`, `applyCliState`, `resolveUnknown`, `readTabMetadata`, busy stuck safety net, metadata poll, JSONL watcher |
-| `src/lib/status-server.ts` | `/api/status` WebSocket handler |
+| `src/lib/status-server.ts` | `/api/status` WebSocket handler, per-connection heartbeat |
+| `src/lib/status-keepalive.ts` | Keepalive profiles for `/api/status` (`?keepalive=long`) |
 | `src/lib/hook-settings.ts` | Hook settings file generation, script management |
 | `src/pages/api/status/hook.ts` | Hook API endpoint (x-pmux-token required) |
 | `src/lib/session-detection.ts` | `detectActiveSession`, `isClaudeRunning` |

@@ -85,7 +85,7 @@ const handleWsUpgrade = (
     });
   } else if (url.pathname === '/api/status') {
     statusWss.handleUpgrade(request, socket, head, (ws) => {
-      statusWss.emit('connection', ws);
+      statusWss.emit('connection', ws, request);
     });
   } else if (url.pathname === '/api/install') {
     installWss.handleUpgrade(request, socket, head, (ws) => {
