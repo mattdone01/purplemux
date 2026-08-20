@@ -30,7 +30,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── quick-prompts.json       # custom quick prompts + disabled builtins
 ├── sidebar-items.json       # custom sidebar items + disabled builtins
 ├── vapid-keys.json          # Web Push VAPID keypair (generated)
-├── push-subscriptions.json  # Web Push endpoint subscriptions
+├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
 ├── pmux.lock                # single-instance lock {pid, port, startedAt}
@@ -187,6 +187,27 @@ Web Push state. VAPID keypair is generated on first run (`vapid-keys.ts`) and ca
 
 `deviceId` is the browser's `purplemux-device-id` (localStorage, sent by `use-web-push.ts` with the subscription). It is what makes the push visibility gate per-device — a focused desktop no longer mutes the phone. Rows written before this wrapper existed are bare `PushSubscription` objects; `normalizeSubscriptionRecords` wraps them on read with `createdAt: 0` and no `deviceId`, and an unbound row keeps the old "any focused window mutes push" gate until that browser re-subscribes.
 
+#### Record kinds
+
+The same file holds both channels' registrations, told apart by a `kind` discriminant:
+
+| `kind` | Written by | Identifier | Read by |
+| --- | --- | --- | --- |
+| absent | `POST /api/push/subscribe` with a `PushSubscription` | `subscription.endpoint` | `web-push` channel |
+| `"fcm"` | `POST /api/push/subscribe` with `{kind:'fcm', token, deviceId, label?}` | `token` | `fcm` channel |
+
+```json
+[
+  { "kind": "fcm", "token": "eyJ…", "deviceId": "kQ9…", "label": "Pixel", "createdAt": 1755300000000 }
+]
+```
+
+A Web Push row carries **no** `kind` — rows written before FCM existed round-trip unchanged, and `getSubscriptionRecords()` / `getFcmSubscriptionRecords()` each read only their own kind. `DELETE` takes `{endpoint}` for a Web Push row, `{token}` for one FCM registration, or `{deviceId}` for every FCM registration of one device. `GET` returns `devices` (endpoints) and `fcmDevices`; the FCM listing carries the device binding but never the token, which is a send credential.
+
+### FCM service account (outside `~/.purplemux`)
+
+The `fcm` channel is off unless `FCM_SERVICE_ACCOUNT_PATH` points at a Firebase service-account JSON key file. The path is read once at startup; absent or unreadable means the channel is not registered and nothing else changes. The file lives wherever the operator puts it — purplemux never copies it into `~/.purplemux` and never logs its contents.
+
 ### `cli-token`, `port`
 
 Shared handshake between the server and any CLI/hook that needs to reach it:
@@ -280,7 +301,7 @@ All files here are regeneratable — deleting them just triggers a recompute on 
 | All workspaces and tabs | `workspaces.json` + `workspaces/` |
 | A single workspace's layout | `workspaces/{wsId}/layout.json` (it will be recreated as a default pane) |
 | Usage statistics | `stats/` |
-| Push subscriptions | `push-subscriptions.json` |
+| Push subscriptions (Web Push + FCM) | `push-subscriptions.json` |
 | Stuck "already running" | `pmux.lock` (only if no purplemux process is alive) |
 
 `hooks.json`, `status-hook.sh`, `codex-hook.sh`, `grok-hook.sh`, `statusline.sh`, `port`, `cli-token`, `vapid-keys.json` are auto-regenerated on the next startup.

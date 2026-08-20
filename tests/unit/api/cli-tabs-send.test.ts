@@ -144,8 +144,10 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
       tabId: TAB_ID,
       cliState: 'busy',
       detail: 'readiness-timeout',
-      waitedMs: 0,
+      waitedMs: expect.any(Number),
     });
+    // A measured elapsed time, so a loaded machine reports 1ms for a zero wait.
+    expect((response.body as { waitedMs: number }).waitedMs).toBeLessThan(50);
     expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
   });
 
