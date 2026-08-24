@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { getDangerouslySkipPermissions } from '@/lib/config-store';
 import { GROK_BIN_PATH, grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import { checkGrokLogin, runGrokPreflight } from '@/lib/providers/grok/preflight';
@@ -53,12 +54,22 @@ const grokBinary = async (): Promise<string> => {
 /**
  * The pane's `GROK_HOME` is exported by the login shell (`src/lib/tmux.ts`), so
  * the command itself only has to name the working directory, the permission
- * mode and — on a resume — the session.
+ * mode and the session.
+ *
+ * A FRESH launch always mints its own `--session-id`. Without one, the new
+ * process carries no session identity, and detection's newest-session-for-cwd
+ * fallback binds the tab to whatever session is newest in that directory —
+ * with another grok tab already running in the same workspace, that is the
+ * OTHER tab's live conversation, which the new tab then shows as its own.
+ * `--session-id` names a NEW conversation (grok refuses an existing id), so
+ * the tab is born with an unambiguous identity and the cwd heuristic is never
+ * consulted; resuming an existing session stays on `--resume`.
  */
 export const composeGrokLaunchCommand = async (resumeSessionId?: string): Promise<string> => {
   const parts = [await grokBinary(), '--cwd', '"$PWD"'];
   if (await getDangerouslySkipPermissions()) parts.push('--permission-mode', 'bypassPermissions');
   if (resumeSessionId) parts.push('--resume', shellSingleQuote(resumeSessionId));
+  else parts.push('--session-id', shellSingleQuote(randomUUID()));
   return parts.join(' ');
 };
 

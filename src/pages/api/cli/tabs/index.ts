@@ -8,6 +8,7 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { buildClaudeFlags, isValidModelName } from '@/lib/claude-command';
 import { codexProvider } from '@/lib/providers/codex';
+import { grokProvider } from '@/lib/providers/grok';
 import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import type { TPanelType } from '@/types/terminal';
@@ -129,6 +130,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (shouldLaunch) {
       if (resolvedType === 'claude-code') {
         command = `claude ${await buildClaudeFlags(workspaceId, { model, effort: reasoning })}`;
+      } else if (resolvedType === 'grok-cli') {
+        // The catch-all else below is codex; routing grok through it launched
+        // codex inside a grok tab. Grok takes no model/reasoning flags here.
+        command = await grokProvider.buildLaunchCommand({ workspaceId });
       } else {
         command = await codexProvider.buildLaunchCommand({ workspaceId });
         if (model) command += ` --model ${model}`;

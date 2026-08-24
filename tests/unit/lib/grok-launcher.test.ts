@@ -41,11 +41,27 @@ beforeEach(async () => {
 });
 
 describe('grok launch command', () => {
-  it('runs the resolved binary against the pane cwd', async () => {
+  it('runs the resolved binary against the pane cwd, minting a fresh session id', async () => {
     const { grokProvider } = await importProvider();
 
-    expect(await grokProvider.buildLaunchCommand({}))
-      .toBe(`'${mockHome.value}/.grok/bin/grok' --cwd "$PWD"`);
+    const command = await grokProvider.buildLaunchCommand({});
+    expect(command).toMatch(
+      new RegExp(`^'${mockHome.value}/.grok/bin/grok' --cwd "\\$PWD" --session-id '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'$`),
+    );
+  });
+
+  it('every fresh launch gets its OWN session id — two tabs must never share one', async () => {
+    // Without an explicit id the new process has no session identity, and
+    // detection's newest-session-for-cwd fallback binds the tab to the OTHER
+    // grok tab's live conversation. The id in the args is what makes the
+    // binding deterministic (SESSION_ARG_RE reads -s/--session-id).
+    const { grokProvider } = await importProvider();
+
+    const first = await grokProvider.buildLaunchCommand({});
+    const second = await grokProvider.buildLaunchCommand({});
+    expect(first).not.toBe(second);
+    expect(first).toContain('--session-id');
+    expect(first).not.toContain('--resume');
   });
 
   it('falls back to the install path when the binary could not be resolved', async () => {
@@ -66,8 +82,12 @@ describe('grok launch command', () => {
   it('resumes by session id', async () => {
     const { grokProvider } = await importProvider();
 
-    expect(await grokProvider.buildResumeCommand(SESSION_ID, {}))
+    const command = await grokProvider.buildResumeCommand(SESSION_ID, {});
+    expect(command)
       .toBe(`'${mockHome.value}/.grok/bin/grok' --cwd "$PWD" --resume '${SESSION_ID}'`);
+    // A resume must NOT also mint a session id: grok only accepts the pair
+    // together with --fork-session, which would silently fork the session.
+    expect(command).not.toContain('--session-id');
   });
 
   it('never threads a GROK_HOME into the command — the pane shell exports it', async () => {
