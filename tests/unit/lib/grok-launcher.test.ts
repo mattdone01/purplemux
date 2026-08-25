@@ -50,6 +50,29 @@ describe('grok launch command', () => {
     );
   });
 
+  it('pins -m and --effort when the orchestrator asks', async () => {
+    const { grokProvider } = await importProvider();
+
+    const command = await grokProvider.buildLaunchCommand({ model: 'grok-4.6', effort: 'high' });
+    expect(command).toContain("-m 'grok-4.6'");
+    expect(command).toContain("--effort 'high'");
+    expect(command).toContain('--session-id');
+  });
+
+  it('accepts grok xhigh effort, which is not a Codex value', async () => {
+    const { grokProvider } = await importProvider();
+
+    expect(await grokProvider.buildLaunchCommand({ effort: 'xhigh' })).toContain("--effort 'xhigh'");
+  });
+
+  it('drops an invalid model or effort rather than interpolating it', async () => {
+    const { grokProvider } = await importProvider();
+
+    const command = await grokProvider.buildLaunchCommand({ model: 'grok 4.6; rm -rf /', effort: 'ultra' });
+    expect(command).not.toContain('-m');
+    expect(command).not.toContain('--effort');
+  });
+
   it('every fresh launch gets its OWN session id — two tabs must never share one', async () => {
     // Without an explicit id the new process has no session identity, and
     // detection's newest-session-for-cwd fallback binds the tab to the OTHER
@@ -85,6 +108,8 @@ describe('grok launch command', () => {
     const command = await grokProvider.buildResumeCommand(SESSION_ID, {});
     expect(command)
       .toBe(`'${mockHome.value}/.grok/bin/grok' --cwd "$PWD" --resume '${SESSION_ID}'`);
+    expect(await grokProvider.buildResumeCommand(SESSION_ID, { model: 'grok-4.6', effort: 'medium' }))
+      .toBe(`'${mockHome.value}/.grok/bin/grok' --cwd "$PWD" -m 'grok-4.6' --effort 'medium' --resume '${SESSION_ID}'`);
     // A resume must NOT also mint a session id: grok only accepts the pair
     // together with --fork-session, which would silently fork the session.
     expect(command).not.toContain('--session-id');

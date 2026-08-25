@@ -6,6 +6,7 @@ import { authorizeWorkspace, canAccessWorkspace, resolveFirstPaneId } from '@/li
 import { resolveCliScope } from '@/lib/workspace-token';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
+import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
 import { buildClaudeFlags, isValidModelName } from '@/lib/claude-command';
 import { codexProvider } from '@/lib/providers/codex';
 import { grokProvider } from '@/lib/providers/grok';
@@ -110,16 +111,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     // Each engine has its own effort vocabulary; validate against the one the
     // tab will actually launch so a typo fails here, not silently at runtime.
     if (reasoning !== undefined) {
-      const claudeTab = (panelType ?? 'terminal') === 'claude-code';
-      const valid = claudeTab
-        ? /^(low|medium|high|xhigh|max)$/.test(String(reasoning))
-        : /^(minimal|low|medium|high)$/.test(String(reasoning));
-      if (!valid) {
-        return res.status(400).json({
-          error: claudeTab
-            ? 'Invalid reasoning for claude-code (low|medium|high|xhigh|max)'
-            : 'Invalid reasoning (minimal|low|medium|high)',
-        });
+      if (!isValidReasoningForPanelType(resolvedType, reasoning)) {
+        return res.status(400).json({ error: reasoningErrorForPanelType(resolvedType) });
       }
     }
 
@@ -131,9 +124,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       if (resolvedType === 'claude-code') {
         command = `claude ${await buildClaudeFlags(workspaceId, { model, effort: reasoning })}`;
       } else if (resolvedType === 'grok-cli') {
-        // The catch-all else below is codex; routing grok through it launched
-        // codex inside a grok tab. Grok takes no model/reasoning flags here.
-        command = await grokProvider.buildLaunchCommand({ workspaceId });
+        // Catch-all else is codex; routing grok through it launched codex
+        // inside a grok tab. Pin model/effort at launch the same as the others.
+        command = await grokProvider.buildLaunchCommand({ workspaceId, model, effort: reasoning });
       } else {
         command = await codexProvider.buildLaunchCommand({ workspaceId });
         if (model) command += ` --model ${model}`;

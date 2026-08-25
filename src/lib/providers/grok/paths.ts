@@ -22,6 +22,8 @@ export const GROK_HOOKS_DIRNAME = 'hooks';
 export const GROK_UPDATES_FILENAME = 'updates.jsonl';
 export const GROK_SUMMARY_FILENAME = 'summary.json';
 export const GROK_SIGNALS_FILENAME = 'signals.json';
+/** Live grok processes in this home — pid → session_id, written by grok itself. */
+export const GROK_ACTIVE_SESSIONS_FILENAME = 'active_sessions.json';
 
 /**
  * Grok names a session group after the URL-encoded working directory, and falls

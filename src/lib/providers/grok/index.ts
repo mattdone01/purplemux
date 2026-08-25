@@ -1,4 +1,6 @@
 import { randomUUID } from 'crypto';
+import { isValidGrokEffort } from '@/lib/agent-effort';
+import { isValidModelName } from '@/lib/claude-command-shared';
 import { getDangerouslySkipPermissions } from '@/lib/config-store';
 import { GROK_BIN_PATH, grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import { checkGrokLogin, runGrokPreflight } from '@/lib/providers/grok/preflight';
@@ -10,7 +12,7 @@ import {
 } from '@/lib/providers/grok/session-detection';
 import { isValidGrokSessionId } from '@/lib/providers/grok/session-store';
 import { GROK_PROVIDER_ID } from '@/lib/session-parser-grok';
-import type { IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
+import type { IAgentLaunchCommandOptions, IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
 import type { IAgentState, ITab } from '@/types/terminal';
 
 export { GROK_PROVIDER_ID };
@@ -65,9 +67,18 @@ const grokBinary = async (): Promise<string> => {
  * the tab is born with an unambiguous identity and the cwd heuristic is never
  * consulted; resuming an existing session stays on `--resume`.
  */
-export const composeGrokLaunchCommand = async (resumeSessionId?: string): Promise<string> => {
+export const composeGrokLaunchCommand = async (
+  resumeSessionId?: string,
+  options: Pick<IAgentLaunchCommandOptions, 'model' | 'effort'> = {},
+): Promise<string> => {
   const parts = [await grokBinary(), '--cwd', '"$PWD"'];
   if (await getDangerouslySkipPermissions()) parts.push('--permission-mode', 'bypassPermissions');
+  if (options.model && isValidModelName(options.model)) {
+    parts.push('-m', shellSingleQuote(options.model));
+  }
+  if (options.effort && isValidGrokEffort(options.effort)) {
+    parts.push('--effort', shellSingleQuote(options.effort));
+  }
   if (resumeSessionId) parts.push('--resume', shellSingleQuote(resumeSessionId));
   else parts.push('--session-id', shellSingleQuote(randomUUID()));
   return parts.join(' ');
@@ -98,12 +109,12 @@ export const grokProvider: IAgentProvider = {
   isAgentRunning: (panePid, childPids) => isGrokRunning(panePid, childPids),
   watchSessions: (panePid, onChange, options) => watchGrokSessions(panePid, onChange, options),
 
-  buildLaunchCommand: () => composeGrokLaunchCommand(),
-  buildResumeCommand: (sessionId) => {
+  buildLaunchCommand: ({ model, effort } = {}) => composeGrokLaunchCommand(undefined, { model, effort }),
+  buildResumeCommand: (sessionId, { model, effort } = {}) => {
     if (!isValidGrokSessionId(sessionId)) {
       throw new Error(`Invalid grok session ID format: ${sessionId}`);
     }
-    return composeGrokLaunchCommand(sessionId);
+    return composeGrokLaunchCommand(sessionId, { model, effort });
   },
 
   readSessionId: (tab) => readField(tab, 'sessionId'),

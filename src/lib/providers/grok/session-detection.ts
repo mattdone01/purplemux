@@ -11,7 +11,7 @@ import { grokHookEvents } from '@/lib/providers/grok/hook-events';
 import { runGrokPreflight } from '@/lib/providers/grok/preflight';
 import {
   findGrokSessionById,
-  findLatestGrokSessionForCwd,
+  findGrokSessionByPid,
   isValidGrokSessionId,
   type IGrokSessionRef,
 } from '@/lib/providers/grok/session-store';
@@ -106,12 +106,12 @@ const paneGrokHome = (tmuxSession: string | undefined): string | undefined => {
 };
 
 /**
- * Grok groups its sessions by working directory, so the newest session dir for
- * the pane's cwd is the right answer when the process carries no `--session-id`
- * or `--resume`. Cwd alone does NOT identify a session: the same project opened
- * in two workspaces has one session dir per home, and the unscoped `~/.grok` is
- * scanned first. The lookup is therefore pinned to the pane's own home, and
- * only an ad-hoc pane — which has none — falls back to scanning every home.
+ * Bind order:
+ * 1. `--session-id` / `--resume <uuid>` on the process args.
+ * 2. `$GROK_HOME/active_sessions.json` keyed by the grok pid — this is how a
+ *    legacy tab launched without `--session-id` still maps to ITS conversation.
+ * Newest-session-for-cwd is never a bind. Two grok tabs in one workspace share
+ * a cwd, and that heuristic attaches the tab without an id to the neighbour.
  */
 export const detectActiveSession = async (
   panePid: number,
@@ -129,24 +129,24 @@ export const detectActiveSession = async (
   const found = await findGrokProcess(all);
   if (!found) return NOT_RUNNING;
 
+  const stub = (sessionId: string): IGrokSessionRef => ({
+    sessionId,
+    home: '',
+    workspaceId: null,
+    sessionDir: '',
+    jsonlPath: '',
+    cwd: found.cwd,
+    lastActivityMs: 0,
+  });
+
   const argSessionId = extractGrokSessionId(found.args);
   if (argSessionId) {
     const ref = await findGrokSessionById(argSessionId);
-    return toSessionInfo(found, ref ?? {
-      sessionId: argSessionId,
-      home: '',
-      workspaceId: null,
-      sessionDir: '',
-      jsonlPath: '',
-      cwd: found.cwd,
-      lastActivityMs: 0,
-    });
+    return toSessionInfo(found, ref ?? stub(argSessionId));
   }
 
-  if (options.allowCwdFallback && found.cwd) {
-    const ref = await findLatestGrokSessionForCwd(found.cwd, paneGrokHome(options.tmuxSession));
-    if (ref) return toSessionInfo(found, ref);
-  }
+  const byPid = await findGrokSessionByPid(found.pid, paneGrokHome(options.tmuxSession));
+  if (byPid) return toSessionInfo(found, byPid.ref ?? stub(byPid.sessionId));
 
   return toSessionInfo(found, null);
 };
@@ -194,7 +194,6 @@ export const watchSessions = (
     if (stopped) return;
     if (!currentPid) {
       const info = await detectActiveSession(panePid, undefined, {
-        allowCwdFallback: true,
         tmuxSession: watchedSession,
       });
       rememberInfo(info);
@@ -211,7 +210,6 @@ export const watchSessions = (
     }
     if (!currentSessionId) {
       const info = await detectActiveSession(panePid, undefined, {
-        allowCwdFallback: true,
         tmuxSession: watchedSession,
       });
       if (info.sessionId !== currentSessionId) {
@@ -225,7 +223,6 @@ export const watchSessions = (
 
   if (!options?.skipInitial) {
     detectActiveSession(panePid, undefined, {
-      allowCwdFallback: true,
       tmuxSession: watchedSession,
     }).then((info) => {
       if (stopped) return;

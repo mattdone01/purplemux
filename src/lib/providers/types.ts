@@ -5,10 +5,14 @@ import type { IPermissionRequest } from '@/types/codex-permission';
 
 export interface IAgentResumeCommandOptions {
   workspaceId?: string;
+  model?: string;
+  effort?: string;
 }
 
 export interface IAgentLaunchCommandOptions {
   workspaceId?: string;
+  model?: string;
+  effort?: string;
 }
 
 export interface IAgentSessionWatchOptions {

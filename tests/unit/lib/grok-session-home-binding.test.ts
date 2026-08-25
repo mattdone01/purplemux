@@ -35,11 +35,13 @@ vi.mock('@/lib/providers/grok/preflight', () => ({
 
 const PANE_PID = 4001;
 const GROK_PID = 4002;
+const OTHER_PID = 4003;
 const CWD = '/repo';
 
 const UNSCOPED_ID = '01a00000-0000-7000-8000-00000000000a';
 const WS_A_ID = '01a00000-0000-7000-8000-00000000000b';
 const WS_B_ID = '01a00000-0000-7000-8000-00000000000c';
+const NEIGHBOUR_ID = '01a00000-0000-7000-8000-00000000000d';
 
 const seedSession = async (home: string, sessionId: string, mtimeMs: number): Promise<string> => {
   const dir = path.join(home, 'sessions', encodeURIComponent(CWD), sessionId);
@@ -51,10 +53,25 @@ const seedSession = async (home: string, sessionId: string, mtimeMs: number): Pr
   return jsonlPath;
 };
 
+const seedActiveSessions = async (
+  home: string,
+  rows: Array<{ sessionId: string; pid: number }>,
+): Promise<void> => {
+  await fs.mkdir(home, { recursive: true });
+  await fs.writeFile(
+    path.join(home, 'active_sessions.json'),
+    JSON.stringify(rows.map((row) => ({
+      session_id: row.sessionId,
+      pid: row.pid,
+      cwd: CWD,
+    }))),
+  );
+};
+
 const workspaceHome = (wsId: string) =>
   path.join(mockHome.value, '.purplemux', 'workspaces', wsId, 'grok-home');
 
-describe('grok cwd fallback binds to the pane own GROK_HOME', () => {
+describe('grok session bind is by process identity, never newest-for-cwd', () => {
   let detectActiveSession: (
     panePid: number,
     childPids?: number[],
@@ -70,18 +87,30 @@ describe('grok cwd fallback binds to the pane own GROK_HOME', () => {
     processUtils.getProcessArgs.mockImplementation(async () => `grok --cwd ${CWD}`);
     processUtils.getProcessCwd.mockImplementation(async () => CWD);
 
-    // The unscoped home is scanned first and is the newest, so it wins any
-    // lookup that is not scoped to the pane's own home.
     await seedSession(path.join(mockHome.value, '.grok'), UNSCOPED_ID, Date.now());
     await seedSession(workspaceHome('ws-a'), WS_A_ID, Date.now() - 60_000);
     await seedSession(workspaceHome('ws-b'), WS_B_ID, Date.now() - 120_000);
+    await seedSession(workspaceHome('ws-b'), NEIGHBOUR_ID, Date.now());
 
     ({ detectActiveSession } = await import('@/lib/providers/grok/session-detection'));
   });
 
-  it('picks the session in the workspace home the pane runs under', async () => {
+  it('does not bind a no-id process to the newest session for the cwd', async () => {
     const info = await detectActiveSession(PANE_PID, undefined, {
       allowCwdFallback: true,
+      tmuxSession: 'pt-ws-b-pane-1',
+    });
+
+    expect(info).toMatchObject({ status: 'running', sessionId: null, jsonlPath: null, pid: GROK_PID });
+  });
+
+  it('binds a no-id process to its own row in active_sessions.json', async () => {
+    await seedActiveSessions(workspaceHome('ws-b'), [
+      { sessionId: WS_B_ID, pid: GROK_PID },
+      { sessionId: NEIGHBOUR_ID, pid: OTHER_PID },
+    ]);
+
+    const info = await detectActiveSession(PANE_PID, undefined, {
       tmuxSession: 'pt-ws-b-pane-1',
     });
 
@@ -91,9 +120,11 @@ describe('grok cwd fallback binds to the pane own GROK_HOME', () => {
     ));
   });
 
-  it('does not reach into another workspace home for the same cwd', async () => {
+  it('does not reach into another workspace home for the same pid', async () => {
+    await seedActiveSessions(workspaceHome('ws-a'), [{ sessionId: WS_A_ID, pid: GROK_PID }]);
+    await seedActiveSessions(workspaceHome('ws-b'), [{ sessionId: WS_B_ID, pid: GROK_PID }]);
+
     const info = await detectActiveSession(PANE_PID, undefined, {
-      allowCwdFallback: true,
       tmuxSession: 'pt-ws-a-pane-1',
     });
 
@@ -101,9 +132,10 @@ describe('grok cwd fallback binds to the pane own GROK_HOME', () => {
     expect(info.jsonlPath).toContain(path.join('workspaces', 'ws-a', 'grok-home'));
   });
 
-  it('reports no session when the pane own home holds none for that cwd', async () => {
+  it('reports no session when the pane own home has no active_sessions row', async () => {
+    await seedActiveSessions(workspaceHome('ws-a'), [{ sessionId: WS_A_ID, pid: GROK_PID }]);
+
     const info = await detectActiveSession(PANE_PID, undefined, {
-      allowCwdFallback: true,
       tmuxSession: 'pt-ws-empty-pane-1',
     });
 
@@ -111,8 +143,11 @@ describe('grok cwd fallback binds to the pane own GROK_HOME', () => {
   });
 
   it('still scans every home for an ad-hoc pane', async () => {
+    await seedActiveSessions(path.join(mockHome.value, '.grok'), [
+      { sessionId: UNSCOPED_ID, pid: GROK_PID },
+    ]);
+
     const info = await detectActiveSession(PANE_PID, undefined, {
-      allowCwdFallback: true,
       tmuxSession: 'pt-adhoc-1',
     });
 
@@ -123,12 +158,23 @@ describe('grok cwd fallback binds to the pane own GROK_HOME', () => {
   it('keeps binding by session id when the process carries one', async () => {
     processUtils.getProcessArgs.mockImplementation(async () =>
       `grok --cwd ${CWD} --session-id ${UNSCOPED_ID}`);
+    await seedActiveSessions(workspaceHome('ws-b'), [{ sessionId: WS_B_ID, pid: GROK_PID }]);
 
     const info = await detectActiveSession(PANE_PID, undefined, {
-      allowCwdFallback: true,
       tmuxSession: 'pt-ws-b-pane-1',
     });
 
     expect(info.sessionId).toBe(UNSCOPED_ID);
+  });
+
+  it('binds the session id from active_sessions even before the transcript exists', async () => {
+    const pendingId = '01a00000-0000-7000-8000-0000000000ee';
+    await seedActiveSessions(workspaceHome('ws-b'), [{ sessionId: pendingId, pid: GROK_PID }]);
+
+    const info = await detectActiveSession(PANE_PID, undefined, {
+      tmuxSession: 'pt-ws-b-pane-1',
+    });
+
+    expect(info.sessionId).toBe(pendingId);
   });
 });
