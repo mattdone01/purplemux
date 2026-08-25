@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { listGrokHomes, workspaceIdForGrokHome } from '@/lib/grok-home';
 import {
+  GROK_ACTIVE_SESSIONS_FILENAME,
   GROK_CWD_MARKER_FILENAME,
   GROK_SIGNALS_FILENAME,
   GROK_SUMMARY_FILENAME,
@@ -195,6 +196,51 @@ export const findLatestGrokSessionForCwd = async (
     const match = (await listGrokSessionsInHome(candidate))
       .find((ref) => ref.cwd !== null && path.resolve(ref.cwd) === resolved);
     if (match) return match;
+  }
+  return null;
+};
+
+export interface IGrokActiveSession {
+  sessionId: string;
+  pid: number;
+  cwd: string | null;
+}
+
+const parseActiveSessions = (parsed: unknown): IGrokActiveSession[] => {
+  if (!Array.isArray(parsed)) return [];
+  const out: IGrokActiveSession[] = [];
+  for (const row of parsed) {
+    if (!isRecord(row)) continue;
+    const sessionId = asString(row.session_id);
+    const pid = row.pid;
+    if (!sessionId || !isValidGrokSessionId(sessionId) || typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+      continue;
+    }
+    out.push({ sessionId, pid, cwd: asString(row.cwd) });
+  }
+  return out;
+};
+
+const readActiveSessions = async (home: string): Promise<IGrokActiveSession[]> =>
+  parseActiveSessions(await readJson(path.join(home, GROK_ACTIVE_SESSIONS_FILENAME)));
+
+/**
+ * Bind a grok process to its own session via `$GROK_HOME/active_sessions.json`.
+ * Newest-session-for-cwd is not a substitute: two grok tabs in one workspace
+ * share a cwd, and that heuristic attaches the tab without `--session-id` to
+ * the neighbour's live conversation.
+ */
+export const findGrokSessionByPid = async (
+  pid: number,
+  home?: string,
+): Promise<{ sessionId: string; ref: IGrokSessionRef | null } | null> => {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const homes = home ? [home] : await listGrokHomes();
+  for (const candidate of homes) {
+    const entry = (await readActiveSessions(candidate)).find((row) => row.pid === pid);
+    if (!entry) continue;
+    const ref = (await listGrokSessionsInHome(candidate)).find((row) => row.sessionId === entry.sessionId) ?? null;
+    return { sessionId: entry.sessionId, ref };
   }
   return null;
 };

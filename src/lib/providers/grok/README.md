@@ -32,6 +32,15 @@ A workspace pane launches with `GROK_HOME=~/.purplemux/workspaces/<ws>/grok-home
 symlinks back to `~/.grok`. An ad-hoc tab runs against the real `~/.grok`, and
 its sessions key as `grok:global:<id>`.
 
+Tab isolation inside a workspace is the process identity, not the cwd. A fresh
+launch always mints `--session-id`. Detection binds in this order: the id on the
+process args, then `$GROK_HOME/active_sessions.json` keyed by the grok pid.
+Newest-session-for-cwd is never a bind — two grok tabs share a cwd, and that
+heuristic attached a tab without an id to the neighbour's live conversation.
+
+`tab create -t grok-cli -m grok-4.6 -r high` passes `-m` and `--effort` on the
+launch command. Omitting them leaves grok's own defaults.
+
 purplemux never writes `~/.grok/config.toml`, and never changes the
 `[compat.claude]` cells — they are how the SDLC skill library reaches Grok.
 

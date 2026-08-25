@@ -52,11 +52,12 @@ POST /api/cli/tabs
   Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
-  codex --model). "reasoning" sets the effort — claude-code: "low" | "medium" | "high" |
-  "xhigh" | "max" (claude --effort; omitted = the launching user's GLOBAL default, so an
-  orchestrator spawning workers should always pin it to the intended tier); codex-cli:
-  "minimal" | "low" | "medium" | "high" (model_reasoning_effort). "launch": false keeps
-  the old bare-shell behavior.
+  grok -m / codex --model). "reasoning" sets the effort — claude-code: "low" | "medium" |
+  "high" | "xhigh" | "max" (claude --effort; omitted = the launching user's GLOBAL default,
+  so an orchestrator spawning workers should always pin it to the intended tier); grok-cli:
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (grok --effort);
+  codex-cli: "minimal" | "low" | "medium" | "high" (model_reasoning_effort). "launch": false
+  keeps the old bare-shell behavior.
   Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched" }
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
