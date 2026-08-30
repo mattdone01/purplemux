@@ -136,4 +136,19 @@ describe('POST /api/status/hook?provider=grok', () => {
     expect(state.statusCode).toBe(204);
     expect(statusManager.handleToolActivity).not.toHaveBeenCalled();
   });
+
+  it('returns a stranded needs-input tab to busy when a tool completes', async () => {
+    statusManager.applyAgentHookMeta.mockReturnValue({ cliState: 'needs-input' });
+
+    const state = await post(POST_TOOL_USE_BODY);
+
+    expect(state.statusCode).toBe(204);
+    expect(statusManager.handleToolActivity).toHaveBeenCalledTimes(1);
+    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('grok', TMUX_SESSION, { kind: 'prompt-submit' });
+  });
+
+  it('does not synthesise a prompt-submit while the tab is already busy', async () => {
+    await post(POST_TOOL_USE_BODY);
+    expect(statusManager.handleProviderEvent).not.toHaveBeenCalled();
+  });
 });

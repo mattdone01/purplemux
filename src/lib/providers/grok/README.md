@@ -53,6 +53,9 @@ Recorded from two real sessions on this machine (2026-08-16), and kept in
   `_x.ai/session/update` channels;
 - `user_message_chunk`, `agent_thought_chunk`, `agent_message_chunk` and their
   streaming behaviour;
+- always-approve still emits `Notification permission_prompt` per tool with
+  `permission_resolved allow wait_ms: 0`; purplemux must not flip to
+  `needs-input` for that (live 2026-08-30, 81 false waits in one turn);
 - `tool_call` and `tool_call_update`, including the non-terminal update that
   only refines a call's title, and the `_meta['x.ai/tool']` block that names the
   tool;

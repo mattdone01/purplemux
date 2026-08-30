@@ -253,7 +253,7 @@ Grok Build reaches the same endpoint with `?provider=grok`, and its payload is t
 | `PreCompact` | `pre-compact` | → `compactingSince = now` (cliState unchanged) |
 | `PostCompact` | `post-compact` | → `compactingSince = null` (cliState unchanged) |
 | `PostToolUse` | _(no state event)_ | feeds `handleToolActivity`, like Claude's `post-tool` |
-| `Notification` `permission_prompt` | `notification` | → `needs-input` |
+| `Notification` `permission_prompt` | `notification` | → `needs-input`, **except always-approve / `bypassPermissions` / yolo** (auto-resolve with `wait_ms: 0`; treating those as a wait stranded the tab for the rest of the turn) |
 | `Notification` `idle_prompt` / `task_complete` | `stop`, **only while the tab is busy** | → `ready-for-review` |
 
 Three rules are specific to grok and are deliberate:

@@ -110,6 +110,12 @@ const handleGrokHook = (req: NextApiRequest, res: NextApiResponse) => {
   if (event === 'post_tool_use') {
     const activity = parseGrokToolActivity(payload);
     if (activity) statusManager.handleToolActivity('grok', tmuxSession, activity);
+    // A tool that completed cannot still be waiting on a permission prompt.
+    // Recovers from a permission_prompt hook whose payload omitted
+    // permissionMode (always-approve still auto-resolves wait_ms: 0).
+    if (applied.cliState === 'needs-input') {
+      statusManager.handleProviderEvent('grok', tmuxSession, { kind: 'prompt-submit' });
+    }
   }
 
   if (!result.ok) {
