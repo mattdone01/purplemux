@@ -59,6 +59,25 @@ describe('translateGrokHookEvent', () => {
     }))).toEqual({ kind: 'notification', notificationType: 'permission_prompt' });
   });
 
+  it.each(['bypassPermissions', 'always-approve', 'yolo'])(
+    'does not treat an auto-approved permission ping (%s) as a wait',
+    (permissionMode) => {
+      expect(translateGrokHookEvent(payload({
+        hookEventName: 'notification',
+        notificationType: 'permission_prompt',
+        permissionMode,
+      }))).toBeNull();
+    },
+  );
+
+  it('still waits on a permission prompt in ask/default mode', () => {
+    expect(translateGrokHookEvent(payload({
+      hookEventName: 'notification',
+      notificationType: 'permission_prompt',
+      permissionMode: 'default',
+    }))).toEqual({ kind: 'notification', notificationType: 'permission_prompt' });
+  });
+
   it('treats the idle and task-complete pings as a settle', () => {
     for (const notificationType of ['idle_prompt', 'task_complete']) {
       expect(translateGrokHookEvent(payload({ hookEventName: 'notification', notificationType })))
@@ -133,6 +152,15 @@ describe('shouldEmitGrokHookEvent', () => {
   it('always emits a permission prompt', () => {
     const perm = payload({ hookEventName: 'notification', notificationType: 'permission_prompt' });
     expect(shouldEmitGrokHookEvent(perm, 'idle')).toBe(true);
+  });
+
+  it('does not emit an auto-approved permission ping', () => {
+    const perm = payload({
+      hookEventName: 'notification',
+      notificationType: 'permission_prompt',
+      permissionMode: 'bypassPermissions',
+    });
+    expect(shouldEmitGrokHookEvent(perm, 'busy')).toBe(false);
   });
 });
 

@@ -63,6 +63,24 @@ export const GROK_IDLE_NOTIFICATION = 'idle_prompt';
 export const GROK_TASK_COMPLETE_NOTIFICATION = 'task_complete';
 
 /**
+ * Permission modes that auto-resolve every tool prompt with wait_ms 0.
+ *
+ * Measured on a live grok-cli tab in always-approve: every tool still emits
+ * `Notification permission_prompt` then `permission_resolved allow wait_ms: 0`.
+ * Treating that as needs-input strands the tab for the rest of the turn and
+ * the orchestrator watchdog fires NEEDS INPUT while the pane shows Thinking.
+ *
+ * Product name is always-approve; Claude-compatible settings use
+ * `bypassPermissions`. `auto` still asks sometimes and is NOT this set.
+ */
+const GROK_AUTO_APPROVE_MODES = new Set(['bypasspermissions', 'alwaysapprove', 'yolo']);
+
+export const isGrokAutoApprovePermissionMode = (mode: string | undefined): boolean => {
+  if (typeof mode !== 'string' || !mode.trim()) return false;
+  return GROK_AUTO_APPROVE_MODES.has(mode.toLowerCase().replace(/[^a-z]/g, ''));
+};
+
+/**
  * A settle is a turn end grok reports as a state rather than an outcome: the
  * `idle_prompt` ping (which fires after interrupted and errored turns too) and
  * `task_complete`. It only moves a tab that is still busy — see
@@ -103,6 +121,8 @@ export const translateGrokHookEvent = (
       return { kind: 'post-compact' };
     case 'notification':
       if (payload.notificationType === GROK_PERMISSION_NOTIFICATION) {
+        // Auto-approve still fires this notification; it is not a wait.
+        if (isGrokAutoApprovePermissionMode(payload.permissionMode)) return null;
         return { kind: 'notification', notificationType: GROK_PERMISSION_NOTIFICATION };
       }
       return isGrokSettleNotification(payload.notificationType) ? { kind: 'stop' } : null;
