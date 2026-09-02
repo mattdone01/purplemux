@@ -44,6 +44,59 @@ const g = globalThis as unknown as { __ptClaudeRuntimeSnapshotCache?: Map<string
 if (!g.__ptClaudeRuntimeSnapshotCache) g.__ptClaudeRuntimeSnapshotCache = new Map();
 const jsonlIdleCache = g.__ptClaudeRuntimeSnapshotCache;
 
+/**
+ * Background work the Claude harness starts for the agent and later reports
+ * back: `Bash(run_in_background)` prints "Command running in background with
+ * ID: <id>", `Agent` prints "agentId: <id>", and each finishes with a
+ * `<task-notification>` carrying `<task-id><id></task-id>`. A turn that ends
+ * with any of them open is a wait, not a finish. Tool results and
+ * notifications both arrive as `user`-typed entries.
+ */
+const BACKGROUND_START_PATTERNS = [
+  /Command running in background with ID:\s*([A-Za-z0-9_-]+)/g,
+  /agentId:\s*([A-Za-z0-9_-]+)/g,
+];
+const TASK_NOTIFICATION_PATTERN = /<task-id>\s*([A-Za-z0-9_-]+)\s*<\/task-id>/g;
+
+const textBlocksOf = (entry: { message?: { content?: unknown } }): string[] => {
+  const c = entry.message?.content;
+  if (typeof c === 'string') return [c];
+  if (!Array.isArray(c)) return [];
+  const out: string[] = [];
+  for (const block of c as Array<{ type?: string; text?: string; content?: unknown }>) {
+    if (typeof block.text === 'string') out.push(block.text);
+    if (typeof block.content === 'string') out.push(block.content);
+    if (Array.isArray(block.content)) {
+      for (const inner of block.content as Array<{ text?: string }>) {
+        if (typeof inner.text === 'string') out.push(inner.text);
+      }
+    }
+  }
+  return out;
+};
+
+export const countOpenBackgroundTasks = (lines: string[]): number => {
+  const started = new Set<string>();
+  const finished = new Set<string>();
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.isSidechain || entry.type !== 'user') continue;
+      for (const text of textBlocksOf(entry)) {
+        for (const pattern of BACKGROUND_START_PATTERNS) {
+          pattern.lastIndex = 0;
+          for (const m of text.matchAll(pattern)) started.add(m[1]);
+        }
+        TASK_NOTIFICATION_PATTERN.lastIndex = 0;
+        for (const m of text.matchAll(TASK_NOTIFICATION_PATTERN)) finished.add(m[1]);
+      }
+    } catch { continue; }
+  }
+  let open = 0;
+  for (const id of started) if (!finished.has(id)) open += 1;
+  return open;
+};
+
 const emptySnapshot = (): IAgentRuntimeSnapshot => ({
   idle: false,
   stale: false,
@@ -187,6 +240,7 @@ export const readClaudeRuntimeSnapshot = async (
 
       let scan = scanLines(lines, elapsed);
       let extracted = extractAssistantInfo(lines);
+      let openBackgroundTasks = countOpenBackgroundTasks(lines);
 
       if (!scan.matched && stat.size > JSONL_TAIL_SIZE) {
         const extSize = Math.min(stat.size, JSONL_EXTENDED_TAIL_SIZE);
@@ -195,13 +249,14 @@ export const readClaudeRuntimeSnapshot = async (
         const extLines = extBuffer.toString('utf-8').split('\n').filter((l) => l.trim());
         scan = scanLines(extLines, elapsed);
         if (!extracted.lastAssistantSnippet && !extracted.currentAction) extracted = extractAssistantInfo(extLines);
+        openBackgroundTasks = countOpenBackgroundTasks(extLines);
       }
 
       if (jsonlIdleCache.size >= MAX_JSONL_CACHE) {
         jsonlIdleCache.delete(jsonlIdleCache.keys().next().value!);
       }
       jsonlIdleCache.set(jsonlPath, { mtimeMs: stat.mtimeMs, idle: scan.idle, stale: scan.stale, needsStaleRecheck: scan.needsStaleRecheck, staleMs: scan.staleMs, lastAssistantSnippet: extracted.lastAssistantSnippet, currentAction: extracted.currentAction, reset: extracted.reset, lastEntryTs: scan.lastEntryTs, interrupted: scan.interrupted });
-      return { idle: scan.idle, stale: scan.stale, lastAssistantSnippet: extracted.lastAssistantSnippet, currentAction: extracted.currentAction, reset: extracted.reset, lastEntryTs: scan.lastEntryTs, staleMs: scan.staleMs, interrupted: scan.interrupted };
+      return { idle: scan.idle, stale: scan.stale, lastAssistantSnippet: extracted.lastAssistantSnippet, currentAction: extracted.currentAction, reset: extracted.reset, lastEntryTs: scan.lastEntryTs, staleMs: scan.staleMs, interrupted: scan.interrupted , openBackgroundTasks };
     } finally {
       await handle.close();
     }
@@ -213,4 +268,5 @@ export const readClaudeRuntimeSnapshot = async (
 export const __testing = {
   extractAssistantInfo,
   scanLines,
+  countOpenBackgroundTasks,
 };

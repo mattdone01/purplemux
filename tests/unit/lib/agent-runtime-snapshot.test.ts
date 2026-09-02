@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
-import { readClaudeRuntimeSnapshot } from '@/lib/providers/claude/runtime-snapshot';
+import { readClaudeRuntimeSnapshot, __testing } from '@/lib/providers/claude/runtime-snapshot';
 import { readCodexRuntimeSnapshot } from '@/lib/providers/codex/runtime-snapshot';
 
 const writeJsonl = async (lines: unknown[]): Promise<string> => {
@@ -104,5 +104,29 @@ describe('agent runtime snapshots', () => {
     expect(snapshot.reset).toBe(true);
     expect(snapshot.lastAssistantSnippet).toBe('Previous answer.');
     expect(snapshot.currentAction).toBeNull();
+  });
+});
+
+describe('countOpenBackgroundTasks', () => {
+  const { countOpenBackgroundTasks } = __testing;
+  const user = (text: string) => JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: text }] } });
+  const notify = (id: string) => JSON.stringify({ type: 'user', message: { content: `<task-notification><task-id>${id}</task-id><status>completed</status></task-notification>` } });
+
+  it('counts a background command until its task notification arrives', () => {
+    const lines = [user('Command running in background with ID: bx3bq. Output is being written to /tmp/x')];
+    expect(countOpenBackgroundTasks(lines)).toBe(1);
+    expect(countOpenBackgroundTasks([...lines, notify('bx3bq')])).toBe(0);
+  });
+
+  it('counts an async subagent the same way', () => {
+    const lines = [user('Async agent launched successfully.\nagentId: a44c861f (internal ID)')];
+    expect(countOpenBackgroundTasks(lines)).toBe(1);
+    expect(countOpenBackgroundTasks([...lines, notify('a44c861f')])).toBe(0);
+  });
+
+  it('ignores sidechain entries, assistant text and a notification with no seen start', () => {
+    const assistant = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Command running in background with ID: fake' }] } });
+    const side = JSON.stringify({ type: 'user', isSidechain: true, message: { content: [{ type: 'tool_result', content: 'Command running in background with ID: side1' }] } });
+    expect(countOpenBackgroundTasks([assistant, side, notify('unseen')])).toBe(0);
   });
 });
