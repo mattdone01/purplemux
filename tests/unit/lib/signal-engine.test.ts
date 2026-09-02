@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { SignalEngine, matchesGlob, isInScope } from '@/lib/signal-engine';
+import { SignalEngine, matchesGlob, isInScope, normalizeScopePattern } from '@/lib/signal-engine';
 import { parseClaudeToolActivity } from '@/lib/providers/claude/tool-activity';
 import type { IAgentSignal } from '@/types/signals';
 
@@ -163,5 +163,55 @@ describe('parseClaudeToolActivity', () => {
   it('survives a malformed tool_input', () => {
     expect(parseClaudeToolActivity({ tool_name: 'Edit', tool_input: 'oops' })).toMatchObject({ paths: [] });
     expect(parseClaudeToolActivity({ tool_name: 'Edit', tool_input: { edits: 'oops' } })).toMatchObject({ paths: [] });
+  });
+});
+
+describe('normalizeScopePattern / isInScope with real-world scopes', () => {
+  it('reads an absolute scope path relative to the cwd', () => {
+    expect(normalizeScopePattern('/repo/treasury/.worktrees/story-01', '/repo')).toBe('treasury/.worktrees/story-01/**');
+    expect(isInScope('treasury/.worktrees/story-01/src/a.ts', ['/repo/treasury/.worktrees/story-01'], '/repo')).toBe(true);
+    expect(isInScope('treasury/.worktrees/story-02/src/a.ts', ['/repo/treasury/.worktrees/story-01'], '/repo')).toBe(false);
+  });
+
+  it('treats a glob-free pattern as the directory and everything beneath it', () => {
+    expect(isInScope('src/deep/a.ts', ['src'])).toBe(true);
+    expect(isInScope('src', ['src'])).toBe(true);
+    expect(isInScope('srcx/a.ts', ['src'])).toBe(false);
+  });
+
+  it('leaves an absolute pattern outside the cwd alone (no match, no crash)', () => {
+    expect(isInScope('src/a.ts', ['/elsewhere/src'], '/repo')).toBe(false);
+  });
+
+  it('keeps explicit globs exactly as written', () => {
+    expect(isInScope('src/a.ts', ['src/*.ts'])).toBe(true);
+    expect(isInScope('src/deep/a.ts', ['src/*.ts'])).toBe(false);
+  });
+});
+
+describe('off-scope re-fire discipline', () => {
+  let engine: SignalEngine;
+  let fired: IAgentSignal[];
+  beforeEach(() => {
+    engine = new SignalEngine();
+    fired = [];
+    engine.setEmitter((s) => fired.push(s));
+  });
+
+  it('does not fire for edits inside an absolute worktree scope', () => {
+    const scope = [`${CWD}/treasury/.worktrees/story-01`];
+    engine.record('t1', edit('treasury/.worktrees/story-01/a.ts', 'treasury/.worktrees/story-01/b.ts'), scope, CWD);
+    engine.record('t1', edit('treasury/.worktrees/story-01/c.ts'), scope, CWD);
+    expect(fired).toHaveLength(0);
+  });
+
+  it('fires once for two off-scope edits and stays quiet until NEW off-scope edits accumulate', () => {
+    const scope = ['src/'];
+    engine.record('t1', edit('other/a.ts', 'other/b.ts'), scope, CWD);
+    expect(fired).toHaveLength(1);
+    // the same two files edited again, plus in-scope work: nothing new to report
+    engine.record('t1', edit('other/a.ts'), scope, CWD);
+    engine.record('t1', edit('src/ok.ts'), scope, CWD);
+    expect(fired).toHaveLength(1);
   });
 });

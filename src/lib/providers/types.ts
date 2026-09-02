@@ -48,6 +48,14 @@ export interface IAgentRuntimeSnapshot {
   lastEntryTs: number | null;
   staleMs: number;
   interrupted: boolean;
+  /**
+   * Background jobs and async subagents the agent started and has not yet
+   * been told finished. An idle turn with any of these open is WAITING, not
+   * done: the harness re-invokes the agent when they exit, so reporting the
+   * tab as ready for review at that moment is premature. Optional so providers
+   * that cannot observe it keep their current behaviour.
+   */
+  openBackgroundTasks?: number;
 }
 
 export interface IAgentSessionHistoryStats {

@@ -219,7 +219,13 @@ class StatusManager {
 
     const unknownStateHandle = this.runtimeHandle(entry);
     if (provider && unknownStateHandle) {
-      const { idle, stale, lastAssistantSnippet } = await provider.readRuntimeSnapshot(unknownStateHandle);
+      const { idle, stale, lastAssistantSnippet, openBackgroundTasks } = await provider.readRuntimeSnapshot(unknownStateHandle);
+      if (idle && !stale && lastAssistantSnippet && (openBackgroundTasks ?? 0) > 0) {
+        this.applyCliState(tabId, entry, 'busy', { silent: true });
+        this.persistToLayout(entry);
+        this.broadcastUpdate(tabId, entry);
+        return;
+      }
       if (idle && !stale && lastAssistantSnippet) {
         this.applyCliState(tabId, entry, 'ready-for-review', { silent: true });
         this.persistToLayout(entry);
@@ -1111,6 +1117,40 @@ class StatusManager {
     return undefined;
   }
 
+  /**
+   * Resolve a `stop` that would read as ready-for-review: if the runtime still
+   * reports open background jobs / async subagents, the agent is waiting for
+   * them (measured 2026-09-02: workers were announced "ready for review"
+   * mid-gate, once per idle prompt, for hours). Stay `busy`; the next `stop`
+   * after the work returns re-evaluates. Any read failure falls back to the
+   * plain transition so a broken JSONL never hides a real finish.
+   */
+  private async applyStopStateAfterBackgroundCheck(tabId: string, entry: ITabStatusEntry): Promise<void> {
+    let openBackgroundTasks = 0;
+    try {
+      const provider = getProviderByPanelType(entry.panelType);
+      const handle = this.runtimeHandle(entry);
+      if (provider && handle) {
+        const snapshot = await provider.readRuntimeSnapshot(handle, { force: true });
+        openBackgroundTasks = snapshot.openBackgroundTasks ?? 0;
+      }
+    } catch (err) {
+      hookLog.debug({ tabId, err: String(err) }, 'background check failed; treating stop as ready');
+    }
+    const current = this.tabs.get(tabId);
+    if (!current || current !== entry) return;
+    if (entry.lastEvent?.name !== 'stop') return; // a newer event already moved the tab on
+    const target: TCliState = openBackgroundTasks > 0 ? 'busy' : 'ready-for-review';
+    if (openBackgroundTasks > 0) {
+      hookLog.debug({ tabId, openBackgroundTasks }, 'stop with open background work: busy, not ready-for-review');
+    }
+    if (entry.cliState !== target) {
+      this.applyCliState(tabId, entry, target);
+      this.persistToLayout(entry);
+      this.broadcastUpdate(tabId, entry);
+    }
+  }
+
   updateTabFromHook(tmuxSession: string, event: string, notificationType?: string): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
@@ -1156,9 +1196,16 @@ class StatusManager {
     );
 
     if (prevState !== newState) {
-      this.applyCliState(tabId, entry, newState);
-      this.persistToLayout(entry);
-      this.broadcastUpdate(tabId, entry);
+      if (newState === 'ready-for-review' && eventName === 'stop' && this.runtimeHandle(entry)) {
+        // A turn can end with background jobs or subagents still open; the
+        // harness re-invokes the agent when they finish, so the tab is
+        // WAITING, not ready. Ask the runtime before announcing a review.
+        void this.applyStopStateAfterBackgroundCheck(tabId, entry);
+      } else {
+        this.applyCliState(tabId, entry, newState);
+        this.persistToLayout(entry);
+        this.broadcastUpdate(tabId, entry);
+      }
     }
 
     if ((newState === 'busy' || newState === 'needs-input') && !entry.jsonlPath) {
