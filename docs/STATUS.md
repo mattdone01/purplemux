@@ -1,5 +1,11 @@
 # Claude CLI Work-State Detection
 
+The chat input availability notice distinguishes terminal connectivity from
+agent work state. A disconnected terminal shows `Connecting...`; a connected
+terminal with disabled input shows the provider's inactive-session message.
+It does not show a connection spinner solely because `cliState` is inactive.
+This is a presentation rule; it does not change the work-state transitions below.
+
 System that detects the in-progress state of the Claude CLI on the server, broadcasts it to the client over WebSocket, and reflects it in the UI indicators.
 
 **Core principle**: `cliState` has a **single source of truth — hook events** (real Claude Code hooks + one hook-equivalent synthesized on the server from the JSONL interrupt marker). All transitions go through `deriveStateFromEvent`, and seq is monotonic per tab. The previous multi-source heuristics (JSONL-driven promotion, pane capture, client-side local derivation) have otherwise been removed; JSONL is only consulted for the synthetic `interrupt` event and for metadata (snippet, currentAction).

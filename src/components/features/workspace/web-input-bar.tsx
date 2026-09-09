@@ -83,6 +83,9 @@ const WebInputBar = ({
   const { entries, isLoading, isError, fetchHistory, addHistory, deleteHistory } =
     useMessageHistory({ wsId });
   const isMobileDevice = useIsMobileDevice();
+  const inactiveMessage = provider === 'codex'
+    ? t('codexInactiveMessage')
+    : provider === 'grok' ? t('grokInactiveMessage') : t('inputDisabledPlaceholder');
   const submitDelayMs = 250;
   const handleMessageSent = useCallback(
     (message: string) => {
@@ -99,9 +102,7 @@ const WebInputBar = ({
       tabId,
       onRestartSession,
       onMessageSent: handleMessageSent,
-      disabledMessage: provider === 'codex'
-        ? t('codexInactiveMessage')
-        : provider === 'grok' ? t('grokInactiveMessage') : t('inputDisabledPlaceholder'),
+      disabledMessage: inactiveMessage,
       submitDelayMs,
     },
   );
@@ -451,14 +452,16 @@ const WebInputBar = ({
         <div
           className={cn(
             'pointer-events-none absolute bottom-full left-0 right-0 transition-opacity duration-300',
-            isDisabled && visible ? 'opacity-100' : 'opacity-0',
+            (isDisabled || !terminalWsConnected) && visible ? 'opacity-100' : 'opacity-0',
           )}
-          aria-hidden={!isDisabled || !visible}
+          aria-hidden={(!isDisabled && terminalWsConnected) || !visible}
         >
           <div className="mx-auto w-full max-w-content px-3 pb-1">
             <div className="grid grid-cols-[1fr_auto_1fr] items-center px-2 text-[11px] text-muted-foreground/70">
-              <Loader2 size={10} className="mr-1.5 justify-self-end animate-spin" />
-              <span>{t('connecting')}</span>
+              {terminalWsConnected
+                ? <Ban size={10} className="mr-1.5 justify-self-end" />
+                : <Loader2 size={10} className="mr-1.5 justify-self-end animate-spin" />}
+              <span>{terminalWsConnected ? inactiveMessage : t('connecting')}</span>
               <span />
             </div>
           </div>
