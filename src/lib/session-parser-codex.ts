@@ -130,6 +130,13 @@ type TInFlightEntry = IInFlightExec | IInFlightWebSearch | IInFlightMcp | IInFli
 const isPatchApply = (name: string): boolean => name === 'apply_patch';
 
 const summarizeFunctionCall = (name: string, args: unknown): string => {
+  // Code-mode calls contain source text rather than JSON arguments. Keep a
+  // bounded preview so their activity does not collapse to the word "exec".
+  // Never evaluate tool input to discover what it does.
+  if (typeof args === 'string') {
+    const source = args.replace(/^\s*\/\/ @exec:[^\n]*\n/, '').trim();
+    return source ? `${name}: ${oneLineSummary(source, 160)}` : name;
+  }
   if (typeof args !== 'object' || args === null) return name;
   const obj = args as Record<string, unknown>;
   if (name === 'exec_command') {
@@ -235,6 +242,7 @@ interface ICodexParseState {
   staleWarnings: Set<string>;
   suppressedCallIds: Set<string>;
   syntheticCallIdCount: number;
+  lastAssistantMessage?: { source: string; text: string };
 }
 
 const createState = (): ICodexParseState => ({
@@ -367,8 +375,22 @@ const processResponseItem = (
 ): ITimelineEntry[] => {
   const type = safeString(payload.type);
   switch (type) {
-    case 'message':
-      return [];
+    case 'message': {
+      // Newer rollouts only emit response items for public assistant messages.
+      // User/developer context and non-public channels must stay out of chat.
+      if (payload.role !== 'assistant') return [];
+      if (payload.recipient != null && payload.recipient !== 'all') return [];
+      if (payload.channel != null && !['commentary', 'final'].includes(safeString(payload.channel))) return [];
+      if (payload.phase != null && !['commentary', 'final', 'final_answer'].includes(safeString(payload.phase))) return [];
+      const content = Array.isArray(payload.content) ? payload.content : [];
+      const markdown = content.flatMap((part) => {
+        if (typeof part !== 'object' || part === null || part.type !== 'output_text') return [];
+        const text = safeString(part.text);
+        return text ? [text] : [];
+      }).join('\n\n');
+      if (!markdown) return [];
+      return [{ id: PENDING_ENTRY_ID, type: 'assistant-message', timestamp, markdown } satisfies ITimelineAssistantMessage];
+    }
     case 'reasoning': {
       const summaryRaw = Array.isArray(payload.summary) ? payload.summary : [];
       const summary: string[] = [];
@@ -911,19 +933,39 @@ const processItem = (
 ): ITimelineEntry[] => {
   const timestamp = tsToMillis(item.timestamp);
   const payload = (item.payload ?? {}) as Record<string, unknown>;
+  let entries: ITimelineEntry[];
   switch (item.type) {
     case 'session_meta':
     case 'turn_context':
       return [];
     case 'response_item':
-      return processResponseItem(payload, timestamp, state);
+      entries = processResponseItem(payload, timestamp, state);
+      break;
     case 'event_msg':
-      return processEventMsg(payload, timestamp, state);
+      entries = processEventMsg(payload, timestamp, state);
+      break;
     case 'compacted':
       return [];
     default:
       return [];
   }
+  // Older rollouts emit the same public message in both envelopes. Pair only
+  // adjacent assistant messages across sources (ignoring metadata/reasoning),
+  // so repeated progress text in a later step or turn remains visible. State
+  // survives incremental reads, including when the pair straddles a read.
+  const message = entries.find((entry) => entry.type === 'assistant-message');
+  if (message?.type === 'assistant-message') {
+    const previous = state.lastAssistantMessage;
+    if (previous?.source !== item.type && previous?.text === message.markdown) {
+      state.lastAssistantMessage = undefined;
+      return [];
+    }
+    state.lastAssistantMessage = { source: item.type, text: message.markdown };
+  } else if (entries.some((entry) => entry.type !== 'reasoning-summary')
+    || ['task_started', 'function_call', 'custom_tool_call'].includes(safeString(payload.type))) {
+    state.lastAssistantMessage = undefined;
+  }
+  return entries;
 };
 
 const mergeToolResults = (entries: ITimelineEntry[]): ITimelineEntry[] => {
