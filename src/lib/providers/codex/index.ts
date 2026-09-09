@@ -1,6 +1,8 @@
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { isValidCodexEffort } from '@/lib/agent-effort';
+import { isValidModelName } from '@/lib/claude-command-shared';
 import { getDangerouslySkipPermissions } from '@/lib/config-store';
 import { createLogger } from '@/lib/logger';
 import { buildCodexHookFlags } from '@/lib/providers/codex/hook-config';
@@ -13,7 +15,7 @@ import {
   isCodexRunning,
   watchSessionsDir,
 } from '@/lib/providers/codex/session-detection';
-import type { IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
+import type { IAgentLaunchCommandOptions, IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
 import type { IAgentState, ITab } from '@/types/terminal';
 
 const log = createLogger('codex-provider');
@@ -94,6 +96,17 @@ const buildDeveloperInstructionsArgs = async (workspaceId: string): Promise<stri
 
 const shellSingleQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 
+const assertValidCodexLaunchOptions = (
+  options: Pick<IAgentLaunchCommandOptions, 'model' | 'effort'>,
+): void => {
+  if (options.model !== undefined && !isValidModelName(options.model)) {
+    throw new Error('Invalid Codex model');
+  }
+  if (options.effort !== undefined && !isValidCodexEffort(options.effort)) {
+    throw new Error('Invalid Codex reasoning effort');
+  }
+};
+
 export const CODEX_LAUNCHER_SCRIPT_CONTENT = `#!/usr/bin/env node
 const fs = require('node:fs');
 const os = require('node:os');
@@ -125,6 +138,18 @@ const parseArgs = (argv) => {
       i += 1;
     } else if (item.startsWith('--resume-session-id=')) {
       result.resumeSessionId = item.slice('--resume-session-id='.length);
+    } else if (item === '--model') {
+      if (!next || next.startsWith('-')) throw new Error('--model requires a value');
+      result.model = next;
+      i += 1;
+    } else if (item.startsWith('--model=')) {
+      result.model = item.slice('--model='.length);
+    } else if (item === '--effort') {
+      if (!next || next.startsWith('-')) throw new Error('--effort requires a value');
+      result.effort = next;
+      i += 1;
+    } else if (item.startsWith('--effort=')) {
+      result.effort = item.slice('--effort='.length);
     }
   }
   return result;
@@ -193,27 +218,43 @@ const ensureCodexLauncherScript = async (): Promise<string> => {
   return CODEX_LAUNCHER_SCRIPT;
 };
 
-export const buildCodexRuntimeArgs = async (workspaceId: string | undefined, resumeSessionId?: string): Promise<string[]> => {
+export const buildCodexRuntimeArgs = async (
+  workspaceId: string | undefined,
+  resumeSessionId?: string,
+  options: Pick<IAgentLaunchCommandOptions, 'model' | 'effort'> = {},
+): Promise<string[]> => {
   if (resumeSessionId && !isValidCodexSessionId(resumeSessionId)) {
     throw new Error(`Invalid codex session ID format: ${resumeSessionId}`);
   }
+  assertValidCodexLaunchOptions(options);
   const skipPerms = await getDangerouslySkipPermissions();
   const { args: hookArgs } = await buildCodexHookFlags();
   const devInstrArgs = workspaceId ? await buildDeveloperInstructionsArgs(workspaceId) : [];
 
   const parts: string[] = [];
   if (resumeSessionId) parts.push('resume', resumeSessionId);
+  if (options.model) parts.push('--model', options.model);
+  if (options.effort) {
+    parts.push('-c', `model_reasoning_effort=${options.effort}`);
+  }
   parts.push(...hookArgs);
   parts.push(...devInstrArgs);
   if (skipPerms) parts.push('--yolo');
   return parts;
 };
 
-const composeLaunchCommand = async (workspaceId: string | undefined, resumeSessionId?: string): Promise<string> => {
+const composeLaunchCommand = async (
+  workspaceId: string | undefined,
+  resumeSessionId?: string,
+  options: Pick<IAgentLaunchCommandOptions, 'model' | 'effort'> = {},
+): Promise<string> => {
+  assertValidCodexLaunchOptions(options);
   const scriptPath = await ensureCodexLauncherScript();
   const parts = ['node', shellSingleQuote(scriptPath)];
   if (workspaceId) parts.push('--workspace-id', shellSingleQuote(workspaceId));
   if (resumeSessionId) parts.push('--resume-session-id', shellSingleQuote(resumeSessionId));
+  if (options.model) parts.push('--model', shellSingleQuote(options.model));
+  if (options.effort) parts.push('--effort', shellSingleQuote(options.effort));
   return parts.join(' ');
 };
 
@@ -233,13 +274,13 @@ export const codexProvider: IAgentProvider = {
   isAgentRunning: (panePid, childPids) => isCodexRunning(panePid, childPids),
   watchSessions: (panePid, onChange, options) => watchSessionsDir(panePid, onChange, options),
 
-  buildLaunchCommand: ({ workspaceId }) =>
-    composeLaunchCommand(workspaceId ?? undefined),
-  buildResumeCommand: (sessionId, { workspaceId }) => {
+  buildLaunchCommand: ({ workspaceId, model, effort }) =>
+    composeLaunchCommand(workspaceId ?? undefined, undefined, { model, effort }),
+  buildResumeCommand: (sessionId, { workspaceId, model, effort }) => {
     if (!isValidCodexSessionId(sessionId)) {
       throw new Error(`Invalid codex session ID format: ${sessionId}`);
     }
-    return composeLaunchCommand(workspaceId ?? undefined, sessionId);
+    return composeLaunchCommand(workspaceId ?? undefined, sessionId, { model, effort });
   },
 
   readSessionId: (tab) => readField(tab, 'sessionId'),

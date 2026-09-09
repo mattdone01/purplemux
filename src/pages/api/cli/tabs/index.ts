@@ -128,9 +128,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         // inside a grok tab. Pin model/effort at launch the same as the others.
         command = await grokProvider.buildLaunchCommand({ workspaceId, model, effort: reasoning });
       } else {
-        command = await codexProvider.buildLaunchCommand({ workspaceId });
-        if (model) command += ` --model ${model}`;
-        if (reasoning) command += ` -c model_reasoning_effort=${reasoning}`;
+        command = await codexProvider.buildLaunchCommand({ workspaceId, model, effort: reasoning });
       }
     }
 
