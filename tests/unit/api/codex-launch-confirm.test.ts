@@ -78,4 +78,21 @@ describe('POST /api/codex/launch-confirm', () => {
     expect(state.statusCode).toBe(409);
     expect(status.applyConfirmedCodexLaunch).not.toHaveBeenCalled();
   });
+
+  it('returns revalidated without applying startup status resets', async () => {
+    lifecycle.confirmCodexLaunchReceiptLocked.mockResolvedValue({
+      ok: true,
+      state: 'revalidated',
+      active: {
+        generation: 'codex-generation',
+        resumeSessionId: '01a008c1-bb96-71d1-9769-b63ff478fd9f',
+      },
+    });
+    const { default: handler } = await import('@/pages/api/codex/launch-confirm');
+    const { state, res } = response();
+    await handler(request, res);
+
+    expect(state.body).toEqual({ generation: 'codex-generation', state: 'revalidated' });
+    expect(status.applyConfirmedCodexLaunch).not.toHaveBeenCalled();
+  });
 });

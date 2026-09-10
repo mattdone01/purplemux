@@ -65,7 +65,7 @@ export interface ICodexLaunchReceipt {
 }
 
 export type TCodexLaunchConfirmationResult =
-  | { ok: true; state: 'confirmed' | 'duplicate'; active: ICodexActiveLaunch }
+  | { ok: true; state: 'confirmed' | 'duplicate' | 'revalidated'; active: ICodexActiveLaunch }
   | { ok: false; state: 'not-found' | 'stale' | 'held'; reason: string };
 
 export type TCodexRuntimeVerification =
@@ -431,6 +431,7 @@ const verifyProcessProof = async (
   for (let attempt = 0; attempt < PROCESS_PROOF_ATTEMPTS; attempt += 1) {
     result = await verifyProcessProofOnce(tab, pending, launcherPid, childPid);
     if (result.ok) return result;
+    if (result.reason !== 'process-identity-unavailable') return result;
     if (attempt + 1 < PROCESS_PROOF_ATTEMPTS) {
       await new Promise<void>((resolve) => setTimeout(resolve, PROCESS_PROOF_RETRY_MS));
     }
@@ -458,12 +459,95 @@ export const verifyCodexActiveRuntime = async (tab: ITab): Promise<TCodexRuntime
   if (!active || active.phase !== 'active' || tab.codexLaunchRuntime?.pending) {
     return { ok: false, reason: 'launch-runtime-unavailable' };
   }
-  const proof = await verifyProcessProofOnce(tab, pendingFromActive(active), active.launcher.pid, active.agent.pid);
+  return verifyRecordedCodexRuntime(tab, active);
+};
+
+const verifyRecordedCodexRuntime = async (
+  tab: ITab,
+  active: ICodexActiveLaunch,
+): Promise<TCodexRuntimeVerification> => {
+  const proof = await verifyProcessProof(tab, pendingFromActive(active), active.launcher.pid, active.agent.pid);
   if (!proof.ok) return proof;
   if (!sameProcess(proof.launcher, active.launcher) || !sameProcess(proof.agent, active.agent)) {
     return { ok: false, reason: 'process-identity-replaced' };
   }
   return proof;
+};
+
+interface ICodexRevalidationSnapshot {
+  active: ICodexActiveLaunch;
+  sessionId: string | null;
+  jsonlPath: string | null;
+  desiredConfig: IAgentLaunchConfig;
+}
+
+const cloneActiveLaunch = (active: ICodexActiveLaunch): ICodexActiveLaunch => ({
+  ...active,
+  launchedConfig: { ...active.launchedConfig },
+  observationBoundary: active.observationBoundary ? { ...active.observationBoundary } : null,
+  launcher: { ...active.launcher },
+  agent: { ...active.agent },
+});
+
+const sameObservationBoundary = (
+  left: ICodexLaunchObservationBoundary | null,
+  right: ICodexLaunchObservationBoundary | null,
+): boolean => left === right || (!!left && !!right
+  && left.sessionId === right.sessionId
+  && left.jsonlPath === right.jsonlPath
+  && left.byteOffset === right.byteOffset);
+
+const sameActiveLaunch = (left: ICodexActiveLaunch, right: ICodexActiveLaunch): boolean =>
+  left.generation === right.generation
+  && left.workspaceId === right.workspaceId
+  && left.tabId === right.tabId
+  && left.sessionName === right.sessionName
+  && left.resumeSessionId === right.resumeSessionId
+  && sameLaunchConfig(left.launchedConfig, right.launchedConfig)
+  && sameObservationBoundary(left.observationBoundary, right.observationBoundary)
+  && sameProcess(left.launcher, right.launcher)
+  && sameProcess(left.agent, right.agent)
+  && left.phase === right.phase
+  && left.bootstrap === right.bootstrap
+  && left.confirmedAt === right.confirmedAt
+  && left.heldReason === right.heldReason;
+
+const revalidateHeldCodexRuntime = async (
+  receipt: ICodexLaunchReceipt,
+  tab: ITab,
+  active: ICodexActiveLaunch,
+): Promise<TCodexLaunchConfirmationResult> => {
+  if (active.heldReason !== 'process-identity-unavailable') {
+    return { ok: false, state: 'held', reason: active.heldReason ?? 'launch-runtime-held' };
+  }
+  const snapshot: ICodexRevalidationSnapshot = {
+    active: cloneActiveLaunch(active),
+    sessionId: codexProvider.readSessionId(tab),
+    jsonlPath: codexProvider.readJsonlPath(tab),
+    desiredConfig: launchConfig(tab),
+  };
+  if (!sameLaunchConfig(snapshot.active.launchedConfig, snapshot.desiredConfig)) {
+    return { ok: false, state: 'held', reason: 'launch-policy-changed' };
+  }
+  const proof = await verifyRecordedCodexRuntime(tab, snapshot.active);
+  if (!proof.ok) return { ok: false, state: 'held', reason: proof.reason };
+
+  const committed = await mutateTabAtomically(receipt.workspaceId, receipt.tabId, (current) => {
+    const currentActive = current.codexLaunchRuntime?.active;
+    const unchanged = !!currentActive
+      && !current.codexLaunchRuntime?.pending
+      && sameActiveLaunch(currentActive, snapshot.active)
+      && codexProvider.readSessionId(current) === snapshot.sessionId
+      && codexProvider.readJsonlPath(current) === snapshot.jsonlPath
+      && sameLaunchConfig(launchConfig(current), snapshot.desiredConfig);
+    if (!unchanged) return { changed: false, value: null as ICodexActiveLaunch | null };
+    currentActive.phase = 'active';
+    delete currentActive.heldReason;
+    return { changed: true, value: currentActive };
+  });
+  if (!committed.found) return { ok: false, state: 'not-found', reason: 'tab-not-found' };
+  if (!committed.value) return { ok: false, state: 'stale', reason: 'launch-runtime-changed' };
+  return { ok: true, state: 'revalidated', active: committed.value };
 };
 
 export const holdCodexActiveGeneration = async (
@@ -495,6 +579,7 @@ export const confirmCodexLaunchReceiptLocked = async (
     if (active.launcher.pid !== receipt.launcherPid || active.agent.pid !== receipt.childPid) {
       return { ok: false, state: 'stale', reason: 'receipt-process-identity-mismatch' };
     }
+    if (active.phase === 'held') return revalidateHeldCodexRuntime(receipt, tab, active);
     const proof = await verifyCodexActiveRuntime(tab);
     if (proof.ok) return { ok: true, state: 'duplicate', active };
     await holdCodexActiveGeneration(receipt.workspaceId, receipt.tabId, receipt.generation, proof.reason);

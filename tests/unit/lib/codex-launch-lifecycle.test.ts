@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   start: vi.fn(),
   running: vi.fn(),
   modelStatus: vi.fn(),
+  beforeMutate: null as (() => void) | null,
 }));
 
 vi.mock('@/lib/cli-utils', () => ({ findTab: mocks.findTab }));
@@ -24,6 +25,9 @@ vi.mock('@/lib/layout-store', () => ({
     mutator: (tab: ITab) => { changed: boolean; value: unknown },
   ) => {
     if (!mocks.tab || mocks.tab.id !== tabId) return { found: false };
+    const beforeMutate = mocks.beforeMutate;
+    mocks.beforeMutate = null;
+    beforeMutate?.();
     const result = mutator(mocks.tab);
     return { found: true, value: result.value, tab: { ...mocks.tab } };
   }),
@@ -94,6 +98,7 @@ const installValidProcessTree = (generation: string, resume = true): void => {
 describe('Codex managed launch lifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.beforeMutate = null;
     mocks.tab = makeTab();
     mocks.findTab.mockImplementation(async () => mocks.tab
       ? { workspaceId: 'ws-test', paneId: 'pane-p', tab: mocks.tab }
@@ -202,6 +207,188 @@ describe('Codex managed launch lifecycle', () => {
       childPid: 30,
     })).toMatchObject({ ok: true, state: 'duplicate' });
     expect(mocks.tab!.codexLaunchRuntime?.active?.bootstrap).toBe('unused');
+  });
+
+  it('revalidates only the identical held runtime after a transient identity read', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t', { resumeSessionId: SESSION_ID });
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation);
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', prepared.intent.generation);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    });
+    const active = mocks.tab!.codexLaunchRuntime!.active!;
+    active.phase = 'held';
+    active.heldReason = 'process-identity-unavailable';
+    active.bootstrap = 'consumed';
+    mocks.tab!.agentState!.jsonlPath = '/sessions/current.jsonl';
+    mocks.tab!.agentState!.summary = 'current summary';
+    mocks.tab!.lastUserMessage = 'current prompt';
+    const before = JSON.parse(JSON.stringify(mocks.tab)) as ITab;
+    mocks.start.mockClear();
+    let launcherReads = 0;
+    mocks.start.mockImplementation(async (pid: number) => {
+      if (pid === 20 && launcherReads++ === 0) return null;
+      return pid * 1_000;
+    });
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toMatchObject({ ok: true, state: 'revalidated' });
+    expect(mocks.start.mock.calls.filter(([pid]) => pid === 20)).toHaveLength(2);
+    const expectedActive = { ...before.codexLaunchRuntime!.active! };
+    expectedActive.phase = 'active';
+    delete expectedActive.heldReason;
+    expect(mocks.tab!.agentState).toEqual(before.agentState);
+    expect(mocks.tab!.agentLaunchConfig).toEqual(before.agentLaunchConfig);
+    expect(mocks.tab!.lastUserMessage).toBe(before.lastUserMessage);
+    expect(mocks.tab!.codexLaunchRuntime!.active).toEqual(expectedActive);
+    expect(mocks.tab!.codexLaunchRuntime!.active!.heldReason).toBeUndefined();
+  });
+
+  it('keeps persistent identity failure held and does not retry negative identity proof', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', prepared.intent.generation);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    });
+    const active = mocks.tab!.codexLaunchRuntime!.active!;
+    active.phase = 'held';
+    active.heldReason = 'process-identity-unavailable';
+    mocks.start.mockClear();
+    mocks.start.mockImplementation(async (pid: number) => pid === 20 ? null : pid * 1_000);
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toEqual({ ok: false, state: 'held', reason: 'process-identity-unavailable' });
+    expect(mocks.start.mock.calls.filter(([pid]) => pid === 20)).toHaveLength(5);
+    expect(active.phase).toBe('held');
+
+    mocks.start.mockClear();
+    mocks.start.mockImplementation(async (pid: number) => pid === 20 ? 99_999 : pid * 1_000);
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toEqual({ ok: false, state: 'held', reason: 'process-identity-replaced' });
+    expect(mocks.start.mock.calls.filter(([pid]) => pid === 20)).toHaveLength(1);
+    expect(active.phase).toBe('held');
+  });
+
+  it('rejects held recovery for wrong identity, pending launch, and non-recoverable holds', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', prepared.intent.generation);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    });
+    const active = mocks.tab!.codexLaunchRuntime!.active!;
+    active.phase = 'held';
+    active.heldReason = 'process-identity-unavailable';
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: 'wrong-generation',
+      launcherPid: 20, childPid: 30,
+    })).toMatchObject({ ok: false, state: 'stale' });
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 21, childPid: 30,
+    })).toEqual({ ok: false, state: 'stale', reason: 'receipt-process-identity-mismatch' });
+
+    mocks.tab!.codexLaunchRuntime!.pending = {
+      generation: 'new-generation', workspaceId: 'ws-test', tabId: 'tab-t',
+      sessionName: mocks.tab!.sessionName, resumeSessionId: null, launchedConfig: {},
+      observationBoundary: null, priorLauncher: null, priorAgent: null,
+      phase: 'prepared', preparedAt: new Date().toISOString(),
+    };
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toMatchObject({ ok: false, state: 'stale' });
+
+    delete mocks.tab!.codexLaunchRuntime!.pending;
+    active.heldReason = 'process-lineage-mismatch';
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toEqual({ ok: false, state: 'held', reason: 'process-lineage-mismatch' });
+  });
+
+  it('fails the held-runtime CAS when policy or binding changes during proof', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', prepared.intent.generation);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    });
+    const active = mocks.tab!.codexLaunchRuntime!.active!;
+    active.phase = 'held';
+    active.heldReason = 'process-identity-unavailable';
+    mocks.tab!.agentState!.jsonlPath = '/sessions/current.jsonl';
+    mocks.beforeMutate = () => {
+      mocks.tab!.agentLaunchConfig = { model: 'gpt-5.6-sol', effort: 'high' };
+      mocks.tab!.agentState!.jsonlPath = '/sessions/replaced.jsonl';
+    };
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toEqual({ ok: false, state: 'stale', reason: 'launch-runtime-changed' });
+    expect(active.phase).toBe('held');
+  });
+
+  it.each([
+    ['launcher argv', 'launcher-identity-mismatch'],
+    ['pane lineage', 'process-lineage-mismatch'],
+    ['competing process', 'competing-agent-process'],
+  ])('keeps recovery held when %s no longer matches', async (failure, reason) => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', prepared.intent.generation);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    });
+    const active = mocks.tab!.codexLaunchRuntime!.active!;
+    active.phase = 'held';
+    active.heldReason = 'process-identity-unavailable';
+
+    if (failure === 'launcher argv') {
+      mocks.argv.mockImplementation(async (pid: number) => pid === 20
+        ? ['node', LAUNCHER, '--generation', 'wrong-generation']
+        : pid === 30
+          ? ['codex', '--model', 'gpt-6-astra', '-c', 'model_reasoning_effort=high']
+          : ['bash']);
+    } else if (failure === 'pane lineage') {
+      mocks.children.mockImplementation(async (pid: number) => pid === 10 ? [20] : []);
+    } else {
+      mocks.children.mockImplementation(async (pid: number) => pid === 10
+        ? [20, 40]
+        : pid === 20
+          ? [30]
+          : []);
+      mocks.argv.mockImplementation(async (pid: number) => pid === 20
+        ? ['node', LAUNCHER, '--generation', prepared.intent.generation, '--workspace-id', 'ws-test', '--tab-id', 'tab-t', '--session-name', 'pt-ws-test-pane-p-tab-t']
+        : pid === 30
+          ? ['codex', '--model', 'gpt-6-astra', '-c', 'model_reasoning_effort=high']
+          : pid === 40 ? ['codex'] : ['bash']);
+    }
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toEqual({ ok: false, state: 'held', reason });
+    expect(active.phase).toBe('held');
   });
 
   it('holds wrapper-only or ambiguous process proof and never binds the resume session', async () => {

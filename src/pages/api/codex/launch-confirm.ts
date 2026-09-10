@@ -41,7 +41,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       launcherPid,
       childPid,
     });
-    if (confirmed.ok) {
+    if (confirmed.ok && confirmed.state !== 'revalidated') {
       getStatusManager().applyConfirmedCodexLaunch(
         tabId,
         confirmed.active.generation,
