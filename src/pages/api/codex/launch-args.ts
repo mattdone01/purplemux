@@ -64,12 +64,16 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   const workspaceId = stringOrNull(body?.workspaceId) ?? await getActiveWorkspaceId();
+  if (!workspaceId) {
+    return res.status(400).json({ error: 'workspaceId is required' });
+  }
+  if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
   const resumeSessionId = stringOrNull(body?.resumeSessionId) ?? undefined;
   const model = hasModel ? body?.model as string : undefined;
   const effort = hasEffort ? body?.effort as string : undefined;
 
   try {
-    const args = await buildCodexRuntimeArgs(workspaceId ?? undefined, resumeSessionId, { model, effort });
+    const args = await buildCodexRuntimeArgs(workspaceId, resumeSessionId, { model, effort });
     return res.status(200).json({ args });
   } catch (err) {
     log.error(`codex launch args build failed: ${err instanceof Error ? err.message : err}`);

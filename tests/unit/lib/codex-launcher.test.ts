@@ -38,7 +38,7 @@ beforeEach(async () => {
 
 interface ILauncherResult {
   requestBody: unknown;
-  requests: Array<{ url: string; body: unknown }>;
+  requests: Array<{ url: string; body: unknown; workspaceToken: string | null }>;
   exitCode: number | null;
   stderr: string;
   codexArgs: string[] | null;
@@ -64,14 +64,20 @@ const executeLauncher = async (
   );
 
   let requestBody: unknown;
-  const requests: Array<{ url: string; body: unknown }> = [];
+  const requests: Array<{ url: string; body: unknown; workspaceToken: string | null }> = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
     req.on('end', () => {
       requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      requests.push({ url: req.url ?? '', body: requestBody });
-      if (req.url === '/api/codex/launch-confirm') {
+      requests.push({
+        url: req.url ?? '',
+        body: requestBody,
+        workspaceToken: typeof req.headers['x-pmux-token'] === 'string'
+          ? req.headers['x-pmux-token']
+          : null,
+      });
+      if (req.url === '/api/cli/codex/launch-confirm') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ state: 'confirmed' }));
         return;
@@ -97,6 +103,7 @@ const executeLauncher = async (
           HOME: mockHome.value,
           PATH: `${binDir}:${process.env.PATH ?? ''}`,
           CODEX_ARGS_CAPTURE: capturePath,
+          PMUX_TOKEN: 'workspace-token',
         },
         stdio: ['ignore', 'ignore', 'pipe'],
       });
@@ -140,7 +147,8 @@ describe('codex launch command', () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.requests[0]).toEqual({
-      url: '/api/codex/launch-args',
+      url: '/api/cli/codex/launch-args',
+      workspaceToken: 'workspace-token',
       body: {
         workspaceId: identity.workspaceId,
         resumeSessionId: null,
@@ -149,14 +157,17 @@ describe('codex launch command', () => {
         generation: identity.generation,
       },
     });
-    expect(result.requests[1]?.url).toBe('/api/codex/launch-confirm');
-    expect(result.requests[1]?.body).toMatchObject({
+    expect(result.requests[1]).toMatchObject({
+      url: '/api/cli/codex/launch-confirm',
+      workspaceToken: 'workspace-token',
+      body: {
       workspaceId: identity.workspaceId,
       tabId: identity.tabId,
       sessionName: identity.sessionName,
       generation: identity.generation,
       launcherPid: expect.any(Number),
       childPid: expect.any(Number),
+      },
     });
   });
 

@@ -1,5 +1,4 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { isRequestAllowed } from '@/lib/access-filter';
 import { authorizeWorkspaceInput } from '@/lib/cli-utils';
 import {
   confirmCodexLaunchReceiptLocked,
@@ -13,12 +12,15 @@ const nonEmptyString = (value: unknown): string | null =>
 const positivePid = (value: unknown): number | null =>
   typeof value === 'number' && Number.isInteger(value) && value > 1 ? value : null;
 
+const isLoopbackAddress = (address: string | undefined): boolean =>
+  address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method not allowed' });
   }
-  if (!isRequestAllowed(req.socket.remoteAddress)) {
+  if (!isLoopbackAddress(req.socket.remoteAddress)) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   const workspaceId = nonEmptyString(req.body?.workspaceId);

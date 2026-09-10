@@ -179,7 +179,7 @@ const fetchArgs = async (payload) => {
   const token = process.env.PMUX_TOKEN || readTrim(path.join(baseDir, 'cli-token'));
   const headers = { 'content-type': 'application/json' };
   if (token) headers['x-pmux-token'] = token;
-  const res = await fetch(\`http://127.0.0.1:\${port}/api/codex/launch-args\`, {
+  const res = await fetch(\`http://127.0.0.1:\${port}/api/cli/codex/launch-args\`, {
     method: 'POST',
     headers,
     body: JSON.stringify(payload),
@@ -202,7 +202,7 @@ const confirmLaunch = async (payload) => {
   const token = process.env.PMUX_TOKEN || readTrim(path.join(baseDir, 'cli-token'));
   const headers = { 'content-type': 'application/json' };
   if (token) headers['x-pmux-token'] = token;
-  const res = await fetch(\`http://127.0.0.1:\${port}/api/codex/launch-confirm\`, {
+  const res = await fetch(\`http://127.0.0.1:\${port}/api/cli/codex/launch-confirm\`, {
     method: 'POST',
     headers,
     body: JSON.stringify(payload),
