@@ -1,7 +1,7 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, setLayoutReconciler } from '@/lib/layout-store';
-import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid, hasSession, sendBracketedPaste } from '@/lib/tmux';
+import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
@@ -32,6 +32,8 @@ import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE
 import { getSignalEngine } from '@/lib/signal-engine';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import type { TLivenessEvent } from '@/types/liveness';
+import { AgentModelWatch } from '@/lib/agent-model-watch';
+import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
@@ -40,6 +42,7 @@ import { createStatusSocketChannel, createWebPushChannel, getNotificationDispatc
 import { registerFcmChannel } from '@/lib/fcm-channel';
 import { getConfig } from '@/lib/config-store';
 import { nanoid } from 'nanoid';
+import { reconcileCodexLaunchTimeout } from '@/lib/providers/codex/launch-lifecycle';
 import fs from 'fs/promises';
 import { watch, type FSWatcher } from 'fs';
 
@@ -83,13 +86,14 @@ const AGENT_GUARDED_STATES: Set<TCliState> = new Set(['busy', 'idle', 'needs-inp
 // An agent CLI normally writes its own title (no pipe), so this regex
 // distinguishes "agent gone" from "agent rewrote title" without a process call.
 const SHELL_TITLE_RE = /^[^|]+\|[^|]+$/;
+
 const PROCESS_RETRY_COUNT = 3;
 const JSONL_WATCH_DEBOUNCE_MS = 100;
 const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000] as const;
 
 const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
-class StatusManager {
+export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
   private currentInterval = 0;
@@ -108,8 +112,15 @@ class StatusManager {
   private tabScopeCache = new Map<string, { scope?: string[]; cwd?: string; at: number }>();
   private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean }>();
   private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
+  private modelWatch = new AgentModelWatch();
+  private automatedPrompts: AutomatedPromptDispatcher;
   private stuckNudgedTabs = new Set<string>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
+  private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
+
+  constructor(automatedPrompts = new AutomatedPromptDispatcher()) {
+    this.automatedPrompts = automatedPrompts;
+  }
 
   async init(): Promise<void> {
     if (this.initialized) return;
@@ -341,10 +352,48 @@ class StatusManager {
 
       const tabs = collectAllTabs(layout.root);
       for (const tab of tabs) {
+        if (tab.panelType === 'codex-cli' && tab.codexLaunchRuntime?.pending) {
+          await reconcileCodexLaunchTimeout(ws.id, tab.id, now).catch((err) => {
+            log.warn(`Codex launch timeout reconciliation failed: ${err instanceof Error ? err.message : err}`);
+          });
+        }
+        const trackedLifecycle = this.codexLifecycleEpoch.get(tab.id);
+        const persistedLifecycle = tab.codexLaunchRuntime?.pending
+          ? { generation: tab.codexLaunchRuntime.pending.generation, phase: 'pending' as const }
+          : tab.codexLaunchRuntime?.active
+            ? { generation: tab.codexLaunchRuntime.active.generation, phase: 'active' as const }
+            : null;
+        if (trackedLifecycle && (
+          !persistedLifecycle
+          || trackedLifecycle.generation !== persistedLifecycle.generation
+          || trackedLifecycle.phase !== persistedLifecycle.phase
+        )) {
+          continue;
+        }
+        const lifecycleEpoch = trackedLifecycle?.epoch ?? 0;
         knownTabIds.add(tab.id);
         const existing = this.tabs.get(tab.id);
-        const paneInfo = panesInfo.get(tab.sessionName);
         const provider = getProviderByPanelType(tab.panelType);
+        const persistedSessionId = provider?.readSessionId(tab) ?? null;
+        const sessionBindingChanged = !!existing
+          && !!persistedSessionId
+          && persistedSessionId !== existing.agentSessionId;
+        if (existing && sessionBindingChanged) {
+          this.stopJsonlWatch(tab.id);
+          existing.agentSessionId = persistedSessionId;
+          existing.jsonlPath = null;
+          existing.agentSummary = null;
+          existing.lastUserMessage = null;
+          existing.lastAssistantMessage = null;
+          existing.currentAction = null;
+          existing.permissionRequest = null;
+        }
+        await this.modelWatch.check(tab, async (detail) => {
+          await this.nudgeLiveness(ws.id, tab.id, tab.name, 'model-drift', detail);
+          return true;
+        }).catch((err) => log.warn(`model policy check failed: ${err instanceof Error ? err.message : err}`));
+        if ((this.codexLifecycleEpoch.get(tab.id)?.epoch ?? 0) !== lifecycleEpoch) continue;
+        const paneInfo = panesInfo.get(tab.sessionName);
 
         const { terminalStatus, listeningPorts } = provider
           ? { terminalStatus: 'idle' as const, listeningPorts: [] as number[] }
@@ -392,6 +441,7 @@ class StatusManager {
         const messageChanged = existing.lastUserMessage !== tab.lastUserMessage;
         const panelTypeChanged = existing.panelType !== tab.panelType;
         const refreshed = await this.readTabMetadata(paneInfo, provider, tab);
+        if ((this.codexLifecycleEpoch.get(tab.id)?.epoch ?? 0) !== lifecycleEpoch) continue;
         existing.tabName = tab.name || (newPaneTitle ? formatTabTitle(newPaneTitle, tab.panelType) : '');
         existing.currentProcess = currentProcess;
         existing.paneTitle = newPaneTitle;
@@ -493,7 +543,7 @@ class StatusManager {
           }
         }
 
-        if (terminalChanged || processChanged || processRetryNeeded || messageChanged || panelTypeChanged || summaryChanged) {
+        if (terminalChanged || processChanged || processRetryNeeded || messageChanged || panelTypeChanged || summaryChanged || sessionBindingChanged) {
           this.broadcastUpdate(tab.id, existing);
         }
       }
@@ -504,6 +554,8 @@ class StatusManager {
         this.stopJsonlWatch(tabId);
         this.tabs.delete(tabId);
         this.lastNudgeByTab.delete(tabId);
+        this.modelWatch.forget(tabId);
+        this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
         this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
@@ -531,7 +583,7 @@ class StatusManager {
   // Milestone watchers are silent during both success-in-progress and total
   // failure; these events are the freshness watcher that tells them apart.
   private async handleLivenessEvent(event: TLivenessEvent): Promise<void> {
-    const src = event.kind === 'bg-died' ? event.job : event.probe;
+    const src = 'probe' in event ? event.probe : event.job;
     const entry = this.tabs.get(src.tabId);
     const tabName = entry?.tabName ?? '';
 
@@ -544,20 +596,22 @@ class StatusManager {
       kind = 'probe-failed';
       detail = `probe "${event.probe.label}" failed ${event.failures}x in a row — last error: ${event.error}`;
     } else {
-      kind = 'bg-died';
+      kind = event.kind;
       const label = event.job.label ? `"${event.job.label}" ` : '';
-      const code = event.exitCode !== null ? `code ${event.exitCode}` : 'unknown exit code';
+      const code = 'exitCode' in event ? `code ${event.exitCode}` : 'unknown exit code';
       detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
     }
 
     await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail);
+
+    if (event.kind === 'bg-completed') return;
 
     // Registering a probe or pid is an explicit opt-in to being watched, so a
     // firing always reaches the human too (push), regardless of alert policy —
     // an escalation that only lands in a log is not an escalation.
     const ws = await getWorkspaceByIdCached(src.workspaceId);
     await this.dispatchAlert({
-      kind: kind === 'bg-died' ? 'bg-job-died' : 'work-stalled',
+      kind: event.kind === 'bg-exited-unknown' ? 'bg-job-unknown' : 'job' in event ? 'bg-job-died' : 'work-stalled',
       tabId: src.tabId,
       workspace: ws,
       workspaceId: src.workspaceId,
@@ -571,26 +625,16 @@ class StatusManager {
   // Unlike nudgeOrchestrator this may target the registering tab itself: when
   // the workspace has no orchestrator (or the orchestrator IS the registrant),
   // the tab whose work died is the actor that must wake up.
-  private async nudgeLiveness(workspaceId: string, tabId: string, tabName: string, kind: TOrchestrationNudgeKind, detail: string): Promise<void> {
+  private async nudgeLiveness(workspaceId: string, tabId: string, tabName: string, kind: TOrchestrationNudgeKind, detail: string): Promise<boolean> {
     const now = Date.now();
-    const last = this.lastNudgeByTab.get(tabId);
-    if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return;
-    this.lastNudgeByTab.set(tabId, { kind, at: now });
+    // Sources deduplicate their own episodes. Debouncing by tab/kind here
+    // drops independent jobs that finish on the same tab close together.
 
     const ws = await getWorkspaceByIdCached(workspaceId);
     const orch = ws?.orchestration;
     const targetTabId = orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId;
     const message = buildNudgeMessage(kind, tabId, tabName, workspaceId, detail);
-    const target = this.tabs.get(targetTabId);
-    let delivered = false;
-    if (target && await hasSession(target.tmuxSession)) {
-      try {
-        await sendBracketedPaste(target.tmuxSession, message);
-        delivered = true;
-      } catch (err) {
-        log.warn(`liveness nudge delivery failed: ${err instanceof Error ? err.message : err}`);
-      }
-    }
+    const delivered = await this.deliverAutomatedPrompt(workspaceId, targetTabId, message, 'liveness nudge');
 
     const nudge: IOrchestrationNudge = {
       id: nanoid(8),
@@ -608,6 +652,7 @@ class StatusManager {
     }
     this.broadcast({ type: 'orchestration:nudge', nudge });
     log.info({ tabId, kind, targetTabId, delivered }, 'liveness nudge');
+    return delivered;
   }
 
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
@@ -634,6 +679,21 @@ class StatusManager {
       }
       if (entry.cliState !== 'idle' && entry.cliState !== 'ready-for-review') continue;
 
+      let watchedWorkActive = false;
+      const livenessManager = getLivenessManager();
+      for (const [tabId, tab] of this.tabs) {
+        if (tab.workspaceId !== ws.id) continue;
+        const { backgroundJobs } = await livenessManager.statusForTab(tabId);
+        if (backgroundJobs.some((job) => job.alive)) {
+          watchedWorkActive = true;
+          break;
+        }
+      }
+      if (watchedWorkActive) {
+        this.orchKeeper.set(ws.id, { idleSince: null, beats: 0, lastBeatAt: 0, stallAlerted: false });
+        continue;
+      }
+
       if (state.idleSince === null) {
         this.orchKeeper.set(ws.id, { ...state, idleSince: now });
         continue;
@@ -643,15 +703,12 @@ class StatusManager {
 
       const idleMinutes = Math.round((now - state.idleSince) / 60_000);
       const message = buildHeartbeatMessage(idleMinutes, ws.id);
-      let delivered = false;
-      if (await hasSession(entry.tmuxSession)) {
-        try {
-          await sendBracketedPaste(entry.tmuxSession, message);
-          delivered = true;
-        } catch (err) {
-          log.warn(`orchestrator heartbeat delivery failed: ${err instanceof Error ? err.message : err}`);
-        }
-      }
+      const delivered = await this.deliverAutomatedPrompt(
+        ws.id,
+        orch.orchestratorTabId,
+        message,
+        'orchestrator heartbeat',
+      );
       const beats = state.beats + 1;
       // Last heartbeat of the episode: the orchestrator slept through every
       // nudge purplemux can send, so the human is the only one left to ask.
@@ -876,16 +933,12 @@ class StatusManager {
     this.lastNudgeByTab.set(tabId, { kind, at: now });
 
     const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
-    const target = this.tabs.get(orch.orchestratorTabId);
-    let delivered = false;
-    if (target && await hasSession(target.tmuxSession)) {
-      try {
-        await sendBracketedPaste(target.tmuxSession, message);
-        delivered = true;
-      } catch (err) {
-        log.warn(`orchestrator nudge delivery failed: ${err instanceof Error ? err.message : err}`);
-      }
-    }
+    const delivered = await this.deliverAutomatedPrompt(
+      ws.id,
+      orch.orchestratorTabId,
+      message,
+      'orchestrator nudge',
+    );
 
     const nudge: IOrchestrationNudge = {
       id: nanoid(8),
@@ -970,10 +1023,26 @@ class StatusManager {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
     setTimeout(() => {
-      sendBracketedPaste(entry.tmuxSession, pending.prompt).catch((err) => {
-        log.warn(`kickoff prompt delivery failed: ${err instanceof Error ? err.message : err}`);
-      });
+      void this.deliverAutomatedPrompt(
+        entry.workspaceId,
+        tabId,
+        pending.prompt,
+        'kickoff prompt',
+      );
     }, 800);
+  }
+
+  private async deliverAutomatedPrompt(
+    workspaceId: string,
+    targetTabId: string,
+    message: string,
+    context: string,
+  ): Promise<boolean> {
+    const result = await this.automatedPrompts.dispatch({ workspaceId, targetTabId, message });
+    if (!result.delivered && result.error) {
+      log.warn(`${context} delivery failed: ${result.error instanceof Error ? result.error.message : result.error}`);
+    }
+    return result.delivered;
   }
 
   private async hasRecentJsonlActivity(entry: ITabStatusEntry, now: number): Promise<boolean> {
@@ -1375,6 +1444,7 @@ class StatusManager {
       this.compactStaleTimers.delete(tabId);
     }
     this.tabs.delete(tabId);
+    this.codexLifecycleEpoch.delete(tabId);
     this.broadcastRemove(tabId);
   }
 
@@ -1430,29 +1500,28 @@ class StatusManager {
     }
   }
 
-  markAgentLaunch(tabId: string, options?: { resetAgentSession?: boolean }): void {
+  markAgentLaunch(tabId: string, options?: { resetAgentSession?: boolean; resumeSessionId?: string }): void {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
     entry.lastResumeOrStartedAt = Date.now();
-    if (options?.resetAgentSession) {
-      entry.agentSessionId = null;
+    const provider = getProviderByPanelType(entry.panelType);
+    const isCodex = entry.agentProviderId === CODEX_PROVIDER_ID || entry.panelType === 'codex-cli';
+    const nextSessionId = isCodex
+      ? undefined
+      : options?.resumeSessionId ?? (options?.resetAgentSession ? null : undefined);
+    if (nextSessionId !== undefined) {
+      entry.agentSessionId = nextSessionId;
       entry.jsonlPath = null;
       entry.agentSummary = null;
       entry.lastUserMessage = null;
       entry.lastAssistantMessage = null;
       entry.currentAction = null;
       entry.permissionRequest = null;
-      const existingWatcher = this.jsonlWatchers.get(tabId);
-      if (existingWatcher) {
-        existingWatcher.watcher.close();
-        if (existingWatcher.debounceTimer) clearTimeout(existingWatcher.debounceTimer);
-        this.jsonlWatchers.delete(tabId);
-      }
+      this.stopJsonlWatch(tabId);
       this.persistToLayout(entry);
-      const provider = getProviderByPanelType(entry.panelType);
       if (provider) {
         updateTabAgentState(entry.tmuxSession, provider, {
-          sessionId: null,
+          sessionId: nextSessionId,
           jsonlPath: null,
           summary: null,
           lastUserMessage: null,
@@ -1464,6 +1533,47 @@ class StatusManager {
       setTimeout(() => {
         this.poll().catch((err) => {
           log.error({ err, tabId }, 'Launch readiness poll error');
+        });
+      }, delay);
+    }
+  }
+
+  markCodexLaunchPending(tabId: string, generation: string): void {
+    const previous = this.codexLifecycleEpoch.get(tabId);
+    this.codexLifecycleEpoch.set(tabId, {
+      generation,
+      phase: 'pending',
+      epoch: (previous?.epoch ?? 0) + 1,
+    });
+    this.modelWatch.forget(tabId);
+  }
+
+  applyConfirmedCodexLaunch(tabId: string, generation: string, resumeSessionId: string | null): void {
+    const entry = this.tabs.get(tabId);
+    if (!entry) return;
+    entry.panelType = 'codex-cli';
+    entry.agentProviderId = CODEX_PROVIDER_ID;
+    entry.lastResumeOrStartedAt = Date.now();
+    entry.agentSessionId = resumeSessionId;
+    entry.jsonlPath = null;
+    entry.agentSummary = null;
+    entry.lastUserMessage = null;
+    entry.lastAssistantMessage = null;
+    entry.currentAction = null;
+    entry.permissionRequest = null;
+    const previous = this.codexLifecycleEpoch.get(tabId);
+    this.codexLifecycleEpoch.set(tabId, {
+      generation,
+      phase: 'active',
+      epoch: (previous?.epoch ?? 0) + 1,
+    });
+    this.stopJsonlWatch(tabId);
+    this.broadcastUpdate(tabId, entry);
+    hookLog.debug({ tabId, generation, resumeSessionId }, 'applied confirmed Codex launch');
+    for (const delay of LAUNCH_READY_POLL_DELAYS_MS) {
+      setTimeout(() => {
+        this.poll().catch((err) => {
+          log.error({ err, tabId, generation }, 'Confirmed launch readiness poll error');
         });
       }, delay);
     }

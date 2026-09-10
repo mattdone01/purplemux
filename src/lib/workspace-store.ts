@@ -28,6 +28,7 @@ import {
 } from '@/lib/path-safety';
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
+import { withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
 
 const log = createLogger('workspace');
@@ -519,7 +520,7 @@ export const updateWorkspaceOrchestration = async (
   workspaceId: string,
   patch: Partial<IWorkspaceOrchestration>,
 ): Promise<IWorkspace | null> =>
-  withLock(async () => {
+  withOrchestrationMappingWrite(workspaceId, () => withLock(async () => {
     const data = await readWorkspacesFile();
     if (!data) return null;
     const ws = data.workspaces.find((w) => w.id === workspaceId);
@@ -532,7 +533,7 @@ export const updateWorkspaceOrchestration = async (
     };
     await writeWorkspacesFile(data);
     return ws;
-  });
+  }));
 
 export interface IReorderItem {
   id: string;

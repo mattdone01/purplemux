@@ -18,8 +18,13 @@ import { resolveLineHeight } from '@/lib/terminal-line-height';
 import { toCtrlChar } from '@/lib/terminal-keys';
 import TerminalKeyBar from '@/components/features/workspace/terminal-key-bar';
 import { useShallow } from 'zustand/react/shallow';
-import { buildClaudeLaunchCommand } from '@/lib/providers/claude/client';
-import { fetchCodexLaunchCommand } from '@/lib/providers/codex/client';
+import { fetchClaudeLaunchCommand } from '@/lib/providers/claude/client';
+import {
+  isCodexLaunchTarget,
+  prepareCodexBrowserLaunch,
+  submitCodexBrowserLaunch,
+  type ICodexBrowserLaunchIntent,
+} from '@/lib/codex-browser-launch';
 import { sendCodexQuitCommand } from '@/lib/agent-terminal-commands';
 import TerminalContainer from '@/components/features/workspace/terminal-container';
 import ClaudeCodePanel from '@/components/features/workspace/claude-code-panel';
@@ -263,7 +268,9 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
   const addPendingMessageRef = useRef<((text: string, options?: { autoHide?: boolean; attachmentPlaceholder?: boolean }) => string) | undefined>(undefined);
   const removePendingMessageRef = useRef<((id: string) => void) | undefined>(undefined);
   const attachFilesRef = useRef<((files: File[]) => Promise<boolean> | void) | undefined>(undefined);
-  const pendingRestartRef = useRef<string | null>(null);
+  const pendingLegacyRestartRef = useRef<string | null>(null);
+  const pendingCodexRestartsRef = useRef<Map<string, ICodexBrowserLaunchIntent>>(new Map());
+  const submitPendingCodexLaunchRef = useRef<(tabId: string, sessionName: string) => void>(() => {});
   const lastTitleRef = useRef('');
 
   const claudeCliState = useTabStore((s) => activeTabId ? s.tabs[activeTabId]?.cliState ?? 'inactive' : 'inactive');
@@ -455,11 +462,12 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
       const process = parseCurrentCommand(title);
       useTabMetadataStore.getState().setTitle(tabId, formatted);
       useTabStore.getState().setCurrentProcess(tabId, process);
-      if (isShellProcess(title) && pendingRestartRef.current) {
-        const cmd = pendingRestartRef.current;
-        pendingRestartRef.current = null;
+      if (isShellProcess(title) && pendingLegacyRestartRef.current) {
+        const cmd = pendingLegacyRestartRef.current;
+        pendingLegacyRestartRef.current = null;
         wsActionsRef.current.sendStdin(`${cmd}\r`);
       }
+      if (isShellProcess(title)) submitPendingCodexLaunchRef.current(tabId, activeTab.sessionName);
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (tab) {
         const prevCheckedAt = useTabStore.getState().tabs[tabId]?.agentProcessCheckedAt ?? 0;
@@ -851,32 +859,66 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
     tabId: activeTabId ?? undefined,
   });
 
-  const buildClaudeCommand = useCallback((sessionId: string | null): string =>
-    buildClaudeLaunchCommand({
-      workspaceId: layoutWsId,
-      dangerouslySkipPermissions: useConfigStore.getState().dangerouslySkipPermissions,
-      resumeSessionId: sessionId,
-    }), [layoutWsId]);
+  const buildClaudeCommand = useCallback(
+    (sessionId: string | null): Promise<string> =>
+      fetchClaudeLaunchCommand(layoutWsId, sessionId, activeTabId),
+    [activeTabId, layoutWsId],
+  );
 
   const handleNewClaudeSession = useCallback(async () => {
     if (status !== 'connected' || !activeTabId) return;
     if (!await ensureAgentInstalled('claude')) return;
-    useTabStore.getState().setSessionView(activeTabId, 'check');
-    sendStdin(`${buildClaudeCommand(null)}\r`);
-  }, [status, sendStdin, activeTabId, buildClaudeCommand, ensureAgentInstalled]);
+    try {
+      const command = await buildClaudeCommand(null);
+      useTabStore.getState().setSessionView(activeTabId, 'check');
+      sendStdin(`${command}\r`);
+    } catch {
+      toast.error(t('resumeFailed'));
+    }
+  }, [status, sendStdin, activeTabId, buildClaudeCommand, ensureAgentInstalled, t]);
 
   const handleRestartClaudeSession = useCallback(async () => {
     if (status !== 'connected' || !activeTabId) return;
     if (!await ensureAgentInstalled('claude')) return;
-    pendingRestartRef.current = buildClaudeCommand(null);
+    try {
+      pendingLegacyRestartRef.current = await buildClaudeCommand(null);
+    } catch {
+      toast.error(t('resumeFailed'));
+      return;
+    }
     useTabStore.getState().setSessionView(activeTabId, 'check');
     sendStdin('/exit\r');
-  }, [status, sendStdin, activeTabId, buildClaudeCommand, ensureAgentInstalled]);
+  }, [status, sendStdin, activeTabId, buildClaudeCommand, ensureAgentInstalled, t]);
 
-  const buildCodexCommand = useCallback(
-    () => fetchCodexLaunchCommand(layoutWsId),
-    [layoutWsId],
-  );
+  const prepareCodexLaunch = useCallback((resumeSessionId: string | null) => {
+    if (!layoutWsId || !activeTabId) throw new Error('Codex launch target is unavailable');
+    return prepareCodexBrowserLaunch({ workspaceId: layoutWsId, tabId: activeTabId, resumeSessionId });
+  }, [activeTabId, layoutWsId]);
+
+  const submitPendingCodexLaunch = useCallback((tabId: string, sessionName: string) => {
+    const intent = pendingCodexRestartsRef.current.get(tabId);
+    if (!intent || !isCodexLaunchTarget(intent, { tabId, sessionName })) return;
+    pendingCodexRestartsRef.current.delete(tabId);
+    void submitCodexBrowserLaunch(intent).catch(() => toast.error(t('codexLaunchFailed')));
+  }, [t]);
+
+  useEffect(() => {
+    submitPendingCodexLaunchRef.current = submitPendingCodexLaunch;
+  }, [submitPendingCodexLaunch]);
+
+  const continueCodexBrowserLaunch = useCallback(async (intent: ICodexBrowserLaunchIntent) => {
+    useTabStore.getState().setSessionView(intent.tabId, 'check');
+    const targetsConnectedTerminal = isCodexLaunchTarget(intent, {
+      tabId: activeTabIdRef.current ?? '',
+      sessionName: connectedSessionRef.current ?? '',
+    });
+    if (targetsConnectedTerminal && agentProcess === true && !isShellProcess(lastTitleRef.current)) {
+      pendingCodexRestartsRef.current.set(intent.tabId, intent);
+      sendCodexQuitCommand(sendStdin);
+      return;
+    }
+    await submitCodexBrowserLaunch(intent);
+  }, [agentProcess, sendStdin]);
 
   const markAgentLaunch = useCallback((tabId: string, options?: { resetAgentSession?: boolean }) => {
     fetch('/api/status/agent-launch', {
@@ -889,17 +931,13 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
   const handleNewCodexSession = useCallback(async () => {
     if (status !== 'connected' || !activeTabId) return;
     if (!await ensureAgentInstalled('codex')) return;
-    let command: string;
     try {
-      command = await buildCodexCommand();
+      const intent = await prepareCodexLaunch(null);
+      await continueCodexBrowserLaunch(intent);
     } catch {
       toast.error(t('codexLaunchFailed'));
-      return;
     }
-    markAgentLaunch(activeTabId, { resetAgentSession: true });
-    useTabStore.getState().setSessionView(activeTabId, 'check');
-    sendStdin(`${command}\r`);
-  }, [status, sendStdin, activeTabId, buildCodexCommand, ensureAgentInstalled, markAgentLaunch, t]);
+  }, [status, activeTabId, continueCodexBrowserLaunch, ensureAgentInstalled, prepareCodexLaunch, t]);
 
   const handleNewGrokSession = useCallback(async () => {
     if (status !== 'connected' || !activeTabId) return;
@@ -936,35 +974,32 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
     useTabStore.getState().setSessionView(activeTabId, 'check');
 
     if (session.provider === 'codex') {
-      let command: string;
       try {
-        command = await fetchCodexLaunchCommand(layoutWsId, session.sessionId);
+        const intent = await prepareCodexLaunch(session.sessionId);
+        await continueCodexBrowserLaunch(intent);
       } catch {
         toast.error(t('codexLaunchFailed'));
-        return;
       }
-      markAgentLaunch(activeTabId, { resetAgentSession: false });
-      sendStdin(`${command}\r`);
       return;
     }
 
-    sendStdin(`${buildClaudeCommand(session.sessionId)}\r`);
-  }, [activeTabId, buildClaudeCommand, ensureAgentInstalled, handleSwitchPanelType, layoutWsId, markAgentLaunch, sendStdin, status, t]);
+    try {
+      sendStdin(`${await buildClaudeCommand(session.sessionId)}\r`);
+    } catch {
+      toast.error(t('resumeFailed'));
+    }
+  }, [activeTabId, buildClaudeCommand, continueCodexBrowserLaunch, ensureAgentInstalled, handleSwitchPanelType, prepareCodexLaunch, sendStdin, status, t]);
 
   const handleRelaunchCodexSession = useCallback(async () => {
     if (status !== 'connected' || !activeTabId) return;
     if (!await ensureAgentInstalled('codex')) return;
-    let command: string;
     try {
-      command = await buildCodexCommand();
+      const intent = await prepareCodexLaunch(null);
+      await continueCodexBrowserLaunch(intent);
     } catch {
       toast.error(t('codexLaunchFailed'));
-      return;
     }
-    markAgentLaunch(activeTabId, { resetAgentSession: true });
-    useTabStore.getState().setSessionView(activeTabId, 'check');
-    sendStdin(`${command}\r`);
-  }, [status, sendStdin, activeTabId, buildCodexCommand, ensureAgentInstalled, markAgentLaunch, t]);
+  }, [status, activeTabId, continueCodexBrowserLaunch, ensureAgentInstalled, prepareCodexLaunch, t]);
 
   useEffect(() => {
     codexRelaunchRef.current = handleRelaunchCodexSession;
@@ -973,18 +1008,14 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
   const handleRestartCodexSession = useCallback(async () => {
     if (status !== 'connected' || !activeTabId) return;
     if (!await ensureAgentInstalled('codex')) return;
-    let command: string;
     try {
-      command = await buildCodexCommand();
+      const intent = await prepareCodexLaunch(null);
+      await continueCodexBrowserLaunch(intent);
     } catch {
       toast.error(t('codexLaunchFailed'));
       return;
     }
-    pendingRestartRef.current = command;
-    markAgentLaunch(activeTabId, { resetAgentSession: true });
-    useTabStore.getState().setSessionView(activeTabId, 'check');
-    sendCodexQuitCommand(sendStdin);
-  }, [status, sendStdin, activeTabId, buildCodexCommand, ensureAgentInstalled, markAgentLaunch, t]);
+  }, [status, activeTabId, continueCodexBrowserLaunch, ensureAgentInstalled, prepareCodexLaunch, t]);
 
   useEffect(() => {
     const handleStartAgentRequest = (event: Event) => {
@@ -1033,37 +1064,45 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
 
     if (prompt.panelType === 'codex-cli') {
       if (!await ensureAgentInstalled('codex')) return;
-      let command: string;
       try {
-        command = await fetchCodexLaunchCommand(layoutWsId, resumeSessionId);
+        const intent = await prepareCodexLaunch(resumeSessionId);
+        await continueCodexBrowserLaunch(intent);
       } catch {
         toast.error(t('codexLaunchFailed'));
         return;
       }
-      pendingRestartRef.current = command;
-      markAgentLaunch(activeTabId, { resetAgentSession: !resumeSessionId });
-      useTabStore.getState().setSessionView(activeTabId, 'check');
-      sendCodexQuitCommand(sendStdin);
       return;
     }
 
     if (!await ensureAgentInstalled('claude')) return;
-    pendingRestartRef.current = buildClaudeCommand(resumeSessionId);
+    try {
+      pendingLegacyRestartRef.current = await buildClaudeCommand(resumeSessionId);
+    } catch {
+      toast.error(t('resumeFailed'));
+      return;
+    }
     useTabStore.getState().setSessionView(activeTabId, 'check');
     sendStdin('\x03');
     setTimeout(() => sendStdin('\x03'), 300);
-  }, [activeTabId, agentModePrompt, status, ensureAgentInstalled, handleSwitchPanelType, layoutWsId, markAgentLaunch, sendStdin, t, buildClaudeCommand]);
+  }, [activeTabId, agentModePrompt, status, ensureAgentInstalled, handleSwitchPanelType, prepareCodexLaunch, sendStdin, t, buildClaudeCommand, continueCodexBrowserLaunch]);
 
   useEffect(() => {
-    if (!pendingRestartRef.current || agentProcess === true) return;
+    if (!pendingLegacyRestartRef.current || agentProcess === true) return;
     if (status !== 'connected') return;
     if (!isShellProcess(lastTitleRef.current)) return;
-    const cmd = pendingRestartRef.current;
-    pendingRestartRef.current = null;
+    const cmd = pendingLegacyRestartRef.current;
+    pendingLegacyRestartRef.current = null;
     const tabId = activeTabIdRef.current;
     if (tabId) markAgentLaunch(tabId);
     sendStdin(`${cmd}\r`);
   }, [agentProcess, status, sendStdin, markAgentLaunch]);
+
+  useEffect(() => {
+    if (!activeTabId || !pendingCodexRestartsRef.current.has(activeTabId) || agentProcess === true) return;
+    if (status !== 'connected' || !isShellProcess(lastTitleRef.current)) return;
+    if (!activeTab) return;
+    submitPendingCodexLaunch(activeTabId, activeTab.sessionName);
+  }, [activeTab, activeTabId, agentProcess, status, submitPendingCodexLaunch]);
 
   const splitGroupRef = useRef<GroupImperativeHandle>(null);
   const suppressTerminalSaveRef = useRef(false);

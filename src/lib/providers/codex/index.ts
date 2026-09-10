@@ -22,7 +22,7 @@ const log = createLogger('codex-provider');
 
 export const CODEX_PROVIDER_ID = 'codex';
 const PURPLEMUX_DIR = path.join(os.homedir(), '.purplemux');
-const CODEX_LAUNCHER_SCRIPT = path.join(PURPLEMUX_DIR, 'codex-launcher.js');
+export const CODEX_LAUNCHER_SCRIPT = path.join(PURPLEMUX_DIR, 'codex-launcher.js');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -133,6 +133,21 @@ const parseArgs = (argv) => {
       i += 1;
     } else if (item.startsWith('--workspace-id=')) {
       result.workspaceId = item.slice('--workspace-id='.length);
+    } else if (item === '--tab-id' && next) {
+      result.tabId = next;
+      i += 1;
+    } else if (item.startsWith('--tab-id=')) {
+      result.tabId = item.slice('--tab-id='.length);
+    } else if (item === '--session-name' && next) {
+      result.sessionName = next;
+      i += 1;
+    } else if (item.startsWith('--session-name=')) {
+      result.sessionName = item.slice('--session-name='.length);
+    } else if (item === '--generation' && next) {
+      result.generation = next;
+      i += 1;
+    } else if (item.startsWith('--generation=')) {
+      result.generation = item.slice('--generation='.length);
     } else if (item === '--resume-session-id' && next) {
       result.resumeSessionId = next;
       i += 1;
@@ -161,7 +176,7 @@ const fetchArgs = async (payload) => {
   }
   const port = readTrim(path.join(baseDir, 'port'));
   if (!port) throw new Error('purplemux port file is missing');
-  const token = readTrim(path.join(baseDir, 'cli-token'));
+  const token = process.env.PMUX_TOKEN || readTrim(path.join(baseDir, 'cli-token'));
   const headers = { 'content-type': 'application/json' };
   if (token) headers['x-pmux-token'] = token;
   const res = await fetch(\`http://127.0.0.1:\${port}/api/codex/launch-args\`, {
@@ -180,9 +195,36 @@ const fetchArgs = async (payload) => {
   return data.args;
 };
 
+const confirmLaunch = async (payload) => {
+  if (!payload.generation) return;
+  const port = readTrim(path.join(baseDir, 'port'));
+  if (!port) throw new Error('purplemux port file is missing');
+  const token = process.env.PMUX_TOKEN || readTrim(path.join(baseDir, 'cli-token'));
+  const headers = { 'content-type': 'application/json' };
+  if (token) headers['x-pmux-token'] = token;
+  const res = await fetch(\`http://127.0.0.1:\${port}/api/codex/launch-confirm\`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const message = await res.text().catch(() => '');
+    throw new Error(\`failed to confirm Codex launch: HTTP \${res.status} \${message}\`.trim());
+  }
+};
+
 const main = async () => {
-  const args = await fetchArgs(parseArgs(process.argv.slice(2)));
-  const child = spawn('codex', args, { stdio: 'inherit' });
+  const launch = parseArgs(process.argv.slice(2));
+  if (launch.generation && (!launch.workspaceId || !launch.tabId || !launch.sessionName)) {
+    throw new Error('managed Codex launch identity is incomplete');
+  }
+  const args = await fetchArgs(launch);
+  const child = spawn('codex', args, {
+    stdio: 'inherit',
+    env: launch.generation
+      ? { ...process.env, PURPLEMUX_CODEX_GENERATION: launch.generation }
+      : process.env,
+  });
   child.on('exit', (code, signal) => {
     if (signal) {
       process.kill(process.pid, signal);
@@ -195,6 +237,20 @@ const main = async () => {
     console.error(err.message || String(err));
     process.exit(1);
   });
+  if (launch.generation && Number.isInteger(child.pid)) {
+    try {
+      await confirmLaunch({
+        workspaceId: launch.workspaceId,
+        tabId: launch.tabId,
+        sessionName: launch.sessionName,
+        generation: launch.generation,
+        launcherPid: process.pid,
+        childPid: child.pid,
+      });
+    } catch (err) {
+      console.error(err && err.message ? err.message : String(err));
+    }
+  }
 };
 
 main().catch((err) => {
@@ -256,6 +312,27 @@ const composeLaunchCommand = async (
   if (options.model) parts.push('--model', shellSingleQuote(options.model));
   if (options.effort) parts.push('--effort', shellSingleQuote(options.effort));
   return parts.join(' ');
+};
+
+export const buildManagedCodexLaunchCommand = async (identity: {
+  workspaceId: string;
+  tabId: string;
+  sessionName: string;
+  generation: string;
+}): Promise<string> => {
+  const scriptPath = await ensureCodexLauncherScript();
+  return [
+    'node',
+    shellSingleQuote(scriptPath),
+    '--generation',
+    shellSingleQuote(identity.generation),
+    '--workspace-id',
+    shellSingleQuote(identity.workspaceId),
+    '--tab-id',
+    shellSingleQuote(identity.tabId),
+    '--session-name',
+    shellSingleQuote(identity.sessionName),
+  ].join(' ');
 };
 
 export const codexProvider: IAgentProvider = {

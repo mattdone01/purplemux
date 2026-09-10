@@ -28,7 +28,7 @@ export interface ISteerResult {
 export const steerSession = async (
   sessionName: string,
   message: string,
-  opts?: { interrupt?: boolean },
+  opts?: { interrupt?: boolean; beforeDeliver?: () => Promise<boolean> },
 ): Promise<ISteerResult> => {
   if (!message.trim()) return { ok: false, interrupted: false, reason: 'empty message' };
   if (!(await hasSession(sessionName))) {
@@ -46,15 +46,21 @@ export const steerSession = async (
       // An interrupt that fails is not fatal — deliver the message anyway and
       // let it queue, which is still better than dropping the correction.
       log.warn(`interrupt failed for ${sessionName}: ${err instanceof Error ? err.message : err}`);
-      return { ok: await deliver(sessionName, message), interrupted: false, reason: 'interrupt failed' };
+      return { ok: await deliver(sessionName, message, opts?.beforeDeliver), interrupted: false, reason: 'interrupt failed' };
     }
   }
 
-  return { ok: await deliver(sessionName, message), interrupted: interrupt };
+  return { ok: await deliver(sessionName, message, opts?.beforeDeliver), interrupted: interrupt };
 };
 
-const deliver = async (sessionName: string, message: string): Promise<boolean> => {
+const deliver = async (
+  sessionName: string,
+  message: string,
+  beforeDeliver?: () => Promise<boolean>,
+): Promise<boolean> => {
   try {
+    if (!await hasSession(sessionName)) return false;
+    if (beforeDeliver && !await beforeDeliver()) return false;
     await sendBracketedPaste(sessionName, message);
     return true;
   } catch (err) {

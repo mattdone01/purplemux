@@ -7,6 +7,7 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { buildClaudeFlags, isValidClaudeEffort, isValidModelName } from '@/lib/claude-command';
 import { createLogger } from '@/lib/logger';
+import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 
 const log = createLogger('orchestration');
 
@@ -45,7 +46,15 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const flags = await buildClaudeFlags(workspaceId, { model, effort });
     const command = `claude ${flags}`;
     const tabName = typeof name === 'string' && name.trim() ? name.trim() : 'orchestrator';
-    const tab = await addTabToPane(workspaceId, targetPaneId, tabName, ws.directories[0], 'claude-code', command);
+    const tab = await addTabToPane(
+      workspaceId,
+      targetPaneId,
+      tabName,
+      ws.directories[0],
+      'claude-code',
+      command,
+      { agentLaunchConfig: agentLaunchConfigFromOptions(model, effort) },
+    );
     if (!tab) return res.status(404).json({ error: 'Pane not found' });
 
     const provider = getProviderByPanelType('claude-code');

@@ -6,6 +6,14 @@ import type { IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
 import { getStatusManager } from '@/lib/status-manager';
 import { getChildPids, getProcessArgs } from '@/lib/process-utils';
 import { createLogger } from '@/lib/logger';
+import { agentLaunchOptionsForTab } from '@/lib/agent-launch-policy';
+import type { IAgentLaunchConfig } from '@/types/terminal';
+import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
+import {
+  prepareCodexManagedLaunch,
+  submitCodexManagedLaunch,
+  waitForCodexManagedLaunch,
+} from '@/lib/providers/codex/managed-launch';
 
 const log = createLogger('auto-resume');
 
@@ -18,6 +26,7 @@ interface IAutoResumeTarget {
   tmuxSession: string;
   sessionId: string;
   provider: IAgentProvider;
+  agentLaunchConfig?: IAgentLaunchConfig;
 }
 
 const findAutoResumeTargets = async (): Promise<IAutoResumeTarget[]> => {
@@ -55,6 +64,7 @@ const findAutoResumeTargets = async (): Promise<IAutoResumeTarget[]> => {
         tmuxSession: tab.sessionName,
         sessionId,
         provider,
+        agentLaunchConfig: tab.agentLaunchConfig,
       });
     }
   }
@@ -95,8 +105,36 @@ const sendResumeKeys = async (target: IAutoResumeTarget): Promise<boolean> => {
       return false;
     }
 
+    if (target.provider.id === CODEX_PROVIDER_ID) {
+      const prepared = await prepareCodexManagedLaunch(target.workspaceId, target.tabId, target.sessionId);
+      if (!prepared.ok) {
+        log.warn(`Cannot prepare managed Codex resume: ${target.tmuxSession} — ${prepared.reason}`);
+        return false;
+      }
+      const submitted = await submitCodexManagedLaunch(
+        target.workspaceId,
+        target.tabId,
+        prepared.launch.generation,
+      );
+      if (!submitted.ok) {
+        log.warn(`Cannot submit managed Codex resume: ${target.tmuxSession} — ${submitted.reason}`);
+        return false;
+      }
+      const activated = await waitForCodexManagedLaunch(
+        target.workspaceId,
+        target.tabId,
+        submitted.generation,
+      );
+      if (!activated.ok) {
+        log.warn(`Managed Codex resume not confirmed: ${target.tmuxSession} — ${activated.reason}`);
+        return false;
+      }
+      return true;
+    }
+
     const resumeCmd = await target.provider.buildResumeCommand(target.sessionId, {
       workspaceId: target.workspaceId,
+      ...agentLaunchOptionsForTab(target),
     });
     log.debug(`Sending resume: ${target.tmuxSession} → ${target.sessionId}`);
     await sendKeysSeparated(target.tmuxSession, resumeCmd);

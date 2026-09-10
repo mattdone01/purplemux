@@ -20,6 +20,16 @@ const cliUtils = vi.hoisted(() => ({
 }));
 
 const live = vi.hoisted(() => ({ entries: {} as Record<string, { cliState: TCliState }> }));
+const dispatchPolicy = vi.hoisted(() => vi.fn<
+  (workspaceId: string, target: ITab, options?: unknown) => Promise<{ ok: boolean; error?: string }>
+>(async () => ({ ok: true })));
+vi.mock('@/lib/agent-dispatch-policy', () => ({
+  withAgentDispatchLock: async (
+    workspaceId: string,
+    target: ITab,
+    work: (checkPolicy: (options?: unknown) => Promise<unknown>) => Promise<unknown>,
+  ) => work((options) => dispatchPolicy(workspaceId, target, options)),
+}));
 
 vi.mock('@/lib/tmux', () => tmux);
 vi.mock('@/lib/cli-utils', () => cliUtils);
@@ -100,6 +110,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
   beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
+    dispatchPolicy.mockResolvedValue({ ok: true });
     live.entries = {};
     tmux.hasSession.mockResolvedValue(true);
     tmux.isContentPendingInComposer.mockResolvedValue(false);
@@ -114,6 +125,19 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(response.statusCode).toBe(200);
     expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
     expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
+    expect(dispatchPolicy).toHaveBeenCalledWith(
+      WORKSPACE_ID,
+      expect.objectContaining({ id: TAB_ID }),
+      { consumeBootstrapForTarget: true },
+    );
+  });
+
+  it('never pastes an automated prompt after a model mismatch', async () => {
+    dispatchPolicy.mockResolvedValue({ ok: false, error: 'agent-model-mismatch' });
+    const response = await call({ content: 'implement story' });
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toMatchObject({ error: 'agent-model-mismatch' });
+    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
   });
 
   it('reports submitted false when the paste is still sitting in the composer', async () => {

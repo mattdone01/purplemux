@@ -103,6 +103,7 @@ const titleFor = (kind: TAlertKind): string => {
     case 'orchestrator-stalled': return 'Orchestrator Stalled';
     case 'work-stalled': return 'Work Stalled';
     case 'bg-job-died': return 'Background Job Died';
+    case 'bg-job-unknown': return 'Background Job Status Unknown';
   }
 };
 
@@ -117,6 +118,7 @@ const bodyFor = (source: IAlertSource): string => {
       return source.detail || STALL_BODY;
     case 'work-stalled':
     case 'bg-job-died':
+    case 'bg-job-unknown':
       return source.detail?.slice(0, MAX_BODY) || source.tabName || source.tabId;
   }
 };

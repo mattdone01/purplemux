@@ -8,7 +8,7 @@ export interface ILivenessProbe {
   tabId: string;
   /** Distinguishes multiple probes on one tab; defaults to "default". */
   label: string;
-  /** Shell command; its stdout's last line must contain seconds-since-last-progress. */
+  /** Shell command; its stdout's last non-empty line must be seconds-since-last-progress. */
   command: string;
   /** Reported age above this is a stall. */
   stalenessThresholdS: number;
@@ -52,4 +52,6 @@ export interface IBackgroundJobStatus {
 export type TLivenessEvent =
   | { kind: 'stalled'; probe: ILivenessProbe; ageS: number }
   | { kind: 'probe-failed'; probe: ILivenessProbe; error: string; failures: number }
-  | { kind: 'bg-died'; job: IBackgroundJob; exitCode: number | null; stderrTail: string | null };
+  | { kind: 'bg-completed'; job: IBackgroundJob; exitCode: 0; stderrTail: string | null }
+  | { kind: 'bg-failed'; job: IBackgroundJob; exitCode: number; stderrTail: string | null }
+  | { kind: 'bg-exited-unknown'; job: IBackgroundJob; stderrTail: string | null };

@@ -68,12 +68,13 @@ TOKEN_FILE="$HOME/.purplemux/cli-token"
 PORT=$(cat "$PORT_FILE")
 TOKEN=$(cat "$TOKEN_FILE")
 SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""
+GENERATION="\${PURPLEMUX_CODEX_GENERATION:-}"
 
 curl -sS -X POST -o /dev/null \\
   -H "x-pmux-token: \${TOKEN}" \\
   -H "Content-Type: application/json" \\
   --data-binary @- \\
-  "http://localhost:\${PORT}/api/status/hook?provider=codex&tmuxSession=\${SESSION}" 2>/dev/null || true
+  "http://localhost:\${PORT}/api/status/hook?provider=codex&tmuxSession=\${SESSION}&generation=\${GENERATION}" 2>/dev/null || true
 exit 0
 `;
 

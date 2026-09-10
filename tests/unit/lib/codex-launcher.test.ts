@@ -38,6 +38,7 @@ beforeEach(async () => {
 
 interface ILauncherResult {
   requestBody: unknown;
+  requests: Array<{ url: string; body: unknown }>;
   exitCode: number | null;
   stderr: string;
   codexArgs: string[] | null;
@@ -63,11 +64,18 @@ const executeLauncher = async (
   );
 
   let requestBody: unknown;
+  const requests: Array<{ url: string; body: unknown }> = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
     req.on('end', () => {
       requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      requests.push({ url: req.url ?? '', body: requestBody });
+      if (req.url === '/api/codex/launch-confirm') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ state: 'confirmed' }));
+        return;
+      }
       res.writeHead(response.status, { 'content-type': 'application/json' });
       res.end(response.status === 200
         ? JSON.stringify({ args: response.args ?? [] })
@@ -103,6 +111,7 @@ const executeLauncher = async (
   const captured = await fs.readFile(capturePath, 'utf8').catch(() => null);
   return {
     requestBody,
+    requests,
     exitCode,
     stderr,
     codexArgs: captured ? JSON.parse(captured) as string[] : null,
@@ -110,6 +119,47 @@ const executeLauncher = async (
 };
 
 describe('codex launch command', () => {
+  it('uses a server generation for runtime args and reports the spawned process identities', async () => {
+    const { CODEX_LAUNCHER_SCRIPT_CONTENT, buildManagedCodexLaunchCommand } = await importProvider();
+    const identity = {
+      generation: 'codex-generation',
+      workspaceId: 'ws-pins',
+      tabId: 'tab-pins',
+      sessionName: 'pt-ws-pins-pane-one-tab-pins',
+    };
+    expect(await buildManagedCodexLaunchCommand(identity)).toContain(
+      "--generation 'codex-generation' --workspace-id 'ws-pins' --tab-id 'tab-pins'",
+    );
+
+    const result = await executeLauncher(CODEX_LAUNCHER_SCRIPT_CONTENT, [
+      '--generation', identity.generation,
+      '--workspace-id', identity.workspaceId,
+      '--tab-id', identity.tabId,
+      '--session-name', identity.sessionName,
+    ], { status: 200, args: ['--model', 'gpt-5.6-sol'] });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.requests[0]).toEqual({
+      url: '/api/codex/launch-args',
+      body: {
+        workspaceId: identity.workspaceId,
+        resumeSessionId: null,
+        tabId: identity.tabId,
+        sessionName: identity.sessionName,
+        generation: identity.generation,
+      },
+    });
+    expect(result.requests[1]?.url).toBe('/api/codex/launch-confirm');
+    expect(result.requests[1]?.body).toMatchObject({
+      workspaceId: identity.workspaceId,
+      tabId: identity.tabId,
+      sessionName: identity.sessionName,
+      generation: identity.generation,
+      launcherPid: expect.any(Number),
+      childPid: expect.any(Number),
+    });
+  });
+
   it('keeps an unpinned launch on the wrapper defaults', async () => {
     const { codexProvider } = await importProvider();
 

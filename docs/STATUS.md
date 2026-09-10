@@ -721,3 +721,69 @@ The idempotent guard at the top of `applyCliState` (`prevState === newState`) bl
 The socket `notification:alert` broadcast is untouched by the FCM channel: foreground banners still come from `status-socket`, and `fcm` covers the backgrounded phone.
 
 The push payload keeps its existing shape and adds `kind`, `isOrchestrator`, `alertId`, and `agentSessionId`. `claudeSessionId` stays as-is for `public/sw.js` back-compat.
+
+
+## Codex launch policy and observed model
+
+Agent tabs can persist `agentLaunchConfig` (`model`, `effort`) in the workspace layout.
+CLI creation and explicit policy updates validate the values. Automatic, timeline,
+and browser resumes carry the saved policy; old tabs with no policy remain unpinned.
+Updating policy does not change a running Codex process. The next resume applies it.
+
+`purplemux tab status` exposes `modelStatus`: requested settings, latest recorded
+settings, last recorded turn, and `unpinned`, `unknown`, `match`, or `mismatch`.
+Observations come from the bound Codex session JSONL (`turn_context` and
+`thread_settings_applied`), including source and timestamp. Launch arguments and
+global defaults are never represented as current model evidence. Missing or
+foreign session evidence is unknown; a known contradictory field is a mismatch.
+Unknown includes an explicit reason: scanning, awaiting the first turn, unavailable
+or contradictory session identity, missing observation, an unverified legacy
+lifecycle, a pending/held launch, or a dead/non-Codex runtime.
+The reader validates the head session identity, then searches backward from the
+newest records with a 4 MiB per-poll budget. Its cached cursor continues bounded
+scans and subsequent appends without rereading a large history; replaced and
+truncated logs invalidate the cache.
+
+The watchdog reports each model mismatch episode once, including an orchestrator
+mismatch. Every automated delivery path, plus CLI create/send/steer, holds both a
+known mismatch and an established, scanning, unavailable, or dead unknown state on
+either the target or workspace orchestrator. A newly booted TUI can lack turn
+metadata until its first prompt. Managed launches persist a server-issued generation
+before terminal submission; a launcher receipt activates it only after the server
+verifies the exact wrapper, Codex child lineage, process births, tab identity, and
+prior-process exit. Pending and failed generations remain unknown and cannot bind a
+resume session. Resumed JSONL reads begin at that generation's recorded byte boundary,
+so historical turns cannot establish its model.
+
+Only the final delivery call can atomically consume a verified generation's one-shot
+bootstrap allowance. The irreversible claim is stored in the separate server-owned
+`codexLaunchRuntime`, while public `agentLaunchConfig` continues to contain only
+desired `model` and `effort`. Status reads, policy PATCH, matching observations,
+concurrent sends, and a service restart cannot grant or reopen the claim. Legacy tabs
+may still compare valid bound observations, but missing legacy metadata never creates
+an allowance. Existing untagged hooks remain compatible only while no managed
+generation exists and their non-null session/path binding plus observed model still
+match; this path never creates runtime proof or an allowance. An explicit managed
+mode switch changes only terminal or agent-session surfaces to Codex in the same
+atomic mutation that prepares its generation. The guard
+does not inject `/model` commands or kill a turn. Human terminal input remains
+available to correct settings.
+
+## Background job outcomes
+
+A registered PID exit is an outcome to verify, not necessarily a crash:
+
+- `bg-completed`: a complete integer exit file reports zero. Verify artifacts and
+  continue; do not repeat the job. No failure push is sent.
+- `bg-failed`: a complete integer exit file reports nonzero. Diagnose before a
+  justified retry.
+- `bg-exited-unknown`: no valid exit code after the bounded two-second grace
+  period. Inspect supervisor logs, child processes and verdict artifacts; do not
+  infer failure or restart automatically.
+
+Each PID registration emits one outcome. Separate jobs finishing on the same tab
+are not collapsed by a per-tab debounce. Historical `bg-died` records still render.
+Finishing one job does not clear unrelated freshness probes: the owner clears its
+completed task probe explicitly. Probe stdout must end in a complete finite,
+nonnegative number of seconds; labelled text and negative/NaN/infinite ages fail
+as probe errors instead of producing spurious huge stall durations.

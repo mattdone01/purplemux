@@ -4,6 +4,8 @@ import { isValidModelName } from '@/lib/claude-command-shared';
 import { buildCodexRuntimeArgs } from '@/lib/providers/codex';
 import { getActiveWorkspaceId } from '@/lib/workspace-store';
 import { createLogger } from '@/lib/logger';
+import { authorizeWorkspaceInput } from '@/lib/cli-utils';
+import { resolveCodexLaunchIntent } from '@/lib/providers/codex/launch-lifecycle';
 
 const log = createLogger('codex-launch-args');
 
@@ -21,7 +23,35 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     resumeSessionId?: unknown;
     model?: unknown;
     effort?: unknown;
+    generation?: unknown;
+    tabId?: unknown;
+    sessionName?: unknown;
   } | null | undefined;
+  const generation = stringOrNull(body?.generation);
+  if (generation) {
+    const workspaceId = stringOrNull(body?.workspaceId);
+    const tabId = stringOrNull(body?.tabId);
+    const sessionName = stringOrNull(body?.sessionName);
+    if (!workspaceId || !tabId || !sessionName) {
+      return res.status(400).json({ error: 'Managed Codex launch identity is incomplete' });
+    }
+    if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
+    const intent = await resolveCodexLaunchIntent(workspaceId, tabId, generation, sessionName);
+    if (!intent) {
+      return res.status(409).json({ error: 'Codex launch generation is not current' });
+    }
+    try {
+      const args = await buildCodexRuntimeArgs(
+        workspaceId,
+        intent.resumeSessionId ?? undefined,
+        intent.launchedConfig,
+      );
+      return res.status(200).json({ args });
+    } catch (err) {
+      log.error(`managed codex launch args build failed: ${err instanceof Error ? err.message : err}`);
+      return res.status(500).json({ error: 'Failed to build Codex launch args' });
+    }
+  }
   const hasModel = body !== null && body !== undefined
     && Object.prototype.hasOwnProperty.call(body, 'model');
   const hasEffort = body !== null && body !== undefined
