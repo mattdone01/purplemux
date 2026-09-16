@@ -119,11 +119,16 @@ describe('alertFor', () => {
     const died = alertFor({ ...base, kind: 'bg-job-died', detail: 'pid 4242 exited with code 137' });
     expect(died.title).toBe('Background Job Died');
     expect(died.body).toBe('pid 4242 exited with code 137');
+
+    const unknown = alertFor({ ...base, kind: 'bg-job-unknown', detail: 'pid 4242 exited with unknown status' });
+    expect(unknown.title).toBe('Background Job Status Unknown');
+    expect(unknown.body).toBe('pid 4242 exited with unknown status');
   });
 
   it('clamps liveness alert bodies and falls back to the tab name', () => {
     expect(alertFor({ ...base, kind: 'work-stalled', detail: 'x'.repeat(200) }).body).toHaveLength(100);
     expect(alertFor({ ...base, kind: 'bg-job-died', detail: null }).body).toBe('orchestrator');
+    expect(alertFor({ ...base, kind: 'bg-job-unknown', detail: null }).body).toBe('orchestrator');
   });
 
   it('describes a stall with the supplied detail', () => {

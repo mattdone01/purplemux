@@ -21,7 +21,7 @@ describe('codex prompt config encoding', () => {
   });
 
   it('uses a stable Node launcher that asks the server for runtime args', () => {
-    expect(CODEX_LAUNCHER_SCRIPT_CONTENT).toContain('/api/codex/launch-args');
+    expect(CODEX_LAUNCHER_SCRIPT_CONTENT).toContain('/api/cli/codex/launch-args');
     expect(CODEX_LAUNCHER_SCRIPT_CONTENT).toContain("spawn('codex', args");
   });
 });

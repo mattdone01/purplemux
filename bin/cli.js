@@ -344,8 +344,8 @@ const cmdTabClose = async (args) => {
   if (resp.ok) process.stdout.write('ok\n');
 };
 
-// Liveness probes: the watchdog runs --cmd on an interval; its last stdout line
-// must print seconds-since-last-progress. Above --stale-after, the orchestrator
+// Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
+// stdout line must be a numeric seconds-since-last-progress value. Above --stale-after, the orchestrator
 // gets a STALLED nudge and the human gets a push alert.
 const cmdTabProbe = async (args) => {
   requireEnv();
@@ -389,8 +389,8 @@ const cmdTabProbe = async (args) => {
   }
 };
 
-// Background job watch: when the pid exits, the orchestrator gets a nudge with
-// the exit code (from --exit-file) and a stderr tail (from --stderr).
+// Background job watch: when the pid exits, the orchestrator gets a completion,
+// failure, or unknown-status nudge with a stderr tail when available.
 const cmdTabBg = async (args) => {
   requireEnv();
   const sub = args[0];
@@ -570,17 +570,19 @@ Commands:
   tab close -w WS TAB_ID                   Close a tab
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
-             [--interval SECS] [--label L] CMD (default every 60s); its last stdout line must print seconds since
+             [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
+                                           finite, nonnegative numeric count of seconds since
                                            the work last progressed. Age > --stale-after fires a STALLED nudge to
                                            the orchestrator (or the tab itself) and a push alert to the human.
                                            3 consecutive probe failures fire a PROBE FAILING nudge — a broken
                                            probe is never a green light.
   tab probe list -w WS TAB_ID              Show a tab's probes with last age / staleness / failures
   tab probe clear -w WS TAB_ID [--label L] Remove probes (all, or one label) — do this when the job completes
-  tab bg add -w WS TAB_ID --pid N          Watch a background pid: on exit, a BACKGROUND JOB DIED nudge fires
-             [--label L] [--stderr FILE]   carrying the exit code (read from --exit-file) and the stderr tail
-             [--exit-file FILE]            (from --stderr). Launch pattern: cmd 2>err.log & echo $! for the pid,
-                                           and wrap with; echo $? > exit.code to capture the code
+  tab bg add -w WS TAB_ID --pid N          Watch a background pid. A strict integer from --exit-file classifies exit 0
+             [--label L] [--stderr FILE]   as COMPLETED and nonzero as FAILED; missing or malformed status becomes
+             [--exit-file FILE]            EXITED with unknown status after a short grace. Nudges include the stderr
+                                           tail when available. Verify completed artifacts; inspect unknown exits
+                                           before deciding. Launch pattern: ( cmd 2>err.log; echo $? > exit.code ) &
   tab bg list -w WS TAB_ID                 Show watched background jobs (pid, alive, age)
   tab bg remove -w WS TAB_ID [--pid N]     Stop watching (all, or one pid)
   tab browser url -w WS TAB_ID             Current URL + title of a web-browser tab

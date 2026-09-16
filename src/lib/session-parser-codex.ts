@@ -84,6 +84,13 @@ const safeString = (value: unknown, fallback = ''): string =>
 const safeNumber = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 
+const isAsyncUserInputAccepted = (output: string): boolean => {
+  const parsed = tryParseJson(output);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  return record.accepted === true && Object.keys(record).length === 1;
+};
+
 const oneLineSummary = (text: string, limit = SUMMARY_PREVIEW_LIMIT): string => {
   const compact = text.replace(/\s+/g, ' ').trim();
   if (compact.length <= limit) return compact;
@@ -258,6 +265,7 @@ const nextSyntheticCallId = (state: ICodexParseState): string =>
   `codex-call-${state.syntheticCallIdCount++}`;
 
 const SUPPRESSED_FUNCTION_NAMES = new Set(['exec_command', 'shell', 'bash', 'write_stdin']);
+const ASYNC_USER_INPUT_FUNCTION_NAME = 'request_user_input_async';
 
 const setInFlight = (state: ICodexParseState, callId: string, entry: TInFlightEntry) => {
   const existing = state.inFlight.get(callId);
@@ -421,6 +429,10 @@ const processResponseItem = (
       const callId = safeString(payload.call_id);
       const name = safeString(payload.name);
       if (!callId || !name) return [];
+      if (name === ASYNC_USER_INPUT_FUNCTION_NAME) {
+        state.suppressedCallIds.add(callId);
+        return [];
+      }
       if (SUPPRESSED_FUNCTION_NAMES.has(name)) {
         state.suppressedCallIds.add(callId);
         return [];
@@ -442,11 +454,11 @@ const processResponseItem = (
     case 'function_call_output': {
       const callId = safeString(payload.call_id);
       if (!callId) return [];
-      if (state.suppressedCallIds.has(callId)) {
+      const output = safeString(payload.output);
+      if (state.suppressedCallIds.has(callId) || isAsyncUserInputAccepted(output)) {
         state.suppressedCallIds.delete(callId);
         return [];
       }
-      const output = safeString(payload.output);
       const entry: ITimelineToolResult = {
         id: PENDING_ENTRY_ID,
         type: 'tool-result',
@@ -607,6 +619,33 @@ const processEventMsg = (
         markdown: message,
       };
       return [entry];
+    }
+    case 'item_completed': {
+      const item = payload.item;
+      if (typeof item !== 'object' || item === null) return [];
+      const completed = item as Record<string, unknown>;
+      if (safeString(completed.type) !== 'AgentMessage' || safeString(completed.delivery) !== 'async') return [];
+      const phase = safeString(completed.phase);
+      if (phase && !['commentary', 'final', 'final_answer'].includes(phase)) return [];
+
+      const content = Array.isArray(completed.content) ? completed.content : [];
+      const markdown = content.flatMap((part) => {
+        if (typeof part !== 'object' || part === null) return [];
+        const record = part as Record<string, unknown>;
+        if (safeString(record.type) !== 'Text') return [];
+        const text = safeString(record.text);
+        return text ? [text] : [];
+      }).join('\n\n');
+      if (!markdown) return [];
+
+      const callId = safeString(completed.id);
+      if (callId) state.suppressedCallIds.add(callId);
+      return [{
+        id: PENDING_ENTRY_ID,
+        type: 'assistant-message',
+        timestamp,
+        markdown,
+      } satisfies ITimelineAssistantMessage];
     }
     case 'task_complete':
     case 'TurnComplete': {

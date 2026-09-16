@@ -22,10 +22,14 @@ export const buildClaudeFlags = async (workspaceId?: string, opts?: { model?: st
   return parts.join(' ');
 };
 
-export const buildResumeCommand = async (sessionId: string, workspaceId?: string): Promise<string> => {
+export const buildResumeCommand = async (
+  sessionId: string,
+  workspaceId?: string,
+  opts?: { model?: string; effort?: string },
+): Promise<string> => {
   if (!isValidSessionId(sessionId)) {
     throw new Error(`Invalid session ID format: ${sessionId}`);
   }
-  const flags = await buildClaudeFlags(workspaceId);
+  const flags = await buildClaudeFlags(workspaceId, opts);
   return `claude --resume ${sessionId} ${flags}`;
 };

@@ -32,8 +32,14 @@ import {
   parseSessionName,
 } from './layout-store';
 import { getStatusManager } from './status-manager';
+import {
+  prepareCodexManagedLaunch,
+  submitCodexManagedLaunch,
+  waitForCodexManagedLaunch,
+} from './providers/codex/managed-launch';
 import { getProviderByPanelType } from '@/lib/providers';
 import type { IAgentProvider } from '@/lib/providers';
+import { resolveAgentLaunchPolicyForSession } from '@/lib/agent-launch-policy';
 import { extractSessionIdFromJsonlPath, readSessionStats } from './session-stats';
 import { readCodexTimelineSessionStats } from './stats/jsonl-parser-codex';
 import type { TTimelineServerMessage, IChunkReadResult, IInitMeta, ITimelineEntry, ISessionStats } from '@/types/timeline';
@@ -686,12 +692,13 @@ const resolveJsonlPath = async (
   return existsSync(jsonlPath) ? jsonlPath : null;
 };
 
-const handleResumeMessage = async (
+export const handleResumeMessage = async (
   ws: WebSocket,
   conn: ITimelineConnection,
   payload: { sessionId: string; tmuxSession: string },
 ) => {
-  const { sessionId, tmuxSession } = payload;
+  const { sessionId } = payload;
+  const tmuxSession = conn.sessionName;
 
   try {
     const { isSafe, processName } = await checkTerminalProcess(tmuxSession);
@@ -706,11 +713,54 @@ const handleResumeMessage = async (
     }
 
     const parsed = parseSessionName(tmuxSession);
-    const resumeCmd = await conn.provider.buildResumeCommand(sessionId, { workspaceId: parsed?.wsId });
+    const launchPolicy = await resolveAgentLaunchPolicyForSession(tmuxSession);
+    if (conn.provider.id === CODEX_PROVIDER_ID) {
+      if (!parsed || !launchPolicy) throw new Error('Managed Codex tab not found');
+      const prepared = await prepareCodexManagedLaunch(
+        launchPolicy.workspaceId,
+        launchPolicy.tabId,
+        sessionId,
+      );
+      if (!prepared.ok) throw new Error(`Codex resume prepare failed: ${prepared.reason}`);
+      const submitted = await submitCodexManagedLaunch(
+        launchPolicy.workspaceId,
+        launchPolicy.tabId,
+        prepared.launch.generation,
+      );
+      if (!submitted.ok) throw new Error(`Codex resume submit failed: ${submitted.reason}`);
+      const activated = await waitForCodexManagedLaunch(
+        launchPolicy.workspaceId,
+        launchPolicy.tabId,
+        submitted.generation,
+      );
+      if (!activated.ok) throw new Error(`Codex resume confirmation failed: ${activated.reason}`);
+      if (conn.currentJsonlPath) {
+        unsubscribeFromFile(ws, conn.currentJsonlPath);
+        conn.currentJsonlPath = null;
+      }
+      sendJson(ws, {
+        type: 'timeline:resume-started',
+        sessionId,
+        jsonlPath: null,
+      });
+      return;
+    }
+    const resumeCmd = await conn.provider.buildResumeCommand(sessionId, {
+      workspaceId: launchPolicy?.workspaceId ?? parsed?.wsId,
+      ...launchPolicy?.options,
+    });
+    if (conn.currentJsonlPath) {
+      unsubscribeFromFile(ws, conn.currentJsonlPath);
+      conn.currentJsonlPath = null;
+    }
     await sendKeys(tmuxSession, resumeCmd);
-    if (parsed) getStatusManager().markAgentLaunch(parsed.tabId);
-
-    await updateTabAgentSessionId(conn.sessionName, conn.provider, sessionId).catch(() => {});
+    await updateTabAgentState(conn.sessionName, conn.provider, {
+      sessionId,
+      jsonlPath: null,
+      summary: null,
+      lastUserMessage: null,
+    });
+    if (parsed) getStatusManager().markAgentLaunch(parsed.tabId, { resumeSessionId: sessionId });
 
     const jsonlPath = await resolveJsonlPath(tmuxSession, sessionId, conn.provider);
 

@@ -16,7 +16,7 @@ import {
   equalizeNode,
   isEqualized,
 } from '@/lib/layout-tree';
-import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings } from '@/types/terminal';
+import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { IAgentProvider } from '@/lib/providers/types';
 import { claudeProvider } from '@/lib/providers/claude';
@@ -58,6 +58,37 @@ const withLock = async <T>(fn: () => Promise<T>): Promise<T> => {
     release!();
   }
 };
+
+export interface IAtomicTabMutation<T> {
+  changed: boolean;
+  value: T;
+}
+
+export type TAtomicTabMutationResult<T> =
+  | { found: false }
+  | { found: true; value: T; tab: ITab };
+
+/**
+ * Server-side compare-and-set seam for persisted tab runtime state. The
+ * callback runs under the layout store's process-wide lock and must not await.
+ */
+export const mutateTabAtomically = async <T>(
+  wsId: string,
+  tabId: string,
+  mutator: (tab: ITab) => IAtomicTabMutation<T>,
+): Promise<TAtomicTabMutationResult<T>> => withLock(async () => {
+  const filePath = resolveLayoutFile(wsId);
+  const layout = await readLayoutFile(filePath);
+  if (!layout) return { found: false };
+  const tab = collectAllTabs(layout.root).find((candidate) => candidate.id === tabId);
+  if (!tab) return { found: false };
+  const result = mutator(tab);
+  if (result.changed) {
+    layout.updatedAt = new Date().toISOString();
+    await writeLayoutFile(layout, filePath);
+  }
+  return { found: true, value: result.value, tab: { ...tab } };
+});
 
 export const generatePaneId = (): string => `pane-${nanoid(6)}`;
 export const generateTabId = (): string => `tab-${nanoid(6)}`;
@@ -291,7 +322,7 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[] }): Promise<ITab | null> =>
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -314,7 +345,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}) };
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}) };
 
     pane.tabs.push(tab);
     pane.activeTabId = tabId;
@@ -574,6 +605,28 @@ export const updateTabCliStatus = (
     tab.dismissedAt = dismissedAt;
     return true;
   });
+
+export const updateTabAgentLaunchConfig = async (
+  wsId: string,
+  paneId: string,
+  tabId: string,
+  agentLaunchConfig: IAgentLaunchConfig | null,
+): Promise<ITab | null> => {
+  const result = await mutate(wsId, (layout) => {
+    const pane = findPane(layout.root, paneId);
+    if (!pane) return null;
+    const tab = pane.tabs.find((candidate) => candidate.id === tabId);
+    if (!tab) return null;
+    if (agentLaunchConfig) {
+      tab.agentLaunchConfig = { ...agentLaunchConfig };
+    } else {
+      delete tab.agentLaunchConfig;
+    }
+    return layout;
+  });
+  if (!result) return null;
+  return findPane(result.root, paneId)?.tabs.find((tab) => tab.id === tabId) ?? null;
+};
 
 const mutate = async (
   wsId: string,

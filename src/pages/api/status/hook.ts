@@ -10,6 +10,10 @@ import { codexHookEvents } from '@/lib/providers/codex/hook-events';
 import { processGrokHookPayload, shouldEmitGrokHookEvent } from '@/lib/providers/grok/hook-handler';
 import { grokHookEvent, parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
+import {
+  withValidatedCodexHookGeneration,
+  withValidatedLegacyCodexHook,
+} from '@/lib/providers/codex/launch-lifecycle';
 
 const log = createLogger('hooks');
 
@@ -45,35 +49,50 @@ const handleClaudeHook = (req: NextApiRequest, res: NextApiResponse) => {
   return res.status(204).end();
 };
 
-const handleCodexHook = (req: NextApiRequest, res: NextApiResponse) => {
+const handleCodexHook = async (req: NextApiRequest, res: NextApiResponse) => {
   const tmuxSession = req.query.tmuxSession;
   if (typeof tmuxSession !== 'string' || !tmuxSession) {
     log.warn({ event: req.body?.hook_event_name }, 'codex hook missing tmuxSession');
     return res.status(400).json({ error: 'missing tmuxSession' });
   }
   const payload = req.body ?? {};
+  const generation = typeof req.query.generation === 'string' ? req.query.generation : null;
   log.debug(
     { tmuxSession, event: payload.hook_event_name, source: payload.source },
     `codex ${payload.hook_event_name ?? 'unknown'}`,
   );
-  const statusManager = getStatusManager();
   const { result, translation } = processCodexHookPayload(payload);
-  const applied = translation.meta
-    ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta)
-    : null;
-  if (!applied) {
-    log.debug({ tmuxSession, event: payload.hook_event_name, reason: 'unknown-session' }, 'codex hook skipped');
+  const applyHook = () => {
+    const statusManager = getStatusManager();
+    const applied = translation.meta
+      ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta)
+      : null;
+    if (!applied) return { applied: null };
+    if (translation.sessionInfo) {
+      codexHookEvents.emit('session-info', tmuxSession, translation.sessionInfo);
+      if (translation.clearSession) codexHookEvents.emit('session-clear', tmuxSession);
+    }
+    if (translation.event && shouldEmitCodexHookEvent(payload, applied.cliState)) {
+      statusManager.handleProviderEvent('codex', tmuxSession, translation.event);
+    }
+    return { applied };
+  };
+  const guarded = generation
+    ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook)
+    : await withValidatedLegacyCodexHook(tmuxSession, {
+        sessionId: translation.meta?.sessionId ?? null,
+        jsonlPath: translation.meta?.jsonlPath,
+      }, applyHook);
+  if (!guarded.ok || !guarded.value.applied) {
+    log.debug({
+      tmuxSession,
+      event: payload.hook_event_name,
+      reason: guarded.ok ? 'unknown-session' : guarded.reason,
+    }, 'codex hook skipped');
     return res.status(204).end();
-  }
-  if (translation.sessionInfo) {
-    codexHookEvents.emit('session-info', tmuxSession, translation.sessionInfo);
-    if (translation.clearSession) codexHookEvents.emit('session-clear', tmuxSession);
   }
   if (!result.ok) {
     log.debug({ tmuxSession, event: payload.hook_event_name, reason: result.reason }, 'codex hook skipped');
-  }
-  if (translation.event && shouldEmitCodexHookEvent(payload, applied.cliState)) {
-    statusManager.handleProviderEvent('codex', tmuxSession, translation.event);
   }
   return res.status(204).end();
 };

@@ -5,11 +5,16 @@
 export const fetchCodexLaunchCommand = async (
   workspaceId?: string | null,
   resumeSessionId?: string | null,
+  tabId?: string | null,
 ): Promise<string> => {
   const res = await fetch('/api/codex/launch-command', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workspaceId: workspaceId ?? null, resumeSessionId: resumeSessionId ?? null }),
+    body: JSON.stringify({
+      workspaceId: workspaceId ?? null,
+      resumeSessionId: resumeSessionId ?? null,
+      tabId: tabId ?? null,
+    }),
   });
   if (!res.ok) {
     throw new Error('Failed to build Codex launch command');

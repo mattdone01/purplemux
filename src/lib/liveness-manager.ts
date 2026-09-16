@@ -26,6 +26,8 @@ export const PROBE_TIMEOUT_MS = 15_000;
 export const PROBE_FAILURE_ALERT_THRESHOLD = 3;
 export const STDERR_TAIL_BYTES = 2_048;
 export const STDERR_TAIL_LINES = 10;
+export const BACKGROUND_EXIT_FILE_GRACE_MS = 2_000;
+export const BACKGROUND_EXIT_CODE_MAX_BYTES = 64;
 
 export interface IProbeRunResult {
   stdout: string;
@@ -42,18 +44,23 @@ export interface ILivenessManagerDeps {
 }
 
 /**
- * Seconds-since-last-progress from a probe's stdout: the first number on the
- * last non-empty line. Anything else is a probe defect, reported as a failure
- * rather than silently treated as fresh.
+ * Seconds-since-last-progress from a probe's stdout. The last non-empty line
+ * must consist entirely of one finite, nonnegative number.
  */
 export const parseProbeAge = (stdout: string): number | null => {
   const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
   const last = lines[lines.length - 1];
   if (!last) return null;
-  const match = /\d+(\.\d+)?/.exec(last);
-  if (!match) return null;
-  const age = Number(match[0]);
-  return Number.isFinite(age) ? age : null;
+  if (!/^\+?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(last)) return null;
+  const age = Number(last);
+  return Number.isFinite(age) && age >= 0 ? age : null;
+};
+
+export const parseBackgroundExitCode = (raw: string | null): number | null => {
+  const value = raw?.trim();
+  if (!value || !/^-?\d+$/.test(value)) return null;
+  const exitCode = Number(value);
+  return Number.isSafeInteger(exitCode) ? exitCode : null;
 };
 
 export const tailLines = (raw: string, maxLines: number): string =>
@@ -69,6 +76,10 @@ interface IProbeRuntime {
   lastAlertAgeS: number | null;
   failureAlerted: boolean;
   running: boolean;
+}
+
+interface IJobRuntime {
+  deadSince: number | null;
 }
 
 const freshRuntime = (): IProbeRuntime => ({
@@ -89,7 +100,7 @@ const jobKey = (j: Pick<IBackgroundJob, 'workspaceId' | 'tabId' | 'pid'>): strin
 
 export class LivenessManager {
   private probes = new Map<string, { probe: ILivenessProbe; runtime: IProbeRuntime }>();
-  private jobs = new Map<string, IBackgroundJob>();
+  private jobs = new Map<string, { job: IBackgroundJob; runtime: IJobRuntime }>();
   private hydrated: Promise<void> | null = null;
 
   constructor(private deps: ILivenessManagerDeps) {}
@@ -103,7 +114,7 @@ export class LivenessManager {
           }
         }
         for (const job of jobs) {
-          if (!this.jobs.has(jobKey(job))) this.jobs.set(jobKey(job), job);
+          if (!this.jobs.has(jobKey(job))) this.jobs.set(jobKey(job), { job, runtime: { deadSince: null } });
         }
       }).catch((err) => {
         log.warn(`hydrate failed: ${err instanceof Error ? err.message : err}`);
@@ -130,13 +141,13 @@ export class LivenessManager {
 
   async registerJob(job: IBackgroundJob): Promise<void> {
     await this.ensureHydrated();
-    this.jobs.set(jobKey(job), job);
+    this.jobs.set(jobKey(job), { job, runtime: { deadSince: null } });
     await upsertJob(job);
   }
 
   async unregisterJobs(workspaceId: string, tabId: string, pid?: number): Promise<number> {
     await this.ensureHydrated();
-    for (const [key, job] of this.jobs) {
+    for (const [key, { job }] of this.jobs) {
       if (job.workspaceId === workspaceId && job.tabId === tabId && (pid === undefined || job.pid === pid)) {
         this.jobs.delete(key);
       }
@@ -153,7 +164,7 @@ export class LivenessManager {
           had = true;
         }
       }
-      for (const [key, job] of this.jobs) {
+      for (const [key, { job }] of this.jobs) {
         if (job.workspaceId === workspaceId && job.tabId === tabId) {
           this.jobs.delete(key);
           had = true;
@@ -182,7 +193,7 @@ export class LivenessManager {
       });
     }
     const backgroundJobs: IBackgroundJobStatus[] = [];
-    for (const job of this.jobs.values()) {
+    for (const { job } of this.jobs.values()) {
       if (job.tabId !== tabId) continue;
       backgroundJobs.push({
         pid: job.pid,
@@ -203,14 +214,23 @@ export class LivenessManager {
   }
 
   private async checkJobs(emit: (event: TLivenessEvent) => void): Promise<void> {
-    for (const [key, job] of [...this.jobs]) {
-      if (this.deps.isPidAlive(job.pid)) continue;
+    for (const [key, { job, runtime }] of [...this.jobs]) {
+      if (this.deps.isPidAlive(job.pid)) {
+        runtime.deadSince = null;
+        continue;
+      }
 
       let exitCode: number | null = null;
       if (job.exitCodeFile) {
-        const raw = await this.deps.readTail(job.exitCodeFile, 64);
-        const match = raw ? /-?\d+/.exec(raw.trim()) : null;
-        if (match) exitCode = Number(match[0]);
+        const raw = await this.deps.readTail(job.exitCodeFile, BACKGROUND_EXIT_CODE_MAX_BYTES + 1);
+        exitCode = raw !== null && Buffer.byteLength(raw) <= BACKGROUND_EXIT_CODE_MAX_BYTES
+          ? parseBackgroundExitCode(raw)
+          : null;
+        if (exitCode === null) {
+          const now = this.deps.now();
+          runtime.deadSince ??= now;
+          if (now - runtime.deadSince < BACKGROUND_EXIT_FILE_GRACE_MS) continue;
+        }
       }
       let stderrTail: string | null = null;
       if (job.stderrFile) {
@@ -218,12 +238,19 @@ export class LivenessManager {
         if (raw && raw.trim()) stderrTail = tailLines(raw, STDERR_TAIL_LINES);
       }
 
-      // A dead pid is a one-shot fact: deregister before emitting so a slow
-      // orchestrator cannot be renotified about the same corpse every poll.
+      if (this.jobs.get(key)?.runtime !== runtime) continue;
       this.jobs.delete(key);
       removeJobs(job.workspaceId, job.tabId, job.pid).catch(() => {});
-      log.info({ tabId: job.tabId, pid: job.pid, exitCode }, 'background job died');
-      emit({ kind: 'bg-died', job, exitCode, stderrTail });
+      if (exitCode === 0) {
+        log.info({ tabId: job.tabId, pid: job.pid }, 'background job completed');
+        emit({ kind: 'bg-completed', job, exitCode, stderrTail });
+      } else if (exitCode !== null) {
+        log.warn({ tabId: job.tabId, pid: job.pid, exitCode }, 'background job failed');
+        emit({ kind: 'bg-failed', job, exitCode, stderrTail });
+      } else {
+        log.info({ tabId: job.tabId, pid: job.pid }, 'background job exited with unknown status');
+        emit({ kind: 'bg-exited-unknown', job, stderrTail });
+      }
     }
   }
 
@@ -243,7 +270,7 @@ export class LivenessManager {
         if (age === null) {
           const reason = result.exitCode !== 0
             ? `exit ${result.exitCode}: ${tailLines(result.stderr || result.stdout, 3).slice(0, 300) || '(no output)'}`
-            : `no numeric age in output: ${tailLines(result.stdout, 1).slice(0, 200) || '(empty)'}`;
+            : `invalid age output: ${tailLines(result.stdout, 1).slice(0, 200) || '(empty)'}`;
           this.recordProbeFailure(probe, runtime, reason, emit);
           return;
         }

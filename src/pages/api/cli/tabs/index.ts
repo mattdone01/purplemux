@@ -8,10 +8,16 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
 import { buildClaudeFlags, isValidModelName } from '@/lib/claude-command';
-import { codexProvider } from '@/lib/providers/codex';
 import { grokProvider } from '@/lib/providers/grok';
 import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
+import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
+import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
+import {
+  prepareCodexManagedLaunch,
+  submitCodexManagedLaunch,
+  waitForCodexManagedLaunch,
+} from '@/lib/providers/codex/managed-launch';
 import type { TPanelType } from '@/types/terminal';
 
 const log = createLogger('api:cli:tabs');
@@ -35,6 +41,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       panelType?: string;
       agentProviderId: string | null;
       agentSessionId: string | null;
+      agentLaunchConfig?: { model?: string; effort?: string };
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -62,6 +69,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             panelType: tab.panelType,
             agentProviderId: provider?.id ?? null,
             agentSessionId: provider?.readSessionId(tab) ?? null,
+            agentLaunchConfig: tab.agentLaunchConfig,
           });
         }
       }
@@ -89,6 +97,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const ws = await getWorkspaceById(workspaceId);
     if (!ws) {
       return res.status(404).json({ error: 'Workspace not found' });
+    }
+    const dispatchPolicy = await checkAgentDispatchPolicy(workspaceId);
+    if (!dispatchPolicy.ok) {
+      return res.status(409).json(dispatchPolicy);
     }
     const paneId = await resolveFirstPaneId(workspaceId);
     if (!paneId) {
@@ -127,16 +139,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         // Catch-all else is codex; routing grok through it launched codex
         // inside a grok tab. Pin model/effort at launch the same as the others.
         command = await grokProvider.buildLaunchCommand({ workspaceId, model, effort: reasoning });
-      } else {
-        command = await codexProvider.buildLaunchCommand({ workspaceId });
-        if (model) command += ` --model ${model}`;
-        if (reasoning) command += ` -c model_reasoning_effort=${reasoning}`;
       }
     }
 
     try {
       const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType, command, {
         scope: scope as string[] | undefined,
+        agentLaunchConfig: agentLaunchConfigFromOptions(model, reasoning),
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
 
@@ -156,6 +165,40 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         if (command) getStatusManager().markAgentLaunch(tab.id);
       }
 
+      let codexLaunchState: 'active' | 'held' | undefined;
+      if (shouldLaunch && resolvedType === 'codex-cli') {
+        const prepared = await prepareCodexManagedLaunch(workspaceId, tab.id);
+        if (!prepared.ok) {
+          return res.status(500).json({
+            error: 'Failed to prepare Codex launch',
+            reason: prepared.reason,
+            tabId: tab.id,
+            launchState: 'held',
+          });
+        }
+        const submitted = await submitCodexManagedLaunch(workspaceId, tab.id, prepared.launch.generation);
+        if (!submitted.ok) {
+          return res.status(500).json({
+            error: 'Failed to submit Codex launch',
+            reason: submitted.reason,
+            tabId: tab.id,
+            generation: submitted.generation,
+            launchState: submitted.phase,
+          });
+        }
+        const activated = await waitForCodexManagedLaunch(workspaceId, tab.id, submitted.generation);
+        codexLaunchState = activated.ok ? activated.phase : 'held';
+        if (!activated.ok) {
+          return res.status(503).json({
+            error: 'Codex launch was not confirmed',
+            reason: activated.reason,
+            tabId: tab.id,
+            generation: activated.generation,
+            launchState: activated.phase,
+          });
+        }
+      }
+
       return res.status(201).json({
         tabId: tab.id,
         workspaceId,
@@ -165,7 +208,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         panelType: tab.panelType,
         agentProviderId: null,
         agentSessionId: null,
-        launched: !!command,
+        agentLaunchConfig: tab.agentLaunchConfig,
+        launched: !!command || codexLaunchState === 'active',
+        ...(codexLaunchState ? { launchState: codexLaunchState } : {}),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'unknown error';

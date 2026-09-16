@@ -27,6 +27,61 @@ export interface IAgentState {
   summary: string | null;
 }
 
+export interface IAgentLaunchConfig {
+  model?: string;
+  effort?: string;
+}
+
+export interface ICodexLaunchProcessIdentity {
+  pid: number;
+  startedAtMs: number;
+}
+
+export interface ICodexLaunchObservationBoundary {
+  sessionId: string;
+  jsonlPath: string;
+  byteOffset: number;
+}
+
+export type TCodexPendingLaunchPhase = 'prepared' | 'submitted' | 'held';
+
+export interface ICodexPendingLaunch {
+  generation: string;
+  workspaceId: string;
+  tabId: string;
+  sessionName: string;
+  resumeSessionId: string | null;
+  launchedConfig: IAgentLaunchConfig;
+  observationBoundary: ICodexLaunchObservationBoundary | null;
+  priorLauncher: ICodexLaunchProcessIdentity | null;
+  priorAgent: ICodexLaunchProcessIdentity | null;
+  phase: TCodexPendingLaunchPhase;
+  preparedAt: string;
+  submittedAt?: string;
+  heldReason?: string;
+}
+
+export interface ICodexActiveLaunch {
+  generation: string;
+  workspaceId: string;
+  tabId: string;
+  sessionName: string;
+  resumeSessionId: string | null;
+  launchedConfig: IAgentLaunchConfig;
+  observationBoundary: ICodexLaunchObservationBoundary | null;
+  launcher: ICodexLaunchProcessIdentity;
+  agent: ICodexLaunchProcessIdentity;
+  phase: 'active' | 'held';
+  bootstrap: 'unused' | 'consumed';
+  confirmedAt: string;
+  heldReason?: string;
+}
+
+export interface ICodexLaunchRuntime {
+  active?: ICodexActiveLaunch;
+  pending?: ICodexPendingLaunch;
+}
+
 export interface ITab {
   id: string;
   sessionName: string;
@@ -36,6 +91,9 @@ export interface ITab {
   cwd?: string;
   panelType?: TPanelType;
   agentState?: IAgentState;
+  agentLaunchConfig?: IAgentLaunchConfig;
+  /** Server-owned proof of the Codex process generation currently attached to this tab. */
+  codexLaunchRuntime?: ICodexLaunchRuntime;
   /** @deprecated use agentState; kept for disk back-compat */
   claudeSessionId?: string | null;
   /** @deprecated use agentState; kept for disk back-compat */

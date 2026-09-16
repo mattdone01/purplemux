@@ -82,10 +82,10 @@ export const claudeProvider: IAgentProvider = {
   isAgentRunning: (panePid, childPids) => isClaudeRunning(panePid, childPids),
   watchSessions: (panePid, onChange, options) => watchSessionsDir(panePid, onChange, options),
 
-  buildResumeCommand: (sessionId, { workspaceId }) =>
-    buildClaudeResumeCommand(sessionId, workspaceId),
-  buildLaunchCommand: async ({ workspaceId }) => {
-    const flags = await buildClaudeFlags(workspaceId);
+  buildResumeCommand: (sessionId, { workspaceId, model, effort }) =>
+    buildClaudeResumeCommand(sessionId, workspaceId, { model, effort }),
+  buildLaunchCommand: async ({ workspaceId, model, effort }) => {
+    const flags = await buildClaudeFlags(workspaceId, { model, effort });
     return `claude ${flags}`;
   },
 

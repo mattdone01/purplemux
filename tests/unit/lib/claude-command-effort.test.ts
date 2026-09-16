@@ -8,9 +8,12 @@ vi.mock('@/lib/hook-settings', () => ({
 }));
 vi.mock('@/lib/claude-prompt', () => ({
   getClaudePromptPath: (wsId: string) => `/home/u/.purplemux/workspaces/${wsId}/claude-prompt.md`,
+  writeClaudePromptFile: vi.fn(),
 }));
 
 import { buildClaudeFlags, isValidClaudeEffort, CLAUDE_EFFORT_LEVELS } from '@/lib/claude-command';
+import { claudeProvider } from '@/lib/providers/claude';
+import { buildClaudeLaunchCommand } from '@/lib/providers/claude/client';
 
 describe('isValidClaudeEffort', () => {
   it('accepts exactly the claude effort vocabulary', () => {
@@ -31,5 +34,30 @@ describe('buildClaudeFlags effort', () => {
   it('omits --effort when absent or invalid — the session then inherits the global default', async () => {
     expect(await buildClaudeFlags('ws-1', { model: 'claude-opus-5' })).not.toContain('--effort');
     expect(await buildClaudeFlags('ws-1', { effort: 'minimal' })).not.toContain('--effort');
+  });
+
+  it('keeps explicit model and effort on the real provider resume path', async () => {
+    const sessionId = '01a008c1-bb96-71d1-9769-b63ff478fd9f';
+    const command = await claudeProvider.buildResumeCommand(sessionId, {
+      workspaceId: 'ws-1',
+      model: 'claude-opus-5',
+      effort: 'high',
+    });
+
+    expect(command).toContain(`--resume ${sessionId}`);
+    expect(command).toContain('--model claude-opus-5');
+    expect(command).toContain('--effort high');
+  });
+
+  it('keeps explicit model and effort in the browser command builder', () => {
+    const command = buildClaudeLaunchCommand({
+      workspaceId: 'ws-1',
+      resumeSessionId: '01a008c1-bb96-71d1-9769-b63ff478fd9f',
+      model: 'claude-opus-5',
+      effort: 'high',
+    });
+
+    expect(command).toContain('--model claude-opus-5');
+    expect(command).toContain('--effort high');
   });
 });

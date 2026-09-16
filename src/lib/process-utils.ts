@@ -56,6 +56,19 @@ export const getProcessArgs = async (
   }
 };
 
+/** Exact argv tokens where the host exposes them; process proof must not parse ps text. */
+export const getProcessArgv = async (pid: number): Promise<string[] | null> => {
+  if (!isLinux) return null;
+  try {
+    const raw = await fs.readFile(`/proc/${pid}/cmdline`);
+    if (raw.length === 0) return null;
+    const argv = raw.toString('utf8').split('\0').filter((part) => part.length > 0);
+    return argv.length > 0 ? argv : null;
+  } catch {
+    return null;
+  }
+};
+
 export const getProcessStartTimeMs = async (
   pid: number | string,
   options?: { timeoutMs?: number },

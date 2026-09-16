@@ -65,6 +65,37 @@ describe('Codex public response messages', () => {
     }
   });
 
+  it('appends a response-item-only commentary message during a live parse', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-live-commentary-'));
+    try {
+      const file = path.join(dir, 'session.jsonl');
+      await fs.writeFile(file, response('Earlier progress.'));
+      const parser = new CodexParser(file);
+      await parser.parseAll();
+
+      const commentary = response(
+        'DEV is working again.\n\nI’m finishing the persistent helper fix.',
+        {
+          internal_chat_message_metadata_passthrough: {
+            turn_id: 'turn-1',
+            content_item_kinds: ['unknown'],
+          },
+        },
+      );
+      await fs.appendFile(file, commentary);
+
+      const increment = await parser.parseIncremental();
+
+      expect(increment.newEntries).toHaveLength(1);
+      expect(increment.newEntries[0]).toMatchObject({
+        type: 'assistant-message',
+        markdown: 'DEV is working again.\n\nI’m finishing the persistent helper fix.',
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('previews code-mode tool activity without running the source', () => {
     const entries = parseCodexContent(line('response_item', {
       type: 'custom_tool_call', name: 'exec', call_id: 'c1',
@@ -75,5 +106,81 @@ describe('Codex public response messages', () => {
     expect(entries[0].summary).toContain('pnpm test');
     expect(entries[0].summary).not.toContain('@exec');
     expect(entries[0].summary.length).toBeLessThanOrEqual(166);
+  });
+
+  it('shows async user questions from their delivered message and suppresses protocol rows', () => {
+    const callId = 'call-question-1';
+    const prompt = 'Please run the route command, then reply “done”.\n- Done\n- Cannot run it now';
+    const content = response('Before the question.')
+      + line('response_item', {
+        type: 'function_call',
+        name: 'request_user_input_async',
+        call_id: callId,
+        arguments: JSON.stringify({
+          questions: [{
+            title: 'Please run the route command, then reply “done”.',
+            options: ['Done', 'Cannot run it now'],
+          }],
+        }),
+      })
+      + line('event_msg', {
+        type: 'item_completed',
+        item: {
+          type: 'AgentMessage',
+          id: callId,
+          content: [{ type: 'Text', text: prompt }],
+          phase: 'final_answer',
+          delivery: 'async',
+          questions: [{
+            title: 'Please run the route command, then reply “done”.',
+            options: ['Done', 'Cannot run it now'],
+          }],
+        },
+      })
+      + line('response_item', {
+        type: 'function_call_output',
+        call_id: callId,
+        output: JSON.stringify({ accepted: true }),
+      })
+      + response(prompt, { phase: 'final_answer' })
+      + response('After the question.');
+
+    const entries = parseCodexContent(content);
+
+    expect(entries.map((entry) => entry.type)).toEqual([
+      'assistant-message',
+      'assistant-message',
+      'assistant-message',
+    ]);
+    expect(messages(content)).toEqual([
+      'Before the question.',
+      prompt,
+      'After the question.',
+    ]);
+  });
+
+  it('suppresses an async-question acknowledgement when a chunk starts after its call', () => {
+    const content = line('response_item', {
+      type: 'function_call_output',
+      call_id: 'call-before-chunk',
+      output: JSON.stringify({ accepted: true }),
+    });
+
+    expect(parseCodexContent(content)).toEqual([]);
+  });
+
+  it('does not surface internal completed agent items as public chat', () => {
+    const content = line('event_msg', {
+      type: 'item_completed',
+      item: {
+        type: 'AgentMessage',
+        id: 'internal-message',
+        content: [{ type: 'Text', text: 'Internal handoff' }],
+        phase: 'analysis',
+        delivery: 'internal',
+      },
+    });
+
+    expect(parseCodexContent(content)).toEqual([]);
   });
 });

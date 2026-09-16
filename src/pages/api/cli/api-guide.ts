@@ -95,16 +95,19 @@ Watchers for DELEGATED WORK, not tab state. A tab that is idle while its backgro
 job is dead looks identical to an idle healthy tab; the built-in watchdog only sees
 pane/turn state. Register a probe (progress freshness) and/or a background pid
 (process death) at dispatch time for any long-running job. Events fire an
-orchestrator nudge (STALLED / LIVENESS PROBE FAILING / BACKGROUND JOB DIED — sent to
-the workspace's orchestrator tab, or to the registering tab itself when there is no
-orchestrator) AND a push alert to the human. Registrations persist across server
-restarts and are dropped when the tab closes.
+orchestrator nudge (STALLED / LIVENESS PROBE FAILING / BACKGROUND JOB COMPLETED /
+BACKGROUND JOB FAILED / BACKGROUND JOB EXITED with unknown status — sent to the
+workspace's orchestrator tab, or to the registering tab itself when there is no
+orchestrator). Stalls, probe failures, failed jobs, and unknown-status exits also send
+a push alert to the human. Registrations persist across server restarts and are dropped
+when the tab closes.
 
 POST /api/cli/tabs/<tabId>/probe?workspaceId=WS
   Body: { "command": "...", "stalenessThresholdS": 60..604800, "intervalS"?: 30..604800 (default 60), "label"?: "default" }
   Requires the workspace's OWN token (registration executes a command server-side).
   The watchdog runs command every intervalS (bounded below by the status poll, ~30-60s);
-  the LAST line of its stdout must contain seconds-since-last-progress (e.g. a
+  the LAST NON-EMPTY line of its stdout must consist entirely of a finite,
+  nonnegative numeric seconds-since-last-progress value (e.g. a
   SELECT now()-max(finished_at) or a stat of a progress file). Exit 0 + a number =
   measured; age > stalenessThresholdS = STALLED (re-alerts every further threshold of
   silence). Nonzero exit, timeout (15s), or non-numeric output = probe failure; 3
@@ -122,11 +125,14 @@ DELETE /api/cli/tabs/<tabId>/probe?workspaceId=WS[&label=L]
 
 POST /api/cli/tabs/<tabId>/bg?workspaceId=WS
   Body: { "pid": N, "label"?: "...", "stderrFile"?: "/abs/path", "exitCodeFile"?: "/abs/path" }
-  Watch a background pid; when it exits, BACKGROUND JOB DIED fires with the exit code
-  (read from exitCodeFile) and the stderr tail (last ~10 lines of stderrFile). Launch
+  Watch a background pid. A strict integer read from exitCodeFile classifies exit 0 as
+  BACKGROUND JOB COMPLETED and nonzero as BACKGROUND JOB FAILED. If the file is missing
+  or malformed after a short grace, BACKGROUND JOB EXITED fires with unknown status;
+  inspect artifacts and logs before deciding whether it succeeded or failed. Nudges
+  include the stderr tail (last ~10 lines of stderrFile) when available. Launch
   pattern that captures both:  ( cmd 2>/tmp/job.err; echo $? > /tmp/job.exit ) & — then
-  register the subshell pid. The registration is one-shot: it is dropped after the
-  death notification.
+  register the subshell pid. The registration is one-shot: only that pid is dropped
+  after its outcome; probe registrations on the tab remain active.
   Response: { "tabId", "workspaceId", "job" }
 
 GET /api/cli/tabs/<tabId>/bg?workspaceId=WS

@@ -8,6 +8,7 @@ import {
   resolveTabCliState,
 } from '@/lib/tab-send';
 import { sendBracketedPaste, hasSession, isContentPendingInComposer } from '@/lib/tmux';
+import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
 
 /**
  * Deliver a prompt to a tab.
@@ -78,7 +79,29 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     });
   }
 
-  await sendBracketedPaste(readiness.target.sessionName, content);
+  const current = await findTab(workspaceId, tabId);
+  if (!current || current.tab.sessionName !== readiness.target.sessionName) {
+    return res.status(409).json({ error: 'agent-target-changed', tabId });
+  }
+  const delivered = await withAgentDispatchLock(workspaceId, current.tab, async (checkPolicy) => {
+    const latest = await findTab(workspaceId, tabId);
+    if (!latest || latest.tab.sessionName !== readiness.target.sessionName) {
+      res.status(409).json({ error: 'agent-target-changed', tabId });
+      return false;
+    }
+    if (!await hasSession(latest.tab.sessionName)) {
+      res.status(409).json({ error: 'agent-not-ready', tabId, detail: 'session-not-running' });
+      return false;
+    }
+    const policy = await checkPolicy({ consumeBootstrapForTarget: true });
+    if (!policy.ok) {
+      res.status(409).json(policy);
+      return false;
+    }
+    await sendBracketedPaste(latest.tab.sessionName, content);
+    return true;
+  });
+  if (!delivered) return;
 
   // Report delivery, not just dispatch. A paste that lands while the agent is
   // mid-turn can have its Enter swallowed and sit in the composer until

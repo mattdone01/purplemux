@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  BACKGROUND_EXIT_FILE_GRACE_MS,
   LivenessManager,
   parseProbeAge,
   tailLines,
@@ -38,6 +39,12 @@ const job = (overrides: Partial<IBackgroundJob> = {}): IBackgroundJob => ({
   ...overrides,
 });
 
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+};
+
 interface IHarness {
   manager: LivenessManager;
   events: TLivenessEvent[];
@@ -73,16 +80,24 @@ const harness = (): IHarness => {
 };
 
 describe('parseProbeAge', () => {
-  it('reads the first number on the last non-empty line', () => {
+  it('reads a fully numeric last non-empty line', () => {
     expect(parseProbeAge('noise\n1234\n')).toBe(1234);
-    expect(parseProbeAge('last_done_s_ago: 42.5')).toBe(42.5);
+    expect(parseProbeAge('noise\n42.5')).toBe(42.5);
+    expect(parseProbeAge('noise\n1.5e2')).toBe(150);
     expect(parseProbeAge('0')).toBe(0);
   });
 
-  it('returns null for empty or non-numeric output', () => {
-    expect(parseProbeAge('')).toBeNull();
-    expect(parseProbeAge('\n\n')).toBeNull();
-    expect(parseProbeAge('still warming up')).toBeNull();
+  it.each([
+    '',
+    '\n\n',
+    'still warming up',
+    'last_done_s_ago: 42.5',
+    '-1',
+    'NaN',
+    'Infinity',
+    '1e309',
+  ])('rejects invalid age output %j', (output) => {
+    expect(parseProbeAge(output)).toBeNull();
   });
 });
 
@@ -184,7 +199,7 @@ describe('probe failures', () => {
 });
 
 describe('background jobs', () => {
-  it('emits bg-died once with exit code and stderr tail, then forgets the pid', async () => {
+  it('emits bg-failed once with a strict nonzero exit code and stderr tail, then forgets the pid', async () => {
     const h = harness();
     await h.manager.registerJob(job({ stderrFile: '/tmp/j.err', exitCodeFile: '/tmp/j.exit' }));
     h.deps.isPidAlive.mockReturnValue(false);
@@ -193,7 +208,8 @@ describe('background jobs', () => {
 
     await h.tick();
     expect(h.events).toHaveLength(1);
-    const died = h.events[0] as Extract<TLivenessEvent, { kind: 'bg-died' }>;
+    const died = h.events[0] as Extract<TLivenessEvent, { kind: 'bg-failed' }>;
+    expect(died.kind).toBe('bg-failed');
     expect(died.exitCode).toBe(137);
     expect(died.stderrTail).toContain('fatal: attest failed');
 
@@ -213,15 +229,131 @@ describe('background jobs', () => {
     expect(backgroundJobs[0]).toMatchObject({ pid: 4242, alive: true });
   });
 
-  it('handles missing exit/stderr files', async () => {
+  it('emits bg-completed for exit zero without removing the tab probes', async () => {
+    const h = harness();
+    await h.manager.registerProbe(probe({ label: 'ongoing' }));
+    await h.manager.registerProbe(probe({ label: 'other' }));
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockResolvedValue('0\n');
+
+    await h.tick();
+
+    expect(h.events).toHaveLength(1);
+    expect(h.events[0]).toMatchObject({ kind: 'bg-completed', exitCode: 0 });
+    const { probes, backgroundJobs } = await h.manager.statusForTab('tab-1');
+    expect(probes.map((p) => p.label).sort()).toEqual(['ongoing', 'other']);
+    expect(backgroundJobs).toEqual([]);
+  });
+
+  it.each(['137 trailing', 'exit 137', '1.5', '1e2'])('rejects malformed exit code %j', async (exitOutput) => {
+    const h = harness();
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockResolvedValue(exitOutput);
+
+    await h.tick();
+    expect(h.events).toEqual([]);
+    h.setNow(1_000_000 + BACKGROUND_EXIT_FILE_GRACE_MS);
+    await h.tick();
+
+    expect(h.events).toHaveLength(1);
+    expect(h.events[0]).toMatchObject({ kind: 'bg-exited-unknown' });
+  });
+
+  it('rejects an oversized exit file whose truncated tail looks like exit zero', async () => {
+    const h = harness();
+    const exitOutput = `x${' '.repeat(63)}0`;
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockImplementation(async (_file: string, maxBytes: number) => exitOutput.slice(-maxBytes));
+
+    await h.tick();
+    expect(h.events).toEqual([]);
+    h.setNow(1_000_000 + BACKGROUND_EXIT_FILE_GRACE_MS);
+    await h.tick();
+
+    expect(h.deps.readTail).toHaveBeenCalledWith('/tmp/j.exit', 65);
+    expect(h.events).toHaveLength(1);
+    expect(h.events[0]).toMatchObject({ kind: 'bg-exited-unknown' });
+  });
+
+  it('allows a bounded grace period for a delayed exit file', async () => {
+    const h = harness();
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockResolvedValueOnce(null).mockResolvedValueOnce('0\n');
+
+    await h.tick();
+    expect(h.events).toEqual([]);
+    h.setNow(1_000_000 + BACKGROUND_EXIT_FILE_GRACE_MS - 1);
+    await h.tick();
+
+    expect(h.events).toHaveLength(1);
+    expect(h.events[0]).toMatchObject({ kind: 'bg-completed', exitCode: 0 });
+  });
+
+  it('emits bg-exited-unknown once when exit/stderr files remain missing after grace', async () => {
     const h = harness();
     await h.manager.registerJob(job({ stderrFile: '/tmp/gone.err', exitCodeFile: '/tmp/gone.exit' }));
     h.deps.isPidAlive.mockReturnValue(false);
     h.deps.readTail.mockResolvedValue(null);
     await h.tick();
-    const died = h.events[0] as Extract<TLivenessEvent, { kind: 'bg-died' }>;
-    expect(died.exitCode).toBeNull();
+    expect(h.events).toEqual([]);
+    h.setNow(1_000_000 + BACKGROUND_EXIT_FILE_GRACE_MS);
+    await h.tick();
+    const died = h.events[0] as Extract<TLivenessEvent, { kind: 'bg-exited-unknown' }>;
     expect(died.stderrTail).toBeNull();
+    await h.tick();
+    expect(h.events).toHaveLength(1);
+  });
+
+  it('emits once when overlapping ticks inspect the same dead registration', async () => {
+    const h = harness();
+    const exitRead = deferred<string | null>();
+    const bothReading = deferred<void>();
+    let reads = 0;
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockImplementation(async () => {
+      reads += 1;
+      if (reads === 2) bothReading.resolve();
+      return exitRead.promise;
+    });
+
+    const first = h.tick();
+    const second = h.tick();
+    await bothReading.promise;
+    exitRead.resolve('0\n');
+    await Promise.all([first, second]);
+
+    expect(h.events).toHaveLength(1);
+    expect(h.events[0]).toMatchObject({ kind: 'bg-completed' });
+    expect((await h.manager.statusForTab('tab-1')).backgroundJobs).toEqual([]);
+  });
+
+  it('does not delete or report a same-pid registration replaced during an in-flight tick', async () => {
+    const h = harness();
+    const exitRead = deferred<string | null>();
+    const reading = deferred<void>();
+    const replacement = job({ label: 'replacement', registeredAt: 1_000_001, exitCodeFile: '/tmp/new.exit' });
+    await h.manager.registerJob(job({ label: 'original', exitCodeFile: '/tmp/old.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockImplementation(async () => {
+      reading.resolve();
+      return exitRead.promise;
+    });
+
+    const staleTick = h.tick();
+    await reading.promise;
+    await h.manager.registerJob(replacement);
+    exitRead.resolve('0\n');
+    await staleTick;
+
+    expect(h.events).toEqual([]);
+    expect((await h.manager.statusForTab('tab-1')).backgroundJobs).toEqual([
+      expect.objectContaining({ pid: 4242, label: 'replacement', registeredAt: 1_000_001 }),
+    ]);
   });
 });
 

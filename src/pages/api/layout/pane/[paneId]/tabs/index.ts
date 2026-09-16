@@ -6,6 +6,12 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { sendKeys } from '@/lib/tmux';
 import { createLogger } from '@/lib/logger';
+import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
+import {
+  prepareCodexManagedLaunch,
+  submitCodexManagedLaunch,
+  waitForCodexManagedLaunch,
+} from '@/lib/providers/codex/managed-launch';
 
 const log = createLogger('layout');
 
@@ -40,12 +46,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   try {
-    const tab = await addTabToPane(wsId, paneId, name, cwd, panelType, command);
+    const managedCodex = panelType === 'codex-cli';
+    const tab = await addTabToPane(wsId, paneId, name, cwd, panelType, managedCodex ? undefined : command);
     if (!tab) {
       return res.status(404).json({ error: 'Pane not found' });
     }
 
-    if (resumeSessionId && provider && !command) {
+    if (resumeSessionId && provider && !command && provider.id !== CODEX_PROVIDER_ID) {
       provider.writeSessionId(tab, resumeSessionId);
       await updateTabAgentSessionId(tab.sessionName, provider, resumeSessionId);
     }
@@ -63,12 +70,27 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         lastEvent: null,
         eventSeq: 0,
       });
-      if (command) {
+      if (command && !managedCodex) {
         getStatusManager().markAgentLaunch(tab.id);
       }
     }
 
-    if (resumeSessionId && provider && !command) {
+    if (managedCodex && (command || resumeSessionId)) {
+      const prepared = await prepareCodexManagedLaunch(wsId, tab.id, resumeSessionId ?? null);
+      if (!prepared.ok) {
+        return res.status(500).json({ error: 'Failed to prepare Codex launch', reason: prepared.reason });
+      }
+      const submitted = await submitCodexManagedLaunch(wsId, tab.id, prepared.launch.generation);
+      if (!submitted.ok) {
+        return res.status(500).json({ error: 'Failed to submit Codex launch', reason: submitted.reason });
+      }
+      const activated = await waitForCodexManagedLaunch(wsId, tab.id, submitted.generation);
+      if (!activated.ok) {
+        return res.status(503).json({ error: 'Codex launch was not confirmed', reason: activated.reason });
+      }
+    }
+
+    if (resumeSessionId && provider && !command && provider.id !== CODEX_PROVIDER_ID) {
       setTimeout(async () => {
         try {
           const resumeCmd = await provider.buildResumeCommand(resumeSessionId, { workspaceId: wsId });
