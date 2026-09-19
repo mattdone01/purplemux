@@ -24,9 +24,9 @@ vi.mock('@/lib/cli-utils', () => ({
   authorizeWorkspace: vi.fn(async () => true),
   authorizeWorkspaceInput: vi.fn(async () => true),
 }));
+vi.mock('@/lib/agent-prompt-delivery', () => ({ deliverPrompt: mocks.paste }));
 vi.mock('@/lib/tmux', () => ({
   hasSession: vi.fn(async () => true),
-  sendBracketedPaste: mocks.paste,
   sendEscape: mocks.escape,
   isContentPendingInComposer: vi.fn(async () => false),
   listSessions: vi.fn(async () => []),

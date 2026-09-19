@@ -7,7 +7,8 @@ import {
   resolveSendWaitMs,
   resolveTabCliState,
 } from '@/lib/tab-send';
-import { sendBracketedPaste, hasSession, isContentPendingInComposer } from '@/lib/tmux';
+import { hasSession, isContentPendingInComposer } from '@/lib/tmux';
+import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
 
 /**
@@ -98,7 +99,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       res.status(409).json(policy);
       return false;
     }
-    await sendBracketedPaste(latest.tab.sessionName, content);
+    await deliverPrompt(latest.tab.sessionName, content);
     return true;
   });
   if (!delivered) return;

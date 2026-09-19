@@ -500,6 +500,15 @@ export const parseSessionName = (sessionName: string): { wsId: string; paneId: s
   return { wsId: match[1], paneId: match[2], tabId: match[3] };
 };
 
+/** Read-only: the tab a tmux session belongs to, or null when no layout names it. */
+export const findTabBySessionName = async (sessionName: string): Promise<ITab | null> => {
+  const parsed = parseSessionName(sessionName);
+  if (!parsed) return null;
+  const layout = await readLayoutFile(resolveLayoutFile(parsed.wsId));
+  if (!layout) return null;
+  return collectAllTabs(layout.root).find((t) => t.sessionName === sessionName) ?? null;
+};
+
 const mutateTab = async (
   sessionName: string,
   mutator: (tab: ITab) => boolean,

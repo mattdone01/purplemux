@@ -1,4 +1,5 @@
-import { sendBracketedPaste, sendEscape, hasSession } from '@/lib/tmux';
+import { sendEscape, hasSession } from '@/lib/tmux';
+import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('steer');
@@ -61,7 +62,7 @@ const deliver = async (
   try {
     if (!await hasSession(sessionName)) return false;
     if (beforeDeliver && !await beforeDeliver()) return false;
-    await sendBracketedPaste(sessionName, message);
+    await deliverPrompt(sessionName, message);
     return true;
   } catch (err) {
     log.error(`steer delivery failed for ${sessionName}: ${err instanceof Error ? err.message : err}`);
