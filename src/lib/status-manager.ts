@@ -114,12 +114,20 @@ export class StatusManager {
   private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
   private modelWatch = new AgentModelWatch();
   private automatedPrompts: AutomatedPromptDispatcher;
+  private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
+  private updateAgentState: typeof updateTabAgentState;
   private stuckNudgedTabs = new Set<string>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
 
-  constructor(automatedPrompts = new AutomatedPromptDispatcher()) {
+  constructor(
+    automatedPrompts = new AutomatedPromptDispatcher(),
+    cacheCodexRateLimits = cacheCodexRateLimitsFromJsonl,
+    updateAgentState = updateTabAgentState,
+  ) {
     this.automatedPrompts = automatedPrompts;
+    this.cacheCodexRateLimits = cacheCodexRateLimits;
+    this.updateAgentState = updateAgentState;
   }
 
   async init(): Promise<void> {
@@ -200,9 +208,7 @@ export class StatusManager {
           lastEvent: syntheticLastEvent,
           eventSeq: 0,
         });
-        if ((cliState === 'needs-input' || cliState === 'unknown') && detected.jsonlPath) {
-          this.startJsonlWatch(tab.id, detected.jsonlPath);
-        }
+        this.reconcileJsonlWatch(tab.id, this.tabs.get(tab.id)!);
         if (cliState === 'unknown') {
           this.resolveUnknown(tab.id).catch((err) => log.warn('resolveUnknown failed: %s', err));
         }
@@ -429,6 +435,7 @@ export class StatusManager {
             eventSeq: 0,
           };
           this.tabs.set(tab.id, entry);
+          this.reconcileJsonlWatch(tab.id, entry);
           this.persistToLayout(entry);
           this.broadcastUpdate(tab.id, entry);
           if (initialState === 'unknown') {
@@ -452,6 +459,7 @@ export class StatusManager {
           ?? provider?.readSessionId(tab) ?? null;
         existing.jsonlPath = refreshed.jsonlPath ?? existing.jsonlPath;
         existing.lastUserMessage = tab.lastUserMessage;
+        this.reconcileJsonlWatch(tab.id, existing);
 
         if (processChanged) {
           existing.processRetries = PROCESS_RETRY_COUNT;
@@ -784,7 +792,10 @@ export class StatusManager {
 
   private applyCliState(tabId: string, entry: ITabStatusEntry, newState: TCliState, opts: { silent?: boolean } = {}): void {
     const prevState = entry.cliState;
-    if (prevState === newState) return;
+    if (prevState === newState) {
+      this.reconcileJsonlWatch(tabId, entry);
+      return;
+    }
     const prevBusySince = entry.busySince;
     entry.cliState = newState;
     entry.readyForReviewAt = newState === 'ready-for-review' ? Date.now() : null;
@@ -809,13 +820,7 @@ export class StatusManager {
       void this.dispatchTransitionAlert(tabId, entry, 'needs-input');
     }
 
-    const shouldWatch = (newState === 'busy' || newState === 'needs-input') && entry.jsonlPath;
-    const keepForFinalRead = newState === 'ready-for-review' && this.jsonlWatchers.has(tabId);
-    if (shouldWatch && !this.jsonlWatchers.has(tabId)) {
-      this.startJsonlWatch(tabId, entry.jsonlPath!);
-    } else if (!shouldWatch && !keepForFinalRead && this.jsonlWatchers.has(tabId)) {
-      this.stopJsonlWatch(tabId);
-    }
+    this.reconcileJsonlWatch(tabId, entry);
 
     if (newState !== 'busy') this.stuckNudgedTabs.delete(tabId);
     if (newState === 'idle' && this.pendingKickoffs.has(tabId)) {
@@ -1358,9 +1363,13 @@ export class StatusManager {
       entry.agentProviderId = providerId;
       changed = true;
     }
-    if (meta.sessionId !== undefined && entry.agentSessionId !== meta.sessionId) {
+    const sessionBindingChanged = meta.sessionId !== undefined && entry.agentSessionId !== meta.sessionId;
+    if (sessionBindingChanged) {
       entry.agentSessionId = meta.sessionId;
       changed = true;
+      if (meta.jsonlPath === undefined && entry.jsonlPath !== null) {
+        entry.jsonlPath = null;
+      }
     }
     if (meta.jsonlPath !== undefined && entry.jsonlPath !== meta.jsonlPath) {
       entry.jsonlPath = meta.jsonlPath;
@@ -1385,11 +1394,14 @@ export class StatusManager {
     }
 
     if (changed) {
+      this.reconcileJsonlWatch(tabId, entry);
       const provider = expectedProvider ?? getProvider(providerId);
       if (provider) {
-        updateTabAgentState(entry.tmuxSession, provider, {
+        this.updateAgentState(entry.tmuxSession, provider, {
           ...(meta.sessionId !== undefined ? { sessionId: meta.sessionId } : {}),
-          ...(meta.jsonlPath !== undefined ? { jsonlPath: meta.jsonlPath } : {}),
+          ...(meta.jsonlPath !== undefined || sessionBindingChanged
+            ? { jsonlPath: meta.jsonlPath ?? null }
+            : {}),
           ...(meta.agentSummary !== undefined || meta.clearMessages
             ? { summary: meta.clearMessages ? null : meta.agentSummary ?? null }
             : {}),
@@ -1467,6 +1479,7 @@ export class StatusManager {
 
   registerTab(tabId: string, entry: ITabStatusEntry): void {
     this.tabs.set(tabId, entry);
+    this.reconcileJsonlWatch(tabId, entry);
     this.broadcastUpdate(tabId, entry);
   }
 
@@ -1520,7 +1533,7 @@ export class StatusManager {
       this.stopJsonlWatch(tabId);
       this.persistToLayout(entry);
       if (provider) {
-        updateTabAgentState(entry.tmuxSession, provider, {
+        this.updateAgentState(entry.tmuxSession, provider, {
           sessionId: nextSessionId,
           jsonlPath: null,
           summary: null,
@@ -1699,9 +1712,22 @@ export class StatusManager {
       entry.agentSessionId = provider.sessionIdFromJsonlPath(jsonlPath) ?? entry.agentSessionId;
     }
 
-    if ((entry.cliState === 'busy' || entry.cliState === 'needs-input') && !this.jsonlWatchers.has(tabId)) {
-      this.startJsonlWatch(tabId, jsonlPath);
+    this.reconcileJsonlWatch(tabId, entry);
+  }
+
+  private reconcileJsonlWatch(tabId: string, entry: ITabStatusEntry): void {
+    const existing = this.jsonlWatchers.get(tabId);
+    const shouldWatch = entry.cliState === 'busy'
+      || entry.cliState === 'needs-input'
+      || entry.cliState === 'unknown';
+    if (shouldWatch && entry.jsonlPath) {
+      this.startJsonlWatch(tabId, entry.jsonlPath);
+      return;
     }
+    const keepForFinalRead = entry.cliState === 'ready-for-review'
+      && !!entry.jsonlPath
+      && existing?.jsonlPath === entry.jsonlPath;
+    if (!keepForFinalRead && existing) this.stopJsonlWatch(tabId);
   }
 
   private startJsonlWatch(tabId: string, jsonlPath: string): void {
@@ -1713,16 +1739,22 @@ export class StatusManager {
     try {
       const watcher = watch(jsonlPath, () => {
         const w = this.jsonlWatchers.get(tabId);
-        if (!w) return;
+        if (!w || w.jsonlPath !== jsonlPath) return;
         if (w.debounceTimer) clearTimeout(w.debounceTimer);
         w.debounceTimer = setTimeout(() => {
           this.onJsonlFileChange(tabId, jsonlPath).catch(() => {});
         }, JSONL_WATCH_DEBOUNCE_MS);
       });
       watcher.on('error', () => {
-        this.stopJsonlWatch(tabId);
+        if (this.jsonlWatchers.get(tabId)?.jsonlPath === jsonlPath) {
+          this.stopJsonlWatch(tabId);
+        }
       });
       this.jsonlWatchers.set(tabId, { watcher, jsonlPath, debounceTimer: null });
+      const entry = this.tabs.get(tabId);
+      if (entry?.agentProviderId === CODEX_PROVIDER_ID || entry?.panelType === 'codex-cli') {
+        this.cacheCodexRateLimits(jsonlPath).catch(() => {});
+      }
     } catch {
       // file may not exist yet
     }
@@ -1753,7 +1785,7 @@ export class StatusManager {
     if (!provider) return;
     const { currentAction, lastAssistantSnippet, reset, interrupted, lastEntryTs } = await provider.readRuntimeSnapshot(jsonlPath);
     if (entry.agentProviderId === CODEX_PROVIDER_ID || entry.panelType === 'codex-cli') {
-      cacheCodexRateLimitsFromJsonl(jsonlPath).catch(() => {});
+      this.cacheCodexRateLimits(jsonlPath).catch(() => {});
     }
 
     if (

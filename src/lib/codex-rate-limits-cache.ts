@@ -1,5 +1,5 @@
 import fs from 'fs/promises';
-import { writeProviderRateLimits } from '@/lib/rate-limits-cache';
+import { writeProviderRateLimitsIfNewer } from '@/lib/rate-limits-cache';
 import { createLogger } from '@/lib/logger';
 import type { IRateLimitsData, IRateLimitWindow } from '@/types/status';
 
@@ -58,8 +58,12 @@ const normalizeRateLimits = (rateLimits: ICodexRateLimitsPayload): IRateLimitsDa
     }
   }
 
-  fiveHour ??= toRateLimitWindow(rateLimits.primary);
-  sevenDay ??= toRateLimitWindow(rateLimits.secondary);
+  if (rateLimits.primary?.window_minutes === undefined) {
+    fiveHour ??= toRateLimitWindow(rateLimits.primary);
+  }
+  if (rateLimits.secondary?.window_minutes === undefined) {
+    sevenDay ??= toRateLimitWindow(rateLimits.secondary);
+  }
 
   if (!fiveHour && !sevenDay) return null;
   return {
@@ -74,6 +78,7 @@ const extractLatestCodexRateLimits = (lines: string[]): IRateLimitsData | null =
     try {
       const parsed = JSON.parse(lines[i]) as {
         type?: string;
+        timestamp?: string;
         payload?: {
           type?: string;
           rate_limits?: ICodexRateLimitsPayload;
@@ -81,7 +86,12 @@ const extractLatestCodexRateLimits = (lines: string[]): IRateLimitsData | null =
       };
       if (parsed.type !== 'event_msg') continue;
       if (parsed.payload?.type !== 'token_count' || !parsed.payload.rate_limits) continue;
-      return normalizeRateLimits(parsed.payload.rate_limits);
+      const timestampMs = parsed.timestamp ? Date.parse(parsed.timestamp) : NaN;
+      if (!Number.isFinite(timestampMs)) continue;
+      const data = normalizeRateLimits(parsed.payload.rate_limits);
+      if (!data) continue;
+      data.ts = timestampMs / 1000;
+      return data;
     } catch {
       continue;
     }
@@ -105,8 +115,7 @@ export const cacheCodexRateLimitsFromJsonl = async (jsonlPath: string): Promise<
       const data = extractLatestCodexRateLimits(lines);
       if (!data) return false;
 
-      await writeProviderRateLimits('codex', data);
-      return true;
+      return writeProviderRateLimitsIfNewer('codex', data);
     } finally {
       await handle.close();
     }
