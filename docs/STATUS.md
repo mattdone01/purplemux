@@ -377,7 +377,7 @@ For tabs in `busy` / `needs-input` / `unknown` / `ready-for-review`, an `fs.watc
 
 | Trigger | Action |
 | --- | --- |
-| Start | Entering `busy`/`needs-input`/`unknown` (hook path or scanAll) |
+| Start | Entering `busy`/`needs-input`/`unknown`, or discovering/rebinding that state's JSONL path during a hook or metadata poll. Codex immediately ingests the latest quota event when the watch binds. |
 | Process | Updates only `currentAction`, `lastAssistantMessage`, reset signals → broadcast `status:update` |
 | Release | Transition to `idle`/`inactive`, tab deletion, shutdown |
 

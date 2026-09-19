@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '@/lib/automated-prompt-dispatcher';
 import { KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS } from '@/lib/orchestration';
 import type { TLivenessEvent } from '@/types/liveness';
@@ -13,6 +16,14 @@ const workspaceStore = vi.hoisted(() => ({
 const liveness = vi.hoisted(() => ({
   statusForTab: vi.fn(),
 }));
+
+const layoutStore = vi.hoisted(() => ({
+  updateTabAgentState: vi.fn(async () => {}),
+}));
+
+const codexRateLimits = {
+  cacheFromJsonl: vi.fn(async () => true),
+};
 
 vi.mock('@/lib/workspace-store', () => ({
   getWorkspaceByIdCached: workspaceStore.getWorkspaceByIdCached,
@@ -115,6 +126,58 @@ describe('status manager automated prompt call paths', () => {
       jsonlPath: null,
       lastUserMessage: null,
     });
+  });
+
+  it('binds, ingests, and rebinds a busy Codex tab when its JSONL path arrives or changes', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'purplemux-status-watch-'));
+    const firstPath = path.join(dir, 'first.jsonl');
+    const secondPath = path.join(dir, 'second.jsonl');
+    const thirdPath = path.join(dir, 'third.jsonl');
+    await Promise.all([
+      fs.writeFile(firstPath, ''),
+      fs.writeFile(secondPath, ''),
+      fs.writeFile(thirdPath, ''),
+    ]);
+    await import('@/lib/providers');
+    const { StatusManager } = await import('@/lib/status-manager');
+    const manager = new StatusManager(
+      undefined,
+      codexRateLimits.cacheFromJsonl,
+      layoutStore.updateTabAgentState,
+    );
+    manager.registerTab('worker', { ...entry('worker'), cliState: 'busy' });
+
+    try {
+      const watchers = (manager as unknown as {
+        jsonlWatchers: Map<string, { jsonlPath: string }>;
+      }).jsonlWatchers;
+      expect(manager.applyAgentHookMeta('codex', 'tmux-worker', {
+        sessionId: 'session-a',
+        jsonlPath: firstPath,
+      })).toEqual({ tabId: 'worker', cliState: 'busy' });
+      expect(watchers.get('worker')?.jsonlPath).toBe(firstPath);
+      await vi.waitFor(() => expect(codexRateLimits.cacheFromJsonl).toHaveBeenCalledWith(firstPath));
+      expect(watchers.get('worker')?.jsonlPath).toBe(firstPath);
+
+      manager.applyAgentHookMeta('codex', 'tmux-worker', { sessionId: 'session-b' });
+      expect(watchers.has('worker')).toBe(false);
+      await vi.waitFor(() => expect(layoutStore.updateTabAgentState).toHaveBeenCalledWith(
+        'tmux-worker',
+        expect.objectContaining({ id: 'codex' }),
+        expect.objectContaining({ sessionId: 'session-b', jsonlPath: null }),
+      ));
+
+      manager.applyAgentHookMeta('codex', 'tmux-worker', { sessionId: 'session-b', jsonlPath: secondPath });
+      await vi.waitFor(() => expect(codexRateLimits.cacheFromJsonl).toHaveBeenCalledWith(secondPath));
+      expect(watchers.get('worker')?.jsonlPath).toBe(secondPath);
+
+      manager.applyAgentHookMeta('codex', 'tmux-worker', { jsonlPath: thirdPath });
+      await vi.waitFor(() => expect(codexRateLimits.cacheFromJsonl).toHaveBeenCalledWith(thirdPath));
+      expect(watchers.get('worker')?.jsonlPath).toBe(thirdPath);
+    } finally {
+      manager.shutdown();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('serializes overlapping liveness outcomes and retains both nudge records', async () => {

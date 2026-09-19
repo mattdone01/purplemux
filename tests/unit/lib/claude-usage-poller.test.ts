@@ -10,7 +10,7 @@ vi.mock('@/lib/statusline-script', () => ({
 }));
 
 import { extractScopedWindows, mergeScopedIntoCache } from '@/lib/claude-usage-poller';
-import { readRateLimitsCache, writeProviderRateLimits } from '@/lib/rate-limits-cache';
+import { readRateLimitsCache, writeProviderRateLimits, writeProviderRateLimitsIfNewer } from '@/lib/rate-limits-cache';
 
 const NOW = Date.UTC(2026, 7, 18, 8, 0, 0);
 
@@ -98,6 +98,17 @@ describe('scoped windows survive both writers', () => {
     await mergeScopedIntoCache(fable, NOW);
     expect((await readRateLimitsCache()).codex).toEqual(codex);
   });
+
+  it('does not let an older Codex session observation replace newer global usage', async () => {
+    const newer = { ts: 20, five_hour: null, seven_day: { used_percentage: 6, resets_at: 300 } };
+    const older = { ts: 10, five_hour: null, seven_day: { used_percentage: 79, resets_at: 200 } };
+    await writeProviderRateLimits('codex', newer);
+
+    await expect(writeProviderRateLimitsIfNewer('codex', older)).resolves.toBe(false);
+    await expect(writeProviderRateLimitsIfNewer('codex', { ...older, ts: newer.ts })).resolves.toBe(false);
+    expect((await readRateLimitsCache()).codex).toEqual(newer);
+  });
+
 });
 
 describe('createClaudeUsagePoller', () => {
