@@ -5,10 +5,12 @@ import type { TCliState } from '@/types/timeline';
 
 const tmux = vi.hoisted(() => ({
   hasSession: vi.fn(async () => true),
-  sendBracketedPaste: vi.fn(async () => {}),
   isContentPendingInComposer: vi.fn(async () => false),
 }));
 
+const delivery = vi.hoisted(() => ({
+  deliverPrompt: vi.fn(async () => {}),
+}));
 const cliUtils = vi.hoisted(() => ({
   findTab: vi.fn(),
   authorizeWorkspaceInput: vi.fn(
@@ -32,6 +34,7 @@ vi.mock('@/lib/agent-dispatch-policy', () => ({
 }));
 
 vi.mock('@/lib/tmux', () => tmux);
+vi.mock('@/lib/agent-prompt-delivery', () => delivery);
 vi.mock('@/lib/cli-utils', () => cliUtils);
 vi.mock('@/lib/status-manager', () => ({
   getStatusManager: () => ({ getAllForClient: () => live.entries }),
@@ -124,7 +127,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
-    expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
+    expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
     expect(dispatchPolicy).toHaveBeenCalledWith(
       WORKSPACE_ID,
       expect.objectContaining({ id: TAB_ID }),
@@ -137,7 +140,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'implement story' });
     expect(response.statusCode).toBe(409);
     expect(response.body).toMatchObject({ error: 'agent-model-mismatch' });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('reports submitted false when the paste is still sitting in the composer', async () => {
@@ -172,7 +175,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     });
     // A measured elapsed time, so a loaded machine reports 1ms for a zero wait.
     expect((response.body as { waitedMs: number }).waitedMs).toBeLessThan(50);
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it.each<TCliState>(['busy', 'inactive', 'unknown', 'cancelled'])(
@@ -184,7 +187,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
       expect(response.statusCode).toBe(409);
       expect(response.body).toMatchObject({ error: 'agent-not-ready', cliState: state });
-      expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+      expect(delivery.deliverPrompt).not.toHaveBeenCalled();
     },
   );
 
@@ -215,7 +218,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
-    expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'here is your brief');
+    expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'here is your brief');
   });
 
   it('pastes nothing when the wait times out, so a stray Enter cannot submit it later', async () => {
@@ -226,7 +229,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(response.statusCode).toBe(409);
     expect(response.body).toMatchObject({ detail: 'readiness-timeout', cliState: 'busy' });
     expect((response.body as { waitedMs: number }).waitedMs).toBeGreaterThanOrEqual(30);
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it.each<TPanelType>(['terminal', 'web-browser', 'diff'])(
@@ -238,7 +241,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: null });
-      expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'ls -la');
+      expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'ls -la');
     },
   );
 
@@ -254,7 +257,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
       cliState: 'idle',
       detail: 'session-not-running',
     });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('does not wait out the deadline for a dead session', async () => {
@@ -274,7 +277,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(404);
     expect(response.body).toEqual({ error: 'Tab not found' });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('400s a missing workspaceId', async () => {
@@ -296,7 +299,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.body).toMatchObject({ error: expect.stringContaining('waitMs') });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('403s a caller that may not drive the workspace, before touching the tab', async () => {
@@ -305,7 +308,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'hello' });
 
     expect(cliUtils.findTab).not.toHaveBeenCalled();
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
     expect(response.statusCode).toBe(0);
   });
 

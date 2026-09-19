@@ -2,12 +2,8 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { findTab } from '@/lib/cli-utils';
 import { getStatusManager } from '@/lib/status-manager';
 import { parseSendRequest, performTabSend, resolveTabCliState } from '@/lib/tab-send';
-import {
-  hasSession,
-  isContentPendingInComposer,
-  sendBracketedPaste,
-  sendBracketedPasteText,
-} from '@/lib/tmux';
+import { hasSession, isContentPendingInComposer } from '@/lib/tmux';
+import { deliverPrompt, deliverPromptText } from '@/lib/agent-prompt-delivery';
 
 /**
  * Cookie-authed twin of `POST /api/cli/tabs/[tabId]/send`, for clients that
@@ -46,8 +42,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         };
       },
       hasSession,
-      paste: sendBracketedPaste,
-      pasteWithoutSubmit: sendBracketedPasteText,
+      paste: deliverPrompt,
+      pasteWithoutSubmit: deliverPromptText,
       isContentPendingInComposer,
     },
     parsed.request,

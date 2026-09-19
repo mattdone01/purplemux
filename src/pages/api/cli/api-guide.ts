@@ -69,7 +69,7 @@ DELETE /api/cli/tabs/<tabId>?workspaceId=WS
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
-  Send text (bracketed paste + Enter) to the tab.
+  Send text to the tab and press Enter. Typed into Claude Code, bracketed paste elsewhere.
   For an agent tab (claude-code / codex-cli / grok-cli) the send waits until the tab can
   accept a turn, up to waitMs (default 60000). A booting agent swallows the Enter after a
   paste, so sending into one reports success over an agent that never starts. waitMs: 0

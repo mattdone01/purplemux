@@ -1,6 +1,7 @@
 import { withAgentDispatchLock, type IAgentDispatchPolicyOptions } from '@/lib/agent-dispatch-policy';
 import { findTab } from '@/lib/cli-utils';
-import { hasSession, sendBracketedPaste } from '@/lib/tmux';
+import { hasSession } from '@/lib/tmux';
+import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import type { ITab } from '@/types/terminal';
 
 interface IPolicyResult {
@@ -33,7 +34,7 @@ const defaultDeps: IAutomatedPromptDispatcherDeps = {
   findTarget: async (workspaceId, tabId) => (await findTab(workspaceId, tabId))?.tab ?? null,
   withPolicyLock: withAgentDispatchLock,
   hasSession,
-  paste: sendBracketedPaste,
+  paste: deliverPrompt,
 };
 
 export class AutomatedPromptDispatcher {

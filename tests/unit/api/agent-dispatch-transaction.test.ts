@@ -37,9 +37,9 @@ vi.mock('@/lib/providers/codex', () => ({
 vi.mock('@/lib/providers/codex/session-detection', () => ({ findCodexSessionById: vi.fn() }));
 vi.mock('@/lib/providers/codex/model-observation', () => ({ getCodexModelStatus: mocks.model }));
 vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ getAllForClient: () => ({}) }) }));
+vi.mock('@/lib/agent-prompt-delivery', () => ({ deliverPrompt: mocks.paste }));
 vi.mock('@/lib/tmux', () => ({
   hasSession: mocks.hasSession,
-  sendBracketedPaste: mocks.paste,
   sendEscape: mocks.escape,
   isContentPendingInComposer: vi.fn(async () => false),
 }));

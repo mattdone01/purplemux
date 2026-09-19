@@ -13,6 +13,7 @@ import { getWorkspaceToken } from '@/lib/workspace-token';
 import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
 import { getProcessArgs } from '@/lib/process-utils';
+import { PASTE_END, PASTE_START, TYPED_CHUNK_GAP_MS, planTypedInput } from '@/lib/typed-input';
 
 const log = createLogger('terminal');
 
@@ -438,28 +439,53 @@ export const sendBracketedPasteText = async (
   await exitCopyMode(sessionName);
   await execFile(
     'tmux',
-    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, '-l', `\x1b[200~${content}\x1b[201~`],
+    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, '-l', '--', `${PASTE_START}${content}${PASTE_END}`],
     { timeout: CMD_TIMEOUT },
   );
 };
 
-/** Send text via bracketed paste mode and press Enter twice (handles Claude Code long input confirmation) */
+/**
+ * Send text as keystrokes WITHOUT submitting it — see `typed-input.ts` for why
+ * a Claude Code composer must not receive its prompt as a paste.
+ */
+export const sendTypedText = async (
+  sessionName: string,
+  content: string,
+): Promise<void> => {
+  await exitCopyMode(sessionName);
+  for (const step of planTypedInput(content)) {
+    const keys = step.kind === 'newline' ? ['C-j'] : ['-l', '--', step.text];
+    await execFile(
+      'tmux',
+      ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, ...keys],
+      { timeout: CMD_TIMEOUT },
+    );
+    await sleep(TYPED_CHUNK_GAP_MS);
+  }
+};
+
+/** Press Enter twice (handles Claude Code long input confirmation) */
+export const submitComposer = async (sessionName: string): Promise<void> => {
+  await execFile(
+    'tmux',
+    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],
+    { timeout: CMD_TIMEOUT },
+  );
+  await sleep(600);
+  await execFile(
+    'tmux',
+    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],
+    { timeout: CMD_TIMEOUT },
+  );
+};
+
+/** Send text via bracketed paste mode and submit it */
 export const sendBracketedPaste = async (
   sessionName: string,
   content: string,
 ): Promise<void> => {
   await sendBracketedPasteText(sessionName, content);
-  await execFile(
-    'tmux',
-    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],
-    { timeout: CMD_TIMEOUT },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  await execFile(
-    'tmux',
-    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],
-    { timeout: CMD_TIMEOUT },
-  );
+  await submitComposer(sessionName);
 };
 
 

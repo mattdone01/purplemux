@@ -5,11 +5,13 @@ import type { TCliState } from '@/types/timeline';
 
 const tmux = vi.hoisted(() => ({
   hasSession: vi.fn(async () => true),
-  sendBracketedPaste: vi.fn(async () => {}),
-  sendBracketedPasteText: vi.fn(async () => {}),
   isContentPendingInComposer: vi.fn(async () => false),
 }));
 
+const delivery = vi.hoisted(() => ({
+  deliverPrompt: vi.fn(async () => {}),
+  deliverPromptText: vi.fn(async () => {}),
+}));
 const cliUtils = vi.hoisted(() => ({ findTab: vi.fn() }));
 
 const live = vi.hoisted(() => ({ entries: {} as Record<string, { cliState: TCliState }> }));
@@ -19,6 +21,7 @@ const WORKSPACE_TOKEN = 'workspace-scoped-token';
 const VALID_COOKIE = 'valid-session-jwt';
 
 vi.mock('@/lib/tmux', () => tmux);
+vi.mock('@/lib/agent-prompt-delivery', () => delivery);
 vi.mock('@/lib/cli-utils', () => ({ findTab: cliUtils.findTab }));
 vi.mock('@/lib/cli-token', () => ({
   verifyTokenValue: (value: string | null | undefined) => value === GLOBAL_TOKEN,
@@ -118,8 +121,8 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
-    expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
-    expect(tmux.sendBracketedPasteText).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
+    expect(delivery.deliverPromptText).not.toHaveBeenCalled();
   });
 
   it.each<TCliState>(['idle', 'ready-for-review', 'needs-input'])('accepts a send while %s', async (state) => {
@@ -129,7 +132,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(200);
     expect((response.body as ISendBody).cliState).toBe(state);
-    expect(tmux.sendBracketedPaste).toHaveBeenCalledOnce();
+    expect(delivery.deliverPrompt).toHaveBeenCalledOnce();
   });
 
   it.each<TCliState>(['busy', 'inactive', 'unknown', 'cancelled'])(
@@ -141,7 +144,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: state });
-      expect(tmux.sendBracketedPaste).toHaveBeenCalledWith(SESSION_NAME, 'hello');
+      expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'hello');
     },
   );
 
@@ -157,7 +160,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
       const response = await call({ content: 'status?' });
 
       expect(response.statusCode).toBe(200);
-      expect(tmux.sendBracketedPaste).toHaveBeenCalledOnce();
+      expect(delivery.deliverPrompt).toHaveBeenCalledOnce();
     },
   );
 
@@ -195,7 +198,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
     const response = await call({ content: 'draft', submit: false });
 
     expect(response.statusCode).toBe(200);
-    expect(tmux.sendBracketedPasteText).toHaveBeenCalledWith(SESSION_NAME, 'draft');
+    expect(delivery.deliverPromptText).toHaveBeenCalledWith(SESSION_NAME, 'draft');
   });
 
   it('leaves the content in the composer when submit is false', async () => {
@@ -203,8 +206,8 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toEqual({ status: 'sent', submitted: false, cliState: 'idle' });
-    expect(tmux.sendBracketedPasteText).toHaveBeenCalledWith(SESSION_NAME, 'draft prompt');
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPromptText).toHaveBeenCalledWith(SESSION_NAME, 'draft prompt');
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
     expect(tmux.isContentPendingInComposer).not.toHaveBeenCalled();
   });
 
@@ -233,7 +236,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(404);
     expect(response.body).toEqual({ error: 'tab-not-found' });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('409s when the tab state is sendable but its tmux session is gone', async () => {
@@ -247,7 +250,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
       cliState: 'idle',
       detail: 'session-not-running',
     });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('a dead session is the only refusal left — busy included', async () => {
@@ -258,7 +261,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(409);
     expect(response.body).toMatchObject({ cliState: 'busy', detail: 'session-not-running' });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -273,7 +276,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.body).toEqual({ error: 'bad-request' });
-    expect(tmux.sendBracketedPaste).not.toHaveBeenCalled();
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
   it('400s without a workspaceId', async () => {
@@ -292,7 +295,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
     const overLimit = await call({ content: 'a'.repeat(MAX_SEND_CONTENT_BYTES + 1) });
     expect(overLimit.statusCode).toBe(400);
     expect(overLimit.body).toEqual({ error: 'bad-request' });
-    expect(tmux.sendBracketedPaste).toHaveBeenCalledOnce();
+    expect(delivery.deliverPrompt).toHaveBeenCalledOnce();
   });
 
   it('measures the size limit in bytes, not code points', async () => {

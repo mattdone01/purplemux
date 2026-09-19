@@ -13,6 +13,8 @@ import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { encodeStdout } from '@/lib/terminal-protocol';
 import { reconcileTabCwd } from '@/lib/layout-store';
 import { createLogger } from '@/lib/logger';
+import { sessionUsesTypedDelivery } from '@/lib/agent-prompt-delivery';
+import { createStdinTypedWriter } from '@/lib/stdin-typed-writer';
 
 const log = createLogger('terminal');
 
@@ -252,6 +254,10 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
   let lastHeartbeat = Date.now();
   let sessionName = '';
   let webStdinQueue = Promise.resolve();
+  const writeStdin = createStdinTypedWriter({
+    write: (data) => { ptyProcess?.write(data); },
+    usesTyped: () => sessionUsesTypedDelivery(sessionName),
+  });
   let currentCols = 80;
   let currentRows = 24;
 
@@ -277,7 +283,7 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
 
     switch (msg.type) {
       case MSG_STDIN: {
-        ptyProcess.write(textDecoder.decode(msg.payload));
+        writeStdin(textDecoder.decode(msg.payload));
         break;
       }
       case MSG_WEB_STDIN: {
@@ -285,7 +291,7 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
         webStdinQueue = webStdinQueue
           .then(() => exitCopyMode(sessionName))
           .catch(() => {})
-          .then(() => { ptyProcess?.write(data); });
+          .then(() => { writeStdin(data); });
         break;
       }
       case MSG_RESIZE: {
