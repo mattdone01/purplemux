@@ -15,11 +15,14 @@ import type {
   IMissionEvent,
   IMissionEventsResponse,
   IMissionEvidence,
+  IMissionHumanInboxPolicy,
   IMissionQuestion,
   IMissionRun,
   IMissionSnapshot,
   IMissionWorkspaceView,
   TMissionProducerEvent,
+  TMissionCandidateReason,
+  TMissionHumanReview,
 } from '@/types/mission-control';
 import {
   isMissionControlError,
@@ -29,7 +32,8 @@ import {
 } from '@/lib/mission-control-errors';
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.purplemux', 'mission-control.sqlite');
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
+const HUMAN_INBOX_POLICY_GUIDANCE = 'On your next ordinary turn, the configured orchestrator should review legacy candidates: record workspace handling or explicitly identify the human-exclusive need. Reuse item IDs. Do not rerun bootstrap.';
 
 type TMissionIdentity = Omit<IMissionBinding, 'generation'>;
 export type TMissionDiscoveryIdentity = TMissionIdentity;
@@ -77,6 +81,11 @@ export interface IMissionApplyEventsResult {
   events: IMissionEvent[];
   cursor: number;
   replayed: boolean;
+}
+
+export interface IMissionEventAuthority {
+  resolvedIdentity: TMissionIdentity | null;
+  configuredOrchestratorTabId: string | null;
 }
 
 export interface IMissionDeliveryOutcome {
@@ -130,6 +139,8 @@ interface IItemRow {
   created_at: number;
   updated_at: number;
   source_key: string | null;
+  human_review_json: string | null;
+  candidate_reason: TMissionCandidateReason | null;
 }
 
 interface IAnswerRow {
@@ -253,6 +264,8 @@ const itemFromRow = (row: IItemRow): IMissionAttentionItem => ({
   evidence: JSON.parse(row.evidence_json) as IMissionEvidence,
   answerId: row.answer_id,
   resolution: row.resolution,
+  humanReview: parseJson<TMissionHumanReview>(row.human_review_json),
+  candidateReason: row.candidate_reason,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
@@ -344,7 +357,8 @@ export class MissionControlStore {
           id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(id),
           revision INTEGER NOT NULL, state TEXT NOT NULL, question_json TEXT NOT NULL,
           evidence_json TEXT NOT NULL, answer_id TEXT, resolution TEXT,
-          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source_key TEXT UNIQUE
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source_key TEXT UNIQUE,
+          human_review_json TEXT, candidate_reason TEXT
         );
         CREATE INDEX attention_workspace_idx ON attention_items(workspace_id, updated_at DESC);
         CREATE TABLE answers (
@@ -379,7 +393,7 @@ export class MissionControlStore {
           PRIMARY KEY (bootstrap_id, workspace_id, run_id)
         );
         CREATE INDEX bootstrap_entries_state_idx ON bootstrap_entries(state, updated_at);
-        PRAGMA user_version = 3;
+        PRAGMA user_version = 4;
       `))();
     }
     if (current === 1) {
@@ -393,6 +407,46 @@ export class MissionControlStore {
       this.database.transaction(() => {
         this.database.exec("ALTER TABLE runs ADD COLUMN observed_identities_json TEXT NOT NULL DEFAULT '[]'");
         this.database.pragma('user_version = 3');
+      })();
+    }
+    if (current >= 1 && current <= 3) {
+      this.database.transaction(() => {
+        this.database.exec('ALTER TABLE attention_items ADD COLUMN human_review_json TEXT');
+        this.database.exec('ALTER TABLE attention_items ADD COLUMN candidate_reason TEXT');
+        const anomalous = this.database.prepare(`SELECT item.id FROM attention_items item
+          WHERE item.state='open' AND (item.answer_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM answers answer WHERE answer.item_id=item.id
+          )) LIMIT 1`).get() as { id: string } | undefined;
+        if (anomalous) throw new Error(`open Mission Control item ${anomalous.id} already has an answer`);
+
+        const legacyOpen = this.database.prepare(`SELECT * FROM attention_items item
+          WHERE item.state='open' AND item.answer_id IS NULL AND NOT EXISTS (
+            SELECT 1 FROM answers answer WHERE answer.item_id=item.id
+          ) ORDER BY item.id`).all() as IItemRow[];
+        const migratedAt = Date.now();
+        for (const item of legacyOpen) {
+          const revision = item.revision + 1;
+          const itemMigratedAt = Math.max(migratedAt, item.updated_at + 1);
+          const payload = {
+            itemId: item.id,
+            fromState: 'open',
+            toState: 'candidate',
+            previousRevision: item.revision,
+            reason: 'legacy-human-review-required',
+            policyVersion: 1,
+            actor: 'system:migration',
+          };
+          const eventId = `system:migration:v4:${createHash('sha256').update(item.id).digest('hex')}`;
+          this.database.prepare(`UPDATE attention_items SET state='candidate', revision=?,
+            candidate_reason='legacy-review', updated_at=? WHERE id=?`)
+            .run(revision, itemMigratedAt, item.id);
+          this.database.prepare(`INSERT INTO events
+            (id,request_hash,schema_version,workspace_id,run_id,entity_id,revision,type,payload_json,producer_at,committed_at)
+            VALUES (?,?,1,?,?,?,?,?,?,?,?)`)
+            .run(eventId, contentHash(payload), item.workspace_id, item.run_id, item.id, revision,
+              'attention.reclassified', toJson(payload), itemMigratedAt, itemMigratedAt);
+        }
+        this.database.pragma('user_version = 4');
       })();
     }
   };
@@ -409,12 +463,13 @@ export class MissionControlStore {
     revision: number,
     committedAt: number,
     requestHash: string,
+    payload: unknown = event.payload,
   ): IMissionEvent => {
     this.database.prepare(`INSERT INTO events
       (id, request_hash, schema_version, workspace_id, run_id, entity_id, revision, type, payload_json, producer_at, committed_at)
       VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(event.eventId, requestHash, event.workspaceId, event.runId, entityId, revision,
-        event.type, toJson(event.payload), event.producerAt, committedAt);
+        event.type, toJson(payload), event.producerAt, committedAt);
     return eventFromRow(this.database.prepare('SELECT * FROM events WHERE id = ?').get(event.eventId) as IEventRow);
   };
 
@@ -449,7 +504,7 @@ export class MissionControlStore {
       const countsByWorkspace = new Map<string, { open: number; awaiting: number }>();
       for (const item of items) {
         const counts = countsByWorkspace.get(item.workspaceId) ?? { open: 0, awaiting: 0 };
-        if (item.state === 'open') counts.open += 1;
+        if (item.state === 'open' && item.humanReview && item.humanReview.humanNeed !== 'none') counts.open += 1;
         if (item.state === 'answered' && item.answerId) {
           const delivery = deliveryByAnswer.get(item.answerId);
           if (delivery && delivery.state !== 'acknowledged') counts.awaiting += 1;
@@ -532,9 +587,33 @@ export class MissionControlStore {
     return { schemaVersion: 1, events, cursor: events.at(-1)?.seq ?? after, hasMore };
   };
 
+  humanInboxPolicy = (workspaceId: string): IMissionHumanInboxPolicy => {
+    const legacyReviewPending = Number((this.database.prepare(`SELECT COUNT(*) AS count
+      FROM attention_items WHERE workspace_id=? AND state='candidate' AND candidate_reason='legacy-review'`)
+      .get(workspaceId) as { count: number }).count);
+    return {
+      version: 1,
+      legacyReviewPending,
+      ...(legacyReviewPending > 0 ? { guidance: HUMAN_INBOX_POLICY_GUIDANCE } : {}),
+    };
+  };
+
+  unreplayedEventIds = (events: TMissionProducerEvent[]): Set<string> => {
+    const pending = new Set<string>();
+    for (const event of events) {
+      const row = this.database.prepare('SELECT request_hash FROM events WHERE id=?').get(event.eventId) as { request_hash: string } | undefined;
+      if (!row) {
+        pending.add(event.eventId);
+      } else if (row.request_hash !== contentHash(event)) {
+        missionConflict(`event ${event.eventId} was already used with different content`);
+      }
+    }
+    return pending;
+  };
+
   applyEvents = (
     events: TMissionProducerEvent[],
-    resolvedBindings: ReadonlyMap<string, TMissionIdentity | null> = new Map(),
+    resolvedBindings: ReadonlyMap<string, TMissionIdentity | IMissionEventAuthority | null> = new Map(),
   ): IMissionApplyEventsResult => {
     const transaction = this.database.transaction(() => {
       const committed: IMissionEvent[] = [];
@@ -548,7 +627,11 @@ export class MissionControlStore {
           continue;
         }
         allReplayed = false;
-        committed.push(this.applyOneEvent(event, requestHash, resolvedBindings.get(event.eventId) ?? null));
+        const suppliedAuthority = resolvedBindings.get(event.eventId) ?? null;
+        const authority: IMissionEventAuthority = suppliedAuthority && 'resolvedIdentity' in suppliedAuthority
+          ? suppliedAuthority
+          : { resolvedIdentity: suppliedAuthority, configuredOrchestratorTabId: null };
+        committed.push(this.applyOneEvent(event, requestHash, authority));
       }
       const cursor = Number((this.database.prepare('SELECT COALESCE(MAX(seq), 0) AS cursor FROM events').get() as { cursor: number }).cursor);
       return { events: committed, cursor, replayed: allReplayed };
@@ -565,9 +648,10 @@ export class MissionControlStore {
   private applyOneEvent = (
     event: TMissionProducerEvent,
     requestHash: string,
-    resolvedIdentity: TMissionIdentity | null,
+    authority: IMissionEventAuthority,
   ): IMissionEvent => {
     const now = Date.now();
+    const resolvedIdentity = authority.resolvedIdentity;
     const runRow = this.runRow(event.runId);
     if (event.type === 'run.started') {
       if (event.expectedRevision !== 0 || event.bindingGeneration !== 0) invalidMissionRequest('run.started requires revision 0 and generation 0');
@@ -672,14 +756,21 @@ export class MissionControlStore {
         missionConflict('attention item ID is already in use');
       }
       if (itemRow) missionConflict('attention item already exists', itemFromRow(itemRow));
-      const { itemId: ignored, ...question } = event.payload;
+      const { itemId: ignored, humanReview: reviewInput, ...question } = event.payload;
       void ignored;
+      const humanReview = reviewInput
+        ? this.stampHumanReview(event, run, authority, now)
+        : null;
+      const state = humanReview && humanReview.humanNeed !== 'none' ? 'open' : 'candidate';
+      const candidateReason: TMissionCandidateReason | null = state === 'candidate' ? 'workspace-issue' : null;
       this.database.prepare(`INSERT INTO attention_items
-        (id,workspace_id,run_id,revision,state,question_json,evidence_json,answer_id,resolution,created_at,updated_at,source_key)
-        VALUES (?,?,?,1,'open',?,?,NULL,NULL,?,?,NULL)`)
-        .run(itemId, event.workspaceId, event.runId, toJson(question), toJson({ source: 'agent', sourceId: event.eventId, observedAt: event.producerAt, confidence: 'confirmed' }), now, now);
+        (id,workspace_id,run_id,revision,state,question_json,evidence_json,answer_id,resolution,created_at,updated_at,source_key,human_review_json,candidate_reason)
+        VALUES (?,?,?,1,?,?,?,NULL,NULL,?,?,NULL,?,?)`)
+        .run(itemId, event.workspaceId, event.runId, state, toJson(question), toJson({ source: 'agent', sourceId: event.eventId, observedAt: event.producerAt, confidence: 'confirmed' }), now, now,
+          humanReview ? toJson(humanReview) : null, candidateReason);
       this.confirmBootstrap(run.id, now);
-      return this.insertEvent(event, itemId, 1, now, requestHash);
+      return this.insertEvent(event, itemId, 1, now, requestHash,
+        this.attentionEventPayload(event.payload, state, candidateReason, humanReview));
     }
 
     if (!itemRow) throw new MissionControlError(404, 'not-found', `attention item ${itemId} not found`);
@@ -689,13 +780,35 @@ export class MissionControlStore {
 
     if (event.type === 'attention.updated') {
       if (!['open', 'candidate'].includes(item.state)) missionConflict('only open or candidate items can be updated', item);
-      const { itemId: ignored, ...question } = event.payload;
+      const { itemId: ignored, humanReview: reviewInput, ...question } = event.payload;
       void ignored;
+      const changed = contentHash(question) !== contentHash(this.questionFromItem(item));
+      if (item.state === 'open' && changed && !reviewInput) {
+        missionConflict('changed human attention requires renewed orchestrator review', item);
+      }
+      let humanReview = item.humanReview;
+      let state: IMissionAttentionItem['state'] = item.state;
+      let candidateReason = item.candidateReason;
+      if (reviewInput) {
+        humanReview = this.stampHumanReview(event, run, authority, now);
+        if (humanReview.humanNeed === 'none') {
+          state = 'candidate';
+          candidateReason = 'workspace-issue';
+        } else {
+          state = 'open';
+          candidateReason = null;
+        }
+      } else if (item.state === 'candidate' && changed && item.humanReview?.humanNeed === 'none') {
+        humanReview = null;
+      }
       const revision = item.revision + 1;
-      this.database.prepare(`UPDATE attention_items SET revision=?, state='open', question_json=?, evidence_json=?, updated_at=? WHERE id=?`)
-        .run(revision, toJson(question), toJson({ source: 'agent', sourceId: event.eventId, observedAt: event.producerAt, confidence: 'confirmed' }), now, item.id);
+      this.database.prepare(`UPDATE attention_items SET revision=?, state=?, question_json=?, evidence_json=?,
+        human_review_json=?, candidate_reason=?, updated_at=? WHERE id=?`)
+        .run(revision, state, toJson(question), toJson({ source: 'agent', sourceId: event.eventId, observedAt: event.producerAt, confidence: 'confirmed' }),
+          humanReview ? toJson(humanReview) : null, candidateReason, now, item.id);
       this.confirmBootstrap(run.id, now);
-      return this.insertEvent(event, item.id, revision, now, requestHash);
+      return this.insertEvent(event, item.id, revision, now, requestHash,
+        this.attentionEventPayload(event.payload, state, candidateReason, humanReview));
     }
 
     if (event.type === 'attention.cancelled') {
@@ -707,7 +820,8 @@ export class MissionControlStore {
         this.database.prepare(`UPDATE deliveries SET state='held', next_attempt_at=NULL, last_error='attention item cancelled', updated_at=? WHERE answer_id=? AND state IN ('queued','dispatching')`)
           .run(now, item.answerId);
       }
-      return this.insertEvent(event, item.id, revision, now, requestHash);
+      return this.insertEvent(event, item.id, revision, now, requestHash,
+        this.eventPayloadWithRouting(event.payload, 'cancelled', item.candidateReason, item.humanReview));
     }
 
     if (event.type === 'attention.resolved') {
@@ -723,7 +837,8 @@ export class MissionControlStore {
       const revision = item.revision + 1;
       this.database.prepare(`UPDATE attention_items SET revision=?, state='resolved', resolution=?, updated_at=? WHERE id=?`)
         .run(revision, event.payload.resolution, now, item.id);
-      return this.insertEvent(event, item.id, revision, now, requestHash);
+      return this.insertEvent(event, item.id, revision, now, requestHash,
+        this.eventPayloadWithRouting(event.payload, 'resolved', item.candidateReason, item.humanReview));
     }
 
     if (item.state !== 'answered' || item.answerId !== event.payload.answerId) missionConflict('answer is not current for this attention item', item);
@@ -741,6 +856,72 @@ export class MissionControlStore {
       updated_at=MAX(?,updated_at+1)
       WHERE run_id=? AND state IN ('queued','dispatching','submitted','held')`).run(now, runId);
   };
+
+  private questionFromItem = (item: IMissionAttentionItem): IMissionQuestion => ({
+    kind: item.kind,
+    title: item.title,
+    context: item.context,
+    storyIds: item.storyIds,
+    options: item.options,
+    recommendation: item.recommendation,
+    blockingScope: item.blockingScope,
+    canContinue: item.canContinue,
+  });
+
+  private stampHumanReview = (
+    event: Extract<TMissionProducerEvent, { type: 'attention.opened' | 'attention.updated' }>,
+    run: IMissionRun,
+    authority: IMissionEventAuthority,
+    reviewedAt: number,
+  ): TMissionHumanReview => {
+    const review = event.payload.humanReview;
+    if (!review) throw new Error('human review is required');
+    if (!authority.configuredOrchestratorTabId
+      || review.reviewerTabId !== authority.configuredOrchestratorTabId) {
+      missionConflict('human review requires the configured orchestrator');
+    }
+    const binding = run.binding;
+    if (!binding) {
+      throw new MissionControlError(409, 'conflict', 'human review requires a bound run', run);
+    }
+    if (binding.tabId !== authority.configuredOrchestratorTabId) {
+      missionConflict('human review requires a run bound to the configured orchestrator', run);
+    }
+    const identity = authority.resolvedIdentity;
+    if (!identity
+      || identity.tabId !== binding.tabId
+      || identity.providerId !== binding.providerId
+      || identity.sessionId !== binding.sessionId
+      || identity.runtimeGeneration !== binding.runtimeGeneration) {
+      missionConflict('human review requires the current orchestrator session binding', run);
+    }
+    return { ...review, binding, eventId: event.eventId, reviewedAt };
+  };
+
+  private attentionEventPayload = (
+    payload: Extract<TMissionProducerEvent, { type: 'attention.opened' | 'attention.updated' }>['payload'],
+    state: IMissionAttentionItem['state'],
+    candidateReason: TMissionCandidateReason | null,
+    humanReview: TMissionHumanReview | null,
+  ): Record<string, unknown> => this.eventPayloadWithRouting(payload, state, candidateReason, humanReview);
+
+  private eventPayloadWithRouting = (
+    payload: object,
+    state: IMissionAttentionItem['state'],
+    candidateReason: TMissionCandidateReason | null,
+    humanReview: TMissionHumanReview | null,
+  ): Record<string, unknown> => ({
+    ...payload,
+    routing: {
+      state,
+      candidateReason,
+      review: humanReview ? {
+        binding: humanReview.binding,
+        eventId: humanReview.eventId,
+        reviewedAt: humanReview.reviewedAt,
+      } : null,
+    },
+  });
 
   private requireBindingGeneration = (event: TMissionProducerEvent, run: IMissionRun): void => {
     if (!run.binding || event.bindingGeneration !== run.binding.generation) missionConflict('stale or unbound orchestrator generation', run);
@@ -767,6 +948,9 @@ export class MissionControlStore {
       if (!row) throw new MissionControlError(404, 'not-found', `attention item ${itemId} not found`);
       const item = itemFromRow(row);
       if (item.state !== 'open') missionConflict('attention item is no longer open', item);
+      if (!item.humanReview || item.humanReview.humanNeed === 'none') {
+        missionConflict('attention item is not eligible for a human answer', item);
+      }
       if (item.revision !== request.expectedRevision) missionConflict('stale attention revision', item);
       const allowedOptions = new Set(item.options.map((option) => option.id));
       if (request.optionIds.some((optionId) => !allowedOptions.has(optionId))) invalidMissionRequest('answer selected an unknown option');
@@ -986,8 +1170,8 @@ export class MissionControlStore {
             if (duplicate) continue;
             const itemId = deterministicId('item', candidate.sourceKey);
             this.database.prepare(`INSERT INTO attention_items
-              (id,workspace_id,run_id,revision,state,question_json,evidence_json,answer_id,resolution,created_at,updated_at,source_key)
-              VALUES (?,?,?,0,'candidate',?,?,NULL,NULL,?,?,?)`)
+              (id,workspace_id,run_id,revision,state,question_json,evidence_json,answer_id,resolution,created_at,updated_at,source_key,human_review_json,candidate_reason)
+              VALUES (?,?,?,0,'candidate',?,?,NULL,NULL,?,?,?,NULL,'historical-context')`)
               .run(itemId, observed.workspaceId, run.id, toJson(candidate.question), toJson(candidate.evidence), now, now, candidate.sourceKey);
           }
           const provisional = run.revision === 0 && run.binding === null && run.evidence.confidence !== 'confirmed';
@@ -1006,7 +1190,9 @@ export class MissionControlStore {
         }
         const workspaceRunIds = (this.database.prepare('SELECT id FROM runs WHERE workspace_id=?').all(observed.workspaceId) as Array<{ id: string }>).map((entry) => entry.id);
         const counts = this.database.prepare(`SELECT
-          SUM(CASE WHEN item.state='open' THEN 1 ELSE 0 END) AS open_items,
+          SUM(CASE WHEN item.state='open' AND item.human_review_json IS NOT NULL
+            AND json_extract(item.human_review_json,'$.humanNeed') IN ('decision','approval','information','external-action')
+            THEN 1 ELSE 0 END) AS open_items,
           SUM(CASE WHEN item.state='answered' AND EXISTS (
             SELECT 1 FROM deliveries delivery WHERE delivery.answer_id=item.answer_id AND delivery.state<>'acknowledged'
           ) THEN 1 ELSE 0 END) AS awaiting

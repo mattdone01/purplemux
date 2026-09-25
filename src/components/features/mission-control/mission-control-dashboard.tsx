@@ -20,7 +20,11 @@ import { cn } from '@/lib/utils';
 import MissionControlAnswerCard, {
   MissionControlDeliveryCard,
 } from '@/components/features/mission-control/mission-control-answer-card';
-import { formatMissionAge, isMissionDraftEmpty } from '@/components/features/mission-control/mission-control-utils';
+import {
+  formatMissionAge,
+  isMissionHumanInboxItem,
+  missionWorkspaceIssuePresentation,
+} from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
 import type {
   IMissionAttentionItem,
@@ -132,28 +136,89 @@ const EmptyPanel = ({ children }: { children: React.ReactNode }) => (
 const CandidateCard = ({
   item,
   workspaceName,
+  draft,
 }: {
   item: IMissionAttentionItem;
   workspaceName: string;
-}) => (
-  <Card className="min-w-0 border-dashed border-ui-amber/30 bg-ui-amber/5 shadow-none">
-    <CardContent className="space-y-3 p-4 sm:p-5">
-      <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
-        <span className="rounded bg-background/80 px-2 py-1 font-medium">{workspaceName}</span>
-        <span className="text-ui-amber">Provisional candidate</span>
-        <span className="text-muted-foreground">· {item.evidence.source}</span>
-      </div>
-      <div>
+  draft: IMissionDraft | undefined;
+}) => {
+  const presentation = missionWorkspaceIssuePresentation(item);
+  const selectedLabels = draft?.optionIds.map((optionId) =>
+    draft.item.options.find((option) => option.id === optionId)?.label ?? optionId) ?? [];
+  return (
+    <Card className="min-w-0 border-dashed border-ui-amber/30 bg-ui-amber/5 shadow-none">
+      <CardContent className="space-y-3 p-4 sm:p-5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
+          <span className="rounded bg-background/80 px-2 py-1 font-medium">{workspaceName}</span>
+          <span className="rounded bg-ui-amber/10 px-2 py-1 font-medium text-ui-amber">{presentation.badge}</span>
+          <span className="text-muted-foreground">· {item.evidence.source}</span>
+        </div>
+        <div>
+          <p className="break-words text-sm font-medium">{item.title}</p>
+          <p className="mt-1 whitespace-pre-wrap break-words text-sm text-muted-foreground">{item.context}</p>
+        </div>
+        <div className="flex items-start gap-2 rounded-md bg-background/70 px-3 py-2 text-xs text-muted-foreground">
+          <Clock3 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{presentation.explanation}</span>
+        </div>
+        {draft && (
+          <div className="space-y-2 rounded-md border border-foreground/10 bg-background/70 p-3">
+            <p className="text-xs font-medium">Saved answer draft</p>
+            {selectedLabels.length > 0 && (
+              <p className="break-words text-sm text-muted-foreground">{selectedLabels.join(', ')}</p>
+            )}
+            {draft.text && <p className="whitespace-pre-wrap break-words text-sm">{draft.text}</p>}
+            {draft.actionCompleted && <p className="text-sm">Action marked complete</p>}
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <span className="text-xs text-muted-foreground">
+                Kept on this page until the same issue is explicitly escalated for you.
+              </span>
+              <Button type="button" disabled className="w-full sm:w-auto">Save answer</Button>
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+};
+
+const RetainedDraftCard = ({
+  item,
+  workspaceName,
+  draft,
+}: {
+  item: IMissionAttentionItem;
+  workspaceName: string;
+  draft: IMissionDraft;
+}) => {
+  const selectedLabels = draft.optionIds.map((optionId) =>
+    draft.item.options.find((option) => option.id === optionId)?.label ?? optionId);
+  return (
+    <Card className="min-w-0 border-foreground/10 bg-card/60 shadow-none">
+      <CardContent className="space-y-3 p-4 sm:p-5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
+          <span className="rounded bg-background/80 px-2 py-1 font-medium">{workspaceName}</span>
+          <span className="rounded bg-muted px-2 py-1 font-medium capitalize text-muted-foreground">{item.state}</span>
+        </div>
         <p className="break-words text-sm font-medium">{item.title}</p>
-        <p className="mt-1 whitespace-pre-wrap break-words text-sm text-muted-foreground">{item.context}</p>
-      </div>
-      <div className="flex items-start gap-2 rounded-md bg-background/70 px-3 py-2 text-xs text-muted-foreground">
-        <Clock3 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-        <span>Awaiting orchestrator confirmation. This is not yet an actionable question.</span>
-      </div>
-    </CardContent>
-  </Card>
-);
+        <div className="space-y-2 rounded-md border border-foreground/10 bg-background/70 p-3">
+          <p className="text-xs font-medium">Saved answer draft</p>
+          {selectedLabels.length > 0 && (
+            <p className="break-words text-sm text-muted-foreground">{selectedLabels.join(', ')}</p>
+          )}
+          {draft.text && <p className="whitespace-pre-wrap break-words text-sm">{draft.text}</p>}
+          {draft.actionCompleted && <p className="text-sm">Action marked complete</p>}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <span className="text-xs text-muted-foreground">
+              The item changed elsewhere. This draft is retained for reference and cannot be submitted.
+            </span>
+            <Button type="button" disabled className="w-full sm:w-auto">Save answer</Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+};
 
 const BootstrapPanel = ({
   snapshot,
@@ -390,13 +455,16 @@ const MissionControlDashboard = ({
   onBootstrap,
 }: IMissionControlDashboardProps) => {
   const [activityFilter, setActivityFilter] = useState<TMissionActivity>('active');
-  const openItems = snapshot.items.filter((item) => item.state === 'open');
-  const retainedDraftItems = Object.values(drafts)
-    .filter((draft) => !isMissionDraftEmpty(draft) && !openItems.some((item) => item.id === draft.item.id))
-    .map((draft) => draft.item);
-  const actionableItems = [...openItems, ...retainedDraftItems];
-  const candidateItems = snapshot.items.filter((item) => item.state === 'candidate');
+  const actionableItems = snapshot.items.filter(isMissionHumanInboxItem);
+  const workspaceIssueItems = snapshot.items.filter((item) =>
+    item.state === 'candidate' || (item.state === 'open' && !isMissionHumanInboxItem(item)));
   const answeredItems = snapshot.items.filter((item) => item.state === 'answered');
+  const retainedTerminalDrafts = snapshot.items.flatMap((item) => {
+    const draft = drafts[item.id];
+    return draft && (item.state === 'answered' || item.state === 'resolved' || item.state === 'cancelled')
+      ? [{ item, draft }]
+      : [];
+  });
   const filteredWorkspaces = snapshot.workspaces.filter((workspace) => workspace.activity === activityFilter);
   const counts = useMemo(() => Object.fromEntries(
     (['active', 'waiting', 'dormant', 'unknown'] as const).map((activity) => [
@@ -432,7 +500,7 @@ const MissionControlDashboard = ({
           <SectionHeading
             title="Needs you"
             count={actionableItems.length}
-            description="Confirmed questions remain here until the server accepts an answer."
+            description="Decisions and actions explicitly escalated for you."
           />
         </div>
         {actionableItems.length === 0 ? (
@@ -488,6 +556,28 @@ const MissionControlDashboard = ({
         </section>
       )}
 
+      {retainedTerminalDrafts.length > 0 && (
+        <section className="space-y-3" aria-labelledby="saved-drafts-heading">
+          <div id="saved-drafts-heading">
+            <SectionHeading
+              title="Saved drafts"
+              count={retainedTerminalDrafts.length}
+              description="Drafts retained after an item changed elsewhere. They are no longer actionable."
+            />
+          </div>
+          <div className="grid min-w-0 gap-3 lg:grid-cols-2">
+            {retainedTerminalDrafts.map(({ item, draft }) => (
+              <RetainedDraftCard
+                key={item.id}
+                item={item}
+                workspaceName={snapshot.workspaces.find((workspace) => workspace.workspaceId === item.workspaceId)?.name ?? item.workspaceId}
+                draft={draft}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
       <section className="space-y-3" aria-labelledby="workspaces-heading">
         <div id="workspaces-heading">
           <SectionHeading
@@ -531,21 +621,22 @@ const MissionControlDashboard = ({
         )}
       </section>
 
-      {candidateItems.length > 0 && (
+      {workspaceIssueItems.length > 0 && (
         <section className="space-y-3" aria-labelledby="candidate-heading">
           <div id="candidate-heading">
             <SectionHeading
-              title="Provisional candidates"
-              count={candidateItems.length}
-              description="Discovery found these in historical context; an orchestrator must confirm them before they become actionable."
+              title="Workspace issues"
+              count={workspaceIssueItems.length}
+              description="Items the orchestrator must review or is handling within the workspace."
             />
           </div>
           <div className="grid min-w-0 gap-3 lg:grid-cols-2">
-            {candidateItems.map((item) => (
+            {workspaceIssueItems.map((item) => (
               <CandidateCard
                 key={item.id}
                 item={item}
                 workspaceName={snapshot.workspaces.find((workspace) => workspace.workspaceId === item.workspaceId)?.name ?? item.workspaceId}
+                draft={drafts[item.id]}
               />
             ))}
           </div>

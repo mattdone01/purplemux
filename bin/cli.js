@@ -235,6 +235,7 @@ const cmdMission = async (args) => {
       const pending = new Map(deliveries.filter((delivery) => delivery.state !== 'acknowledged').map((delivery) => [delivery.answerId, delivery]));
       return out({
         workspaceId: wsId,
+        humanInboxPolicy: body.humanInboxPolicy,
         answers: answers.flatMap((answer) => {
           const item = items.get(answer.itemId);
           const delivery = pending.get(answer.id);
@@ -251,6 +252,7 @@ const cmdMission = async (args) => {
     }
     return out({
       workspaceId: wsId,
+      humanInboxPolicy: body.humanInboxPolicy,
       answers,
       deliveries,
     });
@@ -696,7 +698,10 @@ Commands:
   help                                     Show this usage
 
 Mission event examples:
-  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-update-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true}}]}'
+  Ordinary attention events create workspace candidates. Workers route blockers to the orchestrator; they do not open the human inbox directly.
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-open-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":0,"producerAt":1700000000001,"bindingGeneration":1,"type":"attention.opened","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true}}]}'
+  The configured orchestrator may promote that same item only after checking existing authority and identifying the remaining human-exclusive need.
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-review-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true,"humanReview":{"humanNeed":"decision","humanReason":"Choose the acceptable product rollout risk.","handling":"Existing rollout guidance does not choose product risk tolerance.","reviewerTabId":"tab-orchestrator"}}}]}'
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-resolve-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":2,"producerAt":1700000000004,"bindingGeneration":1,"type":"attention.resolved","payload":{"itemId":"question-1","resolution":"Applied the gradual rollout"}}]}'
 
 Environment:

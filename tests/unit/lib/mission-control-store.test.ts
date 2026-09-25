@@ -37,6 +37,28 @@ const question: IMissionQuestion = {
   blockingScope: 'story',
   canContinue: true,
 };
+const humanReview = {
+  humanNeed: 'decision' as const,
+  humanReason: 'Only the human can choose the rollout strategy.',
+  handling: 'The orchestrator checked the delivery constraints and delegated analysis.',
+  reviewerTabId: binding.tabId,
+};
+const reviewAuthority = {
+  resolvedIdentity: identity,
+  configuredOrchestratorTabId: binding.tabId,
+};
+const humanReviewFor = (humanNeed: 'decision' | 'approval' | 'information' | 'external-action' | 'none') => humanNeed === 'none'
+  ? {
+      humanNeed,
+      handling: 'The orchestrator will handle this with existing workspace authority.',
+      reviewerTabId: binding.tabId,
+    }
+  : {
+      humanNeed,
+      humanReason: `Only the human can provide the required ${humanNeed}.`,
+      handling: 'The orchestrator checked existing instructions, authority, evidence, and delegated handling.',
+      reviewerTabId: binding.tabId,
+    };
 
 const databasePath = (): string => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'purplemux-mission-'));
@@ -56,7 +78,7 @@ const startEvent = (eventId = 'event-start'): TMissionProducerEvent => ({
   payload: { objective: 'Deliver Mission Control', tabId: binding.tabId },
 });
 
-const openEvent = (eventId = 'event-open'): TMissionProducerEvent => ({
+const openEvent = (eventId = 'event-open'): Extract<TMissionProducerEvent, { type: 'attention.opened' }> => ({
   eventId,
   schemaVersion: 1,
   workspaceId: 'ws-a',
@@ -65,13 +87,27 @@ const openEvent = (eventId = 'event-open'): TMissionProducerEvent => ({
   producerAt: 1_700_000_000_100,
   bindingGeneration: 1,
   type: 'attention.opened',
-  payload: { itemId: 'item-a', ...question },
+  payload: { itemId: 'item-a', ...question, humanReview },
 });
 
 const seed = (store: MissionControlStore): void => {
   const start = startEvent();
   store.applyEvents([start], new Map([[start.eventId, identity]]));
-  store.applyEvents([openEvent()]);
+  const opened = openEvent();
+  store.applyEvents([opened], new Map([[opened.eventId, reviewAuthority]]));
+};
+
+const seedRun = (store: MissionControlStore): void => {
+  const start = startEvent();
+  store.applyEvents([start], new Map([[start.eventId, identity]]));
+};
+
+const downgradeToSchema3 = (file: string): void => {
+  const database = new Database(file);
+  database.exec('ALTER TABLE attention_items DROP COLUMN human_review_json');
+  database.exec('ALTER TABLE attention_items DROP COLUMN candidate_reason');
+  database.pragma('user_version = 3');
+  database.close();
 };
 
 const discoveryInput = (
@@ -112,6 +148,155 @@ afterEach(() => {
 });
 
 describe('MissionControlStore', () => {
+  it('routes ordinary attention to a durable workspace candidate with audited event routing', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const event: TMissionProducerEvent = {
+      ...openEvent('event-workspace-issue'),
+      payload: { itemId: 'item-a', ...question },
+    };
+    const result = store.applyEvents([event]);
+    expect(store.snapshot().items[0]).toMatchObject({
+      id: 'item-a', state: 'candidate', revision: 1,
+      candidateReason: 'workspace-issue', humanReview: null,
+    });
+    expect(store.snapshot().workspaces[0].openItems).toBe(0);
+    expect(result.events[0].payload).toMatchObject({
+      routing: { state: 'candidate', candidateReason: 'workspace-issue', review: null },
+    });
+    expect(store.applyEvents([event])).toMatchObject({ replayed: true, events: [{ id: event.eventId }] });
+    expect(() => store.applyEvents([{
+      ...event, payload: { ...event.payload, title: 'Changed under the same event ID' },
+    }])).toThrowError(/different content/);
+    expect(() => store.submitAnswer('item-a', {
+      submissionId: 'candidate-answer', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false,
+    }, 'user')).toThrowError(/no longer open/);
+    store.close();
+  });
+
+  it.each(['decision', 'approval', 'information', 'external-action'] as const)(
+    'opens attention only after a valid %s review and exposes the reason',
+    (humanNeed) => {
+      const store = new MissionControlStore(databasePath());
+      seedRun(store);
+      const event: TMissionProducerEvent = {
+        ...openEvent(`event-human-${humanNeed}`),
+        payload: { itemId: `item-${humanNeed}`, ...question, humanReview: humanReviewFor(humanNeed) },
+      };
+      const result = store.applyEvents([event], new Map([[event.eventId, reviewAuthority]]));
+      expect(store.snapshot().items[0]).toMatchObject({
+        state: 'open', candidateReason: null,
+        humanReview: {
+          humanNeed,
+          humanReason: `Only the human can provide the required ${humanNeed}.`,
+          reviewerTabId: binding.tabId,
+          binding,
+          eventId: event.eventId,
+        },
+      });
+      expect(store.snapshot().workspaces[0].openItems).toBe(1);
+      expect(result.events[0].payload).toMatchObject({
+        humanReview: { humanNeed },
+        routing: { state: 'open', candidateReason: null, review: { binding, eventId: event.eventId } },
+      });
+      store.close();
+    },
+  );
+
+  it('keeps candidates non-actionable until review and requires renewed review for changed open content', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const ordinary: TMissionProducerEvent = {
+      ...openEvent('event-candidate'),
+      payload: { itemId: 'item-a', ...question },
+    };
+    store.applyEvents([ordinary]);
+    const unchangedCandidate: TMissionProducerEvent = {
+      ...ordinary, eventId: 'event-candidate-unchanged', type: 'attention.updated', expectedRevision: 1,
+    };
+    store.applyEvents([unchangedCandidate]);
+    expect(store.snapshot().items[0]).toMatchObject({ state: 'candidate', revision: 2, humanReview: null });
+
+    const promote: TMissionProducerEvent = {
+      ...ordinary, eventId: 'event-promote', type: 'attention.updated', expectedRevision: 2,
+      payload: { ...ordinary.payload, humanReview: humanReviewFor('approval') },
+    };
+    store.applyEvents([promote], new Map([[promote.eventId, reviewAuthority]]));
+    const promoted = store.snapshot().items[0];
+    expect(promoted).toMatchObject({ state: 'open', revision: 3, candidateReason: null, humanReview: { humanNeed: 'approval' } });
+
+    const changedWithoutReview: TMissionProducerEvent = {
+      ...ordinary, eventId: 'event-change-without-review', type: 'attention.updated', expectedRevision: 3,
+      payload: { itemId: 'item-a', ...question, title: 'A different human question' },
+    };
+    expect(() => store.applyEvents([changedWithoutReview])).toThrowError(/renewed orchestrator review/);
+    expect(store.snapshot().items[0]).toEqual(promoted);
+
+    const unchangedOpen: TMissionProducerEvent = {
+      ...ordinary, eventId: 'event-open-unchanged', type: 'attention.updated', expectedRevision: 3,
+    };
+    store.applyEvents([unchangedOpen]);
+    expect(store.snapshot().items[0]).toMatchObject({ state: 'open', revision: 4, humanReview: { eventId: promote.eventId } });
+
+    const disposition: TMissionProducerEvent = {
+      ...ordinary, eventId: 'event-workspace-disposition', type: 'attention.updated', expectedRevision: 4,
+      payload: { ...ordinary.payload, humanReview: humanReviewFor('none') },
+    };
+    store.applyEvents([disposition], new Map([[disposition.eventId, reviewAuthority]]));
+    expect(store.snapshot().items[0]).toMatchObject({
+      state: 'candidate', revision: 5, candidateReason: 'workspace-issue', humanReview: { humanNeed: 'none' }, answerId: null,
+    });
+    store.close();
+  });
+
+  it.each([
+    ['wrong configured tab', { ...reviewAuthority, configuredOrchestratorTabId: 'tab-worker' }, /configured orchestrator/],
+    ['stale session', { ...reviewAuthority, resolvedIdentity: { ...identity, sessionId: 'session-stale' } }, /current orchestrator session/],
+    ['stale runtime', { ...reviewAuthority, resolvedIdentity: { ...identity, runtimeGeneration: 'launch-stale' } }, /current orchestrator session/],
+    ['missing live identity', { ...reviewAuthority, resolvedIdentity: null }, /current orchestrator session/],
+  ] as const)('rejects %s review authority without mutation', (_case, authority, message) => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const event = openEvent(`event-authority-${_case}`);
+    expect(() => store.applyEvents([event], new Map([[event.eventId, authority]]))).toThrowError(message);
+    expect(store.snapshot().items).toEqual([]);
+    store.close();
+  });
+
+  it('rejects review when the run is bound to a worker instead of the configured orchestrator', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const workerIdentity = observedIdentity('worker');
+    const event: Extract<TMissionProducerEvent, { type: 'attention.opened' }> = {
+      ...openEvent('event-worker-review'),
+      payload: {
+        itemId: 'item-a', ...question,
+        humanReview: { ...humanReviewFor('decision'), reviewerTabId: workerIdentity.tabId },
+      },
+    };
+    expect(() => store.applyEvents([event], new Map([[event.eventId, {
+      resolvedIdentity: workerIdentity,
+      configuredOrchestratorTabId: workerIdentity.tabId,
+    }]]))).toThrowError(/run bound to the configured orchestrator/);
+    expect(store.snapshot().items).toEqual([]);
+    store.close();
+  });
+
+  it('rejects review against an unbound provisional run', () => {
+    const store = new MissionControlStore(databasePath());
+    store.reconcileDiscovery(discoveryInput('bootstrap-unbound-review'));
+    const provisional = store.snapshot().runs[0];
+    const event: Extract<TMissionProducerEvent, { type: 'attention.opened' }> = {
+      ...openEvent('event-unbound-review'),
+      runId: provisional.id,
+      bindingGeneration: 0,
+    };
+    expect(() => store.applyEvents([event], new Map([[event.eventId, reviewAuthority]])))
+      .toThrowError(/unbound/);
+    expect(store.snapshot().items).toEqual([]);
+    store.close();
+  });
+
   it('persists open attention and replays events after reopen without cursor gaps', () => {
     const file = databasePath();
     const first = new MissionControlStore(file);
@@ -138,6 +323,8 @@ describe('MissionControlStore', () => {
 
     const legacy = new Database(file);
     legacy.exec('ALTER TABLE runs DROP COLUMN observed_identities_json');
+    legacy.exec('ALTER TABLE attention_items DROP COLUMN human_review_json');
+    legacy.exec('ALTER TABLE attention_items DROP COLUMN candidate_reason');
     legacy.pragma('user_version = 2');
     legacy.close();
 
@@ -145,10 +332,142 @@ describe('MissionControlStore', () => {
     expect(migrated.snapshot().runs).toMatchObject([{ id: 'run-a', objective: 'Deliver Mission Control' }]);
     migrated.close();
     const inspected = new Database(file, { readonly: true });
-    expect(inspected.pragma('user_version', { simple: true })).toBe(3);
+    expect(inspected.pragma('user_version', { simple: true })).toBe(4);
     expect((inspected.prepare('PRAGMA table_info(runs)').all() as Array<{ name: string }>).map((column) => column.name))
       .toContain('observed_identities_json');
+    expect((inspected.prepare('PRAGMA table_info(attention_items)').all() as Array<{ name: string }>).map((column) => column.name))
+      .toEqual(expect.arrayContaining(['human_review_json', 'candidate_reason']));
     inspected.close();
+  });
+
+  it('reclassifies unanswered schema-3 opens exactly once while preserving durable records', () => {
+    const file = databasePath();
+    const original = new MissionControlStore(file);
+    seed(original);
+    const before = original.snapshot();
+    original.close();
+    downgradeToSchema3(file);
+
+    const migrated = new MissionControlStore(file);
+    const after = migrated.snapshot();
+    expect(after.runs).toEqual(before.runs);
+    expect(after.answers).toEqual(before.answers);
+    expect(after.deliveries).toEqual(before.deliveries);
+    expect(after.bootstrap).toEqual(before.bootstrap);
+    expect(after.items[0]).toMatchObject({
+      id: before.items[0].id,
+      title: before.items[0].title,
+      context: before.items[0].context,
+      state: 'candidate',
+      revision: before.items[0].revision + 1,
+      candidateReason: 'legacy-review',
+      humanReview: null,
+      createdAt: before.items[0].createdAt,
+    });
+    const migrationEvents = after.recentEvents.filter((event) => event.type === 'attention.reclassified');
+    expect(migrationEvents).toHaveLength(1);
+    expect(migrationEvents[0]).toMatchObject({
+      workspaceId: 'ws-a', runId: 'run-a', entityId: 'item-a', revision: 2,
+      payload: {
+        itemId: 'item-a', fromState: 'open', toState: 'candidate', previousRevision: 1,
+        reason: 'legacy-human-review-required', policyVersion: 1, actor: 'system:migration',
+      },
+    });
+    expect(migrationEvents[0].id).toMatch(/^system:migration:v4:[a-f0-9]{64}$/);
+    expect(migrated.humanInboxPolicy('ws-a')).toEqual({
+      version: 1,
+      legacyReviewPending: 1,
+      guidance: expect.stringContaining('Do not rerun bootstrap'),
+    });
+    const originalReplay = migrated.applyEvents([openEvent()], new Map([[openEvent().eventId, reviewAuthority]]));
+    expect(originalReplay.replayed).toBe(true);
+    expect(migrated.snapshot().items[0]).toMatchObject({ state: 'candidate', revision: 2 });
+    migrated.close();
+
+    const reopened = new MissionControlStore(file);
+    expect(reopened.snapshot().recentEvents.filter((event) => event.type === 'attention.reclassified')).toHaveLength(1);
+    expect(reopened.snapshot().items[0]).toMatchObject({ state: 'candidate', revision: 2, candidateReason: 'legacy-review' });
+    const stalePromotion: TMissionProducerEvent = {
+      ...openEvent('event-stale-legacy-promotion'), type: 'attention.updated', expectedRevision: 1,
+    };
+    expect(() => reopened.applyEvents([stalePromotion], new Map([[stalePromotion.eventId, reviewAuthority]])))
+      .toThrowError(/stale attention revision/);
+    const promotion: TMissionProducerEvent = {
+      ...openEvent('event-legacy-promotion'), type: 'attention.updated', expectedRevision: 2,
+    };
+    reopened.applyEvents([promotion], new Map([[promotion.eventId, reviewAuthority]]));
+    expect(reopened.snapshot().items[0]).toMatchObject({
+      id: 'item-a', state: 'open', revision: 3, candidateReason: null,
+      humanReview: { humanNeed: 'decision', eventId: promotion.eventId },
+    });
+    expect(reopened.humanInboxPolicy('ws-a')).toEqual({ version: 1, legacyReviewPending: 0 });
+    reopened.close();
+  });
+
+  it('rolls back every schema-4 migration change when reclassification event persistence fails', () => {
+    const file = databasePath();
+    const original = new MissionControlStore(file);
+    seed(original);
+    original.close();
+    downgradeToSchema3(file);
+    const legacy = new Database(file);
+    legacy.exec(`CREATE TRIGGER reject_reclassification BEFORE INSERT ON events
+      WHEN NEW.type='attention.reclassified' BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END`);
+    legacy.close();
+
+    expect(() => new MissionControlStore(file)).toThrowError(/injected migration failure/);
+    const inspected = new Database(file, { readonly: true });
+    expect(inspected.pragma('user_version', { simple: true })).toBe(3);
+    expect((inspected.prepare('PRAGMA table_info(attention_items)').all() as Array<{ name: string }>).map((column) => column.name))
+      .not.toEqual(expect.arrayContaining(['human_review_json', 'candidate_reason']));
+    expect(inspected.prepare('SELECT state,revision FROM attention_items WHERE id=?').get('item-a'))
+      .toEqual({ state: 'open', revision: 1 });
+    expect(inspected.prepare("SELECT COUNT(*) AS count FROM events WHERE type='attention.reclassified'").get())
+      .toEqual({ count: 0 });
+    inspected.close();
+  });
+
+  it('aborts migration when an anomalous open item is already linked to an answer', () => {
+    const file = databasePath();
+    const original = new MissionControlStore(file);
+    seed(original);
+    original.submitAnswer('item-a', {
+      submissionId: 'anomalous-answer', expectedRevision: 1,
+      optionIds: ['gradual'], text: '', actionCompleted: false,
+    }, 'user');
+    original.close();
+    const legacy = new Database(file);
+    legacy.prepare("UPDATE attention_items SET state='open' WHERE id='item-a'").run();
+    legacy.exec('ALTER TABLE attention_items DROP COLUMN human_review_json');
+    legacy.exec('ALTER TABLE attention_items DROP COLUMN candidate_reason');
+    legacy.pragma('user_version = 3');
+    legacy.close();
+
+    expect(() => new MissionControlStore(file)).toThrowError(/already has an answer/);
+    const inspected = new Database(file, { readonly: true });
+    expect(inspected.pragma('user_version', { simple: true })).toBe(3);
+    expect(inspected.prepare("SELECT state,answer_id FROM attention_items WHERE id='item-a'").get())
+      .toMatchObject({ state: 'open', answer_id: expect.any(String) });
+    inspected.close();
+  });
+
+  it('preserves an answered item and identical answer replay through schema-4 migration', () => {
+    const file = databasePath();
+    const original = new MissionControlStore(file);
+    seed(original);
+    const request = {
+      submissionId: 'answer-before-migration', expectedRevision: 1,
+      optionIds: ['gradual'], text: '', actionCompleted: false,
+    };
+    const accepted = original.submitAnswer('item-a', request, 'user');
+    original.close();
+    downgradeToSchema3(file);
+
+    const migrated = new MissionControlStore(file);
+    expect(migrated.snapshot().items[0]).toMatchObject({ state: 'answered', revision: 2, answerId: accepted.answer.id });
+    expect(migrated.snapshot().recentEvents.filter((event) => event.type === 'attention.reclassified')).toEqual([]);
+    expect(migrated.submitAnswer('item-a', request, 'user')).toMatchObject({ replayed: true, answer: { id: accepted.answer.id } });
+    migrated.close();
   });
 
   it('returns original answer results for identical retries and conflicts on changed reuse', () => {
@@ -173,6 +492,37 @@ describe('MissionControlStore', () => {
     store.close();
   });
 
+  it('serializes workspace disposition against answer submission without losing a winning answer', () => {
+    const demoted = new MissionControlStore(databasePath());
+    seed(demoted);
+    const disposition: TMissionProducerEvent = {
+      ...openEvent('event-demote-before-answer'), type: 'attention.updated', expectedRevision: 1,
+      payload: { ...openEvent().payload, humanReview: humanReviewFor('none') },
+    };
+    demoted.applyEvents([disposition], new Map([[disposition.eventId, reviewAuthority]]));
+    const request = {
+      submissionId: 'answer-race', expectedRevision: 1,
+      optionIds: ['gradual'], text: '', actionCompleted: false,
+    };
+    expect(() => demoted.submitAnswer('item-a', request, 'user')).toThrowError(/no longer open/);
+    expect(demoted.snapshot()).toMatchObject({ answers: [], deliveries: [], items: [{ state: 'candidate', revision: 2 }] });
+    demoted.close();
+
+    const answered = new MissionControlStore(databasePath());
+    seed(answered);
+    const accepted = answered.submitAnswer('item-a', request, 'user');
+    const lateDisposition: TMissionProducerEvent = {
+      ...disposition, eventId: 'event-demote-after-answer', expectedRevision: 2,
+    };
+    expect(() => answered.applyEvents([lateDisposition], new Map([[lateDisposition.eventId, reviewAuthority]])))
+      .toThrowError(/only open or candidate/);
+    expect(answered.submitAnswer('item-a', request, 'user')).toMatchObject({
+      replayed: true, answer: { id: accepted.answer.id }, delivery: { id: accepted.delivery.id },
+    });
+    expect(answered.snapshot().items[0]).toMatchObject({ state: 'answered', revision: 2 });
+    answered.close();
+  });
+
   it('rolls back an entire producer batch when a later event conflicts', () => {
     const store = new MissionControlStore(databasePath());
     seed(store);
@@ -190,6 +540,24 @@ describe('MissionControlStore', () => {
     const snapshot = store.snapshot();
     expect(snapshot.runs[0]).toMatchObject({ revision: 1, phase: null });
     expect(snapshot.recentEvents.map((event) => event.id)).not.toContain('event-progress');
+    store.close();
+  });
+
+  it('rolls back earlier batch events when a later human review lacks authority', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const progress: TMissionProducerEvent = {
+      eventId: 'event-progress-before-review', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
+      expectedRevision: 1, producerAt: 1_700_000_000_200, bindingGeneration: 1,
+      type: 'progress.updated', payload: { phase: 'reviewing' },
+    };
+    const review = openEvent('event-invalid-review');
+    expect(() => store.applyEvents([progress, review], new Map([[review.eventId, {
+      ...reviewAuthority, configuredOrchestratorTabId: 'tab-worker',
+    }]]))).toThrowError(/configured orchestrator/);
+    expect(store.snapshot().runs[0]).toMatchObject({ revision: 1, phase: null });
+    expect(store.snapshot().items).toEqual([]);
+    expect(store.snapshot().recentEvents.map((event) => event.id)).not.toContain(progress.eventId);
     store.close();
   });
 
@@ -372,9 +740,9 @@ describe('MissionControlStore', () => {
       eventId: 'event-open-second', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
       expectedRevision: 0, producerAt: 1_700_000_000_150, bindingGeneration: 1,
       type: 'attention.opened',
-      payload: { itemId: 'item-second', ...question, title: 'Second question' },
+      payload: { itemId: 'item-second', ...question, title: 'Second question', humanReview },
     };
-    store.applyEvents([secondOpen]);
+    store.applyEvents([secondOpen], new Map([[secondOpen.eventId, reviewAuthority]]));
     const accepted = store.submitAnswer('item-a', {
       submissionId: 'submission-snapshot', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false,
     }, 'user');

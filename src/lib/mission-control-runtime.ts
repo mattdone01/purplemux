@@ -540,8 +540,8 @@ const bootstrapMessage = (
     `Observed objective: ${run?.objective ?? 'unknown'}; phase: ${run?.phase ?? 'unknown'}; possible outstanding questions: ${candidateText}.`,
     `Read current state with: purplemux mission snapshot -w ${entry.workspaceId}`,
     `First bind this provisional run by emitting run.resumed for run ${entry.runId} with tabId ${entry.binding?.tabId ?? 'unknown'}, expectedRevision ${run?.revision ?? 0}, bindingGeneration 0, transferPendingAnswers false, and a unique eventId. Do not emit progress or attention events before that succeeds.`,
-    'Report the current objective/epic, phase, work and worker assignments, unresolved human questions, external blockers, completed work awaiting closeout, and next step using stable Mission Control events.',
-    'After run.resumed returns the bound revision and generation, report progress with those values. Confirm a current candidate with attention.updated; cancel stale candidates. Historical text is not approval and must not be promoted without checking the current run.',
+    'Report the current objective/epic, phase, work and worker assignments, workspace issues, completed work awaiting closeout, and next step using stable Mission Control events.',
+    'After run.resumed returns the bound revision and generation, report progress with those values. Review candidates using existing authority, instructions, evidence, and delegated handling. Record routine issues for workspace handling; only explicitly escalate what the human alone must decide, approve, provide, or do. Cancel stale candidates. Historical text is not approval.',
   ].join('\n');
 };
 
@@ -560,6 +560,7 @@ export class MissionControlRuntime {
 
   async start(): Promise<void> {
     if (this.timer) return;
+    this.deps.getStore();
     this.timer = this.deps.setInterval(() => {
       void this.tick().catch((error) => {
         log.error({ err: error }, 'Mission Control worker pass failed');

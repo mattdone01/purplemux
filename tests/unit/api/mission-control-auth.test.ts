@@ -5,6 +5,8 @@ import { signSessionToken } from '@/lib/auth';
 const store = vi.hoisted(() => ({
   submitAnswer: vi.fn(),
   applyEvents: vi.fn(),
+  unreplayedEventIds: vi.fn(),
+  humanInboxPolicy: vi.fn(),
 }));
 const runtime = vi.hoisted(() => ({
   getMissionSnapshot: vi.fn(),
@@ -13,12 +15,20 @@ const runtime = vi.hoisted(() => ({
 const scope = vi.hoisted(() => ({
   resolveCliScope: vi.fn(),
   canDriveWorkspace: vi.fn(),
+  canAccessWorkspace: vi.fn(),
+}));
+const workspace = vi.hoisted(() => ({
+  getWorkspaceById: vi.fn(),
 }));
 
 vi.mock('@/lib/mission-control-store', () => ({ getMissionControlStore: () => store }));
 vi.mock('@/lib/mission-control-runtime', () => runtime);
 vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: scope.resolveCliScope }));
-vi.mock('@/lib/cli-utils', () => ({ canDriveWorkspace: scope.canDriveWorkspace }));
+vi.mock('@/lib/cli-utils', () => ({
+  canDriveWorkspace: scope.canDriveWorkspace,
+  canAccessWorkspace: scope.canAccessWorkspace,
+}));
+vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: workspace.getWorkspaceById }));
 
 const fakeResponse = () => {
   const state = { statusCode: 0, body: undefined as unknown, headers: {} as Record<string, unknown> };
@@ -36,9 +46,16 @@ beforeEach(() => {
   runtime.getMissionSnapshot.mockResolvedValue({ schemaVersion: 1, cursor: 0 });
   store.submitAnswer.mockReturnValue({ replayed: false, answer: { id: 'answer-a' } });
   store.applyEvents.mockReturnValue({ events: [], cursor: 0, replayed: false });
+  store.unreplayedEventIds.mockImplementation((events) => new Set(events.map((event: { eventId: string }) => event.eventId)));
+  store.humanInboxPolicy.mockReturnValue({ version: 1, legacyReviewPending: 0 });
   runtime.resolveMissionTargetIdentity.mockResolvedValue({
     tabId: 'tab-a', providerId: 'codex', sessionId: 'session-a', runtimeGeneration: 'runtime-a',
   });
+  workspace.getWorkspaceById.mockResolvedValue({
+    id: 'ws-a', name: 'A', directories: [],
+    orchestration: { enabled: false, orchestratorTabId: 'tab-a' },
+  });
+  scope.canAccessWorkspace.mockResolvedValue(true);
 });
 
 describe('Mission Control human authentication', () => {
@@ -98,6 +115,22 @@ describe('Mission Control agent authorization', () => {
     type: 'run.started', payload: { objective: 'Ship', tabId: 'tab-a' },
   };
 
+  it('adds the workspace human-inbox policy to CLI snapshots', async () => {
+    const { default: handler } = await import('@/pages/api/cli/mission-control/index');
+    scope.resolveCliScope.mockReturnValue({ type: 'workspace', workspaceId: 'ws-a' });
+    store.humanInboxPolicy.mockReturnValue({
+      version: 1, legacyReviewPending: 2, guidance: 'Review on the next ordinary turn.',
+    });
+    const { state, res } = fakeResponse();
+    await handler({ method: 'GET', query: { workspaceId: 'ws-a' }, headers: {} } as unknown as NextApiRequest, res);
+    expect(state.statusCode).toBe(200);
+    expect(state.body).toMatchObject({
+      schemaVersion: 1,
+      humanInboxPolicy: { version: 1, legacyReviewPending: 2, guidance: 'Review on the next ordinary turn.' },
+    });
+    expect(store.humanInboxPolicy).toHaveBeenCalledWith('ws-a');
+  });
+
   it.each([
     [{ type: 'admin' }, 'global token'],
     [{ type: 'workspace', workspaceId: 'ws-peer' }, 'peer token'],
@@ -130,5 +163,61 @@ describe('Mission Control agent authorization', () => {
     await handler({ method: 'POST', query: { workspaceId: 'ws-a' }, headers: {}, body: { events: [{ ...start, workspaceId: 'ws-b' }] } } as unknown as NextApiRequest, res);
     expect(state.statusCode).toBe(403);
     expect(store.applyEvents).not.toHaveBeenCalled();
+  });
+
+  it('resolves review identity before reading configured orchestrator and passes both to storage', async () => {
+    const { default: handler } = await import('@/pages/api/cli/mission-control/events');
+    scope.resolveCliScope.mockReturnValue({ type: 'workspace', workspaceId: 'ws-a' });
+    scope.canDriveWorkspace.mockReturnValue(true);
+    const review = {
+      eventId: 'event-review', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
+      expectedRevision: 1, producerAt: 1_700_000_000_100, bindingGeneration: 1,
+      type: 'attention.updated',
+      payload: {
+        itemId: 'item-a', kind: 'question', title: 'Approve', context: 'Approve the release.',
+        storyIds: [], options: [], recommendation: null, blockingScope: 'run', canContinue: false,
+        humanReview: {
+          humanNeed: 'approval', humanReason: 'Only the human can approve release.',
+          handling: 'The orchestrator checked delegated authority.', reviewerTabId: 'tab-a',
+        },
+      },
+    };
+    const { state, res } = fakeResponse();
+    await handler({ method: 'POST', query: { workspaceId: 'ws-a' }, headers: {}, body: { events: [review] } } as unknown as NextApiRequest, res);
+    expect(state.statusCode).toBe(200);
+    expect(runtime.resolveMissionTargetIdentity).toHaveBeenCalledWith('ws-a', 'tab-a');
+    expect(workspace.getWorkspaceById).toHaveBeenCalledWith('ws-a');
+    const authorities = store.applyEvents.mock.calls[0][1] as Map<string, unknown>;
+    expect(authorities.get('event-review')).toEqual({
+      resolvedIdentity: { tabId: 'tab-a', providerId: 'codex', sessionId: 'session-a', runtimeGeneration: 'runtime-a' },
+      configuredOrchestratorTabId: 'tab-a',
+    });
+    expect(state.body).toMatchObject({ humanInboxPolicy: { version: 1, legacyReviewPending: 0 } });
+  });
+
+  it('does not resolve identity or reread configuration for an identical replay', async () => {
+    const { default: handler } = await import('@/pages/api/cli/mission-control/events');
+    scope.resolveCliScope.mockReturnValue({ type: 'workspace', workspaceId: 'ws-a' });
+    scope.canDriveWorkspace.mockReturnValue(true);
+    store.unreplayedEventIds.mockReturnValue(new Set());
+    const replay = {
+      eventId: 'event-review-replay', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
+      expectedRevision: 1, producerAt: 1_700_000_000_100, bindingGeneration: 1,
+      type: 'attention.updated',
+      payload: {
+        itemId: 'item-a', kind: 'question', title: 'Approve', context: 'Approve the release.',
+        storyIds: [], options: [], recommendation: null, blockingScope: 'run', canContinue: false,
+        humanReview: {
+          humanNeed: 'approval', humanReason: 'Only the human can approve release.',
+          handling: 'The orchestrator checked delegated authority.', reviewerTabId: 'tab-a',
+        },
+      },
+    };
+    const { state, res } = fakeResponse();
+    await handler({ method: 'POST', query: { workspaceId: 'ws-a' }, headers: {}, body: { events: [replay] } } as unknown as NextApiRequest, res);
+    expect(state.statusCode).toBe(200);
+    expect(runtime.resolveMissionTargetIdentity).not.toHaveBeenCalled();
+    expect(workspace.getWorkspaceById).not.toHaveBeenCalled();
+    expect(store.applyEvents).toHaveBeenCalledWith([replay], new Map());
   });
 });

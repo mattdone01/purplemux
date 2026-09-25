@@ -5,6 +5,8 @@ export type TMissionActivity = 'active' | 'waiting' | 'dormant' | 'unknown';
 export type TMissionItemState = 'candidate' | 'open' | 'answered' | 'resolved' | 'cancelled';
 export type TMissionDeliveryState = 'queued' | 'dispatching' | 'submitted' | 'acknowledged' | 'held' | 'failed';
 export type TMissionConfidence = 'confirmed' | 'provisional' | 'unknown';
+export type TMissionCandidateReason = 'workspace-issue' | 'legacy-review' | 'historical-context';
+export type TMissionHumanNeed = 'decision' | 'approval' | 'information' | 'external-action';
 
 export interface IMissionBinding {
   tabId: string;
@@ -62,6 +64,31 @@ export interface IMissionQuestion {
   canContinue: boolean;
 }
 
+export type TMissionHumanReviewInput =
+  | {
+      humanNeed: 'none';
+      handling: string;
+      reviewerTabId: string;
+    }
+  | {
+      humanNeed: TMissionHumanNeed;
+      humanReason: string;
+      handling: string;
+      reviewerTabId: string;
+    };
+
+export type TMissionHumanReview = TMissionHumanReviewInput & {
+  binding: IMissionBinding;
+  eventId: string;
+  reviewedAt: number;
+};
+
+export interface IMissionHumanInboxPolicy {
+  version: 1;
+  legacyReviewPending: number;
+  guidance?: string;
+}
+
 export interface IMissionAttentionItem extends IMissionQuestion {
   id: string;
   workspaceId: string;
@@ -71,6 +98,8 @@ export interface IMissionAttentionItem extends IMissionQuestion {
   evidence: IMissionEvidence;
   answerId: string | null;
   resolution: string | null;
+  humanReview: TMissionHumanReview | null;
+  candidateReason: TMissionCandidateReason | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -161,8 +190,8 @@ export type TMissionProducerEvent = IMissionEventBase & (
   | { type: 'run.resumed'; payload: { tabId: string; transferPendingAnswers: boolean } }
   | { type: 'progress.updated'; payload: { objective?: string; epic?: IMissionEpic | null; phase?: string | null; state?: 'running' | 'waiting'; nextStep?: string | null; storyCounts?: IMissionRun['storyCounts']; closeoutPending?: boolean } }
   | { type: 'run.finished'; payload: { state: 'completed' | 'cancelled'; summary: string; closeoutPending: boolean } }
-  | { type: 'attention.opened'; payload: IMissionQuestion & { itemId: string } }
-  | { type: 'attention.updated'; payload: IMissionQuestion & { itemId: string } }
+  | { type: 'attention.opened'; payload: IMissionQuestion & { itemId: string; humanReview?: TMissionHumanReviewInput } }
+  | { type: 'attention.updated'; payload: IMissionQuestion & { itemId: string; humanReview?: TMissionHumanReviewInput } }
   | { type: 'attention.resolved'; payload: { itemId: string; resolution: string } }
   | { type: 'attention.cancelled'; payload: { itemId: string; reason: string } }
   | { type: 'answer.acknowledged'; payload: { answerId: string } }

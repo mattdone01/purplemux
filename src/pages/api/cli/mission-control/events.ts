@@ -3,9 +3,10 @@ import { canDriveWorkspace } from '@/lib/cli-utils';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
 import { resolveMissionTargetIdentity } from '@/lib/mission-control-runtime';
-import { getMissionControlStore } from '@/lib/mission-control-store';
+import { getMissionControlStore, type IMissionEventAuthority } from '@/lib/mission-control-store';
 import { parseMissionEvents } from '@/lib/mission-control-validation';
 import { resolveCliScope } from '@/lib/workspace-token';
+import { getWorkspaceById } from '@/lib/workspace-store';
 
 export const config = {
   api: { bodyParser: { sizeLimit: '64kb' } },
@@ -30,12 +31,36 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (events.some((event) => event.workspaceId !== workspaceId)) {
       throw new MissionControlError(403, 'forbidden', 'Every event must match the authorized workspace');
     }
-    const bindings = new Map();
+    const store = getMissionControlStore();
+    const unreplayed = store.unreplayedEventIds(events);
+    const identities = new Map<string, Awaited<ReturnType<typeof resolveMissionTargetIdentity>>>();
     await Promise.all(events.map(async (event) => {
-      if (event.type !== 'run.started' && event.type !== 'run.resumed') return;
-      bindings.set(event.eventId, await resolveMissionTargetIdentity(event.workspaceId, event.payload.tabId));
+      if (!unreplayed.has(event.eventId)) return;
+      const tabId = event.type === 'run.started' || event.type === 'run.resumed'
+        ? event.payload.tabId
+        : (event.type === 'attention.opened' || event.type === 'attention.updated')
+          ? event.payload.humanReview?.reviewerTabId
+          : undefined;
+      if (tabId) identities.set(event.eventId, await resolveMissionTargetIdentity(event.workspaceId, tabId));
     }));
-    return res.status(200).json(getMissionControlStore().applyEvents(events, bindings));
+    const needsReviewAuthority = events.some((event) => unreplayed.has(event.eventId)
+      && (event.type === 'attention.opened' || event.type === 'attention.updated')
+      && event.payload.humanReview !== undefined);
+    const configuredOrchestratorTabId = needsReviewAuthority
+      ? (await getWorkspaceById(workspaceId))?.orchestration?.orchestratorTabId ?? null
+      : null;
+    const authorities = new Map<string, IMissionEventAuthority>();
+    for (const event of events) {
+      if (!unreplayed.has(event.eventId)) continue;
+      authorities.set(event.eventId, {
+        resolvedIdentity: identities.get(event.eventId) ?? null,
+        configuredOrchestratorTabId,
+      });
+    }
+    return res.status(200).json({
+      ...store.applyEvents(events, authorities),
+      humanInboxPolicy: store.humanInboxPolicy(workspaceId),
+    });
   } catch (error) {
     sendMissionError(res, error);
   }

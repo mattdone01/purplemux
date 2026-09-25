@@ -67,6 +67,15 @@ const MissionControlAnswerCard = ({
         </p>
       </CardHeader>
       <CardContent className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
+        {item.humanReview?.humanNeed !== 'none' && item.humanReview?.humanReason && (
+          <div className="rounded-md border border-ui-amber/20 bg-ui-amber/5 px-3 py-2 text-sm">
+            <p className="font-medium text-ui-amber">Why you&apos;re needed</p>
+            <p className="mt-1 whitespace-pre-wrap break-words text-foreground/80">
+              {item.humanReview.humanReason}
+            </p>
+          </div>
+        )}
+
         {item.storyIds.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {item.storyIds.map((storyId) => (

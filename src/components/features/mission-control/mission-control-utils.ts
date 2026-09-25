@@ -102,6 +102,51 @@ export const missionDraftRequest = (draft: IMissionDraft): IMissionAnswerRequest
 export const isMissionDraftEmpty = (draft: IMissionDraft): boolean =>
   draft.optionIds.length === 0 && draft.text.trim().length === 0 && !draft.actionCompleted;
 
+export const reconcileMissionDraftWithItem = (
+  draft: IMissionDraft,
+  currentItem: IMissionAttentionItem | undefined,
+): IMissionDraft | null => {
+  if (!currentItem || (currentItem.state === 'open' && currentItem.revision === draft.expectedRevision)) {
+    return draft;
+  }
+  if (currentItem.state !== 'candidate' && isMissionDraftEmpty(draft) && !draft.hasAttempted) return null;
+  return {
+    ...draft,
+    status: 'conflict',
+    error: null,
+    currentItem,
+    hasAttempted: true,
+  };
+};
+
+export const isMissionHumanInboxItem = (item: IMissionAttentionItem): boolean =>
+  item.state === 'open'
+  && item.humanReview !== null
+  && item.humanReview.humanNeed !== 'none';
+
+export const missionWorkspaceIssuePresentation = (
+  item: IMissionAttentionItem,
+): { badge: string; explanation: string } => {
+  if (item.humanReview?.humanNeed === 'none') {
+    return {
+      badge: 'Orchestrator handling',
+      explanation: item.humanReview.handling,
+    };
+  }
+  if (item.candidateReason === 'legacy-review') {
+    return {
+      badge: 'Orchestrator review required',
+      explanation: 'Previously shown in Needs you. Awaiting review of whether your input is required.',
+    };
+  }
+  return {
+    badge: 'Orchestrator review required',
+    explanation: item.candidateReason === 'historical-context'
+      ? 'Historical context is waiting for the orchestrator to decide how it should be handled.'
+      : 'The orchestrator must review this workspace issue before it can require your input.',
+  };
+};
+
 export const shouldApplyMissionSnapshot = (
   current: IMissionSnapshot | null,
   incoming: IMissionSnapshot,

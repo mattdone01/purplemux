@@ -14,6 +14,7 @@ import {
   editMissionDraft,
   isMissionDraftEmpty,
   missionDraftRequest,
+  reconcileMissionDraftWithItem,
 } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
 import useBrowserTitle from '@/hooks/use-browser-title';
@@ -70,20 +71,12 @@ const MissionControlPage = () => {
 
       for (const [itemId, draft] of Object.entries(next)) {
         const currentItem = snapshot.items.find((item) => item.id === itemId);
-        if (!currentItem || (currentItem.state === 'open' && currentItem.revision === draft.expectedRevision)) {
-          continue;
-        }
-        if (isMissionDraftEmpty(draft) && !draft.hasAttempted) {
+        const reconciled = reconcileMissionDraftWithItem(draft, currentItem);
+        if (!reconciled) {
           delete next[itemId];
           continue;
         }
-        next[itemId] = {
-          ...draft,
-          status: 'conflict',
-          error: null,
-          currentItem,
-          hasAttempted: true,
-        };
+        next[itemId] = reconciled;
       }
       return next;
     });

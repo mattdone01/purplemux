@@ -173,24 +173,47 @@ GET /api/cli/workspaces/<workspaceId>/standup
 
 GET /api/cli/mission-control?workspaceId=WS
   Returns the workspace-scoped durable Mission Control snapshot, including answers
-  and delivery status. Read access follows the existing workspace/allowedPeers rules.
+  and delivery status. The response also includes humanInboxPolicy with the count and
+  ordinary-turn guidance for legacy candidates that still need orchestrator review.
+  Read access follows the existing workspace/allowedPeers rules.
 
 POST /api/cli/mission-control/events?workspaceId=WS
   Requires WS's own workspace token; the global token and allowedPeers cannot write.
   Body: { "events": [TMissionProducerEvent, ...] } (1..25 events, one atomic transaction)
-  Response: { "events": [IMissionEvent, ...], "cursor": N, "replayed": boolean }
+  Response: { "events": [IMissionEvent, ...], "cursor": N, "replayed": boolean,
+              "humanInboxPolicy": { "version": 1, "legacyReviewPending": N, "guidance"?: string } }
 
   Start a run:
   {"events":[{"eventId":"evt-start-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
     "expectedRevision":0,"producerAt":1700000000000,"bindingGeneration":0,"type":"run.started",
     "payload":{"objective":"Ship Mission Control","tabId":"tab-orchestrator"}}]}
 
-  Open a question (the run binding generation must still be current):
+  Record a workspace issue (the run binding generation must still be current):
   {"events":[{"eventId":"evt-question-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
     "expectedRevision":0,"producerAt":1700000000001,"bindingGeneration":1,"type":"attention.opened",
     "payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Pick one option",
       "storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual",
       "blockingScope":"story","canContinue":true}}]}
+
+  Ordinary attention creates a durable candidate. Workers route blockers to the
+  orchestrator. The configured orchestrator checks existing instructions, authority,
+  evidence, and delegated handling. Routine setup, coordination, already-granted
+  permissions, and parked-work choices remain workspace issues.
+
+  Escalate the same item only when a human-exclusive need remains:
+  {"events":[{"eventId":"evt-question-review-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
+    "expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated",
+    "payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Pick one option",
+      "storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual",
+      "blockingScope":"story","canContinue":true,"humanReview":{"humanNeed":"decision",
+        "humanReason":"Choose the acceptable product rollout risk.",
+        "handling":"Existing rollout guidance does not choose product risk tolerance.",
+        "reviewerTabId":"tab-orchestrator"}}}]}
+
+  To record workspace handling without human escalation, send humanReview with
+  humanNeed "none", handling, and reviewerTabId. Review is a process assertion checked
+  against server-owned configuration and the current binding; it is not authenticated
+  orchestrator authorship. Reuse the item ID and report transitions, not unchanged issues.
 
   Update progress by supplying the current run revision, or update/resolve an attention item
   by supplying that item's current revision. Resolution requires the saved answer to have been
@@ -215,6 +238,7 @@ CLI equivalents:
   purplemux mission ack -w WS --run RUN --answer ANSWER --generation N --revision N --event-id EVENT --producer-at MS
   By default answers returns only current answered items whose delivery is not acknowledged,
   including the current item revision and run binding generation. --all includes history.
+  Both forms forward humanInboxPolicy so ordinary turns can review pending legacy candidates.
   Reuse the exact event ID and producer timestamp after a lost response; changing either is a conflict.
 
 ## Web-browser tabs

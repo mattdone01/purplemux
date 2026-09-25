@@ -6,8 +6,11 @@ import {
   createMissionDraft,
   deliveryStatus,
   editMissionDraft,
+  isMissionHumanInboxItem,
   mergeMissionRefreshSnapshot,
+  missionWorkspaceIssuePresentation,
   missionDraftRequest,
+  reconcileMissionDraftWithItem,
   shouldApplyMissionSnapshot,
 } from '@/components/features/mission-control/mission-control-utils';
 import type {
@@ -37,6 +40,18 @@ const item = (over: Partial<IMissionAttentionItem> = {}): IMissionAttentionItem 
   evidence: { source: 'agent', sourceId: 'event-1', observedAt: now - 10_000, confidence: 'confirmed' },
   answerId: null,
   resolution: null,
+  humanReview: {
+    humanNeed: 'decision',
+    humanReason: 'Choose the release path that matches the product risk tolerance.',
+    handling: 'The orchestrator checked the rollout plan and cannot choose product risk tolerance.',
+    reviewerTabId: 'tab-1',
+    binding: {
+      tabId: 'tab-1', providerId: 'codex', sessionId: 'session-1', generation: 1, runtimeGeneration: 'launch-1',
+    },
+    eventId: 'event-review-1',
+    reviewedAt: now - 10_000,
+  },
+  candidateReason: null,
   createdAt: now - 60_000,
   updatedAt: now - 10_000,
   ...over,
@@ -87,7 +102,11 @@ const snapshot = (): IMissionSnapshot => ({
   }],
   items: [
     item(),
-    item({ id: 'candidate-1', state: 'candidate', title: 'Historical blocker?', evidence: { source: 'bootstrap', sourceId: 'candidate', observedAt: now, confidence: 'provisional' } }),
+    item({
+      id: 'candidate-1', state: 'candidate', title: 'Historical blocker?', humanReview: null,
+      candidateReason: 'historical-context',
+      evidence: { source: 'bootstrap', sourceId: 'candidate', observedAt: now, confidence: 'provisional' },
+    }),
     item({ id: 'answered-1', state: 'answered', title: 'Choose the database', answerId: 'answer-1', revision: 2 }),
   ],
   answers: [{
@@ -185,6 +204,25 @@ describe('Mission Control draft lifecycle', () => {
     expect(edited.submissionId).toBe('22222222-2222-4222-8222-222222222222');
   });
 
+  it('retains an empty same-ID draft and submission ID when an open item moves to workspace review', () => {
+    const draft = createMissionDraft(item(), '11111111-1111-4111-8111-111111111111');
+    const candidate = item({
+      revision: 2,
+      state: 'candidate',
+      humanReview: null,
+      candidateReason: 'legacy-review',
+    });
+
+    const reconciled = reconcileMissionDraftWithItem(draft, candidate);
+
+    expect(reconciled).toMatchObject({
+      submissionId: '11111111-1111-4111-8111-111111111111',
+      expectedRevision: 1,
+      status: 'conflict',
+      currentItem: candidate,
+    });
+  });
+
   it('does not apply a snapshot older than the one already displayed', () => {
     const current = snapshot();
     expect(shouldApplyMissionSnapshot(current, { ...current, cursor: 7, generatedAt: now + 1_000 })).toBe(false);
@@ -217,6 +255,47 @@ describe('Mission Control draft lifecycle', () => {
     expect(deliveryStatus({ ...snapshot().deliveries[0], state: 'queued' }).label).toContain('Saved');
     expect(deliveryStatus(snapshot().deliveries[0]).label).toContain('Delivered');
     expect(deliveryStatus({ ...snapshot().deliveries[0], state: 'acknowledged' }).label).toContain('Acknowledged');
+  });
+
+  it('requires an explicit human review for the actionable inbox', () => {
+    const reviewed = item();
+    expect(isMissionHumanInboxItem(reviewed)).toBe(true);
+    expect(isMissionHumanInboxItem({ ...reviewed, humanReview: null })).toBe(false);
+    expect(isMissionHumanInboxItem({
+      ...reviewed,
+      humanReview: {
+        humanNeed: 'none',
+        handling: 'The orchestrator can handle this from existing instructions.',
+        reviewerTabId: 'tab-1',
+        binding: reviewed.humanReview!.binding,
+        eventId: 'event-none',
+        reviewedAt: now,
+      },
+    })).toBe(false);
+  });
+
+  it('describes migrated review and workspace handling distinctly', () => {
+    expect(missionWorkspaceIssuePresentation(item({
+      state: 'candidate', humanReview: null, candidateReason: 'legacy-review',
+    }))).toEqual({
+      badge: 'Orchestrator review required',
+      explanation: 'Previously shown in Needs you. Awaiting review of whether your input is required.',
+    });
+    expect(missionWorkspaceIssuePresentation(item({
+      state: 'candidate',
+      candidateReason: 'workspace-issue',
+      humanReview: {
+        humanNeed: 'none',
+        handling: 'The orchestrator will apply the existing rollout policy.',
+        reviewerTabId: 'tab-1',
+        binding: item().humanReview!.binding,
+        eventId: 'event-handled',
+        reviewedAt: now,
+      },
+    }))).toMatchObject({
+      badge: 'Orchestrator handling',
+      explanation: 'The orchestrator will apply the existing rollout policy.',
+    });
   });
 });
 
@@ -254,17 +333,153 @@ describe('Mission Control dashboard', () => {
     );
 
     expect(html.indexOf('Needs you')).toBeLessThan(html.indexOf('Workspaces'));
-    expect(html.indexOf('Workspaces')).toBeLessThan(html.indexOf('Provisional candidates'));
+    expect(html.indexOf('Workspaces')).toBeLessThan(html.indexOf('Workspace issues'));
     expect(html).toContain('Choose a release path');
+    expect(html).toContain('Why you&#x27;re needed');
+    expect(html).toContain('Choose the release path that matches the product risk tolerance.');
     expect(html).toContain('Delivered · awaiting acknowledgement');
-    expect(html).toContain('Provisional candidates');
-    expect(html).toContain('Awaiting orchestrator confirmation');
+    expect(html).toContain('Workspace issues');
+    expect(html).toContain('Orchestrator review required');
     expect(html).toContain('Epic closeout pending');
     expect(html).toContain('Your decisions and active work across all workspaces.');
     expect(html).toContain('1 confirmed');
     expect(html).toContain('Discover again');
     expect(html).toContain('<details');
     expect(html).not.toContain('<details open');
+  });
+
+  it('keeps a migrated same-ID draft with its workspace issue and disables submission', () => {
+    const migrated = item({
+      id: 'legacy-question',
+      revision: 2,
+      state: 'candidate',
+      title: 'Review the old escalation',
+      humanReview: null,
+      candidateReason: 'legacy-review',
+    });
+    const oldOpen = item({ id: migrated.id, revision: 1, title: migrated.title });
+    const draft = {
+      ...createMissionDraft(oldOpen, '11111111-1111-4111-8111-111111111111'),
+      text: 'Keep this answer draft',
+      status: 'conflict' as const,
+      currentItem: migrated,
+      hasAttempted: true,
+    };
+    const data = { ...snapshot(), items: [migrated], answers: [], deliveries: [] };
+    const html = renderToStaticMarkup(
+      <MissionControlDashboard
+        snapshot={data}
+        drafts={{ [migrated.id]: draft }}
+        refreshing={false}
+        bootstrapPending={false}
+        bootstrapError={null}
+        onRefresh={() => {}}
+        onDraftChange={() => {}}
+        onAdoptCurrent={() => {}}
+        onSubmit={() => {}}
+        onOpenWorkspace={() => {}}
+        onBootstrap={() => {}}
+      />,
+    );
+
+    expect(html).toContain('Previously shown in Needs you. Awaiting review of whether your input is required.');
+    expect(html).toContain('Saved answer draft');
+    expect(html).toContain('Keep this answer draft');
+    expect(html).toContain('data-disabled=""');
+    expect(draft.submissionId).toBe('11111111-1111-4111-8111-111111111111');
+  });
+
+  it('shows a competing-device answer draft outside Needs you with submission disabled', () => {
+    const open = item({ id: 'competing-answer' });
+    const original = {
+      ...createMissionDraft(open, '11111111-1111-4111-8111-111111111111'),
+      optionIds: ['staged'],
+      text: 'Keep this competing answer',
+    };
+    const answered = item({
+      id: open.id,
+      revision: 2,
+      state: 'answered',
+      answerId: 'other-answer',
+    });
+    const retained = reconcileMissionDraftWithItem(original, answered)!;
+    const data = { ...snapshot(), items: [answered], answers: [], deliveries: [] };
+    const html = renderToStaticMarkup(
+      <MissionControlDashboard
+        snapshot={data}
+        drafts={{ [answered.id]: retained }}
+        refreshing={false}
+        bootstrapPending={false}
+        bootstrapError={null}
+        onRefresh={() => {}}
+        onDraftChange={() => {}}
+        onAdoptCurrent={() => {}}
+        onSubmit={() => {}}
+        onOpenWorkspace={() => {}}
+        onBootstrap={() => {}}
+      />,
+    );
+
+    expect(retained).toMatchObject({
+      submissionId: '11111111-1111-4111-8111-111111111111',
+      text: 'Keep this competing answer',
+      currentItem: answered,
+    });
+    expect(html).toContain('No confirmed questions need an answer.');
+    expect(html).toContain('Saved drafts');
+    expect(html).toContain('Keep this competing answer');
+    expect(html).toContain('The item changed elsewhere. This draft is retained for reference and cannot be submitted.');
+    expect(html).toContain('data-disabled=""');
+  });
+
+  it('keeps a migrated draft visible and disabled after the item is cancelled', () => {
+    const oldOpen = item({ id: 'cancelled-migration' });
+    const original = {
+      ...createMissionDraft(oldOpen, '22222222-2222-4222-8222-222222222222'),
+      text: 'Keep this migrated answer',
+    };
+    const migrated = item({
+      id: oldOpen.id,
+      revision: 2,
+      state: 'candidate',
+      humanReview: null,
+      candidateReason: 'legacy-review',
+    });
+    const afterMigration = reconcileMissionDraftWithItem(original, migrated)!;
+    const cancelled = item({
+      id: oldOpen.id,
+      revision: 3,
+      state: 'cancelled',
+      humanReview: null,
+      candidateReason: 'legacy-review',
+    });
+    const retained = reconcileMissionDraftWithItem(afterMigration, cancelled)!;
+    const data = { ...snapshot(), items: [cancelled], answers: [], deliveries: [] };
+    const html = renderToStaticMarkup(
+      <MissionControlDashboard
+        snapshot={data}
+        drafts={{ [cancelled.id]: retained }}
+        refreshing={false}
+        bootstrapPending={false}
+        bootstrapError={null}
+        onRefresh={() => {}}
+        onDraftChange={() => {}}
+        onAdoptCurrent={() => {}}
+        onSubmit={() => {}}
+        onOpenWorkspace={() => {}}
+        onBootstrap={() => {}}
+      />,
+    );
+
+    expect(retained).toMatchObject({
+      submissionId: '22222222-2222-4222-8222-222222222222',
+      text: 'Keep this migrated answer',
+      currentItem: cancelled,
+    });
+    expect(html).toContain('No confirmed questions need an answer.');
+    expect(html).toContain('Saved drafts');
+    expect(html).toContain('Keep this migrated answer');
+    expect(html).toContain('data-disabled=""');
   });
 
   it('uses a single-column, overflow-safe base layout suitable for 320px screens', () => {

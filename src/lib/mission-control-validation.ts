@@ -22,6 +22,20 @@ const option = z.object({
   label: shortText,
   description: z.string().trim().max(8000).optional(),
 }).strict();
+const reviewText = z.string().trim().min(1).max(1000);
+const humanReview = z.discriminatedUnion('humanNeed', [
+  z.object({
+    humanNeed: z.literal('none'),
+    handling: reviewText,
+    reviewerTabId: id,
+  }).strict(),
+  z.object({
+    humanNeed: z.enum(['decision', 'approval', 'information', 'external-action']),
+    humanReason: reviewText,
+    handling: reviewText,
+    reviewerTabId: id,
+  }).strict(),
+]);
 const question = z.object({
   kind: z.enum(['question', 'action']),
   title: shortText,
@@ -62,8 +76,8 @@ const eventSchema = z.discriminatedUnion('type', [
     closeoutPending: z.boolean().optional(),
   }).strict().refine((value) => Object.keys(value).length > 0, 'progress update must change at least one field') }).strict(),
   z.object({ ...base, type: z.literal('run.finished'), payload: z.object({ state: z.enum(['completed', 'cancelled']), summary: z.string().trim().min(1).max(8000), closeoutPending: z.boolean() }).strict() }).strict(),
-  z.object({ ...base, type: z.literal('attention.opened'), payload: question.extend({ itemId: id }) }).strict(),
-  z.object({ ...base, type: z.literal('attention.updated'), payload: question.extend({ itemId: id }) }).strict(),
+  z.object({ ...base, type: z.literal('attention.opened'), payload: question.extend({ itemId: id, humanReview: humanReview.optional() }) }).strict(),
+  z.object({ ...base, type: z.literal('attention.updated'), payload: question.extend({ itemId: id, humanReview: humanReview.optional() }) }).strict(),
   z.object({ ...base, type: z.literal('attention.resolved'), payload: z.object({ itemId: id, resolution: z.string().trim().min(1).max(8000) }).strict() }).strict(),
   z.object({ ...base, type: z.literal('attention.cancelled'), payload: z.object({ itemId: id, reason: z.string().trim().min(1).max(8000) }).strict() }).strict(),
   z.object({ ...base, type: z.literal('answer.acknowledged'), payload: z.object({ answerId: id }).strict() }).strict(),
@@ -94,6 +108,9 @@ const parse = <T>(schema: z.ZodType<T>, input: unknown): T => {
 
 export const parseMissionEvents = (input: unknown): TMissionProducerEvent[] => {
   const events = parse(z.array(eventSchema).min(1).max(25), input);
+  if (events.some((event) => event.eventId.startsWith('system:migration:'))) {
+    throw new MissionControlError(400, 'invalid-request', 'event ID uses a reserved namespace');
+  }
   const eventIds = events.map((event) => event.eventId);
   if (new Set(eventIds).size !== eventIds.length) {
     throw new MissionControlError(400, 'invalid-request', 'duplicate event IDs in batch');

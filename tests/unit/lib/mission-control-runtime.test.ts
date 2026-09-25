@@ -70,6 +70,7 @@ import {
   MissionControlRuntime,
   type IMissionControlRuntimeStore,
   type IMissionRuntimeDeps,
+  type TMissionDispatchResult,
 } from '@/lib/mission-control-runtime';
 import type {
   IMissionBinding,
@@ -484,6 +485,8 @@ const snapshot = (runBinding: IMissionBinding | null = binding, runRevision = 4)
     evidence: { source: 'agent', sourceId: 'event-two', observedAt: NOW, confidence: 'confirmed' },
     answerId: 'answer-one',
     resolution: null,
+    humanReview: null,
+    candidateReason: null,
     createdAt: NOW,
     updatedAt: NOW,
   }],
@@ -612,7 +615,7 @@ describe('Mission Control durable delivery worker', () => {
     await Promise.resolve();
   });
 
-  it('keeps PurpleMux startup available and retries recovery after storage opens', async () => {
+  it('propagates store initialization failure before arming the worker interval', async () => {
     const harness = runtimeHarness();
     let unavailable = true;
     harness.deps.getStore = () => {
@@ -620,12 +623,57 @@ describe('Mission Control durable delivery worker', () => {
       return harness.store;
     };
 
-    await expect(harness.runtime.start()).resolves.toBeUndefined();
-    expect(harness.deps.setInterval).toHaveBeenCalledOnce();
+    await expect(harness.runtime.start()).rejects.toThrow('database unavailable');
+    expect(harness.deps.setInterval).not.toHaveBeenCalled();
 
     unavailable = false;
+    await expect(harness.runtime.start()).resolves.toBeUndefined();
+    expect(harness.deps.setInterval).toHaveBeenCalledOnce();
+    expect(harness.store.recoverDispatching).toHaveBeenCalledWith('server-restarted-during-uncertain-delivery');
+  });
+
+  it('contains a worker-pass failure after store initialization and retries on a later pass', async () => {
+    const harness = runtimeHarness();
+    let storeReads = 0;
+    harness.deps.getStore = () => {
+      storeReads += 1;
+      if (storeReads === 2) throw new Error('worker pass unavailable');
+      return harness.store;
+    };
+
+    await expect(harness.runtime.start()).resolves.toBeUndefined();
+    expect(harness.deps.setInterval).toHaveBeenCalledOnce();
+    expect(harness.store.recoverDispatching).not.toHaveBeenCalled();
+
     await harness.runtime.tick();
     expect(harness.store.recoverDispatching).toHaveBeenCalledWith('server-restarted-during-uncertain-delivery');
+  });
+
+  it('installs one interval when start is called concurrently', async () => {
+    const harness = runtimeHarness();
+
+    await Promise.all([harness.runtime.start(), harness.runtime.start()]);
+
+    expect(harness.deps.setInterval).toHaveBeenCalledOnce();
+    expect(harness.store.recoverDispatching).toHaveBeenCalledOnce();
+  });
+
+  it('does not resurrect the interval when stop runs during the initial worker pass', async () => {
+    const harness = runtimeHarness({ due: [delivery()] });
+    let completeDispatch: ((result: { delivered: true }) => void) | undefined;
+    harness.deps.dispatch = vi.fn(() => new Promise<TMissionDispatchResult>((resolve) => {
+      completeDispatch = resolve;
+    }));
+
+    const starting = harness.runtime.start();
+    const stopping = harness.runtime.stop();
+    expect(harness.deps.clearInterval).toHaveBeenCalledOnce();
+    completeDispatch?.({ delivered: true });
+    await Promise.all([starting, stopping]);
+
+    vi.mocked(harness.store.listDueDeliveries).mockReturnValue([]);
+    await harness.runtime.start();
+    expect(harness.deps.setInterval).toHaveBeenCalledTimes(2);
   });
 
   it('claims before dispatch and durably schedules a bounded readiness retry', async () => {
