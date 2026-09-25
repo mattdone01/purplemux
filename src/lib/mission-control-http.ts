@@ -1,6 +1,9 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { SESSION_COOKIE, extractCookie, verifySessionToken } from '@/lib/auth';
-import { MissionControlError } from '@/lib/mission-control-errors';
+import { isMissionControlError, MissionControlError } from '@/lib/mission-control-errors';
+import { createLogger } from '@/lib/logger';
+
+const log = createLogger('mission-control-http');
 
 export const setMissionHeaders = (res: NextApiResponse): void => {
   res.setHeader('Cache-Control', 'no-store');
@@ -42,9 +45,22 @@ export const requireMissionSameOrigin = (req: NextApiRequest): void => {
 };
 
 export const sendMissionError = (res: NextApiResponse, error: unknown): void => {
-  if (error instanceof MissionControlError) {
+  if (isMissionControlError(error)) {
+    if (error.code === 'storage-unavailable') {
+      log.error({ status: error.status, code: error.code }, 'Mission Control storage failure');
+    }
     res.status(error.status).json({ error: error.message, code: error.code, ...(error.current ? { current: error.current } : {}) });
     return;
   }
+  const errorName = error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(error.name)
+    ? error.name
+    : typeof error;
+  const candidateCode = typeof error === 'object' && error !== null && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  const errorCode = typeof candidateCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(candidateCode)
+    ? candidateCode
+    : undefined;
+  log.error({ errorName, ...(errorCode ? { errorCode } : {}) }, 'Unexpected Mission Control request failure');
   res.status(503).json({ error: 'Mission Control storage unavailable', code: 'storage-unavailable' });
 };

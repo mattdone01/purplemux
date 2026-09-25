@@ -267,7 +267,49 @@ describe('MissionControlStore', () => {
     expect(replay.replayed).toBe(true);
     expect(replay.events[0].id).toBe('event-ack');
     expect(reopened.snapshot().items[0].state).toBe('resolved');
+    const resolveAgain: TMissionProducerEvent = {
+      ...resolve,
+      eventId: 'event-resolve-again',
+      expectedRevision: 3,
+      producerAt: 1_700_000_000_400,
+    };
+    expect(() => reopened.applyEvents([resolveAgain]))
+      .toThrowError('attention item is already closed; do not retry this event unchanged');
+    expect(reopened.snapshot().items[0]).toMatchObject({ state: 'resolved', revision: 3 });
     reopened.close();
+  });
+
+  it('guides externally completed unanswered attention to cancellation without changing it', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const resolve: TMissionProducerEvent = {
+      eventId: 'event-resolve-unanswered', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
+      expectedRevision: 1, producerAt: 1_700_000_000_300, bindingGeneration: 1,
+      type: 'attention.resolved', payload: { itemId: 'item-a', resolution: 'Completed elsewhere' },
+    };
+
+    expect(() => store.applyEvents([resolve])).toThrowError(
+      /send attention\.cancelled with a reason instead; do not retry this event unchanged/,
+    );
+    expect(store.snapshot().items[0]).toMatchObject({ state: 'open', revision: 1, answerId: null });
+    expect(store.snapshot().recentEvents.map((event) => event.id)).not.toContain(resolve.eventId);
+
+    const cancel: TMissionProducerEvent = {
+      eventId: 'event-cancel-unanswered', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
+      expectedRevision: 1, producerAt: 1_700_000_000_400, bindingGeneration: 1,
+      type: 'attention.cancelled', payload: { itemId: 'item-a', reason: 'Completed elsewhere' },
+    };
+    store.applyEvents([cancel]);
+    const resolveCancelled: TMissionProducerEvent = {
+      ...resolve,
+      eventId: 'event-resolve-cancelled',
+      expectedRevision: 2,
+      producerAt: 1_700_000_000_500,
+    };
+    expect(() => store.applyEvents([resolveCancelled]))
+      .toThrowError('attention item is already closed; do not retry this event unchanged');
+    expect(store.snapshot().items[0]).toMatchObject({ state: 'cancelled', revision: 2, answerId: null });
+    store.close();
   });
 
   it('rechecks delivery eligibility around paste and preserves uncertainty across resume', () => {

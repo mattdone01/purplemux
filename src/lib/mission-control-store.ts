@@ -22,6 +22,7 @@ import type {
   TMissionProducerEvent,
 } from '@/types/mission-control';
 import {
+  isMissionControlError,
   MissionControlError,
   invalidMissionRequest,
   missionConflict,
@@ -555,7 +556,7 @@ export class MissionControlStore {
     try {
       return transaction();
     } catch (error) {
-      if (error instanceof MissionControlError) throw error;
+      if (isMissionControlError(error)) throw error;
       if (isSqliteFailure(error)) throw new MissionControlError(503, 'storage-unavailable', 'Mission Control storage unavailable');
       throw error;
     }
@@ -710,7 +711,13 @@ export class MissionControlStore {
     }
 
     if (event.type === 'attention.resolved') {
-      if (item.state !== 'answered' || !item.answerId) missionConflict('only answered attention can be resolved', item);
+      if (['resolved', 'cancelled'].includes(item.state)) {
+        missionConflict('attention item is already closed; do not retry this event unchanged', item);
+      }
+      if (!item.answerId) {
+        missionConflict('attention has no human answer to resolve; if the action completed outside Mission Control, send attention.cancelled with a reason instead; do not retry this event unchanged', item);
+      }
+      if (item.state !== 'answered') missionConflict('only answered attention can be resolved', item);
       const delivery = this.database.prepare('SELECT * FROM deliveries WHERE answer_id=?').get(item.answerId) as IDeliveryRow | undefined;
       if (!delivery || delivery.state !== 'acknowledged') missionConflict('answer must be acknowledged before resolution', item);
       const revision = item.revision + 1;
@@ -802,7 +809,7 @@ export class MissionControlStore {
     try {
       return transaction();
     } catch (error) {
-      if (error instanceof MissionControlError) throw error;
+      if (isMissionControlError(error)) throw error;
       if (isSqliteFailure(error)) throw new MissionControlError(503, 'storage-unavailable', 'Mission Control storage unavailable');
       throw error;
     }
@@ -1025,7 +1032,7 @@ export class MissionControlStore {
     try {
       return transaction();
     } catch (error) {
-      if (error instanceof MissionControlError) throw error;
+      if (isMissionControlError(error)) throw error;
       if (isSqliteFailure(error)) throw new MissionControlError(503, 'storage-unavailable', 'Mission Control storage unavailable');
       throw error;
     }
