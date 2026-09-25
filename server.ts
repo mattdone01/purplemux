@@ -13,6 +13,7 @@ import { handleTimelineConnection, gracefulTimelineShutdown } from './src/lib/ti
 import { handleSyncConnection, gracefulSyncShutdown } from './src/lib/sync-server';
 import { handleStatusConnection, gracefulStatusShutdown } from './src/lib/status-server';
 import { getStatusManager } from './src/lib/status-manager';
+import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { enqueueSystemToast } from './src/lib/sync-server';
 import { getCliToken } from './src/lib/cli-token';
@@ -97,6 +98,7 @@ const handleWsUpgrade = (
 const NO_AUTH_WS_PATHS = new Set(['/api/install']);
 
 const shutdownWs = async () => {
+  await getMissionControlRuntime().stop();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
   gracefulStatusShutdown();
@@ -372,6 +374,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   startCredentialForkSync();
   await autoResumeOnStartup();
   await getStatusManager().init();
+  await getMissionControlRuntime().start();
 
   const envHost = process.env.HOST?.trim();
   const configData = await getConfig();

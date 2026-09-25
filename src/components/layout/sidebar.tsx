@@ -5,6 +5,7 @@ import {
   ChevronsRight,
   Plus,
   FolderPlus,
+  LayoutDashboard,
   Settings,
   LogOut,
 } from 'lucide-react';
@@ -629,6 +630,20 @@ const Sidebar = () => {
 
           <div className="flex items-center justify-between px-2 pb-2">
             <div className="flex items-center gap-0.5">
+              <button
+                className={cn(
+                  'flex h-7 w-7 items-center justify-center rounded transition-colors hover:bg-sidebar-accent',
+                  isNavActive('/mission-control') && !activeWebviewId ? 'text-foreground' : 'text-muted-foreground',
+                )}
+                onClick={() => {
+                  useWebviewStore.getState().hide();
+                  router.push('/mission-control');
+                }}
+                aria-label="Mission Control"
+                title="Mission Control"
+              >
+                <LayoutDashboard className="h-3.5 w-3.5" />
+              </button>
               {sidebarItems.map((item) => {
                 const isExternal = item.url.startsWith('http://') || item.url.startsWith('https://');
                 const isActive = isExternal

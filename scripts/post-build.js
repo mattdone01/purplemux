@@ -169,7 +169,7 @@ const ensureWithDeps = (pkgName, visited = new Set()) => {
   }
 };
 
-const dynamicPackages = ['pino-roll', 'pino-pretty'];
+const dynamicPackages = ['pino-roll', 'pino-pretty', 'better-sqlite3'];
 const visited = new Set();
 for (const pkg of dynamicPackages) {
   ensureWithDeps(pkg, visited);
