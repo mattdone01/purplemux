@@ -1,14 +1,16 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('fs');
 const path = require('path');
+const { Arch } = require('builder-util');
+const { rebuildStandaloneNative } = require('./rebuild-standalone-native');
 
 exports.default = async (context) => {
-  const appRoot = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
-  const contents = path.join(appRoot, 'Contents');
-  const resources = path.join(contents, 'Resources');
+  const resources = context.packager.getResourcesDir(context.appOutDir);
   const unpacked = path.join(resources, 'app.asar.unpacked');
 
   if (process.platform === 'darwin') {
+    const appRoot = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
+    const contents = path.join(appRoot, 'Contents');
     const appExecutable = path.join(contents, 'MacOS', context.packager.appInfo.productFilename);
     const nodeExecutable = path.join(resources, 'purplemux-node');
     if (fs.existsSync(appExecutable)) {
@@ -19,6 +21,22 @@ exports.default = async (context) => {
   }
 
   if (!fs.existsSync(unpacked)) return;
+
+  const standaloneRoot = path.join(unpacked, '.next', 'standalone');
+  if (fs.existsSync(standaloneRoot)) {
+    const arch = Arch[context.arch];
+    if (!arch || arch === 'universal') {
+      throw new Error(`[after-pack] unsupported Electron native rebuild architecture: ${arch ?? context.arch}`);
+    }
+    const electronVersion = context.packager.config.electronVersion || require('electron/package.json').version;
+    const binary = await rebuildStandaloneNative({
+      standaloneRoot,
+      electronVersion,
+      platform: context.electronPlatformName,
+      arch,
+    });
+    console.log(`[after-pack] rebuilt standalone better-sqlite3 for ${context.electronPlatformName}-${arch}: ${binary}`);
+  }
 
   const removeBrokenSymlinks = (dir) => {
     let entries;

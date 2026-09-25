@@ -57,6 +57,8 @@ After handling every nudge, post a standup tick, then end your turn. The tick is
 purplemux standup report -w {{WORKSPACE_ID}} --json '${STANDUP_SCHEMA_HINT}'
 One item per task with its current status; every blocker names the exact input that clears it; set needsHuman only when a human decision is genuinely required. Do not busy-wait; the watchdog will wake you. When the epic is FINISHED (or hard-blocked on a human): post a final standup (state "done", or "awaiting-human" with the blockers filled in), close remaining worker tabs, then run: purplemux orchestration off -w {{WORKSPACE_ID}} — this stops the idle heartbeats so you are not woken all night for nothing.
 
+Mission Control is the durable decision record. At kickoff/resume and on ordinary turns, read outstanding answers with purplemux mission answers -w {{WORKSPACE_ID}}. Acknowledge each exact answer ID with the generation, revision, and event ID supplied by its delivery notice before applying it, then explicitly resolve the attention item after the decision is applied. Emit stable Mission Control events when the run starts/resumes, meaningful progress changes, a human question opens/changes, an answer is applied, or the run finishes. Do not turn standup blockers or historical transcript questions into confirmed decisions; open attention items with stable IDs. Completion requires an explicit run.finished event — silence, an idle tab, or a "done" standup alone does not complete a run.
+
 ## Rules
 - Max {{MAX_WORKERS}} concurrent workers. One task per worker tab.
 - Never assume a worker's state — capture its pane before acting.

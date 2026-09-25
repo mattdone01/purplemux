@@ -1,5 +1,8 @@
 import { execSync } from 'child_process';
+import path from 'path';
 import type { NextConfig } from "next";
+
+const projectRoot = path.resolve(__dirname);
 
 const commitHash = (() => {
   try {
@@ -14,6 +17,8 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_COMMIT_HASH: commitHash,
   },
   output: 'standalone',
+  outputFileTracingRoot: projectRoot,
+  serverExternalPackages: ['better-sqlite3'],
   bundlePagesRouterDependencies: true,
   outputFileTracingExcludes: {
     '*': [
@@ -27,9 +32,16 @@ const nextConfig: NextConfig = {
       './tests/**',
     ],
   },
+  outputFileTracingIncludes: {
+    '/api/mission-control/**/*': ['./node_modules/better-sqlite3/**/*'],
+    '/api/cli/mission-control/**/*': ['./node_modules/better-sqlite3/**/*'],
+  },
   reactStrictMode: true,
   experimental: {
     optimizePackageImports: ['react-icons'],
+  },
+  turbopack: {
+    root: projectRoot,
   },
   i18n: {
     locales: ['en', 'ko', 'ja', 'zh-CN', 'es', 'de', 'fr', 'pt-BR', 'zh-TW', 'ru', 'tr'],

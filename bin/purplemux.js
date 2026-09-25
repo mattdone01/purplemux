@@ -11,7 +11,7 @@ if (!process.env.__PMUX_PRISTINE_ENV) {
 const path = require('path');
 
 const CLI_COMMANDS = new Set([
-  'workspaces', 'workspace', 'tab', 'orchestration', 'standup', 'memory', 'mem', 'api-guide', 'help',
+  'workspaces', 'workspace', 'tab', 'orchestration', 'standup', 'mission', 'memory', 'mem', 'api-guide', 'help',
 ]);
 
 import('update-notifier')

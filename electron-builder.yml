@@ -46,8 +46,12 @@ files:
   - "!**/*.map"
 
 asar: true
+npmRebuild: true
+nativeRebuilder: sequential
 asarUnpack:
   - "**/node-pty/**"
+  - "**/better-sqlite3/**"
+  - "**/*.node"
   - ".next/standalone/**"
   - "src/config/tmux.conf"
 

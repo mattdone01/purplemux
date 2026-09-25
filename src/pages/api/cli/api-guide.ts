@@ -169,6 +169,54 @@ POST /api/cli/workspaces/<workspaceId>/standup
 GET /api/cli/workspaces/<workspaceId>/standup
   Response: { "latest": { ... } | null, "history": [...] }
 
+## Mission Control
+
+GET /api/cli/mission-control?workspaceId=WS
+  Returns the workspace-scoped durable Mission Control snapshot, including answers
+  and delivery status. Read access follows the existing workspace/allowedPeers rules.
+
+POST /api/cli/mission-control/events?workspaceId=WS
+  Requires WS's own workspace token; the global token and allowedPeers cannot write.
+  Body: { "events": [TMissionProducerEvent, ...] } (1..25 events, one atomic transaction)
+  Response: { "events": [IMissionEvent, ...], "cursor": N, "replayed": boolean }
+
+  Start a run:
+  {"events":[{"eventId":"evt-start-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
+    "expectedRevision":0,"producerAt":1700000000000,"bindingGeneration":0,"type":"run.started",
+    "payload":{"objective":"Ship Mission Control","tabId":"tab-orchestrator"}}]}
+
+  Open a question (the run binding generation must still be current):
+  {"events":[{"eventId":"evt-question-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
+    "expectedRevision":0,"producerAt":1700000000001,"bindingGeneration":1,"type":"attention.opened",
+    "payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Pick one option",
+      "storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual",
+      "blockingScope":"story","canContinue":true}}]}
+
+  Update progress by supplying the current run revision, or update/resolve an attention item
+  by supplying that item's current revision. Resolution requires the saved answer to have been
+  acknowledged first. Event IDs are stable idempotency keys: identical retries replay; changed
+  content under the same ID returns 409.
+
+  Update an attention item:
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-question-update-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true}}]}'
+
+  Resolve an acknowledged attention item:
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-question-resolve-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":2,"producerAt":1700000000004,"bindingGeneration":1,"type":"attention.resolved","payload":{"itemId":"question-1","resolution":"Applied the gradual rollout"}}]}'
+
+  Acknowledge an answer:
+  {"events":[{"eventId":"evt-ack-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
+    "expectedRevision":2,"producerAt":1700000000002,"bindingGeneration":1,"type":"answer.acknowledged",
+    "payload":{"answerId":"ANSWER_ID"}}]}
+
+CLI equivalents:
+  purplemux mission snapshot -w WS
+  purplemux mission events -w WS --json '{"events":[...]}'
+  purplemux mission answers -w WS [--run RUN] [--all]
+  purplemux mission ack -w WS --run RUN --answer ANSWER --generation N --revision N --event-id EVENT --producer-at MS
+  By default answers returns only current answered items whose delivery is not acknowledged,
+  including the current item revision and run binding generation. --all includes history.
+  Reuse the exact event ID and producer timestamp after a lost response; changing either is a conflict.
+
 ## Web-browser tabs
 
 These endpoints only work when the tab's panelType is "web-browser" and the webview

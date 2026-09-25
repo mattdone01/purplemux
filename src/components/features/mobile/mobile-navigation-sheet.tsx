@@ -5,6 +5,7 @@ import {
   FolderPlus,
   GitCompareArrows,
   Globe,
+  LayoutDashboard,
   Plus,
   Settings,
   X,
@@ -436,6 +437,20 @@ const MobileNavigationSheet = ({
           )}
           <SidebarRateLimits />
           <div className="flex items-center gap-0.5 px-3 pt-1 pb-4">
+            <button
+              className={cn(
+                'flex h-8 w-8 items-center justify-center rounded-md transition-colors hover:bg-accent',
+                router.pathname.startsWith('/mission-control') ? 'text-foreground' : 'text-muted-foreground',
+              )}
+              onClick={() => {
+                onOpenChange(false);
+                router.push('/mission-control');
+              }}
+              aria-label="Mission Control"
+              title="Mission Control"
+            >
+              <LayoutDashboard className="h-[15px] w-[15px]" />
+            </button>
             {sidebarItems.map((item) => {
               const isExternal = item.url.startsWith('http://') || item.url.startsWith('https://');
               const navPath = isExternal ? `/webview?url=${encodeURIComponent(item.url)}` : item.url;

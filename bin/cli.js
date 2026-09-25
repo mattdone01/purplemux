@@ -208,6 +208,91 @@ const cmdStandup = async (args) => {
   die("usage: standup report -w WS --json '{...}' | standup show -w WS");
 };
 
+const missionWorkspace = (args) => {
+  const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
+  if (!wsId) die('--workspace is required');
+  return wsId;
+};
+
+const cmdMission = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = missionWorkspace(rest);
+  const endpoint = `/api/cli/mission-control?workspaceId=${encodeURIComponent(wsId)}`;
+  if (sub === 'snapshot') {
+    const { body } = await api('GET', endpoint);
+    return out(body);
+  }
+  if (sub === 'answers') {
+    const runId = flagValue(rest, '--run');
+    const all = rest.includes('--all');
+    const { body } = await api('GET', endpoint);
+    const answers = body.answers.filter((answer) => !runId || answer.runId === runId);
+    const deliveries = body.deliveries.filter((delivery) => !runId || delivery.runId === runId);
+    if (!all) {
+      const items = new Map(body.items.filter((item) => item.state === 'answered').map((item) => [item.id, item]));
+      const pending = new Map(deliveries.filter((delivery) => delivery.state !== 'acknowledged').map((delivery) => [delivery.answerId, delivery]));
+      return out({
+        workspaceId: wsId,
+        answers: answers.flatMap((answer) => {
+          const item = items.get(answer.itemId);
+          const delivery = pending.get(answer.id);
+          if (!item || !delivery) return [];
+          const run = body.runs.find((candidate) => candidate.id === answer.runId);
+          return [{
+            ...answer,
+            itemRevision: item.revision,
+            bindingGeneration: run?.binding?.generation ?? null,
+            delivery,
+          }];
+        }),
+      });
+    }
+    return out({
+      workspaceId: wsId,
+      answers,
+      deliveries,
+    });
+  }
+  if (sub === 'events') {
+    const raw = flagValue(rest, '--json') || await readStdin();
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { die("mission events must be valid JSON — pass --json '{\"events\":[...]}' or pipe JSON on stdin"); }
+    const data = Array.isArray(parsed) ? { events: parsed } : parsed;
+    const { body } = await api('POST', `/api/cli/mission-control/events?workspaceId=${encodeURIComponent(wsId)}`, data);
+    return out(body);
+  }
+  if (sub === 'ack') {
+    const runId = flagValue(rest, '--run');
+    const answerId = flagValue(rest, '--answer');
+    const generation = flagValue(rest, '--generation');
+    const revision = flagValue(rest, '--revision');
+    const eventId = flagValue(rest, '--event-id');
+    const producerAt = flagValue(rest, '--producer-at');
+    if (!runId || !answerId || !eventId) die('--run, --answer, and --event-id are required');
+    if (!generation || !/^\d+$/.test(generation)) die('--generation must be a nonnegative integer');
+    if (!revision || !/^\d+$/.test(revision)) die('--revision must be a nonnegative integer');
+    if (!producerAt || !/^\d+$/.test(producerAt) || !Number.isSafeInteger(Number(producerAt))) {
+      die('--producer-at must be a nonnegative safe integer copied from the answer command');
+    }
+    const event = {
+      eventId,
+      schemaVersion: 1,
+      workspaceId: wsId,
+      runId,
+      expectedRevision: Number(revision),
+      producerAt: Number(producerAt),
+      bindingGeneration: Number(generation),
+      type: 'answer.acknowledged',
+      payload: { answerId },
+    };
+    const { body } = await api('POST', `/api/cli/mission-control/events?workspaceId=${encodeURIComponent(wsId)}`, { events: [event] });
+    return out(body);
+  }
+  die('usage: mission snapshot|events|answers|ack -w WS [options]');
+};
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -602,8 +687,17 @@ Commands:
                                             "items":[{"label":"...","status":"done|active|blocked|todo","note":"..."}],
                                             "blockers":[{"what":"...","needs":"..."}],"needsHuman":false,"next":["..."]}
   standup show -w WS                       Latest standup + history for a workspace
+  mission snapshot -w WS                   Read the workspace Mission Control snapshot
+  mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
+  mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items; --all includes history
+  mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
+                                           Acknowledge one persisted answer after reading and applying it
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
+
+Mission event examples:
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-update-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true}}]}'
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-resolve-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":2,"producerAt":1700000000004,"bindingGeneration":1,"type":"attention.resolved","payload":{"itemId":"question-1","resolution":"Applied the gradual rollout"}}]}'
 
 Environment:
   PMUX_PORT       Server port (required)
@@ -631,6 +725,8 @@ const main = async () => {
       return cmdOrchestration(args.slice(1));
     case 'standup':
       return cmdStandup(args.slice(1));
+    case 'mission':
+      return cmdMission(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);
