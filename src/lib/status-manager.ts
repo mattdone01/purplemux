@@ -6,7 +6,7 @@ import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessi
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
-import type { IAgentProvider } from '@/lib/providers/types';
+import type { IAgentProvider, IAgentRuntimeSnapshot } from '@/lib/providers/types';
 import type { IAgentHookMetaPatch, TAgentWorkStateEvent } from '@/lib/providers/types';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
@@ -31,6 +31,7 @@ import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatus
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
+import { classifyTurnEnd, isBackgroundWaitStalled } from '@/lib/turn-end';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
 import type { TLivenessEvent } from '@/types/liveness';
@@ -119,6 +120,7 @@ export class StatusManager {
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
   private updateAgentState: typeof updateTabAgentState;
   private stuckNudgedTabs = new Set<string>();
+  private transcriptFallbackLogged = new Set<string>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
 
@@ -521,7 +523,7 @@ export class StatusManager {
             this.broadcastUpdate(tab.id, existing);
             continue;
           }
-          if (!this.stuckNudgedTabs.has(tab.id) && !(await this.hasRecentJsonlActivity(existing, now))) {
+          if (!this.stuckNudgedTabs.has(tab.id) && await this.looksStalled(existing, now)) {
             this.stuckNudgedTabs.add(tab.id);
             this.nudgeOrchestrator(tab.id, existing, 'stuck').catch((err) => {
               log.warn(`stuck nudge failed: ${err instanceof Error ? err.message : err}`);
@@ -567,6 +569,7 @@ export class StatusManager {
         this.modelWatch.forget(tabId);
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
+        this.transcriptFallbackLogged.delete(tabId);
         this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
       }
@@ -801,7 +804,12 @@ export class StatusManager {
     return result;
   }
 
-  private applyCliState(tabId: string, entry: ITabStatusEntry, newState: TCliState, opts: { silent?: boolean } = {}): void {
+  private applyCliState(
+    tabId: string,
+    entry: ITabStatusEntry,
+    newState: TCliState,
+    opts: { silent?: boolean; nudge?: { kind: TOrchestrationNudgeKind; detail: string } } = {},
+  ): void {
     const prevState = entry.cliState;
     if (prevState === newState) {
       this.reconcileJsonlWatch(tabId, entry);
@@ -839,7 +847,8 @@ export class StatusManager {
     }
     const nudgeKind = nudgeKindForTransition(prevState, newState, !!opts.silent);
     if (nudgeKind) {
-      this.nudgeOrchestrator(tabId, entry, nudgeKind).catch((err) => {
+      const nudge = opts.nudge && !opts.silent ? opts.nudge : { kind: nudgeKind, detail: undefined };
+      this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail).catch((err) => {
         log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
       });
     }
@@ -1061,16 +1070,25 @@ export class StatusManager {
     return result.delivered;
   }
 
-  private async hasRecentJsonlActivity(entry: ITabStatusEntry, now: number): Promise<boolean> {
+  /**
+   * A tab busy past BUSY_STUCK_MS is stalled when its transcript has been quiet
+   * that long — unless it waits on its own background work, which is judged by
+   * that work's activity and kind (ADR-0018, L19, L25): the main transcript
+   * alone is silent while a subagent or a gate waiter runs.
+   */
+  private async looksStalled(entry: ITabStatusEntry, now: number): Promise<boolean> {
     const handle = this.runtimeHandle(entry);
-    if (!handle) return false;
+    if (!handle) return true;
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
-    if (!provider) return false;
+    if (!provider) return true;
     try {
       const snapshot = await provider.readRuntimeSnapshot(handle);
-      return snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS;
+      const activityAt = Math.max(snapshot.lastEntryTs ?? -Infinity, snapshot.backgroundActivityAt ?? -Infinity);
+      const waitVerdict = isBackgroundWaitStalled(snapshot.openBackgroundTaskKinds, Number.isFinite(activityAt) ? activityAt : null, now);
+      if (waitVerdict !== null) return waitVerdict;
+      return !(snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS);
     } catch {
-      return false;
+      return true;
     }
   }
 
@@ -1203,37 +1221,68 @@ export class StatusManager {
   }
 
   /**
-   * Resolve a `stop` that would read as ready-for-review: if the runtime still
-   * reports open background jobs / async subagents, the agent is waiting for
-   * them (measured 2026-09-02: workers were announced "ready for review"
-   * mid-gate, once per idle prompt, for hours). Stay `busy`; the next `stop`
-   * after the work returns re-evaluates. Any read failure falls back to the
-   * plain transition so a broken JSONL never hides a real finish.
+   * Classify a `stop` before announcing it (ADR-0018). A marker line
+   * (`DONE:` …) becomes a `turn-marker` nudge carrying it. No marker and open
+   * background work — the provider's own tasks, read from the whole transcript,
+   * or a live registered `tab bg` job — is WAITING: the tab stays busy and no
+   * nudge goes out, because the harness wakes the worker when the work returns
+   * (measured 2026-09-26: 95 of 108 READY nudges in one hour were such waits).
+   * Otherwise today's ready-for-review. Any read failure falls back to the
+   * plain transition so a broken transcript never hides a real finish.
    */
-  private async applyStopStateAfterBackgroundCheck(tabId: string, entry: ITabStatusEntry): Promise<void> {
-    let openBackgroundTasks = 0;
+  private async applyStopTurnEnd(tabId: string, entry: ITabStatusEntry, tmuxSession: string): Promise<void> {
+    let snapshot: IAgentRuntimeSnapshot | null = null;
     try {
+      if (!this.runtimeHandle(entry)) await this.resolveAndWatchJsonl(tabId, tmuxSession);
       const provider = getProviderByPanelType(entry.panelType);
       const handle = this.runtimeHandle(entry);
-      if (provider && handle) {
-        const snapshot = await provider.readRuntimeSnapshot(handle, { force: true });
-        openBackgroundTasks = snapshot.openBackgroundTasks ?? 0;
-      }
+      if (provider && handle) snapshot = await provider.readRuntimeSnapshot(handle, { force: true });
     } catch (err) {
-      hookLog.debug({ tabId, err: String(err) }, 'background check failed; treating stop as ready');
+      hookLog.debug({ tabId, err: String(err) }, 'turn-end read failed; treating stop as ready');
     }
+    let liveRegisteredJobs = 0;
+    try {
+      liveRegisteredJobs = (await getLivenessManager().statusForTab(tabId)).backgroundJobs.filter((job) => job.alive).length;
+    } catch (err) {
+      hookLog.debug({ tabId, err: String(err) }, 'registered job read failed');
+    }
+
     const current = this.tabs.get(tabId);
     if (!current || current !== entry) return;
     if (entry.lastEvent?.name !== 'stop') return; // a newer event already moved the tab on
-    const target: TCliState = openBackgroundTasks > 0 ? 'busy' : 'ready-for-review';
-    if (openBackgroundTasks > 0) {
-      hookLog.debug({ tabId, openBackgroundTasks }, 'stop with open background work: busy, not ready-for-review');
-    }
-    if (entry.cliState !== target) {
-      this.applyCliState(tabId, entry, target);
+
+    const turnEnd = classifyTurnEnd({
+      tail: snapshot?.lastAssistantTail,
+      transcript: snapshot !== null,
+      openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0,
+      liveRegisteredJobs,
+    });
+    const at = Date.now();
+    if (turnEnd.kind === 'waiting') {
+      entry.turnEnd = { kind: 'waiting', at, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
+      hookLog.debug({ tabId, ...entry.turnEnd }, 'stop with open background work: waiting, no nudge');
+      if (entry.cliState !== 'busy') this.applyCliState(tabId, entry, 'busy', { silent: true });
       this.persistToLayout(entry);
       this.broadcastUpdate(tabId, entry);
+      return;
     }
+    if (turnEnd.kind === 'turn-marker') {
+      entry.turnEnd = { kind: 'turn-marker', at, marker: turnEnd.lines };
+    } else {
+      entry.turnEnd = { kind: 'ready-for-review', at };
+      if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
+        this.transcriptFallbackLogged.add(tabId);
+        log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');
+      }
+    }
+    const nudge = turnEnd.kind === 'turn-marker'
+      ? { kind: 'turn-marker' as const, detail: turnEnd.lines.join('\n') }
+      : undefined;
+    if (entry.cliState !== 'ready-for-review') {
+      this.applyCliState(tabId, entry, 'ready-for-review', { nudge });
+      this.persistToLayout(entry);
+    }
+    this.broadcastUpdate(tabId, entry);
   }
 
   updateTabFromHook(tmuxSession: string, event: string, notificationType?: string): void {
@@ -1281,11 +1330,8 @@ export class StatusManager {
     );
 
     if (prevState !== newState) {
-      if (newState === 'ready-for-review' && eventName === 'stop' && this.runtimeHandle(entry)) {
-        // A turn can end with background jobs or subagents still open; the
-        // harness re-invokes the agent when they finish, so the tab is
-        // WAITING, not ready. Ask the runtime before announcing a review.
-        void this.applyStopStateAfterBackgroundCheck(tabId, entry);
+      if (newState === 'ready-for-review' && eventName === 'stop') {
+        void this.applyStopTurnEnd(tabId, entry, tmuxSession);
       } else {
         this.applyCliState(tabId, entry, newState);
         this.persistToLayout(entry);

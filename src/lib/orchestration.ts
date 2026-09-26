@@ -46,6 +46,7 @@ export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace 
 ## Event loop (your whole job)
 purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a worker changes state. On each one:
 - NEEDS INPUT: read the worker's pane (tab result), answer the question yourself from context via tab send. Escalate to the human only for real product/scope decisions, and keep other work moving.
+- "ended: DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE: …": the worker's own end line, verbatim — act on it. A worker that ends its turn with no marker while its background jobs or subagents run is WAITING and sends no nudge; the job's completion wakes it.
 - READY FOR REVIEW / turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept or send concrete fix-up instructions. On accept: immediately assign the next task to that tab, or CLOSE it (purplemux tab close). Never leave a finished or abandoned worker tab open — the tab strip is the human's dashboard, and stale tabs hide real state.
 - STALLED: read the pane. If genuinely working (long build/tests), wait. If hung, interrupt (tmux send-keys Escape) and re-prompt tighter; if that fails, close and respawn with an amended brief.
 - BACKGROUND JOB COMPLETED: verify its artifacts and acceptance criteria, then accept the result or send concrete follow-up work. Do not restart successful work.
@@ -102,6 +103,10 @@ export const buildNudgeMessage = (
       return `${NUDGE_PREFIX} ${who} NEEDS INPUT. ${capture} — then answer via tab send.`;
     case 'ready-for-review':
       return `${NUDGE_PREFIX} ${who} is READY FOR REVIEW. ${capture} — verify, then accept or send follow-up work.`;
+    // The worker's own end line, verbatim: the orchestrator acts on it without
+    // a capture turn (ADR-0018).
+    case 'turn-marker':
+      return `${NUDGE_PREFIX} ${who} ended: ${detail ?? '(marker unavailable)'} — read with: purplemux tab result -w ${workspaceId} ${tabId}`;
     case 'turn-ended':
       return `${NUDGE_PREFIX} ${who} finished its turn. ${capture} — verify, then accept or send follow-up work.`;
     case 'inactive':

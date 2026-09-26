@@ -49,6 +49,17 @@ export interface ITabStatusEntry {
   // Drives the F1 grace window that suppresses spurious inactive transitions
   // during the agent's boot-up. Runtime only — not persisted to layout.
   lastResumeOrStartedAt?: number;
+  /** How the watchdog classified the last `stop` (ADR-0018). Runtime only. */
+  turnEnd?: ITurnEndRecord | null;
+}
+
+export interface ITurnEndRecord {
+  kind: 'turn-marker' | 'waiting' | 'ready-for-review';
+  at: number;
+  /** The marker line(s) of a `turn-marker` stop. */
+  marker?: string[];
+  openBackgroundTasks?: number;
+  liveRegisteredJobs?: number;
 }
 
 export type TTabDisplayStatus = 'busy' | 'ready-for-review' | 'needs-input' | 'idle' | 'unknown';
@@ -168,7 +179,7 @@ export interface IStandupUpdateMessage {
   standup: IWorkspaceStandup;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-died' | 'model-drift';
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-died' | 'model-drift';
 
 export interface IOrchestrationNudge {
   id: string;

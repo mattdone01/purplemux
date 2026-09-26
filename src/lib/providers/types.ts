@@ -39,6 +39,12 @@ export interface IAgentPreflight {
   loggedIn: boolean;
 }
 
+export interface IOpenBackgroundTaskKinds {
+  shell: number;
+  agent: number;
+  monitor: number;
+}
+
 export interface IAgentRuntimeSnapshot {
   idle: boolean;
   stale: boolean;
@@ -56,6 +62,21 @@ export interface IAgentRuntimeSnapshot {
    * that cannot observe it keep their current behaviour.
    */
   openBackgroundTasks?: number;
+  /**
+   * Newest sign of life of that background work (task output files, subagent
+   * transcripts, Monitor events, the transcript itself); null when nothing is
+   * open. The main transcript alone is quiet while a subagent works (L19).
+   */
+  backgroundActivityAt?: number | null;
+  /** The open background work by kind; judged differently for a stall (ADR-0018). */
+  openBackgroundTaskKinds?: IOpenBackgroundTaskKinds;
+  /**
+   * The final ≤ 600 characters of the current turn's last assistant message.
+   * The turn-end marker (`DONE:` …) is its last line, which a head snippet
+   * cuts off. Null when the turn has no assistant text; absent when the
+   * provider cannot read it.
+   */
+  lastAssistantTail?: string | null;
 }
 
 export interface IAgentSessionHistoryStats {

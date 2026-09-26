@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import type { IAgentRuntimeSnapshot } from '@/lib/providers/types';
+import { TURN_TAIL_CHARS } from '@/lib/turn-end';
 import type { ICurrentAction } from '@/types/status';
 import type { TToolName } from '@/types/timeline';
 
@@ -17,6 +18,7 @@ interface ICodexRuntimeCacheEntry extends IAgentRuntimeSnapshot {
 interface ICodexScanState {
   currentAction: ICurrentAction | null;
   lastAssistantSnippet: string | null;
+  lastAssistantTail: string | null;
   reset: boolean;
   lastEntryTs: number | null;
   interrupted: boolean;
@@ -106,6 +108,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
   const state: ICodexScanState = {
     currentAction: null,
     lastAssistantSnippet: null,
+    lastAssistantTail: null,
     reset: false,
     lastEntryTs: null,
     interrupted: false,
@@ -152,6 +155,8 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
         const message = safeString(payload.message);
         if (message && !state.lastAssistantSnippet) {
           state.lastAssistantSnippet = compact(message);
+          // Walking backwards, the first message of the current turn is its last.
+          if (!state.reset) state.lastAssistantTail = message.trimEnd().slice(-TURN_TAIL_CHARS);
         }
         if (!state.reset && !state.terminalIdle && !state.currentAction && message) {
           state.currentAction = { toolName: null, summary: compact(message) };
@@ -210,6 +215,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
     idle,
     stale,
     lastAssistantSnippet: state.lastAssistantSnippet,
+    lastAssistantTail: state.lastAssistantTail,
     currentAction: state.currentAction,
     reset: state.reset,
     lastEntryTs: state.lastEntryTs,

@@ -1,6 +1,12 @@
 import fs from 'fs/promises';
 import { INTERRUPT_PREFIX, summarizeToolCall } from '@/lib/session-parser';
 import type { IAgentRuntimeSnapshot } from '@/lib/providers/types';
+import { TURN_TAIL_CHARS } from '@/lib/turn-end';
+import {
+  latestBackgroundActivityAt,
+  openBackgroundTasks,
+  readBackgroundLedger,
+} from '@/lib/providers/claude/background-ledger';
 import type { ICurrentAction } from '@/types/status';
 import type { TToolName } from '@/types/timeline';
 
@@ -18,6 +24,7 @@ interface IJsonlIdleCache {
   needsStaleRecheck: boolean;
   staleMs: number;
   lastAssistantSnippet: string | null;
+  lastAssistantTail: string | null;
   currentAction: ICurrentAction | null;
   reset: boolean;
   lastEntryTs: number | null;
@@ -26,6 +33,7 @@ interface IJsonlIdleCache {
 
 interface IAssistantExtract {
   lastAssistantSnippet: string | null;
+  lastAssistantTail: string | null;
   currentAction: ICurrentAction | null;
   reset: boolean;
 }
@@ -44,63 +52,11 @@ const g = globalThis as unknown as { __ptClaudeRuntimeSnapshotCache?: Map<string
 if (!g.__ptClaudeRuntimeSnapshotCache) g.__ptClaudeRuntimeSnapshotCache = new Map();
 const jsonlIdleCache = g.__ptClaudeRuntimeSnapshotCache;
 
-/**
- * Background work the Claude harness starts for the agent and later reports
- * back: `Bash(run_in_background)` prints "Command running in background with
- * ID: <id>", `Agent` prints "agentId: <id>", and each finishes with a
- * `<task-notification>` carrying `<task-id><id></task-id>`. A turn that ends
- * with any of them open is a wait, not a finish. Tool results and
- * notifications both arrive as `user`-typed entries.
- */
-const BACKGROUND_START_PATTERNS = [
-  /Command running in background with ID:\s*([A-Za-z0-9_-]+)/g,
-  /agentId:\s*([A-Za-z0-9_-]+)/g,
-];
-const TASK_NOTIFICATION_PATTERN = /<task-id>\s*([A-Za-z0-9_-]+)\s*<\/task-id>/g;
-
-const textBlocksOf = (entry: { message?: { content?: unknown } }): string[] => {
-  const c = entry.message?.content;
-  if (typeof c === 'string') return [c];
-  if (!Array.isArray(c)) return [];
-  const out: string[] = [];
-  for (const block of c as Array<{ type?: string; text?: string; content?: unknown }>) {
-    if (typeof block.text === 'string') out.push(block.text);
-    if (typeof block.content === 'string') out.push(block.content);
-    if (Array.isArray(block.content)) {
-      for (const inner of block.content as Array<{ text?: string }>) {
-        if (typeof inner.text === 'string') out.push(inner.text);
-      }
-    }
-  }
-  return out;
-};
-
-export const countOpenBackgroundTasks = (lines: string[]): number => {
-  const started = new Set<string>();
-  const finished = new Set<string>();
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      if (entry.isSidechain || entry.type !== 'user') continue;
-      for (const text of textBlocksOf(entry)) {
-        for (const pattern of BACKGROUND_START_PATTERNS) {
-          pattern.lastIndex = 0;
-          for (const m of text.matchAll(pattern)) started.add(m[1]);
-        }
-        TASK_NOTIFICATION_PATTERN.lastIndex = 0;
-        for (const m of text.matchAll(TASK_NOTIFICATION_PATTERN)) finished.add(m[1]);
-      }
-    } catch { continue; }
-  }
-  let open = 0;
-  for (const id of started) if (!finished.has(id)) open += 1;
-  return open;
-};
-
 const emptySnapshot = (): IAgentRuntimeSnapshot => ({
   idle: false,
   stale: false,
   lastAssistantSnippet: null,
+  lastAssistantTail: null,
   currentAction: null,
   reset: false,
   lastEntryTs: null,
@@ -131,12 +87,13 @@ const extractAssistantInfo = (lines: string[]): IAssistantExtract => {
 
       if (entry.type !== 'assistant' || !entry.message?.content) continue;
 
-      if (userMessageSeen) return { lastAssistantSnippet: null, currentAction: null, reset: true };
+      if (userMessageSeen) return { lastAssistantSnippet: null, lastAssistantTail: null, currentAction: null, reset: true };
 
       const content = entry.message.content;
       if (!Array.isArray(content)) continue;
 
       let lastAssistantSnippet: string | null = null;
+      let lastAssistantTail: string | null = null;
       let currentAction: ICurrentAction | null = null;
 
       for (let j = content.length - 1; j >= 0; j--) {
@@ -161,14 +118,16 @@ const extractAssistantInfo = (lines: string[]): IAssistantExtract => {
           lastAssistantSnippet = text.length > MAX_SNIPPET_LENGTH
             ? text.slice(0, MAX_SNIPPET_LENGTH) + '…'
             : text;
+          // The turn-end marker is the message's LAST line; the snippet is its head.
+          lastAssistantTail = text.slice(-TURN_TAIL_CHARS);
           break;
         }
       }
 
-      return { lastAssistantSnippet, currentAction, reset: false };
+      return { lastAssistantSnippet, lastAssistantTail, currentAction, reset: false };
     } catch { continue; }
   }
-  return { lastAssistantSnippet: null, currentAction: null, reset: false };
+  return { lastAssistantSnippet: null, lastAssistantTail: null, currentAction: null, reset: false };
 };
 
 const scanLines = (lines: string[], elapsed: number): IScanResult => {
@@ -209,64 +168,114 @@ const scanLines = (lines: string[], elapsed: number): IScanResult => {
   return { matched: false, idle: elapsed > STALE_MS_AWAITING_API, stale: true, needsStaleRecheck: elapsed <= STALE_MS_AWAITING_API, staleMs: STALE_MS_AWAITING_API, lastEntryTs: null, interrupted: false };
 };
 
+/**
+ * Open background work comes from the whole transcript (the ledger), never
+ * from the tail window: on 2026-09-26 every start lay beyond the 8 KB tail and
+ * all 108 replayed READY nudges read 0 open tasks. It is recomputed on every
+ * call, cache hit included, because a task ends without the tail changing.
+ */
+const withBackgroundWork = async (jsonlPath: string, snapshot: IAgentRuntimeSnapshot): Promise<IAgentRuntimeSnapshot> => {
+  try {
+    const now = Date.now();
+    const ledger = await readBackgroundLedger(jsonlPath);
+    const open = openBackgroundTasks(ledger, now);
+    const openBackgroundTaskKinds = { shell: 0, agent: 0, monitor: 0 };
+    for (const task of open) openBackgroundTaskKinds[task.kind] += 1;
+    const backgroundActivityAt = open.length > 0 ? await latestBackgroundActivityAt(jsonlPath, ledger, now) : null;
+    return { ...snapshot, openBackgroundTasks: open.length, openBackgroundTaskKinds, backgroundActivityAt };
+  } catch {
+    return snapshot;
+  }
+};
+
+const fromCache = (cached: IJsonlIdleCache, idle: boolean, stale: boolean): IAgentRuntimeSnapshot => ({
+  idle,
+  stale,
+  lastAssistantSnippet: cached.lastAssistantSnippet,
+  lastAssistantTail: cached.lastAssistantTail,
+  currentAction: cached.currentAction,
+  reset: cached.reset,
+  lastEntryTs: cached.lastEntryTs,
+  staleMs: cached.staleMs,
+  interrupted: cached.interrupted,
+});
+
+const readTailSnapshot = async (
+  jsonlPath: string,
+  options: { force?: boolean },
+): Promise<IAgentRuntimeSnapshot> => {
+  const stat = await fs.stat(jsonlPath);
+  if (stat.size === 0) return { ...emptySnapshot(), idle: true };
+
+  const cached = jsonlIdleCache.get(jsonlPath);
+  if (!options.force && cached && cached.mtimeMs === stat.mtimeMs) {
+    jsonlIdleCache.delete(jsonlPath);
+    jsonlIdleCache.set(jsonlPath, cached);
+    if (cached.idle) return fromCache(cached, true, cached.stale);
+    if (cached.needsStaleRecheck) return fromCache(cached, Date.now() - stat.mtimeMs > cached.staleMs, true);
+    return fromCache(cached, false, false);
+  }
+
+  const handle = await fs.open(jsonlPath, 'r');
+  try {
+    const elapsed = Date.now() - stat.mtimeMs;
+    const readLines = async (size: number): Promise<string[]> => {
+      const readSize = Math.min(stat.size, size);
+      const buffer = Buffer.alloc(readSize);
+      await handle.read(buffer, 0, readSize, stat.size - readSize);
+      return buffer.toString('utf-8').split('\n').filter((l) => l.trim());
+    };
+
+    const lines = await readLines(JSONL_TAIL_SIZE);
+    let scan = scanLines(lines, elapsed);
+    let extracted = extractAssistantInfo(lines);
+
+    // Nothing parsed from the tail: a final message longer than the window
+    // leaves its line cut, so the marker would be lost with it.
+    const nothingExtracted = !extracted.lastAssistantSnippet && !extracted.currentAction && !extracted.reset;
+    if ((!scan.matched || nothingExtracted) && stat.size > JSONL_TAIL_SIZE) {
+      const extLines = await readLines(JSONL_EXTENDED_TAIL_SIZE);
+      if (!scan.matched) scan = scanLines(extLines, elapsed);
+      if (nothingExtracted) extracted = extractAssistantInfo(extLines);
+    }
+
+    if (jsonlIdleCache.size >= MAX_JSONL_CACHE) {
+      jsonlIdleCache.delete(jsonlIdleCache.keys().next().value!);
+    }
+    const entry: IJsonlIdleCache = {
+      mtimeMs: stat.mtimeMs,
+      idle: scan.idle,
+      stale: scan.stale,
+      needsStaleRecheck: scan.needsStaleRecheck,
+      staleMs: scan.staleMs,
+      lastAssistantSnippet: extracted.lastAssistantSnippet,
+      lastAssistantTail: extracted.lastAssistantTail,
+      currentAction: extracted.currentAction,
+      reset: extracted.reset,
+      lastEntryTs: scan.lastEntryTs,
+      interrupted: scan.interrupted,
+    };
+    jsonlIdleCache.set(jsonlPath, entry);
+    return fromCache(entry, scan.idle, scan.stale);
+  } finally {
+    await handle.close();
+  }
+};
+
 export const readClaudeRuntimeSnapshot = async (
   jsonlPath: string,
   options: { force?: boolean } = {},
 ): Promise<IAgentRuntimeSnapshot> => {
+  let snapshot: IAgentRuntimeSnapshot;
   try {
-    const stat = await fs.stat(jsonlPath);
-    if (stat.size === 0) return { ...emptySnapshot(), idle: true };
-
-    const cached = jsonlIdleCache.get(jsonlPath);
-    if (!options.force && cached && cached.mtimeMs === stat.mtimeMs) {
-      jsonlIdleCache.delete(jsonlPath);
-      jsonlIdleCache.set(jsonlPath, cached);
-      if (cached.idle) return { idle: true, stale: cached.stale, lastAssistantSnippet: cached.lastAssistantSnippet, currentAction: cached.currentAction, reset: cached.reset, lastEntryTs: cached.lastEntryTs, staleMs: cached.staleMs, interrupted: cached.interrupted };
-      if (cached.needsStaleRecheck) {
-        const idle = Date.now() - stat.mtimeMs > cached.staleMs;
-        return { idle, stale: true, lastAssistantSnippet: cached.lastAssistantSnippet, currentAction: cached.currentAction, reset: cached.reset, lastEntryTs: cached.lastEntryTs, staleMs: cached.staleMs, interrupted: cached.interrupted };
-      }
-      return { idle: false, stale: false, lastAssistantSnippet: cached.lastAssistantSnippet, currentAction: cached.currentAction, reset: cached.reset, lastEntryTs: cached.lastEntryTs, staleMs: cached.staleMs, interrupted: cached.interrupted };
-    }
-
-    const handle = await fs.open(jsonlPath, 'r');
-    try {
-      const elapsed = Date.now() - stat.mtimeMs;
-
-      const readSize = Math.min(stat.size, JSONL_TAIL_SIZE);
-      const buffer = Buffer.alloc(readSize);
-      await handle.read(buffer, 0, readSize, stat.size - readSize);
-      const lines = buffer.toString('utf-8').split('\n').filter((l) => l.trim());
-
-      let scan = scanLines(lines, elapsed);
-      let extracted = extractAssistantInfo(lines);
-      let openBackgroundTasks = countOpenBackgroundTasks(lines);
-
-      if (!scan.matched && stat.size > JSONL_TAIL_SIZE) {
-        const extSize = Math.min(stat.size, JSONL_EXTENDED_TAIL_SIZE);
-        const extBuffer = Buffer.alloc(extSize);
-        await handle.read(extBuffer, 0, extSize, stat.size - extSize);
-        const extLines = extBuffer.toString('utf-8').split('\n').filter((l) => l.trim());
-        scan = scanLines(extLines, elapsed);
-        if (!extracted.lastAssistantSnippet && !extracted.currentAction) extracted = extractAssistantInfo(extLines);
-        openBackgroundTasks = countOpenBackgroundTasks(extLines);
-      }
-
-      if (jsonlIdleCache.size >= MAX_JSONL_CACHE) {
-        jsonlIdleCache.delete(jsonlIdleCache.keys().next().value!);
-      }
-      jsonlIdleCache.set(jsonlPath, { mtimeMs: stat.mtimeMs, idle: scan.idle, stale: scan.stale, needsStaleRecheck: scan.needsStaleRecheck, staleMs: scan.staleMs, lastAssistantSnippet: extracted.lastAssistantSnippet, currentAction: extracted.currentAction, reset: extracted.reset, lastEntryTs: scan.lastEntryTs, interrupted: scan.interrupted });
-      return { idle: scan.idle, stale: scan.stale, lastAssistantSnippet: extracted.lastAssistantSnippet, currentAction: extracted.currentAction, reset: extracted.reset, lastEntryTs: scan.lastEntryTs, staleMs: scan.staleMs, interrupted: scan.interrupted , openBackgroundTasks };
-    } finally {
-      await handle.close();
-    }
+    snapshot = await readTailSnapshot(jsonlPath, options);
   } catch {
     return emptySnapshot();
   }
+  return withBackgroundWork(jsonlPath, snapshot);
 };
 
 export const __testing = {
   extractAssistantInfo,
   scanLines,
-  countOpenBackgroundTasks,
 };

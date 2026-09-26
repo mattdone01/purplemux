@@ -1,0 +1,1 @@
+{"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-26T02:50:00.000Z", "sessionId": "sess-1", "content": "<task-notification>\n<task-id>aagent0001</task-id>\n<output-file>/tmp/claude-1000/-proj/sess-1/tasks/aagent0001.output</output-file>\n<status>completed</status>\n<summary>Agent \"story worker\" finished</summary>\n</task-notification>"}
