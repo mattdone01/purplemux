@@ -115,7 +115,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
 // Where the class alone does not tell the caller what happened.
 const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'tab-not-found': 'permanent — the tab is closed; do not retry',
-  'session-not-running': "permanent — the tab's session is not running; do not retry",
+  'session-not-running': "the tab's session is dead; do not retry — a person must restart the tab",
   'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
 }));
 
@@ -175,8 +175,17 @@ const causeCode = (err) => {
  */
 const networkFailure = (method, requestPath, err) => {
   const cause = causeCode(err);
-  const reason = cause || err?.message || String(err);
-  if ((cause && CONNECT_ERRORS.has(cause)) || method === 'GET' || method === 'HEAD') {
+  // undici reports a network failure as `fetch failed` (no answer) or
+  // `terminated` (the body stopped), with a coded cause. Anything else — a
+  // malformed URL or header, a port fetch refuses — is deterministic and was
+  // never sent: retrying cannot help, and no write can have taken effect.
+  const network = (err?.message === 'fetch failed' || err?.message === 'terminated') && cause;
+  if (!network) {
+    const detail = err?.cause?.message ? ` (${err.cause.message})` : '';
+    return fail(null, `request not sent: ${err?.message || String(err)}${detail}`);
+  }
+  const reason = cause;
+  if (CONNECT_ERRORS.has(cause) || method === 'GET' || method === 'HEAD') {
     return fail('server-unreachable', `${BASE} (${reason})`);
   }
   return fail(
@@ -208,7 +217,7 @@ const readBody = async (method, requestPath, resp, as) => {
 // rollback must not turn a closed tab back into a retryable exit 1.
 const legacyCode = (body) => {
   if (body.error === 'Tab not found') return 'tab-not-found';
-  if (body.error === 'Tab session is not running') return 'session-not-running';
+  if (body.error === 'Tab session is not running' || body.error === 'session not found') return 'session-not-running';
   if (body.error === 'agent-target-changed') return 'target-changed';
   if (body.error === 'agent-not-ready' && typeof body.detail === 'string') return body.detail;
   return null;
@@ -235,6 +244,10 @@ const api = async (method, path, data) => {
   const resp = await request(method, path, opts);
   const body = isJson(resp) ? await readBody(method, path, resp, 'json') : null;
   if (!resp.ok) failFromResponse(resp, body);
+  // Every CLI route answers JSON; a success without it is not a purplemux
+  // answer (another server on the port), and printing `null` would pass it off
+  // as one.
+  if (!isJson(resp)) fail(null, `HTTP ${resp.status} without a JSON body — is purplemux the server on port ${PORT}?`);
   return { resp, body };
 };
 
@@ -503,6 +516,8 @@ const cmdTabSteer = async (args) => {
 // The send waits for the target to reach a state that can accept a turn. An
 // agent TUI that is still booting swallows the Enter after the paste, so a
 // send that does not wait can report success over an agent that never starts.
+const MAX_CLI_WAIT_MS = 290_000;
+
 const cmdTabSend = async (args) => {
   requireEnv();
   const file = flagValue(args, '--file') || flagValue(args, '-f');
@@ -525,6 +540,11 @@ const cmdTabSend = async (args) => {
   // default would silently wait 60s for a caller that asked for something else.
   if (waitMsGiven && (waitMs === null || !/^\d+$/.test(waitMs))) {
     die('--wait-ms must be a whole number of milliseconds');
+  }
+  // Node's fetch stops waiting for response headers at 300 s. A longer wait
+  // would end in outcome-unknown while the server could still paste later.
+  if (waitMsGiven && Number(waitMs) > MAX_CLI_WAIT_MS) {
+    die(`--wait-ms must be at most ${MAX_CLI_WAIT_MS} (the CLI's HTTP client stops waiting at 300 s)`);
   }
   const wsId = resolveWsForTab(args);
   const { body } = await api(
@@ -687,7 +707,7 @@ const cmdTabBrowser = async (args) => {
       const path = `/api/cli/tabs/${tabId}/browser/screenshot?${qs}&full=${full}`;
       if (outPath) {
         const resp = await apiRaw('GET', path);
-        const buf = Buffer.from(await resp.arrayBuffer());
+        const buf = Buffer.from(await readBody('GET', path, resp, 'arrayBuffer'));
         fs.writeFileSync(outPath, buf);
         out({ saved: outPath, bytes: buf.byteLength });
       } else {
@@ -792,8 +812,8 @@ Commands:
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
-                                           for an agent tab to be able to accept a turn; --wait-ms N changes
-                                           the budget, --no-wait answers immediately. On timeout nothing is
+                                           for an agent tab to be able to accept a turn; --wait-ms N (max
+                                           290000) changes the budget, --no-wait answers immediately. On timeout nothing is
                                            pasted and the call exits 5 (readiness-timeout).
                                            Exit 4 (tab-not-found, session-not-running, target-changed) means
                                            the tab is gone: never retry it, and never loop on it.

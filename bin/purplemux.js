@@ -27,6 +27,7 @@ if (cmd && CLI_COMMANDS.has(cmd)) {
   process.env.__PMUX_APP_DIR = path.resolve(__dirname, '..');
   require('../dist/server.js');
 } else {
-  process.stderr.write(`unknown command: ${cmd}\nRun 'purplemux help' for usage.\n`);
-  process.exit(1);
+  // A usage error (exit 2) under the CLI exit-code contract (ADR-0016).
+  process.stderr.write(`error: unknown command: ${cmd}. Run 'purplemux help' for usage. (usage error — fix the command)\n`);
+  process.exit(2);
 }

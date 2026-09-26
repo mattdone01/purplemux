@@ -155,6 +155,34 @@ describe('tab send — permanent and retryable failures are distinct', () => {
 
     reply = json(409, { error: 'agent-target-changed', tabId: 'tab-x' });
     expect((await cli(['tab', 'send', '-w', 'WS', 'tab-x', 'hi'])).code).toBe(4);
+
+    reply = json(409, { error: 'Tab session is not running' });
+    expect((await cli(['tab', 'result', '-w', 'WS', 'tab-x'])).code).toBe(4);
+
+    reply = json(409, { error: 'session not found' });
+    expect((await cli(['tab', 'steer', '-w', 'WS', 'tab-x', 'fix it'])).code).toBe(4);
+  });
+
+  it('exits 1 for a success that is not JSON: another server holds the port', async () => {
+    reply = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html></html>');
+    };
+
+    const { code, stdout, stderr } = await cli(['tab', 'status', '-w', 'WS', 'tab-x']);
+
+    expect(code).toBe(1);
+    expect(stdout).toBe('');
+    expect(stderr).toContain('without a JSON body');
+  });
+
+  it('accepts the longest wait the CLI can hold open', async () => {
+    reply = json(200, { status: 'sent', submitted: true, cliState: 'idle' });
+
+    const { code } = await cli(['tab', 'send', '-w', 'WS', '--wait-ms', '290000', 'tab-x', 'hi']);
+
+    expect(code).toBe(0);
+    expect(requests[0].body).toEqual({ content: 'hi', waitMs: 290000 });
   });
 
   it('prints the success body and exits 0', async () => {
@@ -255,6 +283,39 @@ describe('server unreachable', () => {
     expect(code).toBe(6);
   });
 
+  it('exits 6 when no token is configured at all', async () => {
+    const { code, stderr } = await cli(['workspaces'], { PMUX_TOKEN: '' });
+    expect(code).toBe(6);
+    expect(stderr).toContain('server-unreachable');
+    expect(requests).toHaveLength(0);
+  });
+
+  it.each([
+    [['tab', 'status', '-w', 'WS', 'tab-x']],
+    [['tab', 'send', '-w', 'WS', 'tab-x', 'hi']],
+  ])('exits 1 for %j when the request could never be sent (a malformed port)', async (args) => {
+    const { code, stderr } = await cli(args, { PMUX_PORT: 'abc' });
+
+    expect(code).toBe(1);
+    expect(stderr).toContain('request not sent');
+    expect(stderr).not.toContain('outcome unknown');
+  });
+
+  it('exits 6 when a screenshot download loses its connection mid-body', async () => {
+    reply = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': '100000' });
+      res.write(Buffer.alloc(10));
+      setTimeout(() => res.socket?.destroy(), 20);
+    };
+
+    const { code, stderr } = await cli(
+      ['tab', 'browser', 'screenshot', '-w', 'WS', 'tab-x', '-o', path.join(home, 'partial.png')],
+    );
+
+    expect(code).toBe(6);
+    expect(stderr).toContain('server-unreachable');
+  });
+
   it('exits 6 when a read loses its connection mid-request', async () => {
     reply = (_req, res) => res.socket?.destroy();
 
@@ -279,6 +340,8 @@ describe('usage errors exit 2', () => {
     [['tab', 'send', '-w', 'WS', 'tab-x']],
     [['tab', 'send', 'tab-x', 'hi']],
     [['tab', 'send', '-w', 'WS', 'tab-x', 'hi', '--wait-ms']],
+    [['tab', 'send', '-w', 'WS', '--wait-ms', '290001', 'tab-x', 'hi']],
+    [['nonsense']],
     [['tab', 'status']],
     [['tab', 'probe', 'set', '-w', 'WS', 'tab-x']],
     [['tab', 'nonsense']],
