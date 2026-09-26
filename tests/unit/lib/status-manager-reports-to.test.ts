@@ -10,6 +10,8 @@ const workspaceStore = vi.hoisted(() => ({
 }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
 const layout = vi.hoisted(() => ({ clearReportsTo: vi.fn(async () => [] as string[]) }));
+// The alert policy's switch, pinned per test: the worker's shared temp HOME may hold another file's config.
+const alertConfig = vi.hoisted(() => ({ orchestratorOnly: true }));
 
 vi.mock('@/lib/workspace-store', () => ({
   getWorkspaceByIdCached: workspaceStore.getWorkspaceByIdCached,
@@ -17,6 +19,10 @@ vi.mock('@/lib/workspace-store', () => ({
   getWorkspacesCached: workspaceStore.getWorkspacesCached,
 }));
 vi.mock('@/lib/liveness-manager', () => ({ getLivenessManager: () => liveness }));
+vi.mock('@/lib/config-store', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/config-store')>();
+  return { ...actual, getConfig: async () => ({ ...(await actual.getConfig()), alertsOrchestratorOnly: alertConfig.orchestratorOnly }) };
+});
 vi.mock('@/lib/layout-store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/layout-store')>()),
   clearReportsTo: layout.clearReportsTo,
@@ -50,10 +56,24 @@ const setup = async (orchestration: { enabled: boolean; orchestratorTabId: strin
     nudgeOrchestrator: (tabId: string, e: ITabStatusEntry, kind: 'stuck', detail?: string) => Promise<void>;
     handleLivenessEvent: (event: TLivenessEvent) => Promise<void>;
     lastNudgeByTab: Map<string, unknown>;
+    stuckNudgedTabs: Set<string>;
   };
   const targets = () => paste.mock.calls.map(([session]) => session.replace('tmux-', ''));
   return { manager, internals, paste, targets };
 };
+
+const bgFailed = (notify?: 'self' | 'orchestrator', tabId = 'w'): TLivenessEvent => ({
+  kind: 'bg-failed',
+  job: { workspaceId: 'ws-1', tabId, pid: 42, label: 'gate', registeredAt: 0, ...(notify ? { notify } : {}) },
+  exitCode: 1,
+  stderrTail: null,
+});
+
+const bgUnknown = (notify?: 'self' | 'orchestrator'): TLivenessEvent => ({
+  kind: 'bg-exited-unknown',
+  job: { workspaceId: 'ws-1', tabId: 'w', pid: 42, label: 'gate', registeredAt: 0, ...(notify ? { notify } : {}) },
+  stderrTail: null,
+});
 
 const bgCompleted = (notify?: 'self' | 'orchestrator'): TLivenessEvent => ({
   kind: 'bg-completed',
@@ -161,5 +181,142 @@ describe('nudge routing — reportsTo and notify self (ADR-0018)', () => {
     manager.removeTab('o2');
     await internals.handleLivenessEvent(bgCompleted());
     expect(targets()).toEqual(['o2', 'o2', 'o1']);
+  });
+});
+
+describe('human pages for liveness events (story 34, consult ruling A)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    alertConfig.orchestratorOnly = true;
+    liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [] });
+  });
+
+  const withAlerts = async (orchestration = { enabled: true, orchestratorTabId: 'o1' as string | null }, w: Partial<ITabStatusEntry> = { reportsTo: 'o1' }) => {
+    const env = await setup(orchestration);
+    const alerts = vi.fn(async (_params: { kind: string }) => {});
+    (env.manager as unknown as { dispatchAlert: typeof alerts }).dispatchAlert = alerts;
+    env.manager.registerTab('o1', entry('o1'));
+    env.manager.registerTab('w', entry('w', w));
+    return { ...env, alerts };
+  };
+  const kinds = (alerts: { mock: { calls: Array<[{ kind: string }]> } }) => alerts.mock.calls.map(([p]) => p.kind);
+
+  it('a self-notified failure delivered to its tab wakes that tab and pages no one', async () => {
+    const { internals, paste, targets, alerts } = await withAlerts();
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(targets()).toEqual(['w']);
+    expect(paste.mock.calls[0][1]).toContain('code 1');
+    expect(alerts).not.toHaveBeenCalled();
+  });
+
+  it('a self-notified failure that could not be delivered still pages the human', async () => {
+    const { manager, internals, paste, alerts } = await withAlerts();
+    // A tab halted by a usage limit is never typed into (story 26): the self-notice is withheld.
+    manager.registerTab('w', entry('w', { reportsTo: 'o1', turnError: { class: 'usage-limit' } as never }));
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(paste).not.toHaveBeenCalled();
+    expect(alerts.mock.calls.map(([p]) => p.kind)).toEqual(['bg-job-died']);
+  });
+
+  it('a vanished self-notified job, and a failure notified to the orchestrator, still page', async () => {
+    const { internals, alerts } = await withAlerts();
+    await internals.handleLivenessEvent(bgUnknown('self'));
+    await internals.handleLivenessEvent(bgFailed());
+    await internals.handleLivenessEvent(bgFailed('orchestrator'));
+    expect(alerts.mock.calls.map(([p]) => p.kind)).toEqual(['bg-job-unknown', 'bg-job-died', 'bg-job-died']);
+  });
+
+  // Review r1 finding 1: tmux accepts the keys whether or not a live agent reads them.
+  it('a self-notified failure typed into a shell or an exited agent still pages', async () => {
+    for (const w of [{ panelType: 'terminal' as const }, { cliState: 'inactive' as const }, { cliState: 'unknown' as const }]) {
+      const { internals, targets, alerts } = await withAlerts(undefined, { reportsTo: 'o1', ...w });
+      await internals.handleLivenessEvent(bgFailed('self'));
+      expect(targets()).toEqual(['w']);
+      expect(kinds(alerts)).toEqual(['bg-job-died']);
+    }
+  });
+
+  // Review r1 finding 2: the woken tab's turn end must reach someone, or the page is the only word.
+  it('a delivered self-notified failure still pages when the tab has nowhere to escalate', async () => {
+    const off = await withAlerts({ enabled: false, orchestratorTabId: null }, {});
+    await off.internals.handleLivenessEvent(bgFailed('self'));
+    expect(off.targets()).toEqual(['w']);
+    expect(kinds(off.alerts)).toEqual(['bg-job-died']);
+
+    // The only target is halted by a usage limit: its nudge would be withheld (story 26).
+    const halted = await withAlerts();
+    halted.manager.registerTab('o1', entry('o1', { turnError: { class: 'usage-limit' } as never }));
+    await halted.internals.handleLivenessEvent(bgFailed('self'));
+    expect(halted.targets()).toEqual(['w']);
+    expect(kinds(halted.alerts)).toEqual(['bg-job-died']);
+  });
+
+  // Review r2 finding 1: an orchestrator id may name a closed tab or an exited agent.
+  it('a delivered self-notified failure still pages when the orchestrator is gone or not a live agent', async () => {
+    // The last: an orchestrator id that names another workspace's live agent (review r3).
+    for (const o1 of [null, { cliState: 'inactive' as const }, { panelType: 'terminal' as const }, { workspaceId: 'ws-2' }]) {
+      const env = await withAlerts(undefined, {});
+      if (o1 === null) env.manager.removeTab('o1');
+      else env.manager.registerTab('o1', entry('o1', o1));
+      await env.internals.handleLivenessEvent(bgFailed('self'));
+      expect(env.targets()).toEqual(['w']);
+      expect(kinds(env.alerts)).toEqual(['bg-job-died']);
+    }
+  });
+
+  // Review r2 finding 2: the alert policy is no substitute for a live target (no stall alert follows).
+  it('a delivered self-notified failure still pages when only the alert policy would hear the tab', async () => {
+    // The orchestrator's own gate: its turn end pushes, but nothing covers it if it hangs busy.
+    const orch = await withAlerts();
+    await orch.internals.handleLivenessEvent(bgFailed('self', 'o1'));
+    expect(orch.targets()).toEqual(['o1']);
+    expect(kinds(orch.alerts)).toEqual(['bg-job-died']);
+
+    // An un-orchestrated worker when the policy alerts every agent tab.
+    alertConfig.orchestratorOnly = false;
+    const worker = await withAlerts({ enabled: false, orchestratorTabId: null }, {});
+    await worker.internals.handleLivenessEvent(bgFailed('self'));
+    expect(worker.targets()).toEqual(['w']);
+    expect(kinds(worker.alerts)).toEqual(['bg-job-died']);
+  });
+
+  it('a delivered self-notified failure pages no one when the orchestrator is a live agent', async () => {
+    const { internals, targets, alerts } = await withAlerts(undefined, {});
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(targets()).toEqual(['w']);
+    expect(alerts).not.toHaveBeenCalled();
+  });
+
+  // CONFIRM residual: a stuck nudge spent earlier in the same wait must not leave a hang after the
+  // wake uncovered, so the skip re-arms it; a page that goes out leaves the latch alone.
+  it('a skipped page re-arms the woken tab\'s stuck nudge', async () => {
+    const skipped = await withAlerts(undefined, {});
+    skipped.internals.stuckNudgedTabs.add('w');
+    await skipped.internals.handleLivenessEvent(bgFailed('self'));
+    expect(skipped.alerts).not.toHaveBeenCalled();
+    expect(skipped.internals.stuckNudgedTabs.has('w')).toBe(false);
+
+    const paged = await withAlerts({ enabled: false, orchestratorTabId: null }, {});
+    paged.internals.stuckNudgedTabs.add('w');
+    await paged.internals.handleLivenessEvent(bgFailed('self'));
+    expect(kinds(paged.alerts)).toEqual(['bg-job-died']);
+    expect(paged.internals.stuckNudgedTabs.has('w')).toBe(true);
+  });
+
+  // The ruling's premise, chained: the woken tab's next stop still escalates to its target.
+  it('after a delivered self-notified failure, the tab\'s next stop nudges its target', async () => {
+    const { manager, internals, targets, alerts } = await withAlerts(undefined, {
+      reportsTo: 'o1', cliState: 'busy', jsonlPath: null, lastEvent: { name: 'prompt-submit', at: Date.now(), seq: 1 }, eventSeq: 1,
+    });
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(alerts).not.toHaveBeenCalled();
+    manager.updateTabFromHook('tmux-w', 'stop');
+    await vi.waitFor(() => expect(targets()).toEqual(['w', 'o1']), { timeout: 5000 });
+  });
+
+  it('a completed self-notified job pages no one (unchanged)', async () => {
+    const { internals, alerts } = await withAlerts();
+    await internals.handleLivenessEvent(bgCompleted('self'));
+    expect(alerts).not.toHaveBeenCalled();
   });
 });

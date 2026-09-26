@@ -99,6 +99,19 @@ describe('purplemux watch — the installed CLI against the real watch routes (A
     return JSON.parse(raw).items as Array<{ targetTabId: string; line: string; kind: string }>;
   };
 
+  it('labels a watch owned through a hook-time identity hook-identity in watch list (story 36)', async () => {
+    const { revokeTabToken, mintHookTabToken } = await import('@/lib/tab-token');
+    await revokeTabToken('tab-b'); // tab-b as a tab created before tab tokens
+    const hook = await mintHookTabToken({ workspaceId: 'ws-b', tabId: 'tab-b' }, 'pt-ws-b-pane-1-tab-b');
+    if (!hook.ok) throw new Error(hook.reason);
+    const asHook = { PMUX_PORT: tabB.PMUX_PORT, PMUX_TAB_TOKEN: hook.token };
+    const made = await cli(['watch', 'lease', 'merge:x/hook', '--until', 'free'], asHook);
+    expect(made.code, made.stderr).toBe(0);
+    const { watch } = JSON.parse(made.stdout);
+    expect(watch).toMatchObject({ verified: false, identity: 'hook' });
+    expect((await cli(['watch', 'list'], asHook)).stdout).toMatch(new RegExp(`${watch.id} .* owner=ws-b/tab-b \\([a-z-]+, hook-identity\\)`));
+  });
+
   it('B waits for merge:x/y held by A; when A releases, the release event alone delivers B one notice', async () => {
     const { startWatches } = await import('@/lib/watch-manager');
     // No timer: only the lease release event can deliver the notice.

@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
+import { brandCodedError } from '@/lib/coded-error';
 import { LEASE_NAME } from '@/lib/lease-policy';
 import type { IWatch, IWatchesState, TWatchErrorCode, TWatchKind, TWatchUntil } from '@/types/watch';
 import type { TCallerIdentity } from '@/types/identity';
@@ -13,6 +14,8 @@ import type { TCallerIdentity } from '@/types/identity';
 export class WatchError extends Error {
   constructor(readonly code: TWatchErrorCode, message: string) {
     super(message);
+    // The brand the routes check (`isCodedError`): the class itself differs across bundles.
+    brandCodedError(this, 'WatchError');
   }
 }
 
