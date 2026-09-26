@@ -283,6 +283,34 @@ POST /api/cli/inbox/<id>/retry
   for another workspace's item; 409 { "code": "inbox-not-held" } (CLI exit 3) when the item
   is not held, or when a newer notice with its key is already queued for that tab.
 
+## Fleet config (ADR-0019)
+
+Versioned string values that tools read at call time, so changing one needs no message to
+anyone: no broadcast, no nudge, no inbox notice. Every change is audited to
+~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][a-z0-9.-]{1,63}$; values are one
+line of text, at most 256 characters, parsed by the reader. Writes need the admin token or the
+tab that is its workspace's enabled orchestrator (cooperative authority, not a boundary).
+
+Keys in use:
+  gate.slots   The host gate slot cap. skills gate.sh reads it after --slots and
+               $GATE_HOST_SLOTS, before its default 3 (story 25). Change it with
+               \`purplemux config set gate.slots <n>\` and tell nobody.
+
+GET /api/cli/fleet-config
+  Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
+GET /api/cli/fleet-config?key=KEY
+  Response: { "key", "value", "version", "setAt", "setBy" }; 404 { "code": "config-not-found" } (CLI exit 7) when unset.
+GET /api/cli/fleet-config?history=1[&key=KEY]
+  The last 200 changes, oldest first: { "history": [{ "key", "oldValue", "newValue", "version", "at", "by" }] }.
+  An unset shows as newValue null.
+PUT /api/cli/fleet-config/KEY   { "value": "6", "expectedVersion"?: 4 }
+  Response: { "key", "value": {...}, "changed" }. Setting the value a key already holds changes
+  nothing (no version, no audit line). 400 config-invalid (exit 2); 403 forbidden (exit 3);
+  409 config-version-conflict (exit 3) when expectedVersion is not the stored version (0 = never set).
+DELETE /api/cli/fleet-config/KEY   { "expectedVersion"?: 5 }
+  Same authority. 404 config-not-found (exit 7) when unset. The version keeps counting, so a key
+  set again never repeats a version.
+
 ## Orchestration
 
 GET /api/cli/workspaces/<workspaceId>/orchestration
