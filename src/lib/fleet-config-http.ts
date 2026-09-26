@@ -61,14 +61,14 @@ export const putValue = async (
   rawKey: unknown,
   body: Record<string, unknown>,
   authority: IFleetConfigAuthority = defaultAuthority,
-): Promise<{ key: string; value: IFleetConfigValue; changed: boolean }> => {
+): Promise<{ key: string; version: number; value: IFleetConfigValue; changed: boolean }> => {
   const key = checkKey(rawKey);
   const value = checkValue(body.value);
   const expectedVersion = checkExpectedVersion(body.expectedVersion);
   await requireWriter(caller, authority);
   const { state, change } = await mutateFleetConfig((s) => setValue(s, { key, value, expectedVersion }, setterOf(caller), authority.now()));
   if (change) await audit(change, caller);
-  return { key, value: state.values[key], changed: change !== null };
+  return { key, version: state.values[key].version, value: state.values[key], changed: change !== null };
 };
 
 export const deleteValue = async (
@@ -76,13 +76,13 @@ export const deleteValue = async (
   rawKey: unknown,
   body: Record<string, unknown>,
   authority: IFleetConfigAuthority = defaultAuthority,
-): Promise<{ key: string; unset: IFleetConfigChange }> => {
+): Promise<{ key: string; version: number; unset: IFleetConfigChange }> => {
   const key = checkKey(rawKey);
   const expectedVersion = checkExpectedVersion(body.expectedVersion);
   await requireWriter(caller, authority);
   const { change } = await mutateFleetConfig((s) => unsetValue(s, { key, expectedVersion }, setterOf(caller), authority.now()));
   await audit(change!, caller);
-  return { key, unset: change! };
+  return { key, version: change!.version, unset: change! };
 };
 
 /** `?key=` answers one value (404 when unset); `?history=1` the change log, optionally for one key. */

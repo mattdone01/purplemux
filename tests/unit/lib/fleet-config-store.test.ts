@@ -89,7 +89,7 @@ describe('fleet config transitions (ADR-0019)', () => {
       expect(codeOf(() => checkKey(bad))).toBe('config-invalid');
     }
     expect(checkValue('x'.repeat(256))).toHaveLength(256);
-    for (const bad of ['', 'x'.repeat(257), 'six\nseven', 'a‮b', 6, null]) {
+    for (const bad of ['', 'x'.repeat(257), 'six\nseven', 'a\u202Eb', 'a\u2028b', 'a\u2029b', '\ud800', 'a\uE000', 6, null]) {
       expect(codeOf(() => checkValue(bad))).toBe('config-invalid');
     }
     expect(checkExpectedVersion(undefined)).toBeUndefined();
@@ -120,7 +120,18 @@ describe('fleet config file store', () => {
   it('refuses a malformed file rather than reading it as empty, and never overwrites it', async () => {
     const store = await import('@/lib/fleet-config-store');
     await fs.mkdir(path.dirname(store.fleetConfigFile()), { recursive: true });
-    for (const raw of ['{', '{"values":{}}', '{"values":{"Bad":{"value":"1","version":1,"setBy":{}}},"versions":{},"history":[]}']) {
+    const good = (over: Record<string, unknown>) => JSON.stringify({
+      values: { 'gate.slots': { value: '6', version: 2, setAt: 1, setBy: {} } }, versions: { 'gate.slots': 2 }, history: [], ...over,
+    });
+    for (const raw of [
+      '{',
+      '{"values":{}}',
+      '{"values":{"Bad":{"value":"1","version":1,"setBy":{}}},"versions":{},"history":[]}',
+      good({ versions: { 'gate.slots': '2' } }),
+      good({ versions: {} }),
+      good({ versions: { 'gate.slots': 1 } }),
+      good({ history: ['x'] }),
+    ]) {
       await fs.writeFile(store.fleetConfigFile(), raw);
       await expect(store.readFleetConfig()).rejects.toBeInstanceOf(store.FleetConfigFileError);
       await expect(store.mutateFleetConfig((s) => store.setValue(s, { key: 'gate.slots', value: '6' }, ORCH, 1)))

@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { drainRouteLocks, resetRouteGlobals, serveLeaseRoutes, writeFixture } from '../api/leases-harness';
+import { callRoute, drainRouteLocks, resetRouteGlobals, serveLeaseRoutes, writeFixture } from '../api/leases-harness';
 
 // Story 24 end to end: the installed CLI (`bin/purplemux.js`) against the real
 // fleet-config routes and store in a temp HOME (ADR-0019).
@@ -63,7 +63,13 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     await writeFixture(mockHome.value, [
       { id: 'ws-a', name: 'portfolio', tabs: [{ id: 'tab-o', name: 'orchestrator' }, { id: 'tab-w', name: 'worker' }], orchestratorTabId: 'tab-o' },
       { id: 'ws-b', name: 'other', tabs: [{ id: 'tab-b', name: 'other orchestrator-less' }] },
+      { id: 'ws-c', name: 'disabled', tabs: [{ id: 'tab-d', name: 'was the orchestrator' }] },
     ]);
+    // ws-c names an orchestrator tab but has orchestration turned off.
+    const wsFile = path.join(mockHome.value, '.purplemux', 'workspaces.json');
+    const doc = JSON.parse(await fs.readFile(wsFile, 'utf-8'));
+    doc.workspaces.find((w: { id: string }) => w.id === 'ws-c').orchestration = { enabled: false, orchestratorTabId: 'tab-d' };
+    await fs.writeFile(wsFile, JSON.stringify(doc));
     const { ensureTabToken } = await import('@/lib/tab-token');
     const { getCliToken } = await import('@/lib/cli-token');
     server = await serveLeaseRoutes({
@@ -115,6 +121,37 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     expect((await cli(['config', 'get', 'gate.slots'], worker)).code).toBe(7);
     expect((await cli(['config', 'set', 'gate.slots', '6'], admin)).code).toBe(0);
     expect((await cli(['config', 'unset', 'gate.slots'], worker)).code).toBe(3);
+  });
+
+  it('an orchestrator tab of a workspace with orchestration off is refused', async () => {
+    const { ensureTabToken } = await import('@/lib/tab-token');
+    const disabled = { PMUX_PORT: orch.PMUX_PORT, PMUX_TAB_TOKEN: await ensureTabToken({ workspaceId: 'ws-c', tabId: 'tab-d' }, 'pt-ws-c-pane-1-tab-d') };
+    const r = await cli(['config', 'set', 'gate.slots', '6'], disabled);
+    expect(r.code).toBe(3);
+    expect(r.stderr).toContain('forbidden');
+  });
+
+  it('a legacy tab (workspace token + X-Pmux-Session) writes only as the orchestrator, audited unverified', async () => {
+    const { getWorkspaceToken } = await import('@/lib/workspace-token');
+    const handler = (await import('@/pages/api/cli/fleet-config/[key]')).default;
+    const put = (session: string) => callRoute(handler, {
+      method: 'PUT',
+      headers: { 'x-pmux-token': getWorkspaceToken('ws-a'), 'x-pmux-session': session },
+      query: { key: 'gate.slots' },
+      body: { value: '6' },
+    });
+    expect(await put('pt-ws-a-pane-1-tab-w')).toMatchObject({ status: 403, body: { code: 'forbidden' } });
+    expect(await put('pt-ws-a-pane-1-tab-o')).toMatchObject({ status: 200, body: { key: 'gate.slots', version: 1, changed: true } });
+    await drainRouteLocks();
+    expect(await auditLines()).toMatchObject([{ event: 'fleet-config-set', by: { workspaceId: 'ws-a', tabId: 'tab-o', admin: false, verified: false } }]);
+  });
+
+  it('a malformed store exits 1 with nothing on stdout, never 7 (unset) and never read as empty', async () => {
+    await fs.writeFile(path.join(mockHome.value, '.purplemux', 'fleet-config.json'), '{"values":');
+    const r = await cli(['config', 'get', 'gate.slots'], worker);
+    expect(r).toMatchObject({ code: 1, stdout: '' });
+    expect(r.stderr).toContain('config-store-unreadable');
+    expect((await cli(['config', 'set', 'gate.slots', '6'], orch)).code).toBe(1);
   });
 
   it('a stale --expect-version exits 3 config-version-conflict and leaves the value', async () => {

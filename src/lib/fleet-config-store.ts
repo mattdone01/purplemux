@@ -39,15 +39,16 @@ export const checkKey = (raw: unknown): string => {
 };
 
 /**
- * A value is one line of text a caller parses. Control and format characters
- * are refused, not cleaned: a tool reading `config get` must see exactly what
- * was set.
+ * A value is one line of text a caller parses. Control, format, surrogate,
+ * private-use and unassigned characters (\p{C}) and the Unicode line and
+ * paragraph separators are refused, not cleaned: a tool reading `config get`
+ * must see exactly what was set (review round 1).
  */
 export const checkValue = (raw: unknown): string => {
   if (typeof raw !== 'string' || raw === '') throw new FleetConfigError('config-invalid', 'value must be non-empty text (use unset to remove a key)');
   const length = [...raw].length;
   if (length > FLEET_VALUE_MAX) throw new FleetConfigError('config-invalid', `value is ${length} characters; the limit is ${FLEET_VALUE_MAX}`);
-  if (/[\p{Cc}\p{Cf}]/u.test(raw)) throw new FleetConfigError('config-invalid', 'value must not contain control or format characters');
+  if (/[\p{C}\p{Zl}\p{Zp}]/u.test(raw)) throw new FleetConfigError('config-invalid', 'value must be one line of printable text (no control, format or separator characters)');
   return raw;
 };
 
@@ -110,7 +111,7 @@ export const unsetValue = (
   const old = state.values[input.key];
   if (!old) throw new FleetConfigError('config-not-found', `${input.key} is not set`);
   requireVersion(state, input.key, input.expectedVersion);
-  const change: IFleetConfigChange = { key: input.key, oldValue: old.value, newValue: null, version: old.version + 1, at: now, by };
+  const change: IFleetConfigChange = { key: input.key, oldValue: old.value, newValue: null, version: versionOf(state, input.key) + 1, at: now, by };
   return { state: record(state, change, null), change };
 };
 
@@ -139,7 +140,7 @@ const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v =
 const isValue = (v: unknown): v is IFleetConfigValue =>
   isRecord(v) && typeof v.value === 'string' && Number.isSafeInteger(v.version) && isRecord(v.setBy);
 
-/** Absent file = nothing set; a file of any other shape is refused, never read as empty. */
+/** Absent file = nothing set; a malformed value, version or history entry is refused, never read as empty. */
 export const readFleetConfig = async (): Promise<IFleetConfigState> => {
   const file = fleetConfigFile();
   let raw: string;
@@ -162,6 +163,13 @@ export const readFleetConfig = async (): Promise<IFleetConfigState> => {
   }
   const bad = Object.entries(parsed.values).find(([k, v]) => !FLEET_KEY.test(k) || !isValue(v));
   if (bad) throw refuse(`has a malformed value for ${JSON.stringify(bad[0])}`);
+  // Every set key has a version at least its value's, and every version is a whole number: a
+  // hand-edited "4" would make the next version "41", a missing one would repeat a version.
+  const versions = parsed.versions as Record<string, unknown>;
+  const badVersion = Object.entries(versions).find(([k, v]) => !FLEET_KEY.test(k) || !Number.isSafeInteger(v) || (v as number) < 0)
+    ?? Object.entries(parsed.values as Record<string, IFleetConfigValue>).find(([k, v]) => !Number.isSafeInteger(versions[k]) || (versions[k] as number) < v.version);
+  if (badVersion) throw refuse(`has a malformed version for ${JSON.stringify(badVersion[0])}`);
+  if (parsed.history.some((c) => !isRecord(c) || typeof c.key !== 'string' || !Number.isSafeInteger(c.version))) throw refuse('has a malformed history entry');
   return parsed as unknown as IFleetConfigState;
 };
 

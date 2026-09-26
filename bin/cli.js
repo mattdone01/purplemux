@@ -561,7 +561,6 @@ const leaseName = (args, what = 'NAME') => {
   return positional[0];
 };
 
-// The inbox (ADR-0012): server notices queued for this workspace's tabs.
 // Fleet config (ADR-0019): versioned values tools read at call time. A change
 // is audited and sent to nobody.
 const CONFIG_USAGE = 'usage: config get KEY | list [--json] | set KEY VALUE [--expect-version N] | unset KEY [--expect-version N] | history [KEY] [--json]';
@@ -647,6 +646,7 @@ const cmdConfig = async (args) => {
   }
 };
 
+// The inbox (ADR-0012): server notices queued for this workspace's tabs.
 const cmdInbox = async (args) => {
   requireEnv();
   const sub = args[0];
