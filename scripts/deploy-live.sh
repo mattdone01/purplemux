@@ -9,7 +9,8 @@
 #                       [--ignore-tab WS/TAB]... [--outside-tab]
 #
 # Steps: build ~/.purplemux/releases/<sha> (a detached worktree of the primary
-# repository) → take the deploy:purplemux lease when the running server has
+# repository) → run the release's own acceptance gate (scripts/acceptance/run.sh:
+# an isolated instance of the release on a spare port and a throwaway HOME) → take the deploy:purplemux lease when the running server has
 # leases → wait until no agent tab is mid-turn (the tab in PMUX_TAB_ID and every
 # --ignore-tab are excluded) → back up ~/.purplemux state → point `current` at
 # the release, `previous` at the old one → restart → health gate → rollback on
@@ -19,7 +20,7 @@
 #   0  deployed, rolled back on demand, or dry run finished
 #   1  unexpected error (lease probe or acquire failed, backup failed)
 #   2  refused before the live service was touched (usage, ref, disk, build,
-#      own tab unknown, drop-in drift)
+#      acceptance failed or missing, own tab unknown, drop-in drift)
 #   3  refused by state: quiet timeout, deploy lease held, another deploy running
 #   4  restart or health gate failed and the previous release was restored
 #      (VERDICT=rolled-back), or the rollback failed too (rollback-failed /
@@ -33,6 +34,8 @@
 # Paths: DEPLOY_REPO (primary checkout), DEPLOY_DROPIN, DEPLOY_UNIT_FILE,
 # DEPLOY_CLI_LINK, DEPLOY_SQLITE_MODULE, DEPLOY_PORT, DEPLOY_PROC_ROOT (/proc). Timing: DEPLOY_POLL_S (15),
 # DEPLOY_HEALTH_TIMEOUT_S (90), DEPLOY_HEALTH_INTERVAL_S (3), DEPLOY_MIN_FREE_GIB (5).
+# Acceptance: DEPLOY_ACCEPTANCE (default <release>/scripts/acceptance/run.sh),
+# DEPLOY_BASH_GUARD (a bash-guard.py the gate also exercises; optional).
 
 set -u
 set -o pipefail
@@ -108,6 +111,7 @@ S_ROLLBACK_HEALTH=""
 S_QUIET="-"
 S_LEASE="-"
 S_BACKUP="-"
+S_ACCEPTANCE="-"
 
 purplemux_cli() {
   if [[ -n "${DEPLOY_PURPLEMUX:-}" ]]; then
@@ -146,6 +150,7 @@ finish() {
   echo "QUIET=$S_QUIET"
   echo "LEASE=$S_LEASE"
   echo "BACKUP=$S_BACKUP"
+  echo "ACCEPTANCE=$S_ACCEPTANCE"
   ((INTERRUPTED)) && echo "INTERRUPTED=deferred until the swap window closed"
   echo "VERDICT=$verdict"
   rm -rf "$WORK"
@@ -300,6 +305,33 @@ if ((!ROLLBACK)); then
     ((reused)) || "$GIT" -C "$REPO" worktree remove --force "$RELEASE_DIR" >>"$BUILD_LOG" 2>&1
     refuse 2 BUILD-FAILED "pnpm install/build failed in $RELEASE_DIR (see $BUILD_LOG)" "a clean build; the live service is untouched"
   fi
+fi
+
+# ---- acceptance gate (story 07): the release proves itself in isolation first ----
+# The release's OWN harness runs, so the checks match the code they judge. It starts
+# the release on a spare port with a throwaway HOME and tmux socket; the live service,
+# its tabs and its state are not touched, and a failure refuses here with exit 2.
+# A rollback returns to a release that already ran live, so it skips the gate.
+
+if ((!ROLLBACK)); then
+  ACCEPTANCE="${DEPLOY_ACCEPTANCE:-$RELEASE_DIR/scripts/acceptance/run.sh}"
+  [[ -x "$ACCEPTANCE" ]] || refuse 2 ACCEPTANCE-MISSING "no executable $ACCEPTANCE" \
+    "the release's scripts/acceptance/run.sh (a release older than story 07 cannot be deployed forward)"
+  ACCEPTANCE_LOG="$PMUX_HOME/logs/acceptance-$(date -u +%Y%m%dT%H%M%SZ)-$SHORT.log"
+  echo "ACCEPTANCE_LOG=$ACCEPTANCE_LOG"
+  acceptance_args=(--candidate "$RELEASE_DIR" --log "$ACCEPTANCE_LOG")
+  [[ -n "${DEPLOY_BASH_GUARD:-}" ]] && acceptance_args+=(--bash-guard "$DEPLOY_BASH_GUARD" --require-bash-guard)
+  # 9>&-: the gate and its candidate server must never hold deploy-live.lock (review round 1).
+  if "$ACCEPTANCE" "${acceptance_args[@]}" >/dev/null 2>&1 9>&-; then
+    S_ACCEPTANCE="pass ($(grep -m 1 -o 'checks=[0-9]* passed=[0-9]* failed=[0-9]* skipped=[0-9]*' "$ACCEPTANCE_LOG" 2>/dev/null || echo 'see log'); $ACCEPTANCE_LOG)"
+  else
+    grep -E '^(FAIL|ACCEPTANCE=)' "$ACCEPTANCE_LOG" >&2 2>/dev/null || tail -n 20 "$ACCEPTANCE_LOG" >&2 2>/dev/null
+    S_ACCEPTANCE="fail ($ACCEPTANCE_LOG)"
+    refuse 2 ACCEPTANCE-FAILED "the release failed its isolated acceptance run (log $ACCEPTANCE_LOG)" \
+      "ACCEPTANCE=PASS; the live service is untouched"
+  fi
+else
+  S_ACCEPTANCE="skipped (rollback)"
 fi
 
 # ---- lease ----

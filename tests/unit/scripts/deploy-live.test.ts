@@ -94,6 +94,20 @@ exit 0
   journalctl: `#!/usr/bin/env bash
 echo "journal: server crashed on boot"
 `,
+  // The release's acceptance gate (scripts/acceptance/run.sh): records its arguments and the
+  // restarts seen so far, writes a verdict to --log, and fails when asked to.
+  acceptance: `#!/usr/bin/env bash
+fd9=closed; [[ -e /proc/$$/fd/9 ]] && fd9=open
+echo "$* | restarts=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0) fd9=$fd9" >> "$FAKE_STATE/acceptance.log"
+log=""
+while (($#)); do case "$1" in --log) log="$2"; shift 2 ;; *) shift ;; esac; done
+if [[ -e "$FAKE_STATE/acceptance-fail" ]]; then
+  printf 'FAIL lease-race — measured: exit codes 0 and 0 — expected: one 0 and one 3\nACCEPTANCE=FAIL checks=20 passed=19 failed=1 skipped=0\n' > "$log"
+  exit 1
+fi
+printf 'ACCEPTANCE=PASS checks=20 passed=20 failed=0 skipped=0\n' > "$log"
+exit 0
+`,
 };
 
 type TEnv = Record<string, string | undefined>;
@@ -209,6 +223,7 @@ const makeHarness = (options: { homeViaSymlink?: boolean } = {}): IHarness => {
       DEPLOY_TMUX: path.join(bin, 'tmux'),
       DEPLOY_PURPLEMUX: path.join(bin, 'purplemux'),
       DEPLOY_JOURNALCTL: path.join(bin, 'journalctl'),
+      DEPLOY_ACCEPTANCE: path.join(bin, 'acceptance'),
       DEPLOY_SQLITE_MODULE: SQLITE_MODULE,
       DEPLOY_PROC_ROOT: proc,
       DEPLOY_POLL_S: '0.05',
@@ -567,6 +582,9 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     expect(field(out, 'VERDICT')).toBe('rolled-back');
     expect(link(path.join(h.releases, 'current'))).toBe(path.join(h.releases, first.slice(0, 12)));
     expect(link(path.join(h.releases, 'previous'))).toBe(path.join(h.releases, second.slice(0, 12)));
+    // A rollback returns to a release that already ran live: no acceptance run.
+    expect(field(out, 'ACCEPTANCE')).toBe('skipped (rollback)');
+    expect(h.log('acceptance').trim().split('\n')).toHaveLength(2);
   });
 
   it('--rollback after a first install restores the saved drop-in and CLI link', () => {
@@ -805,6 +823,60 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     } finally {
       fs.rmSync(linked.root, { recursive: true, force: true });
     }
+  });
+
+  it('runs the release acceptance gate on the built release before the lease, backup or any restart', () => {
+    const sha = h.sha();
+    const { status, out } = h.run([sha]);
+    expect(status, out).toBe(0);
+    const release = path.join(h.releases, sha.slice(0, 12));
+    const call = h.log('acceptance');
+    expect(call).toContain(`--candidate ${release} --log `);
+    expect(call).toContain('| restarts=0');
+    // The gate never holds deploy-live.lock (fd 9): a leftover could otherwise refuse every later deploy.
+    expect(call).toContain('fd9=closed');
+    expect(call).not.toContain('--bash-guard');
+    expect(field(out, 'ACCEPTANCE')).toMatch(/^pass \(checks=20 passed=20 failed=0 skipped=0; .*acceptance-.*\.log\)$/);
+    expect(field(out, 'VERDICT')).toBe('deployed');
+  });
+
+  it('a failed acceptance run refuses with exit 2 and never leases, backs up, swaps or restarts', () => {
+    h.flag('acceptance-fail');
+    const originalDropIn = fs.readFileSync(h.dropIn, 'utf-8');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(2);
+    expect(out).toContain('REFUSED ACCEPTANCE-FAILED');
+    expect(out).toContain('FAIL lease-race');
+    expect(field(out, 'ACCEPTANCE')).toMatch(/^fail \(/);
+    expect(field(out, 'VERDICT')).toBe('refused (ACCEPTANCE-FAILED)');
+    expect(h.log('purplemux')).not.toContain('lease acquire');
+    expect(restarts(h)).toBe(0);
+    expect(fs.readFileSync(h.dropIn, 'utf-8')).toBe(originalDropIn);
+    expect(link(path.join(h.releases, 'current'))).toBeNull();
+    expect(fs.existsSync(path.join(h.home, '.purplemux', 'backups'))).toBe(false);
+  });
+
+  it('refuses a release that carries no acceptance harness', () => {
+    const { status, out } = h.run([h.sha()], { DEPLOY_ACCEPTANCE: undefined });
+    expect(status, out).toBe(2);
+    expect(out).toContain('REFUSED ACCEPTANCE-MISSING');
+    expect(restarts(h)).toBe(0);
+  });
+
+  it('--dry-run runs the acceptance gate too, and DEPLOY_BASH_GUARD makes the guard check required', () => {
+    const { status, out } = h.run([h.sha(), '--dry-run'], { DEPLOY_BASH_GUARD: '/opt/guard/bash-guard.py' });
+    expect(status, out).toBe(0);
+    expect(h.log('acceptance')).toContain('--bash-guard /opt/guard/bash-guard.py --require-bash-guard');
+    expect(field(out, 'ACCEPTANCE')).toMatch(/^pass /);
+    expect(field(out, 'VERDICT')).toBe('dry-run');
+    expect(restarts(h)).toBe(0);
+  });
+
+  it('a dry run whose acceptance fails is refused, so the verdict never reads dry-run', () => {
+    h.flag('acceptance-fail');
+    const { status, out } = h.run([h.sha(), '--dry-run']);
+    expect(status, out).toBe(2);
+    expect(field(out, 'VERDICT')).toBe('refused (ACCEPTANCE-FAILED)');
   });
 
   it('prints usage and exits 2 on unknown options', () => {
