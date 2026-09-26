@@ -453,7 +453,7 @@ exit 0`,
 // The real thing, against a built candidate: ACCEPTANCE_E2E_CANDIDATE=<built checkout>.
 const E2E = process.env.ACCEPTANCE_E2E_CANDIDATE;
 describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
-  it('passes every wave-1 and story-15 check on an isolated instance', { timeout: 600_000 }, () => {
+  it('passes every wave-1, story-15 and wave-2 check on an isolated instance', { timeout: 600_000 }, () => {
     const log = path.join(os.tmpdir(), `acceptance-e2e-${process.pid}.log`);
     // The real HOME: the harness's own live-home refusal and live-port avoidance
     // must look at the live instance, not at the test run's isolated HOME.
@@ -462,7 +462,12 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=21 passed=20 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=30 passed=29 failed=0 skipped=1$/m);
+    // The wave-2 checks (story 22) ran, each by id.
+    for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
+      'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {
+      expect(body).toMatch(new RegExp(`^PASS ${id} — `, 'm'));
+    }
     expect(body.match(/^SKIP .*/gm)).toEqual(['SKIP bash-guard — no --bash-guard path given']);
   });
 });

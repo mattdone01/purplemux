@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Wave-1 acceptance checks against an ISOLATED purplemux instance (story 07; ADR-0017 amendment).
+// Wave-1 and wave-2 acceptance checks against an ISOLATED purplemux instance (stories 07 and 22;
+// ADR-0017 amendment).
 //
 //   checks.cjs --state <state.json> [--bash-guard <bash-guard.py>] [--require-bash-guard]
 //
@@ -18,6 +19,12 @@
 // `stop`) are posted to /api/status/hook the way the installed hook script posts them. The real
 // classifier then decides turn-marker, WAITING or READY FOR REVIEW, and `orchestration status`
 // shows the nudge it recorded.
+//
+// Wave 2 (story 22) adds: notes delivered to an empty composer and acked (story 10), fleet config
+// get/set/unset with its authority and the `constructor` key (story 24), tab close reaping only the
+// closed tab's own processes (story 16), the API-error resume and the usage-WARNING negative (story
+// 26), an auto-compaction SessionStart that is no turn end (story 32), and dim-suggestion marking in
+// `tab result` (story 17).
 //
 // Output: one line per check — `PASS <id> — <what>`, `FAIL <id> — <what> — measured: … — expected: …`
 // or `SKIP <id> — <why>` — then `ACCEPTANCE=PASS|FAIL checks=N passed=P failed=F skipped=S`.
@@ -98,9 +105,9 @@ class Instance {
   }
 
   /** POST a Claude hook event for a tab's tmux session, as the installed hook script does. */
-  hook(event, session) {
+  hook(event, session, extra = {}) {
     const token = fs.readFileSync(path.join(this.state.home, '.purplemux', 'cli-token'), 'utf8').trim();
-    const body = JSON.stringify({ event, session });
+    const body = JSON.stringify({ event, session, ...extra });
     return new Promise((resolve) => {
       const req = http.request(
         { host: '127.0.0.1', port: this.state.port, path: '/api/status/hook', method: 'POST', headers: { 'Content-Type': 'application/json', 'x-pmux-token': token, 'Content-Length': Buffer.byteLength(body) } },
@@ -114,22 +121,51 @@ class Instance {
     });
   }
 
-  /** Start the scratch `claude` stand-in in an agent tab's pane, over the ISOLATED tmux socket only. */
-  async startStandIn(session, transcriptText) {
+  /**
+   * Start a scratch `claude` stand-in in an agent tab's pane, over the ISOLATED tmux socket only.
+   * `transcript` is the last assistant text, or the transcript's entries as objects. `workspaceDir`
+   * is the pane's cwd under scratch/work (a/ or b/); `composer` runs the stand-in that draws an
+   * empty Claude composer and swallows its input unechoed, so the inbox can deliver to it.
+   */
+  async startStandIn(session, transcript, { workspaceDir = 'b', composer = false } = {}) {
     const tmuxDir = this.state.tmuxTmpdir;
     if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
     const uuid = crypto.randomUUID();
-    const cwd = path.join(this.state.scratch, 'work', 'b');
+    const cwd = path.join(this.state.scratch, 'work', workspaceDir);
     const project = path.join(this.state.home, '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
     fs.mkdirSync(project, { recursive: true });
-    const lines = [
-      { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
-      { type: 'assistant', timestamp: new Date().toISOString(), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: transcriptText }] } },
-    ];
+    const lines = Array.isArray(transcript)
+      ? transcript
+      : [
+        { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
+        { type: 'assistant', timestamp: new Date().toISOString(), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: transcript }] } },
+      ];
     fs.writeFileSync(path.join(project, `${uuid}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
     const env = { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir };
-    const standIn = path.join(this.state.scratch, 'bin', 'claude');
+    const standIn = composer ? this.composerStandIn() : path.join(this.state.scratch, 'bin', 'claude');
     return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, `${standIn} --resume ${uuid}`, 'Enter'], { env, timeoutMs: 10000 });
+  }
+
+  /** A second stand-in, also named `claude`: it draws an empty composer and reads its input unechoed. */
+  composerStandIn() {
+    const file = path.join(this.state.scratch, 'bin', 'composer', 'claude');
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, "#!/bin/sh\nclear\nprintf '\\n────────────────\\n\\342\\235\\257 \\n────────────────\\n'\nstty -echo 2>/dev/null\ncat >/dev/null\n");
+      fs.chmodSync(file, 0o755);
+    }
+    return file;
+  }
+
+  /** Type keys into a pane over the ISOLATED tmux socket (for a pane whose shell `tab send` refuses). */
+  keys(session, line) {
+    const tmuxDir = this.state.tmuxTmpdir;
+    if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
+    return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, line, 'Enter'], { env: { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir }, timeoutMs: 10000 });
+  }
+
+  async inbox(ws) {
+    return parseJson((await this.cli(['inbox', 'list', '-w', ws, '--all'])).out)?.items ?? [];
   }
 
   async nudgesFor(ws, tabId) {
@@ -468,6 +504,247 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
   );
 };
 
+/** The wave-2 checks (story 22). Each pushes one result; a failed prerequisite fails what depends on it. */
+const wave2 = async (inst) => {
+  const results = [];
+  const nonce = crypto.randomBytes(3).toString('hex');
+  const { a: wsA, b: wsB } = inst.state.workspaces;
+  const pass = (id, what) => results.push({ status: 'pass', id, what });
+  const fail = (id, what, measured, expected) => results.push({ status: 'fail', id, what, measured, expected });
+  const check = (id, what, ok, measured, expected) => (ok ? pass(id, what) : fail(id, what, measured, expected));
+  const created = async (ws, name, type, extra = []) => parseJson((await inst.cli(['tab', 'create', '-w', ws, '-n', name, '-t', type, ...extra])).out);
+  await fleetConfig(inst, { nonce, wsB, check });
+  await tabCloseReap(inst, { wsA, check, created });
+  await notes(inst, { nonce, wsA, wsB, check, created });
+  await turnErrors(inst, { nonce, wsB, check, created });
+  await compaction(inst, { wsB, check, created });
+  await suggestions(inst, { nonce, wsA, check, created });
+  return results;
+};
+
+/** Story 24 (ADR-0019): authority, and the `constructor` key that plain indexing read as Object. */
+const fleetConfig = async (inst, { nonce, wsB, check }) => {
+  // The orchestrator of workspace B (a terminal tab, set by the story 15 checks) and a plain worker tab.
+  const orchestrator = parseJson((await inst.cli(['orchestration', 'status', '-w', wsB])).out)?.orchestration?.orchestratorTabId ?? null;
+  const worker = parseJson((await inst.cli(['tab', 'create', '-w', wsB, '-n', 'acc2-worker', '-t', 'terminal'])).out)?.tabId ?? null;
+  await sleep(1000);
+  const key = `acc.slots-${nonce}`;
+  const bySelf = orchestrator ? await inst.inTab(wsB, orchestrator, inst.tabCli(['config', 'set', key, '4'])) : { rc: -1, out: '', err: 'no orchestrator' };
+  const byWorker = worker ? await inst.inTab(wsB, worker, inst.tabCli(['config', 'set', key, '9'])) : { rc: -1, out: '', err: 'no worker tab' };
+  const value = await inst.cli(['config', 'get', key]);
+  check(
+    'config-authority',
+    'the orchestrator tab sets a fleet value; a worker tab of the same workspace is refused (exit 3); the value is the orchestrator\'s',
+    bySelf.rc === 0 && byWorker.rc === 3 && value.out.trim() === '4',
+    `orchestrator ${brief(bySelf)}; worker ${brief(byWorker)}; get "${value.out.trim()}"`,
+    'orchestrator exit 0, worker exit 3, get "4"',
+  );
+  const unsetBefore = await inst.cli(['config', 'get', 'constructor']);
+  const set = await inst.cli(['config', 'set', 'constructor', '5']);
+  const got = await inst.cli(['config', 'get', 'constructor']);
+  const listed = parseJson((await inst.cli(['config', 'list', '--json'])).out)?.values?.constructor ?? null;
+  const unset = await inst.cli(['config', 'unset', 'constructor']);
+  const after = await inst.cli(['config', 'get', 'constructor']);
+  check(
+    'config-constructor-key',
+    'the key `constructor` is an ordinary key: unset exits 7, set/get round-trip with a whole-number version, unset, then exit 7 again',
+    unsetBefore.rc === 7 && set.rc === 0 && got.rc === 0 && got.out.trim() === '5' && Number.isInteger(listed?.version) && unset.rc === 0 && after.rc === 7,
+    `get ${unsetBefore.rc}, set ${brief(set)}, get ${got.rc} "${got.out.trim()}", version ${JSON.stringify(listed?.version)}, unset ${unset.rc}, get ${after.rc}`,
+    'get 7, set 0, get 0 "5", an integer version, unset 0, get 7',
+  );
+  await inst.cli(['config', 'unset', key]);
+  if (worker) await inst.cli(['tab', 'close', '-w', wsB, worker]);
+};
+
+const alive = (pid) => {
+  try {
+    const state = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1][0];
+    return state !== 'Z';
+  } catch {
+    return false;
+  }
+};
+
+/** Story 16 (ADR-0016): a tab close reaps the tab's own setsid'd job and nothing of another tab's. */
+const tabCloseReap = async (inst, { wsA, check, created }) => {
+  const one = await created(wsA, 'acc2-reap-1', 'terminal');
+  const two = await created(wsA, 'acc2-reap-2', 'terminal');
+  await sleep(1000);
+  const orphan = 'setsid nohup sleep 300 >/dev/null 2>&1 & echo $!';
+  const mine = one ? await inst.inTab(wsA, one.tabId, orphan) : { rc: -1, out: '', err: 'no tab' };
+  const theirs = two ? await inst.inTab(wsA, two.tabId, orphan) : { rc: -1, out: '', err: 'no tab' };
+  const minePid = Number(mine.out.trim());
+  const theirsPid = Number(theirs.out.trim());
+  const started = minePid > 1 && theirsPid > 1 && alive(minePid) && alive(theirsPid);
+  const closed = started ? await inst.cli(['tab', 'close', '-w', wsA, one.tabId]) : { rc: -1, out: '', err: 'jobs not started' };
+  const lines = closed.out.trim().split('\n');
+  const gone = started ? await within(5000, async () => !alive(minePid)) : false;
+  const otherAlive = started && alive(theirsPid);
+  check(
+    'tab-close-reaps-own',
+    'tab close reaps the closed tab\'s setsid job (listed as killed after "ok") and leaves another tab\'s job running',
+    closed.rc === 0 && lines[0] === 'ok' && lines.some((l) => l.startsWith(`killed ${minePid} `)) && gone && otherAlive
+      && !lines.some((l) => l.includes(` ${theirsPid} `)),
+    `jobs ${minePid}/${theirsPid} started ${started}; close ${brief(closed)}, output ${JSON.stringify(lines.slice(0, 4))}; own gone ${gone}, other alive ${otherAlive}`,
+    `exit 0, "ok" then "killed ${minePid} …"; ${minePid} gone; ${theirsPid} still running`,
+  );
+  // The second tab's close reaps its job too (and is the cleanup).
+  if (two) await inst.cli(['tab', 'close', '-w', wsA, two.tabId]);
+  if (theirsPid > 1 && alive(theirsPid)) {
+    try {
+      process.kill(theirsPid, 'SIGKILL');
+    } catch {
+      // gone
+    }
+  }
+};
+
+/** Story 10 (ADR-0013): a note reaches an idle, empty composer as a fixed line, is shown and acked. */
+const notes = async (inst, { nonce, wsA, wsB, check, created }) => {
+  const orch = await created(wsA, 'acc2-orch-a', 'claude-code', ['--no-launch']);
+  const sender = await created(wsB, 'acc2-sender', 'terminal');
+  await sleep(1000);
+  const on = orch ? await inst.cli(['orchestration', 'on', '-w', wsA, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
+  const standIn = orch && on.rc === 0 ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', composer: true }) : { rc: -1 };
+  await sleep(1500);
+  if (orch) await inst.hook('session-start', orch.sessionName);
+  const ready = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
+  const bodyMarker = `ACC-NOTE-BODY-${nonce}`;
+  const bodyFile = path.join(inst.state.scratch, 'io', `note-${nonce}.txt`);
+  fs.mkdirSync(path.dirname(bodyFile), { recursive: true });
+  fs.writeFileSync(bodyFile, `${bodyMarker}\nthe body is pulled, never typed\n`);
+  const sent = sender && ready
+    ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'send', '--to-workspace', wsA, '--subject', `acc note ${nonce}`, '-f', bodyFile]))
+    : { rc: -1, out: '', err: `orchestration on ${on.rc}, stand-in ${standIn.rc}, idle ${ready}` };
+  const note = parseJson(sent.out)?.note ?? null;
+  const delivered = note ? await within(90000, async () => {
+    const all = parseJson((await inst.cli(['note', 'list'])).out)?.notes ?? [];
+    return all.find((n) => n.id === note.id && n.state === 'delivered');
+  }) : null;
+  const pane = orch ? await inst.cli(['tab', 'result', '-w', wsA, orch.tabId, '--raw']) : { out: '' };
+  check(
+    'note-delivered',
+    'a note to another workspace reaches its orchestrator\'s idle, empty composer as the fixed notice line; the body is never typed',
+    Boolean(delivered) && !pane.out.includes(bodyMarker),
+    `send ${brief(sent)}, note ${note?.id ?? 'none'}, delivered ${Boolean(delivered)}, body in the pane ${pane.out.includes(bodyMarker)}`,
+    'send exit 0, the note delivered within 90 s, the body absent from the pane',
+  );
+  const shown = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'show', note.id])) : { rc: -1, out: '', err: 'no note' };
+  const bySender = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'ack', note.id])) : { rc: -1, out: '', err: 'no note' };
+  const reader = await created(wsA, 'acc2-reader', 'terminal');
+  await sleep(1000);
+  const byRecipient = note && reader && delivered ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['note', 'ack', note.id, '--comment', 'seen'])) : { rc: -1, out: '', err: 'not delivered' };
+  const acked = parseJson(byRecipient.out)?.note?.state ?? null;
+  check(
+    'note-ack',
+    'the sender may show its note but not ack it (exit 3); a tab of the recipient workspace acks it',
+    shown.rc === 0 && (parseJson(shown.out)?.body ?? '').includes(bodyMarker) && bySender.rc === 3 && byRecipient.rc === 0 && acked === 'acked',
+    `show ${brief(shown)}; sender ack ${brief(bySender)}; recipient ack ${brief(byRecipient)}, state ${acked}`,
+    'show exit 0 with the body; sender ack exit 3; recipient ack exit 0, state acked',
+  );
+  for (const t of [orch, sender, reader]) if (t) await inst.cli(['tab', 'close', '-w', t === sender ? wsB : wsA, t.tabId]);
+  await inst.cli(['orchestration', 'off', '-w', wsA]);
+};
+
+// Story 26 transcripts: the real Claude 2.1.283 server-error entry, and the usage WARNING (a normal
+// turn that only mentions the pane footer — never an error, never a resume).
+const API_ERROR_TRANSCRIPT = () => [
+  { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
+  { type: 'assistant', timestamp: new Date().toISOString(), error: 'server_error', isApiErrorMessage: true, uuid: crypto.randomUUID(), message: { model: '<synthetic>', role: 'assistant', stop_reason: 'stop_sequence', stop_sequence: '', type: 'message', content: [{ type: 'text', text: 'API Error: Server error mid-response. The response above may be incomplete.' }] } },
+];
+const USAGE_WARNING_TRANSCRIPT = () => [
+  { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
+  { type: 'assistant', timestamp: new Date().toISOString(), uuid: crypto.randomUUID(), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'P1\'s pane shows "You\'ve used 92% of your session limit · resets 9:20am (UTC) · /upgrade to k…". Nothing to do until the reset.' }] } },
+];
+
+/** Start a stand-in worker in workspace B and drive one turn to its stop. */
+const turnOf = async (inst, wsB, created, name, transcript) => {
+  const w = await created(wsB, name, 'claude-code', ['--no-launch']);
+  if (!w) return null;
+  await sleep(500);
+  if ((await inst.startStandIn(w.sessionName, transcript)).rc !== 0) return null;
+  await sleep(1000);
+  await inst.hook('session-start', w.sessionName);
+  await inst.hook('prompt-submit', w.sessionName);
+  const busy = await within(10000, async () => (await inst.cliState(wsB, w.tabId)) === 'busy');
+  return busy ? w : null;
+};
+
+/** Story 26: an API-error stop queues ONE resume and sends no READY; the usage WARNING is a plain turn. */
+const turnErrors = async (inst, { wsB, check, created }) => {
+  const err = await turnOf(inst, wsB, created, 'acc2-api-error', API_ERROR_TRANSCRIPT());
+  const errStopped = err ? await inst.hook('stop', err.sessionName) : 0;
+  const resume = errStopped === 204 ? await within(10000, async () => (await inst.inbox(wsB)).find((i) => i.kind === 'resume' && i.targetTabId === err.tabId)) : null;
+  const errNudges = err ? await inst.nudgesFor(wsB, err.tabId) : [];
+  const resumes = err ? (await inst.inbox(wsB)).filter((i) => i.kind === 'resume' && i.targetTabId === err.tabId).length : 0;
+  check(
+    'api-error-resume',
+    'a stop on a Claude API error queues one resume notice for the tab and sends no READY FOR REVIEW nudge',
+    Boolean(resume) && resumes === 1 && !errNudges.some((n) => n.kind === 'ready-for-review'),
+    `stop ${errStopped}, resume items ${resumes}, nudges ${errNudges.map((n) => n.kind).join(',') || 'none'}`,
+    'one resume inbox item, no ready-for-review nudge',
+  );
+  const warn = await turnOf(inst, wsB, created, 'acc2-usage-warning', USAGE_WARNING_TRANSCRIPT());
+  const warnStopped = warn ? await inst.hook('stop', warn.sessionName) : 0;
+  const ready = warnStopped === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, warn.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  const warnResumes = warn ? (await inst.inbox(wsB)).filter((i) => i.targetTabId === warn.tabId).length : -1;
+  check(
+    'usage-warning-negative',
+    'a turn that quotes the usage WARNING footer is an ordinary turn: READY FOR REVIEW, no resume, no halt',
+    Boolean(ready) && warnResumes === 0,
+    `stop ${warnStopped}, ready nudge ${Boolean(ready)}, inbox items for the tab ${warnResumes}`,
+    'a ready-for-review nudge and no inbox item',
+  );
+  for (const t of [err, warn]) if (t) await inst.cli(['tab', 'close', '-w', wsB, t.tabId]);
+};
+
+/** Story 32 (L30): an auto-compaction's SessionStart (source=compact) keeps the turn busy with no nudge. */
+const compaction = async (inst, { wsB, check, created }) => {
+  const w = await turnOf(inst, wsB, created, 'acc2-compact', 'Still working.');
+  const before = w ? (await inst.nudgesFor(wsB, w.tabId)).length : -1;
+  if (w) {
+    await inst.hook('pre-compact', w.sessionName);
+    await inst.hook('session-start', w.sessionName, { source: 'compact' });
+  }
+  await sleep(3000);
+  const state = w ? await inst.cliState(wsB, w.tabId) : null;
+  const after = w ? await inst.nudgesFor(wsB, w.tabId) : [];
+  // The same tab still ends its turn normally afterwards: the check is not passing on a dead tab.
+  const stopped = w ? await inst.hook('stop', w.sessionName) : 0;
+  const ready = stopped === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  check(
+    'compaction-no-turn-end',
+    'a SessionStart with source=compact mid-turn leaves the tab busy and sends no nudge; its later stop is READY',
+    state === 'busy' && after.length === before && Boolean(ready),
+    `cliState ${state}, nudges ${before} → ${after.length} (${after.map((n) => n.kind).join(',') || 'none'}), later ready ${Boolean(ready)}`,
+    'busy, no new nudge, then a ready-for-review nudge on the stop',
+  );
+  if (w) await inst.cli(['tab', 'close', '-w', wsB, w.tabId]);
+};
+
+/** Story 17 (L7): `tab result` marks dim composer text as a suggestion; --no-suggestions and --raw. */
+const suggestions = async (inst, { nonce, wsA, check, created }) => {
+  const t = await created(wsA, 'acc2-ghost', 'claude-code', ['--no-launch']);
+  await sleep(1000);
+  const ghost = `ghost ${nonce}`;
+  // Drawn by printf in the pane's shell: a composer line whose text is dim (SGR 2), as Claude draws one.
+  const drawn = t ? await inst.keys(t.sessionName, `clear; printf '────\\n\\342\\235\\257 \\033[2m%s\\033[0m\\n────\\n' '${ghost}'`) : { rc: -1 };
+  await sleep(1000);
+  const plain = t ? parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId])).out) : null;
+  const none = t ? parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId, '--no-suggestions'])).out) : null;
+  const raw = t ? parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId, '--raw'])).out) : null;
+  const marked = (plain?.content ?? '').split('\n').some((l) => l.startsWith('❯') && l.includes(`[suggestion] ${ghost}`));
+  check(
+    'result-suggestion',
+    '`tab result` prints dim composer text as "[suggestion] <text>" and returns it; --no-suggestions drops it; --raw keeps the escapes',
+    drawn.rc === 0 && marked && plain?.suggestion === ghost && none?.suggestion === null && !(none?.content ?? '').includes(ghost)
+      && (raw?.content ?? '').includes('\u001b[2m'),
+    `drawn ${drawn.rc}; marked ${marked}, suggestion ${JSON.stringify(plain?.suggestion)}; --no-suggestions ${JSON.stringify(none?.suggestion)} text present ${(none?.content ?? '').includes(ghost)}; --raw has SGR 2 ${(raw?.content ?? '').includes('\u001b[2m')}`,
+    `a "❯ [suggestion] ${ghost}" line and suggestion "${ghost}"; null and absent; SGR 2 present`,
+  );
+  if (t) await inst.cli(['tab', 'close', '-w', wsA, t.tabId]);
+};
+
 const freePort = () =>
   new Promise((resolve) => {
     const server = http.createServer();
@@ -506,7 +783,8 @@ const main = async (argv) => {
     process.stderr.write(`REFUSED BASH-GUARD — ${opts.bashGuard} does not exist\n`);
     return 2;
   }
-  const results = await wave1(new Instance(state), opts);
+  const inst = new Instance(state);
+  const results = [...(await wave1(inst, opts)), ...(await wave2(inst))];
   const { lines, pass } = summarize(results, opts);
   process.stdout.write(`${lines.join('\n')}\n`);
   return pass ? 0 : 1;
