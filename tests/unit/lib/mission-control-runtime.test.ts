@@ -19,6 +19,11 @@ const mocks = vi.hoisted(() => ({
   halted: new Set<string>(),
 }));
 
+const logs = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('@/lib/logger', () => {
+  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: logs.warn, error: () => {}, fatal: () => {}, child: () => logger };
+  return { createLogger: () => logger };
+});
 vi.mock('@/lib/cli-utils', () => ({ findTab: mocks.findTab }));
 vi.mock('@/lib/capture-at-width', () => ({ capturePaneAtWidth: mocks.capture }));
 vi.mock('@/lib/agent-prompt-delivery', () => ({ deliverPrompt: mocks.deliverPrompt }));
@@ -924,11 +929,40 @@ describe('Mission Control inbox handoff — review r1 fixes (story 12)', () => {
     const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] }, due: [delivery()] });
     harness.inbox.items.mockRejectedValue(new Error('inbox.json is not { items: [...] }'));
 
+    logs.warn.mockClear();
     await expect(harness.runtime.tick()).resolves.toBeUndefined();
     await expect(harness.runtime.tick()).resolves.toBeUndefined();
 
     expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
     expect(harness.inbox.enqueue).not.toHaveBeenCalled();
+    const warnings = logs.warn.mock.calls.filter(([message]) => String(message).includes('inbox sync skipped'));
+    expect(warnings).toHaveLength(1);
+  });
+
+  it('withdraws an orphan only for a row waiting on ANOTHER item, never on its own (R2-1)', async () => {
+    const own = runtimeHarness({
+      handoffs: { deliveries: [], bootstrapEntries: [] },
+      items: [inboxItem()],
+      snapshotDeliveries: [delivery({ state: 'queued', nextAttemptAt: null, lastError: 'inbox:i-one' })],
+    });
+    await own.runtime.tick();
+    expect(own.inbox.withdraw).not.toHaveBeenCalled();
+  });
+
+  it('starts no pass once stop has begun (R2-1)', async () => {
+    const harness = runtimeHarness({ due: [delivery()] });
+    await harness.runtime.stop();
+    await harness.runtime.tick();
+    expect(harness.store.listDueDeliveries).not.toHaveBeenCalled();
+    expect(harness.inbox.registerPreflight).not.toHaveBeenCalled();
+  });
+
+  it('the server stops the inbox before Mission Control (N5, pinned in server.ts)', async () => {
+    const { readFileSync } = await import('fs');
+    const server = readFileSync(new URL('../../../server.ts', import.meta.url), 'utf8');
+    const shutdown = server.slice(server.indexOf('const shutdownWs = async'));
+    expect(shutdown.indexOf('await stopInbox();')).toBeGreaterThan(-1);
+    expect(shutdown.indexOf('await stopInbox();')).toBeLessThan(shutdown.indexOf('await getMissionControlRuntime().stop();'));
   });
 
   it('stop settles a paste the inbox finished before it stopped (N5)', async () => {

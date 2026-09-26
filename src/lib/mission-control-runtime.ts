@@ -452,11 +452,13 @@ export class MissionControlRuntime {
   private claims = new Map<string, TMissionClaim>();
   private unregisterPreflight: (() => void) | null = null;
   private lastInboxReadError: string | null = null;
+  private stopping = false;
 
   constructor(private deps: IMissionRuntimeDeps = defaultDeps) {}
 
   async start(): Promise<void> {
     if (this.timer) return;
+    this.stopping = false;
     this.deps.getStore();
     this.timer = this.deps.setInterval(() => {
       void this.tick().catch((error) => {
@@ -469,6 +471,9 @@ export class MissionControlRuntime {
   }
 
   async stop(): Promise<void> {
+    // No pass starts once stop has begun (a bootstrap request during shutdown would otherwise hand
+    // off a row, or re-register the preflight, beside the final sync — review r2, R2-1).
+    this.stopping = true;
     if (this.timer) {
       this.deps.clearInterval(this.timer);
       this.timer = null;
@@ -504,6 +509,7 @@ export class MissionControlRuntime {
   }
 
   async tick(): Promise<void> {
+    if (this.stopping) return;
     if (this.running) return this.running;
     this.running = this.runJobs().finally(() => {
       this.running = null;
@@ -755,7 +761,8 @@ export class MissionControlRuntime {
       if (rowState === undefined) continue; // unknown: the preflight still refuses it at paste time
       // A row queued with no marker is about to be handed off again (a new item replaces this one);
       // a row waiting on ANOTHER item, or in any other state, leaves this one orphaned (review r1, N4).
-      if (rowState === 'queued' && !markedItem(rowMarker)) continue;
+      const waitsOn = markedItem(rowMarker);
+      if (rowState === 'queued' && (waitsOn === null || waitsOn === item.id)) continue;
       await this.deps.inbox.withdraw(item.id, 'mission-record-not-waiting');
     }
     return true;
