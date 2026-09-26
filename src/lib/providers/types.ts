@@ -50,6 +50,21 @@ export interface IRuntimeSnapshotOptions {
   withActivity?: boolean;
 }
 
+/**
+ * How the current turn ended when it ended on a provider error (ADR-0018,
+ * story 26). Read from structured fields only, never from message text: a
+ * worker quoting "API Error:" or a pane's usage-warning footer is not an error.
+ */
+export interface ITurnError {
+  class: 'api-error' | 'usage-limit' | 'other';
+  /** The provider's error code (`server_error`, `usage_limit_exceeded` …). */
+  code: string;
+  /** The error message, ≤ 300 characters. */
+  text: string;
+  /** Identifies the failed turn: the error entry's uuid (Claude) or turn id (Codex). */
+  turnId: string;
+}
+
 export interface IOpenBackgroundTaskKinds {
   shell: number;
   agent: number;
@@ -88,6 +103,8 @@ export interface IAgentRuntimeSnapshot {
    * provider cannot read it.
    */
   lastAssistantTail?: string | null;
+  /** The current turn's terminal provider error; null for a clean end; absent when the provider cannot tell. */
+  lastTurnError?: ITurnError | null;
 }
 
 export interface IAgentSessionHistoryStats {

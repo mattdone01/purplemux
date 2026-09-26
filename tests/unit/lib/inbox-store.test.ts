@@ -229,4 +229,21 @@ describe('inbox store — file', () => {
     await Promise.all(Array.from({ length: 12 }, (_, i) => enqueueNotice(req({ dedupeKey: `k${i}` }))));
     expect((await readInboxState()).items).toHaveLength(12);
   });
+
+  it('tells onInboxHeld once per item that becomes held, after the write', async () => {
+    const { enqueueNotice, mutateInbox, holdInState, refuseInState, onInboxHeld, readInboxState } = await load();
+    const seen: string[] = [];
+    const off = onInboxHeld((item) => seen.push(`${item.id}:${item.heldReason}`));
+    try {
+      const { item } = await enqueueNotice(req());
+      await mutateInbox((s) => ({ state: refuseInState(s, item.id, 'composer-not-empty', Date.now()), value: null }));
+      expect(seen).toEqual([]);
+      await mutateInbox((s) => ({ state: holdInState(s, item.id, 'stranded-in-composer', Date.now()), value: null }));
+      expect((await readInboxState()).items[0].state).toBe('held');
+      await mutateInbox((s) => ({ state: holdInState(s, item.id, 'again', Date.now()), value: null }));
+      expect(seen).toEqual([`${item.id}:stranded-in-composer`]);
+    } finally {
+      off();
+    }
+  });
 });

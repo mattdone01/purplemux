@@ -6,7 +6,7 @@ import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessi
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
-import type { IAgentProvider, IAgentRuntimeSnapshot } from '@/lib/providers/types';
+import type { IAgentProvider, IAgentRuntimeSnapshot, ITurnError } from '@/lib/providers/types';
 import type { IAgentHookMetaPatch, TAgentWorkStateEvent } from '@/lib/providers/types';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
@@ -32,6 +32,8 @@ import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import { classifyTurnEnd, isBackgroundWaitStalled } from '@/lib/turn-end';
+import { enqueueNotice, onInboxHeld } from '@/lib/inbox-store';
+import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
 import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
@@ -1171,6 +1173,74 @@ export class StatusManager {
     return !(snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS);
   }
 
+  /**
+   * A turn that ended on a provider error (story 26, ADR-0018 amendment).
+   * `api-error`: the worker is resumed ONCE through the inbox (composer gate,
+   * bounded) and no one is nudged; a second failure in the same episode, or a
+   * resume notice the inbox holds, nudges the target once. `usage-limit`:
+   * nothing is ever typed (typing cancels the provider's auto-continue); the
+   * target is nudged once. A clean stop ends the episode.
+   */
+  private applyTurnError(tabId: string, entry: ITabStatusEntry, error: ITurnError, stopSeq: number | undefined): void {
+    const at = Date.now();
+    entry.turnEnd = { kind: error.class === 'usage-limit' ? 'usage-limit' : 'api-error', at, seq: stopSeq };
+    if (entry.cliState !== 'ready-for-review') {
+      this.applyCliState(tabId, entry, 'ready-for-review', { silent: true });
+      this.persistToLayout(entry);
+    }
+    this.broadcastUpdate(tabId, entry);
+
+    const episode = entry.turnError?.class === error.class ? entry.turnError : null;
+    if (error.class === 'usage-limit') {
+      if (episode) return;
+      entry.turnError = { class: 'usage-limit', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: true };
+      this.escalateTurnError(tabId, entry, 'usage-limit', error.text || error.code);
+      return;
+    }
+    if (episode) {
+      if (!episode.escalated) {
+        episode.escalated = true;
+        this.escalateTurnError(tabId, entry, 'api-error', error.text || error.code);
+      }
+      return;
+    }
+    const next = { class: 'api-error' as const, code: error.code, text: error.text, startedAt: at, resumeItemId: null as string | null, escalated: false };
+    entry.turnError = next;
+    enqueueNotice({
+      kind: 'resume',
+      targetWorkspaceId: entry.workspaceId,
+      targetTabId: tabId,
+      dedupeKey: `resume-${tabId}-${error.turnId || at}`,
+      fields: { resumeId: `r-${nanoid(8)}` },
+    }).then(({ item }) => {
+      next.resumeItemId = item.id;
+      log.info({ tabId, resume: item.id, code: error.code }, 'api-error stop: one resume queued');
+    }).catch((err) => {
+      // No resume can go out, so the episode escalates at once.
+      log.warn(`api-error resume could not be queued for ${tabId}: ${err instanceof Error ? err.message : err}`);
+      if (!next.escalated) {
+        next.escalated = true;
+        this.escalateTurnError(tabId, entry, 'api-error', `${error.text || error.code} (the resume could not be queued)`);
+      }
+    });
+  }
+
+  private escalateTurnError(tabId: string, entry: ITabStatusEntry, kind: 'api-error' | 'usage-limit', detail: string): void {
+    this.nudgeOrchestrator(tabId, entry, kind, detail).catch((err) => {
+      log.warn(`${kind} nudge failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  /** The inbox held this tab's one resume: the episode escalates (story 26). */
+  handleHeldResume(item: IInboxItem): void {
+    if (item.kind !== 'resume') return;
+    const entry = this.tabs.get(item.targetTabId);
+    const episode = entry?.turnError;
+    if (!entry || !episode || episode.class !== 'api-error' || episode.resumeItemId !== item.id || episode.escalated) return;
+    episode.escalated = true;
+    this.escalateTurnError(item.targetTabId, entry, 'api-error', `${episode.text || episode.code} (resume notice ${item.id} held: ${item.heldReason ?? 'undelivered'})`);
+  }
+
   private async liveRegisteredJobs(tabId: string): Promise<number> {
     try {
       return (await getLivenessManager().statusForTab(tabId)).backgroundJobs.filter((job) => job.alive).length;
@@ -1378,6 +1448,14 @@ export class StatusManager {
     // Each classified stop opens a new wait: a WAITING chain never leaves busy,
     // so the one-stuck-nudge-per-busy-stretch latch re-arms here.
     this.stuckNudgedTabs.delete(tabId);
+
+    const turnError = snapshot?.lastTurnError ?? null;
+    if (turnError && turnError.class !== 'other') {
+      this.applyTurnError(tabId, entry, turnError, stopSeq);
+      return;
+    }
+    // A clean stop (or an unclassified error) ends any error episode.
+    entry.turnError = null;
 
     const turnEnd = classifyTurnEnd({
       tail: snapshot?.lastAssistantTail,
@@ -2039,6 +2117,7 @@ export const getStatusManager = (): StatusManager => {
       manager.removeTab(tabId);
       manager.forgetReportsTo(workspaceId, tabId);
     });
+    onInboxHeld((item) => manager.handleHeldResume(item));
     setLeaseAgentStateSource((tabId) => manager.getTabAgentState(tabId));
   }
   return g.__ptStatusManager;

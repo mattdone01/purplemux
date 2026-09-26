@@ -298,6 +298,9 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   or READY-TO-MERGE: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
   — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
   No marker and open background work → WAITING, no nudge. Otherwise READY FOR REVIEW.
+  A turn that ended on a provider API error is resumed ONCE through the inbox with no nudge;
+  a second failure (or a held resume) sends "API ERROR". A usage-limit halt is never typed
+  into and sends one "HALTED by a usage limit" nudge.
 
 ## Standup ticks
 

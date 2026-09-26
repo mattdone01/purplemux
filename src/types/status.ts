@@ -53,10 +53,23 @@ export interface ITabStatusEntry {
   reportsTo?: string | null;
   /** How the watchdog classified the last `stop` (ADR-0018). Runtime only. */
   turnEnd?: ITurnEndRecord | null;
+  /** The provider-error episode this tab is in; a clean stop ends it (story 26). Runtime only. */
+  turnError?: ITurnErrorEpisode | null;
+}
+
+export interface ITurnErrorEpisode {
+  class: 'api-error' | 'usage-limit';
+  code: string;
+  text: string;
+  startedAt: number;
+  /** The one automatic resume of this episode (an inbox item id). */
+  resumeItemId: string | null;
+  /** The orchestrator was told; nothing more is sent this episode. */
+  escalated: boolean;
 }
 
 export interface ITurnEndRecord {
-  kind: 'turn-marker' | 'waiting' | 'ready-for-review';
+  kind: 'turn-marker' | 'waiting' | 'ready-for-review' | 'api-error' | 'usage-limit';
   at: number;
   /** `lastEvent.seq` of the stop this classifies; a newer event makes it stale. */
   seq?: number;
@@ -183,7 +196,7 @@ export interface IStandupUpdateMessage {
   standup: IWorkspaceStandup;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-died' | 'model-drift';
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'api-error' | 'usage-limit' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-died' | 'model-drift';
 
 export interface IOrchestrationNudge {
   id: string;

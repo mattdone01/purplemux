@@ -1,5 +1,5 @@
 import fs from 'fs/promises';
-import type { IAgentRuntimeSnapshot } from '@/lib/providers/types';
+import type { IAgentRuntimeSnapshot, ITurnError } from '@/lib/providers/types';
 import { TURN_TAIL_CHARS } from '@/lib/turn-end';
 import type { ICurrentAction } from '@/types/status';
 import type { TToolName } from '@/types/timeline';
@@ -19,6 +19,8 @@ interface ICodexScanState {
   currentAction: ICurrentAction | null;
   lastAssistantSnippet: string | null;
   lastAssistantTail: string | null;
+  lastTurnError: ITurnError | null;
+  completionSeen: boolean;
   reset: boolean;
   lastEntryTs: number | null;
   interrupted: boolean;
@@ -101,6 +103,27 @@ const isCompletionEvent = (type: string): boolean =>
   || type === 'shutdown_complete'
   || type === 'ShutdownComplete';
 
+// A failed Codex turn ends in `task_complete` carrying
+// `error: { message, codex_error_info }` (measured 2026-09-26 over 543 sessions:
+// usage_limit_exceeded 21, server_overloaded 9, other 7).
+const CODEX_ERROR_CLASS: Readonly<Record<string, ITurnError['class']>> = {
+  server_overloaded: 'api-error',
+  usage_limit_exceeded: 'usage-limit',
+};
+
+const codexTurnError = (payload: Record<string, unknown>): ITurnError | null => {
+  const error = payload.error;
+  if (typeof error !== 'object' || error === null) return null;
+  const e = error as { message?: unknown; codex_error_info?: unknown };
+  const code = typeof e.codex_error_info === 'string' && e.codex_error_info ? e.codex_error_info : 'unknown';
+  return {
+    class: Object.hasOwn(CODEX_ERROR_CLASS, code) ? CODEX_ERROR_CLASS[code] : 'other',
+    code,
+    text: (typeof e.message === 'string' ? e.message : '').trim().slice(0, 300),
+    turnId: typeof payload.turn_id === 'string' ? payload.turn_id : '',
+  };
+};
+
 const isInterruptEvent = (type: string): boolean =>
   type === 'turn_aborted' || type === 'TurnAborted';
 
@@ -109,6 +132,8 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
     currentAction: null,
     lastAssistantSnippet: null,
     lastAssistantTail: null,
+    lastTurnError: null,
+    completionSeen: false,
     reset: false,
     lastEntryTs: null,
     interrupted: false,
@@ -131,6 +156,9 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
     if (item.type === 'event_msg') {
       const eventType = safeString(payload.type);
       if (isCompletionEvent(eventType)) {
+        // Walking backwards, the first completion is the current turn's end.
+        if (!state.completionSeen && !state.reset) state.lastTurnError = codexTurnError(payload);
+        state.completionSeen = true;
         state.terminalIdle = true;
         state.needsStaleRecheck = false;
         state.staleMs = 0;
@@ -216,6 +244,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
     stale,
     lastAssistantSnippet: state.lastAssistantSnippet,
     lastAssistantTail: state.lastAssistantTail,
+    lastTurnError: state.lastTurnError,
     currentAction: state.currentAction,
     reset: state.reset,
     lastEntryTs: state.lastEntryTs,
