@@ -58,6 +58,8 @@ export interface ITabStatusEntry {
 export interface ITurnEndRecord {
   kind: 'turn-marker' | 'waiting' | 'ready-for-review';
   at: number;
+  /** `lastEvent.seq` of the stop this classifies; a newer event makes it stale. */
+  seq?: number;
   /** The marker line(s) of a `turn-marker` stop. */
   marker?: string[];
   openBackgroundTasks?: number;

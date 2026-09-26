@@ -60,6 +60,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           sessionName: found.tab.sessionName,
           panelType: found.tab.panelType,
           cliState: resolveTabCliState(found.tab, getStatusManager().getAllForClient()[id]),
+          waitingAtPrompt: getStatusManager().isWaitingAtPrompt(id),
         };
       },
       hasSession,

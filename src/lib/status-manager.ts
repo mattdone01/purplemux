@@ -123,7 +123,7 @@ export class StatusManager {
   private updateAgentState: typeof updateTabAgentState;
   private stuckNudgedTabs = new Set<string>();
   private transcriptFallbackLogged = new Set<string>();
-  private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number }>();
+  private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
 
@@ -602,6 +602,22 @@ export class StatusManager {
     await getLeaseSweeper().sweep().catch((err) => {
       log.warn(`lease sweep failed: ${err instanceof Error ? err.message : err}`);
     });
+  }
+
+  /**
+   * A WAITING worker sits at an empty composer: its turn ended on a stop from
+   * the current process and only its background work runs. `tab send` may
+   * paste into it (ADR-0018, architect ruling A′). Only while that stop is
+   * still the latest event, and no agent launch has happened since it — a
+   * relaunched TUI is booting, the race ADR-0008's composer gate exists for.
+   */
+  isWaitingAtPrompt(tabId: string): boolean {
+    const entry = this.tabs.get(tabId);
+    if (!entry || entry.cliState !== 'busy') return false;
+    const turnEnd = entry.turnEnd;
+    const stop = entry.lastEvent;
+    if (turnEnd?.kind !== 'waiting' || stop?.name !== 'stop' || turnEnd.seq !== stop.seq) return false;
+    return (entry.lastResumeOrStartedAt ?? 0) < stop.at;
   }
 
   getTabAgentState(tabId: string): ITabAgentState | null {
@@ -1116,13 +1132,14 @@ export class StatusManager {
         snapshot = null;
       }
     }
-    const kinds = snapshot?.openBackgroundTaskKinds;
-    // A live registered pid is watched by the liveness manager, which reports
-    // its exit; only an open subagent's silence outranks it.
-    if (!kinds?.agent && await this.liveRegisteredJobs(tabId) > 0) return false;
-    if (!snapshot) return true;
-    const activityAt = Math.max(snapshot.lastEntryTs ?? -Infinity, snapshot.backgroundActivityAt ?? -Infinity);
+    // A live registered pid is a silent waiter like a background shell: it
+    // gets the shell backstop, and an open subagent's rule outranks it.
+    const liveJobs = await this.liveRegisteredJobs(tabId);
+    const open = snapshot?.openBackgroundTaskKinds ?? { shell: 0, agent: 0, monitor: 0 };
+    const kinds = { ...open, shell: open.shell + liveJobs };
+    const activityAt = Math.max(snapshot?.lastEntryTs ?? -Infinity, snapshot?.backgroundActivityAt ?? -Infinity);
     const waitVerdict = isBackgroundWaitStalled(kinds, Number.isFinite(activityAt) ? activityAt : null, now);
+    if (!snapshot) return waitVerdict ?? true;
     if (waitVerdict !== null) return waitVerdict;
     return !(snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS);
   }
@@ -1140,13 +1157,17 @@ export class StatusManager {
    * When the tab's current Claude process started, from its session pid file.
    * Background tasks older than it were orphaned by a restart (`--resume`
    * appends to the same transcript) and never report back. Other providers
-   * report no background tasks, so they need no cutoff. Cached for a minute.
+   * report no background tasks, so they need no cutoff. Measured 2026-09-26:
+   * `startedAt` is milliseconds, 1–3 s after the process start, and never
+   * rewritten (`evidence/story-15/pidfile-startedat.txt`). Cached for a minute
+   * and dropped on a session start.
    */
   private async agentProcessStartedAt(tabId: string, entry: ITabStatusEntry): Promise<number | null> {
     if (runtimeProviderId(entry.agentProviderId, entry.panelType) !== 'claude') return null;
     const cached = this.processStartCache.get(tabId);
     const now = Date.now();
-    if (cached && now - cached.checkedAt < PROCESS_START_CACHE_MS) return cached.startedAt;
+    const stamp = entry.lastResumeOrStartedAt ?? null;
+    if (cached && cached.stamp === stamp && now - cached.checkedAt < PROCESS_START_CACHE_MS) return cached.startedAt;
     let startedAt: number | null = null;
     try {
       const provider = getProviderByPanelType(entry.panelType);
@@ -1157,7 +1178,7 @@ export class StatusManager {
     } catch {
       startedAt = null;
     }
-    this.processStartCache.set(tabId, { startedAt, checkedAt: now });
+    this.processStartCache.set(tabId, { startedAt, checkedAt: now, stamp });
     return startedAt;
   }
 
@@ -1336,7 +1357,7 @@ export class StatusManager {
     });
     const at = Date.now();
     if (turnEnd.kind === 'waiting') {
-      entry.turnEnd = { kind: 'waiting', at, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
+      entry.turnEnd = { kind: 'waiting', at, seq: stopSeq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
       hookLog.debug({ tabId, ...entry.turnEnd }, 'stop with open background work: waiting, no nudge');
       if (entry.cliState !== 'busy') this.applyCliState(tabId, entry, 'busy', { silent: true });
       this.persistToLayout(entry);
@@ -1344,9 +1365,9 @@ export class StatusManager {
       return;
     }
     if (turnEnd.kind === 'turn-marker') {
-      entry.turnEnd = { kind: 'turn-marker', at, marker: turnEnd.lines };
+      entry.turnEnd = { kind: 'turn-marker', at, seq: stopSeq, marker: turnEnd.lines };
     } else {
-      entry.turnEnd = { kind: 'ready-for-review', at };
+      entry.turnEnd = { kind: 'ready-for-review', at, seq: stopSeq };
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);
         log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');

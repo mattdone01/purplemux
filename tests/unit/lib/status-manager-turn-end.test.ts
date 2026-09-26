@@ -190,30 +190,64 @@ describe('stop classification (ADR-0018)', () => {
   });
 
   it('lets only the newest of two quick stops classify the tab (stop → prompt-submit → stop)', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const { getProviderByPanelType } = await import('@/lib/providers/registry');
+    const claude = getProviderByPanelType('claude-code')!;
+    const original = claude.readRuntimeSnapshot.bind(claude);
     let releaseFirst!: () => void;
     const firstRead = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    let calls = 0;
-    liveness.statusForTab.mockImplementation(async () => {
-      calls += 1;
-      if (calls === 1) {
+    let reads = 0;
+    // Classification reads carry `tasksSince`; the snippet refresh does not. Both
+    // stops run the same async chain, so the first classification read is stop 1's.
+    const read = vi.spyOn(claude, 'readRuntimeSnapshot').mockImplementation(async (handle, options) => {
+      if (!options || !('tasksSince' in options)) return original(handle, options);
+      reads += 1;
+      if (reads === 1) {
         await firstRead;
-        return { probes: [], backgroundJobs: [{ pid: 1, alive: true, registeredAt: 0, ageS: 1 }] };
+        return { ...(await original(handle, options)), lastAssistantTail: 'Waiting on the gate.', openBackgroundTasks: 1 };
       }
-      return { probes: [], backgroundJobs: [] };
+      return original(handle, options);
     });
-    const { manager, paste } = await managerWithPaste();
-    const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('All set.')]));
+    try {
+      const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('All set.')]));
+      manager.registerTab('worker', entry);
+
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      manager.updateTabFromHook('tmux-worker', 'prompt-submit');
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+      releaseFirst();
+      await settle();
+
+      expect(entry.cliState).toBe('ready-for-review');
+      expect(entry.turnEnd?.kind).toBe('ready-for-review');
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it('reports a WAITING tab as at its prompt only for the current stop and until a relaunch (ruling A′)', async () => {
+    const { manager } = await managerWithPaste();
+    const shapes = (await fs.readFile(path.join(FIXTURES, 'claude-background/shapes-2.1.283.jsonl'), 'utf-8')).trim().split('\n');
+    const start = shapes.find((l) => l.includes('"backgroundTaskId": "bshell01"'))!;
+    const entry = worker('claude-code', await writeLines('claude/w.jsonl', [start, claudeEnd('Waiting on the gate.')]));
+    entry.lastResumeOrStartedAt = Date.now() - 60_000;
     manager.registerTab('worker', entry);
+    expect(manager.isWaitingAtPrompt('worker')).toBe(false);
 
     manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
+    expect(entry.turnEnd?.seq).toBe(entry.lastEvent?.seq);
+    expect(manager.isWaitingAtPrompt('worker')).toBe(true);
+
+    manager.markAgentLaunch('worker');
+    expect(manager.isWaitingAtPrompt('worker')).toBe(false);
+    entry.lastResumeOrStartedAt = entry.lastEvent!.at - 1;
+    expect(manager.isWaitingAtPrompt('worker')).toBe(true);
+
     manager.updateTabFromHook('tmux-worker', 'prompt-submit');
-    manager.updateTabFromHook('tmux-worker', 'stop');
-    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
-    releaseFirst();
-    await settle();
-
-    expect(entry.cliState).toBe('ready-for-review');
-    expect(entry.turnEnd?.kind).toBe('ready-for-review');
+    expect(manager.isWaitingAtPrompt('worker')).toBe(false);
+    expect(manager.isWaitingAtPrompt('nope')).toBe(false);
   });
 
   it('drops a stale classification when a newer event moved the tab on', async () => {
@@ -278,13 +312,36 @@ describe('busy-stuck check for a waiting tab (ADR-0018, L19, L25)', () => {
     expect(await looksStalled(worker('claude-code', file), t0 + 95 * 60 * 1000)).toBe(true);
   });
 
-  it('is never STALLED while a registered tab bg job lives and no subagent is open', async () => {
+  it('judges a live registered tab bg job like a silent shell: not STALLED at 40 min, STALLED at the 90 min backstop', async () => {
     liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: true, registeredAt: 0, ageS: 1 }] });
     const t0 = Date.parse('2026-09-26T05:00:00.000Z');
     const file = await writeLines('claude/j.jsonl', [{ ...claudeEnd('Gate launched; waiting.'), timestamp: new Date(t0).toISOString() }]);
+    await setMtime(file, t0);
     expect(await looksStalled(worker('claude-code', file), t0 + 40 * 60 * 1000)).toBe(false);
+    expect(await looksStalled(worker('claude-code', file), t0 + 90 * 60 * 1000)).toBe(true);
     liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: false, registeredAt: 0, ageS: 1 }] });
     expect(await looksStalled(worker('claude-code', file), t0 + 40 * 60 * 1000)).toBe(true);
+  });
+
+  it('drops tasks started before the tab\'s Claude process (pid file startedAt flows through)', async () => {
+    const t0 = Date.parse('2026-09-26T05:00:00.000Z');
+    const { file } = await shellWait(t0);
+    const tmux = await import('@/lib/tmux');
+    vi.mocked(tmux.getSessionPanePid).mockResolvedValue(4242);
+    await import('@/lib/providers');
+    const { getProviderByPanelType } = await import('@/lib/providers/registry');
+    const claude = getProviderByPanelType('claude-code')!;
+    const detect = vi.spyOn(claude, 'detectActiveSession').mockResolvedValue({
+      status: 'running', sessionId: 's', jsonlPath: file, pid: 4243, startedAt: t0 + 60_000, cwd: '/',
+    });
+    try {
+      // The shell started before this process: an orphan, so the tab is judged by the no-open 10 min rule.
+      expect(await looksStalled(worker('claude-code', file), t0 + 40 * 60 * 1000)).toBe(true);
+      expect(detect).toHaveBeenCalledWith(4242, undefined, { tmuxSession: 'tmux-worker' });
+    } finally {
+      detect.mockRestore();
+      vi.mocked(tmux.getSessionPanePid).mockResolvedValue(null);
+    }
   });
 
   it('is not STALLED on a silent gate waiter 40 min in, and is at the 90 min backstop', async () => {
