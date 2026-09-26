@@ -6,6 +6,7 @@ import { isValidModelName } from '@/lib/claude-command-shared';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
 import type { IAgentLaunchConfig } from '@/types/terminal';
 import { withCodexTargetLock } from '@/lib/providers/codex/launch-lifecycle';
+import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const tabId = req.query.tabId as string;
@@ -21,7 +22,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   if (req.method === 'GET') {
     const found = await findTab(workspaceId, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
     const provider = getProviderByPanelType(found.tab.panelType);
     return res.status(200).json({
       tabId: found.tab.id,
@@ -38,7 +39,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   if (req.method === 'DELETE') {
     const found = await findTab(workspaceId, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
     const ok = await removeTabFromPane(workspaceId, found.paneId, tabId);
     return res.status(200).json({ ok });
   }
@@ -46,7 +47,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'PATCH') {
     return withCodexTargetLock(workspaceId, tabId, async () => {
       const found = await findTab(workspaceId, tabId);
-      if (!found) return res.status(404).json({ error: 'Tab not found' });
+      if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
       if (!getProviderByPanelType(found.tab.panelType)) {
         return res.status(400).json({ error: 'Tab is not an agent panel' });
       }
@@ -74,7 +75,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           }
         : null;
       const tab = await updateTabAgentLaunchConfig(workspaceId, found.paneId, tabId, nextConfig);
-      if (!tab) return res.status(404).json({ error: 'Tab not found' });
+      if (!tab) return res.status(404).json(TAB_NOT_FOUND_BODY);
       return res.status(200).json({
         tabId,
         workspaceId,
