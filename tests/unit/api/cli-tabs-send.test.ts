@@ -168,6 +168,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(response.statusCode).toBe(409);
     expect(response.body).toEqual({
       error: 'agent-not-ready',
+      code: 'readiness-timeout',
       tabId: TAB_ID,
       cliState: 'busy',
       detail: 'readiness-timeout',
@@ -253,6 +254,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(response.statusCode).toBe(409);
     expect(response.body).toEqual({
       error: 'agent-not-ready',
+      code: 'session-not-running',
       tabId: TAB_ID,
       cliState: 'idle',
       detail: 'session-not-running',
@@ -276,7 +278,48 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'hello' });
 
     expect(response.statusCode).toBe(404);
-    expect(response.body).toEqual({ error: 'Tab not found' });
+    expect(response.body).toEqual({ error: 'Tab not found', code: 'tab-not-found' });
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+  });
+
+  it('reports a tab replaced during the wait as target-changed', async () => {
+    const replaced = { ...tabWith('idle'), sessionName: 'pmux-ws-send-pane-1-tab-2' };
+    cliUtils.findTab
+      .mockResolvedValueOnce(locate(tabWith('idle')))
+      .mockResolvedValue(locate(replaced));
+
+    const response = await call({ content: 'hello' });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toEqual({ error: 'agent-target-changed', code: 'target-changed', tabId: TAB_ID });
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+  });
+
+  it('reports a tab replaced inside the dispatch lock as target-changed', async () => {
+    cliUtils.findTab
+      .mockResolvedValueOnce(locate(tabWith('idle')))
+      .mockResolvedValueOnce(locate(tabWith('idle')))
+      .mockResolvedValue(null);
+
+    const response = await call({ content: 'hello' });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toEqual({ error: 'agent-target-changed', code: 'target-changed', tabId: TAB_ID });
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+  });
+
+  it('reports a session that died inside the dispatch lock as session-not-running', async () => {
+    tmux.hasSession.mockResolvedValueOnce(true).mockResolvedValue(false);
+
+    const response = await call({ content: 'hello' });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toEqual({
+      error: 'agent-not-ready',
+      code: 'session-not-running',
+      tabId: TAB_ID,
+      detail: 'session-not-running',
+    });
     expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 

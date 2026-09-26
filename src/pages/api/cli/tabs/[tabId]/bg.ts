@@ -3,6 +3,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import type { IBackgroundJob } from '@/types/liveness';
+import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
 
 const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -13,14 +14,14 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   if (req.method === 'GET') {
     if (!(await authorizeWorkspace(req, res, workspaceId))) return;
-    if (!(await findTab(workspaceId, tabId))) return res.status(404).json({ error: 'Tab not found' });
+    if (!(await findTab(workspaceId, tabId))) return res.status(404).json(TAB_NOT_FOUND_BODY);
     const { backgroundJobs } = await getLivenessManager().statusForTab(tabId);
     return res.status(200).json({ tabId, workspaceId, backgroundJobs });
   }
 
   if (req.method === 'POST') {
     if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
-    if (!(await findTab(workspaceId, tabId))) return res.status(404).json({ error: 'Tab not found' });
+    if (!(await findTab(workspaceId, tabId))) return res.status(404).json(TAB_NOT_FOUND_BODY);
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const pid = Number(body.pid);

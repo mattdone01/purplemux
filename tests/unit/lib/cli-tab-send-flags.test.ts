@@ -5,10 +5,11 @@ import { promisify } from 'util';
 import { describe, expect, it } from 'vitest';
 
 const run = promisify(execFile);
-const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'bin', 'cli.js');
+// The installed entry point: ~/.local/bin/purplemux resolves to bin/purplemux.js.
+const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'bin', 'purplemux.js');
 
-/** Port 1 refuses instantly, so a command that reaches the network still fails fast. */
-const ENV = { ...process.env, PMUX_PORT: '1', PMUX_TOKEN: 'test-token' };
+/** fetch refuses port 1 before connecting, so a command that reaches the network still fails fast. */
+const ENV = { ...process.env, PMUX_PORT: '1', PMUX_TOKEN: 'test-token', NO_UPDATE_NOTIFIER: '1' };
 
 const cli = async (args: string[]): Promise<{ code: number; stderr: string }> => {
   try {
@@ -24,7 +25,7 @@ describe('purplemux tab send --wait-ms', () => {
   it('rejects the flag with no value instead of silently using the default', async () => {
     const { code, stderr } = await cli(['tab', 'send', '-w', 'ws-x', 'tab-1', 'hello', '--wait-ms']);
 
-    expect(code).toBe(1);
+    expect(code).toBe(2);
     expect(stderr).toContain('--wait-ms must be a whole number of milliseconds');
   });
 
