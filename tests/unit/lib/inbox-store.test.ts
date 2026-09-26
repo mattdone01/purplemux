@@ -166,6 +166,19 @@ describe('inbox store — pure transitions', () => {
     expect(withdrawInState(state, 'i-nosuchitem', 'x', T0 + 3)).toEqual(state);
   });
 
+  it('drops a queued or held item at its staleAt instead of typing it; an item without one never goes stale', async () => {
+    const { enqueueInState, holdInState, deliverInState, sweepInState } = await load();
+    let state: IInboxState = { items: [] };
+    const q = enqueueInState(state, { ...req({ dedupeKey: 'q' }), staleAt: T0 + MIN }, T0, ids); state = q.state;
+    const h = enqueueInState(state, { ...req({ dedupeKey: 'h' }), staleAt: T0 + MIN }, T0, ids); state = holdInState(h.state, h.item.id, 'x', T0 + 1);
+    const d = enqueueInState(state, { ...req({ dedupeKey: 'd' }), staleAt: T0 + MIN }, T0, ids); state = deliverInState(d.state, d.item.id, T0 + 1);
+    const n = enqueueInState(state, req({ dedupeKey: 'n' }), T0, ids); state = n.state;
+    expect(sweepInState(state, T0 + MIN - 1)).toBe(state);
+    const swept = sweepInState(state, T0 + MIN);
+    expect(Object.fromEntries(swept.items.map((i) => [i.dedupeKey, [i.state, i.droppedReason]])))
+      .toEqual({ q: ['dropped', 'stale'], h: ['dropped', 'stale'], d: ['delivered', null], n: ['queued', null] });
+  });
+
   it('prunes delivered, dropped and held items 7 days after their last transition, never queued ones', async () => {
     const { enqueueInState, deliverInState, holdInState, sweepInState } = await load();
     let state: IInboxState = { items: [] };

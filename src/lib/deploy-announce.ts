@@ -36,6 +36,12 @@ const DAY = 24 * 60 * 60 * 1000;
 /** Announcement records are pruned this long after creation. */
 export const DEPLOY_RETENTION_MS = 7 * DAY;
 export const DEPLOY_LEASE = 'deploy:purplemux';
+/**
+ * A deploy notice not typed by restartAt + this is dropped by the inbox, never typed: past it the
+ * restart has happened or was abandoned (deploy-live's quiet wait is 15 min by default). The backstop
+ * for an announce whose caller never withdrew it — an interrupt, a client failure (final confirmation).
+ */
+export const DEPLOY_NOTICE_STALE_MS = 30 * 60_000;
 const DEPLOY_ID = /^d-[A-Za-z0-9_-]{4,32}$/;
 const TAB_ID = /^tab-[A-Za-z0-9_-]{1,32}$/;
 
@@ -232,6 +238,7 @@ export class DeployAnnouncer {
             targetTabId: t.tabId,
             dedupeKey: `deploy-${id}`,
             fields: { deployId: id, restartAt, inMinutes },
+            staleAt: restartAt + DEPLOY_NOTICE_STALE_MS,
           });
           queued.push(item.id);
           recipients.push({ ...t, itemId: item.id });

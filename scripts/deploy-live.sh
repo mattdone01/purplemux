@@ -104,9 +104,11 @@ OWN_TAB="${PMUX_TAB_ID:-}"
 PROC_ROOT="${DEPLOY_PROC_ROOT:-/proc}"
 
 WORK="$(mktemp -d)"
+exec {SUMMARY_FD}>&1
 LEASE_HELD=0
 CLI_DIR=""
 ANNOUNCE_ID=""
+ANNOUNCE_CLOSED=0
 total=0
 INTERRUPTED=0
 
@@ -143,19 +145,28 @@ token_cli() {
 # waiting, so none is typed after the restart with an out-of-date "restarts at ~T" (review rounds
 # 1-2). Runs before the restart on a deploy, and from finish() on every other path.
 close_announcement() {
+  ((ANNOUNCE_CLOSED)) && return 0
+  # An interrupt (or a client failure) during the announce call can land after the server queued the
+  # notices but before ANNOUNCE_ID was set: the id the server returned is then in announce.json.
+  [[ -n "${ANNOUNCE_ID:-}" ]] || ANNOUNCE_ID="$(helper field "$WORK/announce.json" id 2>/dev/null)"
   [[ -n "${ANNOUNCE_ID:-}" ]] || return 0
-  local withdrawn
-  if admin_cli deploy status "$ANNOUNCE_ID" --json >"$WORK/announce-status.json" 2>/dev/null; then
-    read -r delivered _ < <(helper announce-progress "$WORK/announce-status.json")
-    S_ANNOUNCED="${delivered}/${total}"
-  fi
+  local withdrawn=""
+  # Withdraw first, then count: a notice delivered between the two is counted exactly once.
   if admin_cli deploy withdraw "$ANNOUNCE_ID" >"$WORK/withdraw.json" 2>/dev/null; then
     withdrawn="$(helper field "$WORK/withdraw.json" withdrawn)"
-    [[ "${withdrawn:-0}" != 0 ]] && S_ANNOUNCED="$S_ANNOUNCED; $withdrawn still waiting, withdrawn"
-  else
+  fi
+  if admin_cli deploy status "$ANNOUNCE_ID" --json >"$WORK/announce-status.json" 2>/dev/null; then
+    read -r delivered _ < <(helper announce-progress "$WORK/announce-status.json")
+    [[ "${total:-0}" == 0 ]] && total="$(helper count "$WORK/announce-status.json" recipients)"
+    S_ANNOUNCED="${delivered}/${total}"
+  fi
+  if [[ -z "$withdrawn" ]]; then
     S_ANNOUNCED="$S_ANNOUNCED; withdraw failed"
+  elif [[ "$withdrawn" != 0 ]]; then
+    S_ANNOUNCED="$S_ANNOUNCED; $withdrawn still waiting, withdrawn"
   fi
   ANNOUNCE_ID=""
+  ANNOUNCE_CLOSED=1
 }
 
 finish() {
@@ -170,6 +181,9 @@ finish() {
     fi
     LEASE_HELD=0
   fi
+  # The summary goes to the stdout saved at start: a signal trap can run inside a command whose own
+  # stdout is redirected (the announce call writes announce.json), and would write the summary there.
+  exec 1>&"$SUMMARY_FD"
   echo "---- deploy-live summary ----"
   echo "RELEASE=$S_RELEASE"
   echo "PREVIOUS=$S_PREVIOUS"

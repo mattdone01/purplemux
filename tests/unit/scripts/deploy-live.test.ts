@@ -89,7 +89,10 @@ case "$1 $2" in
     echo "announce" >> "$FAKE_STATE/order.log"
     code=$(cat "$FAKE_STATE/announce-exit" 2>/dev/null || echo 0)
     if [[ "$code" != 0 ]]; then cat "$FAKE_STATE/announce-stderr" >&2; exit "$code"; fi
-    echo '{"id":"d-fake1234","recipients":[{},{},{}]}'; exit 0 ;;
+    echo '{"id":"d-fake1234","recipients":[{},{},{}]}'
+    # The server committed; the deploy is interrupted before the script reads the id.
+    [[ -e "$FAKE_STATE/term-after-announce" ]] && kill -TERM "$(ps -o ppid= $PPID | tr -d ' ')" 2>/dev/null
+    exit 0 ;;
   "deploy withdraw")
     echo "withdraw" >> "$FAKE_STATE/order.log"
     printf '{"id":"d-fake1234","withdrawn":%s}' "$(cat "$FAKE_STATE/withdrawn" 2>/dev/null || echo 0)"; exit 0 ;;
@@ -513,6 +516,18 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     expect(field(r.out, 'LEASE')).toBe('acquired, released');
     expect(restarts(h)).toBe(0);
     expect(h.log('order')).not.toContain('api/cli/tabs');
+  });
+
+  it('an interrupt while the announce call is in flight still withdraws what the server queued and prints its summary', () => {
+    announceStatus(['queued', 'queued', 'queued']);
+    h.flag('term-after-announce');
+    h.flag('withdrawn', '3');
+    const { status, out } = h.run([h.sha(), '--announce', '5']);
+    expect(status, out).not.toBe(0);
+    expect(field(out, 'VERDICT')).toBe('interrupted');
+    expect(h.log('order')).toContain('withdraw');
+    expect(field(out, 'ANNOUNCED')).toContain('3 still waiting, withdrawn');
+    expect(restarts(h)).toBe(0);
   });
 
   it('--announce takes 1 to 60 minutes; --dry-run and a deploy without it announce nothing', () => {

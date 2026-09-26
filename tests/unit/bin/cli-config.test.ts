@@ -46,7 +46,9 @@ const cli = async (args: string[], env: Record<string, string>): Promise<IResult
   }
 };
 
-describe('purplemux config — the installed CLI against the real fleet-config routes (ADR-0019)', () => {
+// Each case spawns the CLI up to ten times: vitest's 5 s default fails them on a loaded host (story 13
+// gate r6 at load average 105), as the other installed-CLI files already allow for.
+describe('purplemux config — the installed CLI against the real fleet-config routes (ADR-0019)', { timeout: 60_000 }, () => {
   let server: { port: number; close: () => Promise<void> };
   let orch: Record<string, string>;
   let worker: Record<string, string>;
