@@ -28,6 +28,7 @@ import {
 } from '@/lib/path-safety';
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
+import { revokeWorkspaceTabTokens } from '@/lib/tab-token';
 import { withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
 
@@ -139,6 +140,31 @@ const readWorkspacesFile = async (): Promise<IWorkspacesData | null> => {
     } catch {}
     return null;
   }
+};
+
+/**
+ * The workspace ids, read strictly: a missing file means none, any other read
+ * error or an unparseable file throws. `readWorkspacesFile` answers null for
+ * both, which is right for the UI and wrong for a sweep that releases what it
+ * cannot see.
+ */
+export const readWorkspaceIdsStrict = async (): Promise<string[]> => {
+  let raw: string;
+  try {
+    raw = await fs.readFile(WORKSPACES_FILE, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new Error(`${WORKSPACES_FILE} unreadable: ${err instanceof Error ? err.message : err}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${WORKSPACES_FILE} is not valid JSON: ${err instanceof Error ? err.message : err}`);
+  }
+  const workspaces = (parsed as { workspaces?: unknown } | null)?.workspaces;
+  if (!Array.isArray(workspaces)) throw new Error(`${WORKSPACES_FILE} has no "workspaces" array`);
+  return workspaces.map((ws) => (ws as { id?: unknown })?.id).filter((id): id is string => typeof id === 'string');
 };
 
 const writeWorkspacesFile = async (data: IWorkspacesData): Promise<void> => {
@@ -443,6 +469,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
     await removeWorkspaceClaudeHome(workspaceId).catch(() => {});
     await removeWorkspaceGrokHome(workspaceId).catch(() => {});
     revokeWorkspaceToken(workspaceId);
+    await revokeWorkspaceTabTokens(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;
   });

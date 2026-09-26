@@ -10,6 +10,7 @@ import {
 import { hasSession, isContentPendingInComposer } from '@/lib/tmux';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
+import { TAB_NOT_FOUND_BODY, targetChangedBody } from '@/lib/cli-error';
 
 /**
  * Deliver a prompt to a tab.
@@ -59,6 +60,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           sessionName: found.tab.sessionName,
           panelType: found.tab.panelType,
           cliState: resolveTabCliState(found.tab, getStatusManager().getAllForClient()[id]),
+          waitingAtPrompt: getStatusManager().isWaitingAtPrompt(id),
         };
       },
       hasSession,
@@ -70,9 +72,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   );
 
   if (!readiness.ok) {
-    if (readiness.reason === 'tab-not-found') return res.status(404).json({ error: 'Tab not found' });
+    if (readiness.reason === 'tab-not-found') return res.status(404).json(TAB_NOT_FOUND_BODY);
     return res.status(409).json({
       error: 'agent-not-ready',
+      code: readiness.reason,
       tabId,
       cliState: readiness.cliState,
       detail: readiness.reason,
@@ -82,16 +85,16 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   const current = await findTab(workspaceId, tabId);
   if (!current || current.tab.sessionName !== readiness.target.sessionName) {
-    return res.status(409).json({ error: 'agent-target-changed', tabId });
+    return res.status(409).json(targetChangedBody(tabId));
   }
   const delivered = await withAgentDispatchLock(workspaceId, current.tab, async (checkPolicy) => {
     const latest = await findTab(workspaceId, tabId);
     if (!latest || latest.tab.sessionName !== readiness.target.sessionName) {
-      res.status(409).json({ error: 'agent-target-changed', tabId });
+      res.status(409).json(targetChangedBody(tabId));
       return false;
     }
     if (!await hasSession(latest.tab.sessionName)) {
-      res.status(409).json({ error: 'agent-not-ready', tabId, detail: 'session-not-running' });
+      res.status(409).json({ error: 'agent-not-ready', code: 'session-not-running', tabId, detail: 'session-not-running' });
       return false;
     }
     const policy = await checkPolicy({ consumeBootstrapForTarget: true });

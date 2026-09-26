@@ -19,6 +19,7 @@ interface IStep {
   cliState: TCliState | null;
   panelType?: TPanelType;
   alive?: boolean;
+  waitingAtPrompt?: boolean;
 }
 
 /**
@@ -41,7 +42,7 @@ const runReadiness = async (
         current = steps[Math.min(polls, steps.length - 1)];
         polls += 1;
         if (!current) return null;
-        return { sessionName: SESSION, cliState: current.cliState, panelType: current.panelType };
+        return { sessionName: SESSION, cliState: current.cliState, panelType: current.panelType, waitingAtPrompt: current.waitingAtPrompt };
       },
       hasSession: async () => current !== null && current.alive !== false,
       now: () => clock,
@@ -239,4 +240,22 @@ describe('resolveSendWaitMs', () => {
       expect(resolveSendWaitMs(value)).toBeNull();
     },
   );
+});
+
+describe('composer-ready gate and a WAITING worker (ADR-0018, ruling A′)', () => {
+  it('accepts a busy agent flagged waitingAtPrompt on the first look', async () => {
+    const { result, polls } = await runReadiness([{ cliState: 'busy', panelType: 'claude-code', waitingAtPrompt: true }], 1000);
+    expect(result).toMatchObject({ ok: true });
+    expect(polls).toBe(1);
+  });
+
+  it('keeps waiting on a busy agent without the flag, and times out', async () => {
+    const { result } = await runReadiness([{ cliState: 'busy', panelType: 'claude-code', waitingAtPrompt: false }], 1000);
+    expect(result).toMatchObject({ ok: false, reason: 'readiness-timeout' });
+  });
+
+  it('never lets the flag excuse a dead session', async () => {
+    const { result } = await runReadiness([{ cliState: 'busy', panelType: 'claude-code', waitingAtPrompt: true, alive: false }], 1000);
+    expect(result).toMatchObject({ ok: false, reason: 'session-not-running' });
+  });
 });

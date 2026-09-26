@@ -6,6 +6,8 @@ import { createSession, hasSession, killSession, resolveExistingDir, sendKeys, w
 import { broadcastSync } from '@/lib/sync-server';
 import { isAgentPanelType as isAgentPanel } from '@/lib/agent-panel-types';
 import { createLogger } from '@/lib/logger';
+import { hasKnownTabs, observeLayoutTabs, observeWorkspaceRemoved } from '@/lib/tab-lifecycle';
+import { findTabIdBySession, revokeTabToken } from '@/lib/tab-token';
 import {
   collectPanes,
   collectAllTabs,
@@ -26,23 +28,12 @@ const log = createLogger('layout');
 
 const BASE_DIR = path.join(os.homedir(), '.purplemux');
 
-interface ILayoutReconciler {
-  reconcileWorkspaceTabs: (wsId: string, validTabIds: readonly string[]) => void;
-  removeWorkspaceTabs: (wsId: string) => void;
-}
-
 const g = globalThis as unknown as {
   __ptLayoutLock?: Promise<void>;
   __ptLayoutContentCache?: Map<string, string>;
-  __ptLayoutReconciler?: ILayoutReconciler | null;
 };
 if (!g.__ptLayoutLock) g.__ptLayoutLock = Promise.resolve();
 if (!g.__ptLayoutContentCache) g.__ptLayoutContentCache = new Map();
-if (g.__ptLayoutReconciler === undefined) g.__ptLayoutReconciler = null;
-
-export const setLayoutReconciler = (reconciler: ILayoutReconciler | null): void => {
-  g.__ptLayoutReconciler = reconciler;
-};
 
 const withLock = async <T>(fn: () => Promise<T>): Promise<T> => {
   let release: () => void;
@@ -150,6 +141,9 @@ export const writeLayoutFile = async (data: ILayoutData, filePath: string): Prom
 
   if (cache.get(filePath) === contentKey) return;
 
+  const wsId = extractWsIdFromPath(filePath);
+  const previous = wsId && !hasKnownTabs(wsId) ? await readLayoutFile(filePath) : null;
+
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmpFile = filePath + '.tmp';
   try {
@@ -162,24 +156,17 @@ export const writeLayoutFile = async (data: ILayoutData, filePath: string): Prom
 
   cache.set(filePath, contentKey);
 
-  const wsId = extractWsIdFromPath(filePath);
   if (wsId) {
-    const reconciler = g.__ptLayoutReconciler;
-    if (reconciler) {
-      const validTabIds = collectAllTabs(data.root).map((t) => t.id);
-      reconciler.reconcileWorkspaceTabs(wsId, validTabIds);
-    }
+    observeLayoutTabs(wsId, collectAllTabs(data.root), previous ? collectAllTabs(previous.root) : null);
     broadcastSync({ type: 'layout', workspaceId: wsId });
   }
 };
 
 export const removeLayoutFile = async (wsId: string): Promise<void> => {
+  const previous = hasKnownTabs(wsId) ? null : await readLayoutFile(resolveLayoutFile(wsId));
   await fs.rm(resolveLayoutDir(wsId), { recursive: true, force: true });
   clearLayoutCache(wsId);
-  const reconciler = g.__ptLayoutReconciler;
-  if (reconciler) {
-    reconciler.removeWorkspaceTabs(wsId);
-  }
+  observeWorkspaceRemoved(wsId, previous ? collectAllTabs(previous.root) : null);
   broadcastSync({ type: 'layout', workspaceId: wsId });
 };
 
@@ -227,7 +214,7 @@ export const crossCheckLayout = async (
       if (!tmuxSet.has(tab.sessionName) && isAgentPanelType(tab.panelType)) {
         const cwd = tab.cwd || defaultCwd;
         log.debug(`crossCheck: agent tab session recreated: ${tab.sessionName} (cwd: ${cwd})`);
-        await createSession(tab.sessionName, 80, 24, cwd);
+        await createSession(tab.sessionName, 80, 24, cwd, { workspaceId: wsId, tabId: tab.id });
         changed = true;
       }
     }
@@ -238,11 +225,20 @@ export const crossCheckLayout = async (
     changed = true;
     const firstPane = panes[0];
     if (firstPane) {
+      const usedIds = new Set(collectAllTabs(layout.root).map((t) => t.id));
+      // An orphan that carries a tab token keeps the id in its PMUX_TAB_ID, so
+      // the layout id and the shell's own idea of its tab stay equal (ADR-0010).
+      const adoptedId = (sessionName: string): string => {
+        const own = findTabIdBySession(wsId, sessionName);
+        const id = own && !usedIds.has(own) ? own : generateTabId();
+        usedIds.add(id);
+        return id;
+      };
       let maxOrder = firstPane.tabs.length > 0 ? Math.max(...firstPane.tabs.map((t) => t.order)) : -1;
       for (const sessionName of orphans) {
         maxOrder++;
         firstPane.tabs.push({
-          id: generateTabId(),
+          id: adoptedId(sessionName),
           sessionName,
           name: '',
           order: maxOrder,
@@ -272,7 +268,7 @@ export interface ICreateLayoutOptions {
 export const createDefaultLayout = async (wsId: string, cwd: string, options?: ICreateLayoutOptions): Promise<ILayoutData> => {
   const { pane, tab } = createDefaultPaneNode(wsId, cwd);
   if (options?.panelType) tab.panelType = options.panelType;
-  await createSession(tab.sessionName, 80, 24, cwd);
+  await createSession(tab.sessionName, 80, 24, cwd, { workspaceId: wsId, tabId: tab.id });
   return {
     root: pane,
     activePaneId: pane.id,
@@ -287,7 +283,7 @@ export const getLayout = async (wsId: string, defaultCwd?: string): Promise<ILay
     if (existing) return existing;
 
     const { pane, tab } = createDefaultPaneNode(wsId, defaultCwd);
-    await createSession(tab.sessionName, 80, 24, defaultCwd);
+    await createSession(tab.sessionName, 80, 24, defaultCwd, { workspaceId: wsId, tabId: tab.id });
 
     const layout: ILayoutData = {
       root: pane,
@@ -303,7 +299,7 @@ export const createPane = async (wsId: string, cwd?: string): Promise<{ paneId: 
   const tabId = generateTabId();
   const sessionName = workspaceSessionName(wsId, paneId, tabId);
 
-  await createSession(sessionName, 80, 24, cwd);
+  await createSession(sessionName, 80, 24, cwd, { workspaceId: wsId, tabId });
 
   const tab: ITab = { id: tabId, sessionName, name: '', order: 0, ...(cwd ? { cwd } : {}) };
   return { paneId, tab };
@@ -322,7 +318,7 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig }): Promise<ITab | null> =>
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -335,7 +331,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const tabId = generateTabId();
     const sessionName = workspaceSessionName(wsId, paneId, tabId);
     if (!isWebBrowser) {
-      await createSession(sessionName, 80, 24, cwd);
+      await createSession(sessionName, 80, 24, cwd, { workspaceId: wsId, tabId });
       if (command) {
         await sendKeys(sessionName, command);
       }
@@ -345,7 +341,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}) };
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}) };
 
     pane.tabs.push(tab);
     pane.activeTabId = tabId;
@@ -443,7 +439,7 @@ export const restartTabSession = async (wsId: string, paneId: string, tabId: str
     const effectiveCwd = await resolveExistingDir(tab.cwd);
     const cwdLost = Boolean(tab.cwd && tab.cwd !== effectiveCwd);
 
-    await createSession(tab.sessionName, 80, 24, effectiveCwd);
+    await createSession(tab.sessionName, 80, 24, effectiveCwd, { workspaceId: wsId, tabId: tab.id });
     if (command && !cwdLost) {
       await sendKeys(tab.sessionName, command);
     }
@@ -500,11 +496,15 @@ export const parseSessionName = (sessionName: string): { wsId: string; paneId: s
   return { wsId: match[1], paneId: match[2], tabId: match[3] };
 };
 
-/** Read-only: the tab a tmux session belongs to, or null when no layout names it. */
-export const findTabBySessionName = async (sessionName: string): Promise<ITab | null> => {
-  const parsed = parseSessionName(sessionName);
-  if (!parsed) return null;
-  const layout = await readLayoutFile(resolveLayoutFile(parsed.wsId));
+/**
+ * Read-only: the tab a tmux session belongs to, or null when no layout names it.
+ * With `workspaceId`, only that workspace's layout is consulted — the caller's
+ * own workspace, never one named by the session string.
+ */
+export const findTabBySessionName = async (sessionName: string, workspaceId?: string): Promise<ITab | null> => {
+  const wsId = workspaceId ?? parseSessionName(sessionName)?.wsId;
+  if (!wsId) return null;
+  const layout = await readLayoutFile(resolveLayoutFile(wsId));
   if (!layout) return null;
   return collectAllTabs(layout.root).find((t) => t.sessionName === sessionName) ?? null;
 };
@@ -655,6 +655,29 @@ const mutate = async (
     return result;
   });
 
+/** Set or clear the tab a tab reports to; false when the tab is gone. */
+export const setTabReportsTo = async (wsId: string, tabId: string, reportsTo: string | null): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    if ((tab.reportsTo ?? null) === reportsTo) return { changed: false, value: true };
+    if (reportsTo) tab.reportsTo = reportsTo;
+    else delete tab.reportsTo;
+    return { changed: true, value: true };
+  })).found;
+
+/** Drop every `reportsTo` in a workspace that names a closed tab; the ids cleared. */
+export const clearReportsTo = async (wsId: string, closedTabId: string): Promise<string[]> => {
+  const cleared: string[] = [];
+  await mutate(wsId, (layout) => {
+    for (const tab of collectAllTabs(layout.root)) {
+      if (tab.reportsTo !== closedTabId) continue;
+      delete tab.reportsTo;
+      cleared.push(tab.id);
+    }
+    return cleared.length ? layout : null;
+  });
+  return cleared;
+};
+
 export const patchLayout = async (
   wsId: string,
   patch: { activePaneId?: string; ratioUpdate?: { path: number[]; ratio: number }; equalize?: boolean; diffSettings?: Partial<IDiffSettings> },
@@ -708,7 +731,7 @@ export const splitPaneInLayout = async (
   const sessionName = workspaceSessionName(wsId, paneId, tabId);
 
   if (!isWebBrowser) {
-    await createSession(sessionName, 80, 24, cwd);
+    await createSession(sessionName, 80, 24, cwd, { workspaceId: wsId, tabId });
   }
 
   const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
@@ -741,6 +764,7 @@ export const splitPaneInLayout = async (
 
   if (!result && !isWebBrowser) {
     await killSession(sessionName).catch(() => {});
+    await revokeTabToken(tabId).catch(() => {});
   }
 
   return result;

@@ -4,6 +4,7 @@ import { parseGrokContent } from '@/lib/session-parser-grok';
 import { grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import type { IAgentRuntimeSnapshot, IAgentSessionHistoryStats } from '@/lib/providers/types';
 import type { ICurrentAction } from '@/types/status';
+import { TURN_TAIL_CHARS } from '@/lib/turn-end';
 import type { ITimelineEntry } from '@/types/timeline';
 
 const MAX_SNIPPET_LENGTH = 200;
@@ -86,6 +87,8 @@ export const summarizeGrokEntries = (
 
   let currentAction: ICurrentAction | null = null;
   let lastAssistantSnippet: string | null = null;
+  let lastAssistantTail: string | null = null;
+  let turnOpen = true;
   let lastEntryTs: number | null = null;
 
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -94,8 +97,10 @@ export const summarizeGrokEntries = (
     if (!currentAction && entry.type === 'tool-call' && !resolved.has(entry.toolUseId)) {
       currentAction = { toolName: entry.toolName, summary: entry.summary };
     }
+    if (entry.type === 'user-message') turnOpen = false;
     if (!lastAssistantSnippet && entry.type === 'assistant-message') {
       lastAssistantSnippet = compact(entry.markdown);
+      if (turnOpen) lastAssistantTail = entry.markdown.trimEnd().slice(-TURN_TAIL_CHARS);
     }
     if (currentAction && lastAssistantSnippet) break;
   }
@@ -108,6 +113,7 @@ export const summarizeGrokEntries = (
     idle,
     stale: staleMs > STALE_MS,
     lastAssistantSnippet: lastAssistantSnippet || null,
+    lastAssistantTail,
     currentAction,
     reset: last.type === 'context-compacted',
     lastEntryTs,

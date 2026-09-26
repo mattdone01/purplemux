@@ -17,6 +17,7 @@ const readFileOrNull = (file) => {
 };
 
 const PORT = process.env.PMUX_PORT || readFileOrNull(path.join(os.homedir(), '.purplemux', 'port'));
+const TAB_TOKEN = process.env.PMUX_TAB_TOKEN || null;
 const ENV_TOKEN = process.env.PMUX_TOKEN || null;
 const ADMIN_TOKEN = readFileOrNull(path.join(os.homedir(), '.purplemux', 'cli-token'));
 const BASE = `http://localhost:${PORT}`;
@@ -30,10 +31,12 @@ const BASE = `http://localhost:${PORT}`;
  * workspace — so when nothing scoped us, resolve the token of the workspace
  * the command already named in `-w` and present that.
  *
- * The order is the whole point. `PMUX_TOKEN` wins whenever it is set, which is
- * exactly the case of a command running INSIDE a tab: it stays confined to its
- * own workspace and never picks up a neighbour's token from disk. The lookup
- * below is reached only by a caller that was never scoped to begin with.
+ * The order is the whole point: `PMUX_TAB_TOKEN` > `PMUX_TOKEN` > the `-w`
+ * workspace's token on disk > the global token. The first two are set exactly
+ * when a command runs INSIDE a tab. The tab token names the tab as well as its
+ * workspace (ADR-0010); both stay confined to their own workspace and never
+ * pick up a neighbour's token from disk. The lookup below is reached only by a
+ * caller that was never scoped to begin with.
  */
 const workspaceTokenFor = (workspaceId) => {
   if (!workspaceId) return null;
@@ -46,58 +49,262 @@ const workspaceTokenFor = (workspaceId) => {
 };
 
 const tokenFor = (requestPath) => {
+  if (TAB_TOKEN) return TAB_TOKEN;
   if (ENV_TOKEN) return ENV_TOKEN;
   const match = /[?&]workspaceId=([^&]+)/.exec(requestPath || '');
   const workspaceId = match ? decodeURIComponent(match[1]) : null;
   return workspaceTokenFor(workspaceId) || ADMIN_TOKEN;
 };
 
+let ownSession;
+/** The tmux session this command runs in, or null outside tmux. Asked of tmux once per process. */
+const ownSessionName = () => {
+  if (ownSession !== undefined) return ownSession;
+  ownSession = null;
+  if (!process.env.TMUX) return ownSession;
+  try {
+    const name = require('child_process')
+      .execFileSync('tmux', ['display-message', '-p', '#{session_name}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .trim();
+    ownSession = name || null;
+  } catch {
+    ownSession = null;
+  }
+  return ownSession;
+};
+
+/**
+ * `X-Pmux-Session` lets the server name the calling tab for a workspace token
+ * (tabs created before tab tokens existed). The server trusts it only inside
+ * the token's own workspace, and a tab token makes it redundant.
+ */
+const headersFor = (requestPath, extra) => {
+  const headers = { 'X-Pmux-Token': tokenFor(requestPath), ...(extra || {}) };
+  const session = TAB_TOKEN ? null : ownSessionName();
+  if (session) headers['X-Pmux-Session'] = session;
+  return headers;
+};
+
+// Exit-code contract (docs/adr/0016-cli-exit-codes-and-tab-owned-processes.md).
+// A caller branches on the exit code, so a failure it must never retry (the tab
+// is gone) and one it may retry (the agent is still booting) cannot share one.
+// A relay loop once retried `tab send` into a closed tab for more than a day
+// because both exited 1.
+const EXIT = Object.freeze({
+  UNEXPECTED: 1,
+  USAGE: 2,
+  CONFLICT: 3,
+  GONE: 4,
+  NOT_READY: 5,
+  UNREACHABLE: 6,
+  NOT_FOUND: 7,
+});
+
+const EXIT_HINT = Object.freeze({
+  [EXIT.UNEXPECTED]: 'unexpected — investigate',
+  [EXIT.USAGE]: 'usage error — fix the command',
+  [EXIT.CONFLICT]: 'conflict — retry only after the state changes',
+  [EXIT.GONE]: 'permanent — the target is gone; do not retry',
+  [EXIT.NOT_READY]: 'not ready yet — retry, bounded',
+  [EXIT.UNREACHABLE]: 'server unreachable — retry, bounded',
+  [EXIT.NOT_FOUND]: 'not found',
+});
+
+// The one code → exit table. A server route adds its `code` here, never a
+// table of its own. A code absent from the table exits 1.
+const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
+  'gh-unavailable': EXIT.UNEXPECTED,
+  'outcome-unknown': EXIT.UNEXPECTED,
+  'close-not-confirmed': EXIT.UNEXPECTED,
+  'lease-policy': EXIT.USAGE,
+  'watch-invalid': EXIT.USAGE,
+  'reports-to-invalid': EXIT.USAGE,
+  'note-too-large': EXIT.USAGE,
+  'config-invalid': EXIT.USAGE,
+  'note-target-missing': EXIT.USAGE,
+  'lease-held': EXIT.CONFLICT,
+  'lease-held-by-other': EXIT.CONFLICT,
+  'watch-cap': EXIT.CONFLICT,
+  forbidden: EXIT.CONFLICT,
+  'inbox-not-held': EXIT.CONFLICT,
+  'grant-tab-unverified': EXIT.CONFLICT,
+  'config-version-conflict': EXIT.CONFLICT,
+  'caller-unresolved': EXIT.CONFLICT,
+  'grant-password-invalid': EXIT.CONFLICT,
+  'grant-locked': EXIT.CONFLICT,
+  'tab-not-found': EXIT.GONE,
+  'session-not-running': EXIT.GONE,
+  'target-changed': EXIT.GONE,
+  'readiness-timeout': EXIT.NOT_READY,
+  'server-unreachable': EXIT.UNREACHABLE,
+  'routes-absent': EXIT.UNREACHABLE,
+  'lease-not-found': EXIT.NOT_FOUND,
+  'note-not-found': EXIT.NOT_FOUND,
+  'watch-not-found': EXIT.NOT_FOUND,
+  'inbox-not-found': EXIT.NOT_FOUND,
+  'deploy-not-found': EXIT.NOT_FOUND,
+  'config-not-found': EXIT.NOT_FOUND,
+}));
+
+// Where the class alone does not tell the caller what happened.
+const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
+  'tab-not-found': 'permanent — the tab is closed; do not retry',
+  'session-not-running': "the tab's session is dead; do not retry — a person must restart the tab",
+  'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
+  'routes-absent': 'no such route on this server (an older server, a foreign server, or a malformed id) — retrying cannot help',
+}));
+
+const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
+
+const hintFor = (code, detail) => {
+  if (code === 'readiness-timeout' && Number.isFinite(detail?.waitedMs)) {
+    const state = detail.cliState ? `, cliState ${detail.cliState}` : '';
+    return `not ready after ${detail.waitedMs} ms${state} — retry, bounded`;
+  }
+  if (code && Object.hasOwn(CODE_HINT, code)) return CODE_HINT[code];
+  return EXIT_HINT[exitFor(code)];
+};
+
+/**
+ * Report a failure and exit through the code → exit table. `code` is the
+ * server's machine code (or a client-side one such as `server-unreachable`);
+ * null means the failure carries no code and exits 1.
+ */
+const fail = (code, message, detail) => {
+  const hint = hintFor(code, detail);
+  const line = code
+    ? `${code} (${hint})${message && message !== code ? ` — ${message}` : ''}`
+    : `${message} (${hint})`;
+  process.stderr.write(`error: ${line}\n`);
+  process.exit(exitFor(code));
+};
+
+// A usage error: the command itself is wrong, so nothing was sent (exit 2).
 const die = (msg) => {
-  process.stderr.write(`error: ${msg}\n`);
-  process.exit(1);
+  process.stderr.write(`error: ${msg} (${EXIT_HINT[EXIT.USAGE]})\n`);
+  process.exit(EXIT.USAGE);
 };
 
 const requireEnv = () => {
-  if (!PORT) die('PMUX_PORT not set and ~/.purplemux/port missing (is the server running?)');
-  if (!ENV_TOKEN && !ADMIN_TOKEN) die('PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
+  if (!PORT) fail('server-unreachable', 'PMUX_PORT not set and ~/.purplemux/port missing (is the server running?)');
+  if (!TAB_TOKEN && !ENV_TOKEN && !ADMIN_TOKEN) fail('server-unreachable', 'PMUX_TAB_TOKEN and PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
+};
+
+// Failures that happen before the request reaches the server: retrying cannot
+// repeat an effect the server never saw.
+const CONNECT_ERRORS = new Set([
+  'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+const causeCode = (err) => {
+  const cause = err?.cause;
+  return cause?.code || cause?.errors?.find((e) => e?.code)?.code || err?.code || null;
+};
+
+/**
+ * A request that never got an answer. A read, or a request that never
+ * connected, is safe to repeat: exit 6. A write that lost its connection after
+ * connecting may have taken effect, so it exits 1 and says the outcome is
+ * unknown — a blind retry of `tab send` could type the prompt twice.
+ */
+const networkFailure = (method, requestPath, err) => {
+  const cause = causeCode(err);
+  // undici reports a network failure as `fetch failed` (no answer) or
+  // `terminated` (the body stopped), with a coded cause. Anything else — a
+  // malformed URL or header, a port fetch refuses — is deterministic and was
+  // never sent: retrying cannot help, and no write can have taken effect.
+  const network = (err?.message === 'fetch failed' || err?.message === 'terminated') && cause;
+  if (!network) {
+    const detail = err?.cause?.message ? ` (${err.cause.message})` : '';
+    return fail(null, `request not sent: ${err?.message || String(err)}${detail}`);
+  }
+  const reason = cause;
+  if (CONNECT_ERRORS.has(cause) || method === 'GET' || method === 'HEAD') {
+    return fail('server-unreachable', `${BASE} (${reason})`);
+  }
+  return fail(
+    'outcome-unknown',
+    `connection lost during ${method} ${requestPath.split('?')[0]} (${reason}); outcome unknown — check the state before retrying`,
+  );
+};
+
+const request = async (method, requestPath, init) => {
+  try {
+    return await fetch(`${BASE}${requestPath}`, { ...init, method });
+  } catch (err) {
+    return networkFailure(method, requestPath, err);
+  }
+};
+
+const readBody = async (method, requestPath, resp, as) => {
+  try {
+    return await resp[as]();
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) return networkFailure(method, requestPath, err);
+    // An error status still has a status to report; a success does not.
+    if (!resp.ok) return null;
+    return fail(null, `HTTP ${resp.status} with a body that is not valid JSON`);
+  }
+};
+
+// Servers built before the contract carry the same facts without `code`; a
+// rollback must not turn a closed tab back into a retryable exit 1.
+const legacyCode = (body) => {
+  if (body.error === 'Tab not found') return 'tab-not-found';
+  if (body.error === 'Tab session is not running' || body.error === 'session not found') return 'session-not-running';
+  if (body.error === 'agent-target-changed') return 'target-changed';
+  if (body.error === 'agent-not-ready' && typeof body.detail === 'string') return body.detail;
+  return null;
+};
+
+const failFromResponse = (resp, body) => {
+  if (!body || typeof body !== 'object') return fail(null, `HTTP ${resp.status}`);
+  const code = typeof body.code === 'string' ? body.code : legacyCode(body);
+  const message = typeof body.error === 'string' ? body.error : `HTTP ${resp.status}`;
+  return fail(code, code ? message : `${message} (HTTP ${resp.status})`, body);
 };
 
 const out = (body) => {
   process.stdout.write(JSON.stringify(body, null, 2) + '\n');
 };
 
+const isJson = (resp) => (resp.headers.get('content-type') || '').includes('json');
+
+/**
+ * Every CLI route answers errors as JSON with a `code`. A 404 WITHOUT a JSON
+ * body is the framework's own not-found page: the running server has no such
+ * route (it predates this CLI). That exits 6 like any absent capability, and
+ * the `routes-absent` code tells a caller (deploy-live.sh, bash-guard) that
+ * the server answered, which `server-unreachable` does not.
+ */
+const failIfRouteAbsent = (resp, requestPath) => {
+  if (resp.status === 404 && !isJson(resp) && requestPath.startsWith('/api/cli/')) {
+    fail('routes-absent', `${requestPath.split('?')[0]} is not served by the purplemux on port ${PORT}`);
+  }
+};
+
 const api = async (method, path, data) => {
-  const url = `${BASE}${path}`;
   const opts = {
     method,
-    headers: { 'X-Pmux-Token': tokenFor(path), 'Content-Type': 'application/json' },
+    headers: headersFor(path, { 'Content-Type': 'application/json' }),
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
-  const resp = await fetch(url, opts);
-  const body = resp.headers.get('content-type')?.includes('json')
-    ? await resp.json()
-    : null;
-  if (!resp.ok) {
-    const msg = body?.error || `HTTP ${resp.status}`;
-    die(msg);
-  }
+  const resp = await request(method, path, opts);
+  failIfRouteAbsent(resp, path);
+  const body = isJson(resp) ? await readBody(method, path, resp, 'json') : null;
+  if (!resp.ok) failFromResponse(resp, body);
+  // Every CLI route answers JSON; a success without it is not a purplemux
+  // answer (another server on the port), and printing `null` would pass it off
+  // as one.
+  if (!isJson(resp)) fail(null, `HTTP ${resp.status} without a JSON body — is purplemux the server on port ${PORT}?`);
   return { resp, body };
 };
 
 const apiRaw = async (method, path) => {
-  const url = `${BASE}${path}`;
-  const resp = await fetch(url, {
-    method,
-    headers: { 'X-Pmux-Token': tokenFor(path) },
-  });
-  if (!resp.ok) {
-    const ct = resp.headers.get('content-type') || '';
-    if (ct.includes('json')) {
-      const body = await resp.json();
-      die(body?.error || `HTTP ${resp.status}`);
-    }
-    die(`HTTP ${resp.status}`);
-  }
+  const resp = await request(method, path, { headers: headersFor(path) });
+  failIfRouteAbsent(resp, path);
+  if (!resp.ok) failFromResponse(resp, isJson(resp) ? await readBody(method, path, resp, 'json') : null);
   return resp;
 };
 
@@ -156,12 +363,16 @@ const cmdWorkspacePeers = async (args) => {
   die('usage: workspace peers show|set -w WS [PEER_WS_ID...]');
 };
 
+/**
+ * `PMUX_TAB_ID` is the tab's layout id; the server adopts an orphan session
+ * under the id its token was minted for, so the two stay equal. The
+ * session-name parse remains for tabs created before `PMUX_TAB_ID` existed.
+ */
 const deriveOwnTabId = () => {
-  try {
-    const session = require('child_process').execSync("tmux display-message -p '#{session_name}'", { encoding: 'utf8' }).trim();
-    const m = session.match(/^pt-ws-.*-(tab-.+)$/);
-    return m ? m[1] : null;
-  } catch { return null; }
+  if (process.env.PMUX_TAB_ID) return process.env.PMUX_TAB_ID;
+  const session = ownSessionName();
+  const m = session ? session.match(/^pt-ws-.*-(tab-.+)$/) : null;
+  return m ? m[1] : null;
 };
 
 const cmdOrchestration = async (args) => {
@@ -295,6 +506,166 @@ const cmdMission = async (args) => {
   die('usage: mission snapshot|events|answers|ack -w WS [options]');
 };
 
+// ---- leases (ADR-0011) ----
+
+const TTL_UNITS = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/** `45m`, `3h`, `2d`, `90s`, `90` (seconds) or `none` (no expiry). */
+const parseTtl = (raw) => {
+  if (raw === 'none') return null;
+  const m = /^(\d+)([smhd]?)$/.exec(raw || '');
+  if (!m) die(`--ttl must be a duration such as 45m, 3h, 2d, 90s, or "none" — got "${raw}"`);
+  return Number(m[1]) * TTL_UNITS[m[2] || 's'];
+};
+
+const age = (seconds) => {
+  if (seconds === null || seconds === undefined) return '-';
+  if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d${Math.floor((seconds % 86400) / 3600)}h`;
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h${Math.floor((seconds % 3600) / 60)}m`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
+  return `${seconds}s`;
+};
+
+const holderText = (h) => {
+  if (h.admin) return 'admin';
+  const ws = h.workspaceName ? `${h.workspaceId} (${h.workspaceName})` : h.workspaceId;
+  const tab = h.tabName ? `${h.tabId} (${h.tabName})` : h.tabId;
+  return `${ws} / ${tab}${h.verified ? '' : ' unverified'}`;
+};
+
+const printLeases = (leases) => {
+  if (!leases.length) {
+    process.stdout.write('no leases\n');
+    return;
+  }
+  for (const l of leases) {
+    const parts = [
+      l.name,
+      `holder=${holderText(l.holder)}`,
+      `state=${l.holderState}`,
+      `age=${age(l.ageSeconds)}`,
+      `expires-in=${age(l.expiresInSeconds)}`,
+    ];
+    if (l.epic) parts.push(`epic=${l.epic}`);
+    if (l.note) parts.push(`note=${JSON.stringify(l.note)}`);
+    process.stdout.write(parts.join('  ') + '\n');
+  }
+};
+
+const LEASE_VALUE_FLAGS = ['--ttl', '--epic', '--note', '--prefix', '--reason', '--kind'];
+const LEASE_BOOL_FLAGS = ['--mine', '--json'];
+
+const leaseName = (args, what = 'NAME') => {
+  const positional = stripBooleanFlags(stripFlags(args, LEASE_VALUE_FLAGS), LEASE_BOOL_FLAGS);
+  if (positional.length !== 1) die(`exactly one ${what} is required`);
+  return positional[0];
+};
+
+// The inbox (ADR-0012): server notices queued for this workspace's tabs.
+const cmdInbox = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = stripBooleanFlags(stripFlags(args.slice(1), ['--workspace', '-w']), ['--all']);
+  switch (sub) {
+    case 'list': {
+      const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
+      if (!wsId) die('usage: inbox list -w WS [--all]');
+      const all = args.includes('--all') ? '&all=1' : '';
+      const { body } = await api('GET', `/api/cli/inbox?workspaceId=${encodeURIComponent(wsId)}${all}`);
+      return out(body);
+    }
+    case 'retry': {
+      const id = rest[0];
+      if (!id || !/^i-[A-Za-z0-9_-]{1,32}$/.test(id)) die('usage: inbox retry ID (an i-… inbox item id)');
+      const { body } = await api('POST', `/api/cli/inbox/${id}/retry`, {});
+      return out(body);
+    }
+    default:
+      die('usage: inbox list -w WS [--all] | inbox retry ID');
+  }
+};
+
+const LEASE_USAGE = 'usage: lease acquire|renew|release|list|check|break|release-epic ... (purplemux help)';
+
+/**
+ * `check` prints `{ held, mine, lease }` on stdout and exits 0 (caller holds),
+ * 3 (another holds) or 7 (nobody holds). Its body is the contract bash-guard
+ * parses; the exit code alone answers the common question.
+ */
+const cmdLease = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const ttlRaw = flagValue(rest, '--ttl');
+  switch (sub) {
+    case 'acquire': {
+      const name = leaseName(rest);
+      const data = { name };
+      if (ttlRaw !== null) data.ttlSeconds = parseTtl(ttlRaw);
+      const epic = flagValue(rest, '--epic');
+      const note = flagValue(rest, '--note');
+      if (epic !== null) data.epic = epic;
+      if (note !== null) data.note = note;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/acquire', data);
+      return out(body);
+    }
+    case 'renew': {
+      const name = leaseName(rest);
+      const data = { name };
+      if (ttlRaw !== null) data.ttlSeconds = parseTtl(ttlRaw);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/renew', data);
+      return out(body);
+    }
+    case 'release': {
+      const name = leaseName(rest);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/release', { name });
+      return out(body);
+    }
+    case 'break': {
+      const name = leaseName(rest);
+      const reason = flagValue(rest, '--reason');
+      if (!reason || !reason.trim()) die('--reason is required');
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/break', { name, reason });
+      return out(body);
+    }
+    case 'release-epic': {
+      const epic = leaseName(rest, 'SLUG');
+      const data = { epic };
+      const kind = flagValue(rest, '--kind');
+      if (kind !== null) data.kind = kind;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/release-epic', data);
+      return out(body);
+    }
+    case 'list': {
+      const positional = stripBooleanFlags(stripFlags(rest, LEASE_VALUE_FLAGS), LEASE_BOOL_FLAGS);
+      if (positional.length) die(`unexpected argument: ${positional[0]}`);
+      const qs = new URLSearchParams();
+      const prefix = flagValue(rest, '--prefix');
+      if (prefix !== null) qs.set('prefix', prefix);
+      if (rest.includes('--mine')) qs.set('mine', '1');
+      requireEnv();
+      const query = qs.toString();
+      const { body } = await api('GET', `/api/cli/leases${query ? `?${query}` : ''}`);
+      if (rest.includes('--json')) return out(body);
+      return printLeases(body.leases || []);
+    }
+    case 'check': {
+      const name = leaseName(rest);
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/leases/check?name=${encodeURIComponent(name)}`);
+      out(body);
+      process.exitCode = body.mine ? 0 : body.held ? EXIT.CONFLICT : EXIT.NOT_FOUND;
+      return;
+    }
+    default:
+      die(LEASE_USAGE);
+  }
+};
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -307,7 +678,10 @@ const cmdTabCreate = async (args) => {
   // edits outside them; it never infers the list.
   const scopeRaw = flagValue(args, '--scope');
   const scope = scopeRaw ? scopeRaw.split(',').map((s) => s.trim()).filter(Boolean) : null;
+  // Nudges go to this live tab of the same workspace first (ADR-0018).
+  const reportsTo = flagValue(args, '--reports-to');
   if (!wsId) die('--workspace is required');
+  if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
     ...(name ? { name } : {}),
@@ -316,7 +690,23 @@ const cmdTabCreate = async (args) => {
     ...(reasoning ? { reasoning } : {}),
     ...(noLaunch ? { launch: false } : {}),
     ...(scope && scope.length ? { scope } : {}),
+    ...(reportsTo ? { reportsTo } : {}),
   });
+  out(body);
+};
+
+const cmdTabReportsTo = async (args) => {
+  requireEnv();
+  const clear = args.includes('--clear');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--clear']);
+  const [tabId, target] = rest;
+  if (!tabId || (clear ? target : !target)) die('usage: tab reports-to -w WS TAB_ID (TARGET_TAB_ID | --clear)');
+  const wsId = resolveWsForTab(args);
+  const { body } = await api(
+    'PATCH',
+    `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
+    { reportsTo: clear ? null : target },
+  );
   out(body);
 };
 
@@ -360,6 +750,8 @@ const cmdTabSteer = async (args) => {
 // The send waits for the target to reach a state that can accept a turn. An
 // agent TUI that is still booting swallows the Enter after the paste, so a
 // send that does not wait can report success over an agent that never starts.
+const MAX_CLI_WAIT_MS = 240_000;
+
 const cmdTabSend = async (args) => {
   requireEnv();
   const file = flagValue(args, '--file') || flagValue(args, '-f');
@@ -382,6 +774,13 @@ const cmdTabSend = async (args) => {
   // default would silently wait 60s for a caller that asked for something else.
   if (waitMsGiven && (waitMs === null || !/^\d+$/.test(waitMs))) {
     die('--wait-ms must be a whole number of milliseconds');
+  }
+  // Node's fetch stops waiting for response headers at 300 s. The server still
+  // takes the dispatch lock and types the prompt after the wait, so the cap
+  // leaves a minute for that; it narrows the outcome-unknown window, it does
+  // not close it.
+  if (waitMsGiven && Number(waitMs) > MAX_CLI_WAIT_MS) {
+    die(`--wait-ms must be at most ${MAX_CLI_WAIT_MS} (the CLI's HTTP client stops waiting at 300 s)`);
   }
   const wsId = resolveWsForTab(args);
   const { body } = await api(
@@ -424,11 +823,14 @@ const cmdTabClose = async (args) => {
   const tabId = rest[0];
   if (!tabId) die('tab ID is required');
   const wsId = resolveWsForTab(args);
-  const { resp } = await api(
+  const { body } = await api(
     'DELETE',
     `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
   );
-  if (resp.ok) process.stdout.write('ok\n');
+  // A 200 is not a close: the server answers `ok: false` when the layout kept
+  // the tab, and printing ok over that hides a tab that is still running.
+  if (body?.ok !== true) return fail('close-not-confirmed', `the server answered ${JSON.stringify(body)}`);
+  process.stdout.write('ok\n');
 };
 
 // Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
@@ -481,7 +883,7 @@ const cmdTabProbe = async (args) => {
 const cmdTabBg = async (args) => {
   requireEnv();
   const sub = args[0];
-  const rest = stripFlags(args.slice(1), ['--workspace', '-w', '--pid', '--label', '--stderr', '--exit-file']);
+  const rest = stripFlags(args.slice(1), ['--workspace', '-w', '--pid', '--label', '--stderr', '--exit-file', '--notify']);
   const tabId = rest[0];
   if (!sub) die('bg subcommand required (add | list | remove)');
   if (!tabId) die('tab ID is required');
@@ -494,12 +896,15 @@ const cmdTabBg = async (args) => {
       const label = flagValue(args, '--label');
       const stderrFile = flagValue(args, '--stderr');
       const exitCodeFile = flagValue(args, '--exit-file');
+      const notify = flagValue(args, '--notify');
       if (!pid || !/^\d+$/.test(pid)) die('--pid N is required');
+      if (args.includes('--notify') && notify !== 'self' && notify !== 'orchestrator') die('--notify must be self or orchestrator');
       const { body } = await api('POST', `/api/cli/tabs/${tabId}/bg?${qs}`, {
         pid: Number(pid),
         ...(label ? { label } : {}),
         ...(stderrFile ? { stderrFile: require('path').resolve(stderrFile) } : {}),
         ...(exitCodeFile ? { exitCodeFile: require('path').resolve(exitCodeFile) } : {}),
+        ...(notify ? { notify } : {}),
       });
       return out(body);
     }
@@ -541,7 +946,7 @@ const cmdTabBrowser = async (args) => {
       const path = `/api/cli/tabs/${tabId}/browser/screenshot?${qs}&full=${full}`;
       if (outPath) {
         const resp = await apiRaw('GET', path);
-        const buf = Buffer.from(await resp.arrayBuffer());
+        const buf = Buffer.from(await readBody('GET', path, resp, 'arrayBuffer'));
         fs.writeFileSync(outPath, buf);
         out({ saved: outPath, bytes: buf.byteLength });
       } else {
@@ -590,11 +995,9 @@ const cmdTabBrowser = async (args) => {
 
 const cmdApiGuide = async () => {
   requireEnv();
-  const resp = await fetch(`${BASE}/api/cli/api-guide`, {
-    headers: { 'X-Pmux-Token': tokenFor(path) },
-  });
-  if (!resp.ok) die(`HTTP ${resp.status}`);
-  process.stdout.write((await resp.text()) + '\n');
+  const guidePath = '/api/cli/api-guide';
+  const resp = await apiRaw('GET', guidePath);
+  process.stdout.write((await readBody('GET', guidePath, resp, 'text')) + '\n');
 };
 
 const flagValue = (args, name) => {
@@ -641,20 +1044,26 @@ Commands:
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
+             [--reports-to TAB_ID]         Send this tab's watchdog nudges to TAB_ID (a live tab of the SAME
+                                           workspace) instead of the workspace orchestrator; exit 2 otherwise
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets the
              [--no-launch]                 reasoning effort — claude-code: low|medium|high|xhigh|max (claude --effort;
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
+  tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
+                  [--clear]                restores the workspace orchestrator. Cleared when TARGET closes
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
-                                           for an agent tab to be able to accept a turn; --wait-ms N changes
-                                           the budget, --no-wait answers immediately. On timeout nothing is
-                                           pasted and the call fails with agent-not-ready.
+                                           for an agent tab to be able to accept a turn; --wait-ms N (max
+                                           240000) changes the budget, --no-wait answers immediately. On timeout nothing is
+                                           pasted and the call exits 5 (readiness-timeout).
+                                           Exit 4 (tab-not-found, session-not-running, target-changed) means
+                                           the tab is gone: never retry it, and never loop on it.
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status (includes registered probes + background jobs)
   tab result -w WS TAB_ID                  Capture tab pane content
-  tab close -w WS TAB_ID                   Close a tab
+  tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
@@ -668,8 +1077,11 @@ Commands:
   tab bg add -w WS TAB_ID --pid N          Watch a background pid. A strict integer from --exit-file classifies exit 0
              [--label L] [--stderr FILE]   as COMPLETED and nonzero as FAILED; missing or malformed status becomes
              [--exit-file FILE]            EXITED with unknown status after a short grace. Nudges include the stderr
-                                           tail when available. Verify completed artifacts; inspect unknown exits
+             [--notify self|orchestrator]  tail when available. Verify completed artifacts; inspect unknown exits
                                            before deciding. Launch pattern: ( cmd 2>err.log; echo $? > exit.code ) &
+                                           --notify self wakes TAB_ID itself (a worker on its own gate); the default
+                                           wakes its reports-to tab, else the orchestrator. A live job also holds
+                                           the tab's turn end as WAITING: no READY nudge until it exits
   tab bg list -w WS TAB_ID                 Show watched background jobs (pid, alive, age)
   tab bg remove -w WS TAB_ID [--pid N]     Stop watching (all, or one pid)
   tab browser url -w WS TAB_ID             Current URL + title of a web-browser tab
@@ -694,6 +1106,25 @@ Commands:
   mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items; --all includes history
   mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
                                            Acknowledge one persisted answer after reading and applying it
+  lease acquire NAME [--ttl 45m|none] [--epic SLUG] [--note TEXT]
+                                           Take a held-resource lease (<kind>:<resource>, e.g. merge:owner/repo,
+                                           epic:SLUG, num:owner/repo:adr:0373). Exit 0 acquired or renewed,
+                                           2 policy (TTL/epic/name), 3 refused: stderr code lease-held (another
+                                           holds it; the holder is named) or forbidden / caller-unresolved
+  lease renew NAME [--ttl 45m]             Move the expiry forward (holder only)
+  lease release NAME                       Release a lease you hold. Exit 0, 3 held by another, 7 not held
+  lease list [--prefix P] [--mine] [--json]
+                                           Every lease on the host: holder, state, age, expiry, epic, note
+  lease check NAME                         Exact name only. Prints {held, mine, lease}; exit 0 you hold it,
+                                           3 another holds it, 7 nobody holds it. Exit 3 WITHOUT a body on
+                                           stdout is a refusal (bad token), not a holder
+  lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
+  lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
+                                           epic:SLUG; a tab of a claiming workspace releases its own claims)
+  inbox list -w WS [--all]                 Server notices (notes, watches, deploys, Mission Control) queued or held
+                                           for WS's tabs; --all adds delivered and dropped (kept 7 days)
+  inbox retry ID                           Re-queue a held notice once (the target workspace's token or admin).
+                                           Exit 3 inbox-not-held, 7 inbox-not-found
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -704,9 +1135,29 @@ Mission event examples:
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-review-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true,"humanReview":{"humanNeed":"decision","humanReason":"Choose the acceptable product rollout risk.","handling":"Existing rollout guidance does not choose product risk tolerance.","reviewerTabId":"tab-orchestrator"}}}]}'
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-resolve-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":2,"producerAt":1700000000004,"bindingGeneration":1,"type":"attention.resolved","payload":{"itemId":"question-1","resolution":"Applied the gradual rollout"}}]}'
 
+Exit codes:
+  exit  meaning                                                      retry?
+     0  success                                                      —
+     1  unexpected error (unmapped code, 5xx, write outcome unknown)  investigate first
+     2  usage error (bad or missing argument, or a usage code)       fix the command
+     3  conflict: held by another holder, or refused by state        only after the state changes
+     4  target gone: tab-not-found, session-not-running,             never
+        target-changed
+     5  not ready yet: readiness-timeout                             yes, bounded
+     6  server unreachable (refused, no port, read interrupted)      yes, bounded
+        routes-absent: 404 without JSON — no such route (an older    no, until the cause
+        server, a foreign server, or a malformed id)                 is fixed
+     7  not found: the named lease, note or watch does not exist     —
+  stderr names the code and its class, e.g.
+    error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
+
 Environment:
-  PMUX_PORT       Server port (required)
-  PMUX_TOKEN      CLI token (required)
+  PMUX_PORT          Server port (falls back to ~/.purplemux/port)
+  PMUX_TAB_TOKEN     This tab's own token; names the calling tab (set in every tab created by the server)
+  PMUX_TOKEN         This tab's workspace token (ignored while PMUX_TAB_TOKEN is set; unset that to override)
+  PMUX_TAB_ID        This tab's id; the default TAB_ID of "orchestration on"
+  PMUX_WORKSPACE_ID  This tab's workspace id
+  Token order: PMUX_TAB_TOKEN > PMUX_TOKEN > the -w workspace's token on disk > ~/.purplemux/cli-token
 `);
 };
 
@@ -730,8 +1181,12 @@ const main = async () => {
       return cmdOrchestration(args.slice(1));
     case 'standup':
       return cmdStandup(args.slice(1));
+    case 'lease':
+      return cmdLease(args.slice(1));
     case 'mission':
       return cmdMission(args.slice(1));
+    case 'inbox':
+      return cmdInbox(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);
@@ -743,6 +1198,7 @@ const main = async () => {
         case 'close': return cmdTabClose(rest);
         case 'probe': return cmdTabProbe(rest);
         case 'bg': return cmdTabBg(rest);
+        case 'reports-to': return cmdTabReportsTo(rest);
         case 'browser': return cmdTabBrowser(rest);
         default: die(`unknown tab command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
       }
@@ -759,5 +1215,5 @@ const main = async () => {
 };
 
 main().catch((err) => {
-  die(err.message || String(err));
+  fail(null, err.message || String(err));
 });

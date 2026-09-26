@@ -1,11 +1,14 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
-import { removeTabFromPane, updateTabAgentLaunchConfig } from '@/lib/layout-store';
+import { removeTabFromPane, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
 import { getProviderByPanelType } from '@/lib/providers';
 import { isValidModelName } from '@/lib/claude-command-shared';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
 import type { IAgentLaunchConfig } from '@/types/terminal';
 import { withCodexTargetLock } from '@/lib/providers/codex/launch-lifecycle';
+import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
+import { checkReportsTo } from '@/lib/reports-to';
+
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const tabId = req.query.tabId as string;
@@ -21,7 +24,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
   if (req.method === 'GET') {
     const found = await findTab(workspaceId, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
     const provider = getProviderByPanelType(found.tab.panelType);
     return res.status(200).json({
       tabId: found.tab.id,
@@ -33,20 +36,39 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentProviderId: provider?.id ?? null,
       agentSessionId: provider?.readSessionId(found.tab) ?? null,
       agentLaunchConfig: found.tab.agentLaunchConfig,
+      reportsTo: found.tab.reportsTo ?? null,
     });
   }
 
   if (req.method === 'DELETE') {
     const found = await findTab(workspaceId, tabId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
     const ok = await removeTabFromPane(workspaceId, found.paneId, tabId);
     return res.status(200).json({ ok });
+  }
+
+  if (req.method === 'PATCH' && req.body && typeof req.body === 'object' && 'reportsTo' in req.body) {
+    const body = req.body as Record<string, unknown>;
+    if (Object.keys(body).some((key) => key !== 'reportsTo')) {
+      return res.status(400).json({ error: 'reportsTo is patched on its own' });
+    }
+    const found = await findTab(workspaceId, tabId);
+    if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
+    const reportsTo = body.reportsTo === null ? null : body.reportsTo;
+    if (reportsTo !== null) {
+      const refused = await checkReportsTo(workspaceId, reportsTo, tabId);
+      if (refused) return res.status(400).json(refused);
+    }
+    if (!(await setTabReportsTo(workspaceId, tabId, reportsTo as string | null))) {
+      return res.status(404).json(TAB_NOT_FOUND_BODY);
+    }
+    return res.status(200).json({ tabId, workspaceId, reportsTo });
   }
 
   if (req.method === 'PATCH') {
     return withCodexTargetLock(workspaceId, tabId, async () => {
       const found = await findTab(workspaceId, tabId);
-      if (!found) return res.status(404).json({ error: 'Tab not found' });
+      if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
       if (!getProviderByPanelType(found.tab.panelType)) {
         return res.status(400).json({ error: 'Tab is not an agent panel' });
       }
@@ -74,7 +96,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           }
         : null;
       const tab = await updateTabAgentLaunchConfig(workspaceId, found.paneId, tabId, nextConfig);
-      if (!tab) return res.status(404).json({ error: 'Tab not found' });
+      if (!tab) return res.status(404).json(TAB_NOT_FOUND_BODY);
       return res.status(200).json({
         tabId,
         workspaceId,

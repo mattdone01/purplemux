@@ -1,0 +1,22 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { acquireLease } from '@/lib/lease-store';
+import { bodyOf, holderOf, leaseAuthority, requireCaller, requireMethod, sendLeaseError, ttlOf, viewOf } from '@/lib/lease-http';
+
+const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (!requireMethod(req, res, 'POST')) return;
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
+  try {
+    const body = bodyOf(req);
+    const { lease, outcome } = await acquireLease(
+      { name: body.name, ttlSeconds: ttlOf(body), epic: body.epic, note: body.note },
+      holderOf(caller),
+      leaseAuthority,
+    );
+    return res.status(200).json({ lease: await viewOf(lease), outcome });
+  } catch (err) {
+    return sendLeaseError(res, err);
+  }
+};
+
+export default handler;

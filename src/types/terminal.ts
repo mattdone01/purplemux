@@ -109,6 +109,12 @@ export interface ITab {
    * in here. Absent means the off-scope detector stays inert for this tab.
    */
   scope?: string[];
+  /**
+   * The tab (same workspace) that receives this tab's watchdog nudges while it
+   * is live, ahead of the workspace orchestrator (ADR-0018). Cleared when that
+   * tab closes.
+   */
+  reportsTo?: string;
   cliState?: TCliState;
   dismissedAt?: number | null;
   webUrl?: string | null;

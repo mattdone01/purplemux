@@ -2,8 +2,9 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
-import { readClaudeRuntimeSnapshot, __testing } from '@/lib/providers/claude/runtime-snapshot';
+import { readClaudeRuntimeSnapshot } from '@/lib/providers/claude/runtime-snapshot';
 import { readCodexRuntimeSnapshot } from '@/lib/providers/codex/runtime-snapshot';
+import { summarizeGrokEntries } from '@/lib/providers/grok/runtime-snapshot';
 
 const writeJsonl = async (lines: unknown[]): Promise<string> => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'purplemux-runtime-snapshot-'));
@@ -107,26 +108,108 @@ describe('agent runtime snapshots', () => {
   });
 });
 
-describe('countOpenBackgroundTasks', () => {
-  const { countOpenBackgroundTasks } = __testing;
-  const user = (text: string) => JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: text }] } });
-  const notify = (id: string) => JSON.stringify({ type: 'user', message: { content: `<task-notification><task-id>${id}</task-id><status>completed</status></task-notification>` } });
-
-  it('counts a background command until its task notification arrives', () => {
-    const lines = [user('Command running in background with ID: bx3bq. Output is being written to /tmp/x')];
-    expect(countOpenBackgroundTasks(lines)).toBe(1);
-    expect(countOpenBackgroundTasks([...lines, notify('bx3bq')])).toBe(0);
+describe('Claude snapshot — background work and turn tail', () => {
+  const started = (id: string) => ({
+    type: 'user',
+    timestamp: '2026-09-26T05:00:00.000Z',
+    message: { content: [{ type: 'tool_result', content: `Command running in background with ID: ${id}.` }] },
+    toolUseResult: { backgroundTaskId: id },
+  });
+  const endTurn = (text: string) => ({
+    type: 'assistant',
+    timestamp: '2026-09-26T05:01:00.000Z',
+    message: { stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+  });
+  const done = (id: string) => ({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    timestamp: '2026-09-26T05:02:00.000Z',
+    content: `<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n</task-notification>`,
   });
 
-  it('counts an async subagent the same way', () => {
-    const lines = [user('Async agent launched successfully.\nagentId: a44c861f (internal ID)')];
-    expect(countOpenBackgroundTasks(lines)).toBe(1);
-    expect(countOpenBackgroundTasks([...lines, notify('a44c861f')])).toBe(0);
+  it('counts a background shell started 20 turns and >8 KB earlier', async () => {
+    const turns = Array.from({ length: 20 }, (_, i) => endTurn(`turn ${i} ${'x'.repeat(2000)}`));
+    const jsonlPath = await writeJsonl([started('bfar1'), ...turns]);
+    const snapshot = await readClaudeRuntimeSnapshot(jsonlPath, { force: true });
+    expect(snapshot.openBackgroundTasks).toBe(1);
+    expect(snapshot.openBackgroundTaskKinds).toEqual({ shell: 1, agent: 0, monitor: 0 });
+    expect(snapshot.backgroundActivityAt).toBeNull();
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { withActivity: true })).backgroundActivityAt).toEqual(expect.any(Number));
   });
 
-  it('ignores sidechain entries, assistant text and a notification with no seen start', () => {
-    const assistant = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Command running in background with ID: fake' }] } });
-    const side = JSON.stringify({ type: 'user', isSidechain: true, message: { content: [{ type: 'tool_result', content: 'Command running in background with ID: side1' }] } });
-    expect(countOpenBackgroundTasks([assistant, side, notify('unseen')])).toBe(0);
+  it('ignores tasks started before the agent process (orphaned by a restart)', async () => {
+    const jsonlPath = await writeJsonl([started('bold1'), endTurn('resumed')]);
+    const processStart = Date.parse('2026-09-26T05:00:30.000Z');
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { force: true })).openBackgroundTasks).toBe(1);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart })).openBackgroundTasks).toBe(0);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart - 60_000 })).openBackgroundTasks).toBe(1);
+  });
+
+  it('keeps the count on a cache hit and drops it once the task ends', async () => {
+    const jsonlPath = await writeJsonl([started('b1'), endTurn('waiting')]);
+    await readClaudeRuntimeSnapshot(jsonlPath);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath)).openBackgroundTasks).toBe(1);
+    await fs.appendFile(jsonlPath, JSON.stringify(done('b1')) + '\n');
+    const after = await readClaudeRuntimeSnapshot(jsonlPath);
+    expect(after.openBackgroundTasks).toBe(0);
+    expect(after.backgroundActivityAt).toBeNull();
+  });
+
+  it('returns the END of the last message as the tail, where the head snippet cuts it off', async () => {
+    const text = `${'Long report line.\n'.repeat(40)}\nBLOCKED: gate red — needs X`;
+    const jsonlPath = await writeJsonl([endTurn(text)]);
+    const snapshot = await readClaudeRuntimeSnapshot(jsonlPath, { force: true });
+    expect(snapshot.lastAssistantSnippet).not.toContain('BLOCKED:');
+    expect(snapshot.lastAssistantTail?.endsWith('BLOCKED: gate red — needs X')).toBe(true);
+    expect(snapshot.lastAssistantTail!.length).toBeLessThanOrEqual(600);
+  });
+
+  it('reads the tail of a final message longer than the 8 KB window', async () => {
+    const text = `${'y'.repeat(20_000)}\nDONE: shipped`;
+    const jsonlPath = await writeJsonl([endTurn('earlier'), endTurn(text)]);
+    const snapshot = await readClaudeRuntimeSnapshot(jsonlPath, { force: true });
+    expect(snapshot.lastAssistantTail?.endsWith('DONE: shipped')).toBe(true);
+  });
+
+  it('has no tail once a new prompt follows the last answer', async () => {
+    const jsonlPath = await writeJsonl([
+      endTurn('DONE: old'),
+      { type: 'user', timestamp: '2026-09-26T05:03:00.000Z', message: { content: 'next task' } },
+    ]);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { force: true })).lastAssistantTail).toBeNull();
+  });
+});
+
+describe('Codex and Grok turn tails', () => {
+  it('returns the current turn\'s last Codex agent_message, newlines kept', async () => {
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-26T05:00:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'go' } },
+      { timestamp: '2026-09-26T05:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'Gate is red.\n\nBLOCKED: gate red — needs X' } },
+      { timestamp: '2026-09-26T05:01:01.000Z', type: 'event_msg', payload: { type: 'task_complete' } },
+    ]);
+    const snapshot = await readCodexRuntimeSnapshot(jsonlPath);
+    expect(snapshot.lastAssistantTail?.split('\n').at(-1)).toBe('BLOCKED: gate red — needs X');
+  });
+
+  it('has no Codex tail when the last event is a new user message', async () => {
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-26T05:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'DONE: old' } },
+      { timestamp: '2026-09-26T05:02:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'next' } },
+    ]);
+    expect((await readCodexRuntimeSnapshot(jsonlPath)).lastAssistantTail ?? null).toBeNull();
+  });
+
+  it('returns the Grok turn\'s last assistant message and none after a new prompt', () => {
+    const base = { seq: 0, id: 'x' };
+    const ended = summarizeGrokEntries([
+      { ...base, type: 'user-message', timestamp: 1, text: 'go' },
+      { ...base, type: 'assistant-message', timestamp: 2, markdown: 'Work done.\n\nBLOCKED: gate red — needs X' },
+    ] as never, 3);
+    expect(ended.lastAssistantTail?.split('\n').at(-1)).toBe('BLOCKED: gate red — needs X');
+    const next = summarizeGrokEntries([
+      { ...base, type: 'assistant-message', timestamp: 2, markdown: 'DONE: old' },
+      { ...base, type: 'user-message', timestamp: 3, text: 'next' },
+    ] as never, 4);
+    expect(next.lastAssistantTail).toBeNull();
   });
 });

@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
 import { steerSession } from '@/lib/agent-steer';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
+import { TAB_NOT_FOUND_BODY, targetChangedBody } from '@/lib/cli-error';
 
 /**
  * Correct a worker mid-turn. Unlike `send`, which queues behind whatever the
@@ -26,12 +27,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   const found = await findTab(workspaceId, tabId);
-  if (!found) return res.status(404).json({ error: 'Tab not found' });
+  if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
 
   return withAgentDispatchLock(workspaceId, found.tab, async (checkPolicy) => {
     const current = await findTab(workspaceId, tabId);
     if (!current || current.tab.sessionName !== found.tab.sessionName) {
-      return res.status(409).json({ error: 'agent-target-changed', tabId });
+      return res.status(409).json(targetChangedBody(tabId));
     }
     let policy = await checkPolicy();
     if (!policy.ok) return res.status(409).json(policy);
@@ -45,8 +46,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     });
     if (!policy.ok) return res.status(409).json(policy);
     if (!result.ok) {
-      const status = result.reason === 'session not found' ? 409 : 500;
-      return res.status(status).json({ error: result.reason ?? 'steer failed' });
+      if (result.reason === 'session not found') {
+        return res.status(409).json({ error: result.reason, code: 'session-not-running' });
+      }
+      return res.status(500).json({ error: result.reason ?? 'steer failed' });
     }
     return res.status(200).json({ status: 'steered', interrupted: result.interrupted });
   });

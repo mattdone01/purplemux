@@ -1,11 +1,12 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, setLayoutReconciler } from '@/lib/layout-store';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo } from '@/lib/layout-store';
+import { onTabClosed } from '@/lib/tab-lifecycle';
 import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
-import type { IAgentProvider } from '@/lib/providers/types';
+import type { IAgentProvider, IAgentRuntimeSnapshot } from '@/lib/providers/types';
 import type { IAgentHookMetaPatch, TAgentWorkStateEvent } from '@/lib/providers/types';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
@@ -30,8 +31,10 @@ import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatus
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
+import { classifyTurnEnd, isBackgroundWaitStalled } from '@/lib/turn-end';
 import { getLivenessManager } from '@/lib/liveness-manager';
-import type { TLivenessEvent } from '@/types/liveness';
+import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
+import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
@@ -80,6 +83,8 @@ const POLL_INTERVAL_LARGE = 60_000;
 const TAB_COUNT_MEDIUM = 11;
 const TAB_COUNT_LARGE = 21;
 const BUSY_STUCK_MS = 10 * 60 * 1000;
+const STOP_SETTLE_MS = 500;
+const PROCESS_START_CACHE_MS = 60_000;
 const AGENT_LAUNCH_GRACE_MS = 5_000;
 const AGENT_GUARDED_STATES: Set<TCliState> = new Set(['busy', 'idle', 'needs-input', 'ready-for-review']);
 // tmux set-titles emits "<cmd>|<path>" once a shell takes over the pane.
@@ -117,6 +122,8 @@ export class StatusManager {
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
   private updateAgentState: typeof updateTabAgentState;
   private stuckNudgedTabs = new Set<string>();
+  private transcriptFallbackLogged = new Set<string>();
+  private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
 
@@ -198,6 +205,7 @@ export class StatusManager {
           terminalStatus,
           listeningPorts,
           ...entryAgentFields(provider, tab, detected.jsonlPath),
+          reportsTo: tab.reportsTo ?? null,
           lastUserMessage: tab.lastUserMessage,
           lastAssistantMessage: detected.lastAssistantSnippet,
           currentAction: detected.currentAction,
@@ -236,8 +244,30 @@ export class StatusManager {
 
     const unknownStateHandle = this.runtimeHandle(entry);
     if (provider && unknownStateHandle) {
-      const { idle, stale, lastAssistantSnippet, openBackgroundTasks } = await provider.readRuntimeSnapshot(unknownStateHandle);
-      if (idle && !stale && lastAssistantSnippet && (openBackgroundTasks ?? 0) > 0) {
+      const snapshot = await provider.readRuntimeSnapshot(unknownStateHandle, {
+        tasksSince: await this.agentProcessStartedAt(tabId, entry),
+      });
+      const { idle, stale, lastAssistantSnippet } = snapshot;
+      const liveRegisteredJobs = await this.liveRegisteredJobs(tabId);
+      // No await past this point: a hook event must not be overwritten.
+      if (this.tabs.get(tabId) !== entry || entry.cliState !== 'unknown') return;
+      const turnEnd = idle && !stale && lastAssistantSnippet
+        ? classifyTurnEnd({
+            tail: snapshot.lastAssistantTail,
+            transcript: true,
+            openBackgroundTasks: snapshot.openBackgroundTasks ?? 0,
+            liveRegisteredJobs,
+          })
+        : null;
+      if (turnEnd?.kind === 'waiting') {
+        // A restart lost the stop this tab ended on; rebuild it, silently, so
+        // `tab send` (ruling A′) and the stall check still see a WAITING tab.
+        // Dated at the transcript's last entry, so the stall clocks do not restart.
+        const at = snapshot.lastEntryTs ?? Date.now();
+        const seq = (entry.eventSeq ?? 0) + 1;
+        entry.eventSeq = seq;
+        entry.lastEvent = { name: 'stop', at, seq };
+        entry.turnEnd = { kind: 'waiting', at, seq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
         this.applyCliState(tabId, entry, 'busy', { silent: true });
         this.persistToLayout(entry);
         this.broadcastUpdate(tabId, entry);
@@ -427,6 +457,7 @@ export class StatusManager {
             terminalStatus,
             listeningPorts,
             ...entryAgentFields(provider, tab, detected.jsonlPath),
+            reportsTo: tab.reportsTo ?? null,
             lastUserMessage: tab.lastUserMessage,
             lastAssistantMessage: detected.lastAssistantSnippet,
             currentAction: detected.currentAction,
@@ -459,6 +490,7 @@ export class StatusManager {
           ?? provider?.readSessionId(tab) ?? null;
         existing.jsonlPath = refreshed.jsonlPath ?? existing.jsonlPath;
         existing.lastUserMessage = tab.lastUserMessage;
+        existing.reportsTo = tab.reportsTo ?? null;
         this.reconcileJsonlWatch(tab.id, existing);
 
         if (processChanged) {
@@ -519,7 +551,7 @@ export class StatusManager {
             this.broadcastUpdate(tab.id, existing);
             continue;
           }
-          if (!this.stuckNudgedTabs.has(tab.id) && !(await this.hasRecentJsonlActivity(existing, now))) {
+          if (!this.stuckNudgedTabs.has(tab.id) && await this.looksStalled(tab.id, existing, now)) {
             this.stuckNudgedTabs.add(tab.id);
             this.nudgeOrchestrator(tab.id, existing, 'stuck').catch((err) => {
               log.warn(`stuck nudge failed: ${err instanceof Error ? err.message : err}`);
@@ -565,6 +597,8 @@ export class StatusManager {
         this.modelWatch.forget(tabId);
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
+        this.transcriptFallbackLogged.delete(tabId);
+        this.processStartCache.delete(tabId);
         this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
       }
@@ -586,6 +620,31 @@ export class StatusManager {
     }).catch((err) => {
       log.warn(`liveness tick failed: ${err instanceof Error ? err.message : err}`);
     });
+
+    await getLeaseSweeper().sweep().catch((err) => {
+      log.warn(`lease sweep failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  /**
+   * A WAITING worker sits at an empty composer: its turn ended on a stop from
+   * the current process and only its background work runs. `tab send` may
+   * paste into it (ADR-0018, architect ruling A′). Only while that stop is
+   * still the latest event, and no agent launch has happened since it — a
+   * relaunched TUI is booting, the race ADR-0008's composer gate exists for.
+   */
+  isWaitingAtPrompt(tabId: string): boolean {
+    const entry = this.tabs.get(tabId);
+    if (!entry || entry.cliState !== 'busy') return false;
+    const turnEnd = entry.turnEnd;
+    const stop = entry.lastEvent;
+    if (turnEnd?.kind !== 'waiting' || stop?.name !== 'stop' || turnEnd.seq !== stop.seq) return false;
+    return (entry.lastResumeOrStartedAt ?? 0) < stop.at;
+  }
+
+  getTabAgentState(tabId: string): ITabAgentState | null {
+    const entry = this.tabs.get(tabId);
+    return entry ? { cliState: entry.cliState, isAgent: isAgentPanelType(entry.panelType) } : null;
   }
 
   // Milestone watchers are silent during both success-in-progress and total
@@ -610,7 +669,7 @@ export class StatusManager {
       detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
     }
 
-    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail);
+    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
 
     if (event.kind === 'bg-completed') return;
 
@@ -630,17 +689,38 @@ export class StatusManager {
     });
   }
 
+  /** The tab's `reportsTo` while that tab is live in the same workspace (ADR-0018). */
+  private liveReportsTo(tabId: string, entry: ITabStatusEntry | undefined): string | null {
+    const target = entry?.reportsTo;
+    if (!target || target === tabId) return null;
+    const targetEntry = this.tabs.get(target);
+    return targetEntry && targetEntry.workspaceId === entry.workspaceId && isAgentPanelType(targetEntry.panelType)
+      ? target
+      : null;
+  }
+
   // Unlike nudgeOrchestrator this may target the registering tab itself: when
   // the workspace has no orchestrator (or the orchestrator IS the registrant),
-  // the tab whose work died is the actor that must wake up.
-  private async nudgeLiveness(workspaceId: string, tabId: string, tabName: string, kind: TOrchestrationNudgeKind, detail: string): Promise<boolean> {
+  // the tab whose work died is the actor that must wake up. `notify: 'self'`
+  // asks for exactly that, so a worker wakes on its own gate.
+  private async nudgeLiveness(
+    workspaceId: string,
+    tabId: string,
+    tabName: string,
+    kind: TOrchestrationNudgeKind,
+    detail: string,
+    notify?: TBackgroundJobNotify,
+  ): Promise<boolean> {
     const now = Date.now();
     // Sources deduplicate their own episodes. Debouncing by tab/kind here
     // drops independent jobs that finish on the same tab close together.
 
     const ws = await getWorkspaceByIdCached(workspaceId);
     const orch = ws?.orchestration;
-    const targetTabId = orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId;
+    const targetTabId = notify === 'self'
+      ? tabId
+      : this.liveReportsTo(tabId, this.tabs.get(tabId))
+        ?? (orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId);
     const message = buildNudgeMessage(kind, tabId, tabName, workspaceId, detail);
     const delivered = await this.deliverAutomatedPrompt(workspaceId, targetTabId, message, 'liveness nudge');
 
@@ -790,7 +870,12 @@ export class StatusManager {
     return result;
   }
 
-  private applyCliState(tabId: string, entry: ITabStatusEntry, newState: TCliState, opts: { silent?: boolean } = {}): void {
+  private applyCliState(
+    tabId: string,
+    entry: ITabStatusEntry,
+    newState: TCliState,
+    opts: { silent?: boolean; nudge?: { kind: TOrchestrationNudgeKind; detail: string } } = {},
+  ): void {
     const prevState = entry.cliState;
     if (prevState === newState) {
       this.reconcileJsonlWatch(tabId, entry);
@@ -828,7 +913,8 @@ export class StatusManager {
     }
     const nudgeKind = nudgeKindForTransition(prevState, newState, !!opts.silent);
     if (nudgeKind) {
-      this.nudgeOrchestrator(tabId, entry, nudgeKind).catch((err) => {
+      const nudge = opts.nudge && !opts.silent ? opts.nudge : { kind: nudgeKind, detail: undefined };
+      this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail).catch((err) => {
         log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
       });
     }
@@ -929,8 +1015,11 @@ export class StatusManager {
   private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<void> {
     if (!isAgentPanelType(entry.panelType)) return;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
-    const orch = ws?.orchestration;
-    if (!ws || !orch?.enabled || !orch.orchestratorTabId || orch.orchestratorTabId === tabId) return;
+    if (!ws) return;
+    const orch = ws.orchestration;
+    const targetTabId = this.liveReportsTo(tabId, entry)
+      ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
+    if (!targetTabId) return;
 
     const now = Date.now();
     const last = this.lastNudgeByTab.get(tabId);
@@ -938,12 +1027,7 @@ export class StatusManager {
     this.lastNudgeByTab.set(tabId, { kind, at: now });
 
     const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
-    const delivered = await this.deliverAutomatedPrompt(
-      ws.id,
-      orch.orchestratorTabId,
-      message,
-      'orchestrator nudge',
-    );
+    const delivered = await this.deliverAutomatedPrompt(ws.id, targetTabId, message, 'orchestrator nudge');
 
     const nudge: IOrchestrationNudge = {
       id: nanoid(8),
@@ -960,7 +1044,7 @@ export class StatusManager {
       this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
     }
     this.broadcast({ type: 'orchestration:nudge', nudge });
-    log.info({ tabId, kind, delivered }, 'orchestrator nudge');
+    log.info({ tabId, kind, targetTabId, delivered }, 'orchestrator nudge');
   }
 
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
@@ -1050,17 +1134,79 @@ export class StatusManager {
     return result.delivered;
   }
 
-  private async hasRecentJsonlActivity(entry: ITabStatusEntry, now: number): Promise<boolean> {
+  /**
+   * A tab busy past BUSY_STUCK_MS is stalled when its transcript has been quiet
+   * that long — unless it waits on its own background work, which is judged by
+   * that work's activity and kind (ADR-0018, L19, L25): the main transcript
+   * alone is silent while a subagent or a gate waiter runs.
+   */
+  private async looksStalled(tabId: string, entry: ITabStatusEntry, now: number): Promise<boolean> {
     const handle = this.runtimeHandle(entry);
-    if (!handle) return false;
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
-    if (!provider) return false;
-    try {
-      const snapshot = await provider.readRuntimeSnapshot(handle);
-      return snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS;
-    } catch {
-      return false;
+    let snapshot: IAgentRuntimeSnapshot | null = null;
+    if (handle && provider) {
+      try {
+        snapshot = await provider.readRuntimeSnapshot(handle, {
+          tasksSince: await this.agentProcessStartedAt(tabId, entry),
+          withActivity: true,
+        });
+      } catch {
+        snapshot = null;
+      }
     }
+    // A live registered pid is a silent waiter like a background shell: it
+    // gets the shell backstop, and an open subagent's rule outranks it.
+    const liveJobs = await this.liveRegisteredJobs(tabId);
+    const open = snapshot?.openBackgroundTaskKinds ?? { shell: 0, agent: 0, monitor: 0 };
+    const kinds = { ...open, shell: open.shell + liveJobs };
+    // The stop the tab waits from is itself a sign of life.
+    const activityAt = Math.max(
+      snapshot?.lastEntryTs ?? -Infinity,
+      snapshot?.backgroundActivityAt ?? -Infinity,
+      entry.lastEvent?.at ?? -Infinity,
+    );
+    const waitVerdict = isBackgroundWaitStalled(kinds, Number.isFinite(activityAt) ? activityAt : null, now);
+    if (!snapshot) return waitVerdict ?? true;
+    if (waitVerdict !== null) return waitVerdict;
+    return !(snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS);
+  }
+
+  private async liveRegisteredJobs(tabId: string): Promise<number> {
+    try {
+      return (await getLivenessManager().statusForTab(tabId)).backgroundJobs.filter((job) => job.alive).length;
+    } catch (err) {
+      hookLog.debug({ tabId, err: String(err) }, 'registered job read failed');
+      return 0;
+    }
+  }
+
+  /**
+   * When the tab's current Claude process started, from its session pid file.
+   * Background tasks older than it were orphaned by a restart (`--resume`
+   * appends to the same transcript) and never report back. Other providers
+   * report no background tasks, so they need no cutoff. Measured 2026-09-26:
+   * `startedAt` is milliseconds, 1–3 s after the process start, and never
+   * rewritten (`evidence/story-15/pidfile-startedat.txt`). Cached for a minute
+   * and dropped on a session start.
+   */
+  private async agentProcessStartedAt(tabId: string, entry: ITabStatusEntry): Promise<number | null> {
+    if (runtimeProviderId(entry.agentProviderId, entry.panelType) !== 'claude') return null;
+    const cached = this.processStartCache.get(tabId);
+    const now = Date.now();
+    const stamp = entry.lastResumeOrStartedAt ?? null;
+    if (cached && cached.stamp === stamp && now - cached.checkedAt < PROCESS_START_CACHE_MS) return cached.startedAt;
+    let startedAt: number | null = null;
+    try {
+      const provider = getProviderByPanelType(entry.panelType);
+      const panePid = await getSessionPanePid(entry.tmuxSession);
+      if (provider && panePid) {
+        startedAt = (await provider.detectActiveSession(panePid, undefined, { tmuxSession: entry.tmuxSession })).startedAt ?? null;
+      }
+    } catch {
+      startedAt = null;
+    }
+    this.processStartCache.set(tabId, { startedAt, checkedAt: now, stamp });
+    return startedAt;
   }
 
   private runtimeHandle(entry: ITabStatusEntry): string | null {
@@ -1192,37 +1338,79 @@ export class StatusManager {
   }
 
   /**
-   * Resolve a `stop` that would read as ready-for-review: if the runtime still
-   * reports open background jobs / async subagents, the agent is waiting for
-   * them (measured 2026-09-02: workers were announced "ready for review"
-   * mid-gate, once per idle prompt, for hours). Stay `busy`; the next `stop`
-   * after the work returns re-evaluates. Any read failure falls back to the
-   * plain transition so a broken JSONL never hides a real finish.
+   * Classify a `stop` before announcing it (ADR-0018). A marker line
+   * (`DONE:` …) becomes a `turn-marker` nudge carrying it. No marker and open
+   * background work — the provider's own tasks, read from the whole transcript,
+   * or a live registered `tab bg` job — is WAITING: the tab stays busy and no
+   * nudge goes out, because the harness wakes the worker when the work returns
+   * (measured 2026-09-26: 95 of 108 READY nudges in one hour were such waits).
+   * Otherwise today's ready-for-review. Any read failure falls back to the
+   * plain transition so a broken transcript never hides a real finish.
    */
-  private async applyStopStateAfterBackgroundCheck(tabId: string, entry: ITabStatusEntry): Promise<void> {
-    let openBackgroundTasks = 0;
+  private async applyStopTurnEnd(tabId: string, entry: ITabStatusEntry, tmuxSession: string): Promise<void> {
+    const stopSeq = entry.lastEvent?.seq;
+    let snapshot: IAgentRuntimeSnapshot | null = null;
     try {
+      if (!this.runtimeHandle(entry)) await this.resolveAndWatchJsonl(tabId, tmuxSession);
       const provider = getProviderByPanelType(entry.panelType);
       const handle = this.runtimeHandle(entry);
       if (provider && handle) {
-        const snapshot = await provider.readRuntimeSnapshot(handle, { force: true });
-        openBackgroundTasks = snapshot.openBackgroundTasks ?? 0;
+        const read = async () => provider.readRuntimeSnapshot(handle, {
+          force: true,
+          tasksSince: await this.agentProcessStartedAt(tabId, entry),
+        });
+        snapshot = await read();
+        // The Stop hook can fire before the final entry reaches the file.
+        if (!snapshot.idle || !snapshot.lastAssistantTail) {
+          await new Promise((resolve) => setTimeout(resolve, STOP_SETTLE_MS));
+          snapshot = await read();
+        }
       }
     } catch (err) {
-      hookLog.debug({ tabId, err: String(err) }, 'background check failed; treating stop as ready');
+      hookLog.debug({ tabId, err: String(err) }, 'turn-end read failed; treating stop as ready');
     }
+    const liveRegisteredJobs = await this.liveRegisteredJobs(tabId);
+
     const current = this.tabs.get(tabId);
     if (!current || current !== entry) return;
-    if (entry.lastEvent?.name !== 'stop') return; // a newer event already moved the tab on
-    const target: TCliState = openBackgroundTasks > 0 ? 'busy' : 'ready-for-review';
-    if (openBackgroundTasks > 0) {
-      hookLog.debug({ tabId, openBackgroundTasks }, 'stop with open background work: busy, not ready-for-review');
-    }
-    if (entry.cliState !== target) {
-      this.applyCliState(tabId, entry, target);
+    // A newer event — even a newer stop — owns the tab now.
+    if (entry.lastEvent?.name !== 'stop' || entry.lastEvent.seq !== stopSeq) return;
+    // Each classified stop opens a new wait: a WAITING chain never leaves busy,
+    // so the one-stuck-nudge-per-busy-stretch latch re-arms here.
+    this.stuckNudgedTabs.delete(tabId);
+
+    const turnEnd = classifyTurnEnd({
+      tail: snapshot?.lastAssistantTail,
+      transcript: snapshot !== null,
+      openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0,
+      liveRegisteredJobs,
+    });
+    const at = Date.now();
+    if (turnEnd.kind === 'waiting') {
+      entry.turnEnd = { kind: 'waiting', at, seq: stopSeq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
+      hookLog.debug({ tabId, ...entry.turnEnd }, 'stop with open background work: waiting, no nudge');
+      if (entry.cliState !== 'busy') this.applyCliState(tabId, entry, 'busy', { silent: true });
       this.persistToLayout(entry);
       this.broadcastUpdate(tabId, entry);
+      return;
     }
+    if (turnEnd.kind === 'turn-marker') {
+      entry.turnEnd = { kind: 'turn-marker', at, seq: stopSeq, marker: turnEnd.lines };
+    } else {
+      entry.turnEnd = { kind: 'ready-for-review', at, seq: stopSeq };
+      if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
+        this.transcriptFallbackLogged.add(tabId);
+        log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');
+      }
+    }
+    const nudge = turnEnd.kind === 'turn-marker'
+      ? { kind: 'turn-marker' as const, detail: turnEnd.lines.join('\n') }
+      : undefined;
+    if (entry.cliState !== 'ready-for-review') {
+      this.applyCliState(tabId, entry, 'ready-for-review', { nudge });
+      this.persistToLayout(entry);
+    }
+    this.broadcastUpdate(tabId, entry);
   }
 
   updateTabFromHook(tmuxSession: string, event: string, notificationType?: string): void {
@@ -1270,11 +1458,8 @@ export class StatusManager {
     );
 
     if (prevState !== newState) {
-      if (newState === 'ready-for-review' && eventName === 'stop' && this.runtimeHandle(entry)) {
-        // A turn can end with background jobs or subagents still open; the
-        // harness re-invokes the agent when they finish, so the tab is
-        // WAITING, not ready. Ask the runtime before announcing a review.
-        void this.applyStopStateAfterBackgroundCheck(tabId, entry);
+      if (newState === 'ready-for-review' && eventName === 'stop') {
+        void this.applyStopTurnEnd(tabId, entry, tmuxSession);
       } else {
         this.applyCliState(tabId, entry, newState);
         this.persistToLayout(entry);
@@ -1457,24 +1642,8 @@ export class StatusManager {
     }
     this.tabs.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
+    this.processStartCache.delete(tabId);
     this.broadcastRemove(tabId);
-  }
-
-  reconcileWorkspaceTabs(wsId: string, validTabIds: readonly string[]): void {
-    const valid = new Set(validTabIds);
-    for (const [tabId, entry] of this.tabs) {
-      if (entry.workspaceId === wsId && !valid.has(tabId)) {
-        this.removeTab(tabId);
-      }
-    }
-  }
-
-  removeWorkspaceTabs(wsId: string): void {
-    for (const [tabId, entry] of this.tabs) {
-      if (entry.workspaceId === wsId) {
-        this.removeTab(tabId);
-      }
-    }
   }
 
   registerTab(tabId: string, entry: ITabStatusEntry): void {
@@ -1836,6 +2005,18 @@ export class StatusManager {
     this.clients.clear();
   }
 
+  /** A closed tab stops receiving nudges at once; the layout copy is cleared too. */
+  forgetReportsTo(workspaceId: string, closedTabId: string): void {
+    for (const entry of this.tabs.values()) {
+      if (entry.workspaceId === workspaceId && entry.reportsTo === closedTabId) entry.reportsTo = null;
+    }
+    clearReportsTo(workspaceId, closedTabId).then((cleared) => {
+      if (cleared.length) log.info({ closedTabId, cleared }, 'reportsTo cleared: target tab closed');
+    }).catch((err) => {
+      log.warn(`reportsTo clear failed for ${closedTabId}: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
   notifyLastUserMessage(sessionName: string, message: string): void {
     const parsed = parseSessionName(sessionName);
     if (!parsed) return;
@@ -1854,10 +2035,11 @@ export const getStatusManager = (): StatusManager => {
     dispatcher.register(createStatusSocketChannel((frame) => manager.broadcast(frame)));
     dispatcher.register(createWebPushChannel());
     registerFcmChannel(dispatcher);
-    setLayoutReconciler({
-      reconcileWorkspaceTabs: (wsId, validTabIds) => manager.reconcileWorkspaceTabs(wsId, validTabIds),
-      removeWorkspaceTabs: (wsId) => manager.removeWorkspaceTabs(wsId),
+    onTabClosed(({ tabId, workspaceId }) => {
+      manager.removeTab(tabId);
+      manager.forgetReportsTo(workspaceId, tabId);
     });
+    setLeaseAgentStateSource((tabId) => manager.getTabAgentState(tabId));
   }
   return g.__ptStatusManager;
 };

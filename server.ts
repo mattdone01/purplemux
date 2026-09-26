@@ -14,12 +14,15 @@ import { handleSyncConnection, gracefulSyncShutdown } from './src/lib/sync-serve
 import { handleStatusConnection, gracefulStatusShutdown } from './src/lib/status-server';
 import { getStatusManager } from './src/lib/status-manager';
 import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
+import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { enqueueSystemToast } from './src/lib/sync-server';
 import { getCliToken } from './src/lib/cli-token';
 import { acquireLock, releaseLock, registerLockCleanup } from './src/lib/lock';
 import { scanSessions, applyConfig } from './src/lib/tmux';
 import { initWorkspaceStore, getWorkspaces, writeAllWorkspacePrompts } from './src/lib/workspace-store';
+import { initTabTokens } from './src/lib/tab-token';
+import { initLeases } from './src/lib/lease-sweeper';
 import { startCredentialForkSync } from './src/lib/workspace-home';
 import { autoResumeOnStartup } from './src/lib/auto-resume';
 import { initAuthCredentials } from './src/lib/auth-credentials';
@@ -99,6 +102,7 @@ const NO_AUTH_WS_PATHS = new Set(['/api/install']);
 
 const shutdownWs = async () => {
   await getMissionControlRuntime().stop();
+  await stopInbox();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
   gracefulStatusShutdown();
@@ -371,10 +375,13 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await scanSessions();
   await applyConfig();
   await initWorkspaceStore();
+  await initTabTokens();
   startCredentialForkSync();
   await autoResumeOnStartup();
   await getStatusManager().init();
+  await initLeases();
   await getMissionControlRuntime().start();
+  await startInbox();
 
   const envHost = process.env.HOST?.trim();
   const configData = await getConfig();

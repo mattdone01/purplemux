@@ -1,9 +1,10 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { verifyCliToken } from '@/lib/cli-token';
+import { resolveCliScope } from '@/lib/workspace-token';
 
 const GUIDE = `# purplemux CLI HTTP API
 
-All endpoints require header \`x-pmux-token: <PMUX_TOKEN>\`.
+All endpoints require header \`x-pmux-token: <token>\` — \`PMUX_TAB_TOKEN\` when set,
+else \`PMUX_TOKEN\`.
 
 ## Workspace scope
 
@@ -16,9 +17,101 @@ Cross-workspace access is deliberate and rare: the TARGET workspace must name yo
 workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
 add one rather than working around a 403.
 
+## Caller identity
+
+Every tab created by the server also carries \`PMUX_TAB_TOKEN\`, \`PMUX_TAB_ID\` (the
+tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants exactly what the
+workspace token grants, and it also names the calling tab (verified). A tab token
+stops working when its tab closes.
+
+Tabs created before tab tokens existed have only \`PMUX_TOKEN\`. For them, send
+header \`x-pmux-session: <tmux session name>\` and the server names the tab
+UNVERIFIED — only when that session belongs to a tab of the token's own workspace;
+any other value is ignored. \`bin/cli.js\` sends it automatically inside tmux. The
+global token (\`~/.purplemux/cli-token\`) resolves to \`admin\`, never to a tab: any
+process of this user can read it, so it is not evidence of a human.
+
 Each workspace also gets its own agent session store — \`CLAUDE_CONFIG_DIR\` for
 Claude, \`GROK_HOME\` for Grok — so several workspaces can share one project root
 without sharing conversation history or resume lists.
+
+## Errors and exit codes
+
+An error body is { "error": "...", "code"?: "..." }. "error" is the human-readable text and
+is kept for compatibility; "code" is the machine-readable class. HTTP statuses are unchanged.
+Branch on "code" (or on the CLI's exit code), never on the "error" text. The CLI maps each code
+to an exit code through one table:
+
+  exit  meaning                                  codes                                       retry?
+     0  success                                  —                                           —
+     1  unexpected error                         unmapped code, 5xx, gh-unavailable,        investigate
+                                                 outcome-unknown (a write lost its
+                                                 connection: check the state first)
+     2  usage error                              bad or missing argument; lease-policy,     fix the command
+                                                 watch-invalid, reports-to-invalid,
+                                                 note-too-large, config-invalid,
+                                                 note-target-missing
+     3  conflict / refused by state              forbidden, lease-held, lease-held-by-other, after the state changes
+                                                 watch-cap, inbox-not-held, caller-unresolved,
+                                                 grant-tab-unverified, grant-password-invalid,
+                                                 grant-locked, config-version-conflict
+     4  target gone (permanent)                  tab-not-found, session-not-running,        NEVER
+                                                 target-changed
+     5  not ready yet                            readiness-timeout                          yes, bounded
+     6  server unreachable                       connection refused, no port configured,    yes, bounded
+                                                 a read interrupted; routes-absent (404     (routes-absent:
+                                                 without JSON: no such route — an older     no, until the
+                                                 server, a foreign one, or a malformed id)  cause is fixed)
+     7  not found                                lease-not-found, note-not-found,           —
+                                                 watch-not-found, inbox-not-found,
+                                                 deploy-not-found, config-not-found
+
+The CLI writes the code and its class to stderr, e.g.
+  error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
+
+## Leases
+
+One host-wide register of held resources (ADR-0011). A name is \`<kind>:<resource>\`, lower
+case: \`merge:<owner>/<repo>\`, \`dev-deploy:<owner>/<repo>\`, \`dev-write:<env>\`,
+\`deploy:<service>\` (admin token or the workspace's enabled orchestrator tab only),
+\`epic:<slug>\` (no expiry by default, \`none\` allowed, at most 7 d), \`num:<owner>/<repo>:<adr|migration>:<nnnn>\` (requires an
+epic; survives the tab), or any other kind (30 m default, 24 h max). A lease dies with its tab,
+by TTL, or 10 min after its agent goes inactive; \`num\` leases outlive the tab and end by TTL,
+release, release-epic or break.
+Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_TOKEN plus
+x-pmux-session) or the admin token — otherwise \`caller-unresolved\` (403).
+
+A lease view: { name, kind, resource, holder: { workspaceId, workspaceName, tabId, tabName,
+verified, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
+ageSeconds, expiresInSeconds, holderState: live|agent-gone|closed|admin }.
+
+GET /api/cli/leases?prefix=&mine=1
+  Response: { "leases": [lease view, ...] }
+
+GET /api/cli/leases/check?name=NAME
+  Exact name only (a prefix would also match merge:x/y-z). 200 for any well-formed name
+  (a malformed one is 400 lease-policy):
+  { "held": bool, "mine": bool, "lease": lease view | null }. The CLI prints it and exits
+  0 (you hold it), 3 (another holds it) or 7 (nobody holds it). Exit 3 with nothing on stdout is
+  a refusal (forbidden), not a holder; an acquire's exit 3 is a holder only when the stderr code
+  is lease-held.
+
+POST /api/cli/leases/acquire   { "name", "ttlSeconds"?: number | null, "epic"?, "note"? }
+  Response: { "lease": view, "outcome": "acquired" | "renewed" } (re-acquire by the holder renews)
+  Errors: lease-held 409 (+ lease, holder), lease-policy 400, caller-unresolved 403,
+  forbidden 403 (deploy: needs the admin token or the workspace's enabled orchestrator tab)
+
+POST /api/cli/leases/renew     { "name", "ttlSeconds"? }  → { "lease": view }
+POST /api/cli/leases/release   { "name" }                 → { "released": true }
+  Errors: lease-not-found 404, lease-held-by-other 409 (+ lease, holder)
+
+POST /api/cli/leases/break     { "name", "reason" }       → { "broken": view }   admin token only
+POST /api/cli/leases/release-epic { "epic", "kind"? }     → { "released": [names] }
+  The epic:<slug> holder or admin releases every claim; a tab of a claiming workspace releases
+  its own workspace's claims; nothing to release answers []. Errors: forbidden 403.
+
+An unreadable lease store answers 500 \`lease-store-unreadable\`: nothing is known about who holds
+what, so treat it as a refusal.
 
 ## Workspaces
 
@@ -43,12 +136,20 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 
 GET /api/cli/tabs?workspaceId=WS
   List tabs. Without workspaceId, lists tabs across all workspaces.
-  Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId" }] }
+  Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
+    "cliState", "lastEvent", "busySince", "reportsTo" }] }
+  cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).
+  A busy tab whose lastEvent is "stop" waits only on open background work (WAITING, ADR-0018:
+  a turn that ended with no marker line while its own background shells, agents or registered
+  jobs run sends no nudge).
 
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
-          "model"?: "...", "reasoning"?: "...", "launch"?: boolean }
+          "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-..." }
   Invalid panelType returns HTTP 400 with validPanelTypes.
+  "reportsTo" names a live tab of the SAME workspace that receives this tab's watchdog nudges
+  ahead of the workspace orchestrator; anything else is 400 { "code": "reports-to-invalid" }
+  (CLI exit 2). It is cleared when that tab closes.
   Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
@@ -62,10 +163,17 @@ POST /api/cli/tabs
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
   Tab info.
-  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId" }
+  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId", "reportsTo" }
+
+PATCH /api/cli/tabs/<tabId>?workspaceId=WS
+  Body: { "reportsTo": "tab-..." | null } — on its own. Sets or clears the nudge target (same rules
+  as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
+  Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
 DELETE /api/cli/tabs/<tabId>?workspaceId=WS
   Close the tab (kills tmux session and removes from layout).
+  Response: { "ok": boolean } — false means the layout kept the tab; the CLI then exits 1
+  (close-not-confirmed) instead of printing ok.
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
@@ -75,8 +183,12 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   paste, so sending into one reports success over an agent that never starts. waitMs: 0
   answers with the current state instead of waiting. Terminal and browser tabs are ungated.
   Response: { "status": "sent", "submitted": boolean, "cliState": string | null }
-  409 { "error": "agent-not-ready", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"? }
+  404 { "error": "Tab not found", "code": "tab-not-found" }
+  409 { "error": "agent-not-ready", "code", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"? }
     — nothing was pasted, so a later Enter cannot submit a half-forgotten prompt.
+  409 { "error": "agent-target-changed", "code": "target-changed", "tabId" } — the tab was replaced.
+  tab-not-found, session-not-running and target-changed are permanent (CLI exit 4): never
+  retry them. readiness-timeout is retryable (CLI exit 5), a bounded number of times.
 
 GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   Response: { "tabId", "workspaceId", "alive", "command", "cliState", "agentProviderId", "agentSessionId", "claudeSessionId",
@@ -97,8 +209,8 @@ pane/turn state. Register a probe (progress freshness) and/or a background pid
 (process death) at dispatch time for any long-running job. Events fire an
 orchestrator nudge (STALLED / LIVENESS PROBE FAILING / BACKGROUND JOB COMPLETED /
 BACKGROUND JOB FAILED / BACKGROUND JOB EXITED with unknown status — sent to the
-workspace's orchestrator tab, or to the registering tab itself when there is no
-orchestrator). Stalls, probe failures, failed jobs, and unknown-status exits also send
+tab's live reportsTo tab, else the workspace's orchestrator tab, else the registering
+tab itself; a job registered with "notify": "self" always wakes the registering tab). Stalls, probe failures, failed jobs, and unknown-status exits also send
 a push alert to the human. Registrations persist across server restarts and are dropped
 when the tab closes.
 
@@ -124,7 +236,11 @@ DELETE /api/cli/tabs/<tabId>/probe?workspaceId=WS[&label=L]
   Response: { "removed": n }
 
 POST /api/cli/tabs/<tabId>/bg?workspaceId=WS
-  Body: { "pid": N, "label"?: "...", "stderrFile"?: "/abs/path", "exitCodeFile"?: "/abs/path" }
+  Body: { "pid": N, "label"?: "...", "stderrFile"?: "/abs/path", "exitCodeFile"?: "/abs/path",
+          "notify"?: "self" | "orchestrator" }
+  "notify": "self" sends the outcome nudge to this tab (a worker waking on its own gate);
+  the default is the routing above. While the pid is alive, a turn end with no marker line
+  is WAITING and sends no READY FOR REVIEW nudge.
   Watch a background pid. A strict integer read from exitCodeFile classifies exit 0 as
   BACKGROUND JOB COMPLETED and nonzero as BACKGROUND JOB FAILED. If the file is missing
   or malformed after a short grace, BACKGROUND JOB EXITED fires with unknown status;
@@ -142,6 +258,31 @@ DELETE /api/cli/tabs/<tabId>/bg?workspaceId=WS[&pid=N]
   Stop watching (all for the tab, or one pid).
   Response: { "removed": n }
 
+## Inbox (ADR-0012)
+
+Server-originated notices — notes, watch firings, deploy announcements, Mission Control
+answers, API-error resumes — reach an agent's composer only through the inbox. Each is one
+line rendered from a fixed per-kind template: "[purplemux <kind> <id>] <ids, times, counts>
+— <pull command>". No caller text is ever typed; read subjects with the pull command.
+Delivery waits for an agent at its prompt (idle, ready-for-review, or WAITING per ADR-0018)
+with an empty composer and no prompt or option list on screen. A refusal backs off
+10 s → 30 s → 2 min → 5 min; a tab that becomes ready is tried on the next 2 s tick. After
+30 refusals or 24 h the item is "held"; a paste that throws or strands in the composer is
+"held" at once and never retried blind. Closing the target tab drops its queued and held
+items. Delivered, dropped and held items are kept 7 days.
+
+GET /api/cli/inbox?workspaceId=WS[&all=1]
+  Read scope. Queued and held items targeting WS's tabs; all=1 adds delivered and dropped.
+  Response: { "workspaceId", "items": [{ "id", "kind", "targetWorkspaceId", "targetTabId", "dedupeKey",
+    "line", "state", "attempts", "lastRefusal", "notBefore", "createdAt", "deliveredAt", "heldReason",
+    "droppedReason", "expiresAt", "transitionAt", ... }] }
+
+POST /api/cli/inbox/<id>/retry
+  The target workspace's own token or the admin token. Re-queues a held item once, with a
+  fresh refusal budget. 404 { "code": "inbox-not-found" } (CLI exit 7) for an unknown id AND
+  for another workspace's item; 409 { "code": "inbox-not-held" } (CLI exit 3) when the item
+  is not held, or when a newer notice with its key is already queued for that tab.
+
 ## Orchestration
 
 GET /api/cli/workspaces/<workspaceId>/orchestration
@@ -151,7 +292,12 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   Body: { "enabled"?: boolean, "orchestratorTabId"?: string | null, "kickoffTemplate"?: string | null }
   Orchestrators use this to designate themselves (enabled + own tabId) and to turn
   orchestration off when the epic is finished — this stops watchdog nudges and idle
-  heartbeats for the workspace.
+  heartbeats for the workspace. A tab's live reportsTo overrides this target for that tab.
+
+  Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:
+  or READY-TO-MERGE: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
+  — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
+  No marker and open background work → WAITING, no nudge. Otherwise READY FOR REVIEW.
 
 ## Standup ticks
 
@@ -280,8 +426,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     res.setHeader('Allow', 'GET');
     return res.status(405).json({ error: 'Method not allowed' });
   }
-  if (!verifyCliToken(req)) {
-    return res.status(403).json({ error: 'Forbidden' });
+  // Any valid CLI scope: the guide is documentation, and the agents that most
+  // need it hold a workspace token, not the global one.
+  if (!resolveCliScope(req)) {
+    return res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
   }
   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
   return res.status(200).send(GUIDE);

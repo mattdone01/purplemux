@@ -153,7 +153,7 @@ export const executeAutoResume = async (targets: IAutoResumeTarget[]): Promise<v
   for (const target of targets) {
     if (!(await hasSession(target.tmuxSession))) {
       log.debug(`No tmux session, creating new: ${target.tmuxSession}`);
-      await createSession(target.tmuxSession, 80, 24);
+      await createSession(target.tmuxSession, 80, 24, undefined, { workspaceId: target.workspaceId, tabId: target.tabId });
       hasNewSession = true;
     }
   }

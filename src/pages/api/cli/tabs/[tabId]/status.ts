@@ -4,6 +4,7 @@ import { hasSession, getPaneCurrentCommand } from '@/lib/tmux';
 import { getProviderByPanelType } from '@/lib/providers';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getCodexModelStatus } from '@/lib/providers/codex/model-observation';
+import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'GET') {
@@ -19,7 +20,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!(await authorizeWorkspace(req, res, workspaceId))) return;
 
   const found = await findTab(workspaceId, tabId);
-  if (!found) return res.status(404).json({ error: 'Tab not found' });
+  if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
 
   const provider = getProviderByPanelType(found.tab.panelType);
   const agentSessionId = provider?.readSessionId(found.tab) ?? null;

@@ -13,12 +13,15 @@ import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
+import { checkReportsTo } from '@/lib/reports-to';
 import {
   prepareCodexManagedLaunch,
   submitCodexManagedLaunch,
   waitForCodexManagedLaunch,
 } from '@/lib/providers/codex/managed-launch';
 import type { TPanelType } from '@/types/terminal';
+import type { TCliState } from '@/types/timeline';
+import type { ILastEvent } from '@/types/status';
 
 const log = createLogger('api:cli:tabs');
 
@@ -42,6 +45,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentProviderId: string | null;
       agentSessionId: string | null;
       agentLaunchConfig?: { model?: string; effort?: string };
+      cliState: TCliState | null;
+      lastEvent: ILastEvent | null;
+      busySince: number | null;
+      reportsTo: string | null;
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -53,6 +60,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           allWorkspaceIds.map(async (id) => ((await canAccessWorkspace(cliScope, id)) ? id : null)),
         )).filter((id): id is string => id !== null);
     const workspaceIds = visibleIds;
+    // Live state lets a deploy drain tell a mid-turn agent from one kept busy
+    // only by open background work (last event `stop`).
+    const liveStatus = getStatusManager().getAllForClient();
 
     for (const id of workspaceIds) {
       const ws = await getWorkspaceById(id);
@@ -70,6 +80,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             agentProviderId: provider?.id ?? null,
             agentSessionId: provider?.readSessionId(tab) ?? null,
             agentLaunchConfig: tab.agentLaunchConfig,
+            cliState: liveStatus[tab.id]?.cliState ?? tab.cliState ?? null,
+            lastEvent: liveStatus[tab.id]?.lastEvent ?? null,
+            busySince: liveStatus[tab.id]?.busySince ?? null,
+            reportsTo: tab.reportsTo ?? null,
           });
         }
       }
@@ -78,7 +92,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -86,6 +100,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       reasoning?: string;
       launch?: boolean;
       scope?: unknown;
+      reportsTo?: unknown;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
@@ -97,6 +112,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const ws = await getWorkspaceById(workspaceId);
     if (!ws) {
       return res.status(404).json({ error: 'Workspace not found' });
+    }
+    if (reportsTo !== undefined && reportsTo !== null) {
+      const refused = await checkReportsTo(workspaceId, reportsTo);
+      if (refused) return res.status(400).json(refused);
     }
     const dispatchPolicy = await checkAgentDispatchPolicy(workspaceId);
     if (!dispatchPolicy.ok) {
@@ -146,6 +165,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType, command, {
         scope: scope as string[] | undefined,
         agentLaunchConfig: agentLaunchConfigFromOptions(model, reasoning),
+        reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
 
@@ -159,6 +179,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           panelType: tab.panelType,
           agentProviderId: provider?.id,
           agentSessionId: provider?.readSessionId(tab) ?? null,
+          reportsTo: tab.reportsTo ?? null,
           lastEvent: null,
           eventSeq: 0,
         });
