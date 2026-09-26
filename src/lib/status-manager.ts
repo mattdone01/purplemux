@@ -6,7 +6,7 @@ import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessi
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
-import type { IAgentProvider, IAgentRuntimeSnapshot, ITurnError } from '@/lib/providers/types';
+import type { IAgentProvider, IAgentRuntimeSnapshot, ITurnError, TSessionStartSource } from '@/lib/providers/types';
 import type { IAgentHookMetaPatch, TAgentWorkStateEvent } from '@/lib/providers/types';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
@@ -86,6 +86,7 @@ const TAB_COUNT_MEDIUM = 11;
 const TAB_COUNT_LARGE = 21;
 const BUSY_STUCK_MS = 10 * 60 * 1000;
 const STOP_SETTLE_MS = 500;
+const COMPACTION_SESSION_START_WINDOW_MS = 60_000;
 const PROCESS_START_CACHE_MS = 60_000;
 const AGENT_LAUNCH_GRACE_MS = 5_000;
 const AGENT_GUARDED_STATES: Set<TCliState> = new Set(['busy', 'idle', 'needs-input', 'ready-for-review']);
@@ -126,6 +127,7 @@ export class StatusManager {
   private stuckNudgedTabs = new Set<string>();
   private transcriptFallbackLogged = new Set<string>();
   private orphanResumesEscalated = new Set<string>();
+  private compactEndedAt = new Map<string, number>();
   private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
@@ -602,6 +604,7 @@ export class StatusManager {
         this.stuckNudgedTabs.delete(tabId);
         this.transcriptFallbackLogged.delete(tabId);
         this.processStartCache.delete(tabId);
+        this.compactEndedAt.delete(tabId);
         this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
       }
@@ -1563,7 +1566,21 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string): void {
+  /**
+   * A compaction's own SessionStart (L30, measured 2026-09-26 08:29Z on W4): the
+   * agent compacted mid-turn and carries on, so it is not a session start and
+   * not a turn end. Named by the hook's `source`; a hook script that predates
+   * the field is recognised by a compaction in progress or one that ended
+   * within the last minute (PreCompact / PostCompact hooks).
+   */
+  private isCompactionSessionStart(tabId: string, entry: ITabStatusEntry, source: TSessionStartSource | undefined, now: number): boolean {
+    if (source) return source === 'compact';
+    if (entry.compactingSince != null) return true;
+    const ended = this.compactEndedAt.get(tabId);
+    return ended !== undefined && now - ended < COMPACTION_SESSION_START_WINDOW_MS;
+  }
+
+  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ tmuxSession, event, notificationType }, 'no tabId for session');
@@ -1577,7 +1594,18 @@ export class StatusManager {
 
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');
+      if (event === 'post-compact') this.compactEndedAt.set(tabId, Date.now());
       this.setCompacting(tabId, entry, event === 'pre-compact' ? Date.now() : null);
+      return;
+    }
+
+    if (event === 'session-start' && this.isCompactionSessionStart(tabId, entry, source, Date.now())) {
+      // No state change, no nudge, no relaunch stamp: the turn goes on.
+      entry.turnEnd = { kind: 'compacting', at: Date.now(), seq: entry.lastEvent?.seq };
+      this.compactEndedAt.delete(tabId);
+      hookLog.debug({ tabId, source, cliState: entry.cliState }, 'compaction session-start: turn continues');
+      this.setCompacting(tabId, entry, null);
+      this.broadcastUpdate(tabId, entry);
       return;
     }
 
@@ -1797,6 +1825,7 @@ export class StatusManager {
     this.tabs.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
     this.processStartCache.delete(tabId);
+    this.compactEndedAt.delete(tabId);
     this.broadcastRemove(tabId);
   }
 
@@ -1811,6 +1840,8 @@ export class StatusManager {
     if (!entry) return;
     switch (event.kind) {
       case 'session-start':
+        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source);
+        break;
       case 'prompt-submit':
       case 'stop':
       case 'interrupt':

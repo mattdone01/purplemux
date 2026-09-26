@@ -137,6 +137,10 @@ export interface IAgentHookTranslation {
  * Hook-shaped event kinds delivered from the agent CLI's hook protocol.
  * Single source of truth for the Claude hook translator + status-manager dispatcher.
  */
+/** Claude Code's SessionStart `source`. */
+export type TSessionStartSource = 'startup' | 'resume' | 'clear' | 'compact';
+export const SESSION_START_SOURCES: readonly TSessionStartSource[] = ['startup', 'resume', 'clear', 'compact'];
+
 export const HOOK_EVENT_KINDS = [
   'session-start',
   'prompt-submit',
@@ -150,7 +154,7 @@ export type THookEventKind = typeof HOOK_EVENT_KINDS[number];
 
 /**
  * Standardized work-state events that providers emit. Maps to TCliState transitions:
- *  - session-start → idle
+ *  - session-start → idle, except a compaction's own SessionStart (`source: compact`), which keeps the state (L30)
  *  - prompt-submit → busy
  *  - notification → needs-input (gated by notificationType)
  *  - stop → ready-for-review
@@ -161,7 +165,7 @@ export type THookEventKind = typeof HOOK_EVENT_KINDS[number];
  * sources (pane-title polling, jsonl watcher) and never come through the hook path.
  */
 export type TAgentWorkStateEvent =
-  | { kind: 'session-start' }
+  | { kind: 'session-start'; source?: TSessionStartSource }
   | { kind: 'prompt-submit' }
   | { kind: 'notification'; notificationType?: string }
   | { kind: 'stop' }
