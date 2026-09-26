@@ -9,6 +9,7 @@ import type { ITab, TPanelType } from '@/types/terminal';
 const mockHome = vi.hoisted(() => ({ value: '' }));
 const workspaceStore = vi.hoisted(() => ({ getWorkspaceByIdCached: vi.fn(), getWorkspacesCached: vi.fn() }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
+const alerts = vi.hoisted(() => ({ dispatch: vi.fn(async () => {}) }));
 
 // The file logger writes under the temp HOME, which each test removes; a write
 // still pending at removal surfaced as an unhandled ENOENT (gate 26-r1).
@@ -35,8 +36,9 @@ vi.mock('@/lib/tmux', async (importOriginal) => ({
 vi.mock('@/lib/notification-dispatcher', () => ({
   createStatusSocketChannel: vi.fn(() => ({})),
   createWebPushChannel: vi.fn(() => ({})),
-  getNotificationDispatcher: () => ({ dispatch: vi.fn(async () => {}), register: vi.fn() }),
+  getNotificationDispatcher: () => ({ dispatch: alerts.dispatch, register: vi.fn() }),
 }));
+vi.mock('@/lib/fcm-channel', () => ({ registerFcmChannel: vi.fn() }));
 
 const FIXTURES = path.join(__dirname, '../../fixtures/turn-errors');
 const waitFor = (check: () => unknown) => vi.waitFor(check, { timeout: 5000 });
@@ -59,7 +61,9 @@ const setup = async () => {
   const store = await import('@/lib/inbox-store');
   const nudges = () => paste.mock.calls.map(([, message]) => message);
   const resumes = async () => (await store.readInboxState()).items.filter((i) => i.kind === 'resume');
-  return { manager, paste, nudges, resumes, store };
+  // Past the 30 s per-(tab, kind) debounce, so a "once per episode" guard is what keeps a repeat quiet.
+  const clearDebounce = () => (manager as unknown as { lastNudgeByTab: Map<string, unknown> }).lastNudgeByTab.clear();
+  return { manager, paste, nudges, resumes, store, clearDebounce };
 };
 
 const transcript = async (fixture: string, extra: unknown[] = []): Promise<string> => {
@@ -112,7 +116,7 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
   });
 
   it('nudges api-error once, with the text, when the resumed turn fails again; no second resume', async () => {
-    const { manager, nudges, resumes } = await setup();
+    const { manager, nudges, resumes, clearDebounce } = await setup();
     const file = await transcript('claude-server-error-2.1.283.jsonl');
     const entry = worker('claude-code', file);
     manager.registerTab('tab-w', entry);
@@ -126,6 +130,7 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
     ]);
     await stopAgain(manager, entry, second);
     await waitFor(() => expect(nudges()).toHaveLength(1));
+    clearDebounce();
     await stopAgain(manager, entry, second);
     await settle();
 
@@ -151,12 +156,13 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
   });
 
   it('never types into a usage-limit halt; nudges usage-limit once per episode', async () => {
-    const { manager, nudges, resumes } = await setup();
+    const { manager, nudges, resumes, clearDebounce } = await setup();
     const file = await transcript('codex-usage-limit-exceeded.jsonl');
     const entry = worker('codex-cli', file);
     manager.registerTab('tab-w', entry);
     manager.updateTabFromHook('tmux-tab-w', 'stop');
     await waitFor(() => expect(nudges()).toHaveLength(1));
+    clearDebounce();
     await stopAgain(manager, entry, file);
     await settle();
 
@@ -192,7 +198,7 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
   });
 
   it('escalates once when the inbox holds the resume (e.g. a composer that keeps typed text)', async () => {
-    const { manager, nudges, resumes, store } = await setup();
+    const { manager, nudges, resumes, store, clearDebounce } = await setup();
     const off = store.onInboxHeld((item) => manager.handleHeldResume(item));
     try {
       const entry = worker('claude-code', await transcript('claude-server-error-2.1.283.jsonl'));
@@ -203,11 +209,126 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
       await store.mutateInbox((s) => ({ state: store.holdInState(s, resume.id, 'composer-not-empty (30 refusals)', Date.now()), value: null }));
       await waitFor(() => expect(nudges()).toHaveLength(1));
       expect(nudges()[0]).toContain(`resume notice ${resume.id} held: composer-not-empty (30 refusals)`);
+      clearDebounce();
       manager.handleHeldResume({ ...resume, state: 'held' });
       await settle();
       expect(nudges()).toHaveLength(1);
     } finally {
       off();
     }
+  });
+
+  const codexTurn = (message: string, error?: { message: string; codex_error_info: string }) => [
+    { timestamp: '2026-09-16T09:20:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'resume' } },
+    { timestamp: '2026-09-16T09:20:30.000Z', type: 'event_msg', payload: { type: 'agent_message', message } },
+    { timestamp: '2026-09-16T09:21:00.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't2', last_agent_message: message, ...(error ? { error } : {}) } },
+  ];
+
+  it('Codex: a second server_overloaded escalates once; a clean marker closes the episode (AC5)', async () => {
+    const { manager, nudges, resumes, clearDebounce } = await setup();
+    const entry = worker('codex-cli', await transcript('codex-server-overloaded.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(entry.turnError?.resumeItemId).toBeTruthy());
+
+    const failedAgain = await transcript('codex-server-overloaded.jsonl', codexTurn('retrying', { message: 'Selected model is at capacity. Please try a different model.', codex_error_info: 'server_overloaded' }));
+    await stopAgain(manager, entry, failedAgain);
+    await waitFor(() => expect(nudges()).toHaveLength(1));
+    expect(nudges()[0]).toContain('API ERROR after its one automatic resume: Selected model is at capacity.');
+    clearDebounce();
+    await stopAgain(manager, entry, failedAgain);
+    await settle();
+    expect(nudges()).toHaveLength(1);
+    expect(await resumes()).toHaveLength(1);
+
+    await stopAgain(manager, entry, await transcript('codex-server-overloaded.jsonl', codexTurn('Work done.\n\nDONE: recovered')));
+    await waitFor(() => expect(nudges()).toHaveLength(2));
+    expect(nudges()[1]).toContain('ended: DONE: recovered');
+    expect(entry.turnError).toBeNull();
+  });
+
+  it('withdraws a resume still queued when the episode closes cleanly, so a stale "continue" is never typed', async () => {
+    const { manager, resumes } = await setup();
+    const entry = worker('claude-code', await transcript('claude-server-error-2.1.283.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(entry.turnError?.resumeItemId).toBeTruthy());
+
+    // The person typed their own prompt; that turn ended cleanly before the resume went out.
+    await stopAgain(manager, entry, await transcript('claude-server-error-2.1.283.jsonl', [
+      { type: 'user', timestamp: '2026-09-26T01:31:00.000Z', message: { content: 'my own prompt' } },
+      { type: 'assistant', timestamp: '2026-09-26T01:33:00.000Z', uuid: 'ok', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'All good now.' }] } },
+    ]));
+    await waitFor(async () => expect((await resumes())[0]).toMatchObject({ state: 'dropped', droppedReason: 'episode-closed' }));
+  });
+
+  it('withdraws the queued resume when the episode turns into a usage-limit halt, and types nothing into the halt', async () => {
+    const { manager, resumes, nudges } = await setup();
+    const entry = worker('codex-cli', await transcript('codex-server-overloaded.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(entry.turnError?.resumeItemId).toBeTruthy());
+
+    await stopAgain(manager, entry, await transcript('codex-server-overloaded.jsonl', codexTurn('next', { message: "You've hit your usage limit.", codex_error_info: 'usage_limit_exceeded' })));
+    await waitFor(async () => expect((await resumes())[0]).toMatchObject({ state: 'dropped', droppedReason: 'episode-closed:usage-limit' }));
+    expect(manager.isHaltedByUsageLimit('tab-w')).toBe(true);
+    await waitFor(() => expect(nudges()).toHaveLength(1));
+    expect(nudges()[0]).toContain('HALTED by a usage limit');
+  });
+
+  it('types no automated prompt into a halted tab, whichever path asks (here a bg --notify self completion)', async () => {
+    const { manager, paste } = await setup();
+    const entry = worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(manager.isHaltedByUsageLimit('tab-w')).toBe(true));
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1)); // the usage-limit nudge, to the orchestrator
+    const handle = (manager as unknown as { handleLivenessEvent: (e: unknown) => Promise<void> }).handleLivenessEvent.bind(manager);
+    await handle({ kind: 'bg-completed', job: { workspaceId: 'ws-1', tabId: 'tab-w', pid: 7, label: 'gate', registeredAt: 0, notify: 'self' }, exitCode: 0, stderrTail: null });
+    expect(paste.mock.calls.map(([session]) => session)).toEqual(['tmux-tab-o']);
+  });
+
+  it('alerts the human when a halted tab has no one to nudge (it is the orchestrator itself)', async () => {
+    const { manager, paste } = await setup();
+    const entry: ITabStatusEntry = { ...worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl')), tmuxSession: 'tmux-tab-o', tabName: 'o' };
+    manager.registerTab('tab-o', entry);
+    manager.updateTabFromHook('tmux-tab-o', 'stop');
+    await waitFor(() => expect(alerts.dispatch).toHaveBeenCalledWith(expect.objectContaining({ kind: 'review', tabId: 'tab-o' }), expect.anything()));
+    expect(paste).not.toHaveBeenCalled();
+  });
+
+  it('escalates when the resume cannot even be queued', async () => {
+    const { manager, nudges, store } = await setup();
+    await fs.mkdir(path.dirname(store.inboxFile()), { recursive: true });
+    await fs.writeFile(store.inboxFile(), '{ corrupt');
+    const entry = worker('claude-code', await transcript('claude-server-error-2.1.283.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(nudges()).toHaveLength(1));
+    expect(nudges()[0]).toContain('(the resume could not be queued)');
+  });
+
+  it('escalates once for a held resume queued before a restart (no episode in memory)', async () => {
+    const { manager, nudges, store, clearDebounce } = await setup();
+    manager.registerTab('tab-w', worker('claude-code', await transcript('claude-authentication-failed.jsonl')));
+    const { item } = await store.enqueueNotice({ kind: 'resume', targetWorkspaceId: 'ws-1', targetTabId: 'tab-w', dedupeKey: 'old', fields: { resumeId: 'r-oldone1' } });
+    manager.handleHeldResume({ ...item, state: 'held', heldReason: 'composer-not-empty (30 refusals)' });
+    await waitFor(() => expect(nudges()).toHaveLength(1));
+    expect(nudges()[0]).toContain(`resume notice ${item.id} held: composer-not-empty (30 refusals)`);
+    clearDebounce();
+    manager.handleHeldResume({ ...item, state: 'held' });
+    await settle();
+    expect(nudges()).toHaveLength(1);
+  });
+
+  it('wires the production onInboxHeld listener in getStatusManager', async () => {
+    const { StatusManager, getStatusManager } = await import('@/lib/status-manager');
+    const held = vi.spyOn(StatusManager.prototype, 'handleHeldResume').mockImplementation(() => {});
+    getStatusManager();
+    const store = await import('@/lib/inbox-store');
+    const { item } = await store.enqueueNotice({ kind: 'resume', targetWorkspaceId: 'ws-1', targetTabId: 'tab-w', dedupeKey: 'wire', fields: { resumeId: 'r-wire01' } });
+    await store.mutateInbox((s) => ({ state: store.holdInState(s, item.id, 'x', Date.now()), value: null }));
+    expect(held).toHaveBeenCalledWith(expect.objectContaining({ id: item.id, state: 'held' }));
+    held.mockRestore();
   });
 });

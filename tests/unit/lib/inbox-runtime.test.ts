@@ -15,7 +15,7 @@ vi.mock('os', async (importOriginal) => {
   return { ...actual, default: { ...actual, homedir: () => mockHome.value }, homedir: () => mockHome.value };
 });
 vi.mock('@/lib/status-manager', () => ({
-  getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false }),
+  getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false, isHaltedByUsageLimit: () => false }),
 }));
 
 const base = () => path.join(mockHome.value, '.purplemux');

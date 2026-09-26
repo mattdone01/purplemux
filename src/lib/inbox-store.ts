@@ -139,6 +139,20 @@ export const sweepInState = (state: IInboxState, now: number): IInboxState => {
   return changed ? { items } : state;
 };
 
+/** Withdraw one still-queued item (its owner no longer wants it typed); anything else is untouched. */
+export const withdrawInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState => {
+  const item = state.items.find((i) => i.id === id);
+  if (!item || item.state !== 'queued') return state;
+  return replace(state, id, (i) => ({ ...i, state: 'dropped', droppedReason: reason, transitionAt: now }));
+};
+
+/** Withdraw a queued item by id; true when it was still queued. */
+export const withdrawNotice = async (id: string, reason: string): Promise<boolean> =>
+  mutateInbox((state) => {
+    const next = withdrawInState(state, id, reason, Date.now());
+    return { state: next, value: next !== state };
+  });
+
 /** Drop the queued and held items of every tab `isGone` confirms closed (the boot pass). */
 export const dropGoneTargetsInState = (
   state: IInboxState,

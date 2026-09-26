@@ -34,6 +34,8 @@ export interface IInboxDispatcherDeps {
   status: (tabId: string) => IClientTabStatusEntry | undefined;
   /** ADR-0018 ruling A′: busy only because its ended turn waits on background work. */
   waitingAtPrompt: (tabId: string) => boolean;
+  /** Halted by a usage limit: never typed into — typing cancels the provider's auto-continue (story 26). */
+  halted: (tabId: string) => boolean;
   capture: (sessionName: string) => Promise<string | null>;
   withDispatchLock: <T>(workspaceId: string, tab: ITab, work: (checkPolicy: TAgentDispatchPolicyCheck) => Promise<T>) => Promise<T>;
   deliver: (sessionName: string, line: string) => Promise<void>;
@@ -147,6 +149,7 @@ export class InboxDispatcher {
       if (current.sessionName !== found.sessionName) return { outcome: 'refused', reason: 'target-changed' };
       const policy = await checkPolicy();
       if (!policy.ok) return { outcome: 'refused', reason: `policy:${policy.error ?? 'refused'}` };
+      if (this.deps.halted(item.targetTabId)) return { outcome: 'refused', reason: 'usage-limit-halt' };
       const readiness = await checkComposerReady({
         panelType: current.panelType,
         status: this.deps.status(item.targetTabId),
@@ -223,6 +226,7 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
     hasSession,
     status: (tabId) => getStatusManager().getAllForClient()[tabId],
     waitingAtPrompt: (tabId) => getStatusManager().isWaitingAtPrompt(tabId),
+    halted: (tabId) => getStatusManager().isHaltedByUsageLimit(tabId),
     capture: (sessionName) => capturePaneAtWidth(sessionName, 120, 50),
     withDispatchLock: (workspaceId, tab, work) => withAgentDispatchLock(workspaceId, tab, work),
     deliver: deliverPrompt,

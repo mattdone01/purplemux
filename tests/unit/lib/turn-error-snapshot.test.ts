@@ -68,6 +68,14 @@ describe('lastTurnError — Codex task_complete.error', () => {
     expect(snapshot.lastTurnError?.turnId).toEqual(expect.any(String));
   });
 
+  it('never gives the current turn an older turn\'s error: a new prompt plus output, before its task_complete', async () => {
+    const early = await copyWith('codex-server-overloaded.jsonl', [
+      { timestamp: '2026-09-16T09:20:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: '[purplemux resume r-abcd12] …' } },
+      { timestamp: '2026-09-16T09:20:30.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'DONE: resumed' } },
+    ]);
+    expect((await readCodexRuntimeSnapshot(early, { force: true })).lastTurnError).toBeNull();
+  });
+
   it('has no turn error for a clean task_complete or once a new prompt starts', async () => {
     const next = await copyWith('codex-server-overloaded.jsonl', [
       { timestamp: '2026-09-16T09:20:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'retry' } },

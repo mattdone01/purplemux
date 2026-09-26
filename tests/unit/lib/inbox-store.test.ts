@@ -252,4 +252,34 @@ describe('inbox store — file', () => {
       off();
     }
   });
+
+  it('calls onInboxHeld after the write, and a throwing listener never undoes it', async () => {
+    const { enqueueNotice, mutateInbox, holdInState, onInboxHeld, readInboxState } = await load();
+    const onDisk: string[] = [];
+    const offRead = onInboxHeld(() => {
+      readInboxState().then((s) => onDisk.push(s.items[0].state)).catch(() => onDisk.push('unreadable'));
+    });
+    const offThrow = onInboxHeld(() => { throw new Error('listener bug'); });
+    try {
+      const { item } = await enqueueNotice(req());
+      await mutateInbox((s) => ({ state: holdInState(s, item.id, 'x', Date.now()), value: null }));
+      await vi.waitFor(() => expect(onDisk).toEqual(['held']));
+      expect((await readInboxState()).items[0].state).toBe('held');
+    } finally {
+      offRead();
+      offThrow();
+    }
+  });
+
+  it('withdraws a still-queued notice and leaves any other state alone', async () => {
+    const { enqueueNotice, withdrawNotice, mutateInbox, deliverInState, readInboxState } = await load();
+    const a = await enqueueNotice(req({ dedupeKey: 'a' }));
+    const b = await enqueueNotice(req({ dedupeKey: 'b' }));
+    await mutateInbox((s) => ({ state: deliverInState(s, b.item.id, Date.now()), value: null }));
+    expect(await withdrawNotice(a.item.id, 'episode-closed')).toBe(true);
+    expect(await withdrawNotice(b.item.id, 'episode-closed')).toBe(false);
+    expect(await withdrawNotice('i-none', 'x')).toBe(false);
+    const states = Object.fromEntries((await readInboxState()).items.map((i) => [i.dedupeKey, [i.state, i.droppedReason]]));
+    expect(states).toEqual({ a: ['dropped', 'episode-closed'], b: ['delivered', null] });
+  });
 });

@@ -21,6 +21,8 @@ interface ICodexScanState {
   lastAssistantTail: string | null;
   lastTurnError: ITurnError | null;
   completionSeen: boolean;
+  /** Walking backwards, a user message was passed: any completion before it belongs to an older turn. */
+  userSeen: boolean;
   reset: boolean;
   lastEntryTs: number | null;
   interrupted: boolean;
@@ -134,6 +136,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
     lastAssistantTail: null,
     lastTurnError: null,
     completionSeen: false,
+    userSeen: false,
     reset: false,
     lastEntryTs: null,
     interrupted: false,
@@ -157,7 +160,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
       const eventType = safeString(payload.type);
       if (isCompletionEvent(eventType)) {
         // Walking backwards, the first completion is the current turn's end.
-        if (!state.completionSeen && !state.reset) state.lastTurnError = codexTurnError(payload);
+        if (!state.completionSeen && !state.userSeen) state.lastTurnError = codexTurnError(payload);
         state.completionSeen = true;
         state.terminalIdle = true;
         state.needsStaleRecheck = false;
@@ -172,6 +175,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
         continue;
       }
       if (eventType === 'user_message') {
+        state.userSeen = true;
         if (!state.lastAssistantSnippet && !state.currentAction) state.reset = true;
         if (!state.terminalIdle) {
           state.needsStaleRecheck = elapsed <= STALE_MS_AWAITING_API;

@@ -45,6 +45,7 @@ describe('inbox × StatusManager.isWaitingAtPrompt', () => {
       hasSession: async () => true,
       status: (tabId) => manager.getAllForClient()[tabId],
       waitingAtPrompt: (tabId) => manager.isWaitingAtPrompt(tabId),
+      halted: (tabId) => manager.isHaltedByUsageLimit(tabId),
       capture: async () => EMPTY,
       withDispatchLock: async (_ws, _tab, work) => work(async () => ({ ok: true }) as never),
       deliver,
