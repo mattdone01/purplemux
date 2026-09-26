@@ -6,6 +6,12 @@ import type { ILayoutData } from '@/types/terminal';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 
+// The file logger writes under the temp HOME, which each test removes; a write
+// still pending at removal surfaced as an unhandled ENOENT (gate 26-r1).
+vi.mock('@/lib/logger', () => {
+  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
+  return { createLogger: () => logger };
+});
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
   return {
