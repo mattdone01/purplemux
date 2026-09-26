@@ -44,7 +44,7 @@ The tab in `PMUX_TAB_ID` is always excluded from the quiet wait. A tab created b
 | 1 | lease probe or acquire failed, backup failed, tmux sessions unreadable | unchanged |
 | 2 | refused: usage, ref, disk, build, own tab unknown, drop-in drift or rewrite, half-finished first install, rollback target missing or unbuilt | unchanged |
 | 3 | quiet timeout, deploy lease held, another deploy running | unchanged |
-| 4 | restart, `daemon-reload` or health gate failed; the previous release was restored (`VERDICT=rolled-back`), or an on-demand rollback failed its gate (`VERDICT=rollback-unhealthy`) | previous release |
+| 4 | restart, `daemon-reload` or health gate failed; the previous release was restored (`VERDICT=rolled-back`); the automatic rollback failed too (`VERDICT=rollback-failed`, read `ROLLBACK_HEALTH=` and the journal); or an on-demand rollback failed its gate (`VERDICT=rollback-unhealthy`) | previous release, or check by hand on `rollback-failed` / `rollback-unhealthy` |
 
 The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
 
@@ -58,7 +58,7 @@ Within 90 s after the restart, all of these must hold:
 4. Every tmux session name recorded before the restart still exists. New sessions are allowed.
 5. A workspace-token `purplemux tab list` answers. With no workspace token on the host the check is reported as skipped (`HEALTH=pass (tab-list skipped: no workspace token)`).
 
-From the first link change until the gate or the rollback ends, the script defers INT and TERM. A `SIGKILL` in that window can still leave the links swapped; run `--rollback` or check `releases/current` by hand.
+From the first link change until the gate or the rollback ends, the script defers INT and TERM. A `SIGKILL` in that window can still leave the links swapped; run `--rollback` or check `releases/current` by hand. A run that received a deferred signal still reports its verdict, but it skips the release rotation (`ROTATION=skipped …`).
 
 ## The first install
 

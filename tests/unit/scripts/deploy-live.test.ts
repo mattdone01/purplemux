@@ -16,7 +16,12 @@ const FAKES: Record<string, string> = {
   systemctl: `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_STATE/systemctl.log"
 if [[ " $* " == *" show "* ]]; then cat "$FAKE_STATE/mainpid"; exit 0; fi
-if [[ " $* " == *" daemon-reload "* ]]; then [[ -e "$FAKE_STATE/reload-fail" ]] && exit 1; exit 0; fi
+if [[ " $* " == *" daemon-reload "* ]]; then
+  r=$(( $(cat "$FAKE_STATE/reloads" 2>/dev/null || echo 0) + 1 ))
+  echo "$r" > "$FAKE_STATE/reloads"
+  [[ -e "$FAKE_STATE/reload-fail" || -e "$FAKE_STATE/reload-fail.$r" ]] && exit 1
+  exit 0
+fi
 if [[ " $* " == *" restart "* ]]; then
   n=$(( $(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0) + 1 ))
   echo "$n" > "$FAKE_STATE/restarts"
@@ -637,6 +642,16 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     }
   });
 
+  it('a first-install rollback whose daemon-reload fails reports rollback-failed and keeps current', () => {
+    h.setHttp('api/health', 503, 'down', 1);
+    h.flag('reload-fail.2');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(4);
+    expect(field(out, 'VERDICT')).toBe('rollback-failed');
+    expect(field(out, 'ROLLBACK_HEALTH')).toBe('fail (systemctl --user daemon-reload exited non-zero)');
+    expect(link(path.join(h.releases, 'current'))).toBe(path.join(h.releases, h.sha().slice(0, 12)));
+  });
+
   it('a failing workspace-token tab list after the restart fails health', () => {
     h.flag('tablist-fail.1');
     const { status, out } = h.run([h.sha()]);
@@ -672,6 +687,7 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     expect(status, out).toBe(0);
     expect(field(out, 'VERDICT')).toBe('deployed');
     expect(field(out, 'INTERRUPTED')).toBe('deferred until the swap window closed');
+    expect(field(out, 'ROTATION')).toBe('skipped (signal received during the swap window)');
     expect(out).toContain('signal deferred until the health gate or rollback finishes');
   });
 

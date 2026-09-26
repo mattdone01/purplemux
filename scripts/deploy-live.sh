@@ -22,6 +22,8 @@
 #      own tab unknown, drop-in drift)
 #   3  refused by state: quiet timeout, deploy lease held, another deploy running
 #   4  restart or health gate failed and the previous release was restored
+#      (VERDICT=rolled-back), or the rollback failed too (rollback-failed /
+#      rollback-unhealthy)
 #
 # From the first link change to the end of the gate or rollback, INT and TERM
 # are deferred, so a signal never leaves the service on an unverified release.
@@ -244,8 +246,10 @@ rollback_first_install() {
   local cli_target
   cli_target="$(cat "$FIRST_INSTALL_SAVE/cli-link-target" 2>/dev/null || true)"
   if [[ -n "$cli_target" ]]; then swap_link "$cli_target" "$CLI_LINK"; else rm -f "$CLI_LINK"; fi
+  # Until systemd has re-read the restored drop-in it still starts `current`,
+  # so the links go only after a successful reload.
+  "$SYSTEMCTL" --user daemon-reload || return 1
   rm -f "$CURRENT" "$PREVIOUS"
-  "$SYSTEMCTL" --user daemon-reload
 }
 
 if ((ROLLBACK)); then
@@ -606,11 +610,17 @@ if ((!deployed)); then
   S_SESSIONS="$deploy_sessions"
   S_PREVIOUS="${OLD_PREVIOUS:--}"
   print_journal
+  [[ "$S_ROLLBACK_HEALTH" == pass ]] || finish 4 "rollback-failed"
   finish 4 "rolled-back"
 fi
 S_HEALTH="$HEALTH_RESULT"
 
 # ---- keep current and previous; prune older releases by exact path ----
+
+if ((INTERRUPTED)); then
+  echo "ROTATION=skipped (signal received during the swap window)"
+  finish 0 "deployed"
+fi
 
 keep_current="$(readlink -f "$CURRENT")"
 keep_previous="$(readlink -f "$PREVIOUS")"
