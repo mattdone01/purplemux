@@ -59,7 +59,8 @@ const request = (port, method, urlPath, { headers = {}, body = null } = {}) => n
 /** The scratch human session: set the first-run password, log in, return the cookie (or null + why). */
 const humanSession = async (port, password) => {
   const setup = await request(port, 'POST', '/api/auth/setup', { body: { authPassword: password } });
-  // 400 "Setup already completed" on a re-run within one instance is fine: the password is ours.
+  // 400 "Setup already completed" on a re-run of the same instance is fine: the password is derived
+  // from the instance's scratch path, so it is the one set the first time.
   if (setup.status !== 200 && setup.status !== 400) return { cookie: null, why: `setup ${setup.status} ${setup.body.slice(0, 120)}` };
   const login = await request(port, 'POST', '/api/auth/login', { body: { password } });
   const setCookie = [].concat(login.headers['set-cookie'] || []).join(';');
@@ -105,29 +106,67 @@ const asyncAgentLaunch = (at, agentId) => ({
 });
 
 /**
- * A composer stand-in Mission Control counts as a LIVE Claude agent: after drawing the empty composer
- * it execs a process whose command line is `claude --resume <uuid>`, so tmux reports the pane's
- * command as `claude` and the server binds the session from that argument (the wave-2 composer
- * stand-in stays `sh`, which Mission Control rightly treats as no agent). Input goes to $ACC_INPUT.
+ * A stand-in the server treats as a LIVE Claude agent, as a real one is seen (review r1):
+ *   * it writes Claude's session pid file (`$HOME/.claude/sessions/<pid>.json`: pid, sessionId, cwd,
+ *     startedAt), so the server binds the session AND reads the process start — the `tasksSince`
+ *     filter then runs as it does live (the `sh` stand-in has no start, so the filter never ran);
+ *   * it draws an empty composer and ends by `exec -a claude cat`, so tmux reports the pane's
+ *     command as `claude` (Mission Control's liveness test) while the process keeps its environment
+ *     (HOME included: teardown finds its processes by the scratch HOME — perl's `$0` wiped it);
+ *   * whatever is typed into the composer is appended to $ACC_INPUT.
  */
-const liveComposerStandIn = (scratch) => {
+const liveStandIn = (scratch) => {
   const file = path.join(scratch, 'bin', 'live', 'claude');
   if (!fs.existsSync(file)) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, [
-      '#!/bin/sh',
+      '#!/bin/bash',
+      '# $1 is --resume, $2 the session uuid.',
+      'd="$HOME/.claude/sessions"; mkdir -p "$d"',
+      // Milliseconds from %s%N: some `date` builds (uutils) ignore the width in %3N and print nanoseconds.
+      'printf \'{"pid":%d,"sessionId":"%s","cwd":"%s","startedAt":%s}\\n\' "$$" "$2" "$PWD" "$(( $(date +%s%N) / 1000000 ))" > "$d/$$.json"',
       'clear',
       'rows=$(stty size 2>/dev/null | cut -d" " -f1)',
       'i=4; while [ "$i" -lt "${rows:-24}" ]; do echo; i=$((i + 1)); done',
       "printf '────────────────\\n\\342\\235\\257 \\n────────────────'",
       'stty -echo 2>/dev/null',
-      // $2 is the session uuid (`claude --resume <uuid>`).
-      `exec perl -e '$0 = "claude --resume " . $ARGV[0]; open(my $f, ">>", $ENV{ACC_INPUT} || "/dev/null") or die; select($f); $| = 1; while (my $l = <STDIN>) { print $f $l; }' "$2"`,
+      'exec -a claude cat >> "${ACC_INPUT:-/dev/null}"',
       '',
     ].join('\n'));
     fs.chmodSync(file, 0o755);
   }
   return file;
+};
+
+/** Bracketed-paste markers a pane may carry around a pasted line. */
+const unpaste = (text) => text.replace(/\u001b\[20[01]~/g, '');
+
+/**
+ * Story 12's judge (review r1): the WHOLE composer input is exactly one non-empty line, and that line is
+ * the fixed bootstrap notice for this workspace. Counting only the marker lines would pass a notice
+ * typed with a multi-line prompt around it — the defect story 12 fixed.
+ */
+const judgeMissionTyped = (text, workspaceId) => {
+  const lines = unpaste(text ?? '').split(/\r?\n|\r/).map((l) => l.trim()).filter(Boolean);
+  const template = new RegExp(`^\\[purplemux mission \\S+\\] Mission Control asks this orchestrator to reconcile — read: purplemux mission bootstrap -w ${workspaceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
+  const ok = lines.length === 1 && template.test(lines[0]);
+  return { ok, measured: `${lines.length} non-empty line(s): ${JSON.stringify(lines.join(' ⏎ ').slice(0, 300))}` };
+};
+
+/**
+ * Story 37's judge (review r1): the stop was WAITING — busy, no nudge, the classification `waiting`
+ * with exactly `open` open tasks read from a transcript — while a LATER plain stop already had its
+ * READY nudge; and after the work ended, the next stop's READY nudge is stamped after that end.
+ */
+const judgeSubagentWait = ({ controlReady, early, later, endedAt, open = 1 }) => {
+  const ok = Boolean(controlReady)
+    && early?.stopped === true && early.cliState === 'busy' && Array.isArray(early.nudges) && early.nudges.length === 0
+    && early.turnEnd?.kind === 'waiting' && early.turnEnd.openBackgroundTasks === open
+    && Boolean(later) && typeof later.at === 'number' && later.at >= endedAt;
+  return {
+    ok,
+    measured: `control READY ${Boolean(controlReady)}; after it: ${JSON.stringify(early ?? null)}; after the end: ${later ? `ready nudge at +${later.at - endedAt} ms` : 'no ready nudge'}`,
+  };
 };
 
 /** Run the wave-4 checks; an exception fails wave 4 alone and keeps the lines already produced. */
@@ -155,7 +194,10 @@ const checks = async (inst, helpers, results) => {
 
   await subagentWork(inst, ctx);
   await identity(inst, ctx);
-  const session = await humanSession(ctx.port, `acc-pw-${nonce}`);
+  // Stable per instance, so a kept instance can be re-run with --only-wave 4 (the setup answers 400
+  // the second time and the login still succeeds).
+  const password = `acc-pw-${crypto.createHash('sha256').update(inst.state.scratch).digest('hex').slice(0, 16)}`;
+  const session = await humanSession(ctx.port, password);
   if (!session.cookie) {
     for (const id of ['grant-step-up', 'grant-drives-other-workspace', 'grant-only-grantee', 'grant-revoke', 'grant-audit', 'grants-read-session-only', 'coordination-route', 'coordination-panel-built', 'mission-bootstrap-inbox']) {
       fail(id, 'needs the scratch human session', session.why, 'setup 200, login 200 with a session-token cookie');
@@ -163,7 +205,7 @@ const checks = async (inst, helpers, results) => {
     return;
   }
   ctx.cookie = session.cookie;
-  ctx.password = `acc-pw-${nonce}`;
+  ctx.password = password;
   await grants(inst, ctx);
   await coordination(inst, ctx);
   await missionInbox(inst, ctx);
@@ -184,14 +226,24 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
     const created = await tab(wsB, name, 'claude-code', ['--no-launch']);
     if (!created?.tabId) return null;
     await sleep(500);
-    const started = await inst.startStandIn(created.sessionName, transcript, { subagents });
-    return started.rc === 0 ? { ...created, transcriptPath: started.transcriptPath } : null;
+    const started = await inst.startStandIn(created.sessionName, transcript, { subagents, standInPath: liveStandIn(inst.state.scratch) });
+    if (started.rc !== 0) return null;
+    // A live session writes its subagent files after its process starts; the ledger skips a file last
+    // written before that start (story 37). The fixture files predate the stand-in, so touch them once
+    // it is running, as a live session would leave them.
+    await sleep(2000);
+    const subDir = path.join(started.transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
+    for (const name of subagents ? Object.keys(subagents) : []) {
+      const now = new Date();
+      fs.utimesSync(path.join(subDir, name), now, now);
+    }
+    return { ...created, transcriptPath: started.transcriptPath };
   };
   const stopTurn = async (w) => {
     await sleep(1000);
     await inst.hook('session-start', w.sessionName);
     await inst.hook('prompt-submit', w.sessionName);
-    const busy = await within(10000, async () => (await inst.cliState(wsB, w.tabId)) === 'busy');
+    const busy = await within(30000, async () => (await inst.cliState(wsB, w.tabId)) === 'busy');
     const stopped = await inst.hook('stop', w.sessionName);
     return busy && stopped === 204;
   };
@@ -199,8 +251,12 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
 
   // Shapes from tab-dTsAzt on 2026-09-26 (stripped): the subagent moved a Bash to the background one
   // second before it returned; the main transcript ends the turn with no marker.
-  // Stamped just after the stand-in starts, so a process-start filter (tasksSince) can never drop them.
-  const t0 = Date.now() + 2000;
+  // Stamped after the stand-in starts (its pid file records the start, and the server filters tasks
+  // started before it): 30 s leaves room for a slow pane on a loaded host.
+  const t0 = Date.now() + 30000;
+  // A task left open by an EARLIER process of the session: the process-start filter must drop it, so
+  // the count below stays 1 (review r1: without a recorded start the filter never ran in isolation).
+  const orphan = (agentId) => subagentMovedShell(Date.now() - 600000, agentId, `bacc37o${nonce}${agentId.slice(-1)}`);
   const shellAgent = `aacc37s${nonce}`;
   const shellTask = `bacc37s${nonce}`;
   const shell = await worker(`acc4-sub-shell-${nonce}`, [
@@ -208,7 +264,7 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
     asyncAgentLaunch(t0 + 1000, shellAgent),
     queuedCompletion(t0 + 20000, shellAgent, 'Agent "acc" completed'),
     assistantEnd(t0 + 21000, 'Still running: the gate the subagent started.'),
-  ], { [`agent-${shellAgent}.jsonl`]: [subagentMovedShell(t0 + 19000, shellAgent, shellTask)] });
+  ], { [`agent-${shellAgent}.jsonl`]: [orphan(shellAgent), subagentMovedShell(t0 + 19000, shellAgent, shellTask)] });
 
   // agent adb9dae4 on 2026-09-26: completed, then woken by its own shell's delivery into its file
   // (no resume line in the main transcript) — it runs until its second completion.
@@ -219,14 +275,14 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
     asyncAgentLaunch(t0 + 1000, wokenAgent),
     queuedCompletion(t0 + 10000, wokenAgent, 'Agent "acc" completed'),
     assistantEnd(t0 + 30000, 'Waiting on the review agent.'),
-  ], { [`agent-${wokenAgent}.jsonl`]: [subagentMovedShell(t0 + 5000, wokenAgent, wokenTask), subagentDelivery(t0 + 25000, wokenAgent, wokenTask)] });
+  ], { [`agent-${wokenAgent}.jsonl`]: [orphan(wokenAgent), subagentMovedShell(t0 + 5000, wokenAgent, wokenTask), subagentDelivery(t0 + 25000, wokenAgent, wokenTask)] });
 
-  const plain = await worker(`acc4-plain-${nonce}`, 'Finished the task.');
+  const plain = await worker(`acc4-plain-${nonce}`, [userLine(t0, 'go'), assistantEnd(t0 + 1000, 'Finished the task.')]);
   const shellStopped = shell ? await stopTurn(shell) : false;
   const wokenStopped = woken ? await stopTurn(woken) : false;
   const plainStopped = plain ? await stopTurn(plain) : false;
   // Order, not a quiet interval: the plain stop, posted AFTER both, must already have its READY nudge.
-  const ready = plainStopped ? await within(10000, async () => (await inst.nudgesFor(wsB, plain.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  const ready = plainStopped ? await within(30000, async () => (await inst.nudgesFor(wsB, plain.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
   const plainStatus = plain ? await status(wsB, plain.tabId) : null;
   check(
     'turn-end-served',
@@ -251,25 +307,25 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
   if (shell) appendLines(shell, [queuedCompletion(stamp, shellTask, 'Background command "gate wait" completed (exit code 0)')]);
   if (woken) appendLines(woken, [queuedCompletion(stamp, wokenAgent, 'Agent "acc" completed')]);
   const again = async (w) => (w && (await inst.hook('stop', w.sessionName)) === 204
-    ? within(10000, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'ready-for-review'))
+    ? within(30000, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'ready-for-review'))
     : null);
   const shellReady = await again(shell);
   const wokenReady = await again(woken);
-  const waited = (early, kind) => early.stopped && early.cliState === 'busy' && early.nudges.length === 0
-    && early.turnEnd?.kind === 'waiting' && early.turnEnd.openBackgroundTasks === 1 && kind;
+  const shellJudged = judgeSubagentWait({ controlReady: ready, early: shellEarly, later: shellReady, endedAt });
+  const wokenJudged = judgeSubagentWait({ controlReady: ready, early: wokenEarly, later: wokenReady, endedAt });
   check(
     'subagent-shell-waiting',
-    'a stop whose only open work is a shell a subagent moved to the background is WAITING (busy, no nudge); once its completion lands the next stop is READY',
-    Boolean(ready && waited(shellEarly, true) && shellReady && shellReady.at >= endedAt),
-    `after the plain stop's nudge: ${JSON.stringify(shellEarly)}; after the completion: ${shellReady ? `ready nudge at +${shellReady.at - endedAt} ms` : 'no ready nudge'}`,
-    'busy, no nudge, turnEnd waiting with 1 open task; then a ready nudge stamped after the completion',
+    'a stop whose only open work is a shell a subagent moved to the background is WAITING (busy, no nudge, one open task — a task from before the process is not counted); once its completion lands the next stop is READY',
+    shellJudged.ok,
+    shellJudged.measured,
+    'control READY first; busy, no nudge, turnEnd waiting with 1 open task; then a ready nudge stamped after the completion',
   );
   check(
     'subagent-woken-waiting',
     'a stop while a completed async subagent was woken by its own shell\'s delivery is WAITING; its second completion makes the next stop READY',
-    Boolean(ready && waited(wokenEarly, true) && wokenReady && wokenReady.at >= endedAt),
-    `after the plain stop's nudge: ${JSON.stringify(wokenEarly)}; after the completion: ${wokenReady ? `ready nudge at +${wokenReady.at - endedAt} ms` : 'no ready nudge'}`,
-    'busy, no nudge, turnEnd waiting with 1 open task (the woken agent); then a ready nudge stamped after its completion',
+    wokenJudged.ok,
+    wokenJudged.measured,
+    'control READY first; busy, no nudge, turnEnd waiting with 1 open task (the woken agent); then a ready nudge stamped after its completion',
   );
   for (const w of [shell, woken, plain, orch]) if (w?.tabId) await inst.cli(['tab', 'close', '-w', wsB, w.tabId]);
   await inst.cli(['orchestration', 'off', '-w', wsB]);
@@ -309,6 +365,9 @@ const identity = async (inst, { check, nonce, sleep, tab, brief, parseJson, port
 };
 
 // ─── stories 11 and 28: drive grants and the grants read ────────────────────────────────────────
+/** A cross-workspace send refused by the workspace gate: exit 3 and the `forbidden` code, not some other failure. */
+const refusedForbidden = (r) => r.rc === 3 && /forbidden/i.test(`${r.err}${r.out}`);
+
 const grants = async (inst, { check, nonce, sleep, tab, brief, port, cookie, password, parseJson }) => {
   const { a: wsA, b: wsB } = inst.state.workspaces;
   const origin = `http://localhost:${port}`;
@@ -327,25 +386,25 @@ const grants = async (inst, { check, nonce, sleep, tab, brief, port, cookie, pas
   check(
     'grant-step-up',
     'a grant needs the human session, the same Origin and the purplemux password: a wrong password is refused, the right one creates it',
-    wrong.status === 403 && wrong.json?.code === 'grant-password-invalid' && noOrigin.status === 403 && made.status === 201 && Boolean(grantId),
-    `wrong ${wrong.status} ${wrong.json?.code}; no Origin ${noOrigin.status}; right ${made.status} ${grantId}`,
-    'wrong 403 grant-password-invalid; no Origin 403; right 201 with a grant id',
+    wrong.status === 403 && wrong.json?.code === 'grant-password-invalid' && noOrigin.status === 403 && /origin/i.test(noOrigin.json?.error ?? '') && made.status === 201 && Boolean(grantId),
+    `wrong ${wrong.status} ${wrong.json?.code}; no Origin ${noOrigin.status} ${noOrigin.json?.error}; right ${made.status} ${grantId}`,
+    'wrong 403 grant-password-invalid; no Origin 403 naming the Origin; right 201 with a grant id',
   );
   const byGrantee = grantId ? await drive(grantee, `ACC4-GRANTED-${nonce}`) : { rc: -1, out: '', err: 'no grant' };
   check(
     'grant-drives-other-workspace',
     'the granted, launch-verified tab drives a tab of the granted workspace (refused before the grant)',
-    before.rc === 3 && byGrantee.rc === 0,
+    refusedForbidden(before) && byGrantee.rc === 0,
     `before ${brief(before)}; with the grant ${brief(byGrantee)}`,
-    'before exit 3; with the grant exit 0',
+    'before exit 3 forbidden; with the grant exit 0',
   );
   const byOther = grantId ? await drive(other, `ACC4-OTHER-${nonce}`) : { rc: -1, out: '', err: 'no grant' };
   check(
     'grant-only-grantee',
     'another tab of the grantee\'s workspace is still refused (the grant names one tab)',
-    byOther.rc === 3,
+    refusedForbidden(byOther),
     brief(byOther),
-    'exit 3',
+    'exit 3 forbidden',
   );
   const read = await request(port, 'GET', '/api/grants', { headers: { cookie } });
   const anonymous = await request(port, 'GET', '/api/grants');
@@ -362,9 +421,9 @@ const grants = async (inst, { check, nonce, sleep, tab, brief, port, cookie, pas
   check(
     'grant-revoke',
     'revoking the grant (session + Origin) ends it: the grantee is refused again',
-    revoked.status === 200 && after.rc === 3,
+    revoked.status === 200 && refusedForbidden(after),
     `revoke ${revoked.status}; drive after ${brief(after)}`,
-    'revoke 200; exit 3',
+    'revoke 200; exit 3 forbidden',
   );
   const auditPath = path.join(inst.state.home, '.purplemux', 'audit', 'coordination.jsonl');
   const events = (fs.existsSync(auditPath) ? fs.readFileSync(auditPath, 'utf8') : '').split('\n')
@@ -425,7 +484,7 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
   fs.mkdirSync(path.dirname(inputFile), { recursive: true });
   fs.writeFileSync(inputFile, '');
   const standIn = orch && on.rc === 0
-    ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', inputFile, standInPath: liveComposerStandIn(inst.state.scratch) })
+    ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', inputFile, standInPath: liveStandIn(inst.state.scratch) })
     : { rc: -1 };
   await sleep(1500);
   if (orch) await inst.hook('session-start', orch.sessionName);
@@ -451,19 +510,19 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
   // Then a further quiet interval: a second paste of the same notice would show up here.
   if (typed) await sleep(15000);
   const mission = await missionItems();
-  const lines = (readIf(inputFile) ?? '').split(/\r?\n|\r/).filter((l) => l.includes('[purplemux mission'));
+  const judged = judgeMissionTyped(readIf(inputFile) ?? '', wsA);
   check(
     'mission-bootstrap-inbox',
     'a reconcile bootstrap reaches the idle orchestrator as ONE inbox notice, typed once into its empty composer as a single line',
-    standup.rc === 0 && entries.length >= 1 && mission.length === 1 && mission[0].state === 'delivered' && lines.length === 1,
-    `orchestration ${on.rc}, stand-in ${standIn.rc}, idle ${idle}, session bound ${Boolean(bound)}; standup ${brief(standup)}; bootstrap ${bootstrap.status} with ${entries.length} entries; mission items ${mission.map((i) => i.state).join(',') || 'none'}; typed lines ${lines.length}: ${JSON.stringify(lines[0] ?? '')}`,
-    'standup 0; bootstrap 200 with an entry; one delivered mission item; one "[purplemux mission" line typed',
+    standup.rc === 0 && entries.length >= 1 && mission.length === 1 && mission[0].state === 'delivered' && judged.ok,
+    `orchestration ${on.rc}, stand-in ${standIn.rc}, idle ${idle}, session bound ${Boolean(bound)}; standup ${brief(standup)}; bootstrap ${bootstrap.status} with ${entries.length} entries; mission items ${mission.map((i) => i.state).join(',') || 'none'}; composer input: ${judged.measured}`,
+    'standup 0; bootstrap 200 with an entry; one delivered mission item; the composer received exactly one line, the fixed bootstrap notice for this workspace',
   );
   if (orch?.tabId) await inst.cli(['tab', 'close', '-w', wsA, orch.tabId]);
   await inst.cli(['orchestration', 'off', '-w', wsA]);
 };
 
 module.exports = {
-  wave4, request, humanSession, liveComposerStandIn,
+  wave4, request, humanSession, liveStandIn, judgeMissionTyped, judgeSubagentWait,
   userLine, assistantEnd, queuedCompletion, subagentMovedShell, subagentDelivery, asyncAgentLaunch,
 };

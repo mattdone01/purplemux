@@ -123,17 +123,53 @@ describe('checks-wave4.cjs fixtures (story 39)', () => {
     expect(await ledgerOf([...main, wave4.queuedCompletion(t0 + 40000, 'aW', 'done')], [sub])).toEqual([]);
   });
 
-  it('the live composer stand-in execs a process named `claude --resume <uuid>`', () => {
+  it('the live stand-in writes Claude\'s session pid file and execs as `claude` with its environment kept', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w4-'));
     try {
-      const file = wave4.liveComposerStandIn(dir);
+      const file = wave4.liveStandIn(dir);
       const text = fs.readFileSync(file, 'utf-8');
-      expect(text.startsWith('#!/bin/sh\n')).toBe(true);
-      expect(text).toMatch(/exec perl -e '\$0 = "claude --resume " \. \$ARGV\[0\];/);
+      expect(text.startsWith('#!/bin/bash\n')).toBe(true);
+      expect(text).toContain('d="$HOME/.claude/sessions"');
+      expect(text).toContain('"startedAt":%s');
+      // Milliseconds on any `date` (uutils printed nanoseconds for %3N and the process start filter dropped every task).
+      expect(text).toContain('$(( $(date +%s%N) / 1000000 ))');
+      expect(text).toContain('exec -a claude cat >> "${ACC_INPUT:-/dev/null}"');
+      expect(text).not.toContain('perl');
       expect(fs.statSync(file).mode & 0o111).not.toBe(0);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('judgeMissionTyped: only the whole input being the one fixed notice line for this workspace passes', () => {
+    const line = '[purplemux mission boot-4f7e4283b1df7a108ab484805afec717] Mission Control asks this orchestrator to reconcile — read: purplemux mission bootstrap -w ws-5wqnrB';
+    expect(wave4.judgeMissionTyped(`${line}\n`, 'ws-5wqnrB').ok).toBe(true);
+    expect(wave4.judgeMissionTyped(`\u001b[200~${line}\u001b[201~\n`, 'ws-5wqnrB').ok).toBe(true);
+    // Review r1: the multi-line prompt story 12 removed, typed around the notice, must fail.
+    expect(wave4.judgeMissionTyped(`Reconcile Mission Control:\n1. read the snapshot\n${line}\n`, 'ws-5wqnrB')).toMatchObject({ ok: false, measured: expect.stringContaining('3 non-empty line(s)') });
+    expect(wave4.judgeMissionTyped(`${line}\n${line}\n`, 'ws-5wqnrB').ok).toBe(false);
+    expect(wave4.judgeMissionTyped(`${line}\n`, 'ws-OTHER').ok).toBe(false);
+    expect(wave4.judgeMissionTyped('', 'ws-5wqnrB').ok).toBe(false);
+  });
+
+  it('judgeSubagentWait: WAITING needs the control READY first, busy, no nudge, turnEnd waiting with the open count, then a READY stamped after the end', () => {
+    const good = {
+      controlReady: { kind: 'ready-for-review', at: 1 },
+      early: { stopped: true, cliState: 'busy', nudges: [], turnEnd: { kind: 'waiting', openBackgroundTasks: 1 } },
+      later: { kind: 'ready-for-review', at: 2000 },
+      endedAt: 1000,
+    };
+    expect(wave4.judgeSubagentWait(good).ok).toBe(true);
+    const bad = (over: Record<string, unknown>) => wave4.judgeSubagentWait({ ...good, ...over }).ok;
+    expect(bad({ controlReady: null })).toBe(false);
+    expect(bad({ early: { ...good.early, turnEnd: null } })).toBe(false);
+    expect(bad({ early: { ...good.early, nudges: ['ready-for-review'] } })).toBe(false);
+    expect(bad({ early: { ...good.early, cliState: 'ready-for-review' } })).toBe(false);
+    // Two open: the pre-process orphan was counted, so the start filter did not run.
+    expect(bad({ early: { ...good.early, turnEnd: { kind: 'waiting', openBackgroundTasks: 2 } } })).toBe(false);
+    expect(bad({ early: { ...good.early, turnEnd: { kind: 'ready-for-review', transcript: false, openBackgroundTasks: 0 } } })).toBe(false);
+    expect(bad({ later: null })).toBe(false);
+    expect(bad({ later: { at: 999 } })).toBe(false);
   });
 });
 
