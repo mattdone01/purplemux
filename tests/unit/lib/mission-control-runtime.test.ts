@@ -336,6 +336,13 @@ describe('Mission Control live delivery guard', () => {
 
     expect(result).toEqual({ delivered: true });
     expect(mocks.deliverPrompt).toHaveBeenCalledOnce();
+    // With escapes, so a dim prompt suggestion reads as an empty composer (story 17).
+    expect(mocks.capture).toHaveBeenCalledWith('pt-ws-one-pane-orch', 120, 50, { escapes: true });
+  });
+
+  it('delivers to an idle orchestrator whose composer shows only a dim suggestion', async () => {
+    mocks.capture.mockResolvedValue('completed\n\x1b[39m❯\u00a0\x1b[2mBilling cleared: re-run the listed runs\x1b[0m');
+    expect(await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' })).toEqual({ delivered: true });
   });
 
   it('refuses a replaced provider session before terminal delivery', async () => {

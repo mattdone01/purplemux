@@ -5,6 +5,8 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getCodexModelStatus } from '@/lib/providers/codex/model-observation';
 import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
+import { getStatusManager } from '@/lib/status-manager';
+import { resolveTabCliState } from '@/lib/tab-send';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'GET') {
@@ -23,7 +25,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
 
   const provider = getProviderByPanelType(found.tab.panelType);
-  const agentSessionId = provider?.readSessionId(found.tab) ?? null;
+  // The live StatusManager entry, as `tab send` reads it; the layout copy lags (L8).
+  const live = getStatusManager().getAllForClient()[tabId];
+  const agentSessionId = live?.agentSessionId ?? provider?.readSessionId(found.tab) ?? null;
   const alive = await hasSession(found.tab.sessionName);
   const modelStatus = found.tab.panelType === 'codex-cli'
     ? await getCodexModelStatus(found.tab, alive ? {} : { runtimeAlive: false })
@@ -51,7 +55,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     workspaceId,
     alive: true,
     command,
-    cliState: found.tab.cliState ?? null,
+    cliState: resolveTabCliState(found.tab, live),
     agentProviderId: provider?.id ?? null,
     agentSessionId,
     // Response key kept as `claudeSessionId` for back-compat with external CLI consumers.
