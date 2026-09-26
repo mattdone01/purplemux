@@ -139,6 +139,14 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 
 ## Tabs
 
+GET /api/cli/grants
+  Portfolio drive grants (ADR-0014), read-only: the admin token sees all; a workspace or tab token sees
+  the grants its workspace holds or is driven under. A grant lets ONE launch-verified tab drive (send,
+  steer, …) the named workspaces until it expires, is revoked, or the tab closes; every such use is
+  audited. Grants are created and revoked only by a human in the web UI with the purplemux password
+  (POST /api/grants, DELETE /api/grants/<id>); no CLI token can. A grantee calling without its launch
+  identity gets 403 grant-tab-unverified: recreate the tab.
+
 POST /api/cli/tab-identity  { session }
   Story 36: the Claude SessionStart hook of a tab created before tab tokens asks for a hook-time
   identity with the pane's WORKSPACE token (403 for the admin token or a tab token), for a live tab

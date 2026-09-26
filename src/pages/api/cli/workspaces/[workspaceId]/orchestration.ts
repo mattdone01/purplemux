@@ -6,7 +6,8 @@ import { parseOrchestrationPatch } from '@/lib/orchestration';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const workspaceId = req.query.workspaceId as string;
-  if (!(await authorizeWorkspace(req, res, workspaceId))) return;
+  // A drive grant never changes a workspace's settings (ADR-0014).
+  if (!(await authorizeWorkspace(req, res, workspaceId, { grant: 'refuse' }))) return;
   const ws = await getWorkspaceById(workspaceId);
   if (!ws) return res.status(404).json({ error: 'Workspace not found' });
 

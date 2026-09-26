@@ -16,6 +16,7 @@ import { getStatusManager } from './src/lib/status-manager';
 import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
 import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
 import { startNotes, stopNotes } from './src/lib/notes-service';
+import { startGrants, stopGrants } from './src/lib/grant-service';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { enqueueSystemToast } from './src/lib/sync-server';
@@ -106,6 +107,7 @@ const shutdownWs = async () => {
   await getMissionControlRuntime().stop();
   await stopWatches();
   await stopNotes();
+  stopGrants();
   await stopInbox();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
@@ -384,6 +386,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await autoResumeOnStartup();
   await getStatusManager().init();
   await initLeases();
+  // After the tab tokens: grants reconcile against the live tabs themselves (ADR-0010 boot-sweep note).
+  await startGrants();
   await getMissionControlRuntime().start();
   await startInbox();
   await startNotes();

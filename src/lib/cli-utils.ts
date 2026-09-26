@@ -6,6 +6,8 @@ import { resolveCliScope, type TCliScope } from '@/lib/workspace-token';
 import { getBrowserBridge, type IBrowserBridgeClient } from '@/lib/browser-bridge-client';
 import type { ITab } from '@/types/terminal';
 import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
+import { findActiveDriveGrant, grantsSnapshot } from '@/lib/grant-store';
+import type { IGrant } from '@/types/grant';
 
 export interface ITabLocation {
   workspaceId: string;
@@ -19,12 +21,45 @@ export interface ITabLocation {
  * it in `allowedPeers`. The global token stays unrestricted so the UI and the
  * user's own shell are unaffected.
  */
-export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string): Promise<boolean> => {
-  if (scope.type === 'admin') return true;
-  if (scope.workspaceId === workspaceId) return true;
+export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string): Promise<boolean> =>
+  (await accessDecision(scope, workspaceId)).ok;
+
+/**
+ * The access answer and, when a grant was the ONLY reason, that grant (ADR-0014):
+ * `authorizeWorkspace` audits or refuses a mutation made through it.
+ */
+export const accessDecision = async (scope: TCliScope, workspaceId: string): Promise<{ ok: boolean; grant: IGrant | null }> => {
+  if (scope.type === 'admin') return { ok: true, grant: null };
+  if (scope.workspaceId === workspaceId) return { ok: true, grant: null };
   const target = await getWorkspaceById(workspaceId);
-  return target?.allowedPeers?.includes(scope.workspaceId) ?? false;
+  if (target?.allowedPeers?.includes(scope.workspaceId)) return { ok: true, grant: null };
+  // A tab that may drive a workspace under a grant may also reach it through the read-gated routes.
+  const grant = grantFor(scope, workspaceId);
+  return grant ? { ok: true, grant } : { ok: false, grant: null };
 };
+
+/** The tab a request targets, for the grant-use audit: the route's `tabId`, or the body's (launch routes). */
+const targetTabOf = (req: NextApiRequest): string | null => {
+  if (typeof req.query?.tabId === 'string') return req.query.tabId;
+  const body = req.body as { tabId?: unknown } | undefined;
+  return body && typeof body === 'object' && typeof body.tabId === 'string' ? body.tabId : null;
+};
+
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * The active human grant that lets this caller drive `workspaceId` (ADR-0014):
+ * only a VERIFIED tab (a launch-bound tab token), only over the named
+ * workspaces, only until it expires, is revoked or its tab closes.
+ */
+const grantFor = (scope: TCliScope, workspaceId: string, now = Date.now()): IGrant | null =>
+  scope.type === 'workspace' && scope.tabVerified === true && scope.tabId
+    ? findActiveDriveGrant(grantsSnapshot(), { workspaceId: scope.workspaceId, tabId: scope.tabId }, workspaceId, now)
+    : null;
+
+/** The caller lives in `workspaceId` (no grant counts): Mission Control's producer events (ADR-0014). */
+export const isOwnWorkspace = (scope: TCliScope, workspaceId: string): boolean =>
+  scope.type === 'workspace' && scope.workspaceId === workspaceId;
 
 /**
  * Whether `scope` may INJECT INPUT into a tab of `workspaceId`. A strictly
@@ -49,7 +84,14 @@ export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string):
  * `PMUX_TOKEN` and therefore stays confined.
  */
 export const canDriveWorkspace = (scope: TCliScope, workspaceId: string): boolean =>
-  scope.type === 'workspace' && scope.workspaceId === workspaceId;
+  driveDecision(scope, workspaceId).ok;
+
+/** The drive answer and, when a grant was what allowed it, that grant (for the per-use audit). */
+export const driveDecision = (scope: TCliScope, workspaceId: string, now = Date.now()): { ok: boolean; grant: IGrant | null } => {
+  if (isOwnWorkspace(scope, workspaceId)) return { ok: true, grant: null };
+  const grant = grantFor(scope, workspaceId, now);
+  return grant ? { ok: true, grant } : { ok: false, grant: null };
+};
 
 /**
  * Resolve the caller and confirm it may act on `workspaceId`, writing the
@@ -61,13 +103,30 @@ export const authorizeWorkspace = async (
   req: NextApiRequest,
   res: NextApiResponse,
   workspaceId: string,
+  opts: { grant?: 'allow' | 'refuse' } = {},
 ): Promise<TCliScope | null> => {
   const scope = resolveCliScope(req);
   if (!scope) {
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
   }
-  if (!(await canAccessWorkspace(scope, workspaceId))) {
+  const access = await accessDecision(scope, workspaceId);
+  if (access.ok && access.grant && !READ_METHODS.has(req.method ?? 'GET')) {
+    // A mutation allowed ONLY by a drive grant (review r1): a workspace's settings stay its own (the
+    // settings routes say so explicitly: a URL prefix could be dodged by an unnormalised path, review r2);
+    // anything else on its tabs (close, create, browser) is a use of the grant, audited like input.
+    const route = (req.url ?? '').split('?')[0];
+    if (opts.grant === 'refuse') {
+      res.status(403).json({
+        error: `Grant ${access.grant.id} lets this tab drive ${workspaceId}'s tabs, not change its settings (${route}).`,
+        code: 'forbidden',
+      });
+      return null;
+    }
+    const { auditGrantUse } = await import('@/lib/grant-service');
+    await auditGrantUse(access.grant, { route, targetWorkspaceId: workspaceId, targetTabId: targetTabOf(req) });
+  }
+  if (!access.ok) {
     res.status(403).json({
       error: `Workspace ${workspaceId} is out of scope for this tab (scoped to ${
         scope.type === 'workspace' ? scope.workspaceId : 'admin'
@@ -97,7 +156,21 @@ export const authorizeWorkspaceInput = async (
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
   }
-  if (!canDriveWorkspace(scope, workspaceId)) {
+  const decision = driveDecision(scope, workspaceId);
+  if (decision.ok && decision.grant) {
+    const { auditGrantUse } = await import('@/lib/grant-service');
+    await auditGrantUse(decision.grant, { route: (req.url ?? '').split('?')[0], targetWorkspaceId: workspaceId, targetTabId: targetTabOf(req) });
+  }
+  if (!decision.ok) {
+    const unverified = await unverifiedGrantHolder(req, scope, workspaceId);
+    if (unverified) {
+      res.status(403).json({
+        error: `Grant ${unverified.grantId} lets tab ${unverified.tabId} drive ${workspaceId}, but this call is not from its launch identity `
+          + `(identity: ${unverified.identity}). A grant needs a tab created after per-tab tokens: recreate the tab.`,
+        code: 'grant-tab-unverified',
+      });
+      return null;
+    }
     res.status(403).json({
       error:
         `Sending input to a tab in ${workspaceId} requires that workspace's own token (caller is ${
@@ -109,6 +182,30 @@ export const authorizeWorkspaceInput = async (
     return null;
   }
   return scope;
+};
+
+/**
+ * A caller that holds a grant but not a launch identity (a hook-time token, or
+ * the session fallback of a tab created before per-tab tokens): its denial
+ * names the grant and the fix (story 11 AC), not only "forbidden".
+ */
+const unverifiedGrantHolder = async (
+  req: NextApiRequest,
+  scope: TCliScope,
+  workspaceId: string,
+): Promise<{ grantId: string; tabId: string; identity: string } | null> => {
+  if (scope.type !== 'workspace' || scope.tabVerified === true) return null;
+  let tabId = scope.tabId ?? null;
+  let identity = scope.tabIdentity ?? 'none';
+  if (!tabId) {
+    const { resolveCaller } = await import('@/lib/caller');
+    const caller = await resolveCaller(req).catch(() => null);
+    tabId = caller?.tabId ?? null;
+    identity = caller?.identity ?? 'none';
+  }
+  if (!tabId) return null;
+  const grant = findActiveDriveGrant(grantsSnapshot(), { workspaceId: scope.workspaceId, tabId }, workspaceId, Date.now());
+  return grant ? { grantId: grant.id, tabId, identity } : null;
 };
 
 export const findTab = async (
