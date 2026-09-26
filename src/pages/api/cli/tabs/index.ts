@@ -19,6 +19,8 @@ import {
   waitForCodexManagedLaunch,
 } from '@/lib/providers/codex/managed-launch';
 import type { TPanelType } from '@/types/terminal';
+import type { TCliState } from '@/types/timeline';
+import type { ILastEvent } from '@/types/status';
 
 const log = createLogger('api:cli:tabs');
 
@@ -42,6 +44,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentProviderId: string | null;
       agentSessionId: string | null;
       agentLaunchConfig?: { model?: string; effort?: string };
+      cliState: TCliState | null;
+      lastEvent: ILastEvent | null;
+      busySince: number | null;
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -53,6 +58,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           allWorkspaceIds.map(async (id) => ((await canAccessWorkspace(cliScope, id)) ? id : null)),
         )).filter((id): id is string => id !== null);
     const workspaceIds = visibleIds;
+    // Live state lets a deploy drain tell a mid-turn agent from one kept busy
+    // only by open background work (last event `stop`).
+    const liveStatus = getStatusManager().getAllForClient();
 
     for (const id of workspaceIds) {
       const ws = await getWorkspaceById(id);
@@ -70,6 +78,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             agentProviderId: provider?.id ?? null,
             agentSessionId: provider?.readSessionId(tab) ?? null,
             agentLaunchConfig: tab.agentLaunchConfig,
+            cliState: liveStatus[tab.id]?.cliState ?? tab.cliState ?? null,
+            lastEvent: liveStatus[tab.id]?.lastEvent ?? null,
+            busySince: liveStatus[tab.id]?.busySince ?? null,
           });
         }
       }
