@@ -49,17 +49,21 @@ describe('status-hook.sh hook-time identity (story 36)', () => {
     }
     const r = spawnSync('sh', [script, event], { input: '{"source":"compact"}', env: base as NodeJS.ProcessEnv, encoding: 'utf-8' });
     expect(r.status).toBe(0);
-    const sourced = spawnSync('sh', ['-c', `. '${envFile}'; printf '%s|%s|%s' "$PMUX_TAB_ID" "$PMUX_WORKSPACE_ID" "$PMUX_TAB_TOKEN"`], { encoding: 'utf-8' });
+    const sourced = spawnSync('sh', ['-c', `. '${envFile}'; printf '%s|%s|%s' "$PMUX_TAB_ID" "$PMUX_WORKSPACE_ID" "$PMUX_TAB_TOKEN"`], { encoding: 'utf-8', env: { ...process.env, PMUX_TAB_ID: '', PMUX_TAB_TOKEN: '', PMUX_WORKSPACE_ID: '' } });
+    // A shell the server launched carries its own identity: the injected line must give way to it.
+    const launchShell = spawnSync('sh', ['-c', `. '${envFile}'; printf '%s|%s' "$PMUX_TAB_ID" "$PMUX_TAB_TOKEN"`], { encoding: 'utf-8', env: { ...process.env, PMUX_TAB_ID: 'tab-launch', PMUX_TAB_TOKEN: 'launch-token' } });
     return {
       calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf-8').split('\n').filter(Boolean) : [],
       envFile: fs.readFileSync(envFile, 'utf-8'),
       sourced: sourced.stdout,
+      launchShell: launchShell.stdout,
     };
   };
 
   it('writes the tab identity for Bash commands, asked with the pane\'s workspace token and the exact pane\'s session', async () => {
     const r = await run('session-start', {});
     expect(r.sourced).toBe(`tab-old1|ws-fOvEfz|${TOKEN}`);
+    expect(r.launchShell).toBe('tab-launch|launch-token');
     const ask = r.calls.find((c) => c.includes('api/cli/tab-identity'))!;
     expect(ask).toContain('x-pmux-token: ws-token');
     expect(ask).not.toContain('admin-token');

@@ -133,15 +133,25 @@ describe('resolveCaller', () => {
       expect(await resolveCaller(req({ 'x-pmux-token': fromY.ok ? fromY.token : '' }))).toMatchObject({ verified: false, identity: 'hook' });
     });
 
-    it('a session the server recreates binds the hook token at launch: it becomes verified', async () => {
+    it('a session the server recreates gets a FRESH launch token; the hook token never becomes verified (review r1)', async () => {
       const { ensureTabToken, mintHookTabToken, tabIdentityOf } = await import('@/lib/tab-token');
       const { resolveCaller } = await import('@/lib/caller');
       const hook = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
-      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('hook');
+      if (!hook.ok) throw new Error(hook.reason);
       const launch = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
-      expect(hook.ok && launch).toBe(hook.ok ? hook.token : false);
+      expect(launch).not.toBe(hook.token);
       expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('launch');
+      expect(await resolveCaller(req({ 'x-pmux-token': hook.token }))).toBeNull();
       expect(await resolveCaller(req({ 'x-pmux-token': launch }))).toMatchObject({ verified: true, identity: 'launch' });
+    });
+
+    it('tab list shows hook only once the token was presented (minting proves only that someone asked)', async () => {
+      const { mintHookTabToken, tabIdentityOf } = await import('@/lib/tab-token');
+      const { resolveCaller } = await import('@/lib/caller');
+      const hook = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
+      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('none');
+      await resolveCaller(req({ 'x-pmux-token': hook.ok ? hook.token : '' }));
+      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('hook');
     });
 
     it('an unknown origin in the token file never counts as launch proof', async () => {

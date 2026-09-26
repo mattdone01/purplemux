@@ -30,8 +30,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(400).json({ error: 'session must be a tmux session name', code: 'invalid' });
   }
   const tab = await findTabBySessionName(session, scope.workspaceId).catch(() => null);
-  if (!tab || tab.panelType === 'web-browser') {
+  if (!tab) {
     return res.status(404).json({ error: `no tab of ${scope.workspaceId} runs session ${session}`, code: 'tab-not-found' });
+  }
+  // Only Claude tabs run the SessionStart hook with $CLAUDE_ENV_FILE; every other tab stays `none` (ADR-0010).
+  if (tab.panelType !== 'claude-code') {
+    return res.status(409).json({ error: `tab ${tab.id} is not a Claude tab; hook-time identity is for Claude tabs only`, code: 'tab-identity-unsupported' });
   }
   const minted = await mintHookTabToken({ workspaceId: scope.workspaceId, tabId: tab.id }, session);
   if (!minted.ok) {

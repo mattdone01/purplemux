@@ -533,7 +533,7 @@ const holderText = (h) => {
   if (h.admin) return 'admin';
   const ws = h.workspaceName ? `${h.workspaceId} (${h.workspaceName})` : h.workspaceId;
   const tab = h.tabName ? `${h.tabId} (${h.tabName})` : h.tabId;
-  return `${ws} / ${tab}${h.verified ? '' : ' unverified'}`;
+  return `${ws} / ${tab}${h.verified ? '' : h.identity === 'hook' ? ' hook-identity' : ' unverified'}`;
 };
 
 const printLeases = (leases) => {
@@ -723,7 +723,7 @@ const printWatches = (watches) => {
     const parts = [
       w.id,
       `${w.kind} ${w.target} --until ${w.until}`,
-      `owner=${w.workspaceId}/${w.tabId} (${w.owner}${w.verified === false ? ', unverified' : ''})`,
+      `owner=${w.workspaceId}/${w.tabId} (${w.owner}${w.verified === false ? (w.identity === 'hook' ? ', hook-identity' : ', unverified') : ''})`,
       `age=${age(w.ageSeconds)}`,
       `expires-in=${age(w.expiresInSeconds)}`,
       `last-check=${w.lastCheckedAt ? new Date(w.lastCheckedAt).toISOString() : 'never'}`,
