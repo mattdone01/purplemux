@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName } from '@/lib/layout-store';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo } from '@/lib/layout-store';
 import { onTabClosed } from '@/lib/tab-lifecycle';
 import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
@@ -34,7 +34,7 @@ import { getSignalEngine } from '@/lib/signal-engine';
 import { classifyTurnEnd, isBackgroundWaitStalled } from '@/lib/turn-end';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
-import type { TLivenessEvent } from '@/types/liveness';
+import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
@@ -202,6 +202,7 @@ export class StatusManager {
           terminalStatus,
           listeningPorts,
           ...entryAgentFields(provider, tab, detected.jsonlPath),
+          reportsTo: tab.reportsTo ?? null,
           lastUserMessage: tab.lastUserMessage,
           lastAssistantMessage: detected.lastAssistantSnippet,
           currentAction: detected.currentAction,
@@ -431,6 +432,7 @@ export class StatusManager {
             terminalStatus,
             listeningPorts,
             ...entryAgentFields(provider, tab, detected.jsonlPath),
+            reportsTo: tab.reportsTo ?? null,
             lastUserMessage: tab.lastUserMessage,
             lastAssistantMessage: detected.lastAssistantSnippet,
             currentAction: detected.currentAction,
@@ -463,6 +465,7 @@ export class StatusManager {
           ?? provider?.readSessionId(tab) ?? null;
         existing.jsonlPath = refreshed.jsonlPath ?? existing.jsonlPath;
         existing.lastUserMessage = tab.lastUserMessage;
+        existing.reportsTo = tab.reportsTo ?? null;
         this.reconcileJsonlWatch(tab.id, existing);
 
         if (processChanged) {
@@ -624,7 +627,7 @@ export class StatusManager {
       detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
     }
 
-    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail);
+    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
 
     if (event.kind === 'bg-completed') return;
 
@@ -644,17 +647,36 @@ export class StatusManager {
     });
   }
 
+  /** The tab's `reportsTo` while that tab is live in the same workspace (ADR-0018). */
+  private liveReportsTo(tabId: string, entry: ITabStatusEntry | undefined): string | null {
+    const target = entry?.reportsTo;
+    if (!target || target === tabId) return null;
+    const targetEntry = this.tabs.get(target);
+    return targetEntry && targetEntry.workspaceId === entry.workspaceId ? target : null;
+  }
+
   // Unlike nudgeOrchestrator this may target the registering tab itself: when
   // the workspace has no orchestrator (or the orchestrator IS the registrant),
-  // the tab whose work died is the actor that must wake up.
-  private async nudgeLiveness(workspaceId: string, tabId: string, tabName: string, kind: TOrchestrationNudgeKind, detail: string): Promise<boolean> {
+  // the tab whose work died is the actor that must wake up. `notify: 'self'`
+  // asks for exactly that, so a worker wakes on its own gate.
+  private async nudgeLiveness(
+    workspaceId: string,
+    tabId: string,
+    tabName: string,
+    kind: TOrchestrationNudgeKind,
+    detail: string,
+    notify?: TBackgroundJobNotify,
+  ): Promise<boolean> {
     const now = Date.now();
     // Sources deduplicate their own episodes. Debouncing by tab/kind here
     // drops independent jobs that finish on the same tab close together.
 
     const ws = await getWorkspaceByIdCached(workspaceId);
     const orch = ws?.orchestration;
-    const targetTabId = orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId;
+    const targetTabId = notify === 'self'
+      ? tabId
+      : this.liveReportsTo(tabId, this.tabs.get(tabId))
+        ?? (orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId);
     const message = buildNudgeMessage(kind, tabId, tabName, workspaceId, detail);
     const delivered = await this.deliverAutomatedPrompt(workspaceId, targetTabId, message, 'liveness nudge');
 
@@ -949,8 +971,11 @@ export class StatusManager {
   private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<void> {
     if (!isAgentPanelType(entry.panelType)) return;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
-    const orch = ws?.orchestration;
-    if (!ws || !orch?.enabled || !orch.orchestratorTabId || orch.orchestratorTabId === tabId) return;
+    if (!ws) return;
+    const orch = ws.orchestration;
+    const targetTabId = this.liveReportsTo(tabId, entry)
+      ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
+    if (!targetTabId) return;
 
     const now = Date.now();
     const last = this.lastNudgeByTab.get(tabId);
@@ -958,12 +983,7 @@ export class StatusManager {
     this.lastNudgeByTab.set(tabId, { kind, at: now });
 
     const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
-    const delivered = await this.deliverAutomatedPrompt(
-      ws.id,
-      orch.orchestratorTabId,
-      message,
-      'orchestrator nudge',
-    );
+    const delivered = await this.deliverAutomatedPrompt(ws.id, targetTabId, message, 'orchestrator nudge');
 
     const nudge: IOrchestrationNudge = {
       id: nanoid(8),
@@ -980,7 +1000,7 @@ export class StatusManager {
       this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
     }
     this.broadcast({ type: 'orchestration:nudge', nudge });
-    log.info({ tabId, kind, delivered }, 'orchestrator nudge');
+    log.info({ tabId, kind, targetTabId, delivered }, 'orchestrator nudge');
   }
 
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
@@ -1876,6 +1896,18 @@ export class StatusManager {
     this.clients.clear();
   }
 
+  /** A closed tab stops receiving nudges at once; the layout copy is cleared too. */
+  forgetReportsTo(workspaceId: string, closedTabId: string): void {
+    for (const entry of this.tabs.values()) {
+      if (entry.workspaceId === workspaceId && entry.reportsTo === closedTabId) entry.reportsTo = null;
+    }
+    clearReportsTo(workspaceId, closedTabId).then((cleared) => {
+      if (cleared.length) log.info({ closedTabId, cleared }, 'reportsTo cleared: target tab closed');
+    }).catch((err) => {
+      log.warn(`reportsTo clear failed for ${closedTabId}: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
   notifyLastUserMessage(sessionName: string, message: string): void {
     const parsed = parseSessionName(sessionName);
     if (!parsed) return;
@@ -1894,7 +1926,10 @@ export const getStatusManager = (): StatusManager => {
     dispatcher.register(createStatusSocketChannel((frame) => manager.broadcast(frame)));
     dispatcher.register(createWebPushChannel());
     registerFcmChannel(dispatcher);
-    onTabClosed(({ tabId }) => manager.removeTab(tabId));
+    onTabClosed(({ tabId, workspaceId }) => {
+      manager.removeTab(tabId);
+      manager.forgetReportsTo(workspaceId, tabId);
+    });
     setLeaseAgentStateSource((tabId) => manager.getTabAgentState(tabId));
   }
   return g.__ptStatusManager;

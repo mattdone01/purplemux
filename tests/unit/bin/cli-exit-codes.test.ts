@@ -458,3 +458,50 @@ describe('help', () => {
     expect(stdout).toContain('Exit codes:');
   });
 });
+
+describe('reportsTo and bg --notify (ADR-0018)', () => {
+  it('exits 2 when tab create names a reports-to tab of another workspace, and sends the id', async () => {
+    reply = json(400, { error: 'reportsTo tab-o is not a tab of workspace WS', code: 'reports-to-invalid', reportsTo: 'tab-o' });
+
+    const { code, stderr } = await cli(['tab', 'create', '-w', 'WS', '-t', 'terminal', '--reports-to', 'tab-o']);
+
+    expect(code).toBe(2);
+    expect(stderr).toContain('reports-to-invalid');
+    expect(requests[0].body).toEqual({ workspaceId: 'WS', panelType: 'terminal', reportsTo: 'tab-o' });
+  });
+
+  it('refuses a bare --reports-to before sending anything', async () => {
+    const { code } = await cli(['tab', 'create', '-w', 'WS', '--reports-to']);
+
+    expect(code).toBe(2);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('patches and clears reportsTo with tab reports-to', async () => {
+    reply = json(200, { tabId: 'tab-w', workspaceId: 'WS', reportsTo: 'tab-o' });
+    expect((await cli(['tab', 'reports-to', '-w', 'WS', 'tab-w', 'tab-o'])).code).toBe(0);
+    expect((await cli(['tab', 'reports-to', '-w', 'WS', 'tab-w', '--clear'])).code).toBe(0);
+
+    expect(requests.map((r) => [r.method, r.url, r.body])).toEqual([
+      ['PATCH', '/api/cli/tabs/tab-w?workspaceId=WS', { reportsTo: 'tab-o' }],
+      ['PATCH', '/api/cli/tabs/tab-w?workspaceId=WS', { reportsTo: null }],
+    ]);
+  });
+
+  it.each([
+    [['tab', 'reports-to', '-w', 'WS', 'tab-w']],
+    [['tab', 'reports-to', '-w', 'WS', 'tab-w', 'tab-o', '--clear']],
+  ])('refuses an ambiguous reports-to call: %j', async (args) => {
+    expect((await cli(args)).code).toBe(2);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('sends --notify self on tab bg add, and refuses any other value', async () => {
+    reply = json(200, { ok: true });
+    expect((await cli(['tab', 'bg', 'add', '-w', 'WS', 'tab-w', '--pid', '42', '--notify', 'self'])).code).toBe(0);
+    expect(requests[0].body).toEqual({ pid: 42, notify: 'self' });
+
+    expect((await cli(['tab', 'bg', 'add', '-w', 'WS', 'tab-w', '--pid', '42', '--notify', 'me'])).code).toBe(2);
+    expect(requests).toHaveLength(1);
+  });
+});

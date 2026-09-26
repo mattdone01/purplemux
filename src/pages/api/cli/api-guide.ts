@@ -137,14 +137,19 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 GET /api/cli/tabs?workspaceId=WS
   List tabs. Without workspaceId, lists tabs across all workspaces.
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
-    "cliState", "lastEvent", "busySince" }] }
+    "cliState", "lastEvent", "busySince", "reportsTo" }] }
   cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).
-  A busy tab whose lastEvent is "stop" waits only on open background work.
+  A busy tab whose lastEvent is "stop" waits only on open background work (WAITING, ADR-0018:
+  a turn that ended with no marker line while its own background shells, agents or registered
+  jobs run sends no nudge).
 
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
-          "model"?: "...", "reasoning"?: "...", "launch"?: boolean }
+          "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-..." }
   Invalid panelType returns HTTP 400 with validPanelTypes.
+  "reportsTo" names a live tab of the SAME workspace that receives this tab's watchdog nudges
+  ahead of the workspace orchestrator; anything else is 400 { "code": "reports-to-invalid" }
+  (CLI exit 2). It is cleared when that tab closes.
   Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
@@ -158,7 +163,12 @@ POST /api/cli/tabs
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
   Tab info.
-  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId" }
+  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId", "reportsTo" }
+
+PATCH /api/cli/tabs/<tabId>?workspaceId=WS
+  Body: { "reportsTo": "tab-..." | null } — on its own. Sets or clears the nudge target (same rules
+  as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
+  Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
 DELETE /api/cli/tabs/<tabId>?workspaceId=WS
   Close the tab (kills tmux session and removes from layout).
@@ -199,8 +209,8 @@ pane/turn state. Register a probe (progress freshness) and/or a background pid
 (process death) at dispatch time for any long-running job. Events fire an
 orchestrator nudge (STALLED / LIVENESS PROBE FAILING / BACKGROUND JOB COMPLETED /
 BACKGROUND JOB FAILED / BACKGROUND JOB EXITED with unknown status — sent to the
-workspace's orchestrator tab, or to the registering tab itself when there is no
-orchestrator). Stalls, probe failures, failed jobs, and unknown-status exits also send
+tab's live reportsTo tab, else the workspace's orchestrator tab, else the registering
+tab itself; a job registered with "notify": "self" always wakes the registering tab). Stalls, probe failures, failed jobs, and unknown-status exits also send
 a push alert to the human. Registrations persist across server restarts and are dropped
 when the tab closes.
 
@@ -226,7 +236,11 @@ DELETE /api/cli/tabs/<tabId>/probe?workspaceId=WS[&label=L]
   Response: { "removed": n }
 
 POST /api/cli/tabs/<tabId>/bg?workspaceId=WS
-  Body: { "pid": N, "label"?: "...", "stderrFile"?: "/abs/path", "exitCodeFile"?: "/abs/path" }
+  Body: { "pid": N, "label"?: "...", "stderrFile"?: "/abs/path", "exitCodeFile"?: "/abs/path",
+          "notify"?: "self" | "orchestrator" }
+  "notify": "self" sends the outcome nudge to this tab (a worker waking on its own gate);
+  the default is the routing above. While the pid is alive, a turn end with no marker line
+  is WAITING and sends no READY FOR REVIEW nudge.
   Watch a background pid. A strict integer read from exitCodeFile classifies exit 0 as
   BACKGROUND JOB COMPLETED and nonzero as BACKGROUND JOB FAILED. If the file is missing
   or malformed after a short grace, BACKGROUND JOB EXITED fires with unknown status;
@@ -253,7 +267,12 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   Body: { "enabled"?: boolean, "orchestratorTabId"?: string | null, "kickoffTemplate"?: string | null }
   Orchestrators use this to designate themselves (enabled + own tabId) and to turn
   orchestration off when the epic is finished — this stops watchdog nudges and idle
-  heartbeats for the workspace.
+  heartbeats for the workspace. A tab's live reportsTo overrides this target for that tab.
+
+  Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:
+  or READY-TO-MERGE: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
+  — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
+  No marker and open background work → WAITING, no nudge. Otherwise READY FOR REVIEW.
 
 ## Standup ticks
 

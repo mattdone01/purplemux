@@ -49,6 +49,8 @@ export interface ITabStatusEntry {
   // Drives the F1 grace window that suppresses spurious inactive transitions
   // during the agent's boot-up. Runtime only — not persisted to layout.
   lastResumeOrStartedAt?: number;
+  /** Live same-workspace tab that receives this tab's nudges (ADR-0018); mirrors ITab.reportsTo. */
+  reportsTo?: string | null;
   /** How the watchdog classified the last `stop` (ADR-0018). Runtime only. */
   turnEnd?: ITurnEndRecord | null;
 }

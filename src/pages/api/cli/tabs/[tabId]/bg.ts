@@ -40,6 +40,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       }
     }
 
+    const notify = body.notify === undefined ? undefined : body.notify;
+    if (notify !== undefined && notify !== 'self' && notify !== 'orchestrator') {
+      return res.status(400).json({ error: 'notify must be self or orchestrator' });
+    }
+
     const job: IBackgroundJob = {
       workspaceId,
       tabId,
@@ -47,6 +52,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       ...(label !== undefined ? { label } : {}),
       ...(stderrFile !== undefined ? { stderrFile } : {}),
       ...(exitCodeFile !== undefined ? { exitCodeFile } : {}),
+      ...(notify === 'self' ? { notify } : {}),
       registeredAt: Date.now(),
     };
     await getLivenessManager().registerJob(job);

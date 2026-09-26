@@ -26,8 +26,16 @@ export interface IBackgroundJob {
   stderrFile?: string;
   /** File the launcher writes the exit code to (`cmd; echo $? > file`); read on death. */
   exitCodeFile?: string;
+  /**
+   * Who is woken when the job exits: `orchestrator` (default — the tab's
+   * `reportsTo`, else the workspace orchestrator, else the tab itself) or
+   * `self` (the registering tab, so a worker wakes on its own gate).
+   */
+  notify?: TBackgroundJobNotify;
   registeredAt: number;
 }
+
+export type TBackgroundJobNotify = 'self' | 'orchestrator';
 
 export interface IProbeStatus {
   label: string;

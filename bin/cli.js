@@ -654,7 +654,10 @@ const cmdTabCreate = async (args) => {
   // edits outside them; it never infers the list.
   const scopeRaw = flagValue(args, '--scope');
   const scope = scopeRaw ? scopeRaw.split(',').map((s) => s.trim()).filter(Boolean) : null;
+  // Nudges go to this live tab of the same workspace first (ADR-0018).
+  const reportsTo = flagValue(args, '--reports-to');
   if (!wsId) die('--workspace is required');
+  if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
     ...(name ? { name } : {}),
@@ -663,7 +666,23 @@ const cmdTabCreate = async (args) => {
     ...(reasoning ? { reasoning } : {}),
     ...(noLaunch ? { launch: false } : {}),
     ...(scope && scope.length ? { scope } : {}),
+    ...(reportsTo ? { reportsTo } : {}),
   });
+  out(body);
+};
+
+const cmdTabReportsTo = async (args) => {
+  requireEnv();
+  const clear = args.includes('--clear');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--clear']);
+  const [tabId, target] = rest;
+  if (!tabId || (clear ? target : !target)) die('usage: tab reports-to -w WS TAB_ID (TARGET_TAB_ID | --clear)');
+  const wsId = resolveWsForTab(args);
+  const { body } = await api(
+    'PATCH',
+    `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
+    { reportsTo: clear ? null : target },
+  );
   out(body);
 };
 
@@ -840,7 +859,7 @@ const cmdTabProbe = async (args) => {
 const cmdTabBg = async (args) => {
   requireEnv();
   const sub = args[0];
-  const rest = stripFlags(args.slice(1), ['--workspace', '-w', '--pid', '--label', '--stderr', '--exit-file']);
+  const rest = stripFlags(args.slice(1), ['--workspace', '-w', '--pid', '--label', '--stderr', '--exit-file', '--notify']);
   const tabId = rest[0];
   if (!sub) die('bg subcommand required (add | list | remove)');
   if (!tabId) die('tab ID is required');
@@ -853,12 +872,15 @@ const cmdTabBg = async (args) => {
       const label = flagValue(args, '--label');
       const stderrFile = flagValue(args, '--stderr');
       const exitCodeFile = flagValue(args, '--exit-file');
+      const notify = flagValue(args, '--notify');
       if (!pid || !/^\d+$/.test(pid)) die('--pid N is required');
+      if (args.includes('--notify') && notify !== 'self' && notify !== 'orchestrator') die('--notify must be self or orchestrator');
       const { body } = await api('POST', `/api/cli/tabs/${tabId}/bg?${qs}`, {
         pid: Number(pid),
         ...(label ? { label } : {}),
         ...(stderrFile ? { stderrFile: require('path').resolve(stderrFile) } : {}),
         ...(exitCodeFile ? { exitCodeFile: require('path').resolve(exitCodeFile) } : {}),
+        ...(notify ? { notify } : {}),
       });
       return out(body);
     }
@@ -998,11 +1020,15 @@ Commands:
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
+             [--reports-to TAB_ID]         Send this tab's watchdog nudges to TAB_ID (a live tab of the SAME
+                                           workspace) instead of the workspace orchestrator; exit 2 otherwise
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets the
              [--no-launch]                 reasoning effort — claude-code: low|medium|high|xhigh|max (claude --effort;
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
+  tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
+                  [--clear]                restores the workspace orchestrator. Cleared when TARGET closes
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
                                            for an agent tab to be able to accept a turn; --wait-ms N (max
@@ -1027,8 +1053,11 @@ Commands:
   tab bg add -w WS TAB_ID --pid N          Watch a background pid. A strict integer from --exit-file classifies exit 0
              [--label L] [--stderr FILE]   as COMPLETED and nonzero as FAILED; missing or malformed status becomes
              [--exit-file FILE]            EXITED with unknown status after a short grace. Nudges include the stderr
-                                           tail when available. Verify completed artifacts; inspect unknown exits
+             [--notify self|orchestrator]  tail when available. Verify completed artifacts; inspect unknown exits
                                            before deciding. Launch pattern: ( cmd 2>err.log; echo $? > exit.code ) &
+                                           --notify self wakes TAB_ID itself (a worker on its own gate); the default
+                                           wakes its reports-to tab, else the orchestrator. A live job also holds
+                                           the tab's turn end as WAITING: no READY nudge until it exits
   tab bg list -w WS TAB_ID                 Show watched background jobs (pid, alive, age)
   tab bg remove -w WS TAB_ID [--pid N]     Stop watching (all, or one pid)
   tab browser url -w WS TAB_ID             Current URL + title of a web-browser tab
@@ -1139,6 +1168,7 @@ const main = async () => {
         case 'close': return cmdTabClose(rest);
         case 'probe': return cmdTabProbe(rest);
         case 'bg': return cmdTabBg(rest);
+        case 'reports-to': return cmdTabReportsTo(rest);
         case 'browser': return cmdTabBrowser(rest);
         default: die(`unknown tab command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
       }
