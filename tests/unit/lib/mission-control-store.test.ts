@@ -709,6 +709,63 @@ describe('MissionControlStore', () => {
     store.close();
   });
 
+  it('claims a delivery waiting in the inbox only by its own marker, and lists every handoff (story 12)', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const accepted = store.submitAnswer('item-a', {
+      submissionId: 'submission-inbox', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false,
+    }, 'user');
+    // Not waiting yet: nothing to claim, nothing handed off.
+    expect(store.claimInboxDelivery(accepted.delivery.id, 'inbox:i-one')).toBeNull();
+    expect(store.listInboxHandoffs().deliveries).toEqual([]);
+
+    const claimed = store.claimDelivery(accepted.delivery.id, accepted.delivery.updatedAt)!;
+    expect(store.listInboxHandoffs().deliveries.map((row) => row.state)).toEqual(['dispatching']);
+    const waiting = store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, binding, { state: 'queued', nextAttemptAt: null, lastError: 'inbox:i-one' })!;
+    expect(store.listDueDeliveries(Date.now() + 60_000, 10)).toEqual([]);
+    expect(store.listInboxHandoffs().deliveries).toEqual([waiting]);
+
+    expect(store.claimInboxDelivery(accepted.delivery.id, 'inbox:i-other')).toBeNull();
+    const pasting = store.claimInboxDelivery(accepted.delivery.id, 'inbox:i-one');
+    expect(pasting).toMatchObject({ state: 'dispatching', attempts: waiting.attempts + 1 });
+    expect(pasting!.updatedAt).toBeGreaterThan(waiting.updatedAt);
+    expect(store.validateDeliveryAttempt(pasting!.id, pasting!.updatedAt, binding)).toEqual({ ok: true });
+    expect(store.claimInboxDelivery(accepted.delivery.id, 'inbox:i-one')).toBeNull();
+    store.close();
+  });
+
+  it('does not claim a waiting delivery whose answer is no longer current (story 12)', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const accepted = store.submitAnswer('item-a', {
+      submissionId: 'submission-inbox-cancel', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false,
+    }, 'user');
+    const claimed = store.claimDelivery(accepted.delivery.id, accepted.delivery.updatedAt)!;
+    store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, binding, { state: 'queued', nextAttemptAt: null, lastError: 'inbox:i-one' });
+    const cancel: TMissionProducerEvent = {
+      eventId: 'event-cancel-inbox', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a',
+      expectedRevision: 2, producerAt: 1_700_000_000_300, bindingGeneration: 1,
+      type: 'attention.cancelled', payload: { itemId: 'item-a', reason: 'No longer needed' },
+    };
+    store.applyEvents([cancel]);
+    expect(store.claimInboxDelivery(accepted.delivery.id, 'inbox:i-one')).toBeNull();
+    store.close();
+  });
+
+  it('does not list a bootstrap entry waiting in the inbox as due (story 12)', () => {
+    const store = new MissionControlStore(databasePath());
+    store.reconcileDiscovery(discoveryInput('bootstrap-inbox'));
+    const [queued] = store.listQueuedBootstrapEntries(10);
+    expect(queued).toBeDefined();
+    const claimed = store.claimBootstrapEntry(queued.bootstrapId, queued.entry.workspaceId, queued.entry.runId, queued.entry.updatedAt)!;
+    store.completeBootstrapAttempt(queued.bootstrapId, queued.entry.workspaceId, queued.entry.runId, claimed.entry.updatedAt, {
+      state: 'queued', reason: 'inbox:i-boot', nextAttemptAt: null,
+    });
+    expect(store.listQueuedBootstrapEntries(10)).toEqual([]);
+    expect(store.listInboxHandoffs().bootstrapEntries.map((row) => row.entry.reason)).toEqual(['inbox:i-boot']);
+    store.close();
+  });
+
   it('does not requeue an answer after its attention item is cancelled', () => {
     const store = new MissionControlStore(databasePath());
     seed(store);
