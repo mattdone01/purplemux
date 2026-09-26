@@ -18,6 +18,18 @@ const checks = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptanc
 const asEnv = (env: Record<string, string | undefined>) => env as NodeJS.ProcessEnv;
 
 describe('checks.cjs judgements', () => {
+  it('judgeNoteDelivery: only a stamped delivery whose notice line reached the composer, body absent, passes', () => {
+    const note = { id: 'n-abcd1234', state: 'delivered', deliveredAt: 1790000000000 };
+    const line = '\u001b[200~[purplemux note n-abcd1234] from ws-b at 10:00Z — purplemux note show n-abcd1234\u001b[201~\n';
+    expect(checks.judgeNoteDelivery(note, line, 'BODY-1').ok).toBe(true);
+    // Queued but not yet typed: `state: delivered` alone is what review r1 found the old check reading.
+    expect(checks.judgeNoteDelivery({ ...note, deliveredAt: null }, line, 'BODY-1').ok).toBe(false);
+    expect(checks.judgeNoteDelivery(note, '', 'BODY-1').ok).toBe(false);
+    expect(checks.judgeNoteDelivery(note, '[purplemux note n-other123] …', 'BODY-1').ok).toBe(false);
+    expect(checks.judgeNoteDelivery(note, `${line}BODY-1\n`, 'BODY-1')).toMatchObject({ ok: false, measured: expect.stringContaining('body typed true') });
+    expect(checks.judgeNoteDelivery(null, line, 'BODY-1').ok).toBe(false);
+  });
+
   it('judgeRace: exactly one winner and one refusal that names the winner', () => {
     const win = { rc: 0, out: '', err: '' };
     const lose = { rc: 3, out: '', err: 'error: lease-held — merge:x/y held by ws-a / tab-A1 (acc-a1)' };

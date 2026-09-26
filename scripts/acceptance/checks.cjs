@@ -57,6 +57,21 @@ const judgeRace = (a, b, idA, idB) => {
     : { ok: false, measured: `the refusal does not name ${winnerId}: ${loser.err.trim().slice(0, 200)}`, expected: 'the holder named' };
 };
 
+/**
+ * Judge a note delivery (story 10): the server stamped `deliveredAt` (the inbox delivered the line, not
+ * just queued it), the recipient's composer received the fixed notice line naming the note, and the
+ * body never reached it. `input` is what the recipient's stand-in read from its terminal.
+ */
+const judgeNoteDelivery = (note, input, bodyMarker) => {
+  const stamped = typeof note?.deliveredAt === 'number';
+  const noticed = Boolean(note?.id) && input.includes(`[purplemux note ${note.id}]`);
+  const bodyTyped = input.includes(bodyMarker);
+  return {
+    ok: stamped && noticed && !bodyTyped,
+    measured: `deliveredAt ${JSON.stringify(note?.deliveredAt ?? null)}, notice line received ${noticed}, body typed ${bodyTyped}`,
+  };
+};
+
 /** Aggregate check results into the report lines and the verdict. */
 const summarize = (results, { requireBashGuard = false } = {}) => {
   const lines = results.map((r) => {
@@ -127,7 +142,7 @@ class Instance {
    * is the pane's cwd under scratch/work (a/ or b/); `composer` runs the stand-in that draws an
    * empty Claude composer and swallows its input unechoed, so the inbox can deliver to it.
    */
-  async startStandIn(session, transcript, { workspaceDir = 'b', composer = false } = {}) {
+  async startStandIn(session, transcript, { workspaceDir = 'b', composer = false, inputFile = null } = {}) {
     const tmuxDir = this.state.tmuxTmpdir;
     if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
     const uuid = crypto.randomUUID();
@@ -143,15 +158,19 @@ class Instance {
     fs.writeFileSync(path.join(project, `${uuid}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
     const env = { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir };
     const standIn = composer ? this.composerStandIn() : path.join(this.state.scratch, 'bin', 'claude');
-    return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, `${standIn} --resume ${uuid}`, 'Enter'], { env, timeoutMs: 10000 });
+    const input = inputFile ? `ACC_INPUT=${shellQuote(inputFile)} ` : '';
+    return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, `${input}${standIn} --resume ${uuid}`, 'Enter'], { env, timeoutMs: 10000 });
   }
 
-  /** A second stand-in, also named `claude`: it draws an empty composer and reads its input unechoed. */
+  /**
+   * A second stand-in, also named `claude`: it draws an empty composer and reads its input unechoed
+   * into $ACC_INPUT, so a check can prove what was typed into the "composer" without it showing.
+   */
   composerStandIn() {
     const file = path.join(this.state.scratch, 'bin', 'composer', 'claude');
     if (!fs.existsSync(file)) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, "#!/bin/sh\nclear\nprintf '\\n────────────────\\n\\342\\235\\257 \\n────────────────\\n'\nstty -echo 2>/dev/null\ncat >/dev/null\n");
+      fs.writeFileSync(file, "#!/bin/sh\nclear\nprintf '\\n────────────────\\n\\342\\235\\257 \\n────────────────\\n'\nstty -echo 2>/dev/null\ncat >>\"${ACC_INPUT:-/dev/null}\"\n");
       fs.chmodSync(file, 0o755);
     }
     return file;
@@ -590,7 +609,13 @@ const tabCloseReap = async (inst, { wsA, check, created }) => {
   );
   // The second tab's close reaps its job too (and is the cleanup).
   if (two) await inst.cli(['tab', 'close', '-w', wsA, two.tabId]);
-  if (theirsPid > 1 && alive(theirsPid)) {
+  // Only the job this check started: alive, still `sleep 300`, still carrying the second tab's marker.
+  const ours = (pid) => {
+    const environ = readIf(`/proc/${pid}/environ`) ?? '';
+    const cmdline = readIf(`/proc/${pid}/cmdline`) ?? '';
+    return two && environ.split('\0').includes(`PMUX_TAB_ID=${two.tabId}`) && cmdline === 'sleep\u0000300\u0000';
+  };
+  if (theirsPid > 1 && alive(theirsPid) && ours(theirsPid)) {
     try {
       process.kill(theirsPid, 'SIGKILL');
     } catch {
@@ -605,7 +630,10 @@ const notes = async (inst, { nonce, wsA, wsB, check, created }) => {
   const sender = await created(wsB, 'acc2-sender', 'terminal');
   await sleep(1000);
   const on = orch ? await inst.cli(['orchestration', 'on', '-w', wsA, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
-  const standIn = orch && on.rc === 0 ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', composer: true }) : { rc: -1 };
+  const inputFile = path.join(inst.state.scratch, 'io', `composer-input-${nonce}.txt`);
+  fs.mkdirSync(path.dirname(inputFile), { recursive: true });
+  fs.writeFileSync(inputFile, '');
+  const standIn = orch && on.rc === 0 ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', composer: true, inputFile }) : { rc: -1 };
   await sleep(1500);
   if (orch) await inst.hook('session-start', orch.sessionName);
   const ready = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
@@ -617,23 +645,25 @@ const notes = async (inst, { nonce, wsA, wsB, check, created }) => {
     ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'send', '--to-workspace', wsA, '--subject', `acc note ${nonce}`, '-f', bodyFile]))
     : { rc: -1, out: '', err: `orchestration on ${on.rc}, stand-in ${standIn.rc}, idle ${ready}` };
   const note = parseJson(sent.out)?.note ?? null;
-  const delivered = note ? await within(90000, async () => {
+  // `state: delivered` is set when the notice is QUEUED; `deliveredAt` only once the inbox typed it
+  // (review r1). 180 s covers two readiness refusals (10 s, 30 s backoff) plus the 15 s notes tick.
+  const delivered = note ? await within(180000, async () => {
     const all = parseJson((await inst.cli(['note', 'list'])).out)?.notes ?? [];
-    return all.find((n) => n.id === note.id && n.state === 'delivered');
+    return all.find((n) => n.id === note.id && typeof n.deliveredAt === 'number');
   }) : null;
-  const pane = orch ? await inst.cli(['tab', 'result', '-w', wsA, orch.tabId, '--raw']) : { out: '' };
+  const judged = judgeNoteDelivery(delivered ?? note, readIf(inputFile) ?? '', bodyMarker);
   check(
     'note-delivered',
-    'a note to another workspace reaches its orchestrator\'s idle, empty composer as the fixed notice line; the body is never typed',
-    Boolean(delivered) && !pane.out.includes(bodyMarker),
-    `send ${brief(sent)}, note ${note?.id ?? 'none'}, delivered ${Boolean(delivered)}, body in the pane ${pane.out.includes(bodyMarker)}`,
-    'send exit 0, the note delivered within 90 s, the body absent from the pane',
+    'a note to another workspace is typed into its orchestrator\'s idle, empty composer as the fixed notice line naming it; the body never is',
+    sent.rc === 0 && judged.ok,
+    `send ${brief(sent)}, note ${note?.id ?? 'none'}; ${judged.measured}`,
+    'send exit 0; deliveredAt stamped within 180 s; the composer received "[purplemux note <id>]" and not the body',
   );
   const shown = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'show', note.id])) : { rc: -1, out: '', err: 'no note' };
   const bySender = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'ack', note.id])) : { rc: -1, out: '', err: 'no note' };
   const reader = await created(wsA, 'acc2-reader', 'terminal');
   await sleep(1000);
-  const byRecipient = note && reader && delivered ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['note', 'ack', note.id, '--comment', 'seen'])) : { rc: -1, out: '', err: 'not delivered' };
+  const byRecipient = note && reader ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['note', 'ack', note.id, '--comment', 'seen'])) : { rc: -1, out: '', err: 'not delivered' };
   const acked = parseJson(byRecipient.out)?.note?.state ?? null;
   check(
     'note-ack',
@@ -652,9 +682,11 @@ const API_ERROR_TRANSCRIPT = () => [
   { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
   { type: 'assistant', timestamp: new Date().toISOString(), error: 'server_error', isApiErrorMessage: true, uuid: crypto.randomUUID(), message: { model: '<synthetic>', role: 'assistant', stop_reason: 'stop_sequence', stop_sequence: '', type: 'message', content: [{ type: 'text', text: 'API Error: Server error mid-response. The response above may be incomplete.' }] } },
 ];
-const USAGE_WARNING_TRANSCRIPT = () => [
+// It ends on a marker line, so the turn-marker nudge proves the stop READ this transcript (a stop
+// that found no transcript falls back to READY, which would pass a READY-based check vacuously).
+const USAGE_WARNING_TRANSCRIPT = (marker) => [
   { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
-  { type: 'assistant', timestamp: new Date().toISOString(), uuid: crypto.randomUUID(), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'P1\'s pane shows "You\'ve used 92% of your session limit · resets 9:20am (UTC) · /upgrade to k…". Nothing to do until the reset.' }] } },
+  { type: 'assistant', timestamp: new Date().toISOString(), uuid: crypto.randomUUID(), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: `P1's pane shows "You've used 92% of your session limit · resets 9:20am (UTC) · /upgrade to k…". Nothing to do until the reset.\n\n${marker}` }] } },
 ];
 
 /** Start a stand-in worker in workspace B and drive one turn to its stop. */
@@ -671,7 +703,7 @@ const turnOf = async (inst, wsB, created, name, transcript) => {
 };
 
 /** Story 26: an API-error stop queues ONE resume and sends no READY; the usage WARNING is a plain turn. */
-const turnErrors = async (inst, { wsB, check, created }) => {
+const turnErrors = async (inst, { nonce, wsB, check, created }) => {
   const err = await turnOf(inst, wsB, created, 'acc2-api-error', API_ERROR_TRANSCRIPT());
   const errStopped = err ? await inst.hook('stop', err.sessionName) : 0;
   const resume = errStopped === 204 ? await within(10000, async () => (await inst.inbox(wsB)).find((i) => i.kind === 'resume' && i.targetTabId === err.tabId)) : null;
@@ -684,16 +716,17 @@ const turnErrors = async (inst, { wsB, check, created }) => {
     `stop ${errStopped}, resume items ${resumes}, nudges ${errNudges.map((n) => n.kind).join(',') || 'none'}`,
     'one resume inbox item, no ready-for-review nudge',
   );
-  const warn = await turnOf(inst, wsB, created, 'acc2-usage-warning', USAGE_WARNING_TRANSCRIPT());
+  const marker = `DONE: acceptance usage warning ${nonce}`;
+  const warn = await turnOf(inst, wsB, created, 'acc2-usage-warning', USAGE_WARNING_TRANSCRIPT(marker));
   const warnStopped = warn ? await inst.hook('stop', warn.sessionName) : 0;
-  const ready = warnStopped === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, warn.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  const ended = warnStopped === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, warn.tabId)).find((n) => n.kind === 'turn-marker')) : null;
   const warnResumes = warn ? (await inst.inbox(wsB)).filter((i) => i.targetTabId === warn.tabId).length : -1;
   check(
     'usage-warning-negative',
-    'a turn that quotes the usage WARNING footer is an ordinary turn: READY FOR REVIEW, no resume, no halt',
-    Boolean(ready) && warnResumes === 0,
-    `stop ${warnStopped}, ready nudge ${Boolean(ready)}, inbox items for the tab ${warnResumes}`,
-    'a ready-for-review nudge and no inbox item',
+    'a turn that quotes the usage WARNING footer is an ordinary turn: its marker nudge (the transcript was read), no resume, no halt',
+    Boolean(ended && ended.message.includes(marker)) && warnResumes === 0,
+    `stop ${warnStopped}, turn-marker nudge ${ended ? JSON.stringify(ended.message.slice(0, 120)) : 'none'}, inbox items for the tab ${warnResumes}`,
+    `a turn-marker nudge carrying "${marker}" and no inbox item`,
   );
   for (const t of [err, warn]) if (t) await inst.cli(['tab', 'close', '-w', wsB, t.tabId]);
 };
@@ -729,8 +762,12 @@ const suggestions = async (inst, { nonce, wsA, check, created }) => {
   const ghost = `ghost ${nonce}`;
   // Drawn by printf in the pane's shell: a composer line whose text is dim (SGR 2), as Claude draws one.
   const drawn = t ? await inst.keys(t.sessionName, `clear; printf '────\\n\\342\\235\\257 \\033[2m%s\\033[0m\\n────\\n' '${ghost}'`) : { rc: -1 };
-  await sleep(1000);
-  const plain = t ? parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId])).out) : null;
+  const plain = t && drawn.rc === 0
+    ? await within(10000, async () => {
+      const r = parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId])).out);
+      return r?.suggestion ? r : null;
+    })
+    : null;
   const none = t ? parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId, '--no-suggestions'])).out) : null;
   const raw = t ? parseJson((await inst.cli(['tab', 'result', '-w', wsA, t.tabId, '--raw'])).out) : null;
   const marked = (plain?.content ?? '').split('\n').some((l) => l.startsWith('❯') && l.includes(`[suggestion] ${ghost}`));
@@ -790,7 +827,7 @@ const main = async (argv) => {
   return pass ? 0 : 1;
 };
 
-module.exports = { judgeRace, summarize, shellQuote, parseArgs };
+module.exports = { judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs };
 
 if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));

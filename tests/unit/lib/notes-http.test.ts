@@ -35,7 +35,8 @@ describe('sendNoteError', () => {
 
   it('still answers 500 note-internal for an error that is not a note refusal', async () => {
     const { sendNoteError } = await import('@/lib/notes-http');
-    for (const err of [new Error('disk full'), Object.assign(new Error('x'), { name: 'NoteError' }), 'plain string']) {
+    const unknownCode = Object.assign(new Error('x'), { name: 'NoteError', code: 'made-up' });
+    for (const err of [new Error('disk full'), Object.assign(new Error('x'), { name: 'NoteError' }), unknownCode, 'plain string']) {
       const { res, state } = response();
       sendNoteError(res, err);
       expect(state).toEqual({ status: 500, body: { error: 'note operation failed', code: 'note-internal' } });
