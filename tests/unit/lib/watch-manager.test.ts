@@ -90,6 +90,11 @@ describe('harness watches (ADR-0015)', () => {
     await m.tick();
   };
 
+  it('records how the owner was named beside verified (story 36)', async () => {
+    const hook = await m.create({ ...B, verified: false, identity: 'hook' } as ICaller, { kind: 'lease', target: 'merge:nomupay/x', until: 'free' });
+    expect(hook).toMatchObject({ verified: false, identity: 'hook' });
+  });
+
   it('merged false then true: exactly one notice reaches the owner tab and the watch is gone', async () => {
     f.answer('/pulls/517', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A), f.pull(true, 'closed', SHA_A));
     const w = await m.create(B, { kind: 'pr', target: 'NomuPay/treasury-ui#517', until: 'merged' });

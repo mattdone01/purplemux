@@ -42,7 +42,7 @@ export const sameHolder = (a: ILeaseHolder, b: ILeaseHolder): boolean => {
 };
 
 export const holderLabel = (h: ILeaseHolder): string =>
-  h.admin ? 'admin' : `${h.workspaceId ?? '?'}/${h.tabId ?? 'no-tab'}${h.tabName ? ` (${h.tabName})` : ''}${h.verified ? '' : ' unverified'}`;
+  h.admin ? 'admin' : `${h.workspaceId ?? '?'}/${h.tabId ?? 'no-tab'}${h.tabName ? ` (${h.tabName})` : ''}${h.verified ? '' : h.identity === 'hook' ? ' hook-identity' : ' unverified'}`;
 
 const ageLabel = (lease: ILease, now: number): string => {
   const s = Math.max(0, Math.round((now - Date.parse(lease.acquiredAt)) / 1000));
@@ -76,7 +76,7 @@ export const acquireInState = (
     const lease: ILease = {
       ...existing,
       // The latest proof counts: an unverified renew does not keep an earlier verified flag.
-      holder: { ...existing.holder, tabName: req.holder.tabName ?? existing.holder.tabName, verified: req.holder.verified },
+      holder: { ...existing.holder, tabName: req.holder.tabName ?? existing.holder.tabName, verified: req.holder.verified, identity: req.holder.identity },
       epic: req.epic ?? existing.epic,
       note: req.note ?? existing.note,
       renewedAt: iso(now),
@@ -321,7 +321,7 @@ const notify = <A extends unknown[]>(listeners: Set<(...args: A) => void>, ...ar
   }
 };
 
-const auditHolder = (h: ILeaseHolder) => ({ workspaceId: h.workspaceId, tabId: h.tabId, verified: h.verified, admin: h.admin });
+const auditHolder = (h: ILeaseHolder) => ({ workspaceId: h.workspaceId, tabId: h.tabId, verified: h.verified, identity: h.identity, admin: h.admin });
 
 /** Runs inside the lock, so audit lines and hooks follow the order of the mutations. */
 const applyEffects = async (effects: TLeaseEffect[]): Promise<void> => {
@@ -381,6 +381,7 @@ export const holderFromCaller = (caller: ICaller): ILeaseHolder => ({
   tabId: caller.admin ? null : caller.tabId,
   tabName: caller.admin ? null : caller.tabName,
   verified: caller.admin ? false : caller.verified,
+  identity: caller.admin ? 'none' : caller.identity,
   admin: caller.admin,
 });
 

@@ -21,7 +21,10 @@ add one rather than working around a 403.
 
 Every tab created by the server also carries \`PMUX_TAB_TOKEN\`, \`PMUX_TAB_ID\` (the
 tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants exactly what the
-workspace token grants, and it also names the calling tab (verified). A tab token
+workspace token grants, and it also names the calling tab: verified (identity
+"launch") for a token the server bound when it created the session. A Claude tab
+created before tab tokens takes a hook-time token at its next session start
+(identity "hook", never verified; see POST /api/cli/tab-identity). A tab token
 stops working when its tab closes.
 
 Tabs created before tab tokens existed have only \`PMUX_TOKEN\`. For them, send
@@ -84,7 +87,7 @@ Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_T
 x-pmux-session) or the admin token — otherwise \`caller-unresolved\` (403).
 
 A lease view: { name, kind, resource, holder: { workspaceId, workspaceName, tabId, tabName,
-verified, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
+verified, identity, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
 ageSeconds, expiresInSeconds, holderState: live|agent-gone|closed|admin }.
 
 GET /api/cli/leases?prefix=&mine=1
@@ -136,10 +139,19 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 
 ## Tabs
 
+POST /api/cli/tab-identity  { session }
+  Story 36: the Claude SessionStart hook of a tab created before tab tokens asks for a hook-time
+  identity with the pane's WORKSPACE token (403 for the admin token or a tab token), for a live tab
+  of that workspace (404 otherwise), a Claude tab only (409 tab-identity-unsupported otherwise).
+  Mint-only: 409 tab-has-launch-identity for a tab with a launch token. Answers { tabId, workspaceId, token, identity: "hook" }; the hook writes the exports to
+  $CLAUDE_ENV_FILE. A hook token resolves identity "hook", never verified.
+
 GET /api/cli/tabs?workspaceId=WS
-  List tabs. Without workspaceId, lists tabs across all workspaces.
+  List tabs. Without workspaceId, lists tabs across all workspaces. Each tab carries identity:
+  launch (token bound at launch), hook (taken at a Claude SessionStart and used at least once,
+  story 36) or none (no tab token yet: a hook token that was minted but never presented shows none).
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
-    "cliState", "lastEvent", "busySince", "reportsTo" }] }
+    "cliState", "lastEvent", "busySince", "reportsTo", "identity" }] }
   cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).
   A busy tab whose lastEvent is "stop" waits only on open background work (WAITING, ADR-0018:
   a turn that ended with no marker line while its own background shells, agents or registered

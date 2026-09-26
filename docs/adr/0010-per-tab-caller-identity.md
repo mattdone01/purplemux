@@ -31,4 +31,38 @@ Verified identity arrives with each newly created tab. Tabs that existed before 
 
 Threat model: accidental collision between cooperating agents. A same-workspace agent can still read a sibling tab's environment through `/proc`; that is outside this epic's threat model.
 
+## Amendment (story 36, 2026-09-26): hook-time identity for tabs created before tab tokens
+
+Verified means the server bound the token to the tab when it created the session. Identity taken on the
+caller's word, per call or at hook time, is never verified.
+
+- A running shell's environment cannot be changed, but Claude Code hands its SessionStart hook a
+  `$CLAUDE_ENV_FILE` whose exports reach every later Bash command (measured on 2.1.283; CwdChanged too).
+  purplemux rewrites `status-hook.sh` at every server start and running agents execute the file, so the next
+  SessionStart (compact, clear, resume) of an old Claude tab runs the new hook without an agent restart.
+- The hook asks only when `$PMUX_TAB_ID` is empty and `$PMUX_TOKEN`, `$TMUX_PANE` and `$CLAUDE_ENV_FILE` are
+  set: `POST /api/cli/tab-identity {session}` with the PANE's workspace token (never the admin token, which is
+  tied to no workspace), for the exact pane's session (`tmux display-message -t $TMUX_PANE`). The session must
+  be a live tab of that workspace. Mint-only: a tab with a launch token answers 409 and never gets it; a tab
+  that already took a hook token gets the same one back.
+- Token records carry `origin: 'launch' | 'hook'` (absent = launch; an unknown value counts as hook) and
+  `injectedAt`. `resolveCliScope` sets `tabVerified` only for launch records. `ICaller.verified` stays a
+  boolean for launch proof; `ICaller.identity` is `launch | hook | session | none`, with
+  `verified === (identity === 'launch')`. Leases, notes, watches and fleet-config audit lines store
+  `identity` beside `verified`; a lease label reads `hook-identity`. Grants still require `verified`.
+- A session the server recreates for a hook-token tab gets a FRESH launch token; the hook token dies. A
+  hook token was handed out on the caller's word, so it is never promoted to proof (story 36 review r1).
+  The hook writes its exports guarded — `[ -n "$PMUX_TAB_ID" ] || { export …; }` — so a launch
+  environment always wins over a stale env file sourced again on resume.
+- Only `claude-code` tabs may take a hook token (409 `tab-identity-unsupported` otherwise): only they run the
+  SessionStart hook with `$CLAUDE_ENV_FILE`.
+- `tab list` shows `hook` only once the token was presented on a call (`presentedAt`): minting proves only
+  that someone asked, and a sibling or a hook killed mid-write could have asked.
+- The ruling's disproof test holds and is pinned: a sibling tab holding the same workspace token can obtain
+  another tab's hook token (the server cannot tell the real hook from it over TCP), which is exactly why a hook
+  token is never verified.
+- Not reached: Codex, Grok and terminal tabs created before tab tokens have no such hook; they stay
+  `identity: none` (the `X-Pmux-Session` fallback) until recreated. `tab list` / `tab status` show
+  `identity: launch | hook | none` per tab.
+
 Source of truth for the epic: `_output/purplemux-portfolio-coordination/architecture.md` (nomupay workspace).

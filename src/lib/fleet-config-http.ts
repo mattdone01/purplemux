@@ -54,7 +54,7 @@ const audit = (change: IFleetConfigChange, caller: ICaller): Promise<void> =>
     oldValue: change.oldValue,
     newValue: change.newValue,
     version: change.version,
-    by: { ...setterOf(caller), verified: caller.admin ? false : caller.verified },
+    by: { ...setterOf(caller), verified: caller.admin ? false : caller.verified, identity: caller.admin ? 'none' : caller.identity },
   });
 
 export const putValue = async (

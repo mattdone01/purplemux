@@ -5,6 +5,7 @@ import path from 'path';
 import os from 'os';
 import { createLogger } from '@/lib/logger';
 import { emitTabClosed, onTabClosed, readLiveTabs, type ILiveTab } from '@/lib/tab-lifecycle';
+import type { TTabTokenOrigin } from '@/types/identity';
 
 const log = createLogger('tab-token');
 
@@ -13,7 +14,17 @@ export interface ITabTokenRecord {
   workspaceId: string;
   sessionName: string;
   createdAt: string;
+  /** Absent = `launch` (every record before story 36 was minted at session creation). */
+  origin?: TTabTokenOrigin;
+  /** When a Claude SessionStart hook first took a `hook` token (story 36). */
+  injectedAt?: string;
+  /** When a `hook` token was first presented on a call: `tab list` shows `hook` only from then on. */
+  presentedAt?: string;
 }
+
+/** Only an explicit or implied `launch` is launch: an unknown origin never counts as proof. */
+export const tokenOrigin = (record: ITabTokenRecord): TTabTokenOrigin =>
+  record.origin === undefined || record.origin === 'launch' ? 'launch' : 'hook';
 
 export type TTabTokens = Record<string, ITabTokenRecord>;
 
@@ -131,12 +142,17 @@ const persist = (): Promise<boolean> =>
 export const ensureTabToken = async (identity: ITabIdentity, sessionName: string): Promise<string> => {
   const tokens = readTokens();
   const existing = tokens[identity.tabId];
-  if (existing && existing.workspaceId === identity.workspaceId) {
+  if (existing && existing.workspaceId === identity.workspaceId && tokenOrigin(existing) === 'launch') {
     if (existing.sessionName === sessionName) return existing.token;
     existing.sessionName = sessionName;
     await persist();
     return existing.token;
   }
+  // A hook-time token was handed out on the caller's word (any holder of the
+  // workspace token can obtain it), so a session the server creates never
+  // promotes it: the tab gets a FRESH launch token and the hook token dies
+  // (story 36 review r1). An existing record of another workspace is replaced.
+  const replaced = existing ?? null;
   const minted: ITabTokenRecord = {
     token: randomBytes(32).toString('hex'),
     workspaceId: identity.workspaceId,
@@ -145,10 +161,73 @@ export const ensureTabToken = async (identity: ITabIdentity, sessionName: string
   };
   tokens[identity.tabId] = minted;
   if (!(await persist())) {
-    if (tokens[identity.tabId] === minted) delete tokens[identity.tabId];
+    if (tokens[identity.tabId] === minted) {
+      if (replaced) tokens[identity.tabId] = replaced;
+      else delete tokens[identity.tabId];
+    }
     throw new Error(`tab token for ${identity.tabId} could not be saved`);
   }
   return minted.token;
+};
+
+/**
+ * Record the first presentation of a `hook` token (story 36 review r1): until
+ * the tab actually uses it, `tab list` shows `none`, since minting it proves
+ * only that someone asked. Cheap: at most one write per hook record.
+ */
+export const notePresented = (tabId: string, record: ITabTokenRecord): void => {
+  if (tokenOrigin(record) !== 'hook' || record.presentedAt) return;
+  record.presentedAt = new Date().toISOString();
+  persist().catch(() => {});
+};
+
+export type THookTokenResult =
+  | { ok: true; token: string; minted: boolean }
+  | { ok: false; reason: 'tab-has-launch-identity' | 'tab-token-unsaved' };
+
+/**
+ * A token for a tab created before tab tokens, asked for by its Claude
+ * SessionStart hook (story 36; architect ruling). Mint-only: a tab that holds a
+ * launch token never has it handed out here; a tab that already took a hook
+ * token gets the same one back (compact, clear and resume each start a session).
+ * The token resolves `identity: 'hook'`, never verified.
+ */
+export const mintHookTabToken = async (identity: ITabIdentity, sessionName: string): Promise<THookTokenResult> => {
+  const tokens = readTokens();
+  const existing = tokens[identity.tabId];
+  if (existing) {
+    if (existing.workspaceId !== identity.workspaceId || tokenOrigin(existing) === 'launch') {
+      return { ok: false, reason: 'tab-has-launch-identity' };
+    }
+    if (existing.sessionName !== sessionName) {
+      existing.sessionName = sessionName;
+      await persist();
+    }
+    return { ok: true, token: existing.token, minted: false };
+  }
+  const now = new Date().toISOString();
+  const minted: ITabTokenRecord = {
+    token: randomBytes(32).toString('hex'),
+    workspaceId: identity.workspaceId,
+    sessionName,
+    createdAt: now,
+    origin: 'hook',
+    injectedAt: now,
+  };
+  tokens[identity.tabId] = minted;
+  if (!(await persist())) {
+    if (tokens[identity.tabId] === minted) delete tokens[identity.tabId];
+    return { ok: false, reason: 'tab-token-unsaved' };
+  }
+  return { ok: true, token: minted.token, minted: true };
+};
+
+/** A tab's identity as `tab list` shows it: from its token record, `none` without one (story 36). */
+export const tabIdentityOf = (workspaceId: string, tabId: string): 'launch' | 'hook' | 'none' => {
+  const record = readTokens()[tabId];
+  if (!record || record.workspaceId !== workspaceId) return 'none';
+  const origin = tokenOrigin(record);
+  return origin === 'hook' && !record.presentedAt ? 'none' : origin;
 };
 
 export const getTabTokenRecord = (tabId: string): ITabTokenRecord | null => readTokens()[tabId] ?? null;

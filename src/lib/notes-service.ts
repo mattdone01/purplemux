@@ -331,7 +331,13 @@ export class NotesService {
     const now = this.deps.now();
     const note = createNote(
       {
-        from: { workspaceId: caller.admin ? null : caller.workspaceId, tabId: caller.admin ? null : caller.tabId, verified: caller.verified, epic },
+        from: {
+          workspaceId: caller.admin ? null : caller.workspaceId,
+          tabId: caller.admin ? null : caller.tabId,
+          verified: caller.verified,
+          identity: caller.admin ? 'none' : caller.identity,
+          epic,
+        },
         to,
         subject,
         body,

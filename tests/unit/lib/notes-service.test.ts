@@ -111,6 +111,15 @@ describe('notes (ADR-0013)', () => {
     svc = new NotesService(f.deps());
   });
 
+  it('records how the sender was named beside verified (story 36): launch, hook, or none for the admin token', async () => {
+    const launch = await svc.send({ ...B, identity: 'launch' } as ICaller, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    const hook = await svc.send({ ...C, verified: false, identity: 'hook' } as ICaller, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    const admin = await svc.send({ ...ADMIN, identity: 'none' } as ICaller, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    expect(launch.from).toMatchObject({ verified: true, identity: 'launch' });
+    expect(hook.from).toMatchObject({ verified: false, identity: 'hook' });
+    expect(admin.from).toMatchObject({ workspaceId: null, verified: false, identity: 'none' });
+  });
+
   it('routes a note to the live epic owner with exactly the one fixed line, and the owner reads the body', async () => {
     const view = await svc.send(B, { toEpic: 'ddh', subject: 'tolerance', body: 'Adopt REPROVE_DUE_TOLERANCE=2 in story 03.' });
     expect(view).toMatchObject({ state: 'delivered', deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a' }, subject: 'tolerance' });

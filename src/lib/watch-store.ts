@@ -5,6 +5,7 @@ import { nanoid } from 'nanoid';
 import { brandCodedError } from '@/lib/coded-error';
 import { LEASE_NAME } from '@/lib/lease-policy';
 import type { IWatch, IWatchesState, TWatchErrorCode, TWatchKind, TWatchUntil } from '@/types/watch';
+import type { TCallerIdentity } from '@/types/identity';
 
 // Harness watches (ADR-0015): tab-owned, one-shot subscriptions the server
 // evaluates. Pure validation first, then the one host file (one file makes the
@@ -146,7 +147,7 @@ export const checkCaps = (state: IWatchesState, spec: IWatchSpec, owner: { works
 
 export const createWatch = (
   spec: IWatchSpec,
-  owner: { workspaceId: string; tabId: string; verified: boolean },
+  owner: { workspaceId: string; tabId: string; verified: boolean; identity?: TCallerIdentity },
   baseline: string | null,
   now: number,
   id: string,
@@ -170,6 +171,7 @@ export const createWatch = (
   lastError: null,
   label: spec.label,
   verified: owner.verified,
+  identity: owner.identity,
   pendingNotice: null,
 });
 

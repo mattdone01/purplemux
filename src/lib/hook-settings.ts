@@ -66,6 +66,27 @@ fi
 PAYLOAD="\${PAYLOAD}}"
 
 curl -s -X POST -o /dev/null -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" -d "$PAYLOAD" "http://localhost:\${PORT}/api/status/hook" 2>/dev/null
+
+# A tab created before tab tokens has no PMUX_TAB_ID (story 36). At a session
+# start, Claude hands this hook a file whose exports reach every later Bash
+# command; ask for the tab's hook-time identity with the pane's own workspace
+# token and the exact pane's session, and write it there. Never verified.
+if [ "$EVENT" = "session-start" ] && [ -z "\${PMUX_TAB_ID:-}" ] && [ -n "\${PMUX_TOKEN:-}" ] \\
+  && [ -n "\${CLAUDE_ENV_FILE:-}" ] && [ -n "\${TMUX_PANE:-}" ]; then
+  PANE_SESSION=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || PANE_SESSION=""
+  if [ -n "$PANE_SESSION" ]; then
+    IDENT=$(curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H "x-pmux-token: \${PMUX_TOKEN}" \\
+      -d "{\\"session\\":\\"\${PANE_SESSION}\\"}" "http://localhost:\${PORT}/api/cli/tab-identity" 2>/dev/null)
+    ID_TAB=$(printf '%s' "$IDENT" | sed -n 's/.*"tabId"[[:space:]]*:[[:space:]]*"\\([A-Za-z0-9_-]*\\)".*/\\1/p')
+    ID_WS=$(printf '%s' "$IDENT" | sed -n 's/.*"workspaceId"[[:space:]]*:[[:space:]]*"\\([A-Za-z0-9_-]*\\)".*/\\1/p')
+    ID_TOKEN=$(printf '%s' "$IDENT" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([0-9a-f]\\{64\\}\\)".*/\\1/p')
+    if [ -n "$ID_TAB" ] && [ -n "$ID_WS" ] && [ -n "$ID_TOKEN" ]; then
+      # Guarded: a session the server recreates carries its own launch identity, which wins
+      # over a stale env file sourced again on resume.
+      printf '[ -n "\${PMUX_TAB_ID:-}" ] || { export PMUX_TAB_ID=%s; export PMUX_WORKSPACE_ID=%s; export PMUX_TAB_TOKEN=%s; }\\n' "$ID_TAB" "$ID_WS" "$ID_TOKEN" >> "$CLAUDE_ENV_FILE"
+    fi
+  fi
+fi
 exit 0
 `;
 

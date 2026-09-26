@@ -132,6 +132,18 @@ describe('purplemux lease — the installed CLI against the real lease routes', 
     expect(JSON.parse(r.stdout)).toMatchObject({ lease: { holder: { workspaceId: 'ws-b', tabId: 'tab-old', verified: false } } });
   });
 
+  it('labels a hook-time holder hook-identity and a session holder unverified (story 36)', async () => {
+    const { mintHookTabToken } = await import('@/lib/tab-token');
+    const hook = await mintHookTabToken({ workspaceId: 'ws-b', tabId: 'tab-old' }, 'pt-ws-b-pane-1-tab-old');
+    if (!hook.ok) throw new Error(hook.reason);
+    const acquired = await cli(['acquire', 'merge:x/hook', '--note', 'h'], { PMUX_PORT: tabA.PMUX_PORT, PMUX_TAB_TOKEN: hook.token });
+    expect(JSON.parse(acquired.stdout)).toMatchObject({ lease: { holder: { tabId: 'tab-old', verified: false, identity: 'hook' } } });
+    await cli(['acquire', 'merge:x/sess'], legacyB);
+    const text = (await cli(['list'], tabA)).stdout;
+    expect(text).toMatch(/^merge:x\/hook {2}holder=ws-b \(Beta\) \/ tab-old.* hook-identity {2}/m);
+    expect(text).toMatch(/^merge:x\/sess {2}holder=ws-b \(Beta\) \/ tab-old.* unverified {2}/m);
+  });
+
   it('release: 0 for the holder, 3 for another tab, 7 when nobody holds it', async () => {
     await cli(['acquire', 'merge:x/y'], tabA);
     expect((await cli(['release', 'merge:x/y'], tabB)).code).toBe(3);
