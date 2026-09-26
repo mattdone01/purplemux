@@ -44,7 +44,7 @@ describe('inbox templates (ADR-0012)', () => {
 
   it.each([
     ['reminder', '[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z is still unacked — purplemux note show n-AbC123, then purplemux note ack n-AbC123'],
-    ['unacked', '[purplemux note n-AbC123] you sent it at 2026-09-26T06:00:00Z; it is unacked 60 min after delivery — purplemux note show n-AbC123'],
+    ['unacked', '[purplemux note n-AbC123] you sent it at 2026-09-26T06:00:00Z; it is still unacked after 60 min — purplemux note show n-AbC123'],
     ['expired', '[purplemux note n-AbC123] you sent it at 2026-09-26T06:00:00Z; it expired unacked — purplemux note show n-AbC123'],
   ] as const)('renders the fixed note %s line (ADR-0013)', (event, line) => {
     expect(renderInboxLine('note', { ...VALID.note, event }).line).toBe(line);

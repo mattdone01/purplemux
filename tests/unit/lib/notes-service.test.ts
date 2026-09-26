@@ -139,30 +139,152 @@ describe('notes (ADR-0013)', () => {
     await expectCode(svc.send(B, { toWorkspace: 'ws-404', subject: 's', body: 'b' }), 'note-target-missing');
   });
 
-  it('reminds the recipient once at 30 min after the line reached it, notifies the sender once at 60 min, then stops', async () => {
+  it('reminds the recipient once, 30 min after the line reached its composer, then never again', async () => {
     const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
-    await svc.tick();
-    expect(f.sent).toHaveLength(1);
     // The line waits in the inbox (the owner is busy): no reminder clock yet.
     f.now += 40 * MIN;
     await svc.tick();
-    expect(f.sent).toHaveLength(1);
+    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(0);
     const reached = f.now;
     f.deliverInbox(f.note(id).inboxItemId!, reached);
     f.now = reached + NOTE_REMIND_MS - 1;
     await svc.tick();
-    expect(f.sent).toHaveLength(1);
+    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(0);
     f.now = reached + NOTE_REMIND_MS;
     await svc.tick();
-    expect(f.sent.map((s) => [s.targetTabId, s.fields.event])).toEqual([['tab-a', 'delivered'], ['tab-a', 'reminder']]);
-    f.now = reached + NOTE_SENDER_NOTICE_MS;
-    await svc.tick();
-    expect(f.sent.at(-1)).toMatchObject({ targetWorkspaceId: 'ws-2', targetTabId: 'tab-b', fields: { event: 'unacked' } });
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       f.now += 30 * MIN;
       await svc.tick();
     }
-    expect(f.sent).toHaveLength(3);
+    expect(f.sent.filter((s) => s.fields.event === 'reminder').map((s) => s.targetTabId)).toEqual(['tab-a']);
+  });
+
+  it('tells the sender once, 60 min after routing, even while the recipient never reads the line', async () => {
+    await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.now = T0 + NOTE_SENDER_NOTICE_MS - 1;
+    await svc.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'unacked')).toHaveLength(0);
+    f.now = T0 + NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    f.now += 5 * NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    const unacked = f.sent.filter((s) => s.fields.event === 'unacked');
+    expect(unacked).toHaveLength(1);
+    expect(unacked[0]).toMatchObject({ targetWorkspaceId: 'ws-2', targetTabId: 'tab-b' });
+    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(0);
+  });
+
+  it('a delivered line the inbox pruned after 7 days is not a drop: no second delivery, no restarted clocks', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.now += NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    const before = f.sent.length;
+    f.inbox.delete(f.note(id).inboxItemId!); // the inbox retention sweep
+    f.epics.set('ddh', { workspaceId: 'ws-3', tabId: 'tab-c' });
+    for (let i = 0; i < 6; i++) {
+      f.now += 30 * MIN;
+      await svc.tick();
+    }
+    expect(f.sent).toHaveLength(before);
+    expect(f.note(id)).toMatchObject({ state: 'delivered', deliveredTo: { tabId: 'tab-a' } });
+  });
+
+  it('an item that vanished before its line was delivered does re-route', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.inbox.delete(f.note(id).inboxItemId!);
+    await svc.tick();
+    expect(f.sent.map((s) => s.fields.event)).toEqual(['delivered', 'delivered']);
+  });
+
+  it('does not remind a recipient tab that has closed', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.live.delete('ws-1/tab-a');
+    f.now += NOTE_REMIND_MS;
+    await svc.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(0);
+    expect(f.note(id).remindedAt).not.toBeNull();
+  });
+
+  it('keeps a sent reminder when the sender notice of the same pass fails, and never repeats it', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!, T0);
+    const deps = f.deps();
+    let broken = true;
+    const flaky = new NotesService({
+      ...deps,
+      tabLive: async (ws, tab) => {
+        if (broken && ws === 'ws-2') throw new Error('workspaces.json unreadable');
+        return deps.tabLive(ws, tab);
+      },
+    });
+    f.now = T0 + NOTE_SENDER_NOTICE_MS;
+    await flaky.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(1);
+    expect(f.note(id).remindedAt).not.toBeNull();
+    broken = false;
+    await flaky.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(1);
+    expect(f.sent.filter((s) => s.fields.event === 'unacked')).toHaveLength(1);
+  });
+
+  it('never runs two ticks at once; a tick asked for meanwhile runs once afterwards', async () => {
+    let running = 0;
+    let most = 0;
+    let passes = 0;
+    const deps = f.deps();
+    const slow = new NotesService({
+      ...deps,
+      mutate: async (fn) => {
+        running += 1;
+        most = Math.max(most, running);
+        passes += 1;
+        await new Promise((r) => setTimeout(r, 20));
+        try {
+          return await deps.mutate(fn);
+        } finally {
+          running -= 1;
+        }
+      },
+    });
+    await Promise.all([slow.tick(), slow.tick(), slow.tick('ddh'), slow.tick()]);
+    expect(most).toBe(1);
+    expect(passes).toBe(2);
+  });
+
+  it('caps the open notes of one sender (exit 3), and counts only open ones', async () => {
+    const { NOTE_OPEN_PER_SENDER } = await import('@/lib/notes-store');
+    for (let i = 0; i < NOTE_OPEN_PER_SENDER; i++) await svc.send(B, { toEpic: 'nobody', subject: `s${i}`, body: 'b' });
+    await expectCode(svc.send(B, { toEpic: 'ddh', subject: 'one more', body: 'b' }), 'note-cap');
+    await expect(svc.send(C, { toEpic: 'ddh', subject: 'another sender', body: 'b' })).resolves.toBeTruthy();
+  });
+
+  it('addresses any holdable epic: the lease grammar, dots and underscores included', async () => {
+    f.epics.set('v1.2_rc', { workspaceId: 'ws-1', tabId: 'tab-a' });
+    const note = await svc.send(B, { toEpic: 'v1.2_rc', subject: 's', body: 'b' });
+    expect(note.deliveredTo).toEqual({ workspaceId: 'ws-1', tabId: 'tab-a' });
+    f.epics.set('b5.x', { workspaceId: 'ws-2', tabId: 'tab-b' });
+    await expect(svc.send(B, { toEpic: 'ddh', fromEpic: 'b5.x', subject: 's', body: 'b' })).resolves.toBeTruthy();
+  });
+
+  it('refuses an ack of a note that expired', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.now = T0 + NOTE_EXPIRE_MS;
+    await svc.tick();
+    await expectCode(svc.ack(A, id, null), 'forbidden');
+  });
+
+  it('--to-me is the tab: another tab of the recipient workspace does not see the note as its own', async () => {
+    await svc.send(B, { toEpic: 'ddh', subject: 'for tab-a', body: 'b' });
+    await svc.send(B, { toEpic: 'unowned', subject: 'waiting for an owner', body: 'b' });
+    expect((await svc.list(A, { toMe: true })).map((n) => n.subject)).toEqual(['for tab-a']);
+    expect(await svc.list(caller('ws-1', 'tab-a2'), { toMe: true })).toEqual([]);
+    f.epics.set('unowned', { workspaceId: 'ws-1', tabId: 'tab-a2' });
+    await svc.tick('unowned'); // the lease-acquire hook
+    expect((await svc.list(caller('ws-1', 'tab-a2'), { toMe: true })).map((n) => n.subject)).toEqual(['waiting for an owner']);
+    // A workspace token with no tab reads its workspace.
+    expect((await svc.list(caller('ws-1', null as unknown as string), { toMe: true })).map((n) => n.subject)).toEqual(['for tab-a', 'waiting for an owner']);
   });
 
   it('acks from the recipient with a comment; the open list no longer shows it; other workspaces cannot ack', async () => {

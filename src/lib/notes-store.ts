@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
+import { EPIC_SLUG } from '@/lib/lease-policy';
 import type { INote, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode } from '@/types/note';
 
 // Notes with acknowledgement (ADR-0013). Pure state transitions first, then the
@@ -28,7 +29,8 @@ export const NOTE_EXPIRE_MS = 14 * DAY;
 export const NOTE_PRUNE_MS = 14 * DAY;
 
 export const OPEN_STATES = new Set(['queued', 'delivered', 'undeliverable']);
-const EPIC_SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** Open notes one sender may have at a time (queued, delivered or undeliverable). */
+export const NOTE_OPEN_PER_SENDER = 50;
 const WORKSPACE_ID = /^ws-[A-Za-z0-9_-]{1,32}$/;
 const NOTE_ID = /^n-[A-Za-z0-9_-]{4,32}$/;
 
@@ -63,7 +65,8 @@ export const checkTarget = (toEpic: unknown, toWorkspace: unknown): INoteTarget 
   if ((epic === null) === (workspaceId === null)) {
     throw new NoteError('note-target-missing', 'exactly one of toEpic or toWorkspace is required');
   }
-  if (epic !== null && !isEpicSlug(epic)) throw new NoteError('note-target-missing', `toEpic must be an epic slug ([a-z0-9-], ≤ 64), got ${JSON.stringify(epic)}`);
+  // The lease grammar, so any holdable epic:<slug> is addressable.
+  if (epic !== null && !isEpicSlug(epic)) throw new NoteError('note-target-missing', `toEpic must be an epic slug (${EPIC_SLUG.source}), got ${JSON.stringify(epic)}`);
   if (workspaceId !== null && (typeof workspaceId !== 'string' || !WORKSPACE_ID.test(workspaceId))) {
     throw new NoteError('note-target-missing', `toWorkspace must be a workspace id, got ${JSON.stringify(workspaceId)}`);
   }

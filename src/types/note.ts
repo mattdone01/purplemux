@@ -51,4 +51,4 @@ export interface INotesState {
 /** A note without its body: what `note list` returns. */
 export type INoteView = Omit<INote, 'body'> & { bodyBytes: number };
 
-export type TNoteErrorCode = 'note-not-found' | 'note-too-large' | 'note-target-missing' | 'forbidden' | 'note-invalid';
+export type TNoteErrorCode = 'note-not-found' | 'note-too-large' | 'note-target-missing' | 'forbidden' | 'note-invalid' | 'note-cap';

@@ -10,6 +10,7 @@ const STATUS: Record<string, number> = {
   'note-target-missing': 400,
   'note-invalid': 400,
   forbidden: 403,
+  'note-cap': 409,
 };
 
 /** Every note refusal carries `code`, which the CLI maps to its exit (ADR-0016). */

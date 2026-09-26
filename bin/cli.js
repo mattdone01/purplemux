@@ -124,6 +124,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'note-target-missing': EXIT.USAGE,
   'note-invalid': EXIT.USAGE,
   'lease-held': EXIT.CONFLICT,
+  'note-cap': EXIT.CONFLICT,
   'lease-held-by-other': EXIT.CONFLICT,
   'watch-cap': EXIT.CONFLICT,
   forbidden: EXIT.CONFLICT,

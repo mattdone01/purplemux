@@ -87,7 +87,7 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
     const line = {
       delivered: `[purplemux note ${id}] from ${from} at ${at} — ${read}, then purplemux note ack ${id}`,
       reminder: `[purplemux note ${id}] from ${from} at ${at} is still unacked — ${read}, then purplemux note ack ${id}`,
-      unacked: `[purplemux note ${id}] you sent it at ${at}; it is unacked 60 min after delivery — ${read}`,
+      unacked: `[purplemux note ${id}] you sent it at ${at}; it is still unacked after 60 min — ${read}`,
       expired: `[purplemux note ${id}] you sent it at ${at}; it expired unacked — ${read}`,
     }[event];
     return { recordId: id, line };
