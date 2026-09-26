@@ -783,6 +783,25 @@ const cmdWatch = async (args) => {
   }
 };
 
+// Portfolio drive grants (ADR-0014): read-only here. A grant is created and revoked only in the
+// web UI (a human session plus the purplemux password); no CLI token can do either.
+const cmdGrant = async (args) => {
+  if (args[0] !== 'list') die('usage: grant list [--json] (grants are created and revoked in the web UI only)');
+  requireEnv();
+  const { body } = await api('GET', '/api/cli/grants');
+  if (args.includes('--json')) return out(body);
+  const now = Date.now();
+  const grants = Array.isArray(body.grants) ? body.grants : [];
+  if (!grants.length) {
+    process.stdout.write('no grants\n');
+    return;
+  }
+  for (const g of grants) {
+    const state = g.revokedAt !== null ? `ended (${g.revokeReason})` : g.expiresAt <= now ? 'expired' : `active until ${new Date(g.expiresAt).toISOString()}`;
+    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} drives ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
+  }
+};
+
 // The inbox (ADR-0012): server notices queued for this workspace's tabs.
 const cmdInbox = async (args) => {
   requireEnv();
@@ -1449,6 +1468,8 @@ Commands:
                                            A stale --expect-version exits 3 config-version-conflict
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
+  grant list [--json]                      Portfolio drive grants you hold or are driven under (read-only; a human
+                                           creates and revokes them in the web UI with the purplemux password)
   deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json]
                                            Tell every enabled orchestrator and tab-bound lease holder that purplemux
                                            restarts in 1-60 min (admin token or the deploy:purplemux holder; else
@@ -1530,6 +1551,8 @@ const main = async () => {
       return cmdInbox(args.slice(1));
     case 'note':
       return cmdNote(args.slice(1));
+    case 'grant':
+      return cmdGrant(args.slice(1));
     case 'config':
       return cmdConfig(args.slice(1));
     case 'deploy':

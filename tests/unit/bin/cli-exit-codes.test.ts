@@ -179,6 +179,24 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     expect(both.stderr).toContain('exclusive');
   });
 
+  it('grant list is read-only: one line per grant, --json passes the body, and nothing creates a grant', async () => {
+    const future = Date.now() + 3_600_000;
+    reply = json(200, { grants: [
+      { id: 'g-aaaa1', grantee: { workspaceId: 'ws-1', tabId: 'tab-a' }, workspaces: ['ws-2'], reason: 'portfolio', expiresAt: future, revokedAt: null, revokeReason: null },
+      { id: 'g-bbbb2', grantee: { workspaceId: 'ws-1', tabId: 'tab-b' }, workspaces: ['ws-3'], reason: 'old', expiresAt: future, revokedAt: 1, revokeReason: 'grantee-tab-closed' },
+    ] });
+    requests.length = 0;
+    const listed = await cli(['grant', 'list']);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toMatch(/^g-aaaa1 {2}ws-1\/tab-a drives ws-2 {2}active until .+ {2}"portfolio"$/m);
+    expect(listed.stdout).toMatch(/^g-bbbb2 .* ended \(grantee-tab-closed\)/m);
+    expect(requests.map((r) => `${r.method} ${r.url}`)).toEqual(['GET /api/cli/grants']);
+    expect(JSON.parse((await cli(['grant', 'list', '--json'])).stdout).grants).toHaveLength(2);
+    const create = await cli(['grant', 'create', '--tab', 'x']);
+    expect(create.code).toBe(2);
+    expect(create.stderr).toContain('web UI only');
+  });
+
   it('exits 1 for a success that is not JSON: another server holds the port', async () => {
     reply = (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });

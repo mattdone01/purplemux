@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { canDriveWorkspace } from '@/lib/cli-utils';
+import { isOwnWorkspace } from '@/lib/cli-utils';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
 import { resolveMissionTargetIdentity } from '@/lib/mission-control-runtime';
@@ -23,7 +23,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (!workspaceId) throw new MissionControlError(400, 'invalid-request', 'workspaceId is required');
     const scope = resolveCliScope(req);
     if (!scope) throw new MissionControlError(401, 'unauthorized', 'CLI token required');
-    if (!canDriveWorkspace(scope, workspaceId)) {
+    // Own workspace only: a portfolio grant never lets a tab write another workspace's MC events (ADR-0014).
+    if (!isOwnWorkspace(scope, workspaceId)) {
       throw new MissionControlError(403, 'forbidden', 'Mission Control writes require this workspace token');
     }
     const body = req.body as { events?: unknown } | null;

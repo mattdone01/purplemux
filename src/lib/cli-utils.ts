@@ -6,6 +6,8 @@ import { resolveCliScope, type TCliScope } from '@/lib/workspace-token';
 import { getBrowserBridge, type IBrowserBridgeClient } from '@/lib/browser-bridge-client';
 import type { ITab } from '@/types/terminal';
 import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
+import { findActiveDriveGrant, grantsSnapshot } from '@/lib/grant-store';
+import type { IGrant } from '@/types/grant';
 
 export interface ITabLocation {
   workspaceId: string;
@@ -22,9 +24,25 @@ export interface ITabLocation {
 export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string): Promise<boolean> => {
   if (scope.type === 'admin') return true;
   if (scope.workspaceId === workspaceId) return true;
+  // A tab that may drive a workspace under a grant may also read it (ADR-0014).
+  if (grantFor(scope, workspaceId)) return true;
   const target = await getWorkspaceById(workspaceId);
   return target?.allowedPeers?.includes(scope.workspaceId) ?? false;
 };
+
+/**
+ * The active human grant that lets this caller drive `workspaceId` (ADR-0014):
+ * only a VERIFIED tab (a launch-bound tab token), only over the named
+ * workspaces, only until it expires, is revoked or its tab closes.
+ */
+const grantFor = (scope: TCliScope, workspaceId: string, now = Date.now()): IGrant | null =>
+  scope.type === 'workspace' && scope.tabVerified === true && scope.tabId
+    ? findActiveDriveGrant(grantsSnapshot(), { workspaceId: scope.workspaceId, tabId: scope.tabId }, workspaceId, now)
+    : null;
+
+/** The caller lives in `workspaceId` (no grant counts): Mission Control's producer events (ADR-0014). */
+export const isOwnWorkspace = (scope: TCliScope, workspaceId: string): boolean =>
+  scope.type === 'workspace' && scope.workspaceId === workspaceId;
 
 /**
  * Whether `scope` may INJECT INPUT into a tab of `workspaceId`. A strictly
@@ -49,7 +67,14 @@ export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string):
  * `PMUX_TOKEN` and therefore stays confined.
  */
 export const canDriveWorkspace = (scope: TCliScope, workspaceId: string): boolean =>
-  scope.type === 'workspace' && scope.workspaceId === workspaceId;
+  driveDecision(scope, workspaceId).ok;
+
+/** The drive answer and, when a grant was what allowed it, that grant (for the per-use audit). */
+export const driveDecision = (scope: TCliScope, workspaceId: string, now = Date.now()): { ok: boolean; grant: IGrant | null } => {
+  if (isOwnWorkspace(scope, workspaceId)) return { ok: true, grant: null };
+  const grant = grantFor(scope, workspaceId, now);
+  return grant ? { ok: true, grant } : { ok: false, grant: null };
+};
 
 /**
  * Resolve the caller and confirm it may act on `workspaceId`, writing the
@@ -97,7 +122,22 @@ export const authorizeWorkspaceInput = async (
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
   }
-  if (!canDriveWorkspace(scope, workspaceId)) {
+  const decision = driveDecision(scope, workspaceId);
+  if (decision.ok && decision.grant) {
+    const tabId = typeof req.query.tabId === 'string' ? req.query.tabId : null;
+    const { auditGrantUse } = await import('@/lib/grant-service');
+    await auditGrantUse(decision.grant, { route: (req.url ?? '').split('?')[0], targetWorkspaceId: workspaceId, targetTabId: tabId });
+  }
+  if (!decision.ok) {
+    const unverified = await unverifiedGrantHolder(req, scope, workspaceId);
+    if (unverified) {
+      res.status(403).json({
+        error: `Grant ${unverified.grantId} lets tab ${unverified.tabId} drive ${workspaceId}, but this call is not from its launch identity `
+          + `(identity: ${unverified.identity}). A grant needs a tab created after per-tab tokens: recreate the tab.`,
+        code: 'grant-tab-unverified',
+      });
+      return null;
+    }
     res.status(403).json({
       error:
         `Sending input to a tab in ${workspaceId} requires that workspace's own token (caller is ${
@@ -109,6 +149,30 @@ export const authorizeWorkspaceInput = async (
     return null;
   }
   return scope;
+};
+
+/**
+ * A caller that holds a grant but not a launch identity (a hook-time token, or
+ * the session fallback of a tab created before per-tab tokens): its denial
+ * names the grant and the fix (story 11 AC), not only "forbidden".
+ */
+const unverifiedGrantHolder = async (
+  req: NextApiRequest,
+  scope: TCliScope,
+  workspaceId: string,
+): Promise<{ grantId: string; tabId: string; identity: string } | null> => {
+  if (scope.type !== 'workspace' || scope.tabVerified === true) return null;
+  let tabId = scope.tabId ?? null;
+  let identity = scope.tabIdentity ?? 'none';
+  if (!tabId) {
+    const { resolveCaller } = await import('@/lib/caller');
+    const caller = await resolveCaller(req).catch(() => null);
+    tabId = caller?.tabId ?? null;
+    identity = caller?.identity ?? 'none';
+  }
+  if (!tabId) return null;
+  const grant = findActiveDriveGrant(grantsSnapshot(), { workspaceId: scope.workspaceId, tabId }, workspaceId, Date.now());
+  return grant ? { grantId: grant.id, tabId, identity } : null;
 };
 
 export const findTab = async (

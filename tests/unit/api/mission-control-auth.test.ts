@@ -26,6 +26,8 @@ vi.mock('@/lib/mission-control-runtime', () => runtime);
 vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: scope.resolveCliScope }));
 vi.mock('@/lib/cli-utils', () => ({
   canDriveWorkspace: scope.canDriveWorkspace,
+  // Producer events check own-workspace (ADR-0014: a drive grant never counts); same answers here.
+  isOwnWorkspace: scope.canDriveWorkspace,
   canAccessWorkspace: scope.canAccessWorkspace,
 }));
 vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: workspace.getWorkspaceById }));
