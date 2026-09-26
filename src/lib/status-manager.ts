@@ -719,7 +719,12 @@ export class StatusManager {
     // act on (a red gate in a TDD loop): it escalates through its own turn-end marker (ADR-0018) to a
     // live agent that also gets its `stuck` nudge if it hangs. Paging the human for each one would bury
     // the page that matters (story 34, consult ruling A) — but only when the tab can carry it on.
-    if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered && await this.carriesSelfFailure(src.tabId, entry)) return;
+    if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered && await this.carriesSelfFailure(src.tabId, entry)) {
+      // The wake starts a new episode: re-arm the once-per-wait stuck nudge, which this skip relies
+      // on if the woken tab hangs (story 34 CONFIRM).
+      this.stuckNudgedTabs.delete(src.tabId);
+      return;
+    }
 
     // Registering a probe or pid is an explicit opt-in to being watched, so a firing reaches the human
     // too (push), regardless of alert policy — an escalation that only lands in a log is not an
