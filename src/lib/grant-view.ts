@@ -97,8 +97,17 @@ export const withoutKey = <T>(record: Record<string, T>, key: string): Record<st
 /**
  * The one error line of the grants dialog: the create refusal first, then every
  * grant's own revoke refusal (a later revoke never wipes another's), then the
- * read failure.
+ * read failure. A refusal for a grant no longer listed (ended elsewhere) is
+ * dropped; with no list (`liveGrantIds` null) every refusal stays.
  */
-export const grantDialogError = (submitError: string | null, revokeErrors: Record<string, string>, readError: string | null): string | null =>
-  submitError ?? (Object.values(revokeErrors).join(' · ') || null) ?? readError;
+export const grantDialogError = (
+  submitError: string | null,
+  revokeErrors: Record<string, string>,
+  readError: string | null,
+  liveGrantIds: string[] | null = null,
+): string | null => {
+  const live = liveGrantIds ? new Set(liveGrantIds) : null;
+  const revokes = Object.entries(revokeErrors).filter(([id]) => !live || live.has(id)).map(([, text]) => text);
+  return submitError ?? (revokes.join(' · ') || null) ?? readError;
+};
 

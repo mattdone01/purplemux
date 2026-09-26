@@ -99,7 +99,7 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
           onReasonChange={setReason}
           password={password}
           onPasswordChange={setPassword}
-          error={grantDialogError(error, revokeErrors, readError)}
+          error={grantDialogError(error, revokeErrors, readError, view ? view.grants.map((g) => g.id) : null)}
           submitting={submitting}
           revokingIds={revokingIds}
           onSubmit={submit}

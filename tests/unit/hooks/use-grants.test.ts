@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { GRANTS_POLL_MS, GRANTS_SWR_OPTIONS, grantsFetcher, grantsHookState, serverTimeOf } from '@/hooks/use-grants';
+import { flatGrantsRetry, GRANTS_POLL_MS, GRANTS_SWR_OPTIONS, grantsFetcher, grantsHookState, serverTimeOf } from '@/hooks/use-grants';
 import { fetchGrantsView, GrantsReadError, type IGrantsView } from '@/lib/grants-client';
 import { grantBadgeOf, grantDialogError, withoutKey } from '@/lib/grant-view';
 import type { IGrant } from '@/types/grant';
@@ -84,23 +84,38 @@ describe('grants on the server clock', () => {
 describe('the SWR roles', () => {
   it('only the poller refreshes; the badges read the cache and never request', () => {
     expect(GRANTS_SWR_OPTIONS.poller.refreshInterval).toBe(GRANTS_POLL_MS);
-    expect(GRANTS_SWR_OPTIONS.reader).toMatchObject({ refreshInterval: 0, revalidateOnMount: false, revalidateIfStale: false, revalidateOnFocus: false, shouldRetryOnError: false });
+    expect(GRANTS_SWR_OPTIONS.reader).toMatchObject({ refreshInterval: 0, revalidateOnMount: false, revalidateIfStale: false, revalidateOnFocus: false });
     expect(GRANTS_SWR_OPTIONS.fresh).toMatchObject({ refreshInterval: 0, revalidateOnFocus: false });
   });
 
-  it('the poller retries a failed read every 30 s, flat (SWR pauses its interval while the cache holds an error)', () => {
+  it('every role retries a failed read every 30 s, flat (SWR runs the retry on the first subscriber, whatever its role)', () => {
     vi.useFakeTimers();
     try {
+      for (const role of ['poller', 'reader', 'fresh'] as const) {
+        expect(GRANTS_SWR_OPTIONS[role].onErrorRetry).toBe(flatGrantsRetry);
+        expect(GRANTS_SWR_OPTIONS[role].shouldRetryOnError).not.toBe(false);
+      }
       const revalidate = vi.fn(async () => true);
-      const retry = GRANTS_SWR_OPTIONS.poller.onErrorRetry!;
       for (const retryCount of [1, 5, 9]) {
-        retry(new Error('x'), '/api/grants', {} as never, revalidate, { retryCount, dedupe: false });
+        flatGrantsRetry(new Error('x'), '/api/grants', {} as never, revalidate, { retryCount, dedupe: false });
         vi.advanceTimersByTime(GRANTS_POLL_MS - 1);
         expect(revalidate).not.toHaveBeenCalled();
         vi.advanceTimersByTime(1);
         expect(revalidate).toHaveBeenCalledWith({ retryCount, dedupe: false });
         revalidate.mockClear();
       }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('failures during an outage share one pending retry (focus reads do not pile up chains)', () => {
+    vi.useFakeTimers();
+    try {
+      const revalidate = vi.fn(async () => true);
+      for (let i = 0; i < 4; i++) flatGrantsRetry(new Error('x'), '/api/grants', {} as never, revalidate, { retryCount: 1, dedupe: false });
+      vi.advanceTimersByTime(GRANTS_POLL_MS);
+      expect(revalidate).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -119,5 +134,10 @@ describe('grant dialog errors', () => {
     expect(grantDialogError('bad password', { 'g-1': 'x' }, 'stale')).toBe('bad password');
     expect(grantDialogError(null, { 'g-1': 'x', 'g-2': 'y' }, 'stale')).toBe('x · y');
     expect(grantDialogError(null, {}, 'stale')).toBe('stale');
+  });
+
+  it('drops a refusal for a grant no longer listed; keeps all when the list is unknown', () => {
+    expect(grantDialogError(null, { 'g-1': 'x', 'g-2': 'y' }, null, ['g-2'])).toBe('y');
+    expect(grantDialogError(null, { 'g-1': 'x' }, null, null)).toBe('x');
   });
 });

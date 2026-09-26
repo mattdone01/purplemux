@@ -17,21 +17,30 @@ export type TGrantsRole = 'poller' | 'reader' | 'fresh';
 
 export const GRANTS_POLL_MS = 30_000;
 
+// One pending retry for the key: each failed focus or reconnect read would otherwise start its own 30 s chain (review r3).
+let pendingRetry: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * A flat 30 s retry. SWR skips its interval while the cache holds an error and
+ * backs off retries for up to ~32 min, so the poll cadence would stop through an
+ * outage (review r2). SWR runs the retry on the key's FIRST subscriber, which may
+ * be any role, so every role carries it (review r3).
+ */
+export const flatGrantsRetry: NonNullable<SWRConfiguration<IGrantsView>['onErrorRetry']> = (_error, _key, _config, revalidate, revalidateOptions) => {
+  if (pendingRetry) return;
+  pendingRetry = setTimeout(() => {
+    pendingRetry = null;
+    void revalidate(revalidateOptions);
+  }, GRANTS_POLL_MS);
+};
+
 export const GRANTS_SWR_OPTIONS: Record<TGrantsRole, SWRConfiguration<IGrantsView>> = {
-  // The one owner of the refresh. SWR skips its interval while the cache holds an
-  // error and backs off retries for up to ~32 min; a flat retry keeps the 30 s
-  // cadence through an outage (review r2).
-  poller: {
-    refreshInterval: GRANTS_POLL_MS,
-    revalidateOnFocus: true,
-    onErrorRetry: (_error, _key, _config, revalidate, revalidateOptions) => {
-      setTimeout(() => void revalidate(revalidateOptions), GRANTS_POLL_MS);
-    },
-  },
+  // The one owner of the refresh.
+  poller: { refreshInterval: GRANTS_POLL_MS, revalidateOnFocus: true, onErrorRetry: flatGrantsRetry },
   // Tab badges: the cache only, no request of their own.
-  reader: { refreshInterval: 0, revalidateOnMount: false, revalidateIfStale: false, revalidateOnFocus: false, shouldRetryOnError: false },
+  reader: { refreshInterval: 0, revalidateOnMount: false, revalidateIfStale: false, revalidateOnFocus: false, onErrorRetry: flatGrantsRetry },
   // The dialog: one fresh read when it opens.
-  fresh: { refreshInterval: 0, revalidateOnFocus: false },
+  fresh: { refreshInterval: 0, revalidateOnFocus: false, onErrorRetry: flatGrantsRetry },
 };
 
 export interface IGrantsHookState {
