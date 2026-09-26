@@ -279,9 +279,19 @@ Three rules are specific to grok and are deliberate:
 purplemux registers no blocking `Stop` gate, so grok's `Stop` fire is a genuine turn end rather than
 a continuation round.
 
-Codex's TUI-ready detector (`checkCodexTuiReady`) is **not** applied to grok. Whether grok needs the
-same synthetic `session-start` has not been measured on a live tab, and copying it blind would put a
-tab into `idle` on a signal that may not mean the same thing.
+Codex's TUI-ready detector (`checkCodexTuiReady`) is **not** applied to grok. grok and Claude share a
+narrower fallback instead (story 17, L8): a `claude-code` or `grok-cli` tab that stays `inactive` for
+more than 8 s (`READINESS_PROBE_AFTER_MS`) while its agent process runs gets one pane capture per
+poll. If the pane shows an empty composer and no option list (`paneShowsEmptyComposer`, the check
+the inbox runs, with the dim prompt suggestion removed), the poll fires a synthetic `session-start`
+and logs `readiness: pane-probe`. A trust prompt (`❯ No, exit`) and the first-run picker
+(`❯ 2. Dark mode`) carry the marker on a non-empty line, so they stay `inactive`; both are real
+fixtures under `tests/fixtures/panes/`. grok's composer marker (`[›❯>]`) is not measured on a live
+pane: no grok tab was running when the fixtures were captured.
+
+A session id the poll detects (`detectActiveSession`) is persisted to the layout when no hook bound
+one, so `tab status` and `tab list` show it after a restart. The poll may move a binding it wrote
+itself (a `/clear` with no hooks), never one a hook or a launch set.
 
 ### Agent Tab Hooks (Reference)
 

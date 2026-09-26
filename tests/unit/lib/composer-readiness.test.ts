@@ -1,5 +1,7 @@
+import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
-import { checkComposerReady } from '@/lib/composer-readiness';
+import { checkComposerReady, paneShowsEmptyComposer } from '@/lib/composer-readiness';
 import type { TCliState } from '@/types/timeline';
 
 const EMPTY = 'done\n────────\n❯ \n────────\n';
@@ -51,5 +53,32 @@ describe('checkComposerReady (ADR-0008, ADR-0012)', () => {
       capture: async () => { throw new Error('tmux gone'); },
     });
     expect(result).toEqual({ ok: false, reason: 'composer-unreadable' });
+  });
+});
+
+// Real captures (`capture-pane -p -e`), 2026-09-26: tests/fixtures/panes.
+const pane = (name: string) => fs.readFileSync(path.join(__dirname, '../../fixtures/panes', name), 'utf-8');
+
+describe('suggestion-aware readiness (story 17, L7)', () => {
+  it('accepts an idle tab whose composer shows only a dim suggestion (8 of 12 idle claude tabs measured)', async () => {
+    expect(await check('idle', { pane: pane('claude-dim-suggestion.ansi') }).result).toEqual({ ok: true });
+    expect(await check('ready-for-review', { pane: pane('claude-dim-suggestion-footer.ansi') }).result).toEqual({ ok: true });
+  });
+
+  it('still refuses text typed on the composer, escapes or not', async () => {
+    expect(await check('idle', { pane: 'x\n\x1b[39m❯\u00a0typed by the owner\x1b[0m\n' }).result).toEqual({ ok: false, reason: 'composer-not-empty' });
+  });
+
+  it.each([
+    ['an empty composer', 'claude-empty-composer.ansi', true],
+    ['a dim suggestion', 'claude-dim-suggestion.ansi', true],
+    ['a trust prompt (❯ No, exit)', 'claude-trust-prompt.ansi', false],
+    ['the first-run theme picker (❯ 2. Dark mode)', 'claude-onboarding-theme.ansi', false],
+  ])('paneShowsEmptyComposer: %s → %s', (_label, name, ready) => {
+    expect(paneShowsEmptyComposer('claude-code', pane(name))).toBe(ready);
+  });
+
+  it('paneShowsEmptyComposer knows no composer for a terminal', () => {
+    expect(paneShowsEmptyComposer('terminal', pane('claude-empty-composer.ansi'))).toBe(false);
   });
 });

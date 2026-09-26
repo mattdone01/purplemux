@@ -636,11 +636,30 @@ export const isContentPendingInComposer = async (
   return isPaneShowingPendingContent(pane, content);
 };
 
-export const capturePaneContent = async (sessionName: string): Promise<string | null> => {
+export interface ICaptureOptions {
+  /** Keep the SGR escapes (`-e`), so a reader can tell dim suggestion text from typed text. */
+  escapes?: boolean;
+}
+
+export const capturePaneContent = async (sessionName: string, opts: ICaptureOptions = {}): Promise<string | null> => {
   try {
     const { stdout } = await execFile(
       'tmux',
-      ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-t', sessionName],
+      ['-L', TMUX_SOCKET, 'capture-pane', '-p', ...(opts.escapes ? ['-e'] : []), '-t', sessionName],
+      { timeout: CMD_TIMEOUT },
+    );
+    return stdout;
+  } catch {
+    return null;
+  }
+};
+
+/** The visible pane with its SGR escapes (`-e`) and wrapped lines joined (`-J`). */
+export const capturePaneContentAnsi = async (sessionName: string): Promise<string | null> => {
+  try {
+    const { stdout } = await execFile(
+      'tmux',
+      ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-e', '-J', '-t', sessionName],
       { timeout: CMD_TIMEOUT },
     );
     return stdout;
@@ -652,11 +671,12 @@ export const capturePaneContent = async (sessionName: string): Promise<string | 
 export const capturePaneContentWithHistory = async (
   sessionName: string,
   historyLines: number,
+  opts: ICaptureOptions = {},
 ): Promise<string | null> => {
   try {
     const { stdout } = await execFile(
       'tmux',
-      ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-S', `-${historyLines}`, '-t', sessionName],
+      ['-L', TMUX_SOCKET, 'capture-pane', '-p', ...(opts.escapes ? ['-e'] : []), '-S', `-${historyLines}`, '-t', sessionName],
       { timeout: CMD_TIMEOUT },
     );
     return stdout;

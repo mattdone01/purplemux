@@ -806,13 +806,17 @@ const cmdTabStatus = async (args) => {
 
 const cmdTabResult = async (args) => {
   requireEnv();
-  const rest = stripFlags(args, ['--workspace', '-w']);
+  const raw = args.includes('--raw');
+  const noSuggestions = args.includes('--no-suggestions');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--raw', '--no-suggestions']);
   const tabId = rest[0];
   if (!tabId) die('tab ID is required');
+  if (raw && noSuggestions) die('--raw and --no-suggestions are exclusive');
   const wsId = resolveWsForTab(args);
+  const mode = raw ? '&raw=1' : noSuggestions ? '&suggestions=0' : '';
   const { body } = await api(
     'GET',
-    `/api/cli/tabs/${tabId}/result?workspaceId=${encodeURIComponent(wsId)}`,
+    `/api/cli/tabs/${tabId}/result?workspaceId=${encodeURIComponent(wsId)}${mode}`,
   );
   out(body);
 };
@@ -1062,7 +1066,9 @@ Commands:
                                            the tab is gone: never retry it, and never loop on it.
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status (includes registered probes + background jobs)
-  tab result -w WS TAB_ID                  Capture tab pane content
+  tab result -w WS TAB_ID                  Capture tab pane content. Dim text the agent shows on its composer line
+             [--no-suggestions | --raw]    (a suggestion, never typed) reads "[suggestion] <text>" and is also in
+                                           "suggestion"; --no-suggestions drops it; --raw keeps every escape
   tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs

@@ -197,9 +197,11 @@ GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   so an idle tab that is HOLDING dead background work is distinguishable from an idle
   tab that is done.
 
-GET /api/cli/tabs/<tabId>/result?workspaceId=WS
-  Capture the current pane content.
-  Response: { "content": "..." }
+GET /api/cli/tabs/<tabId>/result?workspaceId=WS[&suggestions=0 | &raw=1]
+  Capture the current pane content (escapes stripped). On the agent's composer line and below,
+  text the agent renders DIM — a prompt suggestion, never typed by anyone — reads
+  "[suggestion] <text>". suggestions=0 drops it; raw=1 returns the escapes untouched.
+  Response: { "content": "...", "suggestion": "<the composer suggestion>" | null }
 
 ## Liveness watch
 

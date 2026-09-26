@@ -235,7 +235,7 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
     status: (tabId) => getStatusManager().getAllForClient()[tabId],
     waitingAtPrompt: (tabId) => getStatusManager().isWaitingAtPrompt(tabId),
     halted: (tabId) => getStatusManager().isHaltedByUsageLimit(tabId),
-    capture: (sessionName) => capturePaneAtWidth(sessionName, 120, 50),
+    capture: (sessionName) => capturePaneAtWidth(sessionName, 120, 50, { escapes: true }),
     withDispatchLock: (workspaceId, tab, work) => withAgentDispatchLock(workspaceId, tab, work),
     deliver: deliverPrompt,
     isPending: isContentPendingInComposer,

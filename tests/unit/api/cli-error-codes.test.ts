@@ -30,6 +30,7 @@ const layout = vi.hoisted(() => ({
 
 vi.mock('@/lib/cli-utils', () => cliUtils);
 vi.mock('@/lib/tmux', () => tmux);
+vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ getAllForClient: () => ({}) }) }));
 vi.mock('@/lib/agent-steer', () => steer);
 vi.mock('@/lib/layout-store', () => layout);
 vi.mock('@/lib/agent-dispatch-policy', () => ({
