@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Wave-1 and wave-2 acceptance checks against an ISOLATED purplemux instance (stories 07 and 22;
-// ADR-0017 amendment).
+// Wave-1, wave-2 and wave-3 acceptance checks against an ISOLATED purplemux instance (stories 07, 22
+// and 23; ADR-0017 amendment). The wave-3 checks (deploy announce, harness watches, self-notified
+// failures, refusal codes) live in checks-wave3.cjs and run after wave 2.
 //
 //   checks.cjs --state <state.json> [--bash-guard <bash-guard.py>] [--require-bash-guard]
 //
@@ -37,6 +38,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { wave3 } = require('./checks-wave3.cjs');
 
 const POLL_MS = 200;
 
@@ -831,7 +833,11 @@ const main = async (argv) => {
     return 2;
   }
   const inst = new Instance(state);
-  const results = [...(await wave1(inst, opts)), ...(await wave2(inst))];
+  const results = [
+    ...(await wave1(inst, opts)),
+    ...(await wave2(inst)),
+    ...(await wave3(inst, { parseJson, within, sleep, brief, shellQuote })),
+  ];
   const { lines, pass } = summarize(results, opts);
   process.stdout.write(`${lines.join('\n')}\n`);
   return pass ? 0 : 1;
