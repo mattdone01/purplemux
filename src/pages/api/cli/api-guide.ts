@@ -258,6 +258,30 @@ DELETE /api/cli/tabs/<tabId>/bg?workspaceId=WS[&pid=N]
   Stop watching (all for the tab, or one pid).
   Response: { "removed": n }
 
+## Inbox (ADR-0012)
+
+Server-originated notices — notes, watch firings, deploy announcements, Mission Control
+answers, API-error resumes — reach an agent's composer only through the inbox. Each is one
+line rendered from a fixed per-kind template: "[purplemux <kind> <id>] <ids, times, counts>
+— <pull command>". No caller text is ever typed; read subjects with the pull command.
+Delivery waits for an agent at its prompt (idle, ready-for-review, or WAITING per ADR-0018)
+with an empty composer and no prompt or option list on screen. A refusal backs off
+10 s → 30 s → 2 min → 5 min; a tab that becomes ready is tried on the next 2 s tick. After
+30 refusals or 24 h the item is "held"; a paste that throws or strands in the composer is
+"held" at once and never retried blind. Closing the target tab drops its queued and held
+items. Delivered, dropped and held items are kept 7 days.
+
+GET /api/cli/inbox?workspaceId=WS[&all=1]
+  Read scope. Queued and held items targeting WS's tabs; all=1 adds delivered and dropped.
+  Response: { "workspaceId", "items": [{ "id", "kind", "targetWorkspaceId", "targetTabId", "dedupeKey",
+    "line", "state", "attempts", "lastRefusal", "notBefore", "createdAt", "deliveredAt", "heldReason",
+    "droppedReason", "expiresAt", "transitionAt", ... }] }
+
+POST /api/cli/inbox/<id>/retry
+  The target workspace's own token or the admin token. Re-queues a held item once, with a
+  fresh refusal budget. 404 { "code": "inbox-not-found" } (CLI exit 7); 409 { "code":
+  "inbox-not-held" } (CLI exit 3); 403 { "code": "forbidden" } for another workspace.
+
 ## Orchestration
 
 GET /api/cli/workspaces/<workspaceId>/orchestration

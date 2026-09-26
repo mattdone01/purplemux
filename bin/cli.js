@@ -561,6 +561,30 @@ const leaseName = (args, what = 'NAME') => {
   return positional[0];
 };
 
+// The inbox (ADR-0012): server notices queued for this workspace's tabs.
+const cmdInbox = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = stripBooleanFlags(stripFlags(args.slice(1), ['--workspace', '-w']), ['--all']);
+  switch (sub) {
+    case 'list': {
+      const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
+      if (!wsId) die('usage: inbox list -w WS [--all]');
+      const all = args.includes('--all') ? '&all=1' : '';
+      const { body } = await api('GET', `/api/cli/inbox?workspaceId=${encodeURIComponent(wsId)}${all}`);
+      return out(body);
+    }
+    case 'retry': {
+      const id = rest[0];
+      if (!id || !/^i-[A-Za-z0-9_-]{1,32}$/.test(id)) die('usage: inbox retry ID (an i-… inbox item id)');
+      const { body } = await api('POST', `/api/cli/inbox/${id}/retry`, {});
+      return out(body);
+    }
+    default:
+      die('usage: inbox list -w WS [--all] | inbox retry ID');
+  }
+};
+
 const LEASE_USAGE = 'usage: lease acquire|renew|release|list|check|break|release-epic ... (purplemux help)';
 
 /**
@@ -1097,6 +1121,10 @@ Commands:
   lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
   lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
                                            epic:SLUG; a tab of a claiming workspace releases its own claims)
+  inbox list -w WS [--all]                 Server notices (notes, watches, deploys, Mission Control) queued or held
+                                           for WS's tabs; --all adds delivered and dropped (kept 7 days)
+  inbox retry ID                           Re-queue a held notice once (the target workspace's token or admin).
+                                           Exit 3 inbox-not-held, 7 inbox-not-found
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -1157,6 +1185,8 @@ const main = async () => {
       return cmdLease(args.slice(1));
     case 'mission':
       return cmdMission(args.slice(1));
+    case 'inbox':
+      return cmdInbox(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

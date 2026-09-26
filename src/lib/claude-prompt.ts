@@ -38,6 +38,7 @@ purplemux standup show -w ${ws.id}                    # latest standup + history
 purplemux lease check NAME                            # exact name; exit 0 you hold it, 3 another does, 7 nobody
 purplemux lease acquire NAME [--ttl 45m] [--epic S]   # e.g. merge:owner/repo, epic:SLUG; exit 3 + stderr lease-held = held elsewhere
 purplemux lease release NAME                          # release what you hold; lease list shows every holder
+purplemux inbox list -w ${ws.id}                        # server notices queued or held for this workspace's tabs
 \`\`\`
 
 The watchdog reads the LAST line of your turn: \`DONE:\`, \`BLOCKED:\`, \`NEEDS-DECISION:\` or
