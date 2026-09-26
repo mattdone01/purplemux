@@ -21,14 +21,31 @@ export interface ITabLocation {
  * it in `allowedPeers`. The global token stays unrestricted so the UI and the
  * user's own shell are unaffected.
  */
-export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string): Promise<boolean> => {
-  if (scope.type === 'admin') return true;
-  if (scope.workspaceId === workspaceId) return true;
-  // A tab that may drive a workspace under a grant may also read it (ADR-0014).
-  if (grantFor(scope, workspaceId)) return true;
+export const canAccessWorkspace = async (scope: TCliScope, workspaceId: string): Promise<boolean> =>
+  (await accessDecision(scope, workspaceId)).ok;
+
+/**
+ * The access answer and, when a grant was the ONLY reason, that grant (ADR-0014):
+ * `authorizeWorkspace` audits or refuses a mutation made through it.
+ */
+export const accessDecision = async (scope: TCliScope, workspaceId: string): Promise<{ ok: boolean; grant: IGrant | null }> => {
+  if (scope.type === 'admin') return { ok: true, grant: null };
+  if (scope.workspaceId === workspaceId) return { ok: true, grant: null };
   const target = await getWorkspaceById(workspaceId);
-  return target?.allowedPeers?.includes(scope.workspaceId) ?? false;
+  if (target?.allowedPeers?.includes(scope.workspaceId)) return { ok: true, grant: null };
+  // A tab that may drive a workspace under a grant may also reach it through the read-gated routes.
+  const grant = grantFor(scope, workspaceId);
+  return grant ? { ok: true, grant } : { ok: false, grant: null };
 };
+
+/** The tab a request targets, for the grant-use audit: the route's `tabId`, or the body's (launch routes). */
+const targetTabOf = (req: NextApiRequest): string | null => {
+  if (typeof req.query?.tabId === 'string') return req.query.tabId;
+  const body = req.body as { tabId?: unknown } | undefined;
+  return body && typeof body === 'object' && typeof body.tabId === 'string' ? body.tabId : null;
+};
+
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /**
  * The active human grant that lets this caller drive `workspaceId` (ADR-0014):
@@ -92,7 +109,22 @@ export const authorizeWorkspace = async (
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
   }
-  if (!(await canAccessWorkspace(scope, workspaceId))) {
+  const access = await accessDecision(scope, workspaceId);
+  if (access.ok && access.grant && !READ_METHODS.has(req.method ?? 'GET')) {
+    // A mutation allowed ONLY by a drive grant (review r1): a workspace's settings stay its own;
+    // anything else on its tabs (close, create, browser) is a use of the grant, audited like input.
+    const route = (req.url ?? '').split('?')[0];
+    if (route.startsWith('/api/cli/workspaces/')) {
+      res.status(403).json({
+        error: `Grant ${access.grant.id} lets this tab drive ${workspaceId}'s tabs, not change its settings (${route}).`,
+        code: 'forbidden',
+      });
+      return null;
+    }
+    const { auditGrantUse } = await import('@/lib/grant-service');
+    await auditGrantUse(access.grant, { route, targetWorkspaceId: workspaceId, targetTabId: targetTabOf(req) });
+  }
+  if (!access.ok) {
     res.status(403).json({
       error: `Workspace ${workspaceId} is out of scope for this tab (scoped to ${
         scope.type === 'workspace' ? scope.workspaceId : 'admin'
@@ -124,9 +156,8 @@ export const authorizeWorkspaceInput = async (
   }
   const decision = driveDecision(scope, workspaceId);
   if (decision.ok && decision.grant) {
-    const tabId = typeof req.query.tabId === 'string' ? req.query.tabId : null;
     const { auditGrantUse } = await import('@/lib/grant-service');
-    await auditGrantUse(decision.grant, { route: (req.url ?? '').split('?')[0], targetWorkspaceId: workspaceId, targetTabId: tabId });
+    await auditGrantUse(decision.grant, { route: (req.url ?? '').split('?')[0], targetWorkspaceId: workspaceId, targetTabId: targetTabOf(req) });
   }
   if (!decision.ok) {
     const unverified = await unverifiedGrantHolder(req, scope, workspaceId);

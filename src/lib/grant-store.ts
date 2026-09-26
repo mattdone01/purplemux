@@ -113,8 +113,10 @@ export const sweepInState = (state: IGrantsState, now: number): { state: IGrants
   let changed = false;
   const kept: IGrant[] = [];
   for (const g of state.grants) {
+    // An expiry is noted (audited) before anything prunes it, even one older than the keep window.
+    const noted = g.revokedAt !== null || g.expiryNotedAt !== null;
     const endedAt = g.revokedAt ?? (g.expiresAt <= now ? g.expiresAt : null);
-    if (endedAt !== null && now - endedAt > GRANT_KEEP_ENDED_MS) {
+    if (noted && endedAt !== null && now - endedAt > GRANT_KEEP_ENDED_MS) {
       changed = true;
       continue;
     }

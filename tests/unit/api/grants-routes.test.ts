@@ -97,13 +97,20 @@ describe('grant routes', () => {
     expect(await create({ workspaces: ['ws-1'] })).toMatchObject({ status: 400, body: { code: 'grant-invalid' } });
   });
 
-  it('revokes with the same gate: session, Origin, password', async () => {
+  it('revokes with the human session and this server\'s Origin; no password (it only takes power away)', async () => {
     const { body } = await create();
     const id = body.grant.id;
-    expect((await call('@/pages/api/grants/[id]', 'DELETE', { cookie: null, query: { id }, body: { password: 'right' } })).status).toBe(401);
-    expect((await call('@/pages/api/grants/[id]', 'DELETE', { query: { id }, body: { password: 'wrong' } })).status).toBe(403);
-    const r = await call('@/pages/api/grants/[id]', 'DELETE', { query: { id }, body: { password: 'right' } });
+    expect((await call('@/pages/api/grants/[id]', 'DELETE', { cookie: null, query: { id } })).status).toBe(401);
+    expect((await call('@/pages/api/grants/[id]', 'DELETE', { query: { id }, origin: 'https://evil.example' })).status).toBe(403);
+    const r = await call('@/pages/api/grants/[id]', 'DELETE', { query: { id } });
     expect(r).toMatchObject({ status: 200, body: { grant: { id, revokeReason: 'revoked', revokedBy: 'human' } } });
+  });
+
+  it('the human list answers 500 for a malformed store, never an empty list', async () => {
+    const { grantsFile, reloadGrants } = await import('@/lib/grant-store');
+    fs.writeFileSync(grantsFile(), '{nope');
+    reloadGrants();
+    expect(await call('@/pages/api/grants', 'GET')).toMatchObject({ status: 500, body: { code: 'grant-store-unreadable' } });
   });
 
   it('GET /api/cli/grants lists read-only: admin sees all, a workspace sees what it holds or is driven under', async () => {

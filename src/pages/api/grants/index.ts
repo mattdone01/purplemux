@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { bodyOf, defaultGrantDeps, requireGrantHuman, sendGrantError } from '@/lib/grant-http';
 import { createGrant } from '@/lib/grant-service';
-import { grantsSnapshot } from '@/lib/grant-store';
+import { grantsRefusal, grantsSnapshot } from '@/lib/grant-store';
 
 /**
  * Portfolio drive grants (ADR-0014). GET lists them for the signed-in human;
@@ -12,6 +12,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     if (req.method === 'GET') {
       await requireGrantHuman(req);
+      const refusal = grantsRefusal();
+      if (refusal) return res.status(500).json({ error: refusal, code: 'grant-store-unreadable' });
       return res.status(200).json({ grants: grantsSnapshot().grants });
     }
     if (req.method === 'POST') {

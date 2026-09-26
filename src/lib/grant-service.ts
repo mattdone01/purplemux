@@ -45,7 +45,26 @@ interface IStepUpState {
   lockedUntil: number;
 }
 
-const g = globalThis as unknown as { __ptGrantStepUp?: IStepUpState; __ptGrantRuntime?: { timer: ReturnType<typeof setInterval> | null; unsubscribe: (() => void) | null } };
+const g = globalThis as unknown as {
+  __ptGrantStepUp?: IStepUpState;
+  __ptGrantStepUpLock?: Promise<void>;
+  __ptGrantRuntime?: { timer: ReturnType<typeof setInterval> | null; unsubscribe: (() => void) | null };
+};
+if (!g.__ptGrantStepUpLock) g.__ptGrantStepUpLock = Promise.resolve();
+
+/** One password check at a time: a burst of guesses cannot all pass the lock check before any failure is counted. */
+const withStepUpLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+  let release: () => void;
+  const next = new Promise<void>((r) => { release = r; });
+  const prev = g.__ptGrantStepUpLock!;
+  g.__ptGrantStepUpLock = next;
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release!();
+  }
+};
 const stepUp = (): IStepUpState => {
   if (!g.__ptGrantStepUp) g.__ptGrantStepUp = { failures: [], lockedUntil: 0 };
   return g.__ptGrantStepUp;
@@ -61,7 +80,10 @@ export const resetStepUp = (): void => {
  * (the one factor a same-uid process cannot recover from disk). 5 wrong
  * passwords in 10 min lock grant creation and revocation for 15 min.
  */
-export const checkStepUp = async (deps: IGrantDeps, subject: string, password: unknown, action: 'create' | 'revoke'): Promise<void> => {
+export const checkStepUp = (deps: IGrantDeps, subject: string, password: unknown, action: 'create'): Promise<void> =>
+  withStepUpLock(() => checkStepUpLocked(deps, subject, password, action));
+
+const checkStepUpLocked = async (deps: IGrantDeps, subject: string, password: unknown, action: 'create'): Promise<void> => {
   const state = stepUp();
   const now = deps.now();
   if (state.lockedUntil > now) {
@@ -123,12 +145,22 @@ export const createGrant = async (deps: IGrantDeps, subject: string, body: ICrea
     return { state: created.state, value: created.grant };
   });
   await deps.audit({ event: 'grant-created', grantId: grant.id, grantee: grant.grantee, workspaces: grant.workspaces, reason, expiresAt: grant.expiresAt, by: subject });
+  // The tab may have closed between the check and the write; its close event then found nothing to end.
+  if (!(await deps.tabExists(ws, tab))) {
+    await revokeForClosedTab(deps, { workspaceId: ws, tabId: tab });
+    throw invalid(`tab ${tab} closed while the grant was being created`);
+  }
   log.info({ grantId: grant.id, grantee: grant.grantee, workspaces: grant.workspaces }, 'drive grant created');
   return grant;
 };
 
-export const revokeGrant = async (deps: IGrantDeps, subject: string, id: unknown, password: unknown): Promise<IGrant> => {
-  await checkStepUp(deps, subject, password, 'revoke');
+/**
+ * Revoke needs the human session and this server's Origin, not the password
+ * (review r1): it only takes power away, and a password check here would let a
+ * grantee lock the human out of revoking (5 wrong guesses) or, exempt from the
+ * lockout, become an unlimited guessing channel.
+ */
+export const revokeGrant = async (deps: IGrantDeps, subject: string, id: unknown): Promise<IGrant> => {
   if (typeof id !== 'string' || !/^g-[A-Za-z0-9_-]{4,32}$/.test(id)) throw new GrantError('grant-not-found', `no grant ${String(id)}`);
   const now = deps.now();
   const { grant, changed } = await mutateGrants((state) => {

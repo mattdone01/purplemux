@@ -54,6 +54,19 @@ describe('grant state (pure)', () => {
     expect(revokeForTabInState(r.state, { workspaceId: 'ws-1', tabId: 'tab-a' }, T0 + 2 * H).revoked).toEqual([]);
   });
 
+  it('the expiry boundary is exact: active until expiresAt, not at it', () => {
+    const { state, grant } = createGrantInState(EMPTY, input, T0, 'g-one1');
+    expect(findActiveDriveGrant(state, grant.grantee, 'ws-2', grant.expiresAt - 1)).not.toBeNull();
+    expect(findActiveDriveGrant(state, grant.grantee, 'ws-2', grant.expiresAt)).toBeNull();
+  });
+
+  it('an expiry older than the keep window is still noted (audited) before it is pruned', () => {
+    const { state } = createGrantInState(EMPTY, { ...input, expiresInHours: 1 }, T0, 'g-one1');
+    const late = sweepInState(state, T0 + H + GRANT_KEEP_ENDED_MS + 10);
+    expect(late.expired.map((g) => g.id)).toEqual(['g-one1']);
+    expect(sweepInState(late.state, T0 + H + GRANT_KEEP_ENDED_MS + 20)).toMatchObject({ state: { grants: [] }, pruned: 1 });
+  });
+
   it('notes an expiry once, and prunes grants ended more than a week ago', () => {
     const { state } = createGrantInState(EMPTY, { ...input, expiresInHours: 1 }, T0, 'g-one1');
     const first = sweepInState(state, T0 + 2 * H);

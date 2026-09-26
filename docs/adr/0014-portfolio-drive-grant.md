@@ -20,13 +20,19 @@ A cross-workspace orchestrator needs to type into tabs of other workspaces. The 
 ## Decision
 Option 3.
 
-- **Human gate.** `POST /api/grants` and `DELETE /api/grants/<id>` need the web session cookie
-  (`requireMissionHuman`), this server's Origin (`requireMissionSameOrigin`) **and** the purplemux password,
-  checked against its scrypt hash. The session JWT alone is not proof: its signing secret sits in
-  `config.json` with the same uid as every agent; the password is stored only as a hash. Wrong or missing
-  passwords are refused (`grant-password-invalid`, 403) and audited; 5 failures in 10 minutes lock grant
-  changes for 15 minutes (`grant-locked`, 429), even for the right password. No CLI token reaches these
-  routes (the login proxy guards `/api/grants`; the handlers require the session).
+- **Human gate.** `POST /api/grants` needs the web session cookie (`requireMissionHuman`), this server's
+  Origin (`requireMissionSameOrigin`) **and** the purplemux password, checked against its scrypt hash. The
+  session JWT alone is not proof: its signing secret sits in `config.json` with the same uid as every agent;
+  the password is stored only as a hash. Wrong or missing passwords are refused (`grant-password-invalid`,
+  403) and audited; 5 failures in 10 minutes lock grant creation for 15 minutes (`grant-locked`, 429), even
+  for the right password. Password checks run one at a time, so a burst of concurrent guesses cannot pass
+  the lock check before a failure is counted (review r1). No CLI token reaches these routes (the handlers
+  require the session; a CLI token passes the login proxy but not the handler).
+- **Revoke** (`DELETE /api/grants/<id>`) needs the session and the Origin but **not** the password — a
+  deliberate deviation from the architecture's table (review r1): revoking only takes power away, and a
+  password check there either lets a grantee lock the human out of revoking (5 wrong guesses every 15
+  minutes) or, exempt from the lockout, becomes an unlimited guessing channel. A process that forges a
+  session can therefore revoke grants — a denial of the grant, never an escalation.
 - **The grant.** `~/.purplemux/grants.json` (0600, tmp + rename, one lock):
   `{ id: g-…, capability: 'drive', grantee: { workspaceId, tabId }, workspaces[], reason, createdAt, createdBy
   (session subject), expiresAt (default 24 h, max 7 d), revokedAt, revokedBy, revokeReason, expiryNotedAt }`.
@@ -44,10 +50,17 @@ Option 3.
   `grantee-tab-closed`; at boot, a grantee tab missing from a readable layout ends its grants too; a
   workspace whose layout cannot be read keeps them as unknown). Ended grants are listed for 7 days, then
   pruned.
-- **Audit** (`~/.purplemux/audit/coordination.jsonl`): `grant-created`, `grant-revoked`, `grant-expired`
-  (once), `grant-password-invalid`, `grant-locked`, and `grant-used` for every input request
-  (`authorizeWorkspaceInput`: send, steer, bg, probe, close, launch routes) that passed only because of a
-  grant, with the route, target workspace and target tab.
+- **Reach and audit** (`~/.purplemux/audit/coordination.jsonl`): `grant-created`, `grant-revoked`,
+  `grant-expired` (once, even for a grant pruned later), `grant-password-invalid`, `grant-locked`, and
+  `grant-used` for every request that was allowed ONLY because of a grant, with the route, target workspace
+  and target tab (the route's `tabId`, or the body's for the launch routes):
+  - the input routes behind `authorizeWorkspaceInput` (send, steer, bg and probe writes, tab PATCH, the
+    Claude/Codex launch routes);
+  - any non-read request behind the read gate `authorizeWorkspace` (tab close, tab create, browser
+    actions) — review r1: `canAccessWorkspace` admits a grant, and those routes change things;
+  - except the workspace settings routes (`/api/cli/workspaces/<ws>/…`: directories, orchestration,
+    standup), which a grant never reaches (403): it drives a workspace's tabs, not its settings.
+  Reads through a grant are not audited.
 - **Denials name the fix.** A grantee calling without its launch identity (a hook-time token or the
   session fallback) gets 403 `grant-tab-unverified` naming the grant and "recreate the tab"; any other
   refusal is the unchanged `forbidden`.
@@ -62,4 +75,8 @@ Option 3.
   UI (or a phone browser) to grant; the CLI can only list.
 - Threat model: the step-up password is evidence of human intent at the API, not a boundary against a
   same-uid process that edits `grants.json` or replaces the hash in `config.json` directly; such file writes
-  are outside this epic's threat model (cooperating agents). Stated so no reader over-trusts a grant.
+  are outside this epic's threat model (cooperating agents). The scrypt hash is readable by that uid and the
+  password may be as short as 4 characters (`MIN_PASSWORD_LENGTH`), so "cannot recover the password" holds
+  only for a strong password. The hash is read from `config.json` on each check, so a swapped hash takes
+  effect at once; reading the boot-time value would need a restart first (hardening not done). Stated so no
+  reader over-trusts a grant.

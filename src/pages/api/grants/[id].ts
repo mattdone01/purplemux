@@ -1,8 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { bodyOf, defaultGrantDeps, requireGrantHuman, sendGrantError } from '@/lib/grant-http';
+import { defaultGrantDeps, requireGrantHuman, sendGrantError } from '@/lib/grant-http';
 import { revokeGrant } from '@/lib/grant-service';
 
-/** Revoke a grant (ADR-0014): the same human gate and step-up password as creating one. */
+/** Revoke a grant (ADR-0014): the human session and this server's Origin; no password (it only takes power away). */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'DELETE') {
     res.setHeader('Allow', 'DELETE');
@@ -10,7 +10,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
   try {
     const subject = await requireGrantHuman(req);
-    const grant = await revokeGrant(defaultGrantDeps(), subject, req.query.id, bodyOf(req).password);
+    const grant = await revokeGrant(defaultGrantDeps(), subject, req.query.id);
     return res.status(200).json({ grant });
   } catch (err) {
     return sendGrantError(res, err);

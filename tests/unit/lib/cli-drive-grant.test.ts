@@ -13,7 +13,7 @@ vi.mock('@/lib/workspace-token', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/workspace-token')>()),
   resolveCliScope: () => scopeHolder.scope,
 }));
-vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: vi.fn(async (id: string) => ({ id, allowedPeers: [] })) }));
+vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: vi.fn(async (id: string) => ({ id, allowedPeers: id === 'ws-3' ? ['ws-1'] : [] })) }));
 vi.mock('@/lib/coordination-audit', () => ({ appendCoordinationAudit: audit }));
 vi.mock('@/lib/caller', () => ({ resolveCaller: vi.fn(async () => scopeHolder.caller) }));
 
@@ -39,6 +39,16 @@ const input = async (scope: TCliScope, caller: unknown = null) => {
   const state = { status: 0, body: undefined as unknown };
   const res = { status(c: number) { state.status = c; return this; }, json(b: unknown) { state.body = b; return this; } } as unknown as NextApiResponse;
   const result = await authorizeWorkspaceInput({ url: '/api/cli/tabs/tab-x/send?workspaceId=ws-2', query: { tabId: 'tab-x' }, headers: {} } as unknown as NextApiRequest, res, 'ws-2');
+  return { result, ...state } as { result: TCliScope | null; status: number; body: { code?: string; error?: string } };
+};
+
+const access = async (scope: TCliScope, method: string, url: string, body?: unknown, ws = 'ws-2') => {
+  scopeHolder.scope = scope;
+  const { authorizeWorkspace } = await import('@/lib/cli-utils');
+  const state = { status: 0, body: undefined as unknown };
+  const res = { status(c: number) { state.status = c; return this; }, json(b: unknown) { state.body = b; return this; } } as unknown as NextApiResponse;
+  const tabId = /\/tabs\/([^/?]+)/.exec(url)?.[1];
+  const result = await authorizeWorkspace({ method, url, query: tabId ? { tabId } : {}, body, headers: {} } as unknown as NextApiRequest, res, ws);
   return { result, ...state } as { result: TCliScope | null; status: number; body: { code?: string; error?: string } };
 };
 
@@ -96,6 +106,37 @@ describe('drive grants in the predicates', () => {
       event: 'grant-used', grantId: 'g-test1', grantee: { workspaceId: 'ws-1', tabId: 'tab-a' },
       route: '/api/cli/tabs/tab-x/send', targetWorkspaceId: 'ws-2', targetTabId: 'tab-x',
     });
+  });
+
+  it('authorizeWorkspace: a grant-only mutation of a tab is allowed and audited once; a read is not audited (review r1)', async () => {
+    await grant();
+    expect((await access(A_VERIFIED, 'GET', '/api/cli/tabs/tab-x?workspaceId=ws-2')).result).toBe(A_VERIFIED);
+    expect(audit).not.toHaveBeenCalled();
+    expect((await access(A_VERIFIED, 'DELETE', '/api/cli/tabs/tab-x?workspaceId=ws-2')).result).toBe(A_VERIFIED);
+    expect((await access(A_VERIFIED, 'POST', '/api/cli/tabs', { workspaceId: 'ws-2' })).result).toBe(A_VERIFIED);
+    expect(audit.mock.calls.map(([e]) => [e.event, e.route, e.targetTabId])).toEqual([
+      ['grant-used', '/api/cli/tabs/tab-x', 'tab-x'],
+      ['grant-used', '/api/cli/tabs', null],
+    ]);
+  });
+
+  it('authorizeWorkspace: a grant never changes a workspace\'s settings (403), and peer access is not a grant use', async () => {
+    await grant();
+    for (const route of ['/api/cli/workspaces/ws-2/orchestration', '/api/cli/workspaces/ws-2/directories', '/api/cli/workspaces/ws-2/standup']) {
+      expect(await access(A_VERIFIED, 'PATCH', route)).toMatchObject({ result: null, status: 403, body: { code: 'forbidden' } });
+    }
+    // ws-3 names ws-1 in allowedPeers: that access predates grants and is not audited as one.
+    expect((await access(A_VERIFIED, 'DELETE', '/api/cli/tabs/tab-y?workspaceId=ws-3', undefined, 'ws-3')).result).toBe(A_VERIFIED);
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it('authorizeWorkspaceInput: a launch route names its target tab from the body', async () => {
+    await grant();
+    scopeHolder.scope = A_VERIFIED;
+    const { authorizeWorkspaceInput } = await import('@/lib/cli-utils');
+    const res = { status() { return this; }, json() { return this; } } as unknown as NextApiResponse;
+    await authorizeWorkspaceInput({ url: '/api/codex/launch-command', query: {}, body: { tabId: 'tab-z' }, headers: {} } as unknown as NextApiRequest, res, 'ws-2');
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({ event: 'grant-used', route: '/api/codex/launch-command', targetTabId: 'tab-z' }));
   });
 
   it('authorizeWorkspaceInput: another tab of the grantee workspace is refused plainly (403 forbidden)', async () => {
