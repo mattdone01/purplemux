@@ -151,7 +151,7 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'tab-not-found': 'permanent — the tab is closed; do not retry',
   'session-not-running': "the tab's session is dead; do not retry — a person must restart the tab",
   'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
-  'routes-absent': 'the running server predates this command — retrying cannot help until it is deployed',
+  'routes-absent': 'no such route on this server (an older server, a foreign server, or a malformed id) — retrying cannot help',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -1056,13 +1056,15 @@ Commands:
   lease acquire NAME [--ttl 45m|none] [--epic SLUG] [--note TEXT]
                                            Take a held-resource lease (<kind>:<resource>, e.g. merge:owner/repo,
                                            epic:SLUG, num:owner/repo:adr:0373). Exit 0 acquired or renewed,
-                                           3 held by another (stderr names the holder), 2 policy (TTL/epic/name)
+                                           2 policy (TTL/epic/name), 3 refused: stderr code lease-held (another
+                                           holds it; the holder is named) or forbidden / caller-unresolved
   lease renew NAME [--ttl 45m]             Move the expiry forward (holder only)
   lease release NAME                       Release a lease you hold. Exit 0, 3 held by another, 7 not held
   lease list [--prefix P] [--mine] [--json]
                                            Every lease on the host: holder, state, age, expiry, epic, note
   lease check NAME                         Exact name only. Prints {held, mine, lease}; exit 0 you hold it,
-                                           3 another holds it, 7 nobody holds it
+                                           3 another holds it, 7 nobody holds it. Exit 3 WITHOUT a body on
+                                           stdout is a refusal (bad token), not a holder
   lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
   lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
                                            epic:SLUG; a tab of a claiming workspace releases its own claims)
@@ -1086,6 +1088,8 @@ Exit codes:
         target-changed
      5  not ready yet: readiness-timeout                             yes, bounded
      6  server unreachable (refused, no port, read interrupted)      yes, bounded
+        routes-absent: the server answered 404 without JSON — it     not until it is deployed
+        predates the command
      7  not found: the named lease, note or watch does not exist     —
   stderr names the code and its class, e.g.
     error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found

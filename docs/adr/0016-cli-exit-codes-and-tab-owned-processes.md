@@ -22,7 +22,7 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 3 | conflict / refused by state | `lease-held`, `lease-held-by-other`, `watch-cap`, `forbidden`, `inbox-not-held`, `grant-tab-unverified`, `config-version-conflict`, `caller-unresolved`, `grant-password-invalid`, `grant-locked` | after the state changes |
 | 4 | target gone (permanent) | `tab-not-found`, `session-not-running`, `target-changed` | **never** |
 | 5 | not ready yet | `readiness-timeout` | yes, bounded |
-| 6 | server unreachable | `server-unreachable`: connection refused, no port or token configured, a read interrupted | yes, bounded |
+| 6 | server unreachable | `server-unreachable`: connection refused, no port or token configured, a read interrupted; `routes-absent`: the server answered 404 without a JSON body on a `/api/cli/` route — it predates the command (story 27) | yes, bounded; `routes-absent` not until the server is deployed |
 | 7 | not found | `lease-not-found`, `note-not-found`, `watch-not-found`, `inbox-not-found`, `deploy-not-found`, `config-not-found` | — |
 
 3. stderr names the code and its class, e.g. `error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found`. A `readiness-timeout` names the waited milliseconds.

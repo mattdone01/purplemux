@@ -74,9 +74,10 @@ The CLI writes the code and its class to stderr, e.g.
 One host-wide register of held resources (ADR-0011). A name is \`<kind>:<resource>\`, lower
 case: \`merge:<owner>/<repo>\`, \`dev-deploy:<owner>/<repo>\`, \`dev-write:<env>\`,
 \`deploy:<service>\` (admin token or the workspace's enabled orchestrator tab only),
-\`epic:<slug>\` (no expiry allowed), \`num:<owner>/<repo>:<adr|migration>:<nnnn>\` (requires an
+\`epic:<slug>\` (no expiry by default, \`none\` allowed, at most 7 d), \`num:<owner>/<repo>:<adr|migration>:<nnnn>\` (requires an
 epic; survives the tab), or any other kind (30 m default, 24 h max). A lease dies with its tab,
-by TTL, or 10 min after its agent goes inactive; \`num\` leases die only by TTL or release-epic.
+by TTL, or 10 min after its agent goes inactive; \`num\` leases outlive the tab and end by TTL,
+release, release-epic or break.
 Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_TOKEN plus
 x-pmux-session) or the admin token — otherwise \`caller-unresolved\` (403).
 
@@ -88,13 +89,17 @@ GET /api/cli/leases?prefix=&mine=1
   Response: { "leases": [lease view, ...] }
 
 GET /api/cli/leases/check?name=NAME
-  Exact name only (a prefix would also match merge:x/y-z). Always 200 when the store answers:
+  Exact name only (a prefix would also match merge:x/y-z). 200 for any well-formed name
+  (a malformed one is 400 lease-policy):
   { "held": bool, "mine": bool, "lease": lease view | null }. The CLI prints it and exits
-  0 (you hold it), 3 (another holds it) or 7 (nobody holds it).
+  0 (you hold it), 3 (another holds it) or 7 (nobody holds it). Exit 3 with nothing on stdout is
+  a refusal (forbidden), not a holder; an acquire's exit 3 is a holder only when the stderr code
+  is lease-held.
 
 POST /api/cli/leases/acquire   { "name", "ttlSeconds"?: number | null, "epic"?, "note"? }
   Response: { "lease": view, "outcome": "acquired" | "renewed" } (re-acquire by the holder renews)
-  Errors: lease-held 409 (+ lease, holder), lease-policy 400, caller-unresolved 403
+  Errors: lease-held 409 (+ lease, holder), lease-policy 400, caller-unresolved 403,
+  forbidden 403 (deploy: needs the admin token or the workspace's enabled orchestrator tab)
 
 POST /api/cli/leases/renew     { "name", "ttlSeconds"? }  → { "lease": view }
 POST /api/cli/leases/release   { "name" }                 → { "released": true }

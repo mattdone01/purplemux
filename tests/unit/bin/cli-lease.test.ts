@@ -202,7 +202,7 @@ describe('purplemux lease — without a lease-capable server', () => {
   it.each(everyCommand)('exits 6 with routes-absent against a server that predates leases: lease %s', async (...args) => {
     const r = await cli(args, { PMUX_PORT: String(stubPort), PMUX_TOKEN: 't' });
     expect(r.code).toBe(6);
-    expect(r.stderr).toMatch(/^error: routes-absent \(the running server predates this command/m);
+    expect(r.stderr).toMatch(/^error: routes-absent \(no such route on this server/m);
   });
 
   it('dispatches through the installed entry point, never "unknown command"', async () => {

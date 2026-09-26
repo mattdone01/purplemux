@@ -34,7 +34,7 @@ purplemux tab close -w ${ws.id} TAB_ID                # close a tab
 purplemux standup report -w ${ws.id} --json '{...}'   # post a standup tick — the human-readable progress digest
 purplemux standup show -w ${ws.id}                    # latest standup + history
 purplemux lease check NAME                            # exact name; exit 0 you hold it, 3 another does, 7 nobody
-purplemux lease acquire NAME [--ttl 45m] [--epic S]   # e.g. merge:owner/repo, epic:SLUG; exit 3 = held elsewhere
+purplemux lease acquire NAME [--ttl 45m] [--epic S]   # e.g. merge:owner/repo, epic:SLUG; exit 3 + stderr lease-held = held elsewhere
 purplemux lease release NAME                          # release what you hold; lease list shows every holder
 \`\`\`
 

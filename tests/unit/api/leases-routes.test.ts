@@ -109,7 +109,7 @@ describe('lease routes', () => {
     });
 
     it('lets only the workspace orchestrator tab or admin take deploy', async () => {
-      expect((await post('/api/cli/leases/acquire', tok.a, { name: 'deploy:purplemux' })).body).toMatchObject({ code: 'lease-policy' });
+      expect(await post('/api/cli/leases/acquire', tok.a, { name: 'deploy:purplemux' })).toMatchObject({ status: 403, body: { code: 'forbidden' } });
       expect((await post('/api/cli/leases/acquire', tok.orch, { name: 'deploy:purplemux' })).status).toBe(200);
       await post('/api/cli/leases/release', tok.orch, { name: 'deploy:purplemux' });
       expect((await post('/api/cli/leases/acquire', tok.admin, { name: 'deploy:purplemux', ttlSeconds: 1800 })).body).toMatchObject({ lease: { holder: { admin: true }, holderState: 'admin' } });
@@ -176,6 +176,18 @@ describe('lease routes', () => {
       await post('/api/cli/leases/acquire', tok.a, { name: 'num:x/y:adr:0373', epic: 'p4' });
       expect(await post('/api/cli/leases/release-epic', tok.b, { epic: 'p4' })).toMatchObject({ status: 200, body: { released: ['num:x/y:adr:0373'] } });
       expect(await post('/api/cli/leases/release-epic', tok.b, { epic: 'p4' })).toMatchObject({ status: 200, body: { released: [] } });
+    });
+  });
+
+  describe('views never show closed on a read error', () => {
+    it('counts every holder workspace as uncertain when the workspace list cannot be read', async () => {
+      await post('/api/cli/leases/acquire', tok.a, { name: 'merge:x/y' });
+      await fs.writeFile(path.join(mockHome.value, '.purplemux', 'workspaces.json'), '{broken');
+
+      const list = await get('/api/cli/leases', tok.admin);
+      expect(list.status).toBe(200);
+      expect((list.body.leases as Array<{ holderState: string }>).map((l) => l.holderState)).toEqual(['live']);
+      expect((await get('/api/cli/leases/check', tok.b, { name: 'merge:x/y' })).body).toMatchObject({ held: true, lease: { holderState: 'live' } });
     });
   });
 
