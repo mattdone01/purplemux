@@ -103,6 +103,7 @@ export const authorizeWorkspace = async (
   req: NextApiRequest,
   res: NextApiResponse,
   workspaceId: string,
+  opts: { grant?: 'allow' | 'refuse' } = {},
 ): Promise<TCliScope | null> => {
   const scope = resolveCliScope(req);
   if (!scope) {
@@ -111,10 +112,11 @@ export const authorizeWorkspace = async (
   }
   const access = await accessDecision(scope, workspaceId);
   if (access.ok && access.grant && !READ_METHODS.has(req.method ?? 'GET')) {
-    // A mutation allowed ONLY by a drive grant (review r1): a workspace's settings stay its own;
+    // A mutation allowed ONLY by a drive grant (review r1): a workspace's settings stay its own (the
+    // settings routes say so explicitly: a URL prefix could be dodged by an unnormalised path, review r2);
     // anything else on its tabs (close, create, browser) is a use of the grant, audited like input.
     const route = (req.url ?? '').split('?')[0];
-    if (route.startsWith('/api/cli/workspaces/')) {
+    if (opts.grant === 'refuse') {
       res.status(403).json({
         error: `Grant ${access.grant.id} lets this tab drive ${workspaceId}'s tabs, not change its settings (${route}).`,
         code: 'forbidden',

@@ -42,13 +42,13 @@ const input = async (scope: TCliScope, caller: unknown = null) => {
   return { result, ...state } as { result: TCliScope | null; status: number; body: { code?: string; error?: string } };
 };
 
-const access = async (scope: TCliScope, method: string, url: string, body?: unknown, ws = 'ws-2') => {
+const access = async (scope: TCliScope, method: string, url: string, body?: unknown, ws = 'ws-2', opts: { grant?: 'allow' | 'refuse' } = {}) => {
   scopeHolder.scope = scope;
   const { authorizeWorkspace } = await import('@/lib/cli-utils');
   const state = { status: 0, body: undefined as unknown };
   const res = { status(c: number) { state.status = c; return this; }, json(b: unknown) { state.body = b; return this; } } as unknown as NextApiResponse;
   const tabId = /\/tabs\/([^/?]+)/.exec(url)?.[1];
-  const result = await authorizeWorkspace({ method, url, query: tabId ? { tabId } : {}, body, headers: {} } as unknown as NextApiRequest, res, ws);
+  const result = await authorizeWorkspace({ method, url, query: tabId ? { tabId } : {}, body, headers: {} } as unknown as NextApiRequest, res, ws, opts);
   return { result, ...state } as { result: TCliScope | null; status: number; body: { code?: string; error?: string } };
 };
 
@@ -122,8 +122,14 @@ describe('drive grants in the predicates', () => {
 
   it('authorizeWorkspace: a grant never changes a workspace\'s settings (403), and peer access is not a grant use', async () => {
     await grant();
-    for (const route of ['/api/cli/workspaces/ws-2/orchestration', '/api/cli/workspaces/ws-2/directories', '/api/cli/workspaces/ws-2/standup']) {
-      expect(await access(A_VERIFIED, 'PATCH', route)).toMatchObject({ result: null, status: 403, body: { code: 'forbidden' } });
+    // The settings routes refuse by their own declaration, whatever the raw URL looks like.
+    for (const route of ['/api/cli/workspaces/ws-2/orchestration', '/api/cli/tabs/../workspaces/ws-2/directories', '/weird']) {
+      expect(await access(A_VERIFIED, 'PATCH', route, undefined, 'ws-2', { grant: 'refuse' })).toMatchObject({ result: null, status: 403, body: { code: 'forbidden' } });
+    }
+    const fs = await import('fs');
+    for (const route of ['standup', 'directories', 'orchestration']) {
+      const src = fs.readFileSync(`src/pages/api/cli/workspaces/[workspaceId]/${route}.ts`, 'utf-8');
+      expect(src).toContain("authorizeWorkspace(req, res, workspaceId, { grant: 'refuse' })");
     }
     // ws-3 names ws-1 in allowedPeers: that access predates grants and is not audited as one.
     expect((await access(A_VERIFIED, 'DELETE', '/api/cli/tabs/tab-y?workspaceId=ws-3', undefined, 'ws-3')).result).toBe(A_VERIFIED);
