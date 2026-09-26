@@ -10,6 +10,7 @@ import { writeGrokHookFile } from '@/lib/providers/grok/hook-config';
 import { GROK_HOOK_SCRIPT_PATH } from '@/lib/providers/grok/paths';
 import { ensureWorkspaceClaudeHome, workspaceIdFromSessionName } from '@/lib/workspace-home';
 import { getWorkspaceToken } from '@/lib/workspace-token';
+import { ensureTabToken, type ITabIdentity } from '@/lib/tab-token';
 import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
 import { getProcessArgs } from '@/lib/process-utils';
@@ -53,7 +54,7 @@ export const listSessions = async (): Promise<string[]> => {
  * after the server started has no home yet, and a pane that launched without
  * hooks would report no work state at all.
  */
-const workspaceEnv = async (sessionName: string): Promise<Record<string, string>> => {
+const workspaceEnv = async (sessionName: string, identity?: ITabIdentity): Promise<Record<string, string>> => {
   const wsId = workspaceIdFromSessionName(sessionName);
   if (!wsId) return {};
   try {
@@ -68,6 +69,7 @@ const workspaceEnv = async (sessionName: string): Promise<Record<string, string>
       CLAUDE_CONFIG_DIR: claudeHome,
       GROK_HOME: grokHome,
       PMUX_TOKEN: getWorkspaceToken(wsId),
+      ...(await tabEnv(sessionName, identity)),
     };
   } catch (err) {
     // A pane that starts without isolation is far better than a pane that does
@@ -77,15 +79,36 @@ const workspaceEnv = async (sessionName: string): Promise<Record<string, string>
   }
 };
 
+/**
+ * The tab's own identity (ADR-0010). The caller names the tab because every
+ * caller creates the session BEFORE the tab reaches the layout, so the layout
+ * cannot answer yet. A failure here costs the tab its verified identity, not
+ * its workspace scope: the CLI falls back to `PMUX_TOKEN`.
+ */
+const tabEnv = async (sessionName: string, identity?: ITabIdentity): Promise<Record<string, string>> => {
+  if (!identity) return {};
+  try {
+    return {
+      PMUX_TAB_TOKEN: await ensureTabToken(identity, sessionName),
+      PMUX_TAB_ID: identity.tabId,
+      PMUX_WORKSPACE_ID: identity.workspaceId,
+    };
+  } catch (err) {
+    log.error(`tab token for ${identity.tabId} failed, launching without tab identity: ${err instanceof Error ? err.message : err}`);
+    return {};
+  }
+};
+
 export const createSession = async (
   name: string,
   cols: number,
   rows: number,
   cwd?: string,
+  identity?: ITabIdentity,
 ): Promise<void> => {
   // tmux 서버 global env cache를 우회하기 위해 `env -i $SHELL -l`을 명령으로 직접 넘긴다.
   // execFile의 env 옵션은 tmux 서버가 이미 떠있는 경우 무시되므로 의존하지 않는다.
-  const shellCmd = buildShellLaunchCommand(await workspaceEnv(name));
+  const shellCmd = buildShellLaunchCommand(await workspaceEnv(name, identity));
   await execFile(
     'tmux',
     [

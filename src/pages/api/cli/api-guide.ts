@@ -3,7 +3,8 @@ import { resolveCliScope } from '@/lib/workspace-token';
 
 const GUIDE = `# purplemux CLI HTTP API
 
-All endpoints require header \`x-pmux-token: <PMUX_TOKEN>\`.
+All endpoints require header \`x-pmux-token: <token>\` — \`PMUX_TAB_TOKEN\` when set,
+else \`PMUX_TOKEN\`.
 
 ## Workspace scope
 
@@ -15,6 +16,20 @@ read, drive, or create tabs anywhere but your own workspace, and an unscoped
 Cross-workspace access is deliberate and rare: the TARGET workspace must name your
 workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
 add one rather than working around a 403.
+
+## Caller identity
+
+Every tab created by the server also carries \`PMUX_TAB_TOKEN\`, \`PMUX_TAB_ID\` (the
+tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants exactly what the
+workspace token grants, and it also names the calling tab (verified). A tab token
+stops working when its tab closes.
+
+Tabs created before tab tokens existed have only \`PMUX_TOKEN\`. For them, send
+header \`x-pmux-session: <tmux session name>\` and the server names the tab
+UNVERIFIED — only when that session belongs to a tab of the token's own workspace;
+any other value is ignored. \`bin/cli.js\` sends it automatically inside tmux. The
+global token (\`~/.purplemux/cli-token\`) resolves to \`admin\`, never to a tab: any
+process of this user can read it, so it is not evidence of a human.
 
 Each workspace also gets its own agent session store — \`CLAUDE_CONFIG_DIR\` for
 Claude, \`GROK_HOME\` for Grok — so several workspaces can share one project root

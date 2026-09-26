@@ -17,6 +17,7 @@ const readFileOrNull = (file) => {
 };
 
 const PORT = process.env.PMUX_PORT || readFileOrNull(path.join(os.homedir(), '.purplemux', 'port'));
+const TAB_TOKEN = process.env.PMUX_TAB_TOKEN || null;
 const ENV_TOKEN = process.env.PMUX_TOKEN || null;
 const ADMIN_TOKEN = readFileOrNull(path.join(os.homedir(), '.purplemux', 'cli-token'));
 const BASE = `http://localhost:${PORT}`;
@@ -30,10 +31,12 @@ const BASE = `http://localhost:${PORT}`;
  * workspace — so when nothing scoped us, resolve the token of the workspace
  * the command already named in `-w` and present that.
  *
- * The order is the whole point. `PMUX_TOKEN` wins whenever it is set, which is
- * exactly the case of a command running INSIDE a tab: it stays confined to its
- * own workspace and never picks up a neighbour's token from disk. The lookup
- * below is reached only by a caller that was never scoped to begin with.
+ * The order is the whole point: `PMUX_TAB_TOKEN` > `PMUX_TOKEN` > the `-w`
+ * workspace's token on disk > the global token. The first two are set exactly
+ * when a command runs INSIDE a tab. The tab token names the tab as well as its
+ * workspace (ADR-0010); both stay confined to their own workspace and never
+ * pick up a neighbour's token from disk. The lookup below is reached only by a
+ * caller that was never scoped to begin with.
  */
 const workspaceTokenFor = (workspaceId) => {
   if (!workspaceId) return null;
@@ -46,10 +49,40 @@ const workspaceTokenFor = (workspaceId) => {
 };
 
 const tokenFor = (requestPath) => {
+  if (TAB_TOKEN) return TAB_TOKEN;
   if (ENV_TOKEN) return ENV_TOKEN;
   const match = /[?&]workspaceId=([^&]+)/.exec(requestPath || '');
   const workspaceId = match ? decodeURIComponent(match[1]) : null;
   return workspaceTokenFor(workspaceId) || ADMIN_TOKEN;
+};
+
+let ownSession;
+/** The tmux session this command runs in, or null outside tmux. Asked of tmux once per process. */
+const ownSessionName = () => {
+  if (ownSession !== undefined) return ownSession;
+  ownSession = null;
+  if (!process.env.TMUX) return ownSession;
+  try {
+    const name = require('child_process')
+      .execFileSync('tmux', ['display-message', '-p', '#{session_name}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .trim();
+    ownSession = name || null;
+  } catch {
+    ownSession = null;
+  }
+  return ownSession;
+};
+
+/**
+ * `X-Pmux-Session` lets the server name the calling tab for a workspace token
+ * (tabs created before tab tokens existed). The server trusts it only inside
+ * the token's own workspace, and a tab token makes it redundant.
+ */
+const headersFor = (requestPath, extra) => {
+  const headers = { 'X-Pmux-Token': tokenFor(requestPath), ...(extra || {}) };
+  const session = TAB_TOKEN ? null : ownSessionName();
+  if (session) headers['X-Pmux-Session'] = session;
+  return headers;
 };
 
 // Exit-code contract (docs/adr/0016-cli-exit-codes-and-tab-owned-processes.md).
@@ -152,7 +185,7 @@ const die = (msg) => {
 
 const requireEnv = () => {
   if (!PORT) fail('server-unreachable', 'PMUX_PORT not set and ~/.purplemux/port missing (is the server running?)');
-  if (!ENV_TOKEN && !ADMIN_TOKEN) fail('server-unreachable', 'PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
+  if (!TAB_TOKEN && !ENV_TOKEN && !ADMIN_TOKEN) fail('server-unreachable', 'PMUX_TAB_TOKEN and PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
 };
 
 // Failures that happen before the request reaches the server: retrying cannot
@@ -238,7 +271,8 @@ const isJson = (resp) => (resp.headers.get('content-type') || '').includes('json
 
 const api = async (method, path, data) => {
   const opts = {
-    headers: { 'X-Pmux-Token': tokenFor(path), 'Content-Type': 'application/json' },
+    method,
+    headers: headersFor(path, { 'Content-Type': 'application/json' }),
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
   const resp = await request(method, path, opts);
@@ -252,7 +286,7 @@ const api = async (method, path, data) => {
 };
 
 const apiRaw = async (method, path) => {
-  const resp = await request(method, path, { headers: { 'X-Pmux-Token': tokenFor(path) } });
+  const resp = await request(method, path, { headers: headersFor(path) });
   if (!resp.ok) failFromResponse(resp, isJson(resp) ? await readBody(method, path, resp, 'json') : null);
   return resp;
 };
@@ -312,12 +346,16 @@ const cmdWorkspacePeers = async (args) => {
   die('usage: workspace peers show|set -w WS [PEER_WS_ID...]');
 };
 
+/**
+ * `PMUX_TAB_ID` is the tab's layout id; the server adopts an orphan session
+ * under the id its token was minted for, so the two stay equal. The
+ * session-name parse remains for tabs created before `PMUX_TAB_ID` existed.
+ */
 const deriveOwnTabId = () => {
-  try {
-    const session = require('child_process').execSync("tmux display-message -p '#{session_name}'", { encoding: 'utf8' }).trim();
-    const m = session.match(/^pt-ws-.*-(tab-.+)$/);
-    return m ? m[1] : null;
-  } catch { return null; }
+  if (process.env.PMUX_TAB_ID) return process.env.PMUX_TAB_ID;
+  const session = ownSessionName();
+  const m = session ? session.match(/^pt-ws-.*-(tab-.+)$/) : null;
+  return m ? m[1] : null;
 };
 
 const cmdOrchestration = async (args) => {
@@ -887,8 +925,12 @@ Exit codes:
     error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
 
 Environment:
-  PMUX_PORT       Server port (required)
-  PMUX_TOKEN      CLI token (required)
+  PMUX_PORT          Server port (falls back to ~/.purplemux/port)
+  PMUX_TAB_TOKEN     This tab's own token; names the calling tab (set in every tab created by the server)
+  PMUX_TOKEN         This tab's workspace token (ignored while PMUX_TAB_TOKEN is set; unset that to override)
+  PMUX_TAB_ID        This tab's id; the default TAB_ID of "orchestration on"
+  PMUX_WORKSPACE_ID  This tab's workspace id
+  Token order: PMUX_TAB_TOKEN > PMUX_TOKEN > the -w workspace's token on disk > ~/.purplemux/cli-token
 `);
 };
 

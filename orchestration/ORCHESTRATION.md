@@ -66,6 +66,8 @@ for the wake-up path = nothing to stall.
 ## Kickoff (step by step)
 
 ```bash
+# Inside a purplemux tab, PMUX_TAB_TOKEN and PMUX_TOKEN are already set and
+# PMUX_TAB_TOKEN wins over PMUX_TOKEN; the exports below are for a plain shell.
 export PMUX_PORT=$(cat ~/.purplemux/port)
 export PMUX_TOKEN=$(cat ~/.purplemux/cli-token)
 
@@ -102,6 +104,7 @@ to worker agents in purplemux tabs; you never implement stories yourself.
 
 ## Environment
 export PMUX_PORT=$(cat ~/.purplemux/port); export PMUX_TOKEN=$(cat ~/.purplemux/cli-token)
+(Inside a purplemux tab, PMUX_TAB_TOKEN is set and takes precedence over PMUX_TOKEN.)
 Workspace: WS_ID. Your own tab: ORCH_TAB_ID (never send to yourself).
 
 purplemux commands you use:

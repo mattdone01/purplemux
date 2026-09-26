@@ -102,7 +102,7 @@ export const authorizeWorkspaceInput = async (
       error:
         `Sending input to a tab in ${workspaceId} requires that workspace's own token (caller is ${
           scope.type === 'workspace' ? `scoped to ${scope.workspaceId}` : 'using the global token'
-        }). Reads are unaffected. Set PMUX_TOKEN to the ${workspaceId} token to drive its tabs; ` +
+        }). Reads are unaffected. Set PMUX_TOKEN to the ${workspaceId} token (and unset PMUX_TAB_TOKEN, which takes precedence) to drive its tabs; ` +
         'allowedPeers deliberately does not grant input.',
       code: 'forbidden',
     });
