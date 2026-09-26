@@ -133,17 +133,19 @@ describe('checks-wave3.cjs judgements (story 23)', () => {
     expect(wave3.alertsFor(path.join(dir, 'none'), 'tab-a')).toEqual([]);
   });
 
-  it('the fake gh answers the nth read of a path, then the default, and 404s an unknown path', () => {
+  it('the fake gh answers the nth read of a path, then the default, applies --jq, and 404s an unknown path', () => {
     fs.mkdirSync(path.join(dir, 'bin'));
     const answers = wave3.installFakeGh(dir);
     fs.writeFileSync(path.join(answers, 'repos_o_r_pulls_2.1'), 'first');
     fs.writeFileSync(path.join(answers, 'repos_o_r_pulls_2'), 'later');
-    fs.writeFileSync(path.join(answers, 'repos_o_r_commits_c_check_runs_per_page_100'), 'runs');
+    fs.writeFileSync(path.join(answers, 'repos_o_r_commits_c_check_runs_per_page_100'), JSON.stringify({ check_runs: [{ status: 'completed', conclusion: null }] }));
     const gh = (...args: string[]) => spawnSync(path.join(dir, 'bin', 'gh'), args, { encoding: 'utf-8' });
     expect(gh('api', 'repos/o/r/pulls/2').stdout).toBe('first');
     expect(gh('api', 'repos/o/r/pulls/2').stdout).toBe('later');
     expect(gh('api', 'repos/o/r/pulls/2').stdout).toBe('later');
-    expect(gh('api', '--paginate', 'repos/o/r/commits/c/check-runs?per_page=100', '--jq', '.x').stdout).toBe('runs');
+    // The server's own --jq filter runs on the API body, as gh would.
+    const filter = '.check_runs[] | [.status, (.conclusion // "")] | @tsv';
+    expect(gh('api', '--paginate', 'repos/o/r/commits/c/check-runs?per_page=100', '--jq', filter).stdout).toBe('completed\t\n');
     const missing = gh('api', 'repos/o/r/pulls/9');
     expect(missing.status).toBe(1);
     expect(missing.stderr).toContain('HTTP 404');
