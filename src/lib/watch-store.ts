@@ -147,6 +147,7 @@ export const createWatch = (
   baseline: string | null,
   now: number,
   id: string,
+  baselineHolds = false,
 ): IWatch => ({
   id,
   workspaceId: owner.workspaceId,
@@ -158,8 +159,9 @@ export const createWatch = (
   intervalS: spec.intervalS,
   createdAt: now,
   expiresAt: now + spec.ttlSeconds * 1000,
-  // The baseline read at creation is the first check of a GitHub watch.
-  lastCheckedAt: spec.kind === 'lease' ? null : now,
+  // The baseline read at creation is the first check of a GitHub watch, unless it already showed
+  // the condition (a PR merged or closed): then the first pass reports it (review round 2).
+  lastCheckedAt: spec.kind === 'lease' || baselineHolds ? null : now,
   failures: 0,
   failingNotified: false,
   lastError: null,
@@ -169,13 +171,15 @@ export const createWatch = (
 });
 
 /**
- * A lease watch is evaluated every pass (a local read); a GitHub watch when its interval is due,
- * the interval doubling per consecutive failure up to WATCH_BACKOFF_MAX (a rate-limited `gh` is
- * not hammered). A pending notice is always due: only its enqueue is retried.
+ * A lease watch is evaluated every pass (a local read); a GitHub watch when its interval is due.
+ * Once the failing notice has gone out (WATCH_FAILURES_BEFORE_NOTICE failures), the interval doubles
+ * per further failure up to WATCH_BACKOFF_MAX, so a broken watch does not hammer a rate-limited `gh`
+ * while the first three reads stay prompt (review round 2). A pending notice is always due.
  */
 export const isDue = (w: IWatch, now: number): boolean => {
   if (w.kind === 'lease' || w.lastCheckedAt === null || w.pendingNotice) return true;
-  const backoff = w.failures > 0 ? Math.min(2 ** w.failures, WATCH_BACKOFF_MAX) : 1;
+  const beyond = w.failures - WATCH_FAILURES_BEFORE_NOTICE + 1;
+  const backoff = beyond > 0 ? Math.min(2 ** beyond, WATCH_BACKOFF_MAX) : 1;
   return now - w.lastCheckedAt >= w.intervalS * 1000 * backoff;
 };
 
@@ -204,7 +208,9 @@ const isWatch = (v: unknown): v is IWatch => {
   const w = v as Record<string, unknown>;
   return isWatchId(w.id) && typeof w.workspaceId === 'string' && typeof w.tabId === 'string'
     && (w.kind === 'pr' || w.kind === 'ref' || w.kind === 'lease') && typeof w.target === 'string'
-    && Number.isSafeInteger(w.expiresAt) && Number.isSafeInteger(w.intervalS);
+    && Number.isSafeInteger(w.expiresAt) && Number.isSafeInteger(w.intervalS)
+    && (w.pendingNotice === undefined || w.pendingNotice === null
+      || (typeof w.pendingNotice === 'object' && typeof (w.pendingNotice as Record<string, unknown>).notice === 'string'));
 };
 
 /** Absent file = no watches; a malformed file is refused, never read as empty (the next write would erase it). */

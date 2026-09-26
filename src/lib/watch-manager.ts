@@ -28,6 +28,8 @@ import type { IWatch, IWatchesState, IWatchView, TWatchFailure } from '@/types/w
 const log = createLogger('watches');
 
 export const WATCH_TICK_MS = 15_000;
+/** A watch whose notice cannot be queued is dropped this long after its expiry. */
+export const PENDING_GRACE_MS = 24 * 60 * 60 * 1000;
 export const GH_TIMEOUT_MS = 20_000;
 
 export type TGhResult = { ok: true; stdout: string } | { ok: false; code: TWatchFailure; message: string };
@@ -214,13 +216,18 @@ export class WatchManager {
   private async pass(lane: 'lease' | 'github', onlyLease?: string): Promise<void> {
     const now = this.deps.now();
     const { watches } = await this.deps.read();
-    const outcomes = new Map<string, TOutcome | 'expired'>();
+    const outcomes = new Map<string, TOutcome | 'expired' | 'dropped'>();
     // Evaluated outside the lock: a GitHub read may take its full timeout.
     for (const w of watches) {
       if ((w.kind === 'lease') !== (lane === 'lease')) continue;
       if (onlyLease !== undefined && w.target !== onlyLease) continue;
       if (now >= w.expiresAt && !w.pendingNotice) {
         outcomes.set(w.id, 'expired');
+        continue;
+      }
+      // A notice the inbox keeps refusing does not keep its watch alive forever (review round 2).
+      if (w.pendingNotice && now >= w.expiresAt + PENDING_GRACE_MS) {
+        outcomes.set(w.id, 'dropped');
         continue;
       }
       if (!isDue(w, now)) continue;
@@ -246,9 +253,13 @@ export class WatchManager {
     });
   }
 
-  private async apply(list: IWatch[], w: IWatch, outcome: TOutcome | 'expired', now: number): Promise<IWatch[]> {
+  private async apply(list: IWatch[], w: IWatch, outcome: TOutcome | 'expired' | 'dropped', now: number): Promise<IWatch[]> {
     const without = () => list.filter((x) => x.id !== w.id);
     const replace = (x: IWatch) => list.map((y) => (y.id === w.id ? x : y));
+    if (outcome === 'dropped') {
+      log.error(`watch ${w.id} dropped: its ${String(w.pendingNotice?.notice)} notice could not be queued for a day past expiry`);
+      return without();
+    }
     if (outcome === 'expired' || outcome.type === 'fire') {
       const fields: TFired = outcome === 'expired' ? { notice: 'expired', until: w.until } : outcome.fields;
       try {
@@ -298,10 +309,15 @@ export class WatchManager {
 
   // ─── the API ────────────────────────────────────────────────────────────
 
-  private async baseline(spec: IWatchSpec): Promise<string | null> {
-    if (spec.kind === 'lease') return null;
+  /** The baseline sha, and whether the creation read already shows a PR merged or closed. */
+  private async baseline(spec: IWatchSpec): Promise<{ sha: string | null; holds: boolean }> {
+    if (spec.kind === 'lease') return { sha: null, holds: false };
     const r = spec.kind === 'pr' ? await this.pull(spec.target) : await this.refSha(spec.target);
-    if (r.ok) return 'head' in r ? r.head : r.sha;
+    if (r.ok) {
+      if (!('head' in r)) return { sha: r.sha, holds: false };
+      const holds = (spec.until === 'merged' || spec.until === 'closed') && (r.merged || r.state === 'closed');
+      return { sha: r.head, holds };
+    }
     if (r.code === 'http-404') throw new WatchError('watch-invalid', `${spec.target} does not exist or is not visible to the server's gh`);
     throw new WatchError('gh-unavailable', `gh could not read ${spec.target} (${r.code}): ${r.message}`);
   }
@@ -315,7 +331,7 @@ export class WatchManager {
     // A cheap cap check before the GitHub read, then the binding one under the lock.
     checkCaps(await this.deps.read(), spec, owner);
     const baseline = await this.baseline(spec);
-    const watch = createWatch(spec, owner, baseline, this.deps.now(), this.deps.newId());
+    const watch = createWatch(spec, owner, baseline.sha, this.deps.now(), this.deps.newId(), baseline.holds);
     await this.deps.mutate(async (state) => {
       checkCaps(state, spec, owner);
       return { state: { watches: [...state.watches, watch] }, value: undefined };

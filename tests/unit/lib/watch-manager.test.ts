@@ -248,12 +248,53 @@ describe('harness watches (ADR-0015)', () => {
     expect(await code(m.clear(B, '../x'))).toBe('watch-not-found');
   });
 
-  it('a failing watch backs off: the next read waits twice the interval, then four times, capped at eight', () => {
+  it('a failing watch reads at its interval until the failing notice, then backs off 2x, 4x, capped at 8x', () => {
     const w = { kind: 'pr', intervalS: 120, lastCheckedAt: T0, failures: 0, pendingNotice: null } as never;
-    expect(isDue(w, T0 + 120_000)).toBe(true);
-    expect(isDue({ ...(w as object), failures: 1 } as never, T0 + 120_000)).toBe(false);
-    expect(isDue({ ...(w as object), failures: 1 } as never, T0 + 240_000)).toBe(true);
-    expect(isDue({ ...(w as object), failures: 9 } as never, T0 + 8 * 120_000)).toBe(true);
+    const at = (failures: number, seconds: number) => isDue({ ...(w as object), failures } as never, T0 + seconds * 1000);
+    expect(at(0, 120)).toBe(true);
+    expect(at(2, 120)).toBe(true); // the first three reads stay prompt: the notice is not delayed
+    expect(at(3, 120)).toBe(false);
+    expect(at(3, 240)).toBe(true);
+    expect(at(4, 479)).toBe(false);
+    expect(at(4, 480)).toBe(true);
+    expect(at(9, 959)).toBe(false);
+    expect(at(9, 960)).toBe(true);
+  });
+
+  it('a PR already merged when the watch is made is reported on the first pass, not an interval later', async () => {
+    f.answer('/pulls/11', f.pull(true, 'closed', SHA_A));
+    const w = await m.create(B, { kind: 'pr', target: 'o/r#11', until: 'merged' });
+    expect(w.lastCheckedAt).toBeNull();
+    await m.tick();
+    expect(f.sent.map((x) => x.line)).toEqual([expect.stringContaining('o/r#11 is MERGED')]);
+  });
+
+  it('a condition that held but could not be queued is reported as itself after expiry, never as expired', async () => {
+    f.answer('/pulls/12', f.pull(false, 'open', SHA_A), f.pull(true, 'closed', SHA_A));
+    const w = await m.create(B, { kind: 'pr', target: 'o/r#12', until: 'merged', ttlSeconds: 600 });
+    const deps = f.deps();
+    let broken = true;
+    const flaky = new WatchManager({ ...deps, enqueue: async (req) => { if (broken) throw new Error('refused'); return deps.enqueue(req); } });
+    f.now += 3 * MIN;
+    await flaky.tick();
+    f.now = w.expiresAt + MIN;
+    broken = false;
+    await flaky.tick();
+    expect(f.sent.map((x) => x.fields.notice)).toEqual(['merged']);
+  });
+
+  it('a notice still refused a day past expiry drops its watch', async () => {
+    f.answer('/pulls/13', f.pull(false, 'open', SHA_A), f.pull(true, 'closed', SHA_A));
+    const w = await m.create(B, { kind: 'pr', target: 'o/r#13', until: 'merged', ttlSeconds: 600 });
+    const refusing = new WatchManager({ ...f.deps(), enqueue: async () => { throw new Error('refused'); } });
+    f.now += 3 * MIN;
+    await refusing.tick();
+    f.now = w.expiresAt + 23 * 60 * MIN;
+    await refusing.tick();
+    expect(f.state.watches).toHaveLength(1);
+    f.now = w.expiresAt + 24 * 60 * MIN;
+    await refusing.tick();
+    expect(f.state.watches).toEqual([]);
   });
 
   it('refuses a GitHub watch that would take the host past its request budget', async () => {
@@ -377,6 +418,7 @@ describe('watch spec and GitHub parsing', () => {
     const e = (over: Record<string, unknown>) => Object.assign(new Error('x'), over) as never;
     expect(classifyGhError(e({ code: 'ENOENT' }), '')).toBe('gh-missing');
     expect(classifyGhError(e({ killed: true }), '')).toBe('timeout');
+    expect(classifyGhError(e({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', killed: true }), '')).toBe('other');
     expect(classifyGhError(e({}), 'gh: Not Found (HTTP 404)')).toBe('http-404');
     expect(classifyGhError(e({}), 'HTTP 403: rate limit')).toBe('http-403');
     expect(classifyGhError(e({}), 'To get started with GitHub CLI, please run:  gh auth login')).toBe('auth');

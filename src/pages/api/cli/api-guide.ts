@@ -331,7 +331,7 @@ GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a 
 evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
 max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
 server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
-text; a failing watch reads less often (the interval doubles per failure, up to 8x). A merged
+text; after that notice the watch reads less often (2x, 4x, up to 8x its interval). A merged
 watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
 requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
 tab holds at most 30 watches.
