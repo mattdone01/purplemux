@@ -15,6 +15,8 @@ import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
 import { getProcessArgs } from '@/lib/process-utils';
 import { PASTE_END, PASTE_START, TYPED_CHUNK_GAP_MS, planTypedInput } from '@/lib/typed-input';
+import { defaultReaperDeps, reapTabProcesses, type IReapResult } from '@/lib/tab-reaper';
+import { appendCoordinationAudit } from '@/lib/coordination-audit';
 
 const log = createLogger('terminal');
 
@@ -132,11 +134,32 @@ export const createSession = async (
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const killSession = async (name: string): Promise<void> => {
-  if (!(await hasSession(name))) return;
+export interface IKillSessionOptions {
+  /** The tab the session belongs to: its processes are reaped first (ADR-0016, story 16). */
+  tabId?: string;
+  /** Skip the environment-marker scan and signal only the pane group (today's behaviour). */
+  keepProcesses?: boolean;
+}
+
+/**
+ * Kill a tab's tmux session. With a `tabId`, the tab's processes — every pane
+ * descendant and every process carrying `PMUX_TAB_ID=<tabId>` — are reaped
+ * first, while the environ scan still sees them; the result is returned and
+ * every kill is audited.
+ */
+export const killSession = async (name: string, opts: IKillSessionOptions = {}): Promise<IReapResult | null> => {
+  if (!(await hasSession(name))) return null;
 
   log.debug(`killSession start: ${name}`);
   const panePid = await getSessionPanePid(name);
+  let reap: IReapResult | null = null;
+  if (opts.tabId) {
+    reap = await reapTabProcesses(defaultReaperDeps(getDescendantPids), { tabId: opts.tabId, panePid, keepProcesses: opts.keepProcesses });
+    if (reap.killed.length > 0 || reap.survivors.length > 0) {
+      log.info({ tabId: opts.tabId, killed: reap.killed.map((p) => p.pid), survivors: reap.survivors.map((p) => p.pid) }, 'tab processes reaped');
+      await appendCoordinationAudit({ event: 'tab-reap', tabId: opts.tabId, session: name, keepProcesses: !!opts.keepProcesses, killed: reap.killed, survivors: reap.survivors });
+    }
+  }
   if (panePid) {
     try {
       log.debug(`SIGTERM → process group ${panePid}: ${name}`);
@@ -159,7 +182,7 @@ export const killSession = async (name: string): Promise<void> => {
   for (let i = 0; i < 5; i++) {
     if (!(await hasSession(name))) {
       log.debug(`killSession done (SIGTERM): ${name}`);
-      return;
+      return reap;
     }
     await sleep(200);
   }
@@ -187,12 +210,13 @@ export const killSession = async (name: string): Promise<void> => {
   for (let i = 0; i < 3; i++) {
     if (!(await hasSession(name))) {
       log.debug(`killSession done (SIGKILL): ${name}`);
-      return;
+      return reap;
     }
     await sleep(200);
   }
 
   log.warn(`tmux session still alive after kill: ${name}`);
+  return reap;
 };
 
 export const resolveExistingDir = async (preferred?: string): Promise<string> => {
@@ -691,7 +715,7 @@ const getChildPidsOf = async (parentPids: number[]): Promise<number[]> => {
   }
 };
 
-const getDescendantPids = async (rootPid: number): Promise<number[]> => {
+export const getDescendantPids = async (rootPid: number): Promise<number[]> => {
   const all: number[] = [];
   let frontier = [rootPid];
   while (frontier.length > 0) {

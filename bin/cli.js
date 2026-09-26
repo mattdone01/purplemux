@@ -819,18 +819,25 @@ const cmdTabResult = async (args) => {
 
 const cmdTabClose = async (args) => {
   requireEnv();
-  const rest = stripFlags(args, ['--workspace', '-w']);
+  const keep = args.includes('--keep-processes');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--keep-processes']);
   const tabId = rest[0];
   if (!tabId) die('tab ID is required');
   const wsId = resolveWsForTab(args);
   const { body } = await api(
     'DELETE',
-    `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
+    `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}${keep ? '&keepProcesses=1' : ''}`,
   );
   // A 200 is not a close: the server answers `ok: false` when the layout kept
   // the tab, and printing ok over that hides a tab that is still running.
   if (body?.ok !== true) return fail('close-not-confirmed', `the server answered ${JSON.stringify(body)}`);
-  process.stdout.write('ok\n');
+  // `ok` stays the first line; what the close reaped follows (ADR-0016).
+  const lines = ['ok'];
+  for (const p of Array.isArray(body.killed) ? body.killed : []) lines.push(`killed ${p.pid} ${p.comm} ${p.args}`);
+  for (const p of Array.isArray(body.survivors) ? body.survivors : []) lines.push(`survivor ${p.pid} ${p.comm} ${p.args}`);
+  if (body.reaper === 'unavailable') lines.push('reaper: unavailable (no /proc): only the pane group was signalled');
+  if (body.envMarker === 'absent') lines.push('envMarker: absent (a tab created before per-tab identity): only its pane descendants were reaped');
+  process.stdout.write(`${lines.join('\n')}\n`);
 };
 
 // Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
@@ -1063,7 +1070,10 @@ Commands:
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status (includes registered probes + background jobs)
   tab result -w WS TAB_ID                  Capture tab pane content
-  tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close
+  tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close, then
+             [--keep-processes]            every process it reaped: the pane's descendants and every process whose
+                                           environment carries PMUX_TAB_ID=TAB_ID (SIGTERM, 3 s, SIGKILL).
+                                           --keep-processes signals only the pane group, as before
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
