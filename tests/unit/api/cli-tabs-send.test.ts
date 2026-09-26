@@ -21,7 +21,7 @@ const cliUtils = vi.hoisted(() => ({
   ),
 }));
 
-const live = vi.hoisted(() => ({ entries: {} as Record<string, { cliState: TCliState }> }));
+const live = vi.hoisted(() => ({ entries: {} as Record<string, { cliState: TCliState }>, waiting: new Set<string>() }));
 const dispatchPolicy = vi.hoisted(() => vi.fn<
   (workspaceId: string, target: ITab, options?: unknown) => Promise<{ ok: boolean; error?: string }>
 >(async () => ({ ok: true })));
@@ -37,7 +37,7 @@ vi.mock('@/lib/tmux', () => tmux);
 vi.mock('@/lib/agent-prompt-delivery', () => delivery);
 vi.mock('@/lib/cli-utils', () => cliUtils);
 vi.mock('@/lib/status-manager', () => ({
-  getStatusManager: () => ({ getAllForClient: () => live.entries }),
+  getStatusManager: () => ({ getAllForClient: () => live.entries, isWaitingAtPrompt: (id: string) => live.waiting.has(id) }),
 }));
 
 interface IFakeResponse {
@@ -115,6 +115,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     vi.clearAllMocks();
     dispatchPolicy.mockResolvedValue({ ok: true });
     live.entries = {};
+    live.waiting = new Set();
     tmux.hasSession.mockResolvedValue(true);
     tmux.isContentPendingInComposer.mockResolvedValue(false);
     cliUtils.authorizeWorkspaceInput.mockResolvedValue({ type: 'workspace', workspaceId: WORKSPACE_ID });
@@ -231,6 +232,18 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(response.body).toMatchObject({ detail: 'readiness-timeout', cliState: 'busy' });
     expect((response.body as { waitedMs: number }).waitedMs).toBeGreaterThanOrEqual(30);
     expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+  });
+
+  it('pastes at once into a busy agent that is WAITING at its prompt (ADR-0018, ruling A′)', async () => {
+    cliUtils.findTab.mockResolvedValue(locate(tabWith('busy')));
+    live.entries = { [TAB_ID]: { cliState: 'busy' } };
+    live.waiting.add(TAB_ID);
+
+    const response = await call({ content: 'gate r2 is green; merge it', waitMs: 30 });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'busy' });
+    expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'gate r2 is green; merge it');
   });
 
   it.each<TPanelType>(['terminal', 'web-browser', 'diff'])(

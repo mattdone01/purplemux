@@ -39,6 +39,23 @@ export interface IAgentPreflight {
   loggedIn: boolean;
 }
 
+export interface IRuntimeSnapshotOptions {
+  force?: boolean;
+  /**
+   * Background tasks started before this time (the agent process's start) are
+   * ignored: a task open when the process died never reports back (ADR-0018).
+   */
+  tasksSince?: number | null;
+  /** Compute `backgroundActivityAt` (file stats); only the stall check needs it. */
+  withActivity?: boolean;
+}
+
+export interface IOpenBackgroundTaskKinds {
+  shell: number;
+  agent: number;
+  monitor: number;
+}
+
 export interface IAgentRuntimeSnapshot {
   idle: boolean;
   stale: boolean;
@@ -56,6 +73,21 @@ export interface IAgentRuntimeSnapshot {
    * that cannot observe it keep their current behaviour.
    */
   openBackgroundTasks?: number;
+  /**
+   * Newest sign of life of that background work (task output files, subagent
+   * transcripts, Monitor events, the transcript itself); null when nothing is
+   * open. The main transcript alone is quiet while a subagent works (L19).
+   */
+  backgroundActivityAt?: number | null;
+  /** The open background work by kind; judged differently for a stall (ADR-0018). */
+  openBackgroundTaskKinds?: IOpenBackgroundTaskKinds;
+  /**
+   * The final ≤ 600 characters of the current turn's last assistant message.
+   * The turn-end marker (`DONE:` …) is its last line, which a head snippet
+   * cuts off. Null when the turn has no assistant text; absent when the
+   * provider cannot read it.
+   */
+  lastAssistantTail?: string | null;
 }
 
 export interface IAgentSessionHistoryStats {
@@ -150,7 +182,7 @@ export interface IAgentProvider {
 
   parsePaneTitle(paneTitle: string | null): string | null;
   sessionIdFromJsonlPath(jsonlPath: string | null | undefined): string | null;
-  readRuntimeSnapshot(jsonlPath: string, options?: { force?: boolean }): Promise<IAgentRuntimeSnapshot>;
+  readRuntimeSnapshot(jsonlPath: string, options?: IRuntimeSnapshotOptions): Promise<IAgentRuntimeSnapshot>;
   readSessionHistoryStats(jsonlPath: string): Promise<IAgentSessionHistoryStats>;
   preflight(): Promise<IAgentPreflight>;
   writeWorkspacePrompt?(ws: IWorkspace): Promise<void>;

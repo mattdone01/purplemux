@@ -96,6 +96,11 @@ export interface ITabSendTarget {
   sessionName: string;
   cliState: TCliState | null;
   panelType?: TPanelType;
+  /**
+   * `busy` only because its ended turn waits on background work (ADR-0018):
+   * the composer is empty, so the `composer-ready` gate accepts it.
+   */
+  waitingAtPrompt?: boolean;
 }
 
 /**
@@ -180,7 +185,8 @@ export const awaitSendReadiness = async (
     if (
       request.gate === 'live-session' ||
       !isAgentPanelType(target.panelType) ||
-      isComposerReadyCliState(target.cliState)
+      isComposerReadyCliState(target.cliState) ||
+      target.waitingAtPrompt === true
     ) {
       return { ok: true, target };
     }

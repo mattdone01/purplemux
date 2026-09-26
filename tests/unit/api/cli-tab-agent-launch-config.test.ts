@@ -51,6 +51,8 @@ vi.mock('@/lib/status-manager', () => ({
 }));
 vi.mock('@/lib/agent-dispatch-policy', () => dispatch);
 vi.mock('@/lib/providers/codex/managed-launch', () => managed);
+const reportsTo = vi.hoisted(() => ({ checkReportsTo: vi.fn() }));
+vi.mock('@/lib/reports-to', () => reportsTo);
 
 interface IFakeResponse {
   statusCode: number;
@@ -167,5 +169,39 @@ describe('POST /api/cli/tabs launch config', () => {
     expect(response.body).toMatchObject({ error: 'agent-model-mismatch', tabId: 'tab-orchestrator' });
     expect(codex.buildLaunchCommand).not.toHaveBeenCalled();
     expect(layout.addTabToPane).not.toHaveBeenCalled();
+  });
+
+  it('refuses a reportsTo outside the workspace before creating anything (ADR-0018)', async () => {
+    reportsTo.checkReportsTo.mockResolvedValue({ error: 'not a tab of workspace ws-pins', code: 'reports-to-invalid', reportsTo: 'tab-other' });
+    const { default: handler } = await import('@/pages/api/cli/tabs');
+    const response = fakeResponse();
+
+    await handler({
+      method: 'POST',
+      headers: { 'x-pmux-token': 'workspace-token' },
+      body: { workspaceId: 'ws-pins', panelType: 'codex-cli', reportsTo: 'tab-other' },
+    } as unknown as NextApiRequest, response.res);
+
+    expect(reportsTo.checkReportsTo).toHaveBeenCalledWith('ws-pins', 'tab-other');
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toMatchObject({ code: 'reports-to-invalid' });
+    expect(layout.addTabToPane).not.toHaveBeenCalled();
+  });
+
+  it('stores a valid reportsTo on the created tab', async () => {
+    reportsTo.checkReportsTo.mockResolvedValue(null);
+    const { default: handler } = await import('@/pages/api/cli/tabs');
+    const response = fakeResponse();
+
+    await handler({
+      method: 'POST',
+      headers: { 'x-pmux-token': 'workspace-token' },
+      body: { workspaceId: 'ws-pins', panelType: 'terminal', reportsTo: 'tab-o2' },
+    } as unknown as NextApiRequest, response.res);
+
+    expect(layout.addTabToPane).toHaveBeenCalledWith(
+      'ws-pins', 'pane-one', undefined, '/repo', 'terminal', undefined,
+      expect.objectContaining({ reportsTo: 'tab-o2' }),
+    );
   });
 });

@@ -36,7 +36,7 @@ vi.mock('@/lib/layout-store', () => ({}));
 vi.mock('@/lib/providers/codex', () => ({ CODEX_LAUNCHER_SCRIPT: '/test/codex-launcher.js', codexProvider: {} }));
 vi.mock('@/lib/providers/codex/session-detection', () => ({ findCodexSessionById: vi.fn() }));
 vi.mock('@/lib/providers/codex/model-observation', () => ({ getCodexModelStatus: mocks.model }));
-vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ getAllForClient: () => ({}) }) }));
+vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false }) }));
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
 vi.mock('@/lib/providers/registry', () => ({ listProviders: () => [] }));
 vi.mock('@/lib/grok-home', () => ({ removeWorkspaceGrokHome: vi.fn() }));

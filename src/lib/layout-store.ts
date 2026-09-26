@@ -318,7 +318,7 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig }): Promise<ITab | null> =>
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -341,7 +341,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}) };
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}) };
 
     pane.tabs.push(tab);
     pane.activeTabId = tabId;
@@ -654,6 +654,29 @@ const mutate = async (
     syncWorkspaceDirectories(wsId, result.root);
     return result;
   });
+
+/** Set or clear the tab a tab reports to; false when the tab is gone. */
+export const setTabReportsTo = async (wsId: string, tabId: string, reportsTo: string | null): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    if ((tab.reportsTo ?? null) === reportsTo) return { changed: false, value: true };
+    if (reportsTo) tab.reportsTo = reportsTo;
+    else delete tab.reportsTo;
+    return { changed: true, value: true };
+  })).found;
+
+/** Drop every `reportsTo` in a workspace that names a closed tab; the ids cleared. */
+export const clearReportsTo = async (wsId: string, closedTabId: string): Promise<string[]> => {
+  const cleared: string[] = [];
+  await mutate(wsId, (layout) => {
+    for (const tab of collectAllTabs(layout.root)) {
+      if (tab.reportsTo !== closedTabId) continue;
+      delete tab.reportsTo;
+      cleared.push(tab.id);
+    }
+    return cleared.length ? layout : null;
+  });
+  return cleared;
+};
 
 export const patchLayout = async (
   wsId: string,

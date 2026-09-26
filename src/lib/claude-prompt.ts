@@ -27,16 +27,22 @@ so no environment setup is needed.
 purplemux workspaces                                # list all workspaces
 purplemux tab list -w ${ws.id}                        # list tabs in this workspace
 purplemux tab create -w ${ws.id} [-n NAME] [-t TYPE]  # create a tab (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+                    [--reports-to TAB_ID]              # its watchdog nudges go to TAB_ID, not the workspace orchestrator
 purplemux tab send -w ${ws.id} TAB_ID CONTENT...      # send input to a tab
 purplemux tab status -w ${ws.id} TAB_ID               # tab status
 purplemux tab result -w ${ws.id} TAB_ID               # capture current pane content
 purplemux tab close -w ${ws.id} TAB_ID                # close a tab
+purplemux tab bg add -w ${ws.id} TAB_ID --pid N --notify self  # wake TAB_ID itself when pid N exits
 purplemux standup report -w ${ws.id} --json '{...}'   # post a standup tick — the human-readable progress digest
 purplemux standup show -w ${ws.id}                    # latest standup + history
 purplemux lease check NAME                            # exact name; exit 0 you hold it, 3 another does, 7 nobody
 purplemux lease acquire NAME [--ttl 45m] [--epic S]   # e.g. merge:owner/repo, epic:SLUG; exit 3 + stderr lease-held = held elsewhere
 purplemux lease release NAME                          # release what you hold; lease list shows every holder
 \`\`\`
+
+The watchdog reads the LAST line of your turn: \`DONE:\`, \`BLOCKED:\`, \`NEEDS-DECISION:\` or
+\`READY-TO-MERGE:\` reaches your orchestrator verbatim. A turn that ends with no such line while
+your background shells, agents or registered jobs still run is WAITING: no nudge until they finish.
 
 Exit codes: 4 means the target tab is gone (\`tab-not-found\`, \`session-not-running\`,
 \`target-changed\`) — never retry it. 5 (agent not ready) and 6 (server unreachable) may be

@@ -13,6 +13,7 @@ import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
+import { checkReportsTo } from '@/lib/reports-to';
 import {
   prepareCodexManagedLaunch,
   submitCodexManagedLaunch,
@@ -47,6 +48,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       cliState: TCliState | null;
       lastEvent: ILastEvent | null;
       busySince: number | null;
+      reportsTo: string | null;
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -81,6 +83,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             cliState: liveStatus[tab.id]?.cliState ?? tab.cliState ?? null,
             lastEvent: liveStatus[tab.id]?.lastEvent ?? null,
             busySince: liveStatus[tab.id]?.busySince ?? null,
+            reportsTo: tab.reportsTo ?? null,
           });
         }
       }
@@ -89,7 +92,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -97,6 +100,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       reasoning?: string;
       launch?: boolean;
       scope?: unknown;
+      reportsTo?: unknown;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
@@ -108,6 +112,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const ws = await getWorkspaceById(workspaceId);
     if (!ws) {
       return res.status(404).json({ error: 'Workspace not found' });
+    }
+    if (reportsTo !== undefined && reportsTo !== null) {
+      const refused = await checkReportsTo(workspaceId, reportsTo);
+      if (refused) return res.status(400).json(refused);
     }
     const dispatchPolicy = await checkAgentDispatchPolicy(workspaceId);
     if (!dispatchPolicy.ok) {
@@ -157,6 +165,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       const tab = await addTabToPane(workspaceId, paneId, name, ws.directories[0], resolvedType, command, {
         scope: scope as string[] | undefined,
         agentLaunchConfig: agentLaunchConfigFromOptions(model, reasoning),
+        reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
 
@@ -170,6 +179,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           panelType: tab.panelType,
           agentProviderId: provider?.id,
           agentSessionId: provider?.readSessionId(tab) ?? null,
+          reportsTo: tab.reportsTo ?? null,
           lastEvent: null,
           eventSeq: 0,
         });
