@@ -118,7 +118,13 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   const { a: wsA, b: wsB } = inst.state.workspaces;
   const tab = async (ws, name, type = 'terminal', extra = []) =>
     parseJson((await inst.cli(['tab', 'create', '-w', ws, '-n', name, '-t', type, ...extra])).out);
-  const inbox = async (ws) => parseJson((await inst.cli(['inbox', 'list', '-w', ws, '--all'])).out)?.items ?? [];
+  // A failed read is null, never an empty list: "none" must be measured, not assumed (review r2).
+  const inboxOrNull = async (ws) => {
+    const r = await inst.cli(['inbox', 'list', '-w', ws, '--all']);
+    const items = r.rc === 0 ? parseJson(r.out)?.items : null;
+    return Array.isArray(items) ? items : null;
+  };
+  const inbox = async (ws) => (await inboxOrNull(ws)) ?? [];
 
   // ─── story 14: harness watches (started first: the GitHub ones need one 60 s interval) ─────────
   const gh = installFakeGh(inst.state.scratch);
@@ -165,17 +171,24 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   const leaseWatch = acquired.rc === 0 ? await inOwner(['watch', 'lease', `merge:acc/w-${nonce}`, '--until', 'free']) : acquired;
   // Creation does not evaluate a watch; the lease lane does, every 15 s. Wait until it has judged the
   // held lease (lastCheckedAt set, the watch still there), so "quiet while held" is observed, not assumed.
-  const watchesOf = async (tabId) => (parseJson((await inst.cli(['watch', 'list', '-w', wsA, '--json'])).out)?.watches ?? []).filter((w) => w.tabId === tabId);
-  const judgedHeld = async (tabId, target) => (await watchesOf(tabId)).find((w) => w.target === target && typeof w.lastCheckedAt === 'number');
+  const watchesOf = async (tabId) => {
+    const r = await inst.cli(['watch', 'list', '-w', wsA, '--json']);
+    const watches = r.rc === 0 ? parseJson(r.out)?.watches : null;
+    return Array.isArray(watches) ? watches.filter((w) => w.tabId === tabId) : null;
+  };
+  const judgedHeld = async (tabId, target) => ((await watchesOf(tabId)) ?? []).find((w) => w.target === target && typeof w.lastCheckedAt === 'number');
   const heldCheck = leaseWatch.rc === 0 ? await within(25000, () => judgedHeld(owner.tabId, `merge:acc/w-${nonce}`)) : null;
-  const earlyFree = await ownerLine(`merge:acc/w-${nonce}`, 'is free');
+  const earlyItems = await inboxOrNull(wsA);
+  const earlyFree = earlyItems === null
+    ? 'unreadable'
+    : earlyItems.find((i) => i.kind === 'watch' && i.targetTabId === owner?.tabId && judgeWatchLine(i.line, `merge:acc/w-${nonce}`, 'is free').ok);
   const released = leaseWatch.rc === 0 ? await inst.inTab(wsA, holder.tabId, inst.tabCli(['lease', 'release', `merge:acc/w-${nonce}`])) : leaseWatch;
   const freeItem = released.rc === 0 ? await within(20000, () => ownerLine(`merge:acc/w-${nonce}`, 'is free')) : null;
   check(
     'watch-lease-free',
     'a lease watch stays quiet while another tab holds the lease and fires on its release',
     Boolean(heldCheck && !earlyFree && freeItem),
-    `acquire ${brief(acquired)}; watch ${brief(leaseWatch)}; judged while held ${heldCheck ? 'yes' : 'no'}; early notice ${Boolean(earlyFree)}; release ${brief(released)}; notice ${freeItem ? 'yes' : 'no'}`,
+    `acquire ${brief(acquired)}; watch ${brief(leaseWatch)}; judged while held ${heldCheck ? 'yes' : 'no'}; early notice ${earlyFree === 'unreadable' ? 'unreadable' : Boolean(earlyFree)}; release ${brief(released)}; notice ${freeItem ? 'yes' : 'no'}`,
     'judged while held with no notice; one "is free" line after the release',
   );
 
@@ -186,14 +199,15 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   const goneWatch = gone?.tabId && heldGone.rc === 0 ? await inst.inTab(wsA, gone.tabId, inst.tabCli(['watch', 'lease', goneLease, '--until', 'free'])) : heldGone;
   const judgedGone = goneWatch.rc === 0 ? await within(25000, () => judgedHeld(gone.tabId, goneLease)) : null;
   const closed = judgedGone ? await inst.cli(['tab', 'close', '-w', wsA, gone.tabId]) : { rc: -1, out: '', err: 'the watch was never judged while held' };
-  const after = closed.rc === 0 ? await within(20000, async () => ((await watchesOf(gone.tabId)).length === 0 ? 'none' : null)) : null;
-  const goneNotices = gone?.tabId ? (await inbox(wsA)).filter((i) => i.kind === 'watch' && i.targetTabId === gone.tabId) : [];
+  const after = closed.rc === 0 ? await within(20000, async () => ((await watchesOf(gone.tabId))?.length === 0 ? 'none' : null)) : null;
+  const inboxA = await inboxOrNull(wsA);
+  const goneNotices = inboxA && gone?.tabId ? inboxA.filter((i) => i.kind === 'watch' && i.targetTabId === gone.tabId) : null;
   if (heldGone.rc === 0) await inst.inTab(wsA, holder.tabId, inst.tabCli(['lease', 'release', goneLease]));
   check(
     'watch-tab-close',
     'closing the owner tab removes its watch on a lease still held, with no notice',
-    Boolean(judgedGone && after && goneNotices.length === 0),
-    `acquire ${brief(heldGone)}; watch ${brief(goneWatch)}; judged while held ${judgedGone ? 'yes' : 'no'}; close ${brief(closed)}; after ${after ? 'none' : 'still listed'}; notices ${goneNotices.length}`,
+    Boolean(judgedGone && after && goneNotices?.length === 0),
+    `acquire ${brief(heldGone)}; watch ${brief(goneWatch)}; judged while held ${judgedGone ? 'yes' : 'no'}; close ${brief(closed)}; after ${after ? 'none' : 'still listed or unreadable'}; notices ${goneNotices ? goneNotices.length : 'unreadable'}`,
     'judged while held; none listed after the close; no notice for the closed tab',
   );
 
@@ -249,7 +263,7 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   // Pages are read from the candidate's log, written in order through one transport: once the paged
   // cases' alerts are on disk, an alert for the heard tab (paged at the same poll) would be too.
   const pagedIds = ['lost', 'shell', 'alone'].map((k) => cases[k].w?.tabId).filter(Boolean);
-  await within(20000, () => pagedIds.every((id) => alertsFor(inst.state.home, id).includes('bg-job-died')));
+  const pagedLanded = await within(20000, () => pagedIds.length === 3 && pagedIds.every((id) => alertsFor(inst.state.home, id).includes('bg-job-died')));
   for (const c of Object.values(cases)) c.alerts = c.w?.tabId ? alertsFor(inst.state.home, c.w.tabId) : [];
   const described = (c) => (c.w?.tabId
     ? `bg add ${c.added ? brief(c.added) : 'not run'}; cliState ${c.state}; nudge ${c.nudge ? `delivered ${c.nudge.delivered}` : 'none'}; alerts ${c.alerts.join(',') || 'none'}`
@@ -258,8 +272,8 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   check(
     'self-failure-heard-no-page',
     'a --notify self failure delivered to a live agent whose reportsTo is a live agent pages no human',
-    Boolean(heard.nudge?.delivered === true && heard.alerts.length === 0 && pagedIds.length === 3),
-    `${described(heard)}; lead cliState ${lead ? await inst.cliState(wsB, lead.tabId) : 'n/a'}`,
+    Boolean(heard.nudge?.delivered === true && heard.alerts.length === 0 && pagedLanded),
+    `${described(heard)}; paged cases' alerts landed ${Boolean(pagedLanded)}; lead cliState ${lead ? await inst.cliState(wsB, lead.tabId) : 'n/a'}`,
     'a delivered bg-failed nudge and no alert of any kind (read after the three paged cases\' alerts landed)',
   );
   check(
