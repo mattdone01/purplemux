@@ -3,6 +3,7 @@ import { checkComposerReady } from '@/lib/composer-readiness';
 import {
   deliverInState,
   dropForTabInState,
+  dropGoneTargetsInState,
   dueItems,
   holdInState,
   mutateInbox,
@@ -23,6 +24,12 @@ export interface IInboxDispatcherDeps {
   now: () => number;
   mutate: <T>(fn: (state: IInboxState) => { state: IInboxState; value: T }) => Promise<T>;
   findTab: (workspaceId: string, tabId: string) => Promise<ITab | null>;
+  /**
+   * The tab is positively gone: the workspace list and its layout were read and
+   * do not name it. An unreadable store is NOT a close (it would drop for good).
+   * Null when it cannot be told.
+   */
+  tabGone: (workspaceId: string, tabId: string) => Promise<boolean | null>;
   hasSession: (sessionName: string) => Promise<boolean>;
   status: (tabId: string) => IClientTabStatusEntry | undefined;
   /** ADR-0018 ruling A′: busy only because its ended turn waits on background work. */
@@ -50,7 +57,7 @@ const STATE_REFUSAL = 'composer-not-ready:';
  * as `transport-uncertain` and never retried blind.
  */
 export class InboxDispatcher {
-  private running = false;
+  private running: Promise<void> | null = null;
 
   constructor(private deps: IInboxDispatcherDeps) {}
 
@@ -67,17 +74,38 @@ export class InboxDispatcher {
 
   async tick(): Promise<void> {
     if (this.running) return;
-    this.running = true;
-    try {
+    const run = (async () => {
       const now = this.deps.now();
       const due = await this.deps.mutate((state) => {
         const swept = sweepInState(state, now);
         return { state: swept, value: dueItems(swept, now, this.wake) };
       });
       for (const item of due) await this.attemptAndRecord(item);
+    })();
+    this.running = run;
+    try {
+      await run;
     } finally {
-      this.running = false;
+      this.running = null;
     }
+  }
+
+  /** Resolves once a tick in flight has recorded its outcome (shutdown waits on it). */
+  async idle(): Promise<void> {
+    await this.running?.catch(() => {});
+  }
+
+  /**
+   * Boot pass: tabs that closed while the server was down fired their
+   * tab-closed events before anyone listened. Drop the queued and held items of
+   * every target the live layouts positively no longer name.
+   */
+  async dropGoneTargets(isGone: (workspaceId: string, tabId: string) => boolean): Promise<IInboxItem[]> {
+    const now = this.deps.now();
+    return this.deps.mutate((state) => {
+      const result = dropGoneTargetsInState(state, isGone, now);
+      return { state: result.state, value: result.dropped };
+    });
   }
 
   private async attemptAndRecord(item: IInboxItem): Promise<void> {
@@ -100,15 +128,22 @@ export class InboxDispatcher {
     else if (attempt.outcome !== 'refused') log.info({ id: item.id, tabId: item.targetTabId, ...attempt }, `inbox ${attempt.outcome}`);
   }
 
+  private async missing(item: IInboxItem): Promise<TAttempt> {
+    const gone = await this.deps.tabGone(item.targetWorkspaceId, item.targetTabId).catch(() => null);
+    return gone === true
+      ? { outcome: 'dropped', reason: 'target-tab-closed' }
+      : { outcome: 'refused', reason: 'target-unresolved' };
+  }
+
   private async attempt(item: IInboxItem): Promise<TAttempt> {
     const found = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
-    if (!found) return { outcome: 'dropped', reason: 'target-tab-closed' };
+    if (!found) return this.missing(item);
     if (!isAgentPanelType(found.panelType)) return { outcome: 'held', reason: 'target-not-agent' };
     if (!(await this.deps.hasSession(found.sessionName))) return { outcome: 'refused', reason: 'session-not-running' };
 
     return this.deps.withDispatchLock(item.targetWorkspaceId, found, async (checkPolicy) => {
       const current = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
-      if (!current) return { outcome: 'dropped', reason: 'target-tab-closed' };
+      if (!current) return this.missing(item);
       if (current.sessionName !== found.sessionName) return { outcome: 'refused', reason: 'target-changed' };
       const policy = await checkPolicy();
       if (!policy.ok) return { outcome: 'refused', reason: `policy:${policy.error ?? 'refused'}` };
@@ -143,10 +178,19 @@ export class InboxDispatcher {
 // ─── the server's instance ───────────────────────────────────────────────
 
 interface IInboxRuntime {
-  dispatcher: InboxDispatcher;
+  dispatcher: InboxDispatcher | null;
   timer: ReturnType<typeof setInterval> | null;
   unsubscribe: (() => void) | null;
 }
+
+/** Positive absence from a strict read: unreadable stores and layouts answer null. */
+const liveTabsGone = async () => {
+  const { readLiveTabs } = await import('@/lib/tab-lifecycle');
+  const snapshot = await readLiveTabs();
+  const live = new Set(snapshot.tabs.map((t) => `${t.workspaceId}/${t.tabId}`));
+  return (workspaceId: string, tabId: string): boolean | null =>
+    snapshot.uncertainWorkspaceIds.has(workspaceId) ? null : !live.has(`${workspaceId}/${tabId}`);
+};
 
 const g = globalThis as unknown as { __ptInboxRuntime?: IInboxRuntime };
 
@@ -163,6 +207,13 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
     now: () => Date.now(),
     mutate: mutateInbox,
     findTab: async (workspaceId, tabId) => (await findTab(workspaceId, tabId))?.tab ?? null,
+    tabGone: async (workspaceId, tabId) => {
+      try {
+        return (await liveTabsGone())(workspaceId, tabId);
+      } catch {
+        return null; // the workspace list itself is unreadable
+      }
+    },
     hasSession,
     status: (tabId) => getStatusManager().getAllForClient()[tabId],
     waitingAtPrompt: (tabId) => getStatusManager().isWaitingAtPrompt(tabId),
@@ -174,25 +225,45 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
 };
 
 export const startInbox = async (): Promise<void> => {
-  if (g.__ptInboxRuntime?.timer) return;
+  if (g.__ptInboxRuntime) return;
+  // Claimed before the first await, so two concurrent starts cannot both pass.
+  const runtime: IInboxRuntime = { dispatcher: null, timer: null, unsubscribe: null };
+  g.__ptInboxRuntime = runtime;
   const dispatcher = new InboxDispatcher(await defaultDeps());
+  runtime.dispatcher = dispatcher;
+  try {
+    const gone = await liveTabsGone();
+    const dropped = await dispatcher.dropGoneTargets((ws, tab) => gone(ws, tab) === true);
+    if (dropped.length) log.info({ dropped: dropped.map((i) => i.id) }, 'inbox boot pass: target tabs closed while down');
+  } catch (err) {
+    log.warn(`inbox boot pass skipped: ${err instanceof Error ? err.message : err}`);
+  }
   const { onTabClosed } = await import('@/lib/tab-lifecycle');
   const unsubscribe = onTabClosed(({ workspaceId, tabId }) => {
     dispatcher.dropForTab(workspaceId, tabId).then((dropped) => {
       if (dropped.length) log.info({ tabId, dropped: dropped.map((i) => i.id) }, 'inbox dropped: target tab closed');
     }).catch((err) => log.warn(`inbox drop failed for ${tabId}: ${err instanceof Error ? err.message : err}`));
   });
+  let lastTickError: string | null = null;
   const timer = setInterval(() => {
-    dispatcher.tick().catch((err) => log.warn(`inbox tick failed: ${err instanceof Error ? err.message : err}`));
+    dispatcher.tick().then(() => { lastTickError = null; }).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      // A corrupt inbox fails every tick; say so once per distinct cause.
+      if (message !== lastTickError) log.warn(`inbox tick failed: ${message}`);
+      lastTickError = message;
+    });
   }, INBOX_TICK_MS);
   timer.unref?.();
-  g.__ptInboxRuntime = { dispatcher, timer, unsubscribe };
+  runtime.timer = timer;
+  runtime.unsubscribe = unsubscribe;
 };
 
-export const stopInbox = (): void => {
+/** Stop ticking, and wait for a delivery in flight to be recorded before shutdown. */
+export const stopInbox = async (): Promise<void> => {
   const runtime = g.__ptInboxRuntime;
   if (!runtime) return;
   if (runtime.timer) clearInterval(runtime.timer);
   runtime.unsubscribe?.();
   g.__ptInboxRuntime = undefined;
+  await runtime.dispatcher?.idle();
 };

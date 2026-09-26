@@ -17,9 +17,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const id = req.query.id as string;
 
   const item = (await readInboxState()).items.find((i) => i.id === id);
-  if (!item) return res.status(404).json({ error: `inbox item ${id} not found`, code: 'inbox-not-found' });
-  if (scope.type !== 'admin' && scope.workspaceId !== item.targetWorkspaceId) {
-    return res.status(403).json({ error: `inbox item ${id} targets ${item.targetWorkspaceId}; only that workspace's token or the admin token may retry it`, code: 'forbidden' });
+  // Another workspace's item answers exactly like a missing one: its id leaks nothing.
+  if (!item || (scope.type !== 'admin' && scope.workspaceId !== item.targetWorkspaceId)) {
+    return res.status(404).json({ error: `inbox item ${id} not found for this token (only the target workspace's token or the admin token may retry)`, code: 'inbox-not-found' });
   }
   try {
     const retried = await mutateInbox((state) => {

@@ -18,6 +18,8 @@ interface IWorld {
   pane: string | null;
   panelType: TPanelType;
   tabPresent: boolean;
+  gone: boolean | null;
+  sessionName: string;
   alive: boolean;
   policy: { ok: boolean; error?: string };
   permission: boolean;
@@ -28,13 +30,14 @@ interface IWorld {
 const setup = (overrides: Partial<IWorld> = {}) => {
   const world: IWorld = {
     clock: T0, state: { items: [] }, cliState: 'idle', waiting: false, pane: EMPTY_CLAUDE, panelType: 'claude-code',
-    tabPresent: true, alive: true, policy: { ok: true }, permission: false, deliverFails: false, stranded: false,
+    tabPresent: true, gone: true, sessionName: 'pt-ws-1-pane-a-tab-w', alive: true, policy: { ok: true }, permission: false, deliverFails: false, stranded: false,
     ...overrides,
   };
   const deliver = vi.fn(async (_session: string, _line: string) => {
     if (world.deliverFails) throw new Error('tmux paste failed');
   });
-  const tab = (): ITab => ({ id: 'tab-w', name: 'w', order: 0, sessionName: 'pt-ws-1-pane-a-tab-w', panelType: world.panelType });
+  const tab = (): ITab => ({ id: 'tab-w', name: 'w', order: 0, sessionName: world.sessionName, panelType: world.panelType });
+  const calls: string[] = [];
   const deps: IInboxDispatcherDeps = {
     now: () => world.clock,
     mutate: async (fn) => {
@@ -42,13 +45,21 @@ const setup = (overrides: Partial<IWorld> = {}) => {
       world.state = state;
       return value;
     },
-    findTab: async () => (world.tabPresent ? tab() : null),
+    findTab: async () => { calls.push('findTab'); return world.tabPresent ? tab() : null; },
+    tabGone: async () => world.gone,
     hasSession: async () => world.alive,
     status: () => ({ cliState: world.cliState, permissionRequest: world.permission ? { id: 'p' } : null } as unknown as IClientTabStatusEntry),
     waitingAtPrompt: () => world.waiting,
-    capture: async () => world.pane,
-    withDispatchLock: async (_ws, _tab, work) => work(async () => world.policy as never),
-    deliver,
+    capture: async () => { calls.push('capture'); return world.pane; },
+    withDispatchLock: async (_ws, _tab, work) => {
+      calls.push('lock:enter');
+      try {
+        return await work(async () => { calls.push('policy'); return world.policy as never; });
+      } finally {
+        calls.push('lock:exit');
+      }
+    },
+    deliver: async (session: string, line: string) => { calls.push('deliver'); await deliver(session, line); },
     isPending: async () => world.stranded,
   };
   const dispatcher = new InboxDispatcher(deps);
@@ -60,7 +71,7 @@ const setup = (overrides: Partial<IWorld> = {}) => {
     return result.item;
   };
   const item = (id = 'i-k1') => world.state.items.find((i) => i.id === id)!;
-  return { world, dispatcher, deliver, enqueue, item };
+  return { world, dispatcher, deliver, enqueue, item, calls };
 };
 
 const LINE = '[purplemux resume r-abcd12] the last turn ended on an API error — continue from where it was cut off';
@@ -178,6 +189,47 @@ describe('inbox dispatcher (ADR-0012)', () => {
     await dispatcher.tick();
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(item()).toMatchObject({ state: 'held', heldReason: 'stranded-in-composer' });
+  });
+
+  it('refuses, never drops, a missing tab it cannot confirm gone (an unreadable store is not a close)', async () => {
+    const { dispatcher, enqueue, item } = setup({ tabPresent: false, gone: null });
+    enqueue();
+    await dispatcher.tick();
+    expect(item()).toMatchObject({ state: 'queued', lastRefusal: 'target-unresolved', attempts: 1 });
+  });
+
+  it('checks, re-finds, applies policy, reads the screen and pastes inside the dispatch lock, in that order', async () => {
+    const { dispatcher, enqueue, calls } = setup();
+    enqueue();
+    await dispatcher.tick();
+    expect(calls).toEqual(['findTab', 'lock:enter', 'findTab', 'policy', 'capture', 'deliver', 'lock:exit']);
+  });
+
+  it('refuses target-changed when the tab was replaced between the first look and the lock', async () => {
+    const { world, dispatcher, deliver, enqueue, item } = setup();
+    enqueue();
+    let looks = 0;
+    const original = world.sessionName;
+    Object.defineProperty(world, 'sessionName', { get: () => (++looks > 1 ? 'pt-ws-1-pane-a-tab-w2' : original) });
+    await dispatcher.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(item().lastRefusal).toBe('target-changed');
+  });
+
+  it('lets shutdown wait for a delivery in flight to be recorded', async () => {
+    const { world, dispatcher, deliver, enqueue } = setup();
+    let release!: () => void;
+    deliver.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    enqueue();
+    const tick = dispatcher.tick();
+    await vi.waitFor(() => expect(deliver).toHaveBeenCalled());
+    let idle = false;
+    const waiting = dispatcher.idle().then(() => { idle = true; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(idle).toBe(false);
+    release();
+    await Promise.all([tick, waiting]);
+    expect(world.state.items[0].state).toBe('delivered');
   });
 
   it('drops the queue of a tab missing from its layout, and holds a notice for a non-agent tab', async () => {

@@ -46,7 +46,9 @@ export const enqueueInState = <K extends TInboxKind>(
     throw new InboxError('inbox-field-invalid', 'inbox dedupeKey must be 1-200 characters');
   }
   const { line } = renderInboxLine(req.kind, req.fields);
-  const existing = state.items.find((i) => i.dedupeKey === req.dedupeKey && i.state === 'queued');
+  // Per target: one key may be queued once for each recipient (a broadcast).
+  const existing = state.items.find((i) => i.state === 'queued' && i.dedupeKey === req.dedupeKey
+    && i.targetWorkspaceId === req.targetWorkspaceId && i.targetTabId === req.targetTabId);
   if (existing) return { state, item: existing, created: false };
   const item: IInboxItem = {
     id: newId(),
@@ -114,20 +116,53 @@ export const dropForTabInState = (
   return { state: { items }, dropped };
 };
 
-/** Queued items past 24 h become held; terminal items 7 days after their last transition are pruned. */
-export const sweepInState = (state: IInboxState, now: number): IInboxState => ({
-  items: state.items
-    .map((item) => (item.state === 'queued' && now >= item.expiresAt
-      ? hold(item, `${item.lastRefusal ?? 'never ready'} (undelivered after 24 h)`, now)
-      : item))
-    .filter((item) => item.state === 'queued' || now - item.transitionAt < INBOX_RETENTION_MS),
-});
+/**
+ * Queued items past 24 h become held; terminal items 7 days after their last
+ * transition are pruned. The same state object comes back when nothing
+ * changed, so a quiet tick writes nothing.
+ */
+export const sweepInState = (state: IInboxState, now: number): IInboxState => {
+  let changed = false;
+  const items: IInboxItem[] = [];
+  for (const item of state.items) {
+    if (item.state !== 'queued' && now - item.transitionAt >= INBOX_RETENTION_MS) {
+      changed = true;
+      continue;
+    }
+    if (item.state === 'queued' && now >= item.expiresAt) {
+      changed = true;
+      items.push(hold(item, `${item.lastRefusal ?? 'never ready'} (undelivered after 24 h)`, now));
+      continue;
+    }
+    items.push(item);
+  }
+  return changed ? { items } : state;
+};
+
+/** Drop the queued and held items of every tab `isGone` confirms closed (the boot pass). */
+export const dropGoneTargetsInState = (
+  state: IInboxState,
+  isGone: (workspaceId: string, tabId: string) => boolean,
+  now: number,
+): { state: IInboxState; dropped: IInboxItem[] } => {
+  const dropped: IInboxItem[] = [];
+  const items = state.items.map((item) => {
+    if ((item.state !== 'queued' && item.state !== 'held') || !isGone(item.targetWorkspaceId, item.targetTabId)) return item;
+    const next: IInboxItem = { ...item, state: 'dropped', droppedReason: 'target-tab-closed', transitionAt: now };
+    dropped.push(next);
+    return next;
+  });
+  return { state: dropped.length ? { items } : state, dropped };
+};
 
 /** A held item goes back to the queue once per call, with a fresh budget. */
 export const retryInState = (state: IInboxState, id: string, now: number): { state: IInboxState; item: IInboxItem } => {
   const item = state.items.find((i) => i.id === id);
   if (!item) throw new InboxError('inbox-not-found', `inbox item ${id} not found`);
   if (item.state !== 'held') throw new InboxError('inbox-not-held', `inbox item ${id} is ${item.state}, not held`);
+  const newer = state.items.find((i) => i.id !== id && i.state === 'queued' && i.dedupeKey === item.dedupeKey
+    && i.targetWorkspaceId === item.targetWorkspaceId && i.targetTabId === item.targetTabId);
+  if (newer) throw new InboxError('inbox-not-held', `a newer notice with this key is already queued: ${newer.id}`);
   const next: IInboxItem = {
     ...item,
     state: 'queued',
@@ -195,7 +230,10 @@ export const readInboxState = async (): Promise<IInboxState> => {
   }
   const items = (JSON.parse(raw) as { items?: unknown } | null)?.items;
   if (!Array.isArray(items)) throw new Error(`${file} has no "items" array; the inbox is refused until it is repaired or moved aside`);
-  return { items: items.filter(isItem) };
+  // A malformed entry is refused, not skipped: the next write would erase it for good.
+  const bad = items.findIndex((item) => !isItem(item));
+  if (bad !== -1) throw new Error(`${file} item ${bad} is malformed; the inbox is refused until it is repaired or moved aside`);
+  return { items: items as IInboxItem[] };
 };
 
 const writeInboxState = async (state: IInboxState): Promise<void> => {

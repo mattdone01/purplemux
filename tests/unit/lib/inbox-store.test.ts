@@ -45,6 +45,49 @@ describe('inbox store — pure transitions', () => {
     expect(second.state.items).toHaveLength(1);
   });
 
+  it('keeps one queued item per target and key: a broadcast reaches every recipient', async () => {
+    const { enqueueInState } = await load();
+    let state: IInboxState = { items: [] };
+    for (const tab of ['tab-a', 'tab-b', 'tab-c']) {
+      const r = enqueueInState(state, req({ targetTabId: tab, dedupeKey: 'deploy-d-1' }), T0, ids);
+      expect(r.created).toBe(true);
+      expect(r.item.targetTabId).toBe(tab);
+      state = r.state;
+    }
+    expect(enqueueInState(state, req({ targetTabId: 'tab-b', dedupeKey: 'deploy-d-1' }), T0, ids).created).toBe(false);
+    expect(state.items).toHaveLength(3);
+  });
+
+  it('returns the same state object from a sweep that changed nothing (a quiet tick writes nothing)', async () => {
+    const { enqueueInState, sweepInState } = await load();
+    const { state } = enqueueInState({ items: [] }, req(), T0, ids);
+    expect(sweepInState(state, T0 + 1)).toBe(state);
+    const empty = { items: [] };
+    expect(sweepInState(empty, T0)).toBe(empty);
+  });
+
+  it('drops only the queued and held items of targets the boot pass confirms gone', async () => {
+    const { enqueueInState, holdInState, deliverInState, dropGoneTargetsInState } = await load();
+    let state: IInboxState = { items: [] };
+    const q = enqueueInState(state, req({ dedupeKey: 'q', targetTabId: 'tab-gone' }), T0, ids); state = q.state;
+    const h = enqueueInState(state, req({ dedupeKey: 'h', targetTabId: 'tab-gone' }), T0, ids); state = holdInState(h.state, h.item.id, 'x', T0);
+    const d = enqueueInState(state, req({ dedupeKey: 'd', targetTabId: 'tab-gone' }), T0, ids); state = deliverInState(d.state, d.item.id, T0);
+    const live = enqueueInState(state, req({ dedupeKey: 'l', targetTabId: 'tab-live' }), T0, ids); state = live.state;
+    const result = dropGoneTargetsInState(state, (_ws, tab) => tab === 'tab-gone', T0 + 1);
+    expect(result.dropped.map((i) => i.dedupeKey).sort()).toEqual(['h', 'q']);
+    expect(Object.fromEntries(result.state.items.map((i) => [i.dedupeKey, i.state]))).toEqual({ q: 'dropped', h: 'dropped', d: 'delivered', l: 'queued' });
+    expect(dropGoneTargetsInState(state, () => false, T0).state).toBe(state);
+  });
+
+  it('refuses to retry a held item while a newer one with its key is queued for the same tab', async () => {
+    const { enqueueInState, holdInState, retryInState } = await load();
+    const first = enqueueInState({ items: [] }, req(), T0, ids);
+    const held = holdInState(first.state, first.item.id, 'x', T0);
+    const newer = enqueueInState(held, req(), T0 + 1, ids);
+    expect(newer.created).toBe(true);
+    expect(() => retryInState(newer.state, first.item.id, T0 + 2)).toThrow(/newer notice/);
+  });
+
   it('queues a new item for a dedupeKey whose earlier item is no longer queued', async () => {
     const { enqueueInState, deliverInState } = await load();
     const first = enqueueInState({ items: [] }, req(), T0, ids);
@@ -160,6 +203,15 @@ describe('inbox store — file', () => {
     expect((await readInboxState()).items).toEqual([item]);
     expect((await fs.stat(inboxFile())).mode & 0o777).toBe(0o600);
     expect((await enqueueNotice(req())).item.id).toBe(item.id);
+  });
+
+  it('refuses a file with a malformed item instead of silently discarding it', async () => {
+    const { readInboxState, enqueueNotice, inboxFile } = await load();
+    await enqueueNotice(req());
+    const raw = JSON.parse(await fs.readFile(inboxFile(), 'utf-8'));
+    raw.items.push({ id: 7 });
+    await fs.writeFile(inboxFile(), JSON.stringify(raw));
+    await expect(readInboxState()).rejects.toThrow(/item 1 is malformed/);
   });
 
   it('refuses a corrupt file instead of reading it as empty', async () => {

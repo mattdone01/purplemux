@@ -102,7 +102,7 @@ const NO_AUTH_WS_PATHS = new Set(['/api/install']);
 
 const shutdownWs = async () => {
   await getMissionControlRuntime().stop();
-  stopInbox();
+  await stopInbox();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
   gracefulStatusShutdown();

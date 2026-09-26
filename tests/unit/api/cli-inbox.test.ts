@@ -96,12 +96,13 @@ describe('inbox routes (ADR-0012)', () => {
     expect((await retry(ids.h)).statusCode).toBe(200);
   });
 
-  it('answers inbox-not-held, inbox-not-found and forbidden with their codes', async () => {
+  it('answers inbox-not-held and inbox-not-found with their codes, and 404s another workspace\'s item', async () => {
     const ids = await seed();
     expect(await retry(ids.q)).toMatchObject({ statusCode: 409, body: { code: 'inbox-not-held' } });
     expect(await retry('i-nothing12')).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });
     auth.scope = { type: 'workspace', workspaceId: 'ws-2' };
-    expect(await retry(ids.h)).toMatchObject({ statusCode: 403, body: { code: 'forbidden' } });
+    // Another workspace's item answers like a missing one.
+    expect(await retry(ids.h)).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });
     auth.scope = null;
     expect(await retry(ids.h)).toMatchObject({ statusCode: 403 });
   });
