@@ -224,6 +224,11 @@ export interface IMissionSnapshot {
   deliveries: IMissionDelivery[];
   recentEvents: IMissionEvent[];
   bootstrap: IMissionBootstrap | null;
+  /**
+   * Story 12: every bootstrap entry still asking its orchestrator to reconcile (queued, dispatching or
+   * submitted), from ANY bootstrap — a notice typed late belongs to its own bootstrap, not the latest.
+   */
+  pendingBootstrapEntries?: Array<{ bootstrapId: string; entry: IMissionBootstrapEntry }>;
 }
 
 export interface IMissionEventsResponse {

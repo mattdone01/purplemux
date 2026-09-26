@@ -57,3 +57,74 @@ describe('Mission Control CLI policy forwarding', () => {
     expect(output.humanInboxPolicy).toEqual(humanInboxPolicy);
   });
 });
+
+describe('Mission Control CLI pull commands (story 12)', () => {
+  const answer = { id: '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b', runId: "run one's", itemId: 'item-a', createdAt: 1_700_000_000_500 };
+  const item = { id: 'item-a', runId: "run one's", state: 'answered', revision: 4, title: 'Choose' };
+  const delivery = { answerId: answer.id, runId: answer.runId, state: 'submitted' };
+
+  it('prints the exact ack command for each pending answer, shell-quoting producer-chosen ids', async () => {
+    const output = await runMission(['answers'], {
+      answers: [answer], deliveries: [delivery], items: [item],
+      runs: [{ id: answer.runId, binding: { generation: 7 } }], humanInboxPolicy,
+    });
+
+    const [row] = output.answers as Array<Record<string, unknown>>;
+    expect(row.ackCommand).toBe(
+      `purplemux mission ack -w ws-one --run 'run one'\\''s' --answer ${answer.id} --generation 7 --revision 4 --event-id mission-ack-${answer.id} --producer-at 1700000000500`,
+    );
+  });
+
+  it('prints no ack command while the run has no binding', async () => {
+    const output = await runMission(['answers'], {
+      answers: [answer], deliveries: [delivery], items: [item], runs: [{ id: answer.runId, binding: null }], humanInboxPolicy,
+    });
+    expect((output.answers as Array<Record<string, unknown>>)[0].ackCommand).toBeNull();
+  });
+
+  it('prints the reconcile steps for this workspace\'s pending bootstrap entries only', async () => {
+    const output = await runMission(['bootstrap'], {
+      bootstrap: {
+        id: 'bootstrap-one',
+        entries: [
+          { workspaceId: 'ws-one', runId: 'run-a', state: 'queued', binding: { tabId: 'tab-orch' } },
+          { workspaceId: 'ws-one', runId: 'run-b', state: 'confirmed', binding: { tabId: 'tab-orch' } },
+          { workspaceId: 'ws-two', runId: 'run-c', state: 'queued', binding: { tabId: 'tab-other' } },
+        ],
+      },
+      runs: [{ id: 'run-a', revision: 0, objective: 'Ship it', phase: 'implementation' }],
+      items: [{ id: 'q-1', runId: 'run-a', state: 'candidate', title: 'Rollout?' }],
+    });
+
+    expect(output.workspaceId).toBe('ws-one');
+    const entries = output.entries as Array<{ runId: string; steps: string[] }>;
+    expect(entries.map((entry) => entry.runId)).toEqual(['run-a']);
+    expect(entries[0].steps).toContain('Observed objective: Ship it; phase: implementation; possible outstanding questions: q-1: Rollout?.');
+    expect(entries[0].steps.join('\n')).toContain('emitting run.resumed for run run-a with tabId tab-orch, expectedRevision 0, bindingGeneration 0, transferPendingAnswers false');
+  });
+
+  it('prints an empty list when there is no bootstrap', async () => {
+    const output = await runMission(['bootstrap'], { bootstrap: null, runs: [], items: [] });
+    expect(output.entries).toEqual([]);
+  });
+});
+
+describe('mission bootstrap reads every pending bootstrap, keyed like the notice (story 12 CONFIRM)', () => {
+  it('prints the older bootstrap\'s pending entry with the key the server typed', async () => {
+    const { missionBootstrapKey } = await import('@/lib/mission-control-runtime');
+    const output = await runMission(['bootstrap'], {
+      bootstrap: { id: 'bootstrap-second', entries: [{ workspaceId: 'ws-one', runId: 'run-a', state: 'provisional', binding: null }] },
+      pendingBootstrapEntries: [
+        { bootstrapId: 'bootstrap-first', entry: { workspaceId: 'ws-one', runId: 'run-a', state: 'queued', binding: { tabId: 'tab-orch' } } },
+        { bootstrapId: 'bootstrap-first', entry: { workspaceId: 'ws-two', runId: 'run-z', state: 'queued', binding: { tabId: 'tab-x' } } },
+      ],
+      runs: [{ id: 'run-a', revision: 0, objective: 'Ship it', phase: 'implementation' }],
+      items: [],
+    });
+    const entries = output.entries as Array<{ key: string; bootstrapId: string; runId: string; steps: string[] }>;
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ bootstrapId: 'bootstrap-first', runId: 'run-a', key: missionBootstrapKey('bootstrap-first', 'ws-one', 'run-a') });
+    expect(entries[0].steps.join('\n')).toContain('run.resumed for run run-a with tabId tab-orch');
+  });
+});
+

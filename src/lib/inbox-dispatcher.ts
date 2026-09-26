@@ -9,16 +9,40 @@ import {
   mutateInbox,
   refuseInState,
   sweepInState,
+  withdrawInState,
 } from '@/lib/inbox-store';
 import { createLogger } from '@/lib/logger';
 import type { TAgentDispatchPolicyCheck } from '@/lib/agent-dispatch-policy';
-import type { IInboxItem, IInboxState } from '@/types/inbox';
+import type { IInboxItem, IInboxState, TInboxKind } from '@/types/inbox';
 import type { IClientTabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
 
 const log = createLogger('inbox');
 
 export const INBOX_TICK_MS = 2_000;
+
+/**
+ * A kind's owner re-validates its own record at paste time (story 12, consult ruling A′): called inside
+ * the dispatch lock, after the readiness gate and the still-queued check, immediately before the paste.
+ * `ok: false` drops the item (`preflight:<reason>`); an `ok` answer may have claimed the owner's record
+ * for this paste, so the delivery that follows is the only one it allows. In memory only: a callback
+ * cannot be persisted, and the owner registers it again when its runtime starts.
+ */
+export type TInboxPreflight = (item: IInboxItem) => Promise<{ ok: true } | { ok: false; reason: string }>;
+
+/** Kinds whose items may not be typed without their owner's preflight. */
+const PREFLIGHT_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['mission']);
+
+const gp = globalThis as unknown as { __ptInboxPreflights?: Map<TInboxKind, TInboxPreflight> };
+const preflights = (): Map<TInboxKind, TInboxPreflight> => (gp.__ptInboxPreflights ??= new Map());
+
+/** Register a kind's preflight; returns the unregister function. */
+export const registerInboxPreflight = (kind: TInboxKind, fn: TInboxPreflight): (() => void) => {
+  preflights().set(kind, fn);
+  return () => {
+    if (preflights().get(kind) === fn) preflights().delete(kind);
+  };
+};
 
 export interface IInboxDispatcherDeps {
   now: () => number;
@@ -48,6 +72,7 @@ type TAttempt =
   | { outcome: 'refused'; reason: string }
   | { outcome: 'held'; reason: string }
   | { outcome: 'dropped'; reason: string }
+  | { outcome: 'rejected'; reason: string }
   | { outcome: 'withdrawn' };
 
 const STATE_REFUSAL = 'composer-not-ready:';
@@ -125,6 +150,8 @@ export class InboxDispatcher {
         case 'held': return { state: holdInState(state, item.id, attempt.reason, now), value: null };
         case 'dropped': return { state: dropForTabInState(state, item.targetWorkspaceId, item.targetTabId, attempt.reason, now).state, value: null };
         case 'refused': return { state: refuseInState(state, item.id, attempt.reason, now), value: null };
+        // This item only: its owner refused it at paste time.
+        case 'rejected': return { state: withdrawInState(state, item.id, attempt.reason, now), value: null };
         case 'withdrawn': return { state, value: null };
       }
     });
@@ -165,6 +192,18 @@ export class InboxDispatcher {
         value: state.items.find((i) => i.id === item.id)?.state === 'queued',
       }));
       if (!stillQueued) return { outcome: 'withdrawn' };
+      if (PREFLIGHT_KINDS.has(item.kind)) {
+        const preflight = preflights().get(item.kind);
+        // No owner listening yet (a boot before its runtime started): wait, within the bound.
+        if (!preflight) return { outcome: 'refused', reason: 'preflight-unregistered' };
+        let verdict: { ok: true } | { ok: false; reason: string };
+        try {
+          verdict = await preflight(item);
+        } catch (err) {
+          return { outcome: 'refused', reason: `preflight-error:${err instanceof Error ? err.message : String(err)}` };
+        }
+        if (!verdict.ok) return { outcome: 'rejected', reason: `preflight:${verdict.reason}` };
+      }
       try {
         await this.deps.deliver(current.sessionName, item.line);
       } catch (err) {

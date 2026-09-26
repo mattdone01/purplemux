@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { InboxDispatcher, type IInboxDispatcherDeps } from '@/lib/inbox-dispatcher';
+import { InboxDispatcher, registerInboxPreflight, type IInboxDispatcherDeps } from '@/lib/inbox-dispatcher';
 import { enqueueInState, INBOX_MAX_REFUSALS } from '@/lib/inbox-store';
 import type { IInboxState } from '@/types/inbox';
 import type { IClientTabStatusEntry } from '@/types/status';
@@ -313,5 +313,89 @@ describe('inbox dispatcher (ADR-0012)', () => {
     await first;
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(world.state.items[0].state).toBe('delivered');
+  });
+});
+
+describe('per-kind paste-time preflight (story 12, consult ruling A′)', () => {
+  const MISSION = { answerId: '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b', workspaceId: 'ws-1', readyAt: T0 };
+  const withMission = () => {
+    const env = setup();
+    const add = (dedupeKey: string) => {
+      const result = enqueueInState(env.world.state, {
+        kind: 'mission', targetWorkspaceId: 'ws-1', targetTabId: 'tab-w', dedupeKey, fields: MISSION,
+      }, env.world.clock, () => `i-${dedupeKey}`);
+      env.world.state = result.state;
+    };
+    return { ...env, add };
+  };
+
+  it('never types a mission notice while no preflight is registered: a refusal inside the bound', async () => {
+    const { dispatcher, deliver, add, item } = withMission();
+    add('m1');
+    await dispatcher.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(item('i-m1')).toMatchObject({ state: 'queued', attempts: 1, lastRefusal: 'preflight-unregistered' });
+  });
+
+  it('runs the preflight inside the lock, after policy and the screen read, immediately before the paste', async () => {
+    const { dispatcher, deliver, add, item, calls } = withMission();
+    const unregister = registerInboxPreflight('mission', async (candidate) => {
+      calls.push(`preflight:${candidate.id}`);
+      return { ok: true };
+    });
+    try {
+      add('m1');
+      await dispatcher.tick();
+    } finally {
+      unregister();
+    }
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(item('i-m1').state).toBe('delivered');
+    expect(calls.slice(calls.indexOf('lock:enter'))).toEqual(['lock:enter', 'findTab', 'policy', 'capture', 'preflight:i-m1', 'deliver', 'lock:exit']);
+  });
+
+  it('drops only the refused item, with the owner\'s reason, and delivers the next one', async () => {
+    const { dispatcher, deliver, add, item } = withMission();
+    const unregister = registerInboxPreflight('mission', async (candidate) =>
+      (candidate.id === 'i-m1' ? { ok: false, reason: 'mission-record-not-waiting' } : { ok: true }));
+    try {
+      add('m1');
+      add('m2');
+      await dispatcher.tick();
+      await dispatcher.tick();
+    } finally {
+      unregister();
+    }
+    expect(item('i-m1')).toMatchObject({ state: 'dropped', droppedReason: 'preflight:mission-record-not-waiting' });
+    expect(item('i-m2').state).toBe('delivered');
+    expect(deliver).toHaveBeenCalledOnce();
+  });
+
+  it('a preflight that throws is a refusal, never a paste', async () => {
+    const { dispatcher, deliver, add, item } = withMission();
+    const unregister = registerInboxPreflight('mission', async () => {
+      throw new Error('database locked');
+    });
+    try {
+      add('m1');
+      await dispatcher.tick();
+    } finally {
+      unregister();
+    }
+    expect(deliver).not.toHaveBeenCalled();
+    expect(item('i-m1')).toMatchObject({ state: 'queued', lastRefusal: 'preflight-error:database locked' });
+  });
+
+  it('kinds without a preflight are unaffected, and unregister only removes its own hook', async () => {
+    const { dispatcher, deliver, enqueue } = withMission();
+    const first = vi.fn(async () => ({ ok: true as const }));
+    const unregisterFirst = registerInboxPreflight('mission', first);
+    const unregisterSecond = registerInboxPreflight('mission', first);
+    unregisterFirst(); // the same function is still the registered one; removes it
+    unregisterSecond();
+    enqueue();
+    await dispatcher.tick();
+    expect(deliver).toHaveBeenCalledWith('pt-ws-1-pane-a-tab-w', LINE);
+    expect(first).not.toHaveBeenCalled();
   });
 });
