@@ -459,7 +459,7 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=20 passed=19 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=21 passed=20 failed=0 skipped=1$/m);
     expect(body.match(/^SKIP .*/gm)).toEqual(['SKIP bash-guard — no --bash-guard path given']);
   });
 });

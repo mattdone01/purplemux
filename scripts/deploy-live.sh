@@ -323,7 +323,7 @@ if ((!ROLLBACK)); then
   [[ -n "${DEPLOY_BASH_GUARD:-}" ]] && acceptance_args+=(--bash-guard "$DEPLOY_BASH_GUARD" --require-bash-guard)
   # 9>&-: the gate and its candidate server must never hold deploy-live.lock (review round 1).
   if "$ACCEPTANCE" "${acceptance_args[@]}" >/dev/null 2>&1 9>&-; then
-    S_ACCEPTANCE="pass ($(grep -m 1 -o 'checks=[0-9]* passed=[0-9]*' "$ACCEPTANCE_LOG" 2>/dev/null || echo 'see log'); $ACCEPTANCE_LOG)"
+    S_ACCEPTANCE="pass ($(grep -m 1 -o 'checks=[0-9]* passed=[0-9]* failed=[0-9]* skipped=[0-9]*' "$ACCEPTANCE_LOG" 2>/dev/null || echo 'see log'); $ACCEPTANCE_LOG)"
   else
     grep -E '^(FAIL|ACCEPTANCE=)' "$ACCEPTANCE_LOG" >&2 2>/dev/null || tail -n 20 "$ACCEPTANCE_LOG" >&2 2>/dev/null
     S_ACCEPTANCE="fail ($ACCEPTANCE_LOG)"

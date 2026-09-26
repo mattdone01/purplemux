@@ -228,6 +228,20 @@ const wave1 = async (inst, { bashGuard }) => {
   const env = await inst.inTab(wsA, tabs.A1, 'printf "%s" "$PMUX_TAB_ID"; test -n "$PMUX_TAB_TOKEN"');
   check('identity-env', 'a tab carries PMUX_TAB_ID and PMUX_TAB_TOKEN', env.rc === 0 && env.out === tabs.A1, `exit ${env.rc}, PMUX_TAB_ID=${env.out}`, `exit 0, PMUX_TAB_ID=${tabs.A1}`);
 
+  // ---- a tab from before story 01 (every live tab at the first deploy): only the workspace token,
+  // the tab named by its tmux session. Its lease writes must still work, unverified (ADR-0010).
+  const legacyName = `acc:legacy-${nonce}`;
+  const legacy = await inst.inTab(wsA, tabs.A1, `env -u PMUX_TAB_TOKEN -u PMUX_TAB_ID ${inst.tabCli(['lease', 'acquire', legacyName, '--ttl', '5m'])}`);
+  const legacyLease = (parseJson((await inst.cli(['lease', 'list', '--json'])).out)?.leases || []).find((l) => l.name === legacyName);
+  await inst.cli(['lease', 'break', legacyName, '--reason', 'acceptance cleanup']);
+  check(
+    'legacy-tab-identity',
+    'a tab without PMUX_TAB_TOKEN (pre-story-01) still takes a lease, as an unverified holder named by its session',
+    legacy.rc === 0 && legacyLease?.holder.tabId === tabs.A1 && legacyLease?.holder.verified === false,
+    `exit ${legacy.rc} (${legacy.err.trim().split('\n')[0] || 'no message'}), holder ${JSON.stringify(legacyLease?.holder || null)}`,
+    `exit 0, holder.tabId=${tabs.A1}, verified=false`,
+  );
+
   // ---- leases (stories 03, 27): the SC-1 race across two workspaces
   const race = `merge:acc/race-${nonce}`;
   const [ra, rb] = await Promise.all([

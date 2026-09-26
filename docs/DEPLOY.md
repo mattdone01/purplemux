@@ -79,6 +79,7 @@ and each prints `PASS`/`FAIL` with what it measured and expected:
 |---|---|
 | `tab-create`, `tab-list`, `tab-send-result`, `tab-status` | tab create/list/send/result/status in two workspaces |
 | `identity-env` | a tab carries `PMUX_TAB_ID` and `PMUX_TAB_TOKEN` (ADR-0010) |
+| `legacy-tab-identity` | a tab without `PMUX_TAB_TOKEN` (every tab created before story 01) still takes a lease, as an unverified holder named by its session |
 | `lease-race`, `lease-verified` | two tabs race one merge lease: one wins, one gets exit 3 naming the holder, the holder is verified |
 | `lease-renew-release`, `lease-expiry` | renew and release by the holder only; a 2 s lease expires (ADR-0011) |
 | `epic-ownership`, `num-claim` | an epic claim frees when its tab closes; a number claim survives its tab until `release-epic` |

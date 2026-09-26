@@ -836,7 +836,7 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     // The gate never holds deploy-live.lock (fd 9): a leftover could otherwise refuse every later deploy.
     expect(call).toContain('fd9=closed');
     expect(call).not.toContain('--bash-guard');
-    expect(field(out, 'ACCEPTANCE')).toMatch(/^pass \(checks=20 passed=20; .*acceptance-.*\.log\)$/);
+    expect(field(out, 'ACCEPTANCE')).toMatch(/^pass \(checks=20 passed=20 failed=0 skipped=0; .*acceptance-.*\.log\)$/);
     expect(field(out, 'VERDICT')).toBe('deployed');
   });
 
