@@ -14,7 +14,9 @@ import path from 'path';
 // lines with fake-clock stamps) into the live log.
 //
 // Scope: the guard reads only the real `logs/*.log` files and only the worker
-// pids. Store files under ~/.purplemux and processes that tests spawn are kept
+// pids. It is meant for `vitest run` (the gate): in a watch session left open for
+// hours the pid counter can wrap between the start snapshot and the exit scan.
+// Store files under ~/.purplemux and processes that tests spawn are kept
 // out by HOME itself (every spawning test passes or inherits a temporary HOME),
 // not by this check.
 
@@ -115,11 +117,13 @@ export const findLeakedLogLines = (realHome: string, pids: ReadonlySet<number>, 
   return scan;
 };
 
-const readPids = (root: string): Set<number> => {
+/** The recorded worker pids, or null when none could be read (the guard cannot look). */
+const readPids = (root: string): Set<number> | null => {
   try {
-    return new Set(fs.readdirSync(path.join(root, PIDS_DIR)).map(Number).filter(Number.isInteger));
+    const pids = new Set(fs.readdirSync(path.join(root, PIDS_DIR)).map(Number).filter(Number.isInteger));
+    return pids.size > 0 ? pids : null;
   } catch {
-    return new Set();
+    return null;
   }
 };
 
@@ -135,7 +139,10 @@ export const verifyNoLeaks = (realHome: string, root: string): void => {
   } catch {
     // no snapshot: every line of every file is in scope, which can only over-report
   }
-  const { leaks, unreadable } = findLeakedLogLines(realHome, readPids(root), before);
+  const pids = readPids(root);
+  const { leaks, unreadable } = pids
+    ? findLeakedLogLines(realHome, pids, before)
+    : { leaks: [], unreadable: [`${path.join(root, PIDS_DIR)}: no worker pid was recorded`] };
   if (leaks.length === 0 && unreadable.length === 0) return;
   process.exitCode = 1;
   const parts: string[] = [];

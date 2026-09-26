@@ -102,6 +102,14 @@ describe('verifyNoLeaks', () => {
     expect(process.exitCode).toBe(1);
   });
 
+  it('fails when no worker pid was recorded: a guard that cannot look must not pass', () => {
+    const { home } = fakeRealHome([]);
+    homes.push(home);
+    const root = rootWith([], snapshotLogSizes(home));
+    expect(() => verifyNoLeaks(home, root)).toThrow(/no worker pid was recorded/);
+    expect(process.exitCode).toBe(1);
+  });
+
   it('passes quietly on a clean run', () => {
     const { home, file } = fakeRealHome([line(111, 'before the run')]);
     homes.push(home);
