@@ -69,7 +69,7 @@ export interface ITurnErrorEpisode {
 }
 
 export interface ITurnEndRecord {
-  kind: 'turn-marker' | 'waiting' | 'ready-for-review' | 'api-error' | 'usage-limit';
+  kind: 'turn-marker' | 'waiting' | 'ready-for-review' | 'api-error' | 'usage-limit' | 'compacting';
   at: number;
   /** `lastEvent.seq` of the stop this classifies; a newer event makes it stale. */
   seq?: number;

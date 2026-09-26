@@ -6,7 +6,7 @@ import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessi
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
-import type { IAgentProvider, IAgentRuntimeSnapshot, ITurnError } from '@/lib/providers/types';
+import type { IAgentProvider, IAgentRuntimeSnapshot, ITurnError, TSessionStartSource } from '@/lib/providers/types';
 import type { IAgentHookMetaPatch, TAgentWorkStateEvent } from '@/lib/providers/types';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
@@ -1563,7 +1563,7 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string): void {
+  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ tmuxSession, event, notificationType }, 'no tabId for session');
@@ -1578,6 +1578,20 @@ export class StatusManager {
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');
       this.setCompacting(tabId, entry, event === 'pre-compact' ? Date.now() : null);
+      return;
+    }
+
+    // A compaction's own SessionStart (L30, measured 2026-09-26 08:29Z on W4):
+    // the agent compacted mid-turn and carries on, so it is neither a session
+    // start nor a turn end. Only the hook's `source` says so; status-hook.sh is
+    // rewritten on every server start, so the server that reads `source` also
+    // installed the script that sends it.
+    if (event === 'session-start' && source === 'compact') {
+      // No state change, no nudge, no relaunch stamp: the turn goes on.
+      entry.turnEnd = { kind: 'compacting', at: Date.now(), seq: entry.lastEvent?.seq };
+      hookLog.debug({ tabId, source, cliState: entry.cliState }, 'compaction session-start: turn continues');
+      this.setCompacting(tabId, entry, null);
+      this.broadcastUpdate(tabId, entry);
       return;
     }
 
@@ -1811,6 +1825,8 @@ export class StatusManager {
     if (!entry) return;
     switch (event.kind) {
       case 'session-start':
+        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source);
+        break;
       case 'prompt-submit':
       case 'stop':
       case 'interrupt':
