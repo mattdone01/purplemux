@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// Wave-1, wave-2 and wave-3 acceptance checks against an ISOLATED purplemux instance (stories 07, 22
-// and 23; ADR-0017 amendment). The wave-3 checks (deploy announce, harness watches, self-notified
-// failures, refusal codes) live in checks-wave3.cjs and run after wave 2.
+// Wave-1 to wave-4 acceptance checks against an ISOLATED purplemux instance (stories 07, 22, 23 and
+// 39; ADR-0017 amendment). The wave-3 checks (deploy announce, harness watches, self-notified
+// failures, refusal codes) live in checks-wave3.cjs and run after wave 2; the wave-4 checks (subagent
+// background work, hook-time identity, drive grants, the grants read, the coordination panel, Mission
+// Control delivery through the inbox) live in checks-wave4.cjs and run last.
 //
 //   checks.cjs --state <state.json> [--bash-guard <bash-guard.py>] [--require-bash-guard]
 //
@@ -39,6 +41,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { wave3 } = require('./checks-wave3.cjs');
+const { wave4 } = require('./checks-wave4.cjs');
 
 const POLL_MS = 200;
 
@@ -143,8 +146,11 @@ class Instance {
    * `transcript` is the last assistant text, or the transcript's entries as objects. `workspaceDir`
    * is the pane's cwd under scratch/work (a/ or b/); `composer` runs the stand-in that draws an
    * empty Claude composer and swallows its input unechoed, so the inbox can deliver to it.
+   * `subagents` maps a subagent file name (`agent-<id>.jsonl`) to its entries, written under
+   * `<transcript>/subagents/` as Claude writes them (story 37). The result carries `transcriptPath`
+   * so a check can append to the transcript later. `standInPath` runs another stand-in script.
    */
-  async startStandIn(session, transcript, { workspaceDir = 'b', composer = false, inputFile = null } = {}) {
+  async startStandIn(session, transcript, { workspaceDir = 'b', composer = false, inputFile = null, subagents = null, standInPath = null } = {}) {
     const tmuxDir = this.state.tmuxTmpdir;
     if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
     const uuid = crypto.randomUUID();
@@ -157,11 +163,20 @@ class Instance {
         { type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'go' } },
         { type: 'assistant', timestamp: new Date().toISOString(), message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: transcript }] } },
       ];
-    fs.writeFileSync(path.join(project, `${uuid}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    const transcriptPath = path.join(project, `${uuid}.jsonl`);
+    fs.writeFileSync(transcriptPath, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    if (subagents) {
+      const dir = path.join(project, uuid, 'subagents');
+      fs.mkdirSync(dir, { recursive: true });
+      for (const [name, entries] of Object.entries(subagents)) {
+        fs.writeFileSync(path.join(dir, name), `${entries.map((l) => JSON.stringify(l)).join('\n')}\n`);
+      }
+    }
     const env = { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir };
-    const standIn = composer ? this.composerStandIn() : path.join(this.state.scratch, 'bin', 'claude');
+    const standIn = standInPath ?? (composer ? this.composerStandIn() : path.join(this.state.scratch, 'bin', 'claude'));
     const input = inputFile ? `ACC_INPUT=${shellQuote(inputFile)} ` : '';
-    return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, `${input}${standIn} --resume ${uuid}`, 'Enter'], { env, timeoutMs: 10000 });
+    const started = await run('tmux', ['-L', 'purple', 'send-keys', '-t', session, `${input}${standIn} --resume ${uuid}`, 'Enter'], { env, timeoutMs: 10000 });
+    return { ...started, transcriptPath };
   }
 
   /**
@@ -804,9 +819,11 @@ const freePort = () =>
   });
 
 const parseArgs = (argv) => {
-  const opts = { state: null, bashGuard: null, requireBashGuard: false };
+  const opts = { state: null, bashGuard: null, requireBashGuard: false, onlyWave: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--state') opts.state = argv[++i];
+    // Debugging one wave against a kept instance; run.sh and the deploy gate never pass it.
+    else if (argv[i] === '--only-wave') opts.onlyWave = Number(argv[++i]);
     else if (argv[i] === '--bash-guard') opts.bashGuard = argv[++i];
     else if (argv[i] === '--require-bash-guard') opts.requireBashGuard = true;
     else throw new Error(`unknown argument: ${argv[i]}`);
@@ -833,11 +850,12 @@ const main = async (argv) => {
     return 2;
   }
   const inst = new Instance(state);
-  const results = [
-    ...(await wave1(inst, opts)),
-    ...(await wave2(inst)),
-    ...(await wave3(inst, { parseJson, within, sleep, brief, shellQuote })),
-  ];
+  const helpers = { parseJson, within, sleep, brief, shellQuote, readIf };
+  const waves = [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers)];
+  const results = [];
+  for (const [i, wave] of waves.entries()) {
+    if (opts.onlyWave === null || opts.onlyWave === i + 1) results.push(...(await wave()));
+  }
   const { lines, pass } = summarize(results, opts);
   process.stdout.write(`${lines.join('\n')}\n`);
   return pass ? 0 : 1;

@@ -77,7 +77,10 @@ describe('checks.cjs judgements', () => {
       state: 's.json',
       bashGuard: 'g.py',
       requireBashGuard: true,
+      onlyWave: null,
     });
+    // Debugging one wave against a kept instance (story 39); run.sh never passes it.
+    expect(checks.parseArgs(['--state', 's.json', '--only-wave', '4']).onlyWave).toBe(4);
     expect(() => checks.parseArgs([])).toThrow(/usage/);
     expect(() => checks.parseArgs(['--state', 's', '--nope'])).toThrow(/unknown argument/);
   });
@@ -89,6 +92,48 @@ describe('checks.cjs judgements', () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('REFUSED STATE');
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('checks-wave4.cjs fixtures (story 39)', () => {
+  const wave4 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave4.cjs'));
+  const ledgerOf = async (main: unknown[], subagents: unknown[][]) => {
+    const { applyBackgroundLine, createBackgroundLedger, mergeLedgers, openBackgroundTasks } = await import('@/lib/providers/claude/background-ledger');
+    const parts = [main, ...subagents].map((entries, i) => {
+      const ledger = createBackgroundLedger();
+      for (const e of entries) applyBackgroundLine(ledger, JSON.stringify(e), i === 0 ? 'main' : 'subagent');
+      return ledger;
+    });
+    return openBackgroundTasks(mergeLedgers(parts), Date.now() + 3_600_000).map((t) => `${t.kind}:${t.id}`);
+  };
+
+  it('the subagent-shell fixture reads as one open shell until its completion (what the live check asserts)', async () => {
+    const t0 = Date.now();
+    const main = [wave4.userLine(t0, 'go'), wave4.asyncAgentLaunch(t0 + 1000, 'aS'), wave4.queuedCompletion(t0 + 20000, 'aS', 'done'), wave4.assistantEnd(t0 + 21000, 'x')];
+    const sub = [wave4.subagentMovedShell(t0 + 19000, 'aS', 'bS')];
+    expect(await ledgerOf(main, [sub])).toEqual(['shell:bS']);
+    expect(await ledgerOf([...main, wave4.queuedCompletion(t0 + 40000, 'bS', 'done')], [sub])).toEqual([]);
+  });
+
+  it('the woken-agent fixture reads as one open agent until its second completion', async () => {
+    const t0 = Date.now();
+    const main = [wave4.userLine(t0, 'go'), wave4.asyncAgentLaunch(t0 + 1000, 'aW'), wave4.queuedCompletion(t0 + 10000, 'aW', 'done'), wave4.assistantEnd(t0 + 30000, 'x')];
+    const sub = [wave4.subagentMovedShell(t0 + 5000, 'aW', 'bW'), wave4.subagentDelivery(t0 + 25000, 'aW', 'bW')];
+    expect(await ledgerOf(main, [sub])).toEqual(['agent:aW']);
+    expect(await ledgerOf([...main, wave4.queuedCompletion(t0 + 40000, 'aW', 'done')], [sub])).toEqual([]);
+  });
+
+  it('the live composer stand-in execs a process named `claude --resume <uuid>`', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w4-'));
+    try {
+      const file = wave4.liveComposerStandIn(dir);
+      const text = fs.readFileSync(file, 'utf-8');
+      expect(text.startsWith('#!/bin/sh\n')).toBe(true);
+      expect(text).toMatch(/exec perl -e '\$0 = "claude --resume " \. \$ARGV\[0\];/);
+      expect(fs.statSync(file).mode & 0o111).not.toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
