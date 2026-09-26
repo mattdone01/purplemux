@@ -104,6 +104,12 @@ class Fakes {
         this.inbox.set(id, item);
         return { item };
       },
+      withdraw: async (itemId) => {
+        const item = this.inbox.get(itemId);
+        if (!item || (item.state !== 'queued' && item.state !== 'held')) return false;
+        this.inbox.set(itemId, { ...item, state: 'dropped' } as IInboxItem);
+        return true;
+      },
       inboxItems: async () => [...this.inbox.values()],
       cliStateOf: (tabId) => (tabId === 'tab-a1' ? 'idle' : 'busy'),
       read: async () => this.store,
@@ -161,6 +167,49 @@ describe('deploy announcer', () => {
     expect(cleanReason('two\nlines‮ here')).toBe('two lines here');
     const a = await svc.announce(ADMIN, { inMinutes: 5, reason: 'r', exceptTabIds: ['tab-b1'] });
     expect(a.recipients.map((r) => r.tabId)).toEqual(['tab-a1', 'tab-c']);
+  });
+
+  it('a malformed store refuses the announce before any notice goes out', async () => {
+    const broken = new DeployAnnouncer({ ...f.deps(), mutate: async () => { throw new Error('deploy-announcements.json is malformed'); } });
+    await expect(broken.announce(ADMIN, { inMinutes: 5, reason: 'r' })).rejects.toThrow(/malformed/);
+    expect(f.sent).toEqual([]);
+  });
+
+  it('an enqueue that fails part-way or a failed record write takes back every notice already queued', async () => {
+    const deps = f.deps();
+    let n = 0;
+    const flaky = new DeployAnnouncer({
+      ...deps,
+      enqueue: async (req) => {
+        if (++n === 3) throw new Error('inbox.json unwritable');
+        return deps.enqueue(req);
+      },
+    });
+    await expect(flaky.announce(ADMIN, { inMinutes: 5, reason: 'r' })).rejects.toThrow(/unwritable/);
+    expect([...f.inbox.values()].map((i) => i.state)).toEqual(['dropped', 'dropped']);
+    expect(f.store.announcements).toEqual([]);
+
+    f = new Fakes();
+    const d2 = f.deps();
+    const unwritable = new DeployAnnouncer({
+      ...d2,
+      mutate: async (fn) => {
+        await fn(f.store);
+        throw new Error('ENOSPC: no space left on device');
+      },
+    });
+    await expect(unwritable.announce(ADMIN, { inMinutes: 5, reason: 'r' })).rejects.toThrow(/ENOSPC/);
+    expect([...f.inbox.values()].map((i) => i.state)).toEqual(['dropped', 'dropped', 'dropped']);
+  });
+
+  it('withdraw takes back the notices still waiting (announcer authority), leaving delivered ones', async () => {
+    const a = await svc.announce(ADMIN, { inMinutes: 5, reason: 'r' });
+    f.inbox.set('i-item1', { id: 'i-item1', state: 'delivered' } as IInboxItem);
+    f.inbox.set('i-item2', { id: 'i-item2', state: 'held' } as IInboxItem);
+    expect(await code(svc.withdraw(caller('ws-a', 'tab-a1'), a.id))).toBe('forbidden');
+    expect(await svc.withdraw(ADMIN, a.id)).toEqual({ id: a.id, withdrawn: 2 });
+    expect([...f.inbox.values()].map((i) => i.state)).toEqual(['delivered', 'dropped', 'dropped']);
+    expect(await code(svc.withdraw(ADMIN, 'd-nosuchone'))).toBe('deploy-not-found');
   });
 
   it('status lists each recipient with its delivery state and cliState', async () => {

@@ -80,6 +80,7 @@ describe('purplemux deploy — the installed CLI against the real deploy routes 
       ...(await loadLeaseRoutes()),
       '/api/cli/deploy/announce': (await import('@/pages/api/cli/deploy/announce')).default,
       '/api/cli/deploy/status': (await import('@/pages/api/cli/deploy/status')).default,
+      '/api/cli/deploy/withdraw': (await import('@/pages/api/cli/deploy/withdraw')).default,
     });
     const port = String(server.port);
     orchA = { PMUX_PORT: port, PMUX_TAB_TOKEN: await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-a1' }, 'pt-ws-a-pane-1-tab-a1') };
@@ -146,6 +147,26 @@ describe('purplemux deploy — the installed CLI against the real deploy routes 
     expect(json.recipients.every((r: Record<string, unknown>) => 'cliState' in r)).toBe(true);
     expect((await cli(['deploy', 'status', 'd-nosuchone'], admin)).code).toBe(7);
     expect((await cli(['deploy', 'status', a.id], holderC)).code).toBe(3);
+  });
+
+  it('--except-tab leaves each named tab out; withdraw takes back what is still queued', async () => {
+    const r = await cli(['deploy', 'announce', '--in', '5', '--reason', 'r', '--except-tab', 'tab-a1', '--except-tab', 'tab-b1', '--json'], admin);
+    expect(r.code, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).recipients).toEqual([]);
+    const a = JSON.parse((await cli(['deploy', 'announce', '--in', '5', '--reason', 'r', '--json'], admin)).stdout);
+    const w = await cli(['deploy', 'withdraw', a.id], admin);
+    expect(w.code, w.stderr).toBe(0);
+    expect(JSON.parse(w.stdout)).toEqual({ id: a.id, withdrawn: 2 });
+    expect((await inbox()).map((i) => i.state)).toEqual(['dropped', 'dropped']);
+    expect((await cli(['deploy', 'withdraw', a.id], holderC)).code).toBe(3);
+  });
+
+  it('a malformed announcement store refuses the announce (exit 1) and no tab is told anything', async () => {
+    await fs.writeFile(path.join(mockHome.value, '.purplemux', 'deploy-announcements.json'), '{"announcements":[{"id":"bad"}]}');
+    const r = await cli(['deploy', 'announce', '--in', '5', '--reason', 'r'], admin);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain('deploy-internal');
+    expect(await inbox()).toEqual([]);
   });
 
   it('refuses bad minutes or a missing reason with exit 2 before anything is sent', async () => {

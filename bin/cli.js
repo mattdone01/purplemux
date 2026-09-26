@@ -651,7 +651,7 @@ const cmdConfig = async (args) => {
 
 // Deploy announce (story 13, ADR-0017): the one broadcast path. The reason is
 // stored and shown by `deploy status`; recipients get the inbox's fixed line.
-const DEPLOY_USAGE = 'usage: deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json] | deploy status ID [--json]';
+const DEPLOY_USAGE = 'usage: deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json] | deploy status ID [--json] | deploy withdraw ID';
 
 const flagValues = (args, name) => {
   const values = [];
@@ -697,6 +697,12 @@ const cmdDeploy = async (args) => {
         process.stdout.write(`  ${r.workspaceId}/${r.tabId}  ${r.state}  cliState=${r.cliState ?? '-'}  ${r.reasons.join(', ')}\n`);
       }
       return;
+    }
+    case 'withdraw': {
+      if (positional.length !== 1) die(DEPLOY_USAGE);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/deploy/withdraw', { id: positional[0] });
+      return out(body);
     }
     default:
       die(DEPLOY_USAGE);
@@ -1358,6 +1364,8 @@ Commands:
                                            restarts in 1-60 min (admin token or the deploy:purplemux holder; else
                                            exit 3). Only a fixed inbox line is typed; the reason is shown by status
   deploy status ID [--json]                The reason and, per recipient, delivery state and cliState (7 unknown)
+  deploy withdraw ID                       Take back the notices still waiting once the deploy is over (announcer
+                                           authority); deploy-live.sh does this when it finishes
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 

@@ -124,7 +124,7 @@ const commands = {
       // not JSON: print nothing
     }
   },
-  // announce-progress STATUS_JSON -> "delivered settled total" (all 0 when unreadable)
+  // announce-progress STATUS_JSON -> "delivered settled" (0 0 when unreadable: nothing settled)
   'announce-progress': ([file]) => {
     let status = null;
     try {
@@ -132,8 +132,17 @@ const commands = {
     } catch {
       // unreadable: nothing settled
     }
-    const { delivered, settled, total } = announceProgress(status);
-    console.log(`${delivered} ${settled} ${total}`);
+    const { delivered, settled } = announceProgress(status);
+    console.log(`${delivered} ${settled}`);
+  },
+  // count JSON_FILE KEY -> the length of the top-level array KEY (0 when absent or unreadable)
+  count: ([file, key]) => {
+    try {
+      const value = readJson(file)[key];
+      console.log(Array.isArray(value) ? value.length : 0);
+    } catch {
+      console.log(0);
+    }
   },
   // backup SRC DST BETTER_SQLITE3_MODULE
   backup: ([src, dst, modulePath]) => backupSqlite(src, dst, modulePath),

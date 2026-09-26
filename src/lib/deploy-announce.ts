@@ -173,6 +173,8 @@ export interface IDeployDeps {
   /** True when `caller` holds the `deploy:purplemux` lease. */
   holdsDeployLease: (caller: ICaller) => Promise<boolean>;
   enqueue: (req: IEnqueueRequest<'deploy'>) => Promise<{ item: IInboxItem }>;
+  /** Take back a notice still waiting (queued or held); true when it was still waiting. */
+  withdraw: (itemId: string, reason: string) => Promise<boolean>;
   inboxItems: () => Promise<IInboxItem[]>;
   cliStateOf: (tabId: string) => string | null;
   read: typeof readAnnouncements;
@@ -211,33 +213,47 @@ export class DeployAnnouncer {
     const id = this.deps.newId();
     const restartAt = now + inMinutes * 60_000;
     const targets = recipientsOf(await this.deps.facts(), except);
-    // Record first, then enqueue: a record without every item says so in `deploy status`
-    // (`pruned`), where an item without a record could not be looked up at all.
-    const recipients: IDeployRecipient[] = [];
-    for (const t of targets) {
-      const { item } = await this.deps.enqueue({
-        kind: 'deploy',
-        targetWorkspaceId: t.workspaceId,
-        targetTabId: t.tabId,
-        dedupeKey: `deploy-${id}`,
-        fields: { deployId: id, restartAt, inMinutes },
+    const by = { workspaceId: caller.admin ? null : caller.workspaceId, tabId: caller.admin ? null : caller.tabId, admin: caller.admin };
+    // Under the announcements lock: the store is read (a malformed one refused) before any notice
+    // goes out, and the record is written before the lock is released. Should an enqueue or the
+    // write fail, every notice already queued is taken back, so no tab is told about a restart
+    // whose `deploy status` would answer 404 (review round 1).
+    const queued: string[] = [];
+    try {
+      return await this.deps.mutate(async (state) => {
+        const recipients: IDeployRecipient[] = [];
+        for (const t of targets) {
+          const { item } = await this.deps.enqueue({
+            kind: 'deploy',
+            targetWorkspaceId: t.workspaceId,
+            targetTabId: t.tabId,
+            dedupeKey: `deploy-${id}`,
+            fields: { deployId: id, restartAt, inMinutes },
+          });
+          queued.push(item.id);
+          recipients.push({ ...t, itemId: item.id });
+        }
+        const announcement: IDeployAnnouncement = { id, reason, inMinutes, createdAt: now, restartAt, by, recipients };
+        return { state: { announcements: [...pruneAnnouncements(state, now).announcements, announcement] }, value: announcement };
       });
-      recipients.push({ ...t, itemId: item.id });
+    } catch (err) {
+      await Promise.all(queued.map((itemId) => this.deps.withdraw(itemId, 'deploy-announce-failed').catch(() => false)));
+      throw err;
     }
-    const announcement: IDeployAnnouncement = {
-      id,
-      reason,
-      inMinutes,
-      createdAt: now,
-      restartAt,
-      by: { workspaceId: caller.admin ? null : caller.workspaceId, tabId: caller.admin ? null : caller.tabId, admin: caller.admin },
-      recipients,
-    };
-    await this.deps.mutate(async (state) => ({
-      state: { announcements: [...pruneAnnouncements(state, now).announcements, announcement] },
-      value: undefined,
-    }));
-    return announcement;
+  }
+
+  /**
+   * The announcement is over (the deploy finished, rolled back or was refused): notices still
+   * waiting are taken back, so no tab is told about a restart that has already happened. The
+   * admin token or the deploy lease holder, as for announce.
+   */
+  async withdraw(caller: ICaller, id: unknown): Promise<{ id: string; withdrawn: number }> {
+    if (!isDeployId(id)) throw new DeployError('deploy-not-found', `no deploy announcement ${String(id)}`);
+    await this.requireAnnouncer(caller);
+    const found = pruneAnnouncements(await this.deps.read(), this.deps.now()).announcements.find((a) => a.id === id);
+    if (!found) throw new DeployError('deploy-not-found', `no deploy announcement ${id}`);
+    const results = await Promise.all(found.recipients.map((r) => this.deps.withdraw(r.itemId, 'deploy-over')));
+    return { id, withdrawn: results.filter(Boolean).length };
   }
 
   /**
@@ -289,6 +305,7 @@ const defaultDeps = async (): Promise<IDeployDeps> => {
       return !!lease && leaseStore.sameHolder(lease.holder, leaseStore.holderFromCaller(caller));
     },
     enqueue: inboxStore.enqueueNotice,
+    withdraw: inboxStore.withdrawNotice,
     inboxItems: async () => (await inboxStore.readInboxState()).items,
     cliStateOf: (tabId) => getStatusManager().getAllForClient()[tabId]?.cliState ?? null,
     read: readAnnouncements,

@@ -363,6 +363,10 @@ GET /api/cli/deploy/status?id=d-…
   A recipient's workspace, the announcer's workspace, the deploy:purplemux holder or admin
   (else 403). 404 deploy-not-found (exit 7). Response: the record, each recipient with
   "state" (queued | delivered | held | dropped | pruned) and "cliState".
+POST /api/cli/deploy/withdraw   { "id": "d-…" }
+  The announcer's authority (admin or the deploy:purplemux holder). Takes back the notices still
+  waiting (queued or held) once the deploy is over: { "id", "withdrawn": n }. deploy-live.sh calls it
+  whatever its verdict. An announce whose record cannot be written takes back its notices itself.
 
 ## Orchestration
 

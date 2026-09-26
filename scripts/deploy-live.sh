@@ -106,6 +106,7 @@ PROC_ROOT="${DEPLOY_PROC_ROOT:-/proc}"
 WORK="$(mktemp -d)"
 LEASE_HELD=0
 CLI_DIR=""
+ANNOUNCE_ID=""
 INTERRUPTED=0
 
 S_RELEASE="-"
@@ -139,6 +140,18 @@ token_cli() {
 
 finish() {
   local code="$1" verdict="$2"
+  # The announcement is over whatever the verdict: a notice still waiting would tell a tab about a
+  # restart that already happened (or did not), so it is taken back (review round 1).
+  if [[ -n "${ANNOUNCE_ID:-}" ]]; then
+    local withdrawn
+    if admin_cli deploy withdraw "$ANNOUNCE_ID" >"$WORK/withdraw.json" 2>/dev/null; then
+      withdrawn="$(helper field "$WORK/withdraw.json" withdrawn)"
+      [[ "${withdrawn:-0}" != 0 ]] && S_ANNOUNCED="$S_ANNOUNCED; $withdrawn still waiting, withdrawn"
+    else
+      S_ANNOUNCED="$S_ANNOUNCED; withdraw failed"
+    fi
+    ANNOUNCE_ID=""
+  fi
   if ((LEASE_HELD)); then
     if admin_cli lease release deploy:purplemux >"$WORK/lease-release.out" 2>&1; then
       S_LEASE="acquired, released"
@@ -387,17 +400,22 @@ if [[ -n "$ANNOUNCE_MIN" ]]; then
   elif ((ROLLBACK)); then
     S_ANNOUNCED="skipped (rollback)"
   else
+    # The own tab and every --ignore-tab: all are left out of the quiet wait because they will not
+    # go idle, so a notice to them would never be delivered before the restart.
     except=()
     [[ -n "$OWN_TAB" ]] && except=(--except-tab "$OWN_TAB")
+    for ignored in "${IGNORE_TABS[@]}"; do except+=(--except-tab "${ignored#*/}"); done
     if admin_cli deploy announce --in "$ANNOUNCE_MIN" --reason "deploy ${SHORT:-$REF}" "${except[@]}" --json \
       >"$WORK/announce.json" 2>"$WORK/announce.err"; then
-      announce_id="$(helper field "$WORK/announce.json" id)"
-      echo "ANNOUNCE_ID=$announce_id"
+      ANNOUNCE_ID="$(helper field "$WORK/announce.json" id)"
+      echo "ANNOUNCE_ID=$ANNOUNCE_ID"
       announce_deadline=$((SECONDS + ${DEPLOY_ANNOUNCE_WAIT_S:-$((ANNOUNCE_MIN * 60))}))
-      delivered=0 settled=0 total=0
+      # The recipient count is the announcement's, never an unreadable status body's.
+      total="$(helper count "$WORK/announce.json" recipients)"
+      delivered=0 settled=0
       while :; do
-        if admin_cli deploy status "$announce_id" --json >"$WORK/announce-status.json" 2>/dev/null; then
-          read -r delivered settled total < <(helper announce-progress "$WORK/announce-status.json")
+        if admin_cli deploy status "$ANNOUNCE_ID" --json >"$WORK/announce-status.json" 2>/dev/null; then
+          read -r delivered settled < <(helper announce-progress "$WORK/announce-status.json")
           ((settled >= total)) && break
         fi
         ((SECONDS >= announce_deadline)) && break
