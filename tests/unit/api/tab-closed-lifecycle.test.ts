@@ -173,6 +173,16 @@ describe('one tab-closed event per close path, and the tab token dies with it', 
     for (const token of Object.values(tokens)) expect(resolveTabToken(token)).toBeNull();
   });
 
+  it('workspace delete also revokes a token whose tab never reached the layout', async () => {
+    const { deleteWorkspace } = await import('@/lib/workspace-store');
+    const { ensureTabToken, resolveTabToken } = await import('@/lib/tab-token');
+    const leaked = await ensureTabToken({ workspaceId: WS, tabId: 'tab-never-written' }, session('pane-9', 'tab-never-written'));
+
+    expect(await deleteWorkspace(WS)).toBe(true);
+    expect(resolveTabToken(leaked)).toBeNull();
+    expect(events.map((e) => e.tabId)).not.toContain('tab-never-written');
+  });
+
   it('a close followed by an unrelated write emits nothing more', async () => {
     const { removeTabFromPane, renameTabInPane } = await import('@/lib/layout-store');
 

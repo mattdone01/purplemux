@@ -108,15 +108,16 @@ describe('purplemux CLI caller identity', () => {
     expect((await cli(['tab', 'list', '-w', 'ws-z'], {})).headers['x-pmux-token']).toBe('admin-token');
   });
 
-  it('designates PMUX_TAB_ID, not a parse of the session name, as its own tab', async () => {
+  it('designates PMUX_TAB_ID as its own tab without asking tmux', async () => {
+    // The fake tmux would name another tab; PMUX_TAB_ID must win.
     const call = await cli(['orchestration', 'on', '-w', 'ws-a'], {
       PMUX_TAB_TOKEN: 'tab-token',
-      PMUX_TAB_ID: 'tab-adopted',
+      PMUX_TAB_ID: 'tab-own',
       TMUX: '/tmp/fake,1,0',
-      FAKE_TMUX_SESSION: 'pt-ws-a-pane-1-tab-old',
+      FAKE_TMUX_SESSION: 'pt-ws-a-pane-1-tab-other',
     });
     expect(call.method).toBe('PATCH');
-    expect(JSON.parse(call.body)).toEqual({ enabled: true, orchestratorTabId: 'tab-adopted' });
+    expect(JSON.parse(call.body)).toEqual({ enabled: true, orchestratorTabId: 'tab-own' });
   });
 
   it('still parses the session name for a tab created before PMUX_TAB_ID existed', async () => {

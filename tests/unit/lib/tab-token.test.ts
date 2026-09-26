@@ -123,14 +123,51 @@ describe('tab token store', () => {
     expect(await revokeTabToken('tab-1')).toBe(false);
   });
 
-  it('starts empty on a corrupt file, and says so', async () => {
+  it('starts empty on a corrupt file, moves it aside instead of overwriting it, and says so', async () => {
     await fs.mkdir(path.dirname(tokensPath()), { recursive: true });
     await fs.writeFile(tokensPath(), '{not json');
-    const { resolveTabToken, getTabTokenRecord } = await import('@/lib/tab-token');
+    const { ensureTabToken, resolveTabToken, getTabTokenRecord } = await import('@/lib/tab-token');
 
     expect(resolveTabToken('a'.repeat(64))).toBeNull();
     expect(getTabTokenRecord('tab-1')).toBeNull();
-    expect(logs.warn.some((m) => m.includes('tab-tokens.json unreadable'))).toBe(true);
+    expect(logs.warn.some((m) => m.includes('tab-tokens.json unreadable, moved to'))).toBe(true);
+
+    await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-2' }, 's2');
+    const aside = (await fs.readdir(path.dirname(tokensPath()))).filter((f) => f.startsWith('tab-tokens.json.unreadable-'));
+    expect(aside).toHaveLength(1);
+    expect(await fs.readFile(path.join(path.dirname(tokensPath()), aside[0]), 'utf-8')).toBe('{not json');
+  });
+
+  it('withdraws a new token that cannot be saved and throws', async () => {
+    await fs.mkdir(`${tokensPath()}.tmp`, { recursive: true });
+    const { ensureTabToken, getTabTokenRecord } = await import('@/lib/tab-token');
+
+    await expect(ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-1' }, 's1')).rejects.toThrow('could not be saved');
+    expect(getTabTokenRecord('tab-1')).toBeNull();
+    expect(logs.warn.some((m) => m.includes('tab-tokens.json write failed'))).toBe(true);
+  });
+
+  it('finds the tab id a token was minted for by exact workspace and session name', async () => {
+    const { ensureTabToken, findTabIdBySession } = await import('@/lib/tab-token');
+    await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-1' }, 'pt-ws-a-pane-1-tab-1');
+
+    expect(findTabIdBySession('ws-a', 'pt-ws-a-pane-1-tab-1')).toBe('tab-1');
+    expect(findTabIdBySession('ws-b', 'pt-ws-a-pane-1-tab-1')).toBeNull();
+    expect(findTabIdBySession('ws-a', 'pt-ws-a-pane-1-tab-')).toBeNull();
+  });
+
+  it('revokes every token of a workspace and only that workspace', async () => {
+    const { ensureTabToken, resolveTabToken, revokeWorkspaceTabTokens } = await import('@/lib/tab-token');
+    const a1 = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-1' }, 's1');
+    const a2 = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-2' }, 's2');
+    const b1 = await ensureTabToken({ workspaceId: 'ws-b', tabId: 'tab-3' }, 's3');
+
+    expect((await revokeWorkspaceTabTokens('ws-a')).sort()).toEqual(['tab-1', 'tab-2']);
+    expect(resolveTabToken(a1)).toBeNull();
+    expect(resolveTabToken(a2)).toBeNull();
+    expect(resolveTabToken(b1)?.tabId).toBe('tab-3');
+    expect(Object.keys(JSON.parse(await fs.readFile(tokensPath(), 'utf-8')))).toEqual(['tab-3']);
+    expect(await revokeWorkspaceTabTokens('ws-a')).toEqual([]);
   });
 
   it('ignores malformed records instead of trusting them', async () => {

@@ -7,7 +7,7 @@ import { broadcastSync } from '@/lib/sync-server';
 import { isAgentPanelType as isAgentPanel } from '@/lib/agent-panel-types';
 import { createLogger } from '@/lib/logger';
 import { hasKnownTabs, observeLayoutTabs, observeWorkspaceRemoved } from '@/lib/tab-lifecycle';
-import { revokeTabToken } from '@/lib/tab-token';
+import { findTabIdBySession, revokeTabToken } from '@/lib/tab-token';
 import {
   collectPanes,
   collectAllTabs,
@@ -225,11 +225,20 @@ export const crossCheckLayout = async (
     changed = true;
     const firstPane = panes[0];
     if (firstPane) {
+      const usedIds = new Set(collectAllTabs(layout.root).map((t) => t.id));
+      // An orphan that carries a tab token keeps the id in its PMUX_TAB_ID, so
+      // the layout id and the shell's own idea of its tab stay equal (ADR-0010).
+      const adoptedId = (sessionName: string): string => {
+        const own = findTabIdBySession(wsId, sessionName);
+        const id = own && !usedIds.has(own) ? own : generateTabId();
+        usedIds.add(id);
+        return id;
+      };
       let maxOrder = firstPane.tabs.length > 0 ? Math.max(...firstPane.tabs.map((t) => t.order)) : -1;
       for (const sessionName of orphans) {
         maxOrder++;
         firstPane.tabs.push({
-          id: generateTabId(),
+          id: adoptedId(sessionName),
           sessionName,
           name: '',
           order: maxOrder,

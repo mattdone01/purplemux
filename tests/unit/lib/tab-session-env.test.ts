@@ -115,16 +115,19 @@ describe('a tab created after this change carries its identity', () => {
     expect(env.PMUX_TOKEN).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('keeps the workspace scope when the tab token cannot be minted', async () => {
-    vi.doMock('@/lib/tab-token', () => ({ ensureTabToken: vi.fn(async () => { throw new Error('disk full'); }) }));
+  it('keeps the workspace scope when the tab token cannot be saved', async () => {
+    // A directory where the temp file must go makes the real write fail.
+    await fs.mkdir(path.join(mockHome.value, '.purplemux', 'tab-tokens.json.tmp'), { recursive: true });
     const { createSession } = await import('@/lib/tmux');
+    const { getTabTokenRecord } = await import('@/lib/tab-token');
 
     await createSession(SESSION, 80, 24, undefined, { workspaceId: 'ws-a', tabId: 'tab-t1' });
     const env = await paneEnvironment();
 
     expect(env.PMUX_TAB_TOKEN).toBeUndefined();
+    expect(env.PMUX_TAB_ID).toBeUndefined();
     expect(env.PMUX_TOKEN).toMatch(/^[0-9a-f]{64}$/);
     expect(env.CLAUDE_CONFIG_DIR).toBe('/fake/claude-home');
-    vi.doUnmock('@/lib/tab-token');
+    expect(getTabTokenRecord('tab-t1')).toBeNull();
   });
 });

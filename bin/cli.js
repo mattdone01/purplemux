@@ -190,9 +190,9 @@ const cmdWorkspacePeers = async (args) => {
 };
 
 /**
- * `PMUX_TAB_ID` is the tab's layout id. The session-name parse remains for tabs
- * created before it existed, and it is wrong for an adopted orphan, whose
- * session keeps its old name under a new tab id.
+ * `PMUX_TAB_ID` is the tab's layout id; the server adopts an orphan session
+ * under the id its token was minted for, so the two stay equal. The
+ * session-name parse remains for tabs created before `PMUX_TAB_ID` existed.
  */
 const deriveOwnTabId = () => {
   if (process.env.PMUX_TAB_ID) return process.env.PMUX_TAB_ID;
@@ -744,7 +744,7 @@ Mission event examples:
 Environment:
   PMUX_PORT          Server port (falls back to ~/.purplemux/port)
   PMUX_TAB_TOKEN     This tab's own token; names the calling tab (set in every tab created by the server)
-  PMUX_TOKEN         This tab's workspace token (used when PMUX_TAB_TOKEN is absent)
+  PMUX_TOKEN         This tab's workspace token (ignored while PMUX_TAB_TOKEN is set; unset that to override)
   PMUX_TAB_ID        This tab's id; the default TAB_ID of "orchestration on"
   PMUX_WORKSPACE_ID  This tab's workspace id
   Token order: PMUX_TAB_TOKEN > PMUX_TOKEN > the -w workspace's token on disk > ~/.purplemux/cli-token

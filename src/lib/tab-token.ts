@@ -64,25 +64,38 @@ const isRecord = (value: unknown): value is ITabTokenRecord => {
     && typeof r.sessionName === 'string' && typeof r.createdAt === 'string';
 };
 
+/** An unreadable file is moved aside, never overwritten: its tokens are the only record of which tab they name. */
+const moveAside = (file: string, err: unknown): void => {
+  const aside = `${file}.unreadable-${Date.now()}`;
+  try {
+    fs.renameSync(file, aside);
+    log.warn(`tab-tokens.json unreadable, moved to ${aside}, starting empty: ${err instanceof Error ? err.message : err}`);
+  } catch (renameErr) {
+    log.warn(`tab-tokens.json unreadable and could not be moved aside, starting empty: ${renameErr instanceof Error ? renameErr.message : renameErr}`);
+  }
+};
+
 const readTokens = (): TTabTokens => {
   if (g.__ptTabTokens) return g.__ptTabTokens;
   const parsed: TTabTokens = {};
+  const file = tokensFile();
   try {
-    const raw = JSON.parse(fs.readFileSync(tokensFile(), 'utf-8')) as Record<string, unknown>;
+    const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as Record<string, unknown>;
     for (const [tabId, value] of Object.entries(raw)) {
       if (isRecord(value)) parsed[tabId] = value;
     }
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`tab-tokens.json unreadable, starting empty: ${err instanceof Error ? err.message : err}`);
-    }
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') moveAside(file, err);
   }
   g.__ptTabTokens = parsed;
   return parsed;
 };
 
-/** Writes the in-memory map as it stands when the lock is taken, so the last writer always persists the latest state. */
-const persist = (): Promise<void> =>
+/**
+ * Writes the in-memory map as it stands when the lock is taken, so the last
+ * writer always persists the latest state. Resolves false when the write failed.
+ */
+const persist = (): Promise<boolean> =>
   withLock(async () => {
     const file = tokensFile();
     const tmp = `${file}.tmp`;
@@ -90,15 +103,21 @@ const persist = (): Promise<void> =>
       await fsp.mkdir(path.dirname(file), { recursive: true });
       await fsp.writeFile(tmp, JSON.stringify(readTokens(), null, 2), { mode: 0o600 });
       await fsp.rename(tmp, file);
+      return true;
     } catch (err) {
       await fsp.unlink(tmp).catch(() => {});
-      log.warn(`tab-tokens.json write failed, in-memory copy still serves: ${err instanceof Error ? err.message : err}`);
+      log.warn(`tab-tokens.json write failed: ${err instanceof Error ? err.message : err}`);
+      return false;
     }
   });
 
 /**
  * The token a session of `identity.tabId` carries. A session recreated for an
  * existing tab (boot cross-check, auto-resume, restart) keeps the tab's token.
+ *
+ * A new token that cannot be saved is withdrawn and this throws: a token that
+ * lives only in memory stops resolving at the next restart, and the CLI
+ * presents it before `PMUX_TOKEN`, so the tab would lose its workspace scope too.
  */
 export const ensureTabToken = async (identity: ITabIdentity, sessionName: string): Promise<string> => {
   const tokens = readTokens();
@@ -109,17 +128,39 @@ export const ensureTabToken = async (identity: ITabIdentity, sessionName: string
     await persist();
     return existing.token;
   }
-  tokens[identity.tabId] = {
+  const minted: ITabTokenRecord = {
     token: randomBytes(32).toString('hex'),
     workspaceId: identity.workspaceId,
     sessionName,
     createdAt: new Date().toISOString(),
   };
-  await persist();
-  return tokens[identity.tabId].token;
+  tokens[identity.tabId] = minted;
+  if (!(await persist())) {
+    if (tokens[identity.tabId] === minted) delete tokens[identity.tabId];
+    throw new Error(`tab token for ${identity.tabId} could not be saved`);
+  }
+  return minted.token;
 };
 
 export const getTabTokenRecord = (tabId: string): ITabTokenRecord | null => readTokens()[tabId] ?? null;
+
+/** The tab id whose token was minted for this exact session of this workspace — an orphan's own id at adoption. */
+export const findTabIdBySession = (workspaceId: string, sessionName: string): string | null => {
+  for (const [tabId, record] of Object.entries(readTokens())) {
+    if (record.workspaceId === workspaceId && record.sessionName === sessionName) return tabId;
+  }
+  return null;
+};
+
+/** Every token of a deleted workspace, including tabs that never reached its layout. */
+export const revokeWorkspaceTabTokens = async (workspaceId: string): Promise<string[]> => {
+  const tokens = readTokens();
+  const revoked = Object.keys(tokens).filter((tabId) => tokens[tabId].workspaceId === workspaceId);
+  if (revoked.length === 0) return revoked;
+  for (const tabId of revoked) delete tokens[tabId];
+  await persist();
+  return revoked;
+};
 
 export const revokeTabToken = async (tabId: string): Promise<boolean> => {
   const tokens = readTokens();

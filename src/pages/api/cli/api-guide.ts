@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { verifyCliToken } from '@/lib/cli-token';
+import { resolveCliScope } from '@/lib/workspace-token';
 
 const GUIDE = `# purplemux CLI HTTP API
 
@@ -295,7 +295,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     res.setHeader('Allow', 'GET');
     return res.status(405).json({ error: 'Method not allowed' });
   }
-  if (!verifyCliToken(req)) {
+  if (!resolveCliScope(req)) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');

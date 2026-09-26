@@ -28,6 +28,7 @@ import {
 } from '@/lib/path-safety';
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
+import { revokeWorkspaceTabTokens } from '@/lib/tab-token';
 import { withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
 import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
 
@@ -443,6 +444,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
     await removeWorkspaceClaudeHome(workspaceId).catch(() => {});
     await removeWorkspaceGrokHome(workspaceId).catch(() => {});
     revokeWorkspaceToken(workspaceId);
+    await revokeWorkspaceTabTokens(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;
   });
