@@ -26,7 +26,7 @@ const HOSTILE = [
 
 describe('inbox templates (ADR-0012)', () => {
   it.each([
-    ['note', '[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z — purplemux note show n-AbC123'],
+    ['note', '[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z — purplemux note show n-AbC123, then purplemux note ack n-AbC123'],
     ['watch', '[purplemux watch w-9xYz01] NomuPay/treasury-api#897 fired at 2026-09-26T06:00:00Z — purplemux watch show w-9xYz01'],
     ['deploy', '[purplemux deploy d-abcd12] purplemux restarts at 2026-09-26T06:00:00Z after a quiet wait of up to 600 s — purplemux deploy status d-abcd12'],
     ['mission', '[purplemux mission 3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b] an answer is ready at 2026-09-26T06:00:00Z — purplemux mission answers -w ws-fOvEfz'],
@@ -37,9 +37,21 @@ describe('inbox templates (ADR-0012)', () => {
 
   it('names an admin sender and a tab-less workspace sender without any caller text', () => {
     expect(renderInboxLine('note', { ...VALID.note, fromWorkspaceId: null, fromTabId: null }).line)
-      .toBe('[purplemux note n-AbC123] from admin at 2026-09-26T06:00:00Z — purplemux note show n-AbC123');
+      .toBe('[purplemux note n-AbC123] from admin at 2026-09-26T06:00:00Z — purplemux note show n-AbC123, then purplemux note ack n-AbC123');
     expect(renderInboxLine('note', { ...VALID.note, fromTabId: null }).line)
       .toContain('from ws-fOvEfz/workspace at');
+  });
+
+  it.each([
+    ['reminder', '[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z is still unacked — purplemux note show n-AbC123, then purplemux note ack n-AbC123'],
+    ['unacked', '[purplemux note n-AbC123] you sent it at 2026-09-26T06:00:00Z; it is still unacked after 60 min — purplemux note show n-AbC123'],
+    ['expired', '[purplemux note n-AbC123] you sent it at 2026-09-26T06:00:00Z; it expired unacked — purplemux note show n-AbC123'],
+  ] as const)('renders the fixed note %s line (ADR-0013)', (event, line) => {
+    expect(renderInboxLine('note', { ...VALID.note, event }).line).toBe(line);
+  });
+
+  it.each(HOSTILE)('refuses a note event that is not one of the four: %j', (event) => {
+    expect(() => renderInboxLine('note', { ...VALID.note, event } as never)).toThrow(InboxFieldError);
   });
 
   it.each(['NomuPay/treasury-ui@feature/x-1', 'merge:nomupay/treasury-api'])('accepts a watch target %s', (target) => {

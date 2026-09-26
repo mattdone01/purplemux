@@ -122,7 +122,9 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'note-too-large': EXIT.USAGE,
   'config-invalid': EXIT.USAGE,
   'note-target-missing': EXIT.USAGE,
+  'note-invalid': EXIT.USAGE,
   'lease-held': EXIT.CONFLICT,
+  'note-cap': EXIT.CONFLICT,
   'lease-held-by-other': EXIT.CONFLICT,
   'watch-cap': EXIT.CONFLICT,
   forbidden: EXIT.CONFLICT,
@@ -670,6 +672,76 @@ const cmdInbox = async (args) => {
   }
 };
 
+// Notes (ADR-0013): a body the recipient pulls; only the inbox's fixed line is typed.
+const NOTE_BODY_MAX_BYTES = 16 * 1024;
+const NOTE_USAGE = 'usage: note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]'
+  + ' | note list [--open] [--to-me] [--from-me] [--epic SLUG] | note show ID | note ack ID [--comment TEXT]';
+const NOTE_VALUE_FLAGS = ['--to-epic', '--to-workspace', '--subject', '--file', '-f', '--from-epic', '--epic', '--comment'];
+const NOTE_BOOL_FLAGS = ['--open', '--to-me', '--from-me'];
+const NOTE_ID = /^n-[A-Za-z0-9_-]{4,32}$/;
+
+const noteId = (rest) => {
+  const positional = stripBooleanFlags(stripFlags(rest, NOTE_VALUE_FLAGS), NOTE_BOOL_FLAGS);
+  if (positional.length !== 1 || !NOTE_ID.test(positional[0])) die(`exactly one note id (n-…) is required — ${NOTE_USAGE}`);
+  return positional[0];
+};
+
+const cmdNote = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'send': {
+      const toEpic = flagValue(rest, '--to-epic');
+      const toWorkspace = flagValue(rest, '--to-workspace');
+      if ((toEpic === null) === (toWorkspace === null)) die(`exactly one of --to-epic or --to-workspace is required — ${NOTE_USAGE}`);
+      const subject = flagValue(rest, '--subject');
+      if (!subject) die(`--subject is required — ${NOTE_USAGE}`);
+      const file = flagValue(rest, '--file') || flagValue(rest, '-f');
+      if (!file) die(`the body comes from -f FILE or -f - (stdin) — ${NOTE_USAGE}`);
+      const body = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
+      const bytes = Buffer.byteLength(body, 'utf8');
+      if (bytes > NOTE_BODY_MAX_BYTES) die(`note body is ${bytes} bytes; the limit is 16 KiB (${NOTE_BODY_MAX_BYTES} bytes)`);
+      const data = { subject, body };
+      if (toEpic !== null) data.toEpic = toEpic;
+      if (toWorkspace !== null) data.toWorkspace = toWorkspace;
+      const fromEpic = flagValue(rest, '--from-epic');
+      if (fromEpic !== null) data.fromEpic = fromEpic;
+      requireEnv();
+      const { body: resp } = await api('POST', '/api/cli/notes', data);
+      return out(resp);
+    }
+    case 'list': {
+      const positional = stripBooleanFlags(stripFlags(rest, NOTE_VALUE_FLAGS), NOTE_BOOL_FLAGS);
+      if (positional.length) die(`unexpected argument: ${positional[0]} — ${NOTE_USAGE}`);
+      const qs = new URLSearchParams();
+      if (rest.includes('--open')) qs.set('open', '1');
+      if (rest.includes('--to-me')) qs.set('toMe', '1');
+      if (rest.includes('--from-me')) qs.set('fromMe', '1');
+      const epic = flagValue(rest, '--epic');
+      if (epic !== null) qs.set('epic', epic);
+      requireEnv();
+      const query = qs.toString();
+      const { body } = await api('GET', `/api/cli/notes${query ? `?${query}` : ''}`);
+      return out(body);
+    }
+    case 'show': {
+      const id = noteId(rest);
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/notes/${id}`);
+      return out(body);
+    }
+    case 'ack': {
+      const id = noteId(rest);
+      const comment = flagValue(rest, '--comment');
+      requireEnv();
+      const { body } = await api('POST', `/api/cli/notes/${id}/ack`, comment === null ? {} : { comment });
+      return out(body);
+    }
+    default:
+      die(NOTE_USAGE);
+  }
+};
+
 const LEASE_USAGE = 'usage: lease acquire|renew|release|list|check|break|release-epic ... (purplemux help)';
 
 /**
@@ -1210,6 +1282,14 @@ Commands:
                                            for WS's tabs; --all adds delivered and dropped (kept 7 days)
   inbox retry ID                           Re-queue a held notice once (the target workspace's token or admin).
                                            Exit 3 inbox-not-held, 7 inbox-not-found
+  note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]
+                                           A note to an epic's owner (the live epic:SLUG holder) or a workspace's
+                                           orchestrator; body <= 16 KiB (exit 2). Only a fixed notice line is typed
+                                           into the recipient; it pulls the body. --from-epic needs that epic lease (3)
+  note list [--open] [--to-me] [--from-me] [--epic SLUG]
+                                           Notes your workspace sent or receives (no bodies). Run --open --to-me at turn start
+  note show ID                             The note and its body (recipient or sender workspace, or admin; else exit 3; 7 unknown)
+  note ack ID [--comment TEXT]             Acknowledge a note delivered to your workspace (else exit 3)
   config get KEY                           Print a fleet config value bare (e.g. gate.slots); exit 7 when unset
   config list [--json]                     Every fleet config value with its version, time and setter
   config set KEY VALUE [--expect-version N]
@@ -1280,6 +1360,8 @@ const main = async () => {
       return cmdMission(args.slice(1));
     case 'inbox':
       return cmdInbox(args.slice(1));
+    case 'note':
+      return cmdNote(args.slice(1));
     case 'config':
       return cmdConfig(args.slice(1));
     case 'tab':

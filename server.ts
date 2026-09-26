@@ -15,6 +15,7 @@ import { handleStatusConnection, gracefulStatusShutdown } from './src/lib/status
 import { getStatusManager } from './src/lib/status-manager';
 import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
 import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
+import { startNotes, stopNotes } from './src/lib/notes-service';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { enqueueSystemToast } from './src/lib/sync-server';
 import { getCliToken } from './src/lib/cli-token';
@@ -102,6 +103,7 @@ const NO_AUTH_WS_PATHS = new Set(['/api/install']);
 
 const shutdownWs = async () => {
   await getMissionControlRuntime().stop();
+  await stopNotes();
   await stopInbox();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
@@ -382,6 +384,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await initLeases();
   await getMissionControlRuntime().start();
   await startInbox();
+  await startNotes();
 
   const envHost = process.env.HOST?.trim();
   const configData = await getConfig();
