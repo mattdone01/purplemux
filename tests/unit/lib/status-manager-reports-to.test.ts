@@ -55,6 +55,19 @@ const setup = async (orchestration: { enabled: boolean; orchestratorTabId: strin
   return { manager, internals, paste, targets };
 };
 
+const bgFailed = (notify?: 'self' | 'orchestrator'): TLivenessEvent => ({
+  kind: 'bg-failed',
+  job: { workspaceId: 'ws-1', tabId: 'w', pid: 42, label: 'gate', registeredAt: 0, ...(notify ? { notify } : {}) },
+  exitCode: 1,
+  stderrTail: null,
+});
+
+const bgUnknown = (notify?: 'self' | 'orchestrator'): TLivenessEvent => ({
+  kind: 'bg-exited-unknown',
+  job: { workspaceId: 'ws-1', tabId: 'w', pid: 42, label: 'gate', registeredAt: 0, ...(notify ? { notify } : {}) },
+  stderrTail: null,
+});
+
 const bgCompleted = (notify?: 'self' | 'orchestrator'): TLivenessEvent => ({
   kind: 'bg-completed',
   job: { workspaceId: 'ws-1', tabId: 'w', pid: 42, label: 'gate', registeredAt: 0, ...(notify ? { notify } : {}) },
@@ -161,5 +174,51 @@ describe('nudge routing — reportsTo and notify self (ADR-0018)', () => {
     manager.removeTab('o2');
     await internals.handleLivenessEvent(bgCompleted());
     expect(targets()).toEqual(['o2', 'o2', 'o1']);
+  });
+});
+
+describe('human pages for liveness events (story 34, consult ruling A)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const withAlerts = async () => {
+    const env = await setup({ enabled: true, orchestratorTabId: 'o1' });
+    const alerts = vi.fn(async (_params: { kind: string }) => {});
+    (env.manager as unknown as { dispatchAlert: typeof alerts }).dispatchAlert = alerts;
+    env.manager.registerTab('o1', entry('o1'));
+    env.manager.registerTab('w', entry('w', { reportsTo: 'o1' }));
+    return { ...env, alerts };
+  };
+
+  it('a self-notified failure delivered to its tab wakes that tab and pages no one', async () => {
+    const { internals, paste, targets, alerts } = await withAlerts();
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(targets()).toEqual(['w']);
+    expect(paste.mock.calls[0][1]).toContain('code 1');
+    expect(alerts).not.toHaveBeenCalled();
+  });
+
+  it('a self-notified failure that could not be delivered still pages the human', async () => {
+    const { manager, internals, paste, alerts } = await withAlerts();
+    // A tab halted by a usage limit is never typed into (story 26): the self-notice is withheld.
+    manager.registerTab('w', entry('w', { reportsTo: 'o1', turnError: { class: 'usage-limit' } as never }));
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(paste).not.toHaveBeenCalled();
+    expect(alerts.mock.calls.map(([p]) => p.kind)).toEqual(['bg-job-died']);
+  });
+
+  it('a vanished self-notified job, and a failure notified to the orchestrator, still page', async () => {
+    const { internals, alerts } = await withAlerts();
+    await internals.handleLivenessEvent(bgUnknown('self'));
+    await internals.handleLivenessEvent(bgFailed());
+    await internals.handleLivenessEvent(bgFailed('orchestrator'));
+    expect(alerts.mock.calls.map(([p]) => p.kind)).toEqual(['bg-job-unknown', 'bg-job-died', 'bg-job-died']);
+  });
+
+  it('a completed self-notified job pages no one (unchanged)', async () => {
+    const { internals, alerts } = await withAlerts();
+    await internals.handleLivenessEvent(bgCompleted('self'));
+    expect(alerts).not.toHaveBeenCalled();
   });
 });

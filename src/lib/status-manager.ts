@@ -712,13 +712,20 @@ export class StatusManager {
       detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
     }
 
-    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
+    const delivered = await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
 
     if (event.kind === 'bg-completed') return;
+    // A `--notify self` job whose known failure reached the tab that registered it is that tab's to
+    // act on (a red gate in a TDD loop): it escalates through its own turn-end marker (ADR-0018), and
+    // the stall watchdog still covers a tab that goes silent. Paging the human for each one would bury
+    // the page that matters (story 34, consult ruling A).
+    if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered) return;
 
-    // Registering a probe or pid is an explicit opt-in to being watched, so a
-    // firing always reaches the human too (push), regardless of alert policy —
-    // an escalation that only lands in a log is not an escalation.
+    // Registering a probe or pid is an explicit opt-in to being watched, so a firing reaches the human
+    // too (push), regardless of alert policy — an escalation that only lands in a log is not an
+    // escalation. The one exception is above: a self-notified failure its own tab received. A job that
+    // vanished (`bg-exited-unknown`), a stall, a failing probe, an orchestrator-notified job and any
+    // self-notice that was NOT delivered (e.g. a tab halted by a usage limit) still page.
     const ws = await getWorkspaceByIdCached(src.workspaceId);
     await this.dispatchAlert({
       kind: event.kind === 'bg-exited-unknown' ? 'bg-job-unknown' : 'job' in event ? 'bg-job-died' : 'work-stalled',
