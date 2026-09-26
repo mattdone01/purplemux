@@ -131,7 +131,9 @@ export const readLiveTabs = async (): Promise<ILiveTabsSnapshot> => {
   return { tabs, uncertainWorkspaceIds };
 };
 
-export const listLiveTabs = async (): Promise<ILiveTab[]> => (await readLiveTabs()).tabs;
-
+/**
+ * The live tab ids only. It cannot say which workspaces were unreadable, so a
+ * caller that RELEASES what an absent tab held uses `readLiveTabs` instead.
+ */
 export const listLiveTabIds = async (): Promise<Set<string>> =>
-  new Set((await listLiveTabs()).map((t) => t.tabId));
+  new Set((await readLiveTabs()).tabs.map((t) => t.tabId));

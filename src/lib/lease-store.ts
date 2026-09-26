@@ -192,6 +192,8 @@ export const releaseTabInState = (state: ILeaseState, tabId: string): { state: I
 export interface IViewFacts {
   now: number;
   liveTabIds: ReadonlySet<string>;
+  /** As in the sweep: a holder in an unreadable workspace is unknown, never shown closed. */
+  uncertainWorkspaceIds?: ReadonlySet<string>;
   /** Currently inactive agent (no grace): what a reader should see now. */
   agentInactive: (tabId: string) => boolean;
   workspaceName: (workspaceId: string) => string | null;
@@ -201,7 +203,9 @@ export const holderStateOf = (lease: ILease, facts: IViewFacts): THolderState =>
   if (lease.holder.admin) return 'admin';
   const tabId = lease.holder.tabId;
   if (!tabId) return 'live';
-  if (!facts.liveTabIds.has(tabId)) return 'closed';
+  if (!facts.liveTabIds.has(tabId)) {
+    return lease.holder.workspaceId !== null && facts.uncertainWorkspaceIds?.has(lease.holder.workspaceId) ? 'live' : 'closed';
+  }
   return facts.agentInactive(tabId) ? 'agent-gone' : 'live';
 };
 
@@ -250,7 +254,9 @@ const isLease = (value: unknown): value is ILease => {
     && typeof l.renewedAt === 'string' && !!l.holder && typeof l.holder === 'object';
 };
 
-export class LeaseFileError extends Error {}
+export class LeaseFileError extends Error {
+  readonly code = 'lease-store-unreadable' as const;
+}
 
 /**
  * Absent file = no leases. Anything else that is not `{ leases: [...] }` is
@@ -386,7 +392,7 @@ export const holderFromCaller = (caller: ICaller): ILeaseHolder => ({
 const requireHolder = (holder: ILeaseHolder): void => {
   if (holder.admin) return;
   if (!holder.tabId || !holder.workspaceId) {
-    throw new LeaseError('caller-unresolved', 'the caller names no tab: use a tab token (PMUX_TAB_TOKEN), send X-Pmux-Session from a tab, or use the admin token');
+    throw new LeaseError('caller-unresolved', 'the caller names no tab: run the command from a purplemux tab (PMUX_TAB_TOKEN, or PMUX_TOKEN with X-Pmux-Session)');
   }
 };
 

@@ -152,7 +152,7 @@ describe('tab lifecycle', () => {
 
   it('lists the live tabs of every workspace layout on disk', async () => {
     const { writeLayoutFile, resolveLayoutFile } = await import('@/lib/layout-store');
-    const { listLiveTabs, listLiveTabIds } = await import('@/lib/tab-lifecycle');
+    const { readLiveTabs, listLiveTabIds } = await import('@/lib/tab-lifecycle');
     workspaces.list = [{ id: 'ws-a' }, { id: 'ws-b' }, { id: 'ws-empty' }];
     await writeLayoutFile({
       root: { type: 'pane', id: 'pane-1', activeTabId: 'tab-1', tabs: [
@@ -170,7 +170,7 @@ describe('tab lifecycle', () => {
       updatedAt: '2026-09-26T00:00:00.000Z',
     }, resolveLayoutFile('ws-b'));
 
-    expect(await listLiveTabs()).toEqual([
+    expect((await readLiveTabs()).tabs).toEqual([
       { workspaceId: 'ws-a', tabId: 'tab-1', sessionName: 'pt-ws-a-pane-1-tab-1' },
       { workspaceId: 'ws-a', tabId: 'tab-2', sessionName: 'pt-ws-a-pane-1-tab-2' },
       { workspaceId: 'ws-b', tabId: 'tab-9', sessionName: 'pt-ws-b-pane-9-tab-9' },

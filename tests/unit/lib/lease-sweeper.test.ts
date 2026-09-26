@@ -197,6 +197,8 @@ describe('boot sweep isolation', () => {
   });
 
   afterEach(async () => {
+    vi.doUnmock('@/lib/logger');
+    vi.doUnmock('@/lib/tab-lifecycle');
     await drainLeaseLocks();
     resetLeaseGlobals();
     await fs.rm(mockHome.value, { recursive: true, force: true });
@@ -219,8 +221,7 @@ describe('boot sweep isolation', () => {
     await expect(initLeases()).resolves.toBeUndefined();
     expect(errors.some((m) => m.includes('boot lease sweep failed') && m.includes('leases.json'))).toBe(true);
     await expect(listLeases()).rejects.toThrow('not valid JSON');
-    vi.doUnmock('@/lib/logger');
-    vi.doUnmock('@/lib/tab-lifecycle');
+    await expect(listLeases()).rejects.toMatchObject({ code: 'lease-store-unreadable' });
   });
 });
 

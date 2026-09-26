@@ -339,6 +339,7 @@ describe('lease store', () => {
     });
     expect(toLeaseView(lease, facts(['tab-a'], ['tab-a'])).holderState).toBe('agent-gone');
     expect(toLeaseView(lease, facts([])).holderState).toBe('closed');
+    expect(toLeaseView(lease, { ...facts([]), uncertainWorkspaceIds: new Set(['ws1']) }).holderState).toBe('live');
     const adminLease = (await acquireLease({ name: 'smoke:x' }, admin, authority)).lease;
     expect(toLeaseView(adminLease, facts([])).holderState).toBe('admin');
     expect(toLeaseView({ ...lease, expiresAt: null, ttlSeconds: null }, facts(['tab-a'])).expiresInSeconds).toBeNull();

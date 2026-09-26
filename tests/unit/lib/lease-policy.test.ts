@@ -46,6 +46,8 @@ describe('parseLeaseName', () => {
     ['dev-deploy:a/b/c', 'must be <owner>/<repo>'],
     ['num:nomupay/treasury-api:adr', 'must be <owner>/<repo>:<adr|migration>:<nnnn>'],
     ['num:nomupay/treasury-api:rfc:0001', 'must be <owner>/<repo>:<adr|migration>:<nnnn>'],
+    ['epic:a/b', 'must be an epic slug'],
+    [`epic:${'a'.repeat(101)}`, 'must be an epic slug'],
   ])('refuses %j with a named rule', (raw, message) => {
     expect(() => parseLeaseName(raw)).toThrow(LeasePolicyError);
     expect(() => parseLeaseName(raw)).toThrow(message);
