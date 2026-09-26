@@ -17,7 +17,7 @@ vi.mock('@/lib/logger', () => {
 
 import { InboxDispatcher, type IInboxDispatcherDeps } from '@/lib/inbox-dispatcher';
 import { enqueueInState, withdrawInState } from '@/lib/inbox-store';
-import { MissionControlRuntime, type IMissionRuntimeDeps } from '@/lib/mission-control-runtime';
+import { missionBootstrapKey, MissionControlRuntime, type IMissionRuntimeDeps } from '@/lib/mission-control-runtime';
 import { MissionControlStore, type IMissionDiscoveryInput } from '@/lib/mission-control-store';
 
 const scratch: string[] = [];
@@ -255,6 +255,42 @@ describe('Mission Control through the inbox (story 12, ruling A′)', () => {
 
     expect(w.deliver).not.toHaveBeenCalled();
     expect(w.items()[0]).toMatchObject({ state: 'dropped', droppedReason: 'mission-record-not-waiting' });
+    store.close();
+  });
+
+  it('a reconcile request still waiting when a newer bootstrap is recorded keeps its steps pullable (CONFIRM)', async () => {
+    const w = world(databasePath());
+    const store = new MissionControlStore(w.file);
+    const tabBinding = { ...identity, tabId: 'tab-one', sessionId: 'session-one' };
+    w.identities.set('tab-one', tabBinding);
+    const discovery = (bootstrapId: string): IMissionDiscoveryInput => ({
+      bootstrapId, reconcile: true, boundarySeq: 0, observedAt: 1_700_000_000_000,
+      workspaces: [{
+        workspaceId: 'ws-one', name: 'one', activity: 'active', agents: [], lastActivityAt: 1_700_000_000_000,
+        lastProgressAt: 1_700_000_000_000, stale: false, identities: [tabBinding],
+        evidence: { source: 'harness', sourceId: `${bootstrapId}/workspace`, observedAt: 1_700_000_000_000, confidence: 'confirmed' },
+        run: {
+          sourceKey: 'one/run', objective: 'Objective one', phase: 'implementation', state: 'running', nextStep: 'Continue',
+          lastProgressAt: 1_700_000_000_000,
+          evidence: { source: 'bootstrap', sourceId: 'one/evidence', observedAt: 1_700_000_000_000, confidence: 'provisional' },
+        },
+        candidates: [],
+        reconciliation: { sourceKey: 'one/reconcile', binding: { ...tabBinding, generation: 1 } },
+      }],
+    });
+    store.reconcileDiscovery(discovery('bootstrap-first'));
+    const runtime = w.runtime(store);
+    w.busy.add('tab-one'); // the notice waits
+    await runtime.tick();
+    const [notice] = w.items();
+    store.reconcileDiscovery(discovery('bootstrap-second')); // a second dashboard click
+
+    const snapshot = store.snapshot([], 'ws-one');
+    expect(snapshot.bootstrap?.id).toBe('bootstrap-second');
+    const pending = snapshot.pendingBootstrapEntries ?? [];
+    expect(pending.map((row) => row.bootstrapId)).toEqual(['bootstrap-first']);
+    const key = missionBootstrapKey('bootstrap-first', 'ws-one', pending[0].entry.runId);
+    expect(notice.line).toContain(`[purplemux mission ${key}]`);
     store.close();
   });
 

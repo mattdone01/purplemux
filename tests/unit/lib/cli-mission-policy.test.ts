@@ -108,3 +108,23 @@ describe('Mission Control CLI pull commands (story 12)', () => {
     expect(output.entries).toEqual([]);
   });
 });
+
+describe('mission bootstrap reads every pending bootstrap, keyed like the notice (story 12 CONFIRM)', () => {
+  it('prints the older bootstrap\'s pending entry with the key the server typed', async () => {
+    const { missionBootstrapKey } = await import('@/lib/mission-control-runtime');
+    const output = await runMission(['bootstrap'], {
+      bootstrap: { id: 'bootstrap-second', entries: [{ workspaceId: 'ws-one', runId: 'run-a', state: 'provisional', binding: null }] },
+      pendingBootstrapEntries: [
+        { bootstrapId: 'bootstrap-first', entry: { workspaceId: 'ws-one', runId: 'run-a', state: 'queued', binding: { tabId: 'tab-orch' } } },
+        { bootstrapId: 'bootstrap-first', entry: { workspaceId: 'ws-two', runId: 'run-z', state: 'queued', binding: { tabId: 'tab-x' } } },
+      ],
+      runs: [{ id: 'run-a', revision: 0, objective: 'Ship it', phase: 'implementation' }],
+      items: [],
+    });
+    const entries = output.entries as Array<{ key: string; bootstrapId: string; runId: string; steps: string[] }>;
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ bootstrapId: 'bootstrap-first', runId: 'run-a', key: missionBootstrapKey('bootstrap-first', 'ws-one', 'run-a') });
+    expect(entries[0].steps.join('\n')).toContain('run.resumed for run run-a with tabId tab-orch');
+  });
+});
+

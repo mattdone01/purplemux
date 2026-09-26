@@ -980,3 +980,23 @@ describe('Mission Control inbox handoff — review r1 fixes (story 12)', () => {
     });
   });
 });
+
+describe('a claimed row is always settled (story 12 CONFIRM minor)', () => {
+  it('keeps the claim when the store throws after claiming, and the sync settles the row', async () => {
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } });
+    harness.validateDeliveryAttempt.mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    await expect(harness.runtime.preflight(inboxItem())).rejects.toThrow('database is locked');
+
+    vi.mocked(harness.store.listInboxHandoffs).mockReturnValue({ deliveries: [waitingDelivery('i-one', { state: 'dispatching', updatedAt: 3 })], bootstrapEntries: [] });
+    harness.inbox.items.mockResolvedValue([inboxItem({ state: 'dropped', droppedReason: 'preflight:mission-record-not-waiting' })]);
+    harness.finalizeDeliveryAttempt.mockClear();
+    await harness.runtime.tick();
+
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding, {
+      state: 'held', nextAttemptAt: null, lastError: 'inbox-dropped:preflight:mission-record-not-waiting',
+    });
+  });
+});
+

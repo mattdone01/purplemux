@@ -652,29 +652,32 @@ export class MissionControlRuntime {
     if (delivery) {
       const claimed = store.claimInboxDelivery(delivery.id, marker);
       if (!claimed?.binding) return { ok: false, reason: 'mission-record-not-waiting' };
+      // Kept before anything else can throw: a claimed row is always settled by the sync (CONFIRM minor).
+      this.claims.set(item.id, { type: 'delivery', id: claimed.id, updatedAt: claimed.updatedAt, binding: claimed.binding });
       const validation = store.validateDeliveryAttempt(claimed.id, claimed.updatedAt, claimed.binding);
       if (!validation.ok) {
+        this.claims.delete(item.id);
         store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimed.binding, {
           state: 'held', nextAttemptAt: null, lastError: `dispatch-ineligible:${validation.reason}`,
         });
         return { ok: false, reason: validation.reason };
       }
-      this.claims.set(item.id, { type: 'delivery', id: claimed.id, updatedAt: claimed.updatedAt, binding: claimed.binding });
       return { ok: true };
     }
     const entry = boot!.entry;
     const claimed = store.claimBootstrapEntry(boot!.bootstrapId, entry.workspaceId, entry.runId, entry.updatedAt);
     if (!claimed) return { ok: false, reason: 'mission-record-not-waiting' };
+    this.claims.set(item.id, {
+      type: 'bootstrap', bootstrapId: boot!.bootstrapId, workspaceId: entry.workspaceId, runId: entry.runId, updatedAt: claimed.entry.updatedAt,
+    });
     const validation = store.validateBootstrapAttempt(boot!.bootstrapId, entry.workspaceId, entry.runId, claimed.entry.updatedAt);
     if (!validation.ok) {
+      this.claims.delete(item.id);
       store.completeBootstrapAttempt(boot!.bootstrapId, entry.workspaceId, entry.runId, claimed.entry.updatedAt, {
         state: 'held', reason: `dispatch-ineligible:${validation.reason}`,
       });
       return { ok: false, reason: validation.reason };
     }
-    this.claims.set(item.id, {
-      type: 'bootstrap', bootstrapId: boot!.bootstrapId, workspaceId: entry.workspaceId, runId: entry.runId, updatedAt: claimed.entry.updatedAt,
-    });
     return { ok: true };
   }
 

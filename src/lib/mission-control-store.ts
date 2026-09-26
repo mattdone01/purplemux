@@ -485,6 +485,10 @@ export class MissionControlStore {
       const recentEvents = (this.database.prepare(`SELECT * FROM events ${eventWhere} ORDER BY seq DESC LIMIT 100`).all(...args) as IEventRow[]).reverse().map(eventFromRow);
       const cursor = Number((this.database.prepare(`SELECT COALESCE(MAX(seq), 0) AS cursor FROM events ${eventWhere}`).get(...args) as { cursor: number }).cursor);
       const latestBootstrap = this.database.prepare('SELECT * FROM bootstrap ORDER BY created_at DESC, rowid DESC LIMIT 1').get() as IBootstrapRow | undefined;
+      const pendingBootstrapEntries = (this.database.prepare(`SELECT * FROM bootstrap_entries
+        WHERE state IN ('queued','dispatching','submitted')${workspaceId ? ' AND workspace_id = ?' : ''}
+        ORDER BY updated_at, bootstrap_id, workspace_id, run_id`).all(...args) as IBootstrapEntryRow[])
+        .map((row) => ({ bootstrapId: row.bootstrap_id, entry: bootstrapEntryFromRow(row) }));
       const fullBootstrap = latestBootstrap ? this.bootstrapById(latestBootstrap.id) : null;
       const bootstrap = fullBootstrap && workspaceId
         ? { ...fullBootstrap, entries: fullBootstrap.entries.filter((entry) => entry.workspaceId === workspaceId) }
@@ -573,6 +577,7 @@ export class MissionControlStore {
         deliveries,
         recentEvents,
         bootstrap,
+        pendingBootstrapEntries,
       };
     });
     return read();

@@ -433,16 +433,24 @@ const missionAckCommand = (wsId, answer, item, generation) => ['purplemux missio
   '--answer', shellArg(answer.id), '--generation', String(generation), '--revision', String(item.revision),
   '--event-id', shellArg(`mission-ack-${answer.id}`.slice(0, 128)), '--producer-at', String(answer.createdAt)].join(' ');
 
+// The key the notice line carries: the same hash the server makes (missionBootstrapKey).
+const missionBootstrapKey = (bootstrapId, workspaceId, runId) =>
+  `boot-${require('crypto').createHash('sha256').update(JSON.stringify([bootstrapId, workspaceId, runId])).digest('hex').slice(0, 32)}`;
+
 const missionBootstrapSteps = (body, wsId) => {
-  const bootstrap = body.bootstrap;
-  if (!bootstrap) return [];
-  return bootstrap.entries
-    .filter((entry) => entry.workspaceId === wsId && ['queued', 'dispatching', 'submitted'].includes(entry.state))
-    .map((entry) => {
+  // Every pending entry of every bootstrap (a late notice belongs to its own bootstrap); an older
+  // server that does not list them offers only the latest bootstrap.
+  const pending = Array.isArray(body.pendingBootstrapEntries)
+    ? body.pendingBootstrapEntries
+    : (body.bootstrap ? body.bootstrap.entries.map((entry) => ({ bootstrapId: body.bootstrap.id, entry })) : []);
+  return pending
+    .filter(({ entry }) => entry.workspaceId === wsId && ['queued', 'dispatching', 'submitted'].includes(entry.state))
+    .map(({ bootstrapId, entry }) => {
       const run = body.runs.find((candidate) => candidate.id === entry.runId);
       const candidates = body.items.filter((item) => item.runId === entry.runId && item.state === 'candidate');
       return {
-        bootstrapId: bootstrap.id,
+        key: missionBootstrapKey(bootstrapId, entry.workspaceId, entry.runId),
+        bootstrapId,
         runId: entry.runId,
         state: entry.state,
         steps: [
