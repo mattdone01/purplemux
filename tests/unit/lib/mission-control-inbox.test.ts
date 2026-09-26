@@ -175,7 +175,8 @@ describe('Mission Control through the inbox (story 12, ruling A′)', () => {
     expect(w.deliver).toHaveBeenCalledOnce();
     expect(store2.snapshot().deliveries.find((row) => row.id === accepted.delivery.id))
       .toMatchObject({ state: 'held', lastError: 'server-restarted-during-uncertain-delivery' });
-    expect(w.items()[0].state).toBe('dropped');
+    // The restarted sync withdrew it: its row is held, no longer waiting on it.
+    expect(w.items()[0]).toMatchObject({ state: 'dropped', droppedReason: 'mission-record-not-waiting' });
     store2.close();
   });
 
@@ -198,15 +199,17 @@ describe('Mission Control through the inbox (story 12, ruling A′)', () => {
     w.identities.set(binding.tabId, replacement);
 
     await runtime.tick();
-    expect(store.snapshot().deliveries[0]).toMatchObject({ state: 'queued', lastError: `inbox:${itemId}` });
+    // Handed off again with a NEW notice; the old one is withdrawn, never reused (review r1, N2).
+    const [old, fresh] = w.items();
+    expect(old).toMatchObject({ id: itemId, state: 'dropped', droppedReason: 'mission-rehanded' });
+    expect(store.snapshot().deliveries[0]).toMatchObject({ state: 'queued', lastError: `inbox:${fresh.id}` });
     await w.dispatcher().tick();
     await runtime.tick();
 
     expect(w.deliver).toHaveBeenCalledOnce();
-    expect(w.items()).toHaveLength(1);
-    expect(w.items()[0].state).toBe('delivered');
+    expect(w.items().filter((item) => item.state === 'delivered')).toEqual([expect.objectContaining({ id: fresh.id })]);
     const row = store.snapshot().deliveries.find((candidate) => candidate.id === accepted.delivery.id)!;
-    expect(row).toMatchObject({ state: 'submitted', lastError: null, submittedAt: w.items()[0].deliveredAt });
+    expect(row).toMatchObject({ state: 'submitted', lastError: null, submittedAt: w.items()[1].deliveredAt });
     expect(row.binding?.sessionId).toBe('session-replacement');
     store.close();
   });

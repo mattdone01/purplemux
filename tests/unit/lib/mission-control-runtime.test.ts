@@ -881,3 +881,68 @@ describe('Mission Control maps inbox outcomes onto its rows (story 12, ruling Aâ
     expect(transferred.inbox.withdraw).not.toHaveBeenCalled();
   });
 });
+
+describe('Mission Control inbox handoff â€” review r1 fixes (story 12)', () => {
+  it('never reuses a still-queued item: it is withdrawn and a fresh one queued (N2)', async () => {
+    const harness = runtimeHarness({ due: [delivery()] });
+    harness.inbox.enqueue
+      .mockResolvedValueOnce({ item: inboxItem({ id: 'i-old' }), created: false })
+      .mockResolvedValueOnce({ item: inboxItem({ id: 'i-fresh' }), created: true });
+
+    await harness.runtime.tick();
+
+    expect(harness.inbox.withdraw).toHaveBeenCalledWith('i-old', 'mission-rehanded');
+    expect(harness.inbox.enqueue).toHaveBeenCalledTimes(2);
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenLastCalledWith('delivery-one', 2, binding, {
+      state: 'queued', nextAttemptAt: null, lastError: 'inbox:i-fresh',
+    });
+  });
+
+  it('holds the row when a reused item cannot be replaced', async () => {
+    const harness = runtimeHarness({ due: [delivery()] });
+    harness.inbox.enqueue.mockResolvedValue({ item: inboxItem({ id: 'i-stuck' }), created: false });
+
+    await harness.runtime.tick();
+
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenLastCalledWith('delivery-one', 2, binding, {
+      state: 'held', nextAttemptAt: null,
+      lastError: 'inbox-enqueue-failed:inbox item i-stuck for mission:delivery:delivery-one could not be replaced',
+    });
+  });
+
+  it('withdraws an item whose row now waits on another item (N4)', async () => {
+    const harness = runtimeHarness({
+      handoffs: { deliveries: [], bootstrapEntries: [] },
+      items: [inboxItem()],
+      snapshotDeliveries: [delivery({ state: 'queued', nextAttemptAt: null, lastError: 'inbox:i-other' })],
+    });
+    await harness.runtime.tick();
+    expect(harness.inbox.withdraw).toHaveBeenCalledWith('i-one', 'mission-record-not-waiting');
+  });
+
+  it('an unreadable inbox skips the pass without failing it, logged once per cause (N6)', async () => {
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] }, due: [delivery()] });
+    harness.inbox.items.mockRejectedValue(new Error('inbox.json is not { items: [...] }'));
+
+    await expect(harness.runtime.tick()).resolves.toBeUndefined();
+    await expect(harness.runtime.tick()).resolves.toBeUndefined();
+
+    expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
+    expect(harness.inbox.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('stop settles a paste the inbox finished before it stopped (N5)', async () => {
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } });
+    await harness.runtime.start();
+    await harness.runtime.preflight(inboxItem());
+    vi.mocked(harness.store.listInboxHandoffs).mockReturnValue({ deliveries: [waitingDelivery('i-one', { state: 'dispatching', updatedAt: 3 })], bootstrapEntries: [] });
+    harness.inbox.items.mockResolvedValue([inboxItem({ state: 'delivered', deliveredAt: NOW + 9 })]);
+    harness.finalizeDeliveryAttempt.mockClear();
+
+    await harness.runtime.stop();
+
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding, {
+      state: 'submitted', nextAttemptAt: null, lastError: null, submittedAt: NOW + 9,
+    });
+  });
+});

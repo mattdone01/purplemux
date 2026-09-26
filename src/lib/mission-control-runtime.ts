@@ -451,6 +451,7 @@ export class MissionControlRuntime {
   private recovered = false;
   private claims = new Map<string, TMissionClaim>();
   private unregisterPreflight: (() => void) | null = null;
+  private lastInboxReadError: string | null = null;
 
   constructor(private deps: IMissionRuntimeDeps = defaultDeps) {}
 
@@ -477,6 +478,13 @@ export class MissionControlRuntime {
     await this.running?.catch((error) => {
       log.error({ err: error }, 'Mission Control worker failed during shutdown');
     });
+    // One last sync: the server stops the inbox first, so a paste it finished is settled here rather
+    // than held by the next boot's recovery (review r1, N5).
+    if (this.claims.size > 0) {
+      await this.sync(this.deps.getStore()).catch((error) => {
+        log.error({ err: error }, 'Mission Control final sync failed during shutdown');
+      });
+    }
   }
 
   async snapshot(workspaceId?: string): Promise<IMissionSnapshot> {
@@ -513,7 +521,8 @@ export class MissionControlRuntime {
       this.recovered = true;
     }
     this.unregisterPreflight ??= this.deps.inbox.registerPreflight('mission', (item) => this.preflight(item));
-    await this.sync(store);
+    // An unreadable inbox skips the whole pass: a handoff would only fail to enqueue and hold the row.
+    if (!await this.sync(store)) return;
     for (const pending of store.listDueDeliveries(this.deps.now(), DELIVERY_LIMIT)) {
       await this.handOffDelivery(store, pending);
     }
@@ -544,13 +553,13 @@ export class MissionControlRuntime {
 
     let item: IInboxItem;
     try {
-      ({ item } = await this.deps.inbox.enqueue({
+      item = await this.freshItem({
         kind: 'mission',
         targetWorkspaceId: claimed.workspaceId,
         targetTabId: claimedBinding.tabId,
         dedupeKey: `mission:delivery:${claimed.id}`,
         fields: { answerId: claimed.answerId, workspaceId: claimed.workspaceId, readyAt: answer.createdAt },
-      }));
+      });
     } catch (error) {
       return hold(`inbox-enqueue-failed:${error instanceof Error ? error.message : String(error)}`);
     }
@@ -584,18 +593,33 @@ export class MissionControlRuntime {
     const key = missionBootstrapKey(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId);
     let item: IInboxItem;
     try {
-      ({ item } = await this.deps.inbox.enqueue({
+      item = await this.freshItem({
         kind: 'mission',
         targetWorkspaceId: claimedEntry.workspaceId,
         targetTabId: claimedEntry.binding.tabId,
         dedupeKey: `mission:bootstrap:${key}`,
         fields: { event: 'bootstrap', bootstrapKey: key, workspaceId: claimedEntry.workspaceId },
-      }));
+      });
     } catch (error) {
       complete({ state: 'held', reason: `inbox-enqueue-failed:${error instanceof Error ? error.message : String(error)}` });
       return;
     }
     complete({ state: 'queued', reason: markerFor(item.id), nextAttemptAt: null });
+  }
+
+  /**
+   * Queue a notice that is NEW for this handoff (review r1, N2). An item still queued under the same
+   * key (a row handed off again after `run.resumed` moved it) is withdrawn first rather than reused: a
+   * reused item's preflight may already be rejecting it for the row in its old state, which would leave
+   * the row waiting on a dropped item. The preflight drops a withdrawn item's late attempt anyway.
+   */
+  private async freshItem(request: IEnqueueRequest<'mission'>): Promise<IInboxItem> {
+    const first = await this.deps.inbox.enqueue(request);
+    if (first.created) return first.item;
+    await this.deps.inbox.withdraw(first.item.id, 'mission-rehanded');
+    const second = await this.deps.inbox.enqueue(request);
+    if (!second.created) throw new Error(`inbox item ${second.item.id} for ${request.dedupeKey} could not be replaced`);
+    return second.item;
   }
 
   /**
@@ -648,12 +672,23 @@ export class MissionControlRuntime {
     return { ok: true };
   }
 
-  /** Map each handed-off row onto its inbox item (ruling A′ §5). */
-  private async sync(store: IMissionControlRuntimeStore): Promise<void> {
+  /** Map each handed-off row onto its inbox item (ruling A′ §5). False when the inbox could not be read. */
+  private async sync(store: IMissionControlRuntimeStore): Promise<boolean> {
     const handoffs = store.listInboxHandoffs();
     // Read every pass, even with nothing waiting: an item whose row left the waiting state is only
-    // found here (the inbox file is small; a read is one file read).
-    const items = new Map((await this.deps.inbox.items()).filter((item) => item.kind === 'mission').map((item) => [item.id, item]));
+    // found here (the inbox file is small; a read is one file read). An unreadable inbox skips this
+    // pass, logged once per cause (review r1, N6): the rows keep waiting and nothing is typed.
+    let all: IInboxItem[];
+    try {
+      all = await this.deps.inbox.items();
+      this.lastInboxReadError = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== this.lastInboxReadError) log.warn(`Mission Control inbox sync skipped: ${message}`);
+      this.lastInboxReadError = message;
+      return false;
+    }
+    const items = new Map(all.filter((item) => item.kind === 'mission').map((item) => [item.id, item]));
 
     // Pastes the preflight allowed: settle once the inbox recorded the outcome.
     for (const [itemId, claim] of [...this.claims]) {
@@ -704,19 +739,26 @@ export class MissionControlRuntime {
       ...this.claims.keys(),
     ].filter((id): id is string => id !== null));
     const orphans = [...items.values()].filter((item) => item.state === 'queued' && !referenced.has(item.id));
-    if (orphans.length === 0) return;
+    if (orphans.length === 0) return true;
     const snapshot = store.snapshot();
     for (const item of orphans) {
       const deliveryId = item.dedupeKey.startsWith('mission:delivery:') ? item.dedupeKey.slice('mission:delivery:'.length) : null;
       const bootKey = item.dedupeKey.startsWith('mission:bootstrap:') ? item.dedupeKey.slice('mission:bootstrap:'.length) : null;
-      const rowState = deliveryId
-        ? snapshot.deliveries.find((row) => row.id === deliveryId)?.state
-        : bootKey && snapshot.bootstrap
-          ? snapshot.bootstrap.entries.find((entry) => missionBootstrapKey(snapshot.bootstrap!.id, entry.workspaceId, entry.runId) === bootKey)?.state
-          : undefined;
-      if (rowState === undefined || rowState === 'queued') continue; // unknown, or about to be handed off again
+      const row = deliveryId
+        ? snapshot.deliveries.find((candidate) => candidate.id === deliveryId)
+        : undefined;
+      const entry = !deliveryId && bootKey && snapshot.bootstrap
+        ? snapshot.bootstrap.entries.find((candidate) => missionBootstrapKey(snapshot.bootstrap!.id, candidate.workspaceId, candidate.runId) === bootKey)
+        : undefined;
+      const rowState = row?.state ?? entry?.state;
+      const rowMarker = row ? row.lastError : entry?.reason ?? null;
+      if (rowState === undefined) continue; // unknown: the preflight still refuses it at paste time
+      // A row queued with no marker is about to be handed off again (a new item replaces this one);
+      // a row waiting on ANOTHER item, or in any other state, leaves this one orphaned (review r1, N4).
+      if (rowState === 'queued' && !markedItem(rowMarker)) continue;
       await this.deps.inbox.withdraw(item.id, 'mission-record-not-waiting');
     }
+    return true;
   }
 }
 
