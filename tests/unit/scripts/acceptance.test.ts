@@ -455,7 +455,10 @@ const E2E = process.env.ACCEPTANCE_E2E_CANDIDATE;
 describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
   it('passes every wave-1 and story-15 check on an isolated instance', { timeout: 600_000 }, () => {
     const log = path.join(os.tmpdir(), `acceptance-e2e-${process.pid}.log`);
-    const r = spawnSync('bash', [RUN, '--candidate', E2E!, '--log', log], { encoding: 'utf-8', timeout: 590_000 });
+    // The real HOME: the harness's own live-home refusal and live-port avoidance
+    // must look at the live instance, not at the test run's isolated HOME.
+    const env = { ...process.env, HOME: process.env.PMUX_TEST_REAL_HOME ?? process.env.HOME };
+    const r = spawnSync('bash', [RUN, '--candidate', E2E!, '--log', log], { encoding: 'utf-8', timeout: 590_000, env });
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
