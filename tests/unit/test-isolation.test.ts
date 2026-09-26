@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { findLeakedLogLines, HOME_ROOT_ENV, REAL_HOME_ENV, snapshotLogSizes, verifyNoLeaks } from '../setup/isolated-home';
+import { findLeakedLogLines, HOME_ROOT_ENV, REAL_HOME_ENV, REAL_TMUX_TMPDIR_ENV, snapshotLogSizes, verifyNoLeaks } from '../setup/isolated-home';
 
 const tmp = (prefix: string) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
@@ -24,6 +24,12 @@ describe('test process isolation from the live ~/.purplemux', () => {
     expect(realHome).toBeTruthy();
     expect(os.homedir()).toBe(path.join(root, `w-${process.pid}`));
     expect(os.homedir().startsWith(realHome + path.sep)).toBe(false);
+  });
+
+  it('runs every test with a scratch TMUX_TMPDIR, and names the real one for the acceptance e2e', () => {
+    expect(process.env.TMUX_TMPDIR).toMatch(/pmux-test-tmux-/);
+    expect(process.env[REAL_TMUX_TMPDIR_ENV]).toBeTruthy();
+    expect(process.env[REAL_TMUX_TMPDIR_ENV]).not.toBe(process.env.TMUX_TMPDIR);
   });
 
   it('recorded this worker\'s pid for the end-of-run leak guard', () => {

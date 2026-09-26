@@ -73,12 +73,17 @@ describe('coded refusals across module graphs (story 35)', () => {
   it('an error without the brand is an internal failure, even named like a refusal', async () => {
     const { sendWatchError } = await import('@/lib/watch-http');
     const { sendNoteError } = await import('@/lib/notes-http');
+    const { sendDeployError } = await import('@/lib/deploy-http');
     const w = response();
     sendWatchError(w.api, Object.assign(new Error('boom'), { name: 'WatchError', code: 'watch-invalid' }));
     expect(w.res).toEqual({ statusCode: 500, body: { error: 'watch operation failed', code: 'watch-internal' } });
+    // Name-only forgeries for every branded class: a name check alone (story 22's isNoteError) fails here.
     const n = response();
-    sendNoteError(n.api, Object.assign(new Error('boom'), { code: 'note-not-found' }));
+    sendNoteError(n.api, Object.assign(new Error('boom'), { name: 'NoteError', code: 'note-not-found' }));
     expect(n.res).toEqual({ statusCode: 500, body: { error: 'note operation failed', code: 'note-internal' } });
+    const d = response();
+    sendDeployError(d.api, Object.assign(new Error('boom'), { name: 'DeployError', code: 'deploy-not-found' }));
+    expect(d.res).toEqual({ statusCode: 500, body: { error: 'deploy operation failed', code: 'deploy-internal' } });
   });
 
   it('a branded error whose code the route does not map is an internal failure', async () => {
