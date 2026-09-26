@@ -104,6 +104,7 @@ printf '{"pid":%s,"port":%s}' "$$" "$PORT" > "$HOME/.purplemux/pmux.lock"
 # HOME is <root>/s/pmxa.X/home, so the test root (where the flags live) is three levels up.
 [[ -e "$HOME/../../../no-port" ]] && rm -f "$HOME/.purplemux/port"
 [[ -e "$HOME/../../../leak" ]] && exec env PMUX_TOKEN=leaked sleep 600
+[[ -e "$HOME/../../../bad-pristine" ]] && exec env __PMUX_PRISTINE_ENV='{not json' sleep 600
 exec sleep 600
 `;
 
@@ -258,6 +259,15 @@ describe('isolated-instance.sh safety', { timeout: 60_000 }, () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('REFUSED NOT-ISOLATED');
     expect(r.stderr).toContain('PMUX_TOKEN');
+    expect(pidsWithHomeUnder(parent)).toEqual([]);
+  });
+
+  it('refuses a pristine env it cannot parse, and tears the candidate down', () => {
+    flagForScratch('bad-pristine');
+    const r = instance(['up', '--candidate', candidate, '--state', path.join(root, 'state.json')], withFakes());
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('REFUSED NOT-ISOLATED');
+    expect(r.stderr).toContain('HOME=<unparseable>');
     expect(pidsWithHomeUnder(parent)).toEqual([]);
   });
 

@@ -66,7 +66,8 @@ when the scratch HOME or socket would resolve to the live ones, when the socket 
 limit, or when the port is the live one or answers. After the start it reads the candidate
 processes' environ and refuses (`NOT-ISOLATED`) if any live key (`PMUX_TOKEN`, `PMUX_TAB_TOKEN`,
 `TMUX`, …) or a pristine env with another HOME got through. The state file is written as soon as the
-server starts, and any failure or signal after that tears the instance down. Teardown scans `/proc`
+server starts, and any failure or signal after that tears the instance down; further signals are
+ignored while the teardown runs. Teardown scans `/proc`
 and stops every process whose environ carries the scratch HOME (by process group when the group
 leader is one of them) and never signals any other process; tmux is killed only through the scratch
 socket. The gate runs without deploy-live's lock descriptor, so a leftover could never hold the lock.

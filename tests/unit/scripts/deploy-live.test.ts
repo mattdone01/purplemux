@@ -97,7 +97,8 @@ echo "journal: server crashed on boot"
   // The release's acceptance gate (scripts/acceptance/run.sh): records its arguments and the
   // restarts seen so far, writes a verdict to --log, and fails when asked to.
   acceptance: `#!/usr/bin/env bash
-echo "$* | restarts=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0)" >> "$FAKE_STATE/acceptance.log"
+fd9=closed; [[ -e /proc/$$/fd/9 ]] && fd9=open
+echo "$* | restarts=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0) fd9=$fd9" >> "$FAKE_STATE/acceptance.log"
 log=""
 while (($#)); do case "$1" in --log) log="$2"; shift 2 ;; *) shift ;; esac; done
 if [[ -e "$FAKE_STATE/acceptance-fail" ]]; then
@@ -832,6 +833,8 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     const call = h.log('acceptance');
     expect(call).toContain(`--candidate ${release} --log `);
     expect(call).toContain('| restarts=0');
+    // The gate never holds deploy-live.lock (fd 9): a leftover could otherwise refuse every later deploy.
+    expect(call).toContain('fd9=closed');
     expect(call).not.toContain('--bash-guard');
     expect(field(out, 'ACCEPTANCE')).toMatch(/^pass \(checks=20 passed=20; .*acceptance-.*\.log\)$/);
     expect(field(out, 'VERDICT')).toBe('deployed');

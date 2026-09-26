@@ -51,6 +51,8 @@ say() { echo "$*" | tee -a "$log"; }
 state="$(mktemp "${TMPDIR:-/tmp}/acceptance-state-XXXXXX.json")"
 child=""
 cleanup() {
+  # A second signal must not cut the teardown short; children inherit the ignore, so `down` finishes.
+  trap '' INT TERM HUP
   [[ -n "$child" ]] && kill "$child" 2>/dev/null && wait "$child" 2>/dev/null
   if [[ -s "$state" ]]; then
     "$INSTANCE" down --state "$state" "${keep[@]}" >>"$log" 2>&1 || say "WARN down failed (see the log)"

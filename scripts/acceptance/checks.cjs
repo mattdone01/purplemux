@@ -440,7 +440,8 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
   const w2State = w2 ? await inst.cliState(wsB, w2.tabId) : null;
   const w2Early = w2 ? await inst.nudgesFor(wsB, w2.tabId) : [];
   stopJob();
-  const jobEnded = await within(5000, async () => !fs.existsSync(`/proc/${job.pid}`) || readIf(`/proc/${job.pid}/stat`)?.split(' ')[2] === 'Z');
+  // Gone, not a zombie: the server's liveness probe is kill(pid, 0), which a zombie still passes.
+  const jobEnded = await within(5000, async () => !fs.existsSync(`/proc/${job.pid}`));
   const endedAt = Date.now();
   const w2Again = w2 && jobEnded ? await inst.hook('stop', w2.sessionName) : 0;
   const woke = w2Again === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, w2.tabId)).find((n) => n.kind === 'ready-for-review')) : null;

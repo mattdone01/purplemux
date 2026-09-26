@@ -36,7 +36,7 @@ LIVE_TMUX_TMPDIR="${ACCEPT_LIVE_TMUX_TMPDIR:-${TMUX_TMPDIR:-/tmp}}"
 START_TIMEOUT_S="${ACCEPT_START_TIMEOUT_S:-90}"
 SOCKET_MAX=100
 # Keys that must never reach the candidate: each points a process at the LIVE service.
-LIVE_KEYS=(PMUX_TOKEN PMUX_TAB_TOKEN PMUX_TAB_ID PMUX_PORT TMUX TMUX_PANE CLAUDE_CONFIG_DIR)
+LIVE_KEYS=(PMUX_TOKEN PMUX_TAB_TOKEN PMUX_TAB_ID PMUX_WORKSPACE_ID PMUX_PORT TMUX TMUX_PANE CLAUDE_CONFIG_DIR GROK_HOME)
 
 usage() {
   echo "usage: isolated-instance.sh up --candidate DIR --state FILE [--port N]" >&2
@@ -124,6 +124,7 @@ up() {
   # From here every exit that is not success tears down what exists and removes the scratch dir.
   on_exit() {
     local rc=$?
+    trap '' INT TERM HUP
     ((ok)) && return
     if [[ -n "$started_pid" ]]; then
       [[ -f "$scratch/server.log" ]] && { echo "---- candidate server.log (tail) ----" >&2; tail -n 20 "$scratch/server.log" >&2; }
@@ -203,10 +204,12 @@ up() {
       ! proc_has "$p" "$key" || { say_refusal NOT-ISOLATED "pid $p carries $key" "none of: ${LIVE_KEYS[*]}"; exit 2; }
     done
     # The server's own children carry the pristine env it captured; it must be the scratch one.
-    local pristine_home
-    pristine_home="$(proc_env "$p" __PMUX_PRISTINE_ENV | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).HOME||"")}catch{}})')"
-    [[ -z "$pristine_home" || "$pristine_home" == "$home" ]] \
-      || { say_refusal NOT-ISOLATED "pid $p carries a pristine env with HOME=$pristine_home" "none, or HOME=$home"; exit 2; }
+    if proc_has "$p" __PMUX_PRISTINE_ENV; then
+      local pristine_home
+      pristine_home="$(proc_env "$p" __PMUX_PRISTINE_ENV | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).HOME||"<no HOME>")}catch{process.stdout.write("<unparseable>")}})')"
+      [[ "$pristine_home" == "$home" ]] \
+        || { say_refusal NOT-ISOLATED "pid $p carries a pristine env with HOME=$pristine_home" "none, or HOME=$home"; exit 2; }
+    fi
   done
 
   local token ws_a ws_b
