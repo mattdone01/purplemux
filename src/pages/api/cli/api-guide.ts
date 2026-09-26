@@ -279,8 +279,9 @@ GET /api/cli/inbox?workspaceId=WS[&all=1]
 
 POST /api/cli/inbox/<id>/retry
   The target workspace's own token or the admin token. Re-queues a held item once, with a
-  fresh refusal budget. 404 { "code": "inbox-not-found" } (CLI exit 7); 409 { "code":
-  "inbox-not-held" } (CLI exit 3); 403 { "code": "forbidden" } for another workspace.
+  fresh refusal budget. 404 { "code": "inbox-not-found" } (CLI exit 7) for an unknown id AND
+  for another workspace's item; 409 { "code": "inbox-not-held" } (CLI exit 3) when the item
+  is not held, or when a newer notice with its key is already queued for that tab.
 
 ## Orchestration
 

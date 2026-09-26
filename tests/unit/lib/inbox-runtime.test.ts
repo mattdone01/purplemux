@@ -91,4 +91,31 @@ describe('inbox runtime wiring', () => {
     await Promise.all([startInbox(), startInbox(), startInbox()]);
     expect(lifecycle.listeners.size).toBe(before + 1);
   });
+
+  it('refuses, never drops, a notice whose layout is unreadable, and never rewrites that layout', async () => {
+    const store = await seed();
+    await writeLayout(['tab-a', 'tab-b']);
+    const layoutFile = path.join(base(), 'workspaces', 'ws-1', 'layout.json');
+    const { startInbox } = await import('@/lib/inbox-dispatcher');
+    await startInbox();
+    await fs.writeFile(layoutFile, '{ corrupt');
+    const runtime = (globalThis as unknown as { __ptInboxRuntime: { dispatcher: { tick: () => Promise<void> } } }).__ptInboxRuntime;
+    await runtime.dispatcher.tick();
+    const b = (await store.readInboxState()).items.find((item) => item.targetTabId === 'tab-b');
+    expect(b).toMatchObject({ state: 'queued', lastRefusal: 'target-unresolved' });
+    expect(await fs.readFile(layoutFile, 'utf-8')).toBe('{ corrupt');
+  });
+
+  it('installs nothing when stopped while starting', async () => {
+    await writeLayout(['tab-a']);
+    const { startInbox, stopInbox } = await import('@/lib/inbox-dispatcher');
+    await import('@/lib/tab-lifecycle');
+    const lifecycle = (globalThis as unknown as { __ptTabLifecycle: { listeners: Set<unknown> } }).__ptTabLifecycle;
+    const before = lifecycle.listeners.size;
+    const starting = startInbox();
+    await stopInbox();
+    await starting;
+    expect(lifecycle.listeners.size).toBe(before);
+    expect((globalThis as unknown as { __ptInboxRuntime?: unknown }).__ptInboxRuntime).toBeUndefined();
+  });
 });

@@ -195,8 +195,8 @@ const liveTabsGone = async () => {
 const g = globalThis as unknown as { __ptInboxRuntime?: IInboxRuntime };
 
 const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
-  const [{ findTab }, { hasSession, isContentPendingInComposer }, { getStatusManager }, { capturePaneAtWidth }, { withAgentDispatchLock }, { deliverPrompt }] = await Promise.all([
-    import('@/lib/cli-utils'),
+  const [{ readLayoutFile, resolveLayoutFile, collectAllTabs }, { hasSession, isContentPendingInComposer }, { getStatusManager }, { capturePaneAtWidth }, { withAgentDispatchLock }, { deliverPrompt }] = await Promise.all([
+    import('@/lib/layout-store'),
     import('@/lib/tmux'),
     import('@/lib/status-manager'),
     import('@/lib/capture-at-width'),
@@ -206,7 +206,13 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
   return {
     now: () => Date.now(),
     mutate: mutateInbox,
-    findTab: async (workspaceId, tabId) => (await findTab(workspaceId, tabId))?.tab ?? null,
+    // A read that never writes: `getLayout` replaces an unreadable layout with a
+    // default one, which fires a close for every tab. An unreadable layout here
+    // is just "not found", and `tabGone` then refuses rather than drops.
+    findTab: async (workspaceId, tabId) => {
+      const layout = await readLayoutFile(resolveLayoutFile(workspaceId));
+      return layout ? collectAllTabs(layout.root).find((tab) => tab.id === tabId) ?? null : null;
+    },
     tabGone: async (workspaceId, tabId) => {
       try {
         return (await liveTabsGone())(workspaceId, tabId);
@@ -230,7 +236,16 @@ export const startInbox = async (): Promise<void> => {
   const runtime: IInboxRuntime = { dispatcher: null, timer: null, unsubscribe: null };
   g.__ptInboxRuntime = runtime;
   const dispatcher = new InboxDispatcher(await defaultDeps());
+  const { onTabClosed } = await import('@/lib/tab-lifecycle');
+  // Stopped while starting: install nothing, or a timer would tick on a slot nobody holds.
+  if (g.__ptInboxRuntime !== runtime) return;
   runtime.dispatcher = dispatcher;
+  // Listen first, then the boot pass: a close in between is caught either way (drops are idempotent).
+  runtime.unsubscribe = onTabClosed(({ workspaceId, tabId }) => {
+    dispatcher.dropForTab(workspaceId, tabId).then((dropped) => {
+      if (dropped.length) log.info({ tabId, dropped: dropped.map((i) => i.id) }, 'inbox dropped: target tab closed');
+    }).catch((err) => log.warn(`inbox drop failed for ${tabId}: ${err instanceof Error ? err.message : err}`));
+  });
   try {
     const gone = await liveTabsGone();
     const dropped = await dispatcher.dropGoneTargets((ws, tab) => gone(ws, tab) === true);
@@ -238,12 +253,7 @@ export const startInbox = async (): Promise<void> => {
   } catch (err) {
     log.warn(`inbox boot pass skipped: ${err instanceof Error ? err.message : err}`);
   }
-  const { onTabClosed } = await import('@/lib/tab-lifecycle');
-  const unsubscribe = onTabClosed(({ workspaceId, tabId }) => {
-    dispatcher.dropForTab(workspaceId, tabId).then((dropped) => {
-      if (dropped.length) log.info({ tabId, dropped: dropped.map((i) => i.id) }, 'inbox dropped: target tab closed');
-    }).catch((err) => log.warn(`inbox drop failed for ${tabId}: ${err instanceof Error ? err.message : err}`));
-  });
+  if (g.__ptInboxRuntime !== runtime) return;
   let lastTickError: string | null = null;
   const timer = setInterval(() => {
     dispatcher.tick().then(() => { lastTickError = null; }).catch((err) => {
@@ -255,15 +265,14 @@ export const startInbox = async (): Promise<void> => {
   }, INBOX_TICK_MS);
   timer.unref?.();
   runtime.timer = timer;
-  runtime.unsubscribe = unsubscribe;
 };
 
 /** Stop ticking, and wait for a delivery in flight to be recorded before shutdown. */
 export const stopInbox = async (): Promise<void> => {
   const runtime = g.__ptInboxRuntime;
   if (!runtime) return;
+  g.__ptInboxRuntime = undefined;
   if (runtime.timer) clearInterval(runtime.timer);
   runtime.unsubscribe?.();
-  g.__ptInboxRuntime = undefined;
   await runtime.dispatcher?.idle();
 };
