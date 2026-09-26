@@ -4,7 +4,7 @@ import fsp from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { createLogger } from '@/lib/logger';
-import { emitTabClosed, listLiveTabs, onTabClosed, type ILiveTab } from '@/lib/tab-lifecycle';
+import { emitTabClosed, onTabClosed, readLiveTabs, type ILiveTab } from '@/lib/tab-lifecycle';
 
 const log = createLogger('tab-token');
 
@@ -31,7 +31,11 @@ export interface ITabTokenSweepPlan {
   keep: TTabTokens;
   removed: { tabId: string; record: ITabTokenRecord }[];
   rebound: { fromTabId: string; toTabId: string; record: ITabTokenRecord }[];
-  /** Kept although no layout names the tab: its session still runs, and the next cross-check adopts it under this id. */
+  /**
+   * Kept although no layout names the tab: its session still runs (the next
+   * cross-check adopts it under this id), or its workspace's layout could not
+   * be read, so its tabs are unknown rather than gone.
+   */
   detached: { tabId: string; record: ITabTokenRecord }[];
 }
 
@@ -206,6 +210,7 @@ export const planTabTokenSweep = (
   tokens: TTabTokens,
   liveTabs: readonly ILiveTab[],
   runningSessions: ReadonlySet<string> = new Set(),
+  uncertainWorkspaceIds: ReadonlySet<string> = new Set(),
 ): ITabTokenSweepPlan => {
   const liveById = new Map(liveTabs.map((t) => [t.tabId, t]));
   const liveBySession = new Map(liveTabs.map((t) => [`${t.workspaceId}\u0000${t.sessionName}`, t]));
@@ -226,7 +231,7 @@ export const planTabTokenSweep = (
       rebound.push({ fromTabId: tabId, toTabId: adopted.tabId, record });
       continue;
     }
-    if (runningSessions.has(record.sessionName) && !keep[tabId]) {
+    if ((runningSessions.has(record.sessionName) || uncertainWorkspaceIds.has(record.workspaceId)) && !keep[tabId]) {
       keep[tabId] = record;
       detached.push({ tabId, record });
       continue;
@@ -240,10 +245,11 @@ export const planTabTokenSweep = (
 export const sweepTabTokens = async (
   liveTabs: readonly ILiveTab[],
   runningSessions: ReadonlySet<string> = new Set(),
+  uncertainWorkspaceIds: ReadonlySet<string> = new Set(),
 ): Promise<ITabTokenSweepPlan> => {
-  const plan = planTabTokenSweep(readTokens(), liveTabs, runningSessions);
+  const plan = planTabTokenSweep(readTokens(), liveTabs, runningSessions, uncertainWorkspaceIds);
   for (const { tabId, record } of plan.detached) {
-    log.warn(`tab token kept for a running session no layout names: ${tabId} (${record.workspaceId}, ${record.sessionName})`);
+    log.warn(`tab token kept although no readable layout names its tab: ${tabId} (${record.workspaceId}, ${record.sessionName})`);
   }
   if (plan.removed.length === 0 && plan.rebound.length === 0) return plan;
 
@@ -273,7 +279,13 @@ export const installTabTokenRevocation = (): void => {
 /** Boot: after the workspace store's cross-check, so adopted orphans are already in the layouts. */
 export const initTabTokens = async (): Promise<void> => {
   installTabTokenRevocation();
-  const { listSessions } = await import('@/lib/tmux');
-  const [liveTabs, sessions] = await Promise.all([listLiveTabs(), listSessions()]);
-  await sweepTabTokens(liveTabs, new Set(sessions));
+  try {
+    const { listSessions } = await import('@/lib/tmux');
+    const [live, sessions] = await Promise.all([readLiveTabs(), listSessions()]);
+    await sweepTabTokens(live.tabs, new Set(sessions), live.uncertainWorkspaceIds);
+  } catch (err) {
+    // A token of a vanished tab outliving one boot costs nothing; a server that
+    // does not start costs everything.
+    log.error(`boot tab-token sweep skipped: ${err instanceof Error ? err.message : err}`);
+  }
 };

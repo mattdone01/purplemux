@@ -1,4 +1,6 @@
+import fs from 'fs/promises';
 import { createLogger } from '@/lib/logger';
+import type { ILayoutData } from '@/types/terminal';
 
 const log = createLogger('tab-lifecycle');
 
@@ -83,23 +85,55 @@ export const observeWorkspaceRemoved = (workspaceId: string, previous?: readonly
   }
 };
 
-/** Every tab of every workspace's layout on disk. The source of truth for boot sweeps. */
-export const listLiveTabs = async (): Promise<ILiveTab[]> => {
-  const [{ getWorkspaces }, { readLayoutFile, resolveLayoutFile, collectAllTabs }] = await Promise.all([
+export interface ILiveTabsSnapshot {
+  tabs: ILiveTab[];
+  /**
+   * Workspaces whose layout exists but could not be read or parsed. Their tabs
+   * are unknown, not gone: a sweep must not release what they hold.
+   */
+  uncertainWorkspaceIds: Set<string>;
+}
+
+/**
+ * Every tab of every workspace's layout on disk — the source of truth for
+ * sweeps. A missing layout means no tabs; an unreadable one means unknown.
+ * A failure to list the workspaces themselves throws.
+ */
+export const readLiveTabs = async (): Promise<ILiveTabsSnapshot> => {
+  const [{ readWorkspaceIdsStrict }, { resolveLayoutFile, collectAllTabs }] = await Promise.all([
     import('@/lib/workspace-store'),
     import('@/lib/layout-store'),
   ]);
-  const { workspaces } = await getWorkspaces();
-  const live: ILiveTab[] = [];
-  for (const ws of workspaces) {
-    const layout = await readLayoutFile(resolveLayoutFile(ws.id));
-    if (!layout) continue;
-    for (const tab of collectAllTabs(layout.root)) {
-      live.push({ workspaceId: ws.id, tabId: tab.id, sessionName: tab.sessionName });
+  const workspaceIds = await readWorkspaceIdsStrict();
+  const tabs: ILiveTab[] = [];
+  const uncertainWorkspaceIds = new Set<string>();
+  for (const ws of workspaceIds.map((id) => ({ id }))) {
+    let raw: string;
+    try {
+      raw = await fs.readFile(resolveLayoutFile(ws.id), 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        uncertainWorkspaceIds.add(ws.id);
+        log.warn(`layout of ${ws.id} unreadable, its tabs count as unknown: ${err instanceof Error ? err.message : err}`);
+      }
+      continue;
+    }
+    try {
+      const layout = JSON.parse(raw) as ILayoutData;
+      for (const tab of collectAllTabs(layout.root)) {
+        tabs.push({ workspaceId: ws.id, tabId: tab.id, sessionName: tab.sessionName });
+      }
+    } catch (err) {
+      uncertainWorkspaceIds.add(ws.id);
+      log.warn(`layout of ${ws.id} unparseable, its tabs count as unknown: ${err instanceof Error ? err.message : err}`);
     }
   }
-  return live;
+  return { tabs, uncertainWorkspaceIds };
 };
 
+/**
+ * The live tab ids only. It cannot say which workspaces were unreadable, so a
+ * caller that RELEASES what an absent tab held uses `readLiveTabs` instead.
+ */
 export const listLiveTabIds = async (): Promise<Set<string>> =>
-  new Set((await listLiveTabs()).map((t) => t.tabId));
+  new Set((await readLiveTabs()).tabs.map((t) => t.tabId));

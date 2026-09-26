@@ -26,7 +26,7 @@ vi.mock('@/lib/tmux', () => ({
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
 vi.mock('@/lib/providers/claude', () => ({ claudeProvider: {} }));
 vi.mock('@/lib/workspace-store', () => ({
-  getWorkspaces: async () => ({ workspaces: workspaces.list, groups: [], sidebarCollapsed: false, sidebarWidth: 220 }),
+  readWorkspaceIdsStrict: async () => workspaces.list.map((w) => w.id),
 }));
 
 const resetGlobals = () => {
@@ -152,7 +152,7 @@ describe('tab lifecycle', () => {
 
   it('lists the live tabs of every workspace layout on disk', async () => {
     const { writeLayoutFile, resolveLayoutFile } = await import('@/lib/layout-store');
-    const { listLiveTabs, listLiveTabIds } = await import('@/lib/tab-lifecycle');
+    const { readLiveTabs, listLiveTabIds } = await import('@/lib/tab-lifecycle');
     workspaces.list = [{ id: 'ws-a' }, { id: 'ws-b' }, { id: 'ws-empty' }];
     await writeLayoutFile({
       root: { type: 'pane', id: 'pane-1', activeTabId: 'tab-1', tabs: [
@@ -170,11 +170,29 @@ describe('tab lifecycle', () => {
       updatedAt: '2026-09-26T00:00:00.000Z',
     }, resolveLayoutFile('ws-b'));
 
-    expect(await listLiveTabs()).toEqual([
+    expect((await readLiveTabs()).tabs).toEqual([
       { workspaceId: 'ws-a', tabId: 'tab-1', sessionName: 'pt-ws-a-pane-1-tab-1' },
       { workspaceId: 'ws-a', tabId: 'tab-2', sessionName: 'pt-ws-a-pane-1-tab-2' },
       { workspaceId: 'ws-b', tabId: 'tab-9', sessionName: 'pt-ws-b-pane-9-tab-9' },
     ]);
     expect(await listLiveTabIds()).toEqual(new Set(['tab-1', 'tab-2', 'tab-9']));
+  });
+
+  it('reports a workspace whose layout is unreadable or unparseable as uncertain, and a missing layout as empty', async () => {
+    const { writeLayoutFile, resolveLayoutFile } = await import('@/lib/layout-store');
+    const { readLiveTabs } = await import('@/lib/tab-lifecycle');
+    workspaces.list = [{ id: 'ws-ok' }, { id: 'ws-corrupt' }, { id: 'ws-dir' }, { id: 'ws-missing' }];
+    await writeLayoutFile({
+      root: { type: 'pane', id: 'pane-1', activeTabId: 'tab-1', tabs: [{ id: 'tab-1', sessionName: 's1', name: '', order: 0 }] },
+      activePaneId: 'pane-1',
+      updatedAt: '2026-09-26T00:00:00.000Z',
+    }, resolveLayoutFile('ws-ok'));
+    await fs.mkdir(path.dirname(resolveLayoutFile('ws-corrupt')), { recursive: true });
+    await fs.writeFile(resolveLayoutFile('ws-corrupt'), '{not json');
+    await fs.mkdir(resolveLayoutFile('ws-dir'), { recursive: true });
+
+    const snapshot = await readLiveTabs();
+    expect(snapshot.tabs.map((t) => t.tabId)).toEqual(['tab-1']);
+    expect([...snapshot.uncertainWorkspaceIds].sort()).toEqual(['ws-corrupt', 'ws-dir']);
   });
 });
