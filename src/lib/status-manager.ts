@@ -718,14 +718,15 @@ export class StatusManager {
     // A `--notify self` job whose known failure reached the tab that registered it is that tab's to
     // act on (a red gate in a TDD loop): it escalates through its own turn-end marker (ADR-0018), and
     // the stall watchdog still covers a tab that goes silent. Paging the human for each one would bury
-    // the page that matters (story 34, consult ruling A).
-    if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered) return;
+    // the page that matters (story 34, consult ruling A) — but only when the tab can carry it on.
+    if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered && await this.carriesSelfFailure(src.tabId, entry)) return;
 
     // Registering a probe or pid is an explicit opt-in to being watched, so a firing reaches the human
     // too (push), regardless of alert policy — an escalation that only lands in a log is not an
-    // escalation. The one exception is above: a self-notified failure its own tab received. A job that
-    // vanished (`bg-exited-unknown`), a stall, a failing probe, an orchestrator-notified job and any
-    // self-notice that was NOT delivered (e.g. a tab halted by a usage limit) still page.
+    // escalation. The one exception is above: a self-notified failure its own tab received and can
+    // carry on. A job that vanished (`bg-exited-unknown`), a stall, a failing probe, an
+    // orchestrator-notified job and any self-notice that was NOT delivered (e.g. a tab halted by a
+    // usage limit) or reached a tab that cannot carry it on still page.
     const ws = await getWorkspaceByIdCached(src.workspaceId);
     await this.dispatchAlert({
       kind: event.kind === 'bg-exited-unknown' ? 'bg-job-unknown' : 'job' in event ? 'bg-job-died' : 'work-stalled',
@@ -737,6 +738,32 @@ export class StatusManager {
       agentSessionId: entry?.agentSessionId,
       detail,
     });
+  }
+
+  /**
+   * Whether a tab that received its own job's failure can carry it on without a page (story 34
+   * review r1): it is a live agent — a shell would run the notice and an exited agent never reads
+   * it, though tmux accepts the keys for both — and its turn end reaches someone: an escalation
+   * target, or the human under the alert policy (whose stall alert then covers a silent tab too).
+   */
+  private async carriesSelfFailure(tabId: string, entry: ITabStatusEntry | undefined): Promise<boolean> {
+    if (!entry || !isAgentPanelType(entry.panelType) || entry.cliState === 'inactive' || entry.cliState === 'unknown') return false;
+    const ws = await getWorkspaceByIdCached(entry.workspaceId);
+    if (!ws) return false;
+    return this.escalationTarget(tabId, entry, ws) !== null || shouldAlert({ id: tabId }, ws, await getConfig());
+  }
+
+  /**
+   * Where a tab's turn-end escalation goes (ADR-0018): its live `reportsTo`, else the enabled
+   * orchestrator when that is another tab. A target halted by a usage limit would have the nudge
+   * withheld and dropped, so it counts as no target and an escalation falls back to the human
+   * (story 26 review r2).
+   */
+  private escalationTarget(tabId: string, entry: ITabStatusEntry, ws: IWorkspace): string | null {
+    const orch = ws.orchestration;
+    const target = this.liveReportsTo(tabId, entry)
+      ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
+    return target && !this.isHaltedByUsageLimit(target) ? target : null;
   }
 
   /** The tab's `reportsTo` while that tab is live in the same workspace (ADR-0018). */
@@ -1071,13 +1098,8 @@ export class StatusManager {
     if (!isAgentPanelType(entry.panelType)) return false;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
     if (!ws) return false;
-    const orch = ws.orchestration;
-    const targetTabId = this.liveReportsTo(tabId, entry)
-      ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
+    const targetTabId = this.escalationTarget(tabId, entry, ws);
     if (!targetTabId) return false;
-    // A halted target would have the nudge withheld and dropped; report no target
-    // so an escalation falls back to the human alert (story 26 review r2).
-    if (this.isHaltedByUsageLimit(targetTabId)) return false;
 
     const now = Date.now();
     const last = this.lastNudgeByTab.get(tabId);
