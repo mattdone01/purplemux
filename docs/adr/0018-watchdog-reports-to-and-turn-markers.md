@@ -41,7 +41,7 @@ The Stop hook can fire before the final entry reaches the file, so a read that i
 | Monitors only | never on their own; a Monitor ends at its timeout |
 | nothing open | today's 10 min on the main transcript |
 
-A stall is reported once per wait: every classified stop re-arms the stuck latch, because a chain of WAITING turns never leaves `busy`.
+A stall is reported once per wait: every classified stop re-arms the stuck latch, because a chain of WAITING turns never leaves `busy`; a skipped self-failure page (story 34) re-arms it too, because the skip relies on that nudge if the woken tab hangs.
 
 **A compaction is not a turn end (L30, story 32).** After an auto-compaction Claude Code fires SessionStart with `source: "compact"` while the turn goes on (measured on W4, 2026-09-26 08:29Z: a false "finished its turn" nudge). The status hook forwards `source`; a compaction's SessionStart keeps the tab's state and `lastEvent`, sends no nudge, clears `compactingSince` and records `turnEnd: compacting`. No fallback without `source`: `status-hook.sh` is rewritten on every server start, so the server that reads the field also installed the script that sends it (a hook-timing fallback would misread Grok, which sends no source, and the measured compaction outlasted any short window). Every other source, and every Grok or Codex session start, keeps today's behaviour (idle; `turn-ended` from busy). Unmeasured: whether a manual `/compact` fires UserPromptSubmit; if it does, the tab stays busy after it until its next stop, and the 10-minute stuck check reports it.
 
