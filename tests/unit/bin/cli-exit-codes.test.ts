@@ -423,6 +423,26 @@ describe('tab close', () => {
 
     expect((await cli(['tab', 'close', '-w', 'WS', 'tab-x'])).code).toBe(4);
   });
+
+  it('prints ok, then every process the close reaped and any survivor (ADR-0016)', async () => {
+    reply = json(200, {
+      ok: true, reaper: 'linux', envMarker: 'present',
+      killed: [{ pid: 101, comm: 'sleep', args: 'sleep 600' }],
+      survivors: [{ pid: 102, comm: 'D-state', args: 'stuck' }],
+    });
+    const { code, stdout } = await cli(['tab', 'close', '-w', 'WS', 'tab-x']);
+    expect(code).toBe(0);
+    expect(stdout).toBe('ok\nkilled 101 sleep sleep 600\nsurvivor 102 D-state stuck\n');
+    expect(requests[0].url).toBe('/api/cli/tabs/tab-x?workspaceId=WS');
+  });
+
+  it('asks for keepProcesses with --keep-processes, and names an absent marker and an unavailable reaper', async () => {
+    reply = json(200, { ok: true, reaper: 'unavailable', envMarker: 'absent', killed: [], survivors: [] });
+    const { stdout } = await cli(['tab', 'close', '-w', 'WS', 'tab-x', '--keep-processes']);
+    expect(requests[0].url).toBe('/api/cli/tabs/tab-x?workspaceId=WS&keepProcesses=1');
+    expect(stdout).toContain('reaper: unavailable');
+    expect(stdout).toContain('envMarker: absent');
+  });
 });
 
 describe('api-guide', () => {

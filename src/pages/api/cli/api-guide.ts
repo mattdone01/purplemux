@@ -170,10 +170,15 @@ PATCH /api/cli/tabs/<tabId>?workspaceId=WS
   as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
   Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
-DELETE /api/cli/tabs/<tabId>?workspaceId=WS
-  Close the tab (kills tmux session and removes from layout).
-  Response: { "ok": boolean } — false means the layout kept the tab; the CLI then exits 1
-  (close-not-confirmed) instead of printing ok.
+DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
+  Close the tab: reap its processes, kill its tmux session, remove it from the layout.
+  Reaped (Linux, ADR-0016): every descendant of the pane and every process of the server's user
+  whose environment holds exactly PMUX_TAB_ID=<tabId> — which survives &, disown, nohup and
+  setsid. SIGTERM, up to 3 s, then SIGKILL. keepProcesses=1 signals only the pane's process group.
+  Response: { "ok": boolean, "reaper": "linux" | "unavailable", "envMarker": "present" | "absent" | "unknown",
+              "killed": [{ "pid", "comm", "args" }], "survivors": [...] } — ok false means the layout kept
+  the tab; the CLI then exits 1 (close-not-confirmed) instead of printing ok. Every kill is audited
+  in ~/.purplemux/audit/coordination.jsonl.
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
@@ -284,6 +289,66 @@ POST /api/cli/inbox/<id>/retry
   fresh refusal budget. 404 { "code": "inbox-not-found" } (CLI exit 7) for an unknown id AND
   for another workspace's item; 409 { "code": "inbox-not-held" } (CLI exit 3) when the item
   is not held, or when a newer notice with its key is already queued for that tab.
+
+## Notes (ADR-0013)
+
+A note is a body the recipient pulls. It is addressed to an epic (--to-epic SLUG: routed at delivery
+time to the live holder of lease epic:SLUG) or to a workspace (--to-workspace WS: its enabled
+orchestrator tab). With no live recipient the note is "undeliverable" (listed, never dropped) until
+an owner claims the epic or orchestration is turned on; then it is delivered. The recipient's tab
+receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
+show n-…, then purplemux note ack n-…"; the subject and body are never typed. If that tab closes
+before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
+the line reached its composer, and one notice reaches the sender's tab (if live) at 60 min; no
+more. A note unacked or undeliverable for 14 days expires (one notice to a live sender); acked and
+expired notes are pruned 14 days later. At turn start, run \`note list --open --to-me\`.
+
+POST /api/cli/notes
+  Any resolved caller. Body: { "toEpic"? , "toWorkspace"? (exactly one), "subject" (≤ 120, control
+  characters removed), "body" (≤ 16 KiB UTF-8), "fromEpic"? (only the holder of epic:<slug>) }.
+  Response: { "note": INoteView }. 413 note-too-large (exit 2), 400 note-target-missing / note-invalid
+  (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold.
+
+GET /api/cli/notes[?open=1][&toMe=1][&fromMe=1][&epic=SLUG]
+  Notes the caller's workspace sent or receives (admin: all), without bodies.
+  Response: { "notes": [{ "id", "from", "to", "subject", "state", "deliveredTo", "routedAt",
+    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", ... }] }
+
+GET /api/cli/notes/<id>
+  The recipient workspace, the sender workspace, or admin. Response: { "note", "body" }.
+  404 note-not-found (exit 7); 403 forbidden (exit 3).
+
+POST /api/cli/notes/<id>/ack
+  The recipient workspace only. Body: { "comment"? (≤ 500) }. Response: { "note" } in state "acked".
+  404 note-not-found (exit 7); 403 forbidden (exit 3), also for a note that is not delivered.
+
+## Fleet config (ADR-0019)
+
+Versioned string values that tools read at call time, so changing one needs no message to
+anyone: no broadcast, no nudge, no inbox notice. Every change is audited to
+~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][a-z0-9.-]{1,63}$; values are one
+line of text, at most 256 characters, parsed by the reader. Writes need the admin token or the
+tab that is its workspace's enabled orchestrator (cooperative authority, not a boundary).
+
+Keys in use:
+  gate.slots   The host gate slot cap. skills gate.sh reads it after --slots and
+               $GATE_HOST_SLOTS, before its default 3 (story 25). Change it with
+               \`purplemux config set gate.slots <n>\` and tell nobody.
+
+GET /api/cli/fleet-config
+  Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
+GET /api/cli/fleet-config?key=KEY
+  Response: { "key", "value", "version", "setAt", "setBy" }; 404 { "code": "config-not-found" } (CLI exit 7) when unset.
+GET /api/cli/fleet-config?history=1[&key=KEY]
+  The last 200 changes, oldest first: { "history": [{ "key", "oldValue", "newValue", "version", "at", "by" }] }.
+  An unset shows as newValue null.
+PUT /api/cli/fleet-config/KEY   { "value": "6", "expectedVersion"?: 4 }
+  Response: { "key", "version", "value": { "value", "version", "setAt", "setBy" }, "changed" }. Setting the value a key already holds changes
+  nothing (no version, no audit line). 400 config-invalid (exit 2); 403 forbidden (exit 3);
+  409 config-version-conflict (exit 3) when expectedVersion is not the stored version (0 = never set).
+DELETE /api/cli/fleet-config/KEY   { "expectedVersion"?: 5 }
+  Same authority. Response: { "key", "version", "unset": { change } }. 404 config-not-found (exit 7) when unset. The version keeps counting, so a key
+  set again never repeats a version.
 
 ## Orchestration
 

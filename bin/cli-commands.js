@@ -15,6 +15,8 @@ const CLI_COMMANDS = new Set([
   'mission',
   'lease',
   'inbox',
+  'note',
+  'config',
   'api-guide',
   'help',
   '-h',

@@ -50,8 +50,15 @@ const count = (name: string, value: unknown): string => {
   return String(value);
 };
 
-/** `fromWorkspaceId: null` is an admin-token sender; `fromTabId: null` a workspace token with no tab. */
-export interface INoteFields { noteId: string; fromWorkspaceId: string | null; fromTabId: string | null; sentAt: number }
+/** Which note notice this is (ADR-0013). A server enum, never caller text. */
+export type TNoteEvent = 'delivered' | 'reminder' | 'unacked' | 'expired';
+const NOTE_EVENTS: readonly TNoteEvent[] = ['delivered', 'reminder', 'unacked', 'expired'];
+
+/**
+ * `fromWorkspaceId: null` is an admin-token sender; `fromTabId: null` a workspace token with no tab.
+ * `event` defaults to `delivered`; `reminder` goes to the recipient, `unacked` and `expired` to the sender.
+ */
+export interface INoteFields { noteId: string; fromWorkspaceId: string | null; fromTabId: string | null; sentAt: number; event?: TNoteEvent }
 export interface IWatchFields { watchId: string; target: string; firedAt: number }
 export interface IDeployFields { deployId: string; restartAt: number; quietSeconds: number }
 export interface IMissionFields { answerId: string; workspaceId: string; readyAt: number }
@@ -73,7 +80,17 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
     const from = f.fromWorkspaceId === null
       ? 'admin'
       : `${field('fromWorkspaceId', f.fromWorkspaceId, 'workspaceId')}/${f.fromTabId === null ? 'workspace' : field('fromTabId', f.fromTabId, 'tabId')}`;
-    return { recordId: id, line: `[purplemux note ${id}] from ${from} at ${time('sentAt', f.sentAt)} — purplemux note show ${id}` };
+    const event = f.event ?? 'delivered';
+    if (!NOTE_EVENTS.includes(event)) throw new InboxFieldError('inbox field event is not a note event');
+    const at = time('sentAt', f.sentAt);
+    const read = `purplemux note show ${id}`;
+    const line = {
+      delivered: `[purplemux note ${id}] from ${from} at ${at} — ${read}, then purplemux note ack ${id}`,
+      reminder: `[purplemux note ${id}] from ${from} at ${at} is still unacked — ${read}, then purplemux note ack ${id}`,
+      unacked: `[purplemux note ${id}] you sent it at ${at}; it is still unacked after 60 min — ${read}`,
+      expired: `[purplemux note ${id}] you sent it at ${at}; it expired unacked — ${read}`,
+    }[event];
+    return { recordId: id, line };
   },
   watch: (f) => {
     const id = field('watchId', f.watchId, 'watchId');

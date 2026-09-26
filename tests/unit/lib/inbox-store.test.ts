@@ -154,6 +154,18 @@ describe('inbox store — pure transitions', () => {
     expect(result.state.items.find((i) => i.dedupeKey === 'a')).toMatchObject({ droppedReason: 'target-tab-closed', transitionAt: T0 + 2 });
   });
 
+  it('withdraws one waiting item (queued or held) by id, never a delivered one', async () => {
+    const { enqueueInState, holdInState, deliverInState, withdrawInState } = await load();
+    let state: IInboxState = { items: [] };
+    const q = enqueueInState(state, req({ dedupeKey: 'q' }), T0, ids); state = q.state;
+    const h = enqueueInState(state, req({ dedupeKey: 'h' }), T0, ids); state = holdInState(h.state, h.item.id, 'x', T0 + 1);
+    const d = enqueueInState(state, req({ dedupeKey: 'd' }), T0, ids); state = deliverInState(d.state, d.item.id, T0 + 1);
+    for (const id of [q.item.id, h.item.id, d.item.id]) state = withdrawInState(state, id, 'note-rerouted', T0 + 2);
+    expect(Object.fromEntries(state.items.map((i) => [i.dedupeKey, i.state]))).toEqual({ q: 'dropped', h: 'dropped', d: 'delivered' });
+    expect(state.items.find((i) => i.dedupeKey === 'q')).toMatchObject({ droppedReason: 'note-rerouted', transitionAt: T0 + 2 });
+    expect(withdrawInState(state, 'i-nosuchitem', 'x', T0 + 3)).toEqual(state);
+  });
+
   it('prunes delivered, dropped and held items 7 days after their last transition, never queued ones', async () => {
     const { enqueueInState, deliverInState, holdInState, sweepInState } = await load();
     let state: IInboxState = { items: [] };
