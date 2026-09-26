@@ -184,6 +184,25 @@ describe('stop classification (ADR-0018)', () => {
     expect(entry.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: true, openBackgroundTasks: 0, liveRegisteredJobs: 0 });
   });
 
+  it('serves turnEnd to clients through the real getAllForClient (the tab status route reads it there)', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('All set.')]));
+    manager.registerTab('worker', entry);
+    expect(manager.getAllForClient().worker.turnEnd).toBeNull();
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    expect(manager.getAllForClient().worker.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: true, openBackgroundTasks: 0 });
+  });
+
+  it('records an unreadable transcript as not read and the open count as unknown, never "read, 0 open"', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const entry = worker('claude-code', path.join(mockHome.value, 'claude/missing.jsonl'));
+    manager.registerTab('worker', entry);
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    expect(entry.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: false, openBackgroundTasks: null });
+  });
+
   it('holds a stop with no marker while a registered tab bg job is alive', async () => {
     liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: true, registeredAt: 0, ageS: 1 }] });
     const { manager, paste } = await managerWithPaste();

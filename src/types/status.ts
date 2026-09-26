@@ -75,7 +75,8 @@ export interface ITurnEndRecord {
   seq?: number;
   /** The marker line(s) of a `turn-marker` stop. */
   marker?: string[];
-  openBackgroundTasks?: number;
+  /** null on a `ready-for-review` stop whose background ledger could not be read. */
+  openBackgroundTasks?: number | null;
   liveRegisteredJobs?: number;
   /** A `ready-for-review` stop: false when no transcript could be read (the fallback). */
   transcript?: boolean;

@@ -8,6 +8,7 @@ import {
   applyBackgroundLine,
   createBackgroundLedger,
   latestBackgroundActivityAt,
+  mergeLedgers,
   openBackgroundTasks,
   readBackgroundLedger,
 } from '@/lib/providers/claude/background-ledger';
@@ -233,14 +234,85 @@ describe('readBackgroundLedger — shells a subagent started (story 37)', () => 
     }
   };
 
-  it('replays tab-dTsAzt: 3 open shells at the 15:49:47 and 15:52:55 nudges, none from the main agent', async () => {
+  it('replays tab-dTsAzt at each READY nudge: 2, 3 and 3 open shells, all started by subagents', async () => {
     // Only the main file: the defect (every start is in a subagent file).
     const mainOnly = ledgerOf(await fixtureLines('subagent-shells/sess-1.jsonl'));
     expect(openBackgroundTasks(mainOnly, at('2026-09-26T15:52:55.000Z'))).toEqual([]);
+    expect(await replayAt('2026-09-26T15:21:20.000Z')).toEqual(['shell:bojj89i0e', 'shell:bpic9vrwt']);
     expect(await replayAt('2026-09-26T15:49:47.000Z')).toEqual(['shell:b1tu3atis', 'shell:b6qc6fwtg', 'shell:bqk1wfdeb']);
     expect(await replayAt('2026-09-26T15:52:55.000Z')).toEqual(['shell:b1tu3atis', 'shell:bchsaon9x', 'shell:bqk1wfdeb']);
-    // Before any subagent shell, only the resumed agent a749e9c8 is open.
-    expect(await replayAt('2026-09-26T15:40:00.000Z')).toEqual(['agent:a749e9c84f6955c4c']);
+  });
+
+  it('a completed async subagent woken by its own shell\'s delivery is open until its next completion', async () => {
+    // adb9dae4: completed 15:46:11, woken 15:50:30 (b6qc6fwtg delivered into its file), completed 15:51:37.
+    // The main file records no resume, so the main file alone reads it as finished.
+    expect(await replayAt('2026-09-26T15:50:40.000Z')).toEqual(['agent:adb9dae4f7fcfa50e', 'shell:b1tu3atis', 'shell:bqk1wfdeb']);
+    // a749e9c8: resumed 15:32:56, completed 15:33:56, woken 15:42:15 by badbi4d6d, completed 15:42:35.
+    expect(await replayAt('2026-09-26T15:40:00.000Z')).toEqual(['agent:adb9dae4f7fcfa50e', 'shell:badbi4d6d']);
+    expect(await replayAt('2026-09-26T15:42:20.000Z')).toEqual(['agent:a749e9c84f6955c4c', 'agent:adb9dae4f7fcfa50e']);
+    expect(await replayAt('2026-09-26T15:42:40.000Z')).toEqual(['agent:adb9dae4f7fcfa50e', 'shell:b1tu3atis']);
+  });
+
+  it('a delivery into the file of an agent never started as async wakes nothing (a synchronous subagent has no completion notice)', () => {
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({
+      type: 'user', isSidechain: true, agentId: 'async-unknown', timestamp: '2026-09-26T01:00:00.000Z', origin: { kind: 'task-notification' },
+      message: { content: '[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>bz</task-id><status>completed</status></task-notification>' },
+    }), 'subagent');
+    expect(sub.wokenAt.get('async-unknown')).toBe(at('2026-09-26T01:00:00.000Z'));
+    expect(mergeLedgers([createBackgroundLedger(), sub]).open.size).toBe(0);
+  });
+
+  it('a shell ends on any end, even one stamped before its start (single-use ids); an agent needs an end not older than its start', () => {
+    const main = createBackgroundLedger();
+    // The notification line lands before the tool_result line (a shell that exits at once), and the clock steps back.
+    applyBackgroundLine(main, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:00:00.000Z', content: '<task-notification><task-id>bfast</task-id><status>completed</status></task-notification>' }));
+    applyBackgroundLine(main, toolResult({ backgroundTaskId: 'bfast' }, { timestamp: '2026-09-26T01:00:01.000Z' }));
+    applyBackgroundLine(main, toolResult({ taskId: 'bmonfast', timeoutMs: 10 ** 9 }, { timestamp: '2026-09-26T01:00:01.000Z' }));
+    applyBackgroundLine(main, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T00:59:00.000Z', content: '<task-notification><task-id>bmonfast</task-id><status>killed</status></task-notification>' }));
+    expect([...main.open.keys()].sort()).toEqual(['bfast']);
+    expect(openBackgroundTasks(mergeLedgers([main]), at('2026-09-26T01:05:00.000Z'))).toEqual([]);
+    // An agent resumed after an older end stays open.
+    applyBackgroundLine(main, toolResult({ resumedAgentId: 'aR' }, { timestamp: '2026-09-26T01:10:00.000Z' }));
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:09:00.000Z', content: '<task-notification><task-id>aR</task-id><status>completed</status></task-notification>' }), 'subagent');
+    expect(openBackgroundTasks(mergeLedgers([main, sub]), at('2026-09-26T01:11:00.000Z')).map((t) => t.id)).toEqual(['aR']);
+  });
+
+  it('a subagent-started Monitor keeps the activity of its events reported in the main file', () => {
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({
+      type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+      message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { taskId: 'bmonsub', timeoutMs: 10 ** 9 },
+    }), 'subagent');
+    const main = createBackgroundLedger();
+    applyBackgroundLine(main, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:20:00.000Z', content: '<task-notification><task-id>bmonsub</task-id><event>gate slot free</event></task-notification>' }));
+    const merged = mergeLedgers([main, sub]);
+    expect([...merged.open.keys()]).toEqual(['bmonsub']);
+    expect(merged.lastEventAt.get('bmonsub')).toBe(at('2026-09-26T01:20:00.000Z'));
+  });
+
+  it('skips a subagent file last written before the agent process started', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ledger-'));
+    try {
+      const file = path.join(dir, 's.jsonl');
+      const sub = path.join(dir, 's', 'subagents');
+      await fs.mkdir(sub, { recursive: true });
+      await fs.writeFile(file, '');
+      const old = path.join(sub, 'agent-old.jsonl');
+      await fs.writeFile(old, JSON.stringify({
+        type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+        message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { backgroundTaskId: 'bold' },
+      }) + '\n');
+      const t = new Date('2026-09-26T01:00:00.000Z');
+      await fs.utimes(old, t, t);
+      await readBackgroundLedger(file, at('2026-09-26T02:00:00.000Z'));
+      expect(__testing.ledgers.has(old)).toBe(false);
+      await readBackgroundLedger(file, at('2026-09-26T00:30:00.000Z'));
+      expect(__testing.ledgers.has(old)).toBe(true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('a subagent shell closes on its completion in the main transcript', async () => {

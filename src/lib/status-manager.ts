@@ -269,6 +269,7 @@ export class StatusManager {
     if (provider && unknownStateHandle) {
       const snapshot = await provider.readRuntimeSnapshot(unknownStateHandle, {
         tasksSince: await this.agentProcessStartedAt(tabId, entry),
+        withBackground: true,
       });
       const { idle, stale, lastAssistantSnippet } = snapshot;
       const liveRegisteredJobs = await this.liveRegisteredJobs(tabId);
@@ -955,6 +956,7 @@ export class StatusManager {
         permissionRequest: entry.permissionRequest,
         lastEvent: entry.lastEvent,
         eventSeq: entry.eventSeq,
+        turnEnd: entry.turnEnd ?? null,
       };
     }
     return result;
@@ -1245,6 +1247,7 @@ export class StatusManager {
       try {
         snapshot = await provider.readRuntimeSnapshot(handle, {
           tasksSince: await this.agentProcessStartedAt(tabId, entry),
+          withBackground: true,
           withActivity: true,
         });
       } catch {
@@ -1652,6 +1655,7 @@ export class StatusManager {
         const read = async () => provider.readRuntimeSnapshot(handle, {
           force: true,
           tasksSince: await this.agentProcessStartedAt(tabId, entry),
+          withBackground: true,
         });
         snapshot = await read();
         // The Stop hook can fire before the final entry reaches the file.
@@ -1684,7 +1688,8 @@ export class StatusManager {
 
     const turnEnd = classifyTurnEnd({
       tail: snapshot?.lastAssistantTail,
-      transcript: snapshot !== null,
+      // An empty snapshot from an unreadable transcript is not a read (story 37).
+      transcript: snapshot !== null && snapshot.transcriptRead !== false,
       openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0,
       liveRegisteredJobs,
     });
@@ -1703,7 +1708,8 @@ export class StatusManager {
       // What the classifier saw, so `tab status` explains a READY nudge (story 37).
       entry.turnEnd = {
         kind: 'ready-for-review', at, seq: stopSeq, transcript: turnEnd.transcript,
-        openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0, liveRegisteredJobs,
+        // null: the background ledger was not read, which differs from "read, nothing open".
+        openBackgroundTasks: snapshot?.openBackgroundTasks ?? null, liveRegisteredJobs,
       };
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);

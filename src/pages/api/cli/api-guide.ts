@@ -223,10 +223,12 @@ GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   probes/backgroundJobs are the tab's registered liveness watch (see "Liveness watch"),
   so an idle tab that is HOLDING dead background work is distinguishable from an idle
   tab that is done.
-  turnEnd is how the watchdog classified the last stop: "kind" (turn-marker, waiting,
-  ready-for-review, ...), "openBackgroundTasks" (the agent's own shells, subagents and
-  monitors, including shells its subagents started), "liveRegisteredJobs", and on a
-  ready-for-review stop "transcript" (false: no transcript was read, the fallback).
+  turnEnd is how the watchdog classified the last stop (null before the first stop): "kind"
+  (turn-marker, waiting, ready-for-review, ...). A waiting or ready-for-review stop carries
+  "openBackgroundTasks" (Claude only: its shells, async subagents and monitors, including
+  shells its subagents started; always 0 for Codex and Grok; null when it could not be read)
+  and "liveRegisteredJobs"; a ready-for-review stop also carries "transcript" (false: no
+  transcript was read, the fallback). A turn-marker stop carries "marker" and no counts.
 
 GET /api/cli/tabs/<tabId>/result?workspaceId=WS[&suggestions=0 | &raw=1]
   Capture the current pane content (escapes stripped). On the agent's composer line and below,
