@@ -8,7 +8,7 @@ const run = promisify(execFile);
 // The installed entry point: ~/.local/bin/purplemux resolves to bin/purplemux.js.
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'bin', 'purplemux.js');
 
-/** Port 1 refuses instantly, so a command that reaches the network still fails fast. */
+/** fetch refuses port 1 before connecting, so a command that reaches the network still fails fast. */
 const ENV = { ...process.env, PMUX_PORT: '1', PMUX_TOKEN: 'test-token', NO_UPDATE_NOTIFIER: '1' };
 
 const cli = async (args: string[]): Promise<{ code: number; stderr: string }> => {

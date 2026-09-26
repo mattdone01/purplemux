@@ -516,7 +516,7 @@ const cmdTabSteer = async (args) => {
 // The send waits for the target to reach a state that can accept a turn. An
 // agent TUI that is still booting swallows the Enter after the paste, so a
 // send that does not wait can report success over an agent that never starts.
-const MAX_CLI_WAIT_MS = 290_000;
+const MAX_CLI_WAIT_MS = 240_000;
 
 const cmdTabSend = async (args) => {
   requireEnv();
@@ -541,8 +541,10 @@ const cmdTabSend = async (args) => {
   if (waitMsGiven && (waitMs === null || !/^\d+$/.test(waitMs))) {
     die('--wait-ms must be a whole number of milliseconds');
   }
-  // Node's fetch stops waiting for response headers at 300 s. A longer wait
-  // would end in outcome-unknown while the server could still paste later.
+  // Node's fetch stops waiting for response headers at 300 s. The server still
+  // takes the dispatch lock and types the prompt after the wait, so the cap
+  // leaves a minute for that; it narrows the outcome-unknown window, it does
+  // not close it.
   if (waitMsGiven && Number(waitMs) > MAX_CLI_WAIT_MS) {
     die(`--wait-ms must be at most ${MAX_CLI_WAIT_MS} (the CLI's HTTP client stops waiting at 300 s)`);
   }
@@ -813,7 +815,7 @@ Commands:
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
                                            for an agent tab to be able to accept a turn; --wait-ms N (max
-                                           290000) changes the budget, --no-wait answers immediately. On timeout nothing is
+                                           240000) changes the budget, --no-wait answers immediately. On timeout nothing is
                                            pasted and the call exits 5 (readiness-timeout).
                                            Exit 4 (tab-not-found, session-not-running, target-changed) means
                                            the tab is gone: never retry it, and never loop on it.

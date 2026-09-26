@@ -179,10 +179,10 @@ describe('tab send — permanent and retryable failures are distinct', () => {
   it('accepts the longest wait the CLI can hold open', async () => {
     reply = json(200, { status: 'sent', submitted: true, cliState: 'idle' });
 
-    const { code } = await cli(['tab', 'send', '-w', 'WS', '--wait-ms', '290000', 'tab-x', 'hi']);
+    const { code } = await cli(['tab', 'send', '-w', 'WS', '--wait-ms', '240000', 'tab-x', 'hi']);
 
     expect(code).toBe(0);
-    expect(requests[0].body).toEqual({ content: 'hi', waitMs: 290000 });
+    expect(requests[0].body).toEqual({ content: 'hi', waitMs: 240000 });
   });
 
   it('prints the success body and exits 0', async () => {
@@ -301,6 +301,14 @@ describe('server unreachable', () => {
     expect(stderr).not.toContain('outcome unknown');
   });
 
+  it('exits 1 for a write to a port fetch refuses: `fetch failed` with an uncoded cause', async () => {
+    const { code, stderr } = await cli(['tab', 'send', '-w', 'WS', 'tab-x', 'hi'], { PMUX_PORT: '1' });
+
+    expect(code).toBe(1);
+    expect(stderr).toContain('request not sent');
+    expect(stderr).not.toContain('outcome unknown');
+  });
+
   it('exits 6 when a screenshot download loses its connection mid-body', async () => {
     reply = (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': '100000' });
@@ -340,7 +348,7 @@ describe('usage errors exit 2', () => {
     [['tab', 'send', '-w', 'WS', 'tab-x']],
     [['tab', 'send', 'tab-x', 'hi']],
     [['tab', 'send', '-w', 'WS', 'tab-x', 'hi', '--wait-ms']],
-    [['tab', 'send', '-w', 'WS', '--wait-ms', '290001', 'tab-x', 'hi']],
+    [['tab', 'send', '-w', 'WS', '--wait-ms', '240001', 'tab-x', 'hi']],
     [['nonsense']],
     [['tab', 'status']],
     [['tab', 'probe', 'set', '-w', 'WS', 'tab-x']],
