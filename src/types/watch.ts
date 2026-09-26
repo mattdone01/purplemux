@@ -1,3 +1,5 @@
+import type { TCallerIdentity } from '@/types/identity';
+
 export type TWatchKind = 'pr' | 'ref' | 'lease';
 export type TWatchUntil = 'merged' | 'closed' | 'head-moved' | 'checks-settled' | 'moved' | 'free';
 /** A server-classified failure; the raw `gh` text is shown by `watch list`, never typed. */
@@ -25,8 +27,10 @@ export interface IWatch {
   lastError: { code: TWatchFailure; message: string; at: number } | null;
   /** Caller text, ≤ 80 characters: shown by `watch list`, never typed. */
   label: string | null;
-  /** True when the owner was resolved by its tab token; false for the session-header fallback (ADR-0010). */
+  /** True when the owner was resolved by its launch tab token; false for the session-header fallback (ADR-0010). */
   verified: boolean;
+  /** How the owner was named (story 36); absent on watches created before it. */
+  identity?: TCallerIdentity;
   /**
    * The notice of a condition that held (or of expiry) whose enqueue failed: the next pass retries the
    * enqueue alone, never the GitHub read.

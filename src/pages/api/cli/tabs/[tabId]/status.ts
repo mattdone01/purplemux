@@ -5,6 +5,7 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getCodexModelStatus } from '@/lib/providers/codex/model-observation';
 import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
+import { tabIdentityOf } from '@/lib/tab-token';
 import { getStatusManager } from '@/lib/status-manager';
 import { resolveTabCliState } from '@/lib/tab-send';
 
@@ -46,6 +47,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       modelStatus,
       probes,
       backgroundJobs,
+      identity: tabIdentityOf(workspaceId, tabId),
     });
   }
 
@@ -63,6 +65,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     modelStatus,
     probes,
     backgroundJobs,
+    identity: tabIdentityOf(workspaceId, tabId),
   });
 };
 

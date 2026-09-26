@@ -136,8 +136,16 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 
 ## Tabs
 
+POST /api/cli/tab-identity  { session }
+  Story 36: the Claude SessionStart hook of a tab created before tab tokens asks for a hook-time
+  identity with the pane's WORKSPACE token (403 for the admin token or a tab token), for a live tab
+  of that workspace (404 otherwise). Mint-only: 409 tab-has-launch-identity for a tab with a launch
+  token. Answers { tabId, workspaceId, token, identity: "hook" }; the hook writes the exports to
+  $CLAUDE_ENV_FILE. A hook token resolves identity "hook", never verified.
+
 GET /api/cli/tabs?workspaceId=WS
-  List tabs. Without workspaceId, lists tabs across all workspaces.
+  List tabs. Without workspaceId, lists tabs across all workspaces. Each tab carries identity:
+  launch (token bound at launch), hook (taken at a Claude SessionStart, story 36) or none.
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
     "cliState", "lastEvent", "busySince", "reportsTo" }] }
   cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).

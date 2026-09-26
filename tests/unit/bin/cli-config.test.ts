@@ -149,7 +149,7 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     expect(await put('pt-ws-a-pane-1-tab-w')).toMatchObject({ status: 403, body: { code: 'forbidden' } });
     expect(await put('pt-ws-a-pane-1-tab-o')).toMatchObject({ status: 200, body: { key: 'gate.slots', version: 1, changed: true } });
     await drainRouteLocks();
-    expect(await auditLines()).toMatchObject([{ event: 'fleet-config-set', by: { workspaceId: 'ws-a', tabId: 'tab-o', admin: false, verified: false } }]);
+    expect(await auditLines()).toMatchObject([{ event: 'fleet-config-set', by: { workspaceId: 'ws-a', tabId: 'tab-o', admin: false, verified: false, identity: 'session' } }]);
   });
 
   it('a malformed store exits 1 with nothing on stdout, never 7 (unset) and never read as empty', async () => {

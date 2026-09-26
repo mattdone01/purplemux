@@ -1,3 +1,5 @@
+import type { TCallerIdentity } from '@/types/identity';
+
 // Notes with acknowledgement (ADR-0013): a body the recipient pulls. Only the
 // inbox's fixed one-line notice is ever typed into the recipient's tab.
 
@@ -8,6 +10,8 @@ export interface INoteParty {
   workspaceId: string | null;
   tabId: string | null;
   verified: boolean;
+  /** How the sender was named (story 36); absent on notes sent before it. */
+  identity?: TCallerIdentity;
   /** Set only when the sender's tab held `epic:<slug>` at send time. */
   epic: string | null;
 }

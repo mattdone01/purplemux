@@ -335,7 +335,7 @@ export class WatchManager {
       throw new WatchError('caller-unresolved', 'a watch belongs to a tab: call from the tab that will receive its notice');
     }
     const spec = checkSpec(input);
-    const owner = { workspaceId: caller.workspaceId, tabId: caller.tabId, verified: caller.verified };
+    const owner = { workspaceId: caller.workspaceId, tabId: caller.tabId, verified: caller.verified, identity: caller.identity };
     // A cheap cap check before the GitHub read, then the binding one under the lock.
     checkCaps(await this.deps.read(), spec, owner);
     const baseline = await this.baseline(spec);

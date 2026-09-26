@@ -24,6 +24,7 @@ vi.mock('@/lib/providers', () => ({
 }));
 vi.mock('@/lib/liveness-manager', () => ({ getLivenessManager: () => liveness }));
 vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => statusManager }));
+vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: vi.fn(() => 'hook') }));
 
 interface IFakeResponse {
   statusCode: number;
@@ -104,6 +105,10 @@ describe('GET /api/cli/tabs/[tabId]/status', () => {
     cliUtils.findTab.mockResolvedValue({ workspaceId: 'ws-1', paneId: 'pane-1', tab: { ...tab, cliState: 'inactive' } });
     const res = await get();
     expect(res.body).toMatchObject({ cliState: 'inactive', agentSessionId: '11111111-1111-4111-8111-111111111111' });
+  });
+
+  it('reports the tab\'s identity (story 36)', async () => {
+    expect((await get()).body).toMatchObject({ identity: 'hook' });
   });
 
   it('reports the live session id when the poll bound one the layout does not have yet', async () => {

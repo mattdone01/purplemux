@@ -14,6 +14,7 @@ import { createLogger } from '@/lib/logger';
 import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
 import { checkReportsTo } from '@/lib/reports-to';
+import { tabIdentityOf } from '@/lib/tab-token';
 import {
   prepareCodexManagedLaunch,
   submitCodexManagedLaunch,
@@ -49,6 +50,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       lastEvent: ILastEvent | null;
       busySince: number | null;
       reportsTo: string | null;
+      /** launch: the server bound its token at launch; hook: taken at a SessionStart (story 36); none: no tab identity. */
+      identity: 'launch' | 'hook' | 'none';
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -84,6 +87,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             lastEvent: liveStatus[tab.id]?.lastEvent ?? null,
             busySince: liveStatus[tab.id]?.busySince ?? null,
             reportsTo: tab.reportsTo ?? null,
+            identity: tab.panelType === 'web-browser' ? 'none' : tabIdentityOf(id, tab.id),
           });
         }
       }

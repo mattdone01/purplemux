@@ -36,6 +36,9 @@ vi.mock('@/lib/status-manager', () => ({
   getStatusManager: () => ({ getAllForClient: () => statuses.value }),
 }));
 vi.mock('@/lib/agent-dispatch-policy', () => ({ checkAgentDispatchPolicy: vi.fn() }));
+vi.mock('@/lib/tab-token', () => ({
+  tabIdentityOf: vi.fn((_ws: string, tabId: string) => ({ 'tab-busy': 'launch', 'tab-new': 'hook' } as Record<string, string>)[tabId] ?? 'none'),
+}));
 vi.mock('@/lib/providers/codex/managed-launch', () => ({
   prepareCodexManagedLaunch: vi.fn(),
   submitCodexManagedLaunch: vi.fn(),
@@ -78,6 +81,11 @@ describe('GET /api/cli/tabs status fields', () => {
   it('falls back to the persisted cliState when the tab has no live status entry', async () => {
     const { body } = await listTabs();
     expect(body.tabs[1]).toMatchObject({ tabId: 'tab-new', cliState: 'busy', lastEvent: null, busySince: null });
+  });
+
+  it('shows each tab\'s identity: launch, hook (story 36) or none', async () => {
+    const { body } = await listTabs();
+    expect(body.tabs.map((t) => [t.tabId, t.identity])).toEqual([['tab-busy', 'launch'], ['tab-new', 'hook'], ['tab-sh', 'none']]);
   });
 
   it('reports null for a tab that has neither a live nor a persisted state', async () => {

@@ -354,8 +354,18 @@ describe('lease store', () => {
 
   it('derives a holder from a caller without inventing a tab for admin', async () => {
     const { holderFromCaller } = await store();
-    expect(holderFromCaller({ scope: { type: 'admin' }, workspaceId: null, tabId: null, tabName: null, verified: false, admin: true })).toEqual(admin);
-    expect(holderFromCaller({ scope: { type: 'workspace', workspaceId: 'ws1' }, workspaceId: 'ws1', tabId: 'tab-a', tabName: 'A', verified: false, admin: false }))
-      .toEqual({ ...tabA, verified: false });
+    expect(holderFromCaller({ scope: { type: 'admin' }, workspaceId: null, tabId: null, tabName: null, verified: false, identity: 'none', admin: true }))
+      .toEqual({ ...admin, identity: 'none' });
+    expect(holderFromCaller({ scope: { type: 'workspace', workspaceId: 'ws1' }, workspaceId: 'ws1', tabId: 'tab-a', tabName: 'A', verified: false, identity: 'session', admin: false }))
+      .toEqual({ ...tabA, verified: false, identity: 'session' });
+  });
+
+  it('keeps how a holder was named, and labels a hook-time identity apart from an unverified one (story 36)', async () => {
+    const { holderFromCaller, holderLabel } = await store();
+    const hook = holderFromCaller({ scope: { type: 'workspace', workspaceId: 'ws1', tabId: 'tab-a', tabIdentity: 'hook' }, workspaceId: 'ws1', tabId: 'tab-a', tabName: 'A', verified: false, identity: 'hook', admin: false });
+    expect(hook).toMatchObject({ verified: false, identity: 'hook' });
+    expect(holderLabel(hook)).toBe('ws1/tab-a (A) hook-identity');
+    expect(holderLabel({ ...hook, identity: 'session' })).toBe('ws1/tab-a (A) unverified');
+    expect(holderLabel({ ...hook, identity: undefined })).toBe('ws1/tab-a (A) unverified');
   });
 });

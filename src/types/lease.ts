@@ -1,8 +1,12 @@
+import type { TCallerIdentity } from '@/types/identity';
+
 export interface ILeaseHolder {
   workspaceId: string | null;
   tabId: string | null;
   tabName: string | null;
   verified: boolean;
+  /** How the holder was named (story 36); absent on leases taken before it. */
+  identity?: TCallerIdentity;
   /** The global token. Shown as `admin`, never as a human (ADR-0010). */
   admin: boolean;
 }

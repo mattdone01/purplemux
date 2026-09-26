@@ -87,12 +87,70 @@ describe('resolveCaller', () => {
     const token = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-a1' }, 'pt-ws-a-pane-1-tab-a1');
 
     expect(await resolveCaller(req({ 'x-pmux-token': token }))).toEqual({
-      scope: { type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-a1', tabVerified: true },
+      scope: { type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-a1', tabVerified: true, tabIdentity: 'launch' },
       workspaceId: 'ws-a',
       tabId: 'tab-a1',
       tabName: 'worker',
       verified: true,
+      identity: 'launch',
       admin: false,
+    });
+  });
+
+  describe('hook-time identity (story 36, architect ruling)', () => {
+    it('a hook token names its tab, unverified, identity hook', async () => {
+      const { mintHookTabToken } = await import('@/lib/tab-token');
+      const { resolveCaller } = await import('@/lib/caller');
+      const minted = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
+      if (!minted.ok) throw new Error(minted.reason);
+      expect(await resolveCaller(req({ 'x-pmux-token': minted.token }))).toEqual({
+        scope: { type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-a2', tabIdentity: 'hook' },
+        workspaceId: 'ws-a',
+        tabId: 'tab-a2',
+        tabName: null,
+        verified: false,
+        identity: 'hook',
+        admin: false,
+      });
+    });
+
+    it('never hands out a launch token: 409-shaped refusal, and the launch token still resolves verified', async () => {
+      const { ensureTabToken, mintHookTabToken } = await import('@/lib/tab-token');
+      const { resolveCaller } = await import('@/lib/caller');
+      const launch = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-a1' }, 'pt-ws-a-pane-1-tab-a1');
+      expect(await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a1' }, 'pt-ws-a-pane-1-tab-a1'))
+        .toEqual({ ok: false, reason: 'tab-has-launch-identity' });
+      expect(await resolveCaller(req({ 'x-pmux-token': launch }))).toMatchObject({ verified: true, identity: 'launch' });
+    });
+
+    it('the ruling\'s disproof test: a sibling tab holding the workspace token CAN take another tab\'s hook token, so it is never verified', async () => {
+      // Tab X presents exactly what tab Y's hook presents; the server cannot tell them apart over TCP.
+      const { mintHookTabToken } = await import('@/lib/tab-token');
+      const { resolveCaller } = await import('@/lib/caller');
+      const fromY = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
+      const fromX = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
+      expect(fromX).toEqual(fromY.ok ? { ...fromY, minted: false } : fromY);
+      expect(await resolveCaller(req({ 'x-pmux-token': fromY.ok ? fromY.token : '' }))).toMatchObject({ verified: false, identity: 'hook' });
+    });
+
+    it('a session the server recreates binds the hook token at launch: it becomes verified', async () => {
+      const { ensureTabToken, mintHookTabToken, tabIdentityOf } = await import('@/lib/tab-token');
+      const { resolveCaller } = await import('@/lib/caller');
+      const hook = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
+      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('hook');
+      const launch = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
+      expect(hook.ok && launch).toBe(hook.ok ? hook.token : false);
+      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('launch');
+      expect(await resolveCaller(req({ 'x-pmux-token': launch }))).toMatchObject({ verified: true, identity: 'launch' });
+    });
+
+    it('an unknown origin in the token file never counts as launch proof', async () => {
+      const { resolveCaller } = await import('@/lib/caller');
+      const token = 'f'.repeat(64);
+      await fs.writeFile(path.join(mockHome.value, '.purplemux', 'tab-tokens.json'), JSON.stringify({
+        'tab-a1': { token, workspaceId: 'ws-a', sessionName: 'pt-ws-a-pane-1-tab-a1', createdAt: '2026-09-26T00:00:00.000Z', origin: 'forged' },
+      }));
+      expect(await resolveCaller(req({ 'x-pmux-token': token }))).toMatchObject({ tabId: 'tab-a1', verified: false, identity: 'hook' });
     });
   });
 
@@ -132,6 +190,7 @@ describe('resolveCaller', () => {
       tabId: 'tab-a2',
       tabName: null,
       verified: false,
+      identity: 'session',
       admin: false,
     });
   });
@@ -144,7 +203,7 @@ describe('resolveCaller', () => {
       'x-pmux-token': getWorkspaceToken('ws-a'),
       'x-pmux-session': 'pt-ws-b-pane-1-tab-b1',
     }));
-    expect(caller).toMatchObject({ workspaceId: 'ws-a', tabId: null, tabName: null, verified: false });
+    expect(caller).toMatchObject({ workspaceId: 'ws-a', tabId: null, tabName: null, verified: false, identity: 'none' });
   });
 
   it('ignores a session name that no layout holds', async () => {
@@ -172,7 +231,7 @@ describe('resolveCaller', () => {
 
     const caller = await resolveCaller(req({ 'x-pmux-token': getCliToken(), 'x-pmux-session': 'pt-ws-a-pane-1-tab-a1' }));
     expect(caller).toEqual({
-      scope: { type: 'admin' }, workspaceId: null, tabId: null, tabName: null, verified: false, admin: true,
+      scope: { type: 'admin' }, workspaceId: null, tabId: null, tabName: null, verified: false, identity: 'none', admin: true,
     });
     expect(Object.keys(caller!)).not.toContain('human');
   });
