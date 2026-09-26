@@ -11,6 +11,8 @@ import type { INote, INoteParty, INoteTarget, INotesState, INoteView, TNoteError
 export class NoteError extends Error {
   constructor(readonly code: TNoteErrorCode, message: string) {
     super(message);
+    // The brand the routes check (`isCodedError`): the class itself differs across bundles.
+    this.name = 'NoteError';
   }
 }
 

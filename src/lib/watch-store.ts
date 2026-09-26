@@ -12,6 +12,8 @@ import type { IWatch, IWatchesState, TWatchErrorCode, TWatchKind, TWatchUntil } 
 export class WatchError extends Error {
   constructor(readonly code: TWatchErrorCode, message: string) {
     super(message);
+    // The brand the routes check (`isCodedError`): the class itself differs across bundles.
+    this.name = 'WatchError';
   }
 }
 
