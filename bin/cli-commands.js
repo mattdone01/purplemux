@@ -13,6 +13,7 @@ const CLI_COMMANDS = new Set([
   'orchestration',
   'standup',
   'mission',
+  'lease',
   'api-guide',
   'help',
   '-h',

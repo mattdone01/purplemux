@@ -20,7 +20,7 @@ const tabB: ILeaseHolder = { workspaceId: 'ws2', tabId: 'tab-b', tabName: 'B', v
 const tabA2: ILeaseHolder = { workspaceId: 'ws1', tabId: 'tab-a2', tabName: 'A2', verified: false, admin: false };
 const admin: ILeaseHolder = { workspaceId: null, tabId: null, tabName: null, verified: false, admin: true };
 
-let now = Date.parse('2026-09-26T03:00:00.000Z');
+let now = Date.now();
 const orchestrators = new Set<string>();
 const authority = {
   now: () => now,
@@ -34,7 +34,7 @@ describe('lease store', () => {
     vi.resetModules();
     resetLeaseGlobals();
     mockHome.value = await makeHome();
-    now = Date.parse('2026-09-26T03:00:00.000Z');
+    now = Date.now();
     orchestrators.clear();
   });
 
@@ -82,7 +82,7 @@ describe('lease store', () => {
   it('lets only the admin token or the workspace orchestrator tab take a deploy lease', async () => {
     const { acquireLease } = await store();
     await expect(acquireLease({ name: 'deploy:purplemux' }, tabA, authority)).rejects.toMatchObject({
-      code: 'lease-policy', message: "deploy leases need the admin token or the workspace's enabled orchestrator tab",
+      code: 'forbidden', message: "deploy leases need the admin token or the workspace's enabled orchestrator tab",
     });
     orchestrators.add('ws1/tab-a');
     expect((await acquireLease({ name: 'deploy:purplemux' }, tabA, authority)).outcome).toBe('acquired');

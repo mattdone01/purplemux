@@ -415,7 +415,8 @@ export const acquireLease = async (
   const note = resolveNote(input.note);
   if (policyFor(kind).orchestratorOnly && !holder.admin) {
     const allowed = await authority.isWorkspaceOrchestrator(holder.workspaceId!, holder.tabId!);
-    if (!allowed) throw new LeasePolicyError(`${kind} leases need the admin token or the workspace's enabled orchestrator tab`);
+    // An authority refusal, not a malformed request: `forbidden` (exit 3), as for fleet config.
+    if (!allowed) throw new LeaseError('forbidden', `${kind} leases need the admin token or the workspace's enabled orchestrator tab`);
   }
   const now = authority.now();
   const result = await transact(now, (state) => {

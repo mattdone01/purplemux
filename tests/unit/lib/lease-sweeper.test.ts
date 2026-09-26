@@ -43,7 +43,7 @@ describe('lease death', () => {
     vi.resetModules();
     resetLeaseGlobals();
     mockHome.value = await makeHome();
-    now = Date.parse('2026-09-26T03:00:00.000Z');
+    now = Date.now();
     live = new Set(['tab-a']);
     uncertain = new Set();
     agents = new Map([['tab-a', { cliState: 'busy', isAgent: true }]]);
