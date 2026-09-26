@@ -252,6 +252,19 @@ describe('notes (ADR-0013)', () => {
     expect(f.sent.map((s) => s.targetTabId)).toEqual(['tab-a', 'tab-c']);
   });
 
+  it('a queued reminder for the old owner is withdrawn too when the note moves', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.now += NOTE_REMIND_MS;
+    await svc.tick(); // the reminder waits: tab-a is busy
+    const reminder = f.note(id).reminderItemId!;
+    expect(f.inbox.get(reminder)).toMatchObject({ state: 'queued' });
+    f.epics.set('ddh', { workspaceId: 'ws-3', tabId: 'tab-c' });
+    await svc.tick('ddh');
+    expect(f.inbox.get(reminder)).toMatchObject({ state: 'dropped', droppedReason: 'note-rerouted' });
+    expect(f.note(id)).toMatchObject({ deliveredTo: { tabId: 'tab-c' }, reminderItemId: null, remindedAt: null });
+  });
+
   it('a note to a workspace follows its orchestrator to a new live tab', async () => {
     const { id } = await svc.send(C, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
     f.deliverInbox(f.note(id).inboxItemId!);

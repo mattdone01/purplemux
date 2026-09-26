@@ -39,6 +39,8 @@ export interface INote {
   ackedBy: { workspaceId: string; tabId: string | null } | null;
   ackComment: string | null;
   remindedAt: number | null;
+  /** The inbox item of the reminder to the current recipient, so a re-route can withdraw it. Absent in notes stored before it existed. */
+  reminderItemId?: string | null;
   senderNotifiedAt: number | null;
   expiredAt: number | null;
   transitionAt: number;

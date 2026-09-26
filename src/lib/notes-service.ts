@@ -191,7 +191,9 @@ export class NotesService {
     if (await this.recipientGone(note, r)) {
       // The old tab may still be open with the line waiting: take the line back first, so it is not
       // typed there after the note has moved (review round 3). A failed withdrawal defers the move.
+      // The same holds for its reminder (final confirmation): the withdrawal leaves a delivered one alone.
       if (item && (item.state === 'queued' || item.state === 'held')) await this.deps.withdraw(item.id, 'note-rerouted');
+      if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-rerouted');
       return this.route(requeued(note, now), now, r);
     }
     let next = note;
@@ -202,17 +204,16 @@ export class NotesService {
     if (next.deliveredTo && next.deliveredAt !== null && next.remindedAt === null && now - next.deliveredAt >= NOTE_REMIND_MS) {
       // Not live here means unknown: the reminder waits, and the sender's clock below still runs
       // (review round 3: an unreadable recipient must not hold back the sender's escalation).
-      let sent = false;
+      let sent: string | null = null;
       try {
         if ((await r.tabState(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) === 'live') {
-          await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'));
-          sent = true;
+          sent = (await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'))).item.id;
         }
       } catch (err) {
         log.warn(`note ${note.id} reminder not sent: ${err instanceof Error ? err.message : err}`);
         return next;
       }
-      if (sent) next = reminded(next, now);
+      if (sent) next = reminded(next, now, sent);
     }
     // The sender's notice counts from the first routing, once per note: it is the escalation for a
     // recipient that never reads the line, so it must not wait for the line to be read.
