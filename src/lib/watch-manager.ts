@@ -214,6 +214,11 @@ export class WatchManager {
   }
 
   private async pass(lane: 'lease' | 'github', onlyLease?: string): Promise<void> {
+    // Every full lease-lane pass also drops the watches of tabs confirmed closed: the backstop for a
+    // tab-closed removal that failed or raced a create (final confirmation).
+    if (lane === 'lease' && onlyLease === undefined) {
+      await this.hydrate().catch((err) => log.warn(`closed-tab watch sweep failed: ${err instanceof Error ? err.message : err}`));
+    }
     const now = this.deps.now();
     const { watches } = await this.deps.read();
     const outcomes = new Map<string, TOutcome | 'expired' | 'dropped'>();
@@ -297,7 +302,10 @@ export class WatchManager {
     });
   }
 
-  /** Boot: drop the watches of tabs confirmed gone while the server was down; an unreadable workspace keeps its own. */
+  /**
+   * Drop the watches of tabs confirmed closed; an unreadable workspace keeps its own. Runs at boot and
+   * on every full lease-lane pass.
+   */
   async hydrate(): Promise<number> {
     const live = await this.deps.liveTabs();
     const open = new Set(live.tabs.map((t) => `${t.workspaceId}/${t.tabId}`));
@@ -334,6 +342,13 @@ export class WatchManager {
     const watch = createWatch(spec, owner, baseline.sha, this.deps.now(), this.deps.newId(), baseline.holds);
     await this.deps.mutate(async (state) => {
       checkCaps(state, spec, owner);
+      // The tab may have closed during the baseline read, and its removal already ran: a watch is
+      // never added for a tab confirmed closed (final confirmation). An unreadable workspace is kept.
+      const live = await this.deps.liveTabs();
+      const open = live.tabs.some((t) => t.workspaceId === owner.workspaceId && t.tabId === owner.tabId);
+      if (!open && !live.uncertainWorkspaceIds.has(owner.workspaceId)) {
+        throw new WatchError('caller-unresolved', `tab ${owner.workspaceId}/${owner.tabId} is closed; a watch belongs to an open tab`);
+      }
       return { state: { watches: [...state.watches, watch] }, value: undefined };
     });
     return watch;

@@ -201,16 +201,44 @@ describe('harness watches (ADR-0015)', () => {
     await m.create(caller('ws-a', 'tab-a'), { kind: 'lease', target: 'merge:x/y', until: 'free' });
     expect(await m.removeTab('ws-b', 'tab-b')).toBe(1);
     expect(f.state.watches.map((w) => w.tabId)).toEqual(['tab-a']);
+    f.live.add('ws-c/tab-c');
+    f.live.add('ws-d/tab-d');
     await m.create(caller('ws-c', 'tab-c'), { kind: 'lease', target: 'merge:x/y', until: 'free' });
     await m.create(caller('ws-d', 'tab-d'), { kind: 'lease', target: 'merge:x/y', until: 'free' });
+    f.live.delete('ws-c/tab-c');
+    f.live.delete('ws-d/tab-d');
     f.uncertain.add('ws-d');
     expect(await m.hydrate()).toBe(1);
     expect(f.state.watches.map((w) => w.tabId)).toEqual(['tab-a', 'tab-d']);
   });
 
+  it('a tab that closes during creation gets no watch, and a watch that outlived its tab is swept by the next pass', async () => {
+    const deps = f.deps();
+    const closing = new WatchManager({
+      ...deps,
+      runGh: async (args) => {
+        f.live.delete('ws-b/tab-b'); // closed during the baseline read; its removal found nothing
+        return deps.runGh(args);
+      },
+    });
+    f.answer('/pulls/21', f.pull(false, 'open', SHA_A));
+    expect(await code(closing.create(B, { kind: 'pr', target: 'o/r#21', until: 'merged' }))).toBe('caller-unresolved');
+    expect(f.state.watches).toEqual([]);
+
+    f.live.add('ws-b/tab-b');
+    await m.create(B, { kind: 'lease', target: 'merge:x/y', until: 'free' });
+    f.live.delete('ws-b/tab-b'); // the tab-closed removal failed or never ran
+    await m.tick('merge:p/q'); // a release event for another lease: no sweep
+    expect(f.state.watches).toHaveLength(1);
+    await m.tick(); // the next full pass sweeps it
+    expect(f.state.watches).toEqual([]);
+    expect(f.sent).toEqual([]);
+  });
+
   it(`refuses the ${WATCH_GITHUB_CAP + 1}st GitHub watch on the host (watch-cap) but not a lease watch`, async () => {
     f.answer('/pulls/', f.pull(false, 'open', SHA_A));
     for (let i = 0; i < WATCH_GITHUB_CAP; i++) {
+      f.live.add(`ws-${i % 3}/tab-${i}`);
       await m.create(caller(`ws-${i % 3}`, `tab-${i}`), { kind: 'pr', target: `o/r#${i + 1}`, until: 'merged' });
     }
     const calls = f.ghCalls.length;
@@ -300,7 +328,10 @@ describe('harness watches (ADR-0015)', () => {
   it('refuses a GitHub watch that would take the host past its request budget', async () => {
     f.answer('/pulls/', f.pull(false, 'open', SHA_A));
     // checks-settled reads 3 times per check: 3 x 3600 / 120 = 90 requests/h each; 22 of them ask 1,980/h.
-    for (let i = 0; i < 22; i++) await m.create(caller('ws-x', `tab-${i}`), { kind: 'pr', target: `o/r#${i + 1}`, until: 'checks-settled' });
+    for (let i = 0; i < 22; i++) {
+      f.live.add(`ws-x/tab-${i}`);
+      await m.create(caller('ws-x', `tab-${i}`), { kind: 'pr', target: `o/r#${i + 1}`, until: 'checks-settled' });
+    }
     const refused = m.create(B, { kind: 'pr', target: 'o/r#99', until: 'checks-settled' });
     await expect(refused).rejects.toThrow(/requests\/h/);
     expect(await code(m.create(B, { kind: 'pr', target: 'o/r#99', until: 'checks-settled', intervalS: 3600 }))).toBe('none');
