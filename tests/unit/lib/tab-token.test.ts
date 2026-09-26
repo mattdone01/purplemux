@@ -138,6 +138,16 @@ describe('tab token store', () => {
     expect(await fs.readFile(path.join(path.dirname(tokensPath()), aside[0]), 'utf-8')).toBe('{not json');
   });
 
+  it('does not move a file aside for an I/O error that is not bad JSON', async () => {
+    await fs.mkdir(tokensPath(), { recursive: true });
+    const { resolveTabToken } = await import('@/lib/tab-token');
+
+    expect(resolveTabToken('a'.repeat(64))).toBeNull();
+    expect(logs.warn.some((m) => m.includes('could not be read, serving empty this run'))).toBe(true);
+    expect((await fs.stat(tokensPath())).isDirectory()).toBe(true);
+    expect((await fs.readdir(path.dirname(tokensPath()))).some((f) => f.includes('.unreadable-'))).toBe(false);
+  });
+
   it('withdraws a new token that cannot be saved and throws', async () => {
     await fs.mkdir(`${tokensPath()}.tmp`, { recursive: true });
     const { ensureTabToken, getTabTokenRecord } = await import('@/lib/tab-token');
@@ -168,6 +178,17 @@ describe('tab token store', () => {
     expect(resolveTabToken(b1)?.tabId).toBe('tab-3');
     expect(Object.keys(JSON.parse(await fs.readFile(tokensPath(), 'utf-8')))).toEqual(['tab-3']);
     expect(await revokeWorkspaceTabTokens('ws-a')).toEqual([]);
+  });
+
+  it('emits one workspace-deleted event per token it revokes', async () => {
+    const { ensureTabToken, revokeWorkspaceTabTokens } = await import('@/lib/tab-token');
+    const { onTabClosed } = await import('@/lib/tab-lifecycle');
+    await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-1' }, 's1');
+    const events: unknown[] = [];
+    onTabClosed((e) => events.push(e));
+
+    await revokeWorkspaceTabTokens('ws-a');
+    expect(events).toEqual([{ workspaceId: 'ws-a', tabId: 'tab-1', sessionName: 's1', reason: 'workspace-deleted' }]);
   });
 
   it('ignores malformed records instead of trusting them', async () => {
@@ -209,7 +230,7 @@ describe('planTabTokenSweep', () => {
     const { planTabTokenSweep } = await import('@/lib/tab-token');
     const tokens: TTabTokens = { 'tab-1': record('ws-a', 's1') };
     const plan = planTabTokenSweep(tokens, [live('ws-a', 'tab-1', 's1')]);
-    expect(plan).toEqual({ keep: tokens, removed: [], rebound: [] });
+    expect(plan).toEqual({ keep: tokens, removed: [], rebound: [], detached: [] });
   });
 
   it('removes the record of a tab that no longer exists', async () => {
@@ -242,6 +263,15 @@ describe('planTabTokenSweep', () => {
     const plan = planTabTokenSweep({ 'tab-new': own, 'tab-old': stale }, [live('ws-a', 'tab-new', 'name')]);
     expect(plan.keep).toEqual({ 'tab-new': own });
     expect(plan.removed.map((r) => r.tabId)).toEqual(['tab-old']);
+  });
+
+  it('keeps the record of a session that still runs although no layout names it', async () => {
+    const { planTabTokenSweep } = await import('@/lib/tab-token');
+    const rec = record('ws-a', 'pt-ws-a-pane-1-tab-reset');
+    const plan = planTabTokenSweep({ 'tab-reset': rec, 'tab-gone': record('ws-a', 's-gone') }, [], new Set(['pt-ws-a-pane-1-tab-reset']));
+    expect(plan.keep).toEqual({ 'tab-reset': rec });
+    expect(plan.detached).toEqual([{ tabId: 'tab-reset', record: rec }]);
+    expect(plan.removed.map((r) => r.tabId)).toEqual(['tab-gone']);
   });
 
   it('treats a record whose tab id now lives in another workspace as gone', async () => {

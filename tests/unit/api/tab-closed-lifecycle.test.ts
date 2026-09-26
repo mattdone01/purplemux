@@ -180,7 +180,10 @@ describe('one tab-closed event per close path, and the tab token dies with it', 
 
     expect(await deleteWorkspace(WS)).toBe(true);
     expect(resolveTabToken(leaked)).toBeNull();
-    expect(events.map((e) => e.tabId)).not.toContain('tab-never-written');
+    expect(eventsFor('tab-never-written')).toEqual([
+      { workspaceId: WS, tabId: 'tab-never-written', sessionName: session('pane-9', 'tab-never-written'), reason: 'workspace-deleted' },
+    ]);
+    for (const tabId of ['tab-1', 'tab-2', 'tab-3']) expect(eventsFor(tabId)).toHaveLength(1);
   });
 
   it('a close followed by an unrelated write emits nothing more', async () => {

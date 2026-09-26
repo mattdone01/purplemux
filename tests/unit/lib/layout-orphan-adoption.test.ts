@@ -75,6 +75,7 @@ describe('boot cross-check adopts an orphan session under its own tab id', () =>
     const adopted = collectAllTabs(layout.root).find((t) => t.sessionName === 'pt-ws-a-pane-0-tab-legacy');
     expect(adopted?.id).toMatch(/^tab-/);
     expect(adopted?.id).not.toBe('tab-1');
+    expect(adopted?.id).not.toBe('tab-legacy');
   });
 
   it('never reuses an id the layout already holds', async () => {
