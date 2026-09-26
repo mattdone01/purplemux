@@ -50,8 +50,14 @@ caller's word, per call or at hook time, is never verified.
   boolean for launch proof; `ICaller.identity` is `launch | hook | session | none`, with
   `verified === (identity === 'launch')`. Leases, notes, watches and fleet-config audit lines store
   `identity` beside `verified`; a lease label reads `hook-identity`. Grants still require `verified`.
-- A session the server recreates for a hook-token tab binds that token at launch: the record becomes
-  `launch`.
+- A session the server recreates for a hook-token tab gets a FRESH launch token; the hook token dies. A
+  hook token was handed out on the caller's word, so it is never promoted to proof (story 36 review r1).
+  The hook writes its exports guarded — `[ -n "$PMUX_TAB_ID" ] || { export …; }` — so a launch
+  environment always wins over a stale env file sourced again on resume.
+- Only `claude-code` tabs may take a hook token (409 `tab-identity-unsupported` otherwise): only they run the
+  SessionStart hook with `$CLAUDE_ENV_FILE`.
+- `tab list` shows `hook` only once the token was presented on a call (`presentedAt`): minting proves only
+  that someone asked, and a sibling or a hook killed mid-write could have asked.
 - The ruling's disproof test holds and is pinned: a sibling tab holding the same workspace token can obtain
   another tab's hook token (the server cannot tell the real hook from it over TCP), which is exactly why a hook
   token is never verified.

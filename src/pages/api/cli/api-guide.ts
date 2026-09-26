@@ -21,7 +21,10 @@ add one rather than working around a 403.
 
 Every tab created by the server also carries \`PMUX_TAB_TOKEN\`, \`PMUX_TAB_ID\` (the
 tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants exactly what the
-workspace token grants, and it also names the calling tab (verified). A tab token
+workspace token grants, and it also names the calling tab: verified (identity
+"launch") for a token the server bound when it created the session. A Claude tab
+created before tab tokens takes a hook-time token at its next session start
+(identity "hook", never verified; see POST /api/cli/tab-identity). A tab token
 stops working when its tab closes.
 
 Tabs created before tab tokens existed have only \`PMUX_TOKEN\`. For them, send
@@ -84,7 +87,7 @@ Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_T
 x-pmux-session) or the admin token — otherwise \`caller-unresolved\` (403).
 
 A lease view: { name, kind, resource, holder: { workspaceId, workspaceName, tabId, tabName,
-verified, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
+verified, identity, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
 ageSeconds, expiresInSeconds, holderState: live|agent-gone|closed|admin }.
 
 GET /api/cli/leases?prefix=&mine=1

@@ -38,8 +38,8 @@ const resetGlobals = () => {
   ]) delete g[key];
 };
 
-const tab = (wsId: string, id: string, panelType?: ITab['panelType']): ITab => ({
-  id, name: id, order: 0, sessionName: `pt-${wsId}-pane-1-${id}`, ...(panelType ? { panelType } : {}),
+const tab = (wsId: string, id: string, panelType: ITab['panelType'] = 'claude-code'): ITab => ({
+  id, name: id, order: 0, sessionName: `pt-${wsId}-pane-1-${id}`, panelType,
 });
 
 const writeLayout = async (wsId: string, tabs: ITab[]) => {
@@ -71,7 +71,7 @@ describe('POST /api/cli/tab-identity', () => {
       workspaces: [{ id: 'ws-a', name: 'A', directories: ['/a'] }, { id: 'ws-b', name: 'B', directories: ['/b'] }],
       groups: [], sidebarCollapsed: false, sidebarWidth: 240, updatedAt: '2026-09-26T00:00:00.000Z',
     }));
-    await writeLayout('ws-a', [tab('ws-a', 'tab-old'), tab('ws-a', 'tab-new'), tab('ws-a', 'tab-web', 'web-browser')]);
+    await writeLayout('ws-a', [tab('ws-a', 'tab-old'), tab('ws-a', 'tab-new'), tab('ws-a', 'tab-web', 'web-browser'), tab('ws-a', 'tab-sh', 'terminal'), tab('ws-a', 'tab-cx', 'codex-cli')]);
     await writeLayout('ws-b', [tab('ws-b', 'tab-b1')]);
   });
 
@@ -91,7 +91,7 @@ describe('POST /api/cli/tab-identity', () => {
     const again = await post(await wsToken('ws-a'), { session: 'pt-ws-a-pane-1-tab-old' });
     expect(again.body.token).toBe(first.body.token);
     const { tabIdentityOf } = await import('@/lib/tab-token');
-    expect(tabIdentityOf('ws-a', 'tab-old')).toBe('hook');
+    expect(tabIdentityOf('ws-a', 'tab-old')).toBe('none'); // until the tab presents it
   });
 
   it('refuses a tab that has its launch identity (409) and never returns that token', async () => {
@@ -111,11 +111,13 @@ describe('POST /api/cli/tab-identity', () => {
     }
   });
 
-  it('answers 404 for a session of another workspace, an unknown session or a browser tab; 400 for a malformed one', async () => {
+  it('answers 404 for a session of another workspace or an unknown session, 409 for a tab that is not Claude, 400 for a malformed one', async () => {
     const token = await wsToken('ws-a');
     expect((await post(token, { session: 'pt-ws-b-pane-1-tab-b1' })).status).toBe(404);
     expect((await post(token, { session: 'pt-ws-a-pane-1-tab-nope' })).status).toBe(404);
-    expect((await post(token, { session: 'pt-ws-a-pane-1-tab-web' })).status).toBe(404);
+    for (const session of ['pt-ws-a-pane-1-tab-web', 'pt-ws-a-pane-1-tab-sh', 'pt-ws-a-pane-1-tab-cx']) {
+      expect(await post(token, { session })).toMatchObject({ status: 409, body: { code: 'tab-identity-unsupported' } });
+    }
     for (const session of [undefined, '', 'a b', 'x'.repeat(201), '"; rm -rf /']) {
       expect((await post(token, { session })).status).toBe(400);
     }
