@@ -138,6 +138,20 @@ const liveStandIn = (scratch) => {
   return file;
 };
 
+/** The process start the live stand-in recorded for session `uuid` (its pid file), or null before it did. */
+const standInStart = (home, uuid) => {
+  const dir = path.join(home, '.claude', 'sessions');
+  for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (data.sessionId === uuid && Number.isFinite(data.startedAt)) return data.startedAt;
+    } catch {
+      // a pid file being written
+    }
+  }
+  return null;
+};
+
 /** Bracketed-paste markers a pane may carry around a pasted line. */
 const unpaste = (text) => text.replace(/\u001b\[20[01]~/g, '');
 
@@ -229,13 +243,15 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
     const started = await inst.startStandIn(created.sessionName, transcript, { subagents, standInPath: liveStandIn(inst.state.scratch) });
     if (started.rc !== 0) return null;
     // A live session writes its subagent files after its process starts; the ledger skips a file last
-    // written before that start (story 37). The fixture files predate the stand-in, so touch them once
-    // it is running, as a live session would leave them.
-    await sleep(2000);
+    // written before that start (story 37). The fixture files predate the stand-in, so touch them after
+    // the start its pid file records — polled, not slept (review r2 N1: a slow pane must not look early).
+    const uuid = path.basename(started.transcriptPath, '.jsonl');
+    const startedAt = await within(30000, async () => standInStart(inst.state.home, uuid));
+    if (startedAt === null) return null;
     const subDir = path.join(started.transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
     for (const name of subagents ? Object.keys(subagents) : []) {
-      const now = new Date();
-      fs.utimesSync(path.join(subDir, name), now, now);
+      const at = new Date(Math.max(Date.now(), startedAt + 1000));
+      fs.utimesSync(path.join(subDir, name), at, at);
     }
     return { ...created, transcriptPath: started.transcriptPath };
   };
@@ -523,6 +539,6 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
 };
 
 module.exports = {
-  wave4, request, humanSession, liveStandIn, judgeMissionTyped, judgeSubagentWait,
+  wave4, request, humanSession, liveStandIn, standInStart, judgeMissionTyped, judgeSubagentWait,
   userLine, assistantEnd, queuedCompletion, subagentMovedShell, subagentDelivery, asyncAgentLaunch,
 };

@@ -141,6 +141,40 @@ describe('checks-wave4.cjs fixtures (story 39)', () => {
     }
   });
 
+  it('the live stand-in, run: a millisecond start in its pid file, the piped line appended, HOME kept, argv[0] claude (review r2 N3)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w4-run-'));
+    const home = path.join(dir, 'home');
+    const input = path.join(dir, 'input.txt');
+    const uuid = '11111111-2222-4333-8444-555555555555';
+    try {
+      fs.mkdirSync(home);
+      const script = wave4.liveStandIn(dir);
+      const before = Date.now();
+      const child = spawn(script, ['--resume', uuid], { cwd: dir, env: asEnv({ PATH: '/usr/bin:/bin', HOME: home, ACC_INPUT: input }), stdio: ['pipe', 'ignore', 'ignore'] });
+      let startedAt: number | null = null;
+      for (let i = 0; i < 100 && startedAt === null; i++) {
+        startedAt = wave4.standInStart(home, uuid);
+        if (startedAt === null) await new Promise((r) => setTimeout(r, 50));
+      }
+      const after = Date.now();
+      expect(startedAt).not.toBeNull();
+      expect(startedAt!).toBeGreaterThanOrEqual(before - 1000);
+      expect(startedAt!).toBeLessThanOrEqual(after + 1000);
+      if (fs.existsSync(`/proc/${child.pid}/environ`)) {
+        // After the exec: argv[0] claude, HOME still in the environment (teardown sweeps by HOME).
+        for (let i = 0; i < 40 && !fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').startsWith('claude'); i++) await new Promise((r) => setTimeout(r, 50));
+        expect(fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').split('\0')[0]).toBe('claude');
+        expect(fs.readFileSync(`/proc/${child.pid}/environ`, 'utf8').split('\0')).toContain(`HOME=${home}`);
+      }
+      child.stdin!.write('typed line\n');
+      child.stdin!.end();
+      await new Promise((r) => child.on('exit', r));
+      expect(fs.readFileSync(input, 'utf8')).toBe('typed line\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('judgeMissionTyped: only the whole input being the one fixed notice line for this workspace passes', () => {
     const line = '[purplemux mission boot-4f7e4283b1df7a108ab484805afec717] Mission Control asks this orchestrator to reconcile — read: purplemux mission bootstrap -w ws-5wqnrB';
     expect(wave4.judgeMissionTyped(`${line}\n`, 'ws-5wqnrB').ok).toBe(true);
