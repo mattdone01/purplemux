@@ -59,9 +59,9 @@ to an exit code through one table:
                                                  target-changed
      5  not ready yet                            readiness-timeout                          yes, bounded
      6  server unreachable                       connection refused, no port configured,    yes, bounded
-                                                 a read interrupted; routes-absent (the     (routes-absent:
-                                                 server answered 404 without JSON: it       not until the
-                                                 predates this command)                     server is deployed)
+                                                 a read interrupted; routes-absent (404     (routes-absent:
+                                                 without JSON: no such route — an older     no, until the
+                                                 server, a foreign one, or a malformed id)  cause is fixed)
      7  not found                                lease-not-found, note-not-found,           —
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found

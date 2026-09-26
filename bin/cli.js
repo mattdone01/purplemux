@@ -1088,8 +1088,8 @@ Exit codes:
         target-changed
      5  not ready yet: readiness-timeout                             yes, bounded
      6  server unreachable (refused, no port, read interrupted)      yes, bounded
-        routes-absent: the server answered 404 without JSON — it     not until it is deployed
-        predates the command
+        routes-absent: 404 without JSON — no such route (an older    no, until the cause
+        server, a foreign server, or a malformed id)                 is fixed
      7  not found: the named lease, note or watch does not exist     —
   stderr names the code and its class, e.g.
     error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
