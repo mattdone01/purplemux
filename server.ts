@@ -105,12 +105,15 @@ const handleWsUpgrade = (
 const NO_AUTH_WS_PATHS = new Set(['/api/install']);
 
 const shutdownWs = async () => {
+  // The inbox first: it waits for a paste in flight to be recorded, and Mission Control's stop then
+  // settles that paste in one last sync (story 12 review r1, N5). Notices enqueued after this wait
+  // in inbox.json for the next boot.
+  await stopInbox();
   await getMissionControlRuntime().stop();
   await stopWatches();
   await stopNotes();
   stopGrants();
   stopHostSignals();
-  await stopInbox();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
   gracefulStatusShutdown();

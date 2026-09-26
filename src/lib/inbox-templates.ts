@@ -82,7 +82,14 @@ export interface IWatchFields {
   until?: (typeof WATCH_UNTILS)[number];
 }
 export interface IDeployFields { deployId: string; restartAt: number; inMinutes: number }
-export interface IMissionFields { answerId: string; workspaceId: string; readyAt: number }
+/**
+ * Mission Control (story 12). `answer` (the default): an answer is waiting; the ack command is pulled with
+ * `mission answers`. `bootstrap`: a reconcile request; its steps are pulled with `mission bootstrap`.
+ * `bootstrapKey` is server-made (`boot-<32 hex>`), never the caller's bootstrap id.
+ */
+export type IMissionFields =
+  | { event?: 'answer'; answerId: string; workspaceId: string; readyAt: number }
+  | { event: 'bootstrap'; bootstrapKey: string; workspaceId: string };
 export interface IResumeFields { resumeId: string }
 
 export interface IInboxFields {
@@ -143,8 +150,13 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
     return { recordId: id, line: `[purplemux deploy ${id}] purplemux restarts at ~${at} (in ${minutes} min) — details: purplemux deploy status ${id}; reach a checkpoint; tabs survive, in-flight hook events do not` };
   },
   mission: (f) => {
+    if (f.event === 'bootstrap') {
+      const key = field('bootstrapKey', f.bootstrapKey, 'missionId');
+      return { recordId: key, line: `[purplemux mission ${key}] Mission Control asks this orchestrator to reconcile — read: purplemux mission bootstrap -w ${field('workspaceId', f.workspaceId, 'workspaceId')}` };
+    }
+    if (f.event !== undefined && f.event !== 'answer') throw new InboxFieldError('inbox field event is not a mission event');
     const id = field('answerId', f.answerId, 'missionId');
-    return { recordId: id, line: `[purplemux mission ${id}] an answer is ready at ${time('readyAt', f.readyAt)} — purplemux mission answers -w ${field('workspaceId', f.workspaceId, 'workspaceId')}` };
+    return { recordId: id, line: `[purplemux mission ${id}] an answer is ready at ${time('readyAt', f.readyAt)} — purplemux mission answers -w ${field('workspaceId', f.workspaceId, 'workspaceId')}; ack it with the command shown there after applying it` };
   },
   // ADR-0018 amendment (story 26): the text is fixed; only the id varies.
   resume: (f) => {

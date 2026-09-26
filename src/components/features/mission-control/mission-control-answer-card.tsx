@@ -255,7 +255,10 @@ export const MissionControlDeliveryCard = ({
             </p>
           )}
         </div>
-        {delivery?.lastError && (
+        {delivery?.state === 'queued' && delivery.lastError?.startsWith('inbox:') && (
+          <p className="text-xs text-muted-foreground">Waiting in the orchestrator&apos;s inbox until its composer is free</p>
+        )}
+        {delivery?.lastError && !delivery.lastError.startsWith('inbox:') && (
           <div className="flex items-start gap-2 text-xs text-ui-red">
             <CircleHelp className="h-3.5 w-3.5 shrink-0" />
             <span className="break-words">{delivery.lastError}</span>

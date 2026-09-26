@@ -1,11 +1,10 @@
-import { deliverPrompt } from '@/lib/agent-prompt-delivery';
-import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
+import { createHash } from 'crypto';
 import { isAgentPanelType, processMatchesPanelType } from '@/lib/agent-panel-types';
-import { capturePaneAtWidth } from '@/lib/capture-at-width';
 import { findTab } from '@/lib/cli-utils';
+import { registerInboxPreflight, type TInboxPreflight } from '@/lib/inbox-dispatcher';
+import { enqueueNotice, readInboxState, withdrawNotice, type IEnqueueRequest } from '@/lib/inbox-store';
 import { collectAllTabs, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
 import { createLogger } from '@/lib/logger';
-import { checkComposerReady } from '@/lib/composer-readiness';
 import { getProviderByPanelType } from '@/lib/providers/registry';
 import { verifyCodexActiveRuntime } from '@/lib/providers/codex/launch-lifecycle';
 import { getChildPids } from '@/lib/process-utils';
@@ -16,25 +15,23 @@ import { getWorkspaces } from '@/lib/workspace-store';
 import {
   getMissionControlStore,
   type IMissionBootstrapQueueEntry,
-  type IMissionDeliveryOutcome,
   type IMissionDiscoveryCandidate,
   type IMissionDiscoveryInput,
   type IMissionDiscoveryRun,
   type IMissionDiscoveryWorkspace,
   type MissionControlStore,
-  type TMissionDeliveryValidation,
 } from '@/lib/mission-control-store';
 import type {
   IMissionAgentObservation,
   IMissionBinding,
   IMissionBootstrap,
-  IMissionBootstrapEntry,
   IMissionDelivery,
   IMissionEvidence,
   IMissionSnapshot,
   IMissionWorkspaceView,
   TMissionActivity,
 } from '@/types/mission-control';
+import type { IInboxItem } from '@/types/inbox';
 import type { IWorkspaceStandup } from '@/types/status';
 import type { ITab } from '@/types/terminal';
 
@@ -43,7 +40,6 @@ const log = createLogger('mission-control-runtime');
 const DELIVERY_LIMIT = 20;
 const BOOTSTRAP_LIMIT = 10;
 const WORKER_INTERVAL_MS = 1_000;
-const RETRY_DELAYS_MS = [5_000, 15_000, 60_000] as const;
 const STALE_BUSY_MS = 10 * 60_000;
 const RECENT_STANDUP_MS = 30 * 60_000;
 
@@ -52,6 +48,8 @@ export type IMissionControlRuntimeStore = Pick<MissionControlStore,
   | 'reconcileDiscovery'
   | 'listDueDeliveries'
   | 'claimDelivery'
+  | 'claimInboxDelivery'
+  | 'listInboxHandoffs'
   | 'validateDeliveryAttempt'
   | 'finalizeDeliveryAttempt'
   | 'recoverDispatching'
@@ -67,26 +65,36 @@ export interface IMissionRuntimeDeps {
   discover: (bootstrapId: string, reconcile: boolean, boundarySeq: number) => Promise<IMissionDiscoveryInput>;
   workspaceViews: () => Promise<IMissionWorkspaceView[]>;
   resolveIdentity: (workspaceId: string, tabId: string) => Promise<Omit<IMissionBinding, 'generation'> | null>;
-  dispatch: (request: IMissionDispatchRequest) => Promise<TMissionDispatchResult>;
+  inbox: IMissionInbox;
   setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
   clearInterval: (timer: ReturnType<typeof setInterval>) => void;
 }
 
-export interface IMissionDispatchRequest {
-  workspaceId: string;
-  binding: IMissionBinding;
-  message: string;
-  preflight?: () => TMissionDeliveryValidation;
+/**
+ * Mission Control delivers through the tab inbox (ADR-0012, story 12; consult ruling A′). While a notice
+ * waits, its row is `queued` with no `next_attempt_at` and the marker `inbox:<itemId>`; the inbox's
+ * paste-time preflight claims it to `dispatching`, so `dispatching` still means "a paste may be in flight".
+ */
+export interface IMissionInbox {
+  enqueue: (request: IEnqueueRequest<'mission'>) => Promise<{ item: IInboxItem; created: boolean }>;
+  items: () => Promise<IInboxItem[]>;
+  withdraw: (id: string, reason: string) => Promise<boolean>;
+  registerPreflight: (kind: 'mission', fn: TInboxPreflight) => () => void;
 }
 
-export type TMissionDispatchResult =
-  | { delivered: true }
-  | {
-      delivered: false;
-      retryable: boolean;
-      uncertain: boolean;
-      reason: string;
-    };
+const INBOX_MARKER = 'inbox:';
+const markerFor = (itemId: string): string => `${INBOX_MARKER}${itemId}`;
+const markedItem = (marker: string | null): string | null =>
+  marker?.startsWith(INBOX_MARKER) ? marker.slice(INBOX_MARKER.length) : null;
+
+/** The server-made id a bootstrap notice carries: never the caller's bootstrap id (ADR-0012). */
+export const missionBootstrapKey = (bootstrapId: string, workspaceId: string, runId: string): string =>
+  `boot-${createHash('sha256').update(JSON.stringify([bootstrapId, workspaceId, runId])).digest('hex').slice(0, 32)}`;
+
+/** A paste the preflight allowed: the claimed row and its version, keyed by inbox item id (memory only). */
+type TMissionClaim =
+  | { type: 'delivery'; id: string; updatedAt: number; binding: IMissionBinding }
+  | { type: 'bootstrap'; bootstrapId: string; workspaceId: string; runId: string; updatedAt: number };
 
 interface ILiveTab {
   tab: ITab;
@@ -223,64 +231,6 @@ export const resolveMissionTargetIdentity = async (
 ): Promise<Omit<IMissionBinding, 'generation'> | null> => {
   const live = await inspectLiveTab(workspaceId, tabId);
   return live ? missionIdentityFor(live.tab, live.providerId, live.sessionId) : null;
-};
-
-export const dispatchMissionPrompt = async (request: IMissionDispatchRequest): Promise<TMissionDispatchResult> => {
-  const found = await findTab(request.workspaceId, request.binding.tabId);
-  if (!found) return { delivered: false, retryable: false, uncertain: false, reason: 'binding-tab-missing' };
-
-  try {
-    return await withAgentDispatchLock(request.workspaceId, found.tab, async (checkPolicy) => {
-      const current = await findTab(request.workspaceId, request.binding.tabId);
-      if (!current || current.tab.sessionName !== found.tab.sessionName) {
-        return { delivered: false, retryable: false, uncertain: false, reason: 'binding-tab-changed' };
-      }
-
-      const live = await inspectLiveTab(request.workspaceId, request.binding.tabId);
-      if (!live) return { delivered: false, retryable: false, uncertain: false, reason: 'bound-agent-not-live' };
-      const identity = missionIdentityFor(live.tab, live.providerId, live.sessionId);
-      if (!sameIdentity(request.binding, identity)) {
-        return { delivered: false, retryable: false, uncertain: false, reason: 'binding-identity-changed' };
-      }
-
-      const policy = await checkPolicy();
-      if (!policy.ok) {
-        return { delivered: false, retryable: false, uncertain: false, reason: policy.error };
-      }
-
-      // A usage-limit halt is never typed into (ADR-0018, story 26); retry later.
-      if (getStatusManager().isHaltedByUsageLimit(request.binding.tabId)) {
-        return { delivered: false, retryable: true, uncertain: false, reason: 'usage-limit-halt' };
-      }
-      const readiness = await checkComposerReady({
-        panelType: live.tab.panelType,
-        status: getStatusManager().getAllForClient()[request.binding.tabId],
-        capture: () => capturePaneAtWidth(live.tab.sessionName, 120, 50, { escapes: true }),
-      });
-      if (!readiness.ok) return { delivered: false, retryable: true, uncertain: false, reason: readiness.reason };
-
-      const eligibility = request.preflight?.();
-      if (eligibility && !eligibility.ok) {
-        return {
-          delivered: false,
-          retryable: false,
-          uncertain: false,
-          reason: `dispatch-ineligible:${eligibility.reason}`,
-        };
-      }
-
-      try {
-        await deliverPrompt(live.tab.sessionName, request.message);
-        return { delivered: true };
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        return { delivered: false, retryable: false, uncertain: true, reason: `transport-uncertain:${detail}` };
-      }
-    });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return { delivered: false, retryable: false, uncertain: false, reason: `dispatch-policy-error:${detail}` };
-  }
 };
 
 export const discoverMissionControlWorkspaces = async (): Promise<IMissionDiscoveryWorkspace[]> => {
@@ -478,63 +428,37 @@ const defaultDeps: IMissionRuntimeDeps = {
   discover,
   workspaceViews,
   resolveIdentity: resolveMissionTargetIdentity,
-  dispatch: dispatchMissionPrompt,
+  inbox: {
+    enqueue: enqueueNotice,
+    items: async () => (await readInboxState()).items,
+    withdraw: withdrawNotice,
+    registerPreflight: registerInboxPreflight,
+  },
   setInterval: (callback, ms) => setInterval(callback, ms),
   clearInterval: (timer) => clearInterval(timer),
 };
 
-const deliveryMessage = (
-  delivery: IMissionDelivery,
-  snapshot: IMissionSnapshot,
-): string | null => {
-  const answer = snapshot.answers.find((candidate) => candidate.id === delivery.answerId);
-  if (!answer || !delivery.binding) return null;
-  const item = snapshot.items.find((candidate) => candidate.id === answer.itemId);
-  if (!item) return null;
-  const eventId = `mission-ack-${answer.id}`.slice(0, 128);
-  return [
-    `[mission-control-answer:${answer.id}] A durable human answer is waiting for item ${answer.itemId}.`,
-    `Read it with: purplemux mission answers -w ${delivery.workspaceId} --run ${delivery.runId}`,
-    `Acknowledge that exact answer after reading it: purplemux mission ack -w ${delivery.workspaceId} --run ${delivery.runId} --answer ${answer.id} --generation ${delivery.binding.generation} --revision ${item.revision} --event-id ${eventId} --producer-at ${answer.createdAt}`,
-    'Apply the answer, then explicitly resolve or cancel the attention item with a Mission Control event. Receipt of this message does not resolve it.',
-  ].join('\n');
-};
-
-const bootstrapMessage = (
-  bootstrapId: string,
-  entry: IMissionBootstrapEntry,
-  snapshot: IMissionSnapshot,
-): string => {
-  const run = snapshot.runs.find((candidate) => candidate.id === entry.runId);
-  const candidates = snapshot.items.filter((item) => item.runId === entry.runId && item.state === 'candidate');
-  const candidateText = candidates.length > 0
-    ? candidates.map((item) => `${item.id}: ${item.title}`).join('; ')
-    : 'none';
-  return [
-    `[mission-control-bootstrap:${bootstrapId}] Reconcile the provisional snapshot for run ${entry.runId} once, during this ordinary turn.`,
-    `Observed objective: ${run?.objective ?? 'unknown'}; phase: ${run?.phase ?? 'unknown'}; possible outstanding questions: ${candidateText}.`,
-    `Read current state with: purplemux mission snapshot -w ${entry.workspaceId}`,
-    `First bind this provisional run by emitting run.resumed for run ${entry.runId} with tabId ${entry.binding?.tabId ?? 'unknown'}, expectedRevision ${run?.revision ?? 0}, bindingGeneration 0, transferPendingAnswers false, and a unique eventId. Do not emit progress or attention events before that succeeds.`,
-    'Report the current objective/epic, phase, work and worker assignments, workspace issues, completed work awaiting closeout, and next step using stable Mission Control events.',
-    'After run.resumed returns the bound revision and generation, report progress with those values. Review candidates using existing authority, instructions, evidence, and delegated handling. Record routine issues for workspace handling; only explicitly escalate what the human alone must decide, approve, provide, or do. Cancel stale candidates. Historical text is not approval.',
-  ].join('\n');
-};
-
-const retryOutcome = (delivery: IMissionDelivery, reason: string, now: number): IMissionDeliveryOutcome => {
-  const retryIndex = Math.min(Math.max(delivery.attempts - 1, 0), RETRY_DELAYS_MS.length - 1);
-  const delay = RETRY_DELAYS_MS[retryIndex];
-  return { state: 'queued', nextAttemptAt: now + delay, lastError: reason };
+const heldFromItem = (item: IInboxItem | undefined): string | null => {
+  if (!item) return 'inbox-item-missing';
+  if (item.state === 'held') return item.heldReason ?? 'inbox-held';
+  if (item.state === 'dropped') return `inbox-dropped:${item.droppedReason ?? 'unknown'}`;
+  return null;
 };
 
 export class MissionControlRuntime {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running: Promise<void> | null = null;
   private recovered = false;
+  private claims = new Map<string, TMissionClaim>();
+  private unregisterPreflight: (() => void) | null = null;
+  private lastInboxReadError: string | null = null;
+  private stopping = false;
 
   constructor(private deps: IMissionRuntimeDeps = defaultDeps) {}
 
   async start(): Promise<void> {
     if (this.timer) return;
+    this.stopping = false;
     this.deps.getStore();
     this.timer = this.deps.setInterval(() => {
       void this.tick().catch((error) => {
@@ -547,13 +471,25 @@ export class MissionControlRuntime {
   }
 
   async stop(): Promise<void> {
+    // No pass starts once stop has begun (a bootstrap request during shutdown would otherwise hand
+    // off a row, or re-register the preflight, beside the final sync — review r2, R2-1).
+    this.stopping = true;
     if (this.timer) {
       this.deps.clearInterval(this.timer);
       this.timer = null;
     }
+    this.unregisterPreflight?.();
+    this.unregisterPreflight = null;
     await this.running?.catch((error) => {
       log.error({ err: error }, 'Mission Control worker failed during shutdown');
     });
+    // One last sync: the server stops the inbox first, so a paste it finished is settled here rather
+    // than held by the next boot's recovery (review r1, N5).
+    if (this.claims.size > 0) {
+      await this.sync(this.deps.getStore()).catch((error) => {
+        log.error({ err: error }, 'Mission Control final sync failed during shutdown');
+      });
+    }
   }
 
   async snapshot(workspaceId?: string): Promise<IMissionSnapshot> {
@@ -573,134 +509,266 @@ export class MissionControlRuntime {
   }
 
   async tick(): Promise<void> {
+    if (this.stopping) return;
     if (this.running) return this.running;
-    this.running = this.runJobs()
-      .catch((error) => {
-        this.recovered = false;
-        throw error;
-      })
-      .finally(() => {
-        this.running = null;
-      });
+    this.running = this.runJobs().finally(() => {
+      this.running = null;
+    });
     return this.running;
   }
 
   private async runJobs(): Promise<void> {
     const store = this.deps.getStore();
+    // Once per process, before the preflight is registered: a `dispatching` row left by the previous
+    // process may be a paste that happened. Only a failed recovery re-arms it — pastes now run in the
+    // inbox's own tick, so a mid-run recovery could hold a row in the middle of one (ruling A′ §6).
     if (!this.recovered) {
       store.recoverDispatching('server-restarted-during-uncertain-delivery');
       this.recovered = true;
     }
+    this.unregisterPreflight ??= this.deps.inbox.registerPreflight('mission', (item) => this.preflight(item));
+    // An unreadable inbox skips the whole pass: a handoff would only fail to enqueue and hold the row.
+    if (!await this.sync(store)) return;
     for (const pending of store.listDueDeliveries(this.deps.now(), DELIVERY_LIMIT)) {
-      await this.processDelivery(store, pending);
+      await this.handOffDelivery(store, pending);
     }
     for (const pending of store.listQueuedBootstrapEntries(BOOTSTRAP_LIMIT)) {
-      await this.processBootstrap(store, pending);
+      await this.handOffBootstrap(store, pending);
     }
   }
 
-  private async processDelivery(store: IMissionControlRuntimeStore, pending: IMissionDelivery): Promise<void> {
+  /** Claim a due answer delivery, queue its one-line notice, and leave the row waiting on the item. */
+  private async handOffDelivery(store: IMissionControlRuntimeStore, pending: IMissionDelivery): Promise<void> {
     const claimed = store.claimDelivery(pending.id, pending.updatedAt);
     if (!claimed) return;
     if (!claimed.binding) {
       throw new Error(`claimed Mission Control delivery ${claimed.id} has no binding`);
     }
     const claimedBinding = claimed.binding;
+    const hold = (lastError: string) => {
+      store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding, { state: 'held', nextAttemptAt: null, lastError });
+    };
 
     const snapshot = store.snapshot();
     const run = snapshot.runs.find((candidate) => candidate.id === claimed.runId);
-    if (!run?.binding || run.binding.generation !== claimedBinding.generation) {
-      store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding, {
-        state: 'held',
-        nextAttemptAt: null,
-        lastError: 'run-binding-changed',
-      });
-      return;
-    }
-    const message = deliveryMessage(claimed, snapshot);
-    if (!message) {
-      store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding, {
-        state: 'held',
-        nextAttemptAt: null,
-        lastError: 'delivery-records-incomplete',
-      });
-      return;
-    }
+    if (!run?.binding || run.binding.generation !== claimedBinding.generation) return hold('run-binding-changed');
+    const answer = snapshot.answers.find((candidate) => candidate.id === claimed.answerId);
+    if (!answer || !snapshot.items.some((item) => item.id === answer.itemId)) return hold('delivery-records-incomplete');
+    const eligibility = store.validateDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding);
+    if (!eligibility.ok) return hold(`dispatch-ineligible:${eligibility.reason}`);
 
-    const result = await this.deps.dispatch({
-      workspaceId: claimed.workspaceId,
-      binding: claimedBinding,
-      message,
-      preflight: () => store.validateDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding),
+    let item: IInboxItem;
+    try {
+      item = await this.freshItem({
+        kind: 'mission',
+        targetWorkspaceId: claimed.workspaceId,
+        targetTabId: claimedBinding.tabId,
+        dedupeKey: `mission:delivery:${claimed.id}`,
+        fields: { answerId: claimed.answerId, workspaceId: claimed.workspaceId, readyAt: answer.createdAt },
+      });
+    } catch (error) {
+      return hold(`inbox-enqueue-failed:${error instanceof Error ? error.message : String(error)}`);
+    }
+    store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding, {
+      state: 'queued',
+      nextAttemptAt: null,
+      lastError: markerFor(item.id),
     });
-    if (result.delivered) {
-      store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding, {
-        state: 'submitted',
-        nextAttemptAt: null,
-        lastError: null,
-        submittedAt: this.deps.now(),
-      });
-      return;
-    }
-
-    const outcome = result.retryable && !result.uncertain
-      ? retryOutcome(claimed, result.reason, this.deps.now())
-      : {
-          state: 'held' as const,
-          nextAttemptAt: null,
-          lastError: result.reason,
-        };
-    store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimedBinding, outcome);
   }
 
-  private async processBootstrap(
+  /** Claim a queued bootstrap entry, queue its one-line notice, and leave the entry waiting on the item. */
+  private async handOffBootstrap(
     store: IMissionControlRuntimeStore,
     pending: IMissionBootstrapQueueEntry,
   ): Promise<void> {
     const { bootstrapId, entry } = pending;
-    const claimed = store.claimBootstrapEntry(
-      bootstrapId,
-      entry.workspaceId,
-      entry.runId,
-      entry.updatedAt,
-    );
+    const claimed = store.claimBootstrapEntry(bootstrapId, entry.workspaceId, entry.runId, entry.updatedAt);
     if (!claimed) return;
     const claimedEntry = claimed.entry;
+    const complete = (outcome: { state: 'queued' | 'held'; reason: string; nextAttemptAt?: null }) =>
+      store.completeBootstrapAttempt(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId, claimedEntry.updatedAt, outcome);
     if (!claimedEntry.binding) {
-      store.completeBootstrapAttempt(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId, claimedEntry.updatedAt, {
-        state: 'held',
-        reason: 'orchestrator-binding-missing',
-      });
+      complete({ state: 'held', reason: 'orchestrator-binding-missing' });
       return;
+    }
+    const eligibility = store.validateBootstrapAttempt(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId, claimedEntry.updatedAt);
+    if (!eligibility.ok) {
+      complete({ state: 'held', reason: `dispatch-ineligible:${eligibility.reason}` });
+      return;
+    }
+    const key = missionBootstrapKey(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId);
+    let item: IInboxItem;
+    try {
+      item = await this.freshItem({
+        kind: 'mission',
+        targetWorkspaceId: claimedEntry.workspaceId,
+        targetTabId: claimedEntry.binding.tabId,
+        dedupeKey: `mission:bootstrap:${key}`,
+        fields: { event: 'bootstrap', bootstrapKey: key, workspaceId: claimedEntry.workspaceId },
+      });
+    } catch (error) {
+      complete({ state: 'held', reason: `inbox-enqueue-failed:${error instanceof Error ? error.message : String(error)}` });
+      return;
+    }
+    complete({ state: 'queued', reason: markerFor(item.id), nextAttemptAt: null });
+  }
+
+  /**
+   * Queue a notice that is NEW for this handoff (review r1, N2). An item still queued under the same
+   * key (a row handed off again after `run.resumed` moved it) is withdrawn first rather than reused: a
+   * reused item's preflight may already be rejecting it for the row in its old state, which would leave
+   * the row waiting on a dropped item. The preflight drops a withdrawn item's late attempt anyway.
+   */
+  private async freshItem(request: IEnqueueRequest<'mission'>): Promise<IInboxItem> {
+    const first = await this.deps.inbox.enqueue(request);
+    if (first.created) return first.item;
+    await this.deps.inbox.withdraw(first.item.id, 'mission-rehanded');
+    const second = await this.deps.inbox.enqueue(request);
+    if (!second.created) throw new Error(`inbox item ${second.item.id} for ${request.dedupeKey} could not be replaced`);
+    return second.item;
+  }
+
+  /**
+   * The inbox's paste-time preflight (ruling A′ §4), inside the dispatch lock, just before the paste:
+   * the row still waits on THIS item for THIS tab, the bound agent is the same live identity, and
+   * last the row is claimed to `dispatching` and re-validated. `ok` means claimed for this paste.
+   */
+  async preflight(item: IInboxItem): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const store = this.deps.getStore();
+    const marker = markerFor(item.id);
+    const handoffs = store.listInboxHandoffs();
+    const delivery = handoffs.deliveries.find((row) => row.state === 'queued' && row.lastError === marker);
+    const boot = delivery ? undefined : handoffs.bootstrapEntries.find((row) => row.entry.state === 'queued' && row.entry.reason === marker);
+    if (!delivery && !boot) return { ok: false, reason: 'mission-record-not-waiting' };
+    const workspaceId = delivery?.workspaceId ?? boot!.entry.workspaceId;
+    const binding = delivery ? delivery.binding : boot!.entry.binding;
+    if (!binding || workspaceId !== item.targetWorkspaceId || binding.tabId !== item.targetTabId) {
+      return { ok: false, reason: 'binding-tab-changed' };
+    }
+    const identity = await this.deps.resolveIdentity(workspaceId, binding.tabId);
+    if (!identity) return { ok: false, reason: 'bound-agent-not-live' };
+    if (!sameIdentity(binding, identity)) return { ok: false, reason: 'binding-identity-changed' };
+
+    if (delivery) {
+      const claimed = store.claimInboxDelivery(delivery.id, marker);
+      if (!claimed?.binding) return { ok: false, reason: 'mission-record-not-waiting' };
+      // Kept before anything else can throw: a claimed row is always settled by the sync (CONFIRM minor).
+      this.claims.set(item.id, { type: 'delivery', id: claimed.id, updatedAt: claimed.updatedAt, binding: claimed.binding });
+      const validation = store.validateDeliveryAttempt(claimed.id, claimed.updatedAt, claimed.binding);
+      if (!validation.ok) {
+        this.claims.delete(item.id);
+        store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimed.binding, {
+          state: 'held', nextAttemptAt: null, lastError: `dispatch-ineligible:${validation.reason}`,
+        });
+        return { ok: false, reason: validation.reason };
+      }
+      return { ok: true };
+    }
+    const entry = boot!.entry;
+    const claimed = store.claimBootstrapEntry(boot!.bootstrapId, entry.workspaceId, entry.runId, entry.updatedAt);
+    if (!claimed) return { ok: false, reason: 'mission-record-not-waiting' };
+    this.claims.set(item.id, {
+      type: 'bootstrap', bootstrapId: boot!.bootstrapId, workspaceId: entry.workspaceId, runId: entry.runId, updatedAt: claimed.entry.updatedAt,
+    });
+    const validation = store.validateBootstrapAttempt(boot!.bootstrapId, entry.workspaceId, entry.runId, claimed.entry.updatedAt);
+    if (!validation.ok) {
+      this.claims.delete(item.id);
+      store.completeBootstrapAttempt(boot!.bootstrapId, entry.workspaceId, entry.runId, claimed.entry.updatedAt, {
+        state: 'held', reason: `dispatch-ineligible:${validation.reason}`,
+      });
+      return { ok: false, reason: validation.reason };
+    }
+    return { ok: true };
+  }
+
+  /** Map each handed-off row onto its inbox item (ruling A′ §5). False when the inbox could not be read. */
+  private async sync(store: IMissionControlRuntimeStore): Promise<boolean> {
+    const handoffs = store.listInboxHandoffs();
+    // Read every pass, even with nothing waiting: an item whose row left the waiting state is only
+    // found here (the inbox file is small; a read is one file read). An unreadable inbox skips this
+    // pass, logged once per cause (review r1, N6): the rows keep waiting and nothing is typed.
+    let all: IInboxItem[];
+    try {
+      all = await this.deps.inbox.items();
+      this.lastInboxReadError = null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== this.lastInboxReadError) log.warn(`Mission Control inbox sync skipped: ${message}`);
+      this.lastInboxReadError = message;
+      return false;
+    }
+    const items = new Map(all.filter((item) => item.kind === 'mission').map((item) => [item.id, item]));
+
+    // Pastes the preflight allowed: settle once the inbox recorded the outcome.
+    for (const [itemId, claim] of [...this.claims]) {
+      const item = items.get(itemId);
+      if (item?.state === 'queued') continue; // the paste is still in flight
+      this.claims.delete(itemId);
+      const held = heldFromItem(item);
+      if (claim.type === 'delivery') {
+        store.finalizeDeliveryAttempt(claim.id, claim.updatedAt, claim.binding, held === null
+          ? { state: 'submitted', nextAttemptAt: null, lastError: null, submittedAt: item?.deliveredAt ?? this.deps.now() }
+          : { state: 'held', nextAttemptAt: null, lastError: held });
+      } else {
+        store.completeBootstrapAttempt(claim.bootstrapId, claim.workspaceId, claim.runId, claim.updatedAt, held === null
+          ? { state: 'submitted', reason: null }
+          : { state: 'held', reason: held });
+      }
     }
 
-    const message = bootstrapMessage(bootstrapId, claimedEntry, store.snapshot());
-    const result = await this.deps.dispatch({
-      workspaceId: claimedEntry.workspaceId,
-      binding: claimedEntry.binding,
-      message,
-      preflight: () => store.validateBootstrapAttempt(
-        bootstrapId,
-        claimedEntry.workspaceId,
-        claimedEntry.runId,
-        claimedEntry.updatedAt,
-      ),
-    });
-    if (result.delivered) {
-      store.completeBootstrapAttempt(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId, claimedEntry.updatedAt, {
-        state: 'submitted',
-        reason: null,
-      });
-      return;
+    // Rows still waiting whose item ended without a paste: held, with the inbox's reason.
+    for (const row of handoffs.deliveries) {
+      const itemId = row.state === 'queued' ? markedItem(row.lastError) : null;
+      if (!itemId) continue;
+      const item = items.get(itemId);
+      const held = item?.state === 'delivered' ? 'inbox-delivered-unclaimed' : heldFromItem(item);
+      if (held === null) continue;
+      const claimed = store.claimInboxDelivery(row.id, markerFor(itemId));
+      if (claimed?.binding) {
+        store.finalizeDeliveryAttempt(claimed.id, claimed.updatedAt, claimed.binding, { state: 'held', nextAttemptAt: null, lastError: held });
+      }
     }
-    const delay = result.retryable && !result.uncertain
-      ? RETRY_DELAYS_MS[Math.min(Math.max(claimed.attempts - 1, 0), RETRY_DELAYS_MS.length - 1)]
-      : undefined;
-    store.completeBootstrapAttempt(bootstrapId, claimedEntry.workspaceId, claimedEntry.runId, claimedEntry.updatedAt, {
-      state: delay === undefined ? 'held' : 'queued',
-      reason: delay === undefined ? result.reason : `readiness-deferred:${result.reason}`,
-      nextAttemptAt: delay === undefined ? null : this.deps.now() + delay,
-    });
+    for (const row of handoffs.bootstrapEntries) {
+      const itemId = row.entry.state === 'queued' ? markedItem(row.entry.reason) : null;
+      if (!itemId) continue;
+      const item = items.get(itemId);
+      const held = item?.state === 'delivered' ? 'inbox-delivered-unclaimed' : heldFromItem(item);
+      if (held === null) continue;
+      const claimed = store.claimBootstrapEntry(row.bootstrapId, row.entry.workspaceId, row.entry.runId, row.entry.updatedAt);
+      if (claimed) {
+        store.completeBootstrapAttempt(row.bootstrapId, row.entry.workspaceId, row.entry.runId, claimed.entry.updatedAt, { state: 'held', reason: held });
+      }
+    }
+
+    // Tidiness only (the preflight is what guarantees nothing is typed): a queued item no row waits on
+    // any more, whose row is known and no longer queued, is withdrawn.
+    const referenced = new Set<string>([
+      ...handoffs.deliveries.map((row) => markedItem(row.lastError)),
+      ...handoffs.bootstrapEntries.map((row) => markedItem(row.entry.reason)),
+      ...this.claims.keys(),
+    ].filter((id): id is string => id !== null));
+    const orphans = [...items.values()].filter((item) => item.state === 'queued' && !referenced.has(item.id));
+    if (orphans.length === 0) return true;
+    const snapshot = store.snapshot();
+    for (const item of orphans) {
+      const deliveryId = item.dedupeKey.startsWith('mission:delivery:') ? item.dedupeKey.slice('mission:delivery:'.length) : null;
+      const bootKey = item.dedupeKey.startsWith('mission:bootstrap:') ? item.dedupeKey.slice('mission:bootstrap:'.length) : null;
+      const row = deliveryId
+        ? snapshot.deliveries.find((candidate) => candidate.id === deliveryId)
+        : undefined;
+      const entry = !deliveryId && bootKey && snapshot.bootstrap
+        ? snapshot.bootstrap.entries.find((candidate) => missionBootstrapKey(snapshot.bootstrap!.id, candidate.workspaceId, candidate.runId) === bootKey)
+        : undefined;
+      const rowState = row?.state ?? entry?.state;
+      const rowMarker = row ? row.lastError : entry?.reason ?? null;
+      if (rowState === undefined) continue; // unknown: the preflight still refuses it at paste time
+      // A row queued with no marker is about to be handed off again (a new item replaces this one);
+      // a row waiting on ANOTHER item, or in any other state, leaves this one orphaned (review r1, N4).
+      const waitsOn = markedItem(rowMarker);
+      if (rowState === 'queued' && (waitsOn === null || waitsOn === item.id)) continue;
+      await this.deps.inbox.withdraw(item.id, 'mission-record-not-waiting');
+    }
+    return true;
   }
 }
 

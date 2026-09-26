@@ -348,6 +348,41 @@ describe('Mission Control dashboard', () => {
     expect(html).not.toContain('<details open');
   });
 
+  it('shows a delivery or bootstrap waiting in the inbox as waiting, and a held one with its inbox reason (story 12)', () => {
+    const render = (data: ReturnType<typeof snapshot>) => renderToStaticMarkup(
+      <MissionControlDashboard
+        snapshot={data}
+        drafts={{}}
+        refreshing={false}
+        bootstrapPending={false}
+        bootstrapError={null}
+        onRefresh={() => {}}
+        onDraftChange={() => {}}
+        onAdoptCurrent={() => {}}
+        onSubmit={() => {}}
+        onOpenWorkspace={() => {}}
+        onBootstrap={() => {}}
+      />,
+    );
+    const waiting = snapshot();
+    waiting.deliveries[0] = { ...waiting.deliveries[0], state: 'queued', lastError: 'inbox:i-waiting1', submittedAt: null };
+    waiting.bootstrap = {
+      id: 'bootstrap-1', boundarySeq: 8, createdAt: now,
+      entries: [{ workspaceId: 'ws-1', runId: 'run-1', binding: null, state: 'queued', reason: 'inbox:i-boot1', updatedAt: now }],
+    };
+    const waitingHtml = render(waiting);
+    expect(waitingHtml).toContain('Waiting in the orchestrator&#x27;s inbox until its composer is free');
+    expect(waitingHtml).toContain('Waiting in the tab inbox');
+    expect(waitingHtml).not.toContain('inbox:i-');
+    expect(waitingHtml).not.toMatch(/Inbox:i/);
+
+    const held = snapshot();
+    held.deliveries[0] = { ...held.deliveries[0], state: 'held', lastError: 'composer-not-ready:busy (undelivered after 24 h)', submittedAt: null };
+    const heldHtml = render(held);
+    expect(heldHtml).toContain('composer-not-ready:busy (undelivered after 24 h)');
+    expect(heldHtml).not.toContain('Waiting in the orchestrator');
+  });
+
   it('keeps a migrated same-ID draft with its workspace issue and disables submission', () => {
     const migrated = item({
       id: 'legacy-question',

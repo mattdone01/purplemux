@@ -77,6 +77,8 @@ const entryLabels: Record<IMissionBootstrapEntry['state'], string> = {
 
 const bootstrapReasonLabel = (reason: string | null): string | null => {
   if (!reason) return null;
+  // Story 12: the entry waits on its notice in the orchestrator's inbox; not an error.
+  if (reason.startsWith('inbox:')) return 'Waiting in the tab inbox';
   const label = reason.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
   return label ? `${label[0].toUpperCase()}${label.slice(1)}` : null;
 };
