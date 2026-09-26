@@ -130,6 +130,9 @@ describe('coordination panel', () => {
     expect(heldReasonLabel(null)).toBe('held');
     // The exact string inbox-store holds for a notice that expired with no refusal (story 20 r2 N1).
     expect(heldReasonLabel('never ready (undelivered after 24 h)')).toBe('target never ready (undelivered after 24 h)');
+    // Story 12's preflight refusals (architect CONFIRM note).
+    expect(heldReasonLabel('preflight-unregistered (30 refusals)')).toBe('owner not ready (30 refusals)');
+    expect(heldReasonLabel('preflight-error:runtime stopped (30 refusals)')).toBe('owner check failed: runtime stopped (30 refusals)');
     const snap = empty();
     snap.inboxHeld = { ok: true, items: [{ id: 'i-1', kind: 'note', targetWorkspaceId: 'ws-1', targetTabId: 'tab-a', heldReason: 'target-not-agent' }] } as unknown as ICoordinationSnapshot['inboxHeld'];
     expect(render(snap)).toMatch(/data-held="i-1".*?target is not an agent tab/);

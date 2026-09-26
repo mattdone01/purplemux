@@ -36,6 +36,9 @@ const HELD_LABEL: Record<string, string> = {
   'composer-not-empty': 'composer not empty',
   // inbox-store: a notice that expired with no refusal at all.
   'never ready': 'target never ready',
+  // inbox-dispatcher preflight (story 12): no owner listening yet, or the owner's check threw.
+  'preflight-unregistered': 'owner not ready',
+  'preflight-error': 'owner check failed',
 };
 
 /** A served token through its label map: an unmapped one reads "other", never the raw token. */
