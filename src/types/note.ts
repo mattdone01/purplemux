@@ -30,7 +30,7 @@ export interface INote {
   state: TNoteState;
   /** The tab the note was last routed to. */
   deliveredTo: { workspaceId: string; tabId: string } | null;
-  /** When the note was last routed (its inbox notice queued). */
+  /** When the note was FIRST routed (its inbox notice queued): the sender's clock. A re-route keeps it. */
   routedAt: number | null;
   /** When the notice reached the recipient's composer (the inbox item delivered). */
   deliveredAt: number | null;

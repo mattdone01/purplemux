@@ -27,6 +27,9 @@ class Fakes {
   epics = new Map<string, { workspaceId: string; tabId: string }>();
   live = new Set(['ws-1/tab-a', 'ws-1/tab-a2', 'ws-2/tab-b', 'ws-3/tab-c', 'ws-9/tab-orch']);
   orchestrators = new Map<string, string>([['ws-9', 'tab-orch']]);
+  /** Workspaces whose layout could not be read: their tabs are neither live nor closed. */
+  uncertain = new Set<string>();
+  reads = { liveTabs: 0, inboxItems: 0 };
   inbox = new Map<string, IInboxItem>();
   sent: Array<IEnqueueRequest<'note'> & { line: string; id: string }> = [];
   private seq = 0;
@@ -49,12 +52,15 @@ class Fakes {
         const h = this.epics.get(slug);
         return !!h && h.workspaceId === c.workspaceId && h.tabId === c.tabId;
       },
-      orchestratorOf: async (ws) => {
-        const tab = this.orchestrators.get(ws);
-        return tab && this.live.has(`${ws}/${tab}`) ? tab : null;
-      },
+      orchestratorOf: async (ws) => this.orchestrators.get(ws) ?? null,
       workspaceExists: async (ws) => ['ws-1', 'ws-2', 'ws-3', 'ws-9'].includes(ws),
-      tabLive: async (ws, tab) => this.live.has(`${ws}/${tab}`),
+      liveTabs: async () => {
+        this.reads.liveTabs += 1;
+        return {
+          tabs: [...this.live].map((k) => ({ workspaceId: k.split('/')[0], tabId: k.split('/')[1] })),
+          uncertainWorkspaceIds: new Set(this.uncertain),
+        };
+      },
       enqueue: async (req) => {
         const id = `i-item${this.sent.length + 1}`;
         const line = renderInboxLine('note', req.fields).line;
@@ -63,7 +69,10 @@ class Fakes {
         this.inbox.set(id, item);
         return { item };
       },
-      inboxItem: async (id) => this.inbox.get(id) ?? null,
+      inboxItems: async () => {
+        this.reads.inboxItems += 1;
+        return [...this.inbox.values()];
+      },
     };
   }
 
@@ -180,8 +189,7 @@ describe('notes (ADR-0013)', () => {
     f.now += NOTE_SENDER_NOTICE_MS;
     await svc.tick();
     const before = f.sent.length;
-    f.inbox.delete(f.note(id).inboxItemId!); // the inbox retention sweep
-    f.epics.set('ddh', { workspaceId: 'ws-3', tabId: 'tab-c' });
+    f.inbox.delete(f.note(id).inboxItemId!); // the inbox retention sweep; the owner is unchanged
     for (let i = 0; i < 6; i++) {
       f.now += 30 * MIN;
       await svc.tick();
@@ -197,14 +205,88 @@ describe('notes (ADR-0013)', () => {
     expect(f.sent.map((s) => s.fields.event)).toEqual(['delivered', 'delivered']);
   });
 
-  it('does not remind a recipient tab that has closed', async () => {
+  it('a delivered, unacked note whose tab closed goes to the epic\'s next owner, who sees it --to-me', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 'before merge, do X', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.now += NOTE_SENDER_NOTICE_MS;
+    await svc.tick(); // reminder to tab-a, sender told once
+    f.live.delete('ws-1/tab-a'); // the epic lease dies with the tab
+    f.epics.delete('ddh');
+    await svc.tick();
+    expect(f.note(id)).toMatchObject({ state: 'undeliverable', deliveredTo: null });
+    f.epics.set('ddh', { workspaceId: 'ws-1', tabId: 'tab-a2' });
+    await svc.tick('ddh'); // the lease-acquire hook
+    expect(f.note(id)).toMatchObject({ state: 'delivered', deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a2' } });
+    expect((await svc.list(caller('ws-1', 'tab-a2'), { open: true, toMe: true })).map((n) => n.id)).toEqual([id]);
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.now += 10 * NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    expect(f.sent.map((s) => `${s.fields.event}>${s.targetTabId}`)).toEqual([
+      'delivered>tab-a', 'reminder>tab-a', 'unacked>tab-b', 'delivered>tab-a2', 'reminder>tab-a2',
+    ]);
+  });
+
+  it('a delivered note follows the epic when another live tab takes it over', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.epics.set('ddh', { workspaceId: 'ws-3', tabId: 'tab-c' });
+    await svc.tick('ddh');
+    expect(f.note(id).deliveredTo).toEqual({ workspaceId: 'ws-3', tabId: 'tab-c' });
+    await svc.tick();
+    expect(f.sent.map((s) => s.targetTabId)).toEqual(['tab-a', 'tab-c']);
+  });
+
+  it('unknown liveness is not closed: no re-route, and the reminder waits instead of being used up', async () => {
     const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
     f.deliverInbox(f.note(id).inboxItemId!);
     f.live.delete('ws-1/tab-a');
+    f.uncertain.add('ws-1'); // its layout could not be read
+    f.epics.delete('ddh');
     f.now += NOTE_REMIND_MS;
     await svc.tick();
-    expect(f.sent.filter((s) => s.fields.event === 'reminder')).toHaveLength(0);
-    expect(f.note(id).remindedAt).not.toBeNull();
+    expect(f.note(id)).toMatchObject({ state: 'delivered', deliveredTo: { tabId: 'tab-a' }, remindedAt: null });
+    f.uncertain.delete('ws-1');
+    f.live.add('ws-1/tab-a');
+    await svc.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'reminder').map((s) => s.targetTabId)).toEqual(['tab-a']);
+  });
+
+  it('tells the sender once per note, across a re-route; an unknown sender tab waits, a closed one settles it', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.uncertain.add('ws-2');
+    f.live.delete('ws-2/tab-b');
+    f.now += NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    expect(f.note(id).senderNotifiedAt).toBeNull();
+    f.uncertain.delete('ws-2');
+    f.live.add('ws-2/tab-b');
+    await svc.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'unacked')).toHaveLength(1);
+    f.dropInbox(f.note(id).inboxItemId!); // re-routed after the notice
+    f.epics.set('ddh', { workspaceId: 'ws-3', tabId: 'tab-c' });
+    await svc.tick();
+    f.now += 5 * NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'unacked')).toHaveLength(1);
+    expect(f.note(id).routedAt).toBe(T0);
+
+    const second = await svc.send(B, { toEpic: 'ddh', subject: 's2', body: 'b' });
+    f.live.delete('ws-2/tab-b'); // confirmed closed: nobody to tell, settled
+    f.now += NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    expect(f.note(second.id).senderNotifiedAt).not.toBeNull();
+    expect(f.sent.filter((s) => s.fields.event === 'unacked')).toHaveLength(1);
+  });
+
+  it('reads the inbox and the live tabs once per pass, however many notes there are', async () => {
+    for (let i = 0; i < 5; i++) {
+      const { id } = await svc.send(B, { toEpic: 'ddh', subject: `s${i}`, body: 'b' });
+      f.deliverInbox(f.note(id).inboxItemId!);
+    }
+    f.reads = { liveTabs: 0, inboxItems: 0 };
+    f.now += NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    expect(f.reads).toEqual({ liveTabs: 1, inboxItems: 1 });
   });
 
   it('keeps a sent reminder when the sender notice of the same pass fails, and never repeats it', async () => {
@@ -214,9 +296,9 @@ describe('notes (ADR-0013)', () => {
     let broken = true;
     const flaky = new NotesService({
       ...deps,
-      tabLive: async (ws, tab) => {
-        if (broken && ws === 'ws-2') throw new Error('workspaces.json unreadable');
-        return deps.tabLive(ws, tab);
+      enqueue: async (req) => {
+        if (broken && req.fields.event === 'unacked') throw new Error('inbox.json unwritable');
+        return deps.enqueue(req);
       },
     });
     f.now = T0 + NOTE_SENDER_NOTICE_MS;

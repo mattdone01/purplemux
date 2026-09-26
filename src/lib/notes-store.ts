@@ -21,7 +21,7 @@ const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
 /** One reminder to the recipient this long after the notice reached its composer. */
 export const NOTE_REMIND_MS = 30 * MIN;
-/** One notice to the sender this long after delivery, if still unacked. */
+/** One notice to the sender this long after the first routing, if still unacked; once per note. */
 export const NOTE_SENDER_NOTICE_MS = 60 * MIN;
 /** A note unacked (or undeliverable) this long after creation expires. */
 export const NOTE_EXPIRE_MS = 14 * DAY;
@@ -102,23 +102,25 @@ export const createNote = (
 
 // ─── transitions (pure: each returns a new note) ──────────────────────────
 
-/** A new delivery restarts the reminder clock: the recipient may be a different tab. */
+/**
+ * A new delivery restarts the recipient's reminder clock (the recipient may be a different tab).
+ * The sender's clock and its one notice belong to the note: a re-route keeps both (review round 2).
+ */
 export const routed = (note: INote, to: { workspaceId: string; tabId: string }, inboxItemId: string, now: number): INote => ({
   ...note,
   state: 'delivered',
   deliveredTo: to,
-  routedAt: now,
+  routedAt: note.routedAt ?? now,
   deliveredAt: null,
   inboxItemId,
   remindedAt: null,
-  senderNotifiedAt: null,
   transitionAt: now,
 });
 
 export const undeliverable = (note: INote, now: number): INote =>
   note.state === 'undeliverable' ? note : { ...note, state: 'undeliverable', transitionAt: now };
 
-/** The notice was dropped (its tab closed): route again. */
+/** The recipient is gone (its notice dropped, its tab closed, or the epic changed hands): route again. */
 export const requeued = (note: INote, now: number): INote => ({
   ...note,
   state: 'queued',
@@ -126,7 +128,6 @@ export const requeued = (note: INote, now: number): INote => ({
   inboxItemId: null,
   deliveredAt: null,
   remindedAt: null,
-  senderNotifiedAt: null,
   transitionAt: now,
 });
 

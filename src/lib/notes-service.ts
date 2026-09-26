@@ -52,11 +52,28 @@ export interface INotesDeps {
   epicHolder: (slug: string) => Promise<{ workspaceId: string; tabId: string } | null>;
   /** True when `caller` itself holds `epic:<slug>`. */
   holdsEpic: (caller: ICaller, slug: string) => Promise<boolean>;
-  /** The workspace's orchestrator tab while orchestration is on and the tab is live; else null. */
+  /** The workspace's orchestrator tab while orchestration is on (liveness is checked by the caller); else null. */
   orchestratorOf: (workspaceId: string) => Promise<string | null>;
   workspaceExists: (workspaceId: string) => Promise<boolean>;
-  tabLive: (workspaceId: string, tabId: string) => Promise<boolean>;
+  /** Every live tab, and the workspaces whose layout could not be read (their tabs are unknown, not closed). */
+  liveTabs: () => Promise<ILiveTabs>;
   enqueue: (req: IEnqueueRequest<'note'>) => Promise<{ item: IInboxItem }>;
+  inboxItems: () => Promise<IInboxItem[]>;
+}
+
+export interface ILiveTabs {
+  tabs: ReadonlyArray<{ workspaceId: string; tabId: string }>;
+  uncertainWorkspaceIds: ReadonlySet<string>;
+}
+
+type TTabState = 'live' | 'closed' | 'unknown';
+
+/** The reads one pass shares: the inbox and the live tabs once each, each epic holder and orchestrator once. */
+interface IReads {
+  epicHolder: (slug: string) => Promise<{ workspaceId: string; tabId: string } | null>;
+  /** The workspace's orchestrator tab while it is live; else null. */
+  orchestratorOf: (workspaceId: string) => Promise<string | null>;
+  tabState: (workspaceId: string, tabId: string) => Promise<TTabState>;
   inboxItem: (id: string) => Promise<IInboxItem | null>;
 }
 
@@ -91,10 +108,10 @@ export class NotesService {
 
   // ─── routing ────────────────────────────────────────────────────────────
 
-  private async recipientOf(note: INote, d: INotesDeps): Promise<{ workspaceId: string; tabId: string } | null> {
-    if (note.to.epic) return d.epicHolder(note.to.epic);
+  private async recipientOf(note: INote, r: IReads): Promise<{ workspaceId: string; tabId: string } | null> {
+    if (note.to.epic) return r.epicHolder(note.to.epic);
     if (note.to.workspaceId) {
-      const tabId = await d.orchestratorOf(note.to.workspaceId);
+      const tabId = await r.orchestratorOf(note.to.workspaceId);
       return tabId ? { workspaceId: note.to.workspaceId, tabId } : null;
     }
     return null;
@@ -111,57 +128,78 @@ export class NotesService {
   }
 
   /** Route a queued or undeliverable note: enqueue its line for the live recipient, or mark it undeliverable. */
-  private async route(note: INote, now: number, d: INotesDeps = this.deps): Promise<INote> {
-    const to = await this.recipientOf(note, d);
+  private async route(note: INote, now: number, r: IReads): Promise<INote> {
+    const to = await this.recipientOf(note, r);
     if (!to) return undeliverable(note, now);
-    const { item } = await d.enqueue(this.notice(note, to, 'delivered'));
+    const { item } = await this.deps.enqueue(this.notice(note, to, 'delivered'));
     return routed(note, to, item.id, now);
   }
 
-  /** One notice to the sender's tab, when it is still live. */
-  private async noticeSender(note: INote, event: 'unacked' | 'expired', d: INotesDeps): Promise<void> {
+  /**
+   * One notice to the sender's tab when it is live. True when the notice is settled: sent, or the
+   * sender has no tab or its tab is confirmed closed. An unknown tab state settles nothing.
+   */
+  private async noticeSender(note: INote, event: 'unacked' | 'expired', r: IReads): Promise<boolean> {
     const { workspaceId, tabId } = note.from;
-    if (!workspaceId || !tabId || !(await d.tabLive(workspaceId, tabId))) return;
-    await d.enqueue(this.notice(note, { workspaceId, tabId }, event));
+    if (!workspaceId || !tabId) return true;
+    const state = await r.tabState(workspaceId, tabId);
+    if (state === 'live') await this.deps.enqueue(this.notice(note, { workspaceId, tabId }, event));
+    return state !== 'unknown';
+  }
+
+  /**
+   * The delivered line's tab can no longer act on it: that tab is confirmed closed (an epic lease
+   * dies with its tab), or the epic now has a different live holder. Unknown liveness is not gone.
+   */
+  private async recipientGone(note: INote, r: IReads): Promise<boolean> {
+    const to = note.deliveredTo;
+    if (!to) return false;
+    if ((await r.tabState(to.workspaceId, to.tabId)) === 'closed') return true;
+    if (!note.to.epic) return false;
+    const holder = await r.epicHolder(note.to.epic);
+    return !!holder && (holder.workspaceId !== to.workspaceId || holder.tabId !== to.tabId);
   }
 
   /**
    * Advance one note by the clock and the inbox. Each side effect is recorded as soon as it is
    * done, so a later failure in the same pass never repeats an earlier notice (review round 1).
    */
-  private async advance(note: INote, now: number, d: INotesDeps): Promise<INote> {
+  private async advance(note: INote, now: number, r: IReads): Promise<INote> {
     if (OPEN_STATES.has(note.state) && now - note.createdAt >= NOTE_EXPIRE_MS) {
-      await this.noticeSender(note, 'expired', d);
+      await this.noticeSender(note, 'expired', r);
       return expired(note, now);
     }
-    if (note.state === 'queued' || note.state === 'undeliverable') return this.route(note, now, d);
+    if (note.state === 'queued' || note.state === 'undeliverable') return this.route(note, now, r);
     if (note.state !== 'delivered') return note;
 
-    const item = note.inboxItemId ? await d.inboxItem(note.inboxItemId) : null;
+    const item = note.inboxItemId ? await r.inboxItem(note.inboxItemId) : null;
     // Re-route only when the line never reached the recipient: an explicit drop (its tab closed),
     // or an item gone before it was delivered. The inbox prunes a DELIVERED item after 7 days;
-    // that is not a drop, and re-routing it would deliver the note again and restart both clocks.
-    if (item?.state === 'dropped' || (!item && note.deliveredAt === null)) return this.route(requeued(note, now), now, d);
+    // that is not a drop, and re-routing it would deliver the note again.
+    if (item?.state === 'dropped' || (!item && note.deliveredAt === null)) return this.route(requeued(note, now), now, r);
+    // A line that reached a tab which is now closed, or an epic that changed hands, goes to the
+    // current owner: `--to-me` is the routed tab, so nobody else would see it (review round 2).
+    if (await this.recipientGone(note, r)) return this.route(requeued(note, now), now, r);
     let next = note;
     if (item?.state === 'delivered' && next.deliveredAt === null) next = reachedComposer(next, item.deliveredAt ?? now);
     // The recipient's reminder counts from the line reaching its composer: a busy recipient is not
-    // reminded of a line it has not seen. Only a live recipient tab is reminded.
+    // reminded of a line it has not seen. recipientGone() above leaves only a live or unknown tab;
+    // an unknown one is tried again next pass, never marked as reminded.
     if (next.deliveredTo && next.deliveredAt !== null && next.remindedAt === null && now - next.deliveredAt >= NOTE_REMIND_MS) {
       try {
-        if (await d.tabLive(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) {
-          await d.enqueue(this.notice(next, next.deliveredTo, 'reminder'));
-        }
+        if ((await r.tabState(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) !== 'live') return next;
+        await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'));
       } catch (err) {
         log.warn(`note ${note.id} reminder not sent: ${err instanceof Error ? err.message : err}`);
         return next;
       }
       next = reminded(next, now);
     }
-    // The sender's notice counts from routing: it is the escalation for a recipient that never
-    // reads the line, so it must not wait for the line to be read (review round 1).
+    // The sender's notice counts from the first routing, once per note: it is the escalation for a
+    // recipient that never reads the line, so it must not wait for the line to be read.
     if (next.senderNotifiedAt === null && next.routedAt !== null && now - next.routedAt >= NOTE_SENDER_NOTICE_MS) {
       try {
-        await this.noticeSender(next, 'unacked', d);
+        if (!(await this.noticeSender(next, 'unacked', r))) return next;
       } catch (err) {
         log.warn(`note ${note.id} sender notice not sent: ${err instanceof Error ? err.message : err}`);
         return next;
@@ -171,18 +209,39 @@ export class NotesService {
     return next;
   }
 
-  /** Reads shared by every note of one tick: the inbox, epic holders and live tabs once each. */
-  private snapshot(): INotesDeps {
+  /** One pass's reads: the inbox and the live tabs are read once, each epic holder and orchestrator once. */
+  private reads(): IReads {
     const d = this.deps;
-    const memo = <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => {
-      const cache = new Map<string, Promise<R>>();
-      return (...a: A) => {
-        const key = JSON.stringify(a);
-        if (!cache.has(key)) cache.set(key, fn(...a));
-        return cache.get(key)!;
-      };
+    let live: Promise<ILiveTabs> | null = null;
+    let inbox: Promise<Map<string, IInboxItem>> | null = null;
+    const holders = new Map<string, Promise<{ workspaceId: string; tabId: string } | null>>();
+    const orchestrators = new Map<string, Promise<string | null>>();
+    const tabState = async (workspaceId: string, tabId: string): Promise<TTabState> => {
+      live ??= d.liveTabs();
+      const snapshot = await live;
+      if (snapshot.tabs.some((t) => t.workspaceId === workspaceId && t.tabId === tabId)) return 'live';
+      return snapshot.uncertainWorkspaceIds.has(workspaceId) ? 'unknown' : 'closed';
     };
-    return { ...d, epicHolder: memo(d.epicHolder), orchestratorOf: memo(d.orchestratorOf), tabLive: memo(d.tabLive), inboxItem: memo(d.inboxItem) };
+    return {
+      epicHolder: (slug) => {
+        if (!holders.has(slug)) holders.set(slug, d.epicHolder(slug));
+        return holders.get(slug)!;
+      },
+      orchestratorOf: (workspaceId) => {
+        if (!orchestrators.has(workspaceId)) {
+          orchestrators.set(workspaceId, (async () => {
+            const tabId = await d.orchestratorOf(workspaceId);
+            return tabId && (await tabState(workspaceId, tabId)) === 'live' ? tabId : null;
+          })());
+        }
+        return orchestrators.get(workspaceId)!;
+      },
+      tabState,
+      inboxItem: async (id) => {
+        inbox ??= d.inboxItems().then((items) => new Map(items.map((i) => [i.id, i])));
+        return (await inbox).get(id) ?? null;
+      },
+    };
   }
 
   private ticking: Promise<void> | null = null;
@@ -214,14 +273,14 @@ export class NotesService {
 
   private async tickOnce(onlyEpic?: string): Promise<void> {
     const now = this.deps.now();
-    const d = this.snapshot();
+    const r = this.reads();
     await this.deps.mutate(async (state) => {
       let next = state;
       for (const note of state.notes) {
         if (onlyEpic !== undefined && note.to.epic !== onlyEpic) continue;
         let advanced: INote;
         try {
-          advanced = await this.advance(note, now, d);
+          advanced = await this.advance(note, now, r);
         } catch (err) {
           log.warn(`note ${note.id} could not advance: ${err instanceof Error ? err.message : err}`);
           continue;
@@ -266,7 +325,7 @@ export class NotesService {
       if (mine >= NOTE_OPEN_PER_SENDER) {
         throw new NoteError('note-cap', `this sender already has ${mine} open notes (the limit is ${NOTE_OPEN_PER_SENDER}); wait for acks or expiry`);
       }
-      const sent = await this.route(note, now);
+      const sent = await this.route(note, now, this.reads());
       return { state: { notes: [...state.notes, sent] }, value: viewOf(sent) };
     });
   }
@@ -326,10 +385,6 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     const { state } = leaseStore.pruneExpired(await leaseStore.readLeaseState(), now);
     return state.leases.find((l) => l.name === `epic:${slug}`) ?? null;
   };
-  const tabLive = async (workspaceId: string, tabId: string) => {
-    const snapshot = await tabLifecycle.readLiveTabs();
-    return snapshot.tabs.some((t) => t.workspaceId === workspaceId && t.tabId === tabId);
-  };
   return {
     now: () => Date.now(),
     newId: newNoteId,
@@ -347,13 +402,12 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     },
     orchestratorOf: async (workspaceId) => {
       const orchestration = (await workspaceStore.getWorkspaceById(workspaceId))?.orchestration;
-      const tabId = orchestration?.enabled ? orchestration.orchestratorTabId : null;
-      return tabId && (await tabLive(workspaceId, tabId)) ? tabId : null;
+      return (orchestration?.enabled ? orchestration.orchestratorTabId : null) ?? null;
     },
     workspaceExists: async (workspaceId) => !!(await workspaceStore.getWorkspaceById(workspaceId)),
-    tabLive,
+    liveTabs: tabLifecycle.readLiveTabs,
     enqueue: inboxStore.enqueueNotice,
-    inboxItem: async (id) => (await inboxStore.readInboxState()).items.find((i) => i.id === id) ?? null,
+    inboxItems: async () => (await inboxStore.readInboxState()).items,
   };
 };
 
