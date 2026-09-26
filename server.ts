@@ -17,6 +17,7 @@ import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
 import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
 import { startNotes, stopNotes } from './src/lib/notes-service';
 import { startGrants, stopGrants } from './src/lib/grant-service';
+import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { enqueueSystemToast } from './src/lib/sync-server';
@@ -112,6 +113,7 @@ const shutdownWs = async () => {
   await stopWatches();
   await stopNotes();
   stopGrants();
+  stopHostSignals();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
   gracefulStatusShutdown();
@@ -391,6 +393,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await initLeases();
   // After the tab tokens: grants reconcile against the live tabs themselves (ADR-0010 boot-sweep note).
   await startGrants();
+  // The Mission Control coordination panel's optional host signals (story 20).
+  startHostSignals();
   await getMissionControlRuntime().start();
   await startInbox();
   await startNotes();

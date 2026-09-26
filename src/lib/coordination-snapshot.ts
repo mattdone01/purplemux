@@ -1,0 +1,46 @@
+import type { ICaller } from '@/lib/caller';
+import type { ICoordinationSnapshot, INoteRow, TSection } from '@/types/coordination';
+
+// The coordination panel's read (story 20): leases, open notes, watches, active
+// grants, held inbox deliveries and host pressure, each section independent.
+
+const section = async <T>(read: () => Promise<T[]>): Promise<TSection<T>> => {
+  try {
+    return { ok: true, items: await read() };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+};
+
+/** The admin view for the server's own read of every workspace's watches (the route is human-only). */
+const PANEL_CALLER = {
+  scope: { type: 'admin' }, workspaceId: null, tabId: null, tabName: null, verified: false, identity: 'none', admin: true,
+} as ICaller;
+
+export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoordinationSnapshot> => {
+  const [{ listLeases }, { viewsOf }, notes, { getWatchManager }, grantStore, { readInboxState }, { readHostMetrics }, { hostSignalsView }] = await Promise.all([
+    import('@/lib/lease-store'),
+    import('@/lib/lease-http'),
+    import('@/lib/notes-store'),
+    import('@/lib/watch-manager'),
+    import('@/lib/grant-store'),
+    import('@/lib/inbox-store'),
+    import('@/lib/host-metrics'),
+    import('@/lib/host-signals'),
+  ]);
+  const [leases, openNotes, watches, grants, inboxHeld, host] = await Promise.all([
+    section(async () => viewsOf(await listLeases(undefined, now))),
+    section(async (): Promise<INoteRow[]> => (await notes.readNotesState()).notes
+      .filter((n) => notes.OPEN_STATES.has(n.state))
+      .map((n) => ({ ...notes.viewOf(n), ageSeconds: Math.max(0, Math.floor((now - n.createdAt) / 1000)) }))),
+    section(async () => (await getWatchManager()).list(PANEL_CALLER, null)),
+    section(async () => {
+      const refusal = grantStore.grantsRefusal();
+      if (refusal) throw new Error(refusal);
+      return grantStore.grantsSnapshot().grants.filter((g) => grantStore.isActive(g, now));
+    }),
+    section(async () => (await readInboxState()).items.filter((i) => i.state === 'held')),
+    readHostMetrics().catch((err) => ({ available: false as const, reason: err instanceof Error ? err.message : String(err) })),
+  ]);
+  return { at: now, leases, notes: openNotes, watches, grants, inboxHeld, host, signals: hostSignalsView(now) };
+};

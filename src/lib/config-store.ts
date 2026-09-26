@@ -40,6 +40,11 @@ export interface IConfigData {
   lineHeightCustom?: number;
   terminalKeyBar?: 'auto' | 'always' | 'never';
   systemResourcesEnabled?: boolean;
+  /**
+   * A shell command printing the host-signal JSON (architecture "Host-signal JSON"), run every 5 min
+   * with a 10 s timeout for the Mission Control coordination panel (story 20). Unset = not configured.
+   */
+  hostSignalCommand?: string;
   networkAccess?: TNetworkAccess;
   updatedAt: string;
 }
@@ -71,6 +76,16 @@ const withLock = async <T>(fn: () => Promise<T>): Promise<T> => {
 const emptyConfig = (): IConfigData => ({
   updatedAt: new Date().toISOString(),
 });
+
+/**
+ * The config a browser may see: never the password hash, the session secret or
+ * the host-signal command (story 20: it may carry a path or an argument not meant
+ * for the page). The one helper for every place that serves config to a client.
+ */
+export const clientSafeConfig = (config: IConfigData): { safe: Omit<IConfigData, 'authPassword' | 'authSecret' | 'hostSignalCommand'>; hasAuthPassword: boolean } => {
+  const { authPassword, authSecret: _authSecret, hostSignalCommand: _hostSignalCommand, ...safe } = config;
+  return { safe, hasAuthPassword: !!authPassword };
+};
 
 export const readConfig = async (): Promise<IConfigData | null> => {
   try {
