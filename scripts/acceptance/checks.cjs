@@ -170,7 +170,17 @@ class Instance {
     const file = path.join(this.state.scratch, 'bin', 'composer', 'claude');
     if (!fs.existsSync(file)) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, "#!/bin/sh\nclear\nprintf '\\n────────────────\\n\\342\\235\\257 \\n────────────────\\n'\nstty -echo 2>/dev/null\ncat >>\"${ACC_INPUT:-/dev/null}\"\n");
+      // Drawn on the pane's last rows, as Claude draws it: readiness reads the tail of the pane.
+      fs.writeFileSync(file, [
+        '#!/bin/sh',
+        'clear',
+        'rows=$(stty size 2>/dev/null | cut -d" " -f1)',
+        'i=4; while [ "$i" -lt "${rows:-24}" ]; do echo; i=$((i + 1)); done',
+        "printf '────────────────\\n\\342\\235\\257 \\n────────────────'",
+        'stty -echo 2>/dev/null',
+        'cat >>"${ACC_INPUT:-/dev/null}"',
+        '',
+      ].join('\n'));
       fs.chmodSync(file, 0o755);
     }
     return file;
