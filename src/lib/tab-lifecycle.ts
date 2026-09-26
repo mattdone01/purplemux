@@ -100,14 +100,14 @@ export interface ILiveTabsSnapshot {
  * A failure to list the workspaces themselves throws.
  */
 export const readLiveTabs = async (): Promise<ILiveTabsSnapshot> => {
-  const [{ getWorkspaces }, { resolveLayoutFile, collectAllTabs }] = await Promise.all([
+  const [{ readWorkspaceIdsStrict }, { resolveLayoutFile, collectAllTabs }] = await Promise.all([
     import('@/lib/workspace-store'),
     import('@/lib/layout-store'),
   ]);
-  const { workspaces } = await getWorkspaces();
+  const workspaceIds = await readWorkspaceIdsStrict();
   const tabs: ILiveTab[] = [];
   const uncertainWorkspaceIds = new Set<string>();
-  for (const ws of workspaces) {
+  for (const ws of workspaceIds.map((id) => ({ id }))) {
     let raw: string;
     try {
       raw = await fs.readFile(resolveLayoutFile(ws.id), 'utf-8');

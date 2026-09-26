@@ -142,6 +142,31 @@ const readWorkspacesFile = async (): Promise<IWorkspacesData | null> => {
   }
 };
 
+/**
+ * The workspace ids, read strictly: a missing file means none, any other read
+ * error or an unparseable file throws. `readWorkspacesFile` answers null for
+ * both, which is right for the UI and wrong for a sweep that releases what it
+ * cannot see.
+ */
+export const readWorkspaceIdsStrict = async (): Promise<string[]> => {
+  let raw: string;
+  try {
+    raw = await fs.readFile(WORKSPACES_FILE, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new Error(`${WORKSPACES_FILE} unreadable: ${err instanceof Error ? err.message : err}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${WORKSPACES_FILE} is not valid JSON: ${err instanceof Error ? err.message : err}`);
+  }
+  const workspaces = (parsed as { workspaces?: unknown } | null)?.workspaces;
+  if (!Array.isArray(workspaces)) throw new Error(`${WORKSPACES_FILE} has no "workspaces" array`);
+  return workspaces.map((ws) => (ws as { id?: unknown })?.id).filter((id): id is string => typeof id === 'string');
+};
+
 const writeWorkspacesFile = async (data: IWorkspacesData): Promise<void> => {
   normalizeWorkspaceOrder(data);
   const { workspaces, groups, activeWorkspaceId, sidebarCollapsed, sidebarWidth } = data;

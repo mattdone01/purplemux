@@ -26,7 +26,7 @@ vi.mock('@/lib/tmux', () => ({
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
 vi.mock('@/lib/providers/claude', () => ({ claudeProvider: {} }));
 vi.mock('@/lib/workspace-store', () => ({
-  getWorkspaces: async () => ({ workspaces: workspaces.list, groups: [], sidebarCollapsed: false, sidebarWidth: 220 }),
+  readWorkspaceIdsStrict: async () => workspaces.list.map((w) => w.id),
 }));
 
 const resetGlobals = () => {
