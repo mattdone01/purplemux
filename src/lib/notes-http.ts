@@ -1,6 +1,6 @@
 import type { NextApiResponse } from 'next';
 import { createLogger } from '@/lib/logger';
-import { NoteError } from '@/lib/notes-store';
+import { isNoteError } from '@/lib/notes-store';
 
 const log = createLogger('notes-http');
 
@@ -15,7 +15,7 @@ const STATUS: Record<string, number> = {
 
 /** Every note refusal carries `code`, which the CLI maps to its exit (ADR-0016). */
 export const sendNoteError = (res: NextApiResponse, err: unknown): void => {
-  if (err instanceof NoteError) {
+  if (isNoteError(err)) {
     res.status(STATUS[err.code] ?? 500).json({ error: err.message, code: err.code });
     return;
   }

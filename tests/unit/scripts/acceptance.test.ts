@@ -18,6 +18,18 @@ const checks = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptanc
 const asEnv = (env: Record<string, string | undefined>) => env as NodeJS.ProcessEnv;
 
 describe('checks.cjs judgements', () => {
+  it('judgeNoteDelivery: only a stamped delivery whose notice line reached the composer, body absent, passes', () => {
+    const note = { id: 'n-abcd1234', state: 'delivered', deliveredAt: 1790000000000 };
+    const line = '\u001b[200~[purplemux note n-abcd1234] from ws-b at 10:00Z — purplemux note show n-abcd1234\u001b[201~\n';
+    expect(checks.judgeNoteDelivery(note, line, 'BODY-1').ok).toBe(true);
+    // Queued but not yet typed: `state: delivered` alone is what review r1 found the old check reading.
+    expect(checks.judgeNoteDelivery({ ...note, deliveredAt: null }, line, 'BODY-1').ok).toBe(false);
+    expect(checks.judgeNoteDelivery(note, '', 'BODY-1').ok).toBe(false);
+    expect(checks.judgeNoteDelivery(note, '[purplemux note n-other123] …', 'BODY-1').ok).toBe(false);
+    expect(checks.judgeNoteDelivery(note, `${line}BODY-1\n`, 'BODY-1')).toMatchObject({ ok: false, measured: expect.stringContaining('body typed true') });
+    expect(checks.judgeNoteDelivery(null, line, 'BODY-1').ok).toBe(false);
+  });
+
   it('judgeRace: exactly one winner and one refusal that names the winner', () => {
     const win = { rc: 0, out: '', err: '' };
     const lose = { rc: 3, out: '', err: 'error: lease-held — merge:x/y held by ws-a / tab-A1 (acc-a1)' };
@@ -453,16 +465,26 @@ exit 0`,
 // The real thing, against a built candidate: ACCEPTANCE_E2E_CANDIDATE=<built checkout>.
 const E2E = process.env.ACCEPTANCE_E2E_CANDIDATE;
 describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
-  it('passes every wave-1 and story-15 check on an isolated instance', { timeout: 600_000 }, () => {
+  it('passes every wave-1, story-15 and wave-2 check on an isolated instance', { timeout: 600_000 }, () => {
     const log = path.join(os.tmpdir(), `acceptance-e2e-${process.pid}.log`);
-    // The real HOME: the harness's own live-home refusal and live-port avoidance
-    // must look at the live instance, not at the test run's isolated HOME.
-    const env = { ...process.env, HOME: process.env.PMUX_TEST_REAL_HOME ?? process.env.HOME };
+    // The real HOME and the real tmux socket directory: the harness's live-home
+    // refusal, live-port avoidance and live-socket leak check must look at the
+    // live instance, not at the test run's isolated HOME and TMUX_TMPDIR.
+    const env = {
+      ...process.env,
+      HOME: process.env.PMUX_TEST_REAL_HOME ?? process.env.HOME,
+      ACCEPT_LIVE_TMUX_TMPDIR: process.env.PMUX_TEST_REAL_TMUX_TMPDIR ?? '/tmp',
+    };
     const r = spawnSync('bash', [RUN, '--candidate', E2E!, '--log', log], { encoding: 'utf-8', timeout: 590_000, env });
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=21 passed=20 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=30 passed=29 failed=0 skipped=1$/m);
+    // The wave-2 checks (story 22) ran, each by id.
+    for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
+      'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {
+      expect(body).toMatch(new RegExp(`^PASS ${id} — `, 'm'));
+    }
     expect(body.match(/^SKIP .*/gm)).toEqual(['SKIP bash-guard — no --bash-guard path given']);
   });
 });
