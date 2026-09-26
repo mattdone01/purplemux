@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import { INTERRUPT_PREFIX, summarizeToolCall } from '@/lib/session-parser';
-import type { IAgentRuntimeSnapshot } from '@/lib/providers/types';
+import type { IAgentRuntimeSnapshot, IRuntimeSnapshotOptions } from '@/lib/providers/types';
 import { TURN_TAIL_CHARS } from '@/lib/turn-end';
 import {
   latestBackgroundActivityAt,
@@ -174,14 +174,20 @@ const scanLines = (lines: string[], elapsed: number): IScanResult => {
  * all 108 replayed READY nudges read 0 open tasks. It is recomputed on every
  * call, cache hit included, because a task ends without the tail changing.
  */
-const withBackgroundWork = async (jsonlPath: string, snapshot: IAgentRuntimeSnapshot): Promise<IAgentRuntimeSnapshot> => {
+const withBackgroundWork = async (
+  jsonlPath: string,
+  snapshot: IAgentRuntimeSnapshot,
+  options: IRuntimeSnapshotOptions,
+): Promise<IAgentRuntimeSnapshot> => {
   try {
     const now = Date.now();
     const ledger = await readBackgroundLedger(jsonlPath);
-    const open = openBackgroundTasks(ledger, now);
+    const open = openBackgroundTasks(ledger, now, options.tasksSince);
     const openBackgroundTaskKinds = { shell: 0, agent: 0, monitor: 0 };
     for (const task of open) openBackgroundTaskKinds[task.kind] += 1;
-    const backgroundActivityAt = open.length > 0 ? await latestBackgroundActivityAt(jsonlPath, ledger, now) : null;
+    const backgroundActivityAt = options.withActivity && open.length > 0
+      ? await latestBackgroundActivityAt(jsonlPath, ledger, now, options.tasksSince)
+      : null;
     return { ...snapshot, openBackgroundTasks: open.length, openBackgroundTaskKinds, backgroundActivityAt };
   } catch {
     return snapshot;
@@ -264,7 +270,7 @@ const readTailSnapshot = async (
 
 export const readClaudeRuntimeSnapshot = async (
   jsonlPath: string,
-  options: { force?: boolean } = {},
+  options: IRuntimeSnapshotOptions = {},
 ): Promise<IAgentRuntimeSnapshot> => {
   let snapshot: IAgentRuntimeSnapshot;
   try {
@@ -272,7 +278,7 @@ export const readClaudeRuntimeSnapshot = async (
   } catch {
     return emptySnapshot();
   }
-  return withBackgroundWork(jsonlPath, snapshot);
+  return withBackgroundWork(jsonlPath, snapshot, options);
 };
 
 export const __testing = {

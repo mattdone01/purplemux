@@ -179,7 +179,9 @@ export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string): vo
     const id = body.match(TASK_ID_PATTERN)?.[1];
     if (!id) continue;
     const event = body.match(EVENT_PATTERN)?.[1]?.trim() ?? '';
-    if (STATUS_PATTERN.test(body) || event.startsWith(MONITOR_EXPIRED_PREFIX)) {
+    // A Monitor event's own text may quote a status tag; only the envelope counts.
+    const envelope = body.replace(EVENT_PATTERN, '');
+    if (STATUS_PATTERN.test(envelope) || event.startsWith(MONITOR_EXPIRED_PREFIX)) {
       end(ledger, id);
     } else if (ledger.open.has(id)) {
       const at = timestampOf(entry);
@@ -188,10 +190,15 @@ export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string): vo
   }
 };
 
-/** Tasks still open at `now`: never ended, and not a Monitor past its deadline. */
-export const openBackgroundTasks = (ledger: IBackgroundLedger, now: number): IBackgroundTask[] =>
+/**
+ * Tasks still open at `now`: never ended, not a Monitor past its deadline, and
+ * not started before `since` (the agent process's start; a task open when an
+ * earlier process died never reports back).
+ */
+export const openBackgroundTasks = (ledger: IBackgroundLedger, now: number, since?: number | null): IBackgroundTask[] =>
   [...ledger.open.values()].filter((task) =>
-    task.expiresAt === null || now <= task.expiresAt + MONITOR_EXPIRY_GRACE_MS);
+    (task.expiresAt === null || now <= task.expiresAt + MONITOR_EXPIRY_GRACE_MS)
+    && (since == null || task.startedAt === null || task.startedAt >= since));
 
 interface ILedgerFileState {
   ino: number;
@@ -269,9 +276,10 @@ export const latestBackgroundActivityAt = async (
   jsonlPath: string,
   ledger: IBackgroundLedger,
   now: number,
+  since?: number | null,
 ): Promise<number | null> => {
   const candidates: Array<number | null> = [await mtimeOf(jsonlPath)];
-  const open = openBackgroundTasks(ledger, now);
+  const open = openBackgroundTasks(ledger, now, since);
   const taskDirs = new Set<string>();
   for (const task of open) {
     if (task.outputFile) {

@@ -120,6 +120,17 @@ describe('nudge routing — reportsTo and notify self (ADR-0018)', () => {
     expect(targets()).toEqual(['o2']);
   });
 
+  it('never routes to a non-agent tab, even if the layout names one', async () => {
+    const { manager, internals, targets } = await setup({ enabled: true, orchestratorTabId: 'o1' });
+    manager.registerTab('o1', entry('o1'));
+    manager.registerTab('sh', entry('sh', { panelType: 'terminal' }));
+    const w = entry('w', { reportsTo: 'sh' });
+    manager.registerTab('w', w);
+
+    await internals.nudgeOrchestrator('w', w, 'stuck');
+    expect(targets()).toEqual(['o1']);
+  });
+
   it('keeps today\'s silence with no reportsTo and orchestration off', async () => {
     const { manager, internals, paste } = await setup({ enabled: false, orchestratorTabId: null });
     const w = entry('w');

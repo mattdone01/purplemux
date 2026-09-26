@@ -132,7 +132,17 @@ describe('Claude snapshot — background work and turn tail', () => {
     const jsonlPath = await writeJsonl([started('bfar1'), ...turns]);
     const snapshot = await readClaudeRuntimeSnapshot(jsonlPath, { force: true });
     expect(snapshot.openBackgroundTasks).toBe(1);
-    expect(snapshot.backgroundActivityAt).toEqual(expect.any(Number));
+    expect(snapshot.openBackgroundTaskKinds).toEqual({ shell: 1, agent: 0, monitor: 0 });
+    expect(snapshot.backgroundActivityAt).toBeNull();
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { withActivity: true })).backgroundActivityAt).toEqual(expect.any(Number));
+  });
+
+  it('ignores tasks started before the agent process (orphaned by a restart)', async () => {
+    const jsonlPath = await writeJsonl([started('bold1'), endTurn('resumed')]);
+    const processStart = Date.parse('2026-09-26T05:00:30.000Z');
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { force: true })).openBackgroundTasks).toBe(1);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart })).openBackgroundTasks).toBe(0);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart - 60_000 })).openBackgroundTasks).toBe(1);
   });
 
   it('keeps the count on a cache hit and drops it once the task ends', async () => {

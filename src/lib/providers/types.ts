@@ -39,6 +39,17 @@ export interface IAgentPreflight {
   loggedIn: boolean;
 }
 
+export interface IRuntimeSnapshotOptions {
+  force?: boolean;
+  /**
+   * Background tasks started before this time (the agent process's start) are
+   * ignored: a task open when the process died never reports back (ADR-0018).
+   */
+  tasksSince?: number | null;
+  /** Compute `backgroundActivityAt` (file stats); only the stall check needs it. */
+  withActivity?: boolean;
+}
+
 export interface IOpenBackgroundTaskKinds {
   shell: number;
   agent: number;
@@ -171,7 +182,7 @@ export interface IAgentProvider {
 
   parsePaneTitle(paneTitle: string | null): string | null;
   sessionIdFromJsonlPath(jsonlPath: string | null | undefined): string | null;
-  readRuntimeSnapshot(jsonlPath: string, options?: { force?: boolean }): Promise<IAgentRuntimeSnapshot>;
+  readRuntimeSnapshot(jsonlPath: string, options?: IRuntimeSnapshotOptions): Promise<IAgentRuntimeSnapshot>;
   readSessionHistoryStats(jsonlPath: string): Promise<IAgentSessionHistoryStats>;
   preflight(): Promise<IAgentPreflight>;
   writeWorkspacePrompt?(ws: IWorkspace): Promise<void>;

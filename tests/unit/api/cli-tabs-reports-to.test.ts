@@ -35,7 +35,7 @@ const tab = (id: string, extra: Partial<ITab> = {}): ITab => ({
   id, name: id, order: 0, sessionName: `pt-ws-1-pane-a-${id}`, panelType: 'claude-code', ...extra,
 });
 
-const tabsIn: Record<string, string[]> = { 'ws-1': ['tab-w', 'tab-o', 'tab-web'], 'ws-2': ['tab-x'] };
+const tabsIn: Record<string, string[]> = { 'ws-1': ['tab-w', 'tab-o', 'tab-web', 'tab-sh'], 'ws-2': ['tab-x'] };
 
 describe('reportsTo on the tab routes (ADR-0018)', () => {
   beforeEach(() => {
@@ -44,7 +44,7 @@ describe('reportsTo on the tab routes (ADR-0018)', () => {
     cli.authorizeWorkspace.mockResolvedValue({ type: 'workspace', workspaceId: 'ws-1' });
     cli.findTab.mockImplementation(async (ws: string, id: string) =>
       tabsIn[ws]?.includes(id)
-        ? { workspaceId: ws, paneId: 'pane-a', tab: tab(id, id === 'tab-web' ? { panelType: 'web-browser' } : {}) }
+        ? { workspaceId: ws, paneId: 'pane-a', tab: tab(id, id === 'tab-web' ? { panelType: 'web-browser' } : id === 'tab-sh' ? { panelType: 'terminal' } : {}) }
         : null);
     tmux.hasSession.mockResolvedValue(true);
   });
@@ -68,6 +68,7 @@ describe('reportsTo on the tab routes (ADR-0018)', () => {
     ['an unknown tab', 'tab-nope'],
     ['itself', 'tab-w'],
     ['a browser tab', 'tab-web'],
+    ['a terminal tab (a nudge would run in its shell)', 'tab-sh'],
     ['an empty id', ''],
     ['a non-string', 7],
   ])('refuses %s with reports-to-invalid', async (_label, reportsTo) => {

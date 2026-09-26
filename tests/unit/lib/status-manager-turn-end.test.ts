@@ -11,7 +11,7 @@ const workspaceStore = vi.hoisted(() => ({
   getWorkspaceByIdCached: vi.fn(),
   getWorkspacesCached: vi.fn(),
 }));
-const liveness = vi.hoisted(() => ({ statusForTab: vi.fn() }));
+const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
 
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
@@ -186,6 +186,33 @@ describe('stop classification (ADR-0018)', () => {
     expect(fallback.has('worker')).toBe(true);
   });
 
+  it('lets only the newest of two quick stops classify the tab (stop → prompt-submit → stop)', async () => {
+    let releaseFirst!: () => void;
+    const firstRead = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
+    liveness.statusForTab.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await firstRead;
+        return { probes: [], backgroundJobs: [{ pid: 1, alive: true, registeredAt: 0, ageS: 1 }] };
+      }
+      return { probes: [], backgroundJobs: [] };
+    });
+    const { manager, paste } = await managerWithPaste();
+    const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('All set.')]));
+    manager.registerTab('worker', entry);
+
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    manager.updateTabFromHook('tmux-worker', 'prompt-submit');
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    releaseFirst();
+    await settle();
+
+    expect(entry.cliState).toBe('ready-for-review');
+    expect(entry.turnEnd?.kind).toBe('ready-for-review');
+  });
+
   it('drops a stale classification when a newer event moved the tab on', async () => {
     const { manager, paste } = await managerWithPaste();
     const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('DONE: x')]));
@@ -204,6 +231,7 @@ describe('busy-stuck check for a waiting tab (ADR-0018, L19, L25)', () => {
   beforeEach(async () => {
     vi.resetModules();
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-stuck-'));
+    liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [] });
   });
   afterEach(async () => {
     vi.useRealTimers();
@@ -212,7 +240,7 @@ describe('busy-stuck check for a waiting tab (ADR-0018, L19, L25)', () => {
 
   const looksStalled = async (entry: ITabStatusEntry, now: number) => {
     const { manager } = await managerWithPaste();
-    return (manager as unknown as { looksStalled: (e: ITabStatusEntry, n: number) => Promise<boolean> }).looksStalled(entry, now);
+    return (manager as unknown as { looksStalled: (id: string, e: ITabStatusEntry, n: number) => Promise<boolean> }).looksStalled('worker', entry, now);
   };
 
   const setMtime = (file: string, at: number) => fs.utimes(file, new Date(at), new Date(at));
@@ -235,12 +263,25 @@ describe('busy-stuck check for a waiting tab (ADR-0018, L19, L25)', () => {
     return { file, out };
   };
 
-  it('is not STALLED 20 min into a wait whose task-output file keeps growing', async () => {
+  it('is not STALLED 20 min into a wait, nor past the backstop while the task-output file keeps growing', async () => {
     const t0 = Date.parse('2026-09-26T05:00:00.000Z');
     const { file, out } = await shellWait(t0);
     await fs.appendFile(out, 'lane 3 passed\n');
     await setMtime(out, t0 + 19 * 60 * 1000);
     expect(await looksStalled(worker('claude-code', file), t0 + 20 * 60 * 1000)).toBe(false);
+    await setMtime(out, t0 + 94 * 60 * 1000);
+    expect(await looksStalled(worker('claude-code', file), t0 + 95 * 60 * 1000)).toBe(false);
+    await setMtime(out, t0);
+    expect(await looksStalled(worker('claude-code', file), t0 + 95 * 60 * 1000)).toBe(true);
+  });
+
+  it('is never STALLED while a registered tab bg job lives and no subagent is open', async () => {
+    liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: true, registeredAt: 0, ageS: 1 }] });
+    const t0 = Date.parse('2026-09-26T05:00:00.000Z');
+    const file = await writeLines('claude/j.jsonl', [{ ...claudeEnd('Gate launched; waiting.'), timestamp: new Date(t0).toISOString() }]);
+    expect(await looksStalled(worker('claude-code', file), t0 + 40 * 60 * 1000)).toBe(false);
+    liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: false, registeredAt: 0, ageS: 1 }] });
+    expect(await looksStalled(worker('claude-code', file), t0 + 40 * 60 * 1000)).toBe(true);
   });
 
   it('is not STALLED on a silent gate waiter 40 min in, and is at the 90 min backstop', async () => {

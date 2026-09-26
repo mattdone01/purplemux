@@ -1,5 +1,6 @@
 import { findTab } from '@/lib/cli-utils';
 import { hasSession } from '@/lib/tmux';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 
 export interface IReportsToInvalid {
   error: string;
@@ -23,8 +24,8 @@ export const checkReportsTo = async (
   if (reportsTo === selfTabId) return invalid(reportsTo, 'a tab cannot report to itself');
   const found = await findTab(workspaceId, reportsTo);
   if (!found) return invalid(reportsTo, `reportsTo ${reportsTo} is not a tab of workspace ${workspaceId}`);
-  if (found.tab.panelType === 'web-browser' || !(await hasSession(found.tab.sessionName))) {
-    return invalid(reportsTo, `reportsTo ${reportsTo} is not a live tab`);
-  }
+  // Nudges are typed and submitted: a shell or a browser would run them.
+  if (!isAgentPanelType(found.tab.panelType)) return invalid(reportsTo, `reportsTo ${reportsTo} is not an agent tab`);
+  if (!(await hasSession(found.tab.sessionName))) return invalid(reportsTo, `reportsTo ${reportsTo} is not a live tab`);
   return null;
 };

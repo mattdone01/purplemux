@@ -109,6 +109,16 @@ describe('background ledger — Claude Code 2.1.283 shapes', () => {
     expect(openIds([start, removed], 0)).toEqual(['bz1']);
   });
 
+  it('does not end a Monitor whose event text quotes a status tag', () => {
+    const start = toolResult({ taskId: 'bm1', timeoutMs: 10 ** 12 });
+    const event = JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: '<task-notification>\n<task-id>bm1</task-id>\n<summary>Monitor event</summary>\n<event>grep hit: <status>completed</status></event>\n</task-notification>',
+    });
+    expect(openIds([start, event], 0)).toEqual(['bm1']);
+  });
+
   it('skips malformed lines and lines with no background hint', () => {
     expect(openIds(['{not json backgroundTaskId', '{"type":"user"}', ''], 0)).toEqual([]);
   });
