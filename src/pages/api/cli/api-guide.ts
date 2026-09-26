@@ -35,6 +35,38 @@ Each workspace also gets its own agent session store — \`CLAUDE_CONFIG_DIR\` f
 Claude, \`GROK_HOME\` for Grok — so several workspaces can share one project root
 without sharing conversation history or resume lists.
 
+## Errors and exit codes
+
+An error body is { "error": "...", "code"?: "..." }. "error" is the human-readable text and
+is kept for compatibility; "code" is the machine-readable class. HTTP statuses are unchanged.
+Branch on "code" (or on the CLI's exit code), never on the "error" text. The CLI maps each code
+to an exit code through one table:
+
+  exit  meaning                                  codes                                       retry?
+     0  success                                  —                                           —
+     1  unexpected error                         unmapped code, 5xx, gh-unavailable,        investigate
+                                                 outcome-unknown (a write lost its
+                                                 connection: check the state first)
+     2  usage error                              bad or missing argument; lease-policy,     fix the command
+                                                 watch-invalid, reports-to-invalid,
+                                                 note-too-large, config-invalid,
+                                                 note-target-missing
+     3  conflict / refused by state              forbidden, lease-held, lease-held-by-other, after the state changes
+                                                 watch-cap, inbox-not-held, caller-unresolved,
+                                                 grant-tab-unverified, grant-password-invalid,
+                                                 grant-locked, config-version-conflict
+     4  target gone (permanent)                  tab-not-found, session-not-running,        NEVER
+                                                 target-changed
+     5  not ready yet                            readiness-timeout                          yes, bounded
+     6  server unreachable                       connection refused, no port configured,    yes, bounded
+                                                 a read interrupted
+     7  not found                                lease-not-found, note-not-found,           —
+                                                 watch-not-found, inbox-not-found,
+                                                 deploy-not-found, config-not-found
+
+The CLI writes the code and its class to stderr, e.g.
+  error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
+
 ## Workspaces
 
 GET /api/cli/workspaces
@@ -81,6 +113,8 @@ GET /api/cli/tabs/<tabId>?workspaceId=WS
 
 DELETE /api/cli/tabs/<tabId>?workspaceId=WS
   Close the tab (kills tmux session and removes from layout).
+  Response: { "ok": boolean } — false means the layout kept the tab; the CLI then exits 1
+  (close-not-confirmed) instead of printing ok.
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
@@ -90,8 +124,12 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   paste, so sending into one reports success over an agent that never starts. waitMs: 0
   answers with the current state instead of waiting. Terminal and browser tabs are ungated.
   Response: { "status": "sent", "submitted": boolean, "cliState": string | null }
-  409 { "error": "agent-not-ready", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"? }
+  404 { "error": "Tab not found", "code": "tab-not-found" }
+  409 { "error": "agent-not-ready", "code", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"? }
     — nothing was pasted, so a later Enter cannot submit a half-forgotten prompt.
+  409 { "error": "agent-target-changed", "code": "target-changed", "tabId" } — the tab was replaced.
+  tab-not-found, session-not-running and target-changed are permanent (CLI exit 4): never
+  retry them. readiness-timeout is retryable (CLI exit 5), a bounded number of times.
 
 GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   Response: { "tabId", "workspaceId", "alive", "command", "cliState", "agentProviderId", "agentSessionId", "claudeSessionId",
@@ -295,8 +333,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     res.setHeader('Allow', 'GET');
     return res.status(405).json({ error: 'Method not allowed' });
   }
+  // Any valid CLI scope: the guide is documentation, and the agents that most
+  // need it hold a workspace token, not the global one.
   if (!resolveCliScope(req)) {
-    return res.status(403).json({ error: 'Forbidden' });
+    return res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
   }
   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
   return res.status(200).send(GUIDE);

@@ -40,6 +40,10 @@ purplemux standup report -w ${ws.id} --json '{...}'   # post a standup tick — 
 purplemux standup show -w ${ws.id}                    # latest standup + history
 \`\`\`
 
+Exit codes: 4 means the target tab is gone (\`tab-not-found\`, \`session-not-running\`,
+\`target-changed\`) — never retry it. 5 (agent not ready) and 6 (server unreachable) may be
+retried a bounded number of times. \`purplemux help\` lists all eight.
+
 For the full HTTP API reference (including endpoint paths and payloads),
 run:
 

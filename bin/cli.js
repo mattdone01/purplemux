@@ -85,52 +85,209 @@ const headersFor = (requestPath, extra) => {
   return headers;
 };
 
+// Exit-code contract (docs/adr/0016-cli-exit-codes-and-tab-owned-processes.md).
+// A caller branches on the exit code, so a failure it must never retry (the tab
+// is gone) and one it may retry (the agent is still booting) cannot share one.
+// A relay loop once retried `tab send` into a closed tab for more than a day
+// because both exited 1.
+const EXIT = Object.freeze({
+  UNEXPECTED: 1,
+  USAGE: 2,
+  CONFLICT: 3,
+  GONE: 4,
+  NOT_READY: 5,
+  UNREACHABLE: 6,
+  NOT_FOUND: 7,
+});
+
+const EXIT_HINT = Object.freeze({
+  [EXIT.UNEXPECTED]: 'unexpected — investigate',
+  [EXIT.USAGE]: 'usage error — fix the command',
+  [EXIT.CONFLICT]: 'conflict — retry only after the state changes',
+  [EXIT.GONE]: 'permanent — the target is gone; do not retry',
+  [EXIT.NOT_READY]: 'not ready yet — retry, bounded',
+  [EXIT.UNREACHABLE]: 'server unreachable — retry, bounded',
+  [EXIT.NOT_FOUND]: 'not found',
+});
+
+// The one code → exit table. A server route adds its `code` here, never a
+// table of its own. A code absent from the table exits 1.
+const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
+  'gh-unavailable': EXIT.UNEXPECTED,
+  'outcome-unknown': EXIT.UNEXPECTED,
+  'close-not-confirmed': EXIT.UNEXPECTED,
+  'lease-policy': EXIT.USAGE,
+  'watch-invalid': EXIT.USAGE,
+  'reports-to-invalid': EXIT.USAGE,
+  'note-too-large': EXIT.USAGE,
+  'config-invalid': EXIT.USAGE,
+  'note-target-missing': EXIT.USAGE,
+  'lease-held': EXIT.CONFLICT,
+  'lease-held-by-other': EXIT.CONFLICT,
+  'watch-cap': EXIT.CONFLICT,
+  forbidden: EXIT.CONFLICT,
+  'inbox-not-held': EXIT.CONFLICT,
+  'grant-tab-unverified': EXIT.CONFLICT,
+  'config-version-conflict': EXIT.CONFLICT,
+  'caller-unresolved': EXIT.CONFLICT,
+  'grant-password-invalid': EXIT.CONFLICT,
+  'grant-locked': EXIT.CONFLICT,
+  'tab-not-found': EXIT.GONE,
+  'session-not-running': EXIT.GONE,
+  'target-changed': EXIT.GONE,
+  'readiness-timeout': EXIT.NOT_READY,
+  'server-unreachable': EXIT.UNREACHABLE,
+  'lease-not-found': EXIT.NOT_FOUND,
+  'note-not-found': EXIT.NOT_FOUND,
+  'watch-not-found': EXIT.NOT_FOUND,
+  'inbox-not-found': EXIT.NOT_FOUND,
+  'deploy-not-found': EXIT.NOT_FOUND,
+  'config-not-found': EXIT.NOT_FOUND,
+}));
+
+// Where the class alone does not tell the caller what happened.
+const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
+  'tab-not-found': 'permanent — the tab is closed; do not retry',
+  'session-not-running': "the tab's session is dead; do not retry — a person must restart the tab",
+  'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
+}));
+
+const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
+
+const hintFor = (code, detail) => {
+  if (code === 'readiness-timeout' && Number.isFinite(detail?.waitedMs)) {
+    const state = detail.cliState ? `, cliState ${detail.cliState}` : '';
+    return `not ready after ${detail.waitedMs} ms${state} — retry, bounded`;
+  }
+  if (code && Object.hasOwn(CODE_HINT, code)) return CODE_HINT[code];
+  return EXIT_HINT[exitFor(code)];
+};
+
+/**
+ * Report a failure and exit through the code → exit table. `code` is the
+ * server's machine code (or a client-side one such as `server-unreachable`);
+ * null means the failure carries no code and exits 1.
+ */
+const fail = (code, message, detail) => {
+  const hint = hintFor(code, detail);
+  const line = code
+    ? `${code} (${hint})${message && message !== code ? ` — ${message}` : ''}`
+    : `${message} (${hint})`;
+  process.stderr.write(`error: ${line}\n`);
+  process.exit(exitFor(code));
+};
+
+// A usage error: the command itself is wrong, so nothing was sent (exit 2).
 const die = (msg) => {
-  process.stderr.write(`error: ${msg}\n`);
-  process.exit(1);
+  process.stderr.write(`error: ${msg} (${EXIT_HINT[EXIT.USAGE]})\n`);
+  process.exit(EXIT.USAGE);
 };
 
 const requireEnv = () => {
-  if (!PORT) die('PMUX_PORT not set and ~/.purplemux/port missing (is the server running?)');
-  if (!TAB_TOKEN && !ENV_TOKEN && !ADMIN_TOKEN) die('PMUX_TAB_TOKEN and PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
+  if (!PORT) fail('server-unreachable', 'PMUX_PORT not set and ~/.purplemux/port missing (is the server running?)');
+  if (!TAB_TOKEN && !ENV_TOKEN && !ADMIN_TOKEN) fail('server-unreachable', 'PMUX_TAB_TOKEN and PMUX_TOKEN not set and ~/.purplemux/cli-token missing (is the server running?)');
+};
+
+// Failures that happen before the request reaches the server: retrying cannot
+// repeat an effect the server never saw.
+const CONNECT_ERRORS = new Set([
+  'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+const causeCode = (err) => {
+  const cause = err?.cause;
+  return cause?.code || cause?.errors?.find((e) => e?.code)?.code || err?.code || null;
+};
+
+/**
+ * A request that never got an answer. A read, or a request that never
+ * connected, is safe to repeat: exit 6. A write that lost its connection after
+ * connecting may have taken effect, so it exits 1 and says the outcome is
+ * unknown — a blind retry of `tab send` could type the prompt twice.
+ */
+const networkFailure = (method, requestPath, err) => {
+  const cause = causeCode(err);
+  // undici reports a network failure as `fetch failed` (no answer) or
+  // `terminated` (the body stopped), with a coded cause. Anything else — a
+  // malformed URL or header, a port fetch refuses — is deterministic and was
+  // never sent: retrying cannot help, and no write can have taken effect.
+  const network = (err?.message === 'fetch failed' || err?.message === 'terminated') && cause;
+  if (!network) {
+    const detail = err?.cause?.message ? ` (${err.cause.message})` : '';
+    return fail(null, `request not sent: ${err?.message || String(err)}${detail}`);
+  }
+  const reason = cause;
+  if (CONNECT_ERRORS.has(cause) || method === 'GET' || method === 'HEAD') {
+    return fail('server-unreachable', `${BASE} (${reason})`);
+  }
+  return fail(
+    'outcome-unknown',
+    `connection lost during ${method} ${requestPath.split('?')[0]} (${reason}); outcome unknown — check the state before retrying`,
+  );
+};
+
+const request = async (method, requestPath, init) => {
+  try {
+    return await fetch(`${BASE}${requestPath}`, { ...init, method });
+  } catch (err) {
+    return networkFailure(method, requestPath, err);
+  }
+};
+
+const readBody = async (method, requestPath, resp, as) => {
+  try {
+    return await resp[as]();
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) return networkFailure(method, requestPath, err);
+    // An error status still has a status to report; a success does not.
+    if (!resp.ok) return null;
+    return fail(null, `HTTP ${resp.status} with a body that is not valid JSON`);
+  }
+};
+
+// Servers built before the contract carry the same facts without `code`; a
+// rollback must not turn a closed tab back into a retryable exit 1.
+const legacyCode = (body) => {
+  if (body.error === 'Tab not found') return 'tab-not-found';
+  if (body.error === 'Tab session is not running' || body.error === 'session not found') return 'session-not-running';
+  if (body.error === 'agent-target-changed') return 'target-changed';
+  if (body.error === 'agent-not-ready' && typeof body.detail === 'string') return body.detail;
+  return null;
+};
+
+const failFromResponse = (resp, body) => {
+  if (!body || typeof body !== 'object') return fail(null, `HTTP ${resp.status}`);
+  const code = typeof body.code === 'string' ? body.code : legacyCode(body);
+  const message = typeof body.error === 'string' ? body.error : `HTTP ${resp.status}`;
+  return fail(code, code ? message : `${message} (HTTP ${resp.status})`, body);
 };
 
 const out = (body) => {
   process.stdout.write(JSON.stringify(body, null, 2) + '\n');
 };
 
+const isJson = (resp) => (resp.headers.get('content-type') || '').includes('json');
+
 const api = async (method, path, data) => {
-  const url = `${BASE}${path}`;
   const opts = {
     method,
     headers: headersFor(path, { 'Content-Type': 'application/json' }),
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
-  const resp = await fetch(url, opts);
-  const body = resp.headers.get('content-type')?.includes('json')
-    ? await resp.json()
-    : null;
-  if (!resp.ok) {
-    const msg = body?.error || `HTTP ${resp.status}`;
-    die(msg);
-  }
+  const resp = await request(method, path, opts);
+  const body = isJson(resp) ? await readBody(method, path, resp, 'json') : null;
+  if (!resp.ok) failFromResponse(resp, body);
+  // Every CLI route answers JSON; a success without it is not a purplemux
+  // answer (another server on the port), and printing `null` would pass it off
+  // as one.
+  if (!isJson(resp)) fail(null, `HTTP ${resp.status} without a JSON body — is purplemux the server on port ${PORT}?`);
   return { resp, body };
 };
 
 const apiRaw = async (method, path) => {
-  const url = `${BASE}${path}`;
-  const resp = await fetch(url, {
-    method,
-    headers: headersFor(path),
-  });
-  if (!resp.ok) {
-    const ct = resp.headers.get('content-type') || '';
-    if (ct.includes('json')) {
-      const body = await resp.json();
-      die(body?.error || `HTTP ${resp.status}`);
-    }
-    die(`HTTP ${resp.status}`);
-  }
+  const resp = await request(method, path, { headers: headersFor(path) });
+  if (!resp.ok) failFromResponse(resp, isJson(resp) ? await readBody(method, path, resp, 'json') : null);
   return resp;
 };
 
@@ -397,6 +554,8 @@ const cmdTabSteer = async (args) => {
 // The send waits for the target to reach a state that can accept a turn. An
 // agent TUI that is still booting swallows the Enter after the paste, so a
 // send that does not wait can report success over an agent that never starts.
+const MAX_CLI_WAIT_MS = 240_000;
+
 const cmdTabSend = async (args) => {
   requireEnv();
   const file = flagValue(args, '--file') || flagValue(args, '-f');
@@ -419,6 +578,13 @@ const cmdTabSend = async (args) => {
   // default would silently wait 60s for a caller that asked for something else.
   if (waitMsGiven && (waitMs === null || !/^\d+$/.test(waitMs))) {
     die('--wait-ms must be a whole number of milliseconds');
+  }
+  // Node's fetch stops waiting for response headers at 300 s. The server still
+  // takes the dispatch lock and types the prompt after the wait, so the cap
+  // leaves a minute for that; it narrows the outcome-unknown window, it does
+  // not close it.
+  if (waitMsGiven && Number(waitMs) > MAX_CLI_WAIT_MS) {
+    die(`--wait-ms must be at most ${MAX_CLI_WAIT_MS} (the CLI's HTTP client stops waiting at 300 s)`);
   }
   const wsId = resolveWsForTab(args);
   const { body } = await api(
@@ -461,11 +627,14 @@ const cmdTabClose = async (args) => {
   const tabId = rest[0];
   if (!tabId) die('tab ID is required');
   const wsId = resolveWsForTab(args);
-  const { resp } = await api(
+  const { body } = await api(
     'DELETE',
     `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
   );
-  if (resp.ok) process.stdout.write('ok\n');
+  // A 200 is not a close: the server answers `ok: false` when the layout kept
+  // the tab, and printing ok over that hides a tab that is still running.
+  if (body?.ok !== true) return fail('close-not-confirmed', `the server answered ${JSON.stringify(body)}`);
+  process.stdout.write('ok\n');
 };
 
 // Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
@@ -578,7 +747,7 @@ const cmdTabBrowser = async (args) => {
       const path = `/api/cli/tabs/${tabId}/browser/screenshot?${qs}&full=${full}`;
       if (outPath) {
         const resp = await apiRaw('GET', path);
-        const buf = Buffer.from(await resp.arrayBuffer());
+        const buf = Buffer.from(await readBody('GET', path, resp, 'arrayBuffer'));
         fs.writeFileSync(outPath, buf);
         out({ saved: outPath, bytes: buf.byteLength });
       } else {
@@ -627,11 +796,9 @@ const cmdTabBrowser = async (args) => {
 
 const cmdApiGuide = async () => {
   requireEnv();
-  const resp = await fetch(`${BASE}/api/cli/api-guide`, {
-    headers: headersFor('/api/cli/api-guide'),
-  });
-  if (!resp.ok) die(`HTTP ${resp.status}`);
-  process.stdout.write((await resp.text()) + '\n');
+  const guidePath = '/api/cli/api-guide';
+  const resp = await apiRaw('GET', guidePath);
+  process.stdout.write((await readBody('GET', guidePath, resp, 'text')) + '\n');
 };
 
 const flagValue = (args, name) => {
@@ -685,13 +852,15 @@ Commands:
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
-                                           for an agent tab to be able to accept a turn; --wait-ms N changes
-                                           the budget, --no-wait answers immediately. On timeout nothing is
-                                           pasted and the call fails with agent-not-ready.
+                                           for an agent tab to be able to accept a turn; --wait-ms N (max
+                                           240000) changes the budget, --no-wait answers immediately. On timeout nothing is
+                                           pasted and the call exits 5 (readiness-timeout).
+                                           Exit 4 (tab-not-found, session-not-running, target-changed) means
+                                           the tab is gone: never retry it, and never loop on it.
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status (includes registered probes + background jobs)
   tab result -w WS TAB_ID                  Capture tab pane content
-  tab close -w WS TAB_ID                   Close a tab
+  tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
@@ -740,6 +909,20 @@ Mission event examples:
   The configured orchestrator may promote that same item only after checking existing authority and identifying the remaining human-exclusive need.
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-review-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true,"humanReview":{"humanNeed":"decision","humanReason":"Choose the acceptable product rollout risk.","handling":"Existing rollout guidance does not choose product risk tolerance.","reviewerTabId":"tab-orchestrator"}}}]}'
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-resolve-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":2,"producerAt":1700000000004,"bindingGeneration":1,"type":"attention.resolved","payload":{"itemId":"question-1","resolution":"Applied the gradual rollout"}}]}'
+
+Exit codes:
+  exit  meaning                                                      retry?
+     0  success                                                      —
+     1  unexpected error (unmapped code, 5xx, write outcome unknown)  investigate first
+     2  usage error (bad or missing argument, or a usage code)       fix the command
+     3  conflict: held by another holder, or refused by state        only after the state changes
+     4  target gone: tab-not-found, session-not-running,             never
+        target-changed
+     5  not ready yet: readiness-timeout                             yes, bounded
+     6  server unreachable (refused, no port, read interrupted)      yes, bounded
+     7  not found: the named lease, note or watch does not exist     —
+  stderr names the code and its class, e.g.
+    error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
 
 Environment:
   PMUX_PORT          Server port (falls back to ~/.purplemux/port)
@@ -800,5 +983,5 @@ const main = async () => {
 };
 
 main().catch((err) => {
-  die(err.message || String(err));
+  fail(null, err.message || String(err));
 });

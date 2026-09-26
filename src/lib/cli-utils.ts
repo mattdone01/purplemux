@@ -5,6 +5,7 @@ import { getWorkspaceById } from '@/lib/workspace-store';
 import { resolveCliScope, type TCliScope } from '@/lib/workspace-token';
 import { getBrowserBridge, type IBrowserBridgeClient } from '@/lib/browser-bridge-client';
 import type { ITab } from '@/types/terminal';
+import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
 
 export interface ITabLocation {
   workspaceId: string;
@@ -63,7 +64,7 @@ export const authorizeWorkspace = async (
 ): Promise<TCliScope | null> => {
   const scope = resolveCliScope(req);
   if (!scope) {
-    res.status(403).json({ error: 'Forbidden' });
+    res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
   }
   if (!(await canAccessWorkspace(scope, workspaceId))) {
@@ -71,6 +72,7 @@ export const authorizeWorkspace = async (
       error: `Workspace ${workspaceId} is out of scope for this tab (scoped to ${
         scope.type === 'workspace' ? scope.workspaceId : 'admin'
       }). Ask the human to add it to that workspace's allowedPeers if cross-workspace access is intended.`,
+      code: 'forbidden',
     });
     return null;
   }
@@ -92,7 +94,7 @@ export const authorizeWorkspaceInput = async (
 ): Promise<TCliScope | null> => {
   const scope = resolveCliScope(req);
   if (!scope) {
-    res.status(403).json({ error: 'Forbidden' });
+    res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
   }
   if (!canDriveWorkspace(scope, workspaceId)) {
@@ -102,6 +104,7 @@ export const authorizeWorkspaceInput = async (
           scope.type === 'workspace' ? `scoped to ${scope.workspaceId}` : 'using the global token'
         }). Reads are unaffected. Set PMUX_TOKEN to the ${workspaceId} token (and unset PMUX_TAB_TOKEN, which takes precedence) to drive its tabs; ` +
         'allowedPeers deliberately does not grant input.',
+      code: 'forbidden',
     });
     return null;
   }
@@ -153,7 +156,7 @@ export const withBrowserTab = async (
   if (!(await authorizeWorkspace(req, res, workspaceId))) return;
   const found = await findTab(workspaceId, tabId);
   if (!found) {
-    res.status(404).json({ error: 'Tab not found' });
+    res.status(404).json(TAB_NOT_FOUND_BODY);
     return;
   }
   if (found.tab.panelType !== 'web-browser') {
