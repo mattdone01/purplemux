@@ -64,3 +64,20 @@ Worker ownership: core owns types/validation/SQLite/API/CLI and store unit/API t
 Required focused evidence: persisted open question survives progress/reopen; answer idempotency and competing device conflict; atomic rejection on DB failure; restart at before/after paste never loses answer or falsely acknowledges; stale binding/native prompt/shell/orphan refusal; workspace-scope and human-cookie/Origin enforcement; consistent snapshot/replay; duplicate/bootstrap-after-new-event protection; worker-active/orchestrator-idle classification; non-actionable historical candidates; 320px web layout and existing navigation; mobile old-server feature detection and draft retention. Then repository test/type/lint/build gates once at integrated SHA.
 
 Deferred integrations: native provider permission responses, epic-board API/state reconciliation, scheduler/reprioritization, event retention, offline durable mobile mutation queue, and transcript LLM summarization. Existing standup stays compatible; transition-only Mission Control reporting must be described in kickoff/resume adoption without quietly claiming installed external skills changed. No completion claim until actual workspace bootstrap has been run and reported with provisional/held entries visible.
+
+## Coordination panel (story 20, epic purplemux-portfolio-coordination)
+
+`GET /api/mission-control/coordination` (human session only; a CLI token gets 401) serves one read-only
+snapshot: leases (with `holderState`, age, expiry), open notes, watches of every workspace, active grants,
+held inbox deliveries, host pressure and host signals. Each section is its own `{ ok, items } | { ok: false,
+error }`, so an unreadable store shows its error and never blanks the others. It adds nothing to
+`IMissionSnapshot` or the Mission Control store.
+
+- **Host** (Linux; `statfs`): disk used % and free bytes for `/` and, when it differs, the filesystem of
+  `~/.purplemux`; inode use of `/` and `/tmp`; load average; memory available. Disk ≥ 90 % or inodes ≥ 85 %
+  render as warnings. Off Linux the section says why, never zeros.
+- **Host signals**: set `hostSignalCommand` in `~/.purplemux/config.json` to a shell command that prints the
+  architecture's "Host-signal JSON" (`schemaVersion`, `stampedAt`, `gateSlots`, `worktrees`, `tmpInodesPct`;
+  unknown keys ignored). The server runs it every 5 minutes with a 10 s timeout (the config is re-read each
+  run) and validates it with zod. The panel shows the values and the run stamp, marks them stale after 15
+  minutes, shows a failing command's or a validation error's text, and says "not configured" without one.

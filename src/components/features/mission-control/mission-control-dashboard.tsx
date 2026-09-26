@@ -17,6 +17,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
+import CoordinationPanel from '@/components/features/mission-control/coordination-panel';
 import MissionControlAnswerCard, {
   MissionControlDeliveryCard,
 } from '@/components/features/mission-control/mission-control-answer-card';
@@ -578,6 +579,7 @@ const MissionControlDashboard = ({
         </section>
       )}
 
+      <CoordinationPanel />
       <section className="space-y-3" aria-labelledby="workspaces-heading">
         <div id="workspaces-heading">
           <SectionHeading

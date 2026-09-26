@@ -40,6 +40,11 @@ export interface IConfigData {
   lineHeightCustom?: number;
   terminalKeyBar?: 'auto' | 'always' | 'never';
   systemResourcesEnabled?: boolean;
+  /**
+   * A shell command printing the host-signal JSON (architecture "Host-signal JSON"), run every 5 min
+   * with a 10 s timeout for the Mission Control coordination panel (story 20). Unset = not configured.
+   */
+  hostSignalCommand?: string;
   networkAccess?: TNetworkAccess;
   updatedAt: string;
 }
