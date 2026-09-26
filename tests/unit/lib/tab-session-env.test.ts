@@ -96,7 +96,7 @@ describe('a tab created after this change carries its identity', () => {
     expect((await paneEnvironment()).PMUX_TAB_TOKEN).toBe(first);
   });
 
-  it('sets no tab identity for a session created without one, and never leaks the server\'s own', async () => {
+  it('sets no tab identity for a session created without one; the server drops its own at boot', async () => {
     const savedSnapshot = process.env.__PMUX_PRISTINE_ENV;
     delete process.env.__PMUX_PRISTINE_ENV;
     process.env.PMUX_TAB_TOKEN = 'server-own-token';
@@ -104,7 +104,9 @@ describe('a tab created after this change carries its identity', () => {
     const { createSession } = await import('@/lib/tmux');
     if (savedSnapshot === undefined) delete process.env.__PMUX_PRISTINE_ENV;
     else process.env.__PMUX_PRISTINE_ENV = savedSnapshot;
-    expect(PRISTINE_ENV.PMUX_TAB_TOKEN).toBe('server-own-token');
+    // A server started from inside a tab drops that tab's identity at boot (story 16 review r1).
+    expect(PRISTINE_ENV.PMUX_TAB_TOKEN).toBeUndefined();
+    expect(process.env.PMUX_TAB_TOKEN).toBeUndefined();
 
     await createSession(SESSION, 80, 24);
     const env = await paneEnvironment();

@@ -24,7 +24,7 @@ const providers = vi.hoisted(() => ({
   getProviderByPanelType: vi.fn((): { id: string } | null => null),
 }));
 const layout = vi.hoisted(() => ({
-  removeTabFromPane: vi.fn(async () => true),
+  closeTab: vi.fn(async (): Promise<{ ok: boolean; reap: unknown }> => ({ ok: true, reap: null })),
   updateTabAgentLaunchConfig: vi.fn(),
 }));
 
@@ -82,10 +82,10 @@ const TAB: ITab = { id: 'tab-1', sessionName: 'pt-ws-1-pane-1-tab-1', name: 'wor
 const QUERY = { tabId: 'tab-1', workspaceId: 'ws-1' };
 const TAB_NOT_FOUND = { error: 'Tab not found', code: 'tab-not-found' };
 
-const call = async (route: string, method: string, body: unknown = {}): Promise<IFakeResponse> => {
+const call = async (route: string, method: string, body: unknown = {}, query: Record<string, string> = QUERY): Promise<IFakeResponse> => {
   const { default: handler } = (await import(route)) as { default: THandler };
   const response = fakeResponse();
-  await handler({ method, query: QUERY, body } as unknown as NextApiRequest, response.res);
+  await handler({ method, query, body } as unknown as NextApiRequest, response.res);
   return response;
 };
 
@@ -172,9 +172,19 @@ describe('a replaced tab is target-changed', () => {
   });
 });
 
+describe('DELETE reports what the close reaped (ADR-0016)', () => {
+  it('passes keepProcesses through and returns the reap result', async () => {
+    const reap = { reaper: 'linux', envMarker: 'present', killed: [{ pid: 7, comm: 'sleep', args: 'sleep 600' }], survivors: [] };
+    layout.closeTab.mockResolvedValue({ ok: true, reap });
+    const response = await call('@/pages/api/cli/tabs/[tabId]/index', 'DELETE', {}, { ...QUERY, keepProcesses: '1' });
+    expect(layout.closeTab).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(String), { keepProcesses: true });
+    expect(response.body).toEqual({ ok: true, ...reap });
+  });
+});
+
 describe('DELETE answers ok as the layout reports it', () => {
   it.each([true, false])('ok: %s', async (ok) => {
-    layout.removeTabFromPane.mockResolvedValue(ok);
+    layout.closeTab.mockResolvedValue({ ok, reap: null });
 
     const response = await call('@/pages/api/cli/tabs/[tabId]/index', 'DELETE');
 

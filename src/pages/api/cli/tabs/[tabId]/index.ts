@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
-import { removeTabFromPane, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
+import { closeTab, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
 import { getProviderByPanelType } from '@/lib/providers';
 import { isValidModelName } from '@/lib/claude-command-shared';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
@@ -43,8 +43,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'DELETE') {
     const found = await findTab(workspaceId, tabId);
     if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
-    const ok = await removeTabFromPane(workspaceId, found.paneId, tabId);
-    return res.status(200).json({ ok });
+    // The tab's processes are reaped before its session dies (ADR-0016);
+    // keepProcesses=1 signals only the pane group, as before story 16.
+    const keepProcesses = req.query.keepProcesses === '1' || req.query.keepProcesses === 'true';
+    const { ok, reap } = await closeTab(workspaceId, found.paneId, tabId, { keepProcesses });
+    return res.status(200).json({ ok, ...(reap ? { reaper: reap.reaper, envMarker: reap.envMarker, killed: reap.killed, survivors: reap.survivors } : {}) });
   }
 
   if (req.method === 'PATCH' && req.body && typeof req.body === 'object' && 'reportsTo' in req.body) {

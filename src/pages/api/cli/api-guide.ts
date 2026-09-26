@@ -170,10 +170,15 @@ PATCH /api/cli/tabs/<tabId>?workspaceId=WS
   as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
   Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
-DELETE /api/cli/tabs/<tabId>?workspaceId=WS
-  Close the tab (kills tmux session and removes from layout).
-  Response: { "ok": boolean } — false means the layout kept the tab; the CLI then exits 1
-  (close-not-confirmed) instead of printing ok.
+DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
+  Close the tab: reap its processes, kill its tmux session, remove it from the layout.
+  Reaped (Linux, ADR-0016): every descendant of the pane and every process of the server's user
+  whose environment holds exactly PMUX_TAB_ID=<tabId> — which survives &, disown, nohup and
+  setsid. SIGTERM, up to 3 s, then SIGKILL. keepProcesses=1 signals only the pane's process group.
+  Response: { "ok": boolean, "reaper": "linux" | "unavailable", "envMarker": "present" | "absent" | "unknown",
+              "killed": [{ "pid", "comm", "args" }], "survivors": [...] } — ok false means the layout kept
+  the tab; the CLI then exits 1 (close-not-confirmed) instead of printing ok. Every kill is audited
+  in ~/.purplemux/audit/coordination.jsonl.
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
