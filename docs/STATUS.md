@@ -279,15 +279,20 @@ Three rules are specific to grok and are deliberate:
 purplemux registers no blocking `Stop` gate, so grok's `Stop` fire is a genuine turn end rather than
 a continuation round.
 
-Codex's TUI-ready detector (`checkCodexTuiReady`) is **not** applied to grok. grok and Claude share a
-narrower fallback instead (story 17, L8): a `claude-code` or `grok-cli` tab that stays `inactive` for
-more than 8 s (`READINESS_PROBE_AFTER_MS`) while its agent process runs gets one pane capture per
-poll. If the pane shows an empty composer and no option list (`paneShowsEmptyComposer`, the check
-the inbox runs, with the dim prompt suggestion removed), the poll fires a synthetic `session-start`
-and logs `readiness: pane-probe`. A trust prompt (`❯ No, exit`) and the first-run picker
-(`❯ 2. Dark mode`) carry the marker on a non-empty line, so they stay `inactive`; both are real
-fixtures under `tests/fixtures/panes/`. grok's composer marker (`[›❯>]`) is not measured on a live
-pane: no grok tab was running when the fixtures were captured.
+Codex's TUI-ready detector (`checkCodexTuiReady`) is **not** applied to grok, and neither is the
+Claude fallback below: grok's composer marker (`[›❯>]`) also matches a bare `>` line, and no real grok
+pane is pinned yet (story 30 F8).
+
+Claude readiness fallback (story 17, L8): a `claude-code` tab that stays `inactive` for more than 8 s
+(`READINESS_PROBE_AFTER_MS`) while its agent process runs gets one pane capture per poll. The clock
+runs only while the agent runs, restarts on every launch (`markAgentLaunch`), and also waits 8 s past
+`lastResumeOrStartedAt`; launch polls at 9.5 s and 12 s reach it without the interval poll. The
+capture is the pane at its own size with escapes (no resize). If it shows an empty composer and no
+option list (`paneShowsEmptyComposer`, the check the inbox runs, with the dim suggestion or
+placeholder removed), and the tab is still `inactive` with no event since the probe began, the poll
+fires a synthetic `session-start` and logs `readiness: pane-probe`. A trust prompt (`❯ No, exit`) and
+the first-run picker (`❯ 2. Dark mode`) stay `inactive`. Fixtures: `tests/fixtures/panes/`. A fresh
+Claude's composer placeholder (`Try "…"`) is dim, so a capture without escapes reads it as typed text.
 
 A session id the poll detects (`detectActiveSession`) is persisted to the layout when no hook bound
 one, so `tab status` and `tab list` show it after a restart. The poll may move a binding it wrote

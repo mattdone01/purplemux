@@ -33,12 +33,16 @@ export const parseSgrLine = (line: string, dimAtStart = false): { segments: ISeg
     push(line.slice(last, match.index));
     last = match.index! + match[0].length;
     if (match[2] !== 'm') continue;
-    const params = match[1] === '' ? ['0'] : match[1].split(/[;:]/);
+    // `;` separates parameters; `:` separates a parameter's own sub-parameters
+    // (`4:2` is double underline, `38:5:2` a colour), so only a group's head is an attribute.
+    const params = match[1] === '' ? ['0'] : match[1].split(';');
     for (let i = 0; i < params.length; i++) {
-      const p = params[i];
-      // 38/48/58 carry a colour argument list: skip it, so its numbers are not read as attributes.
+      const group = params[i];
+      const p = group.split(':')[0];
+      // 38/48/58 carry a colour: in `;` form the arguments follow as separate
+      // parameters and are skipped, so their numbers are not read as attributes.
       if (p === '38' || p === '48' || p === '58') {
-        i += params[i + 1] === '5' ? 2 : params[i + 1] === '2' ? 4 : 0;
+        if (!group.includes(':')) i += params[i + 1] === '5' ? 2 : params[i + 1] === '2' ? 4 : 0;
         continue;
       }
       if (p === '0' || p === '') dim = false;
@@ -84,14 +88,16 @@ export const renderPaneResult = (captured: string, panelType: TPanelType | undef
   const lines = captured.split('\n');
   const from = composerLineIndex(lines, panelType);
   let suggestion: string | null = null;
+  let dimCarry = false;
   if (mode === 'raw') {
-    if (from !== -1) {
-      const dim = parseSgrLine(lines[from]).segments.filter((s) => s.dim).map((s) => s.text).join('').trim();
-      suggestion = dim || null;
+    // The same suggestion as the default mode: dim carried over from the lines above counts.
+    for (let i = 0; i <= from; i++) {
+      const { segments, dimAtEnd } = parseSgrLine(lines[i], dimCarry);
+      dimCarry = dimAtEnd;
+      if (i === from) suggestion = segments.filter((s) => s.dim).map((s) => s.text).join('').trim() || null;
     }
     return { content: captured, suggestion };
   }
-  let dimCarry = false;
   const out = lines.map((line, i) => {
     const { segments, dimAtEnd } = parseSgrLine(line, dimCarry);
     dimCarry = dimAtEnd;

@@ -23,6 +23,8 @@ const state = vi.hoisted(() => ({
   pane: '' as string | null,
   jsonlPath: null as string | null,
   captures: 0,
+  captureOpts: [] as unknown[],
+  duringCapture: null as null | (() => Promise<void> | void),
 }));
 
 vi.mock('@/lib/logger', () => {
@@ -53,10 +55,10 @@ vi.mock('@/lib/tmux', async (importOriginal) => ({
   getPaneTitle: vi.fn(async () => ''),
   getSessionPanePid: vi.fn(async () => null),
   getSessionCwd: vi.fn(async () => null),
-}));
-vi.mock('@/lib/capture-at-width', () => ({
-  capturePaneAtWidth: vi.fn(async () => {
+  capturePaneContent: vi.fn(async (_session: string, opts?: { escapes?: boolean }) => {
     state.captures += 1;
+    state.captureOpts.push(opts);
+    await state.duringCapture?.();
     return state.pane;
   }),
 }));
@@ -111,10 +113,12 @@ describe('readiness pane-probe fallback (story 17)', () => {
     state.pane = fixture('claude-empty-composer.ansi');
     state.jsonlPath = null;
     state.captures = 0;
+    state.captureOpts = [];
+    state.duringCapture = null;
   });
   afterEach(() => vi.useRealTimers());
 
-  it('marks an inactive claude tab idle once its pane shows an empty composer after 8 s (W1 01:06Z)', async () => {
+  it('marks an inactive claude tab idle once its pane shows an empty composer after 8 s (W1 01:06Z), and `tab send` then accepts it', async () => {
     const { entry, pollAt } = await setup();
     await pollAt(0);
     await pollAt(5_000);
@@ -123,6 +127,56 @@ describe('readiness pane-probe fallback (story 17)', () => {
     await pollAt(8_500);
     expect(entry.cliState).toBe('idle');
     expect(state.captures).toBe(1);
+    expect(state.captureOpts).toEqual([{ escapes: true }]);
+    const { isComposerReadyCliState } = await import('@/lib/tab-send');
+    expect(isComposerReadyCliState(entry.cliState)).toBe(true);
+  });
+
+  it('marks a fresh Claude (dim placeholder, 80x24) idle', async () => {
+    state.pane = fixture('claude-fresh-80x24.ansi');
+    const { entry, pollAt } = await setup();
+    await pollAt(0);
+    await pollAt(9_000);
+    expect(entry.cliState).toBe('idle');
+  });
+
+  it('starts the clock only while the agent runs: a relaunch after a long idle shell waits 8 s again (review r1 finding 1)', async () => {
+    state.running = false;
+    const { manager, entry, pollAt } = await setup();
+    await pollAt(0);
+    await pollAt(30_000);
+    await pollAt(60_000);
+    state.running = true;
+    manager.markAgentLaunch('tab-a');
+    await pollAt(60_700);
+    await pollAt(61_500);
+    await pollAt(66_000);
+    expect(state.captures).toBe(0);
+    expect(entry.cliState).toBe('inactive');
+    await pollAt(69_500);
+    expect(entry.cliState).toBe('idle');
+  });
+
+  it('waits 8 s from the last launch stamp even when the clock is older', async () => {
+    const { manager, entry, pollAt } = await setup();
+    await pollAt(0);
+    vi.setSystemTime(T0 + 7_000);
+    manager.markAgentLaunch('tab-a');
+    await pollAt(7_000);
+    await pollAt(14_000);
+    expect(state.captures).toBe(0);
+    await pollAt(15_500);
+    expect(entry.cliState).toBe('idle');
+  });
+
+  it('does not overwrite an event that arrived during the probe (review r1 finding 2: no false turn end)', async () => {
+    const { manager, entry, pollAt, paste } = await setup();
+    await pollAt(0);
+    state.duringCapture = () => { manager.updateTabFromHook('tmux-tab-a', 'prompt-submit'); };
+    await pollAt(9_000);
+    expect(entry.cliState).toBe('busy');
+    expect(entry.lastEvent?.name).toBe('prompt-submit');
+    expect(paste).not.toHaveBeenCalled();
   });
 
   it('reads a dim prompt suggestion on the composer as an empty composer', async () => {
@@ -133,15 +187,15 @@ describe('readiness pane-probe fallback (story 17)', () => {
     expect(entry.cliState).toBe('idle');
   });
 
-  it('applies to grok-cli tabs as well', async () => {
+  it('leaves grok-cli tabs alone until a real grok pane is pinned (review r1 finding 6, story 30 F8)', async () => {
     state.pane = '\n  > \n';
     const { entry, pollAt } = await setup('grok-cli');
-    // grok's own process check: the default provider reads /proc, so force it through the running mock.
     const providers = await import('@/lib/providers');
     vi.spyOn(providers.getProviderByPanelType('grok-cli')!, 'isAgentRunning').mockResolvedValue(true);
     await pollAt(0);
     await pollAt(9_000);
-    expect(entry.cliState).toBe('idle');
+    expect(entry.cliState).toBe('inactive');
+    expect(state.captures).toBe(0);
   });
 
   it.each([
@@ -162,6 +216,7 @@ describe('readiness pane-probe fallback (story 17)', () => {
     const { entry, pollAt } = await setup();
     await pollAt(0);
     await pollAt(9_000);
+    await pollAt(40_000);
     expect(entry.cliState).toBe('inactive');
     expect(state.captures).toBe(0);
   });

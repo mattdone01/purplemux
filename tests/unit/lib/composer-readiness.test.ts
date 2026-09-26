@@ -72,10 +72,17 @@ describe('suggestion-aware readiness (story 17, L7)', () => {
   it.each([
     ['an empty composer', 'claude-empty-composer.ansi', true],
     ['a dim suggestion', 'claude-dim-suggestion.ansi', true],
+    ['a fresh Claude, 80x24 detached (dim placeholder)', 'claude-fresh-80x24.ansi', true],
+    ['a fresh Claude, 200x60', 'claude-fresh-200x60.ansi', true],
     ['a trust prompt (❯ No, exit)', 'claude-trust-prompt.ansi', false],
     ['the first-run theme picker (❯ 2. Dark mode)', 'claude-onboarding-theme.ansi', false],
   ])('paneShowsEmptyComposer: %s → %s', (_label, name, ready) => {
     expect(paneShowsEmptyComposer('claude-code', pane(name))).toBe(ready);
+  });
+
+  it('reads a fresh Claude as not ready without escapes: why every composer capture keeps them', () => {
+    const plain = pane('claude-fresh-80x24.ansi').replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, '');
+    expect(paneShowsEmptyComposer('claude-code', plain)).toBe(false);
   });
 
   it('paneShowsEmptyComposer knows no composer for a terminal', () => {

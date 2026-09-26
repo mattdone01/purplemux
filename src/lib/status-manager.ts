@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo } from '@/lib/layout-store';
 import { onTabClosed } from '@/lib/tab-lifecycle';
-import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
+import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
@@ -93,7 +93,9 @@ const AGENT_LAUNCH_GRACE_MS = 5_000;
 // its prompt up, and `tab send` refuses it (L8: W1, 2026-09-26 01:06Z). After this
 // long inactive with the agent running, the poll looks at the pane (story 17).
 export const READINESS_PROBE_AFTER_MS = 8_000;
-const PANE_PROBE_PANELS: ReadonlySet<TPanelType> = new Set<TPanelType>(['claude-code', 'grok-cli']);
+// Claude only. grok-cli joins once a real grok pane is pinned as a fixture
+// (story 30 F8): its `[›❯>]` marker also matches a bare `>` line.
+const PANE_PROBE_PANELS: ReadonlySet<TPanelType> = new Set<TPanelType>(['claude-code']);
 const AGENT_GUARDED_STATES: Set<TCliState> = new Set(['busy', 'idle', 'needs-input', 'ready-for-review']);
 // tmux set-titles emits "<cmd>|<path>" once a shell takes over the pane.
 // An agent CLI normally writes its own title (no pipe), so this regex
@@ -102,7 +104,10 @@ const SHELL_TITLE_RE = /^[^|]+\|[^|]+$/;
 
 const PROCESS_RETRY_COUNT = 3;
 const JSONL_WATCH_DEBOUNCE_MS = 100;
-const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000] as const;
+// 9.5 s and 12 s: the first polls past READINESS_PROBE_AFTER_MS, counted from
+// the first poll that sees the agent running (~0.7 s), so a tab whose
+// SessionStart hook never fires is probed without waiting for the interval poll.
+const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
 
 const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
@@ -594,7 +599,9 @@ export class StatusManager {
         }
 
         if (existing.cliState === 'inactive' && existing.panelType === 'codex-cli' && provider) {
-          if (await this.checkCodexTuiReady(existing, checkAgentRunning)) {
+          const seq = existing.eventSeq;
+          if (await this.checkCodexTuiReady(existing, checkAgentRunning)
+              && this.stillInactiveAt(tab.id, existing, seq)) {
             hookLog.debug({ tabId: tab.id }, 'codex tui ready — synthetic session-start');
             this.updateTabFromHook(existing.tmuxSession, 'session-start');
             continue;
@@ -603,12 +610,15 @@ export class StatusManager {
 
         if (existing.cliState !== 'inactive') {
           this.inactiveSeenAt.delete(tab.id);
-        } else if (provider && existing.panelType && PANE_PROBE_PANELS.has(existing.panelType)
-            && await this.checkAgentPaneReady(tab.id, existing, now, checkAgentRunning)) {
-          this.inactiveSeenAt.delete(tab.id);
-          hookLog.info({ tabId: tab.id, panelType: existing.panelType }, 'readiness: pane-probe — synthetic session-start');
-          this.updateTabFromHook(existing.tmuxSession, 'session-start');
-          continue;
+        } else if (provider && existing.panelType && PANE_PROBE_PANELS.has(existing.panelType)) {
+          const seq = existing.eventSeq;
+          if (await this.checkAgentPaneReady(tab.id, existing, now, checkAgentRunning)
+              && this.stillInactiveAt(tab.id, existing, seq)) {
+            this.inactiveSeenAt.delete(tab.id);
+            hookLog.info({ tabId: tab.id, panelType: existing.panelType }, 'readiness: pane-probe — synthetic session-start');
+            this.updateTabFromHook(existing.tmuxSession, 'session-start');
+            continue;
+          }
         }
 
         if (terminalChanged || processChanged || processRetryNeeded || messageChanged || panelTypeChanged || summaryChanged || sessionBindingChanged) {
@@ -1484,18 +1494,34 @@ export class StatusManager {
     now: number,
     checkAgentRunning: () => Promise<boolean>,
   ): Promise<boolean> {
+    // The clock runs only while the agent runs: a tab idling at a shell does not
+    // age it, and a relaunch starts it again (review r1: a stale clock probed a
+    // booting TUI at +700 ms).
+    if (!(await checkAgentRunning())) {
+      this.inactiveSeenAt.delete(tabId);
+      return false;
+    }
     const since = this.inactiveSeenAt.get(tabId);
     if (since === undefined) {
       this.inactiveSeenAt.set(tabId, now);
       return false;
     }
     if (now - since < READINESS_PROBE_AFTER_MS) return false;
-    if (!(await checkAgentRunning())) return false;
-    const content = await capturePaneAtWidth(entry.tmuxSession, 80, 24, { escapes: true }).catch((err) => {
-      log.warn('readiness pane-probe capture failed: %s', err);
-      return null;
-    });
+    const launch = entry.lastResumeOrStartedAt;
+    if (launch !== undefined && now - launch < READINESS_PROBE_AFTER_MS) return false;
+    // The pane at its own size: the marker check needs no width, and a resize
+    // would pause a narrow viewer on every poll while a trust prompt waits.
+    const content = await capturePaneContent(entry.tmuxSession, { escapes: true });
     return !!content && paneShowsEmptyComposer(entry.panelType, content);
+  }
+
+  /**
+   * After a probe's awaits: the tab is still this entry, still inactive, and no
+   * event arrived meanwhile. A prompt-submit or notification in that window must
+   * not be overwritten by the synthetic session start (a false turn end).
+   */
+  private stillInactiveAt(tabId: string, entry: ITabStatusEntry, seq: number | undefined): boolean {
+    return this.tabs.get(tabId) === entry && entry.cliState === 'inactive' && entry.eventSeq === seq;
   }
 
   /**
@@ -1509,9 +1535,12 @@ export class StatusManager {
     const persisted = provider.readSessionId(tab);
     if (persisted === detected) return;
     if (persisted && this.pollBoundSessions.get(tabId) !== persisted) return;
-    this.pollBoundSessions.set(tabId, detected);
-    hookLog.debug({ tabId, sessionId: detected }, 'session id bound by poll — persisted');
-    this.updateAgentState(tab.sessionName, provider, { sessionId: detected }).catch((err) => {
+    // Ownership is recorded only once the write lands: a failed move leaves the
+    // old id in the layout, and the next poll must still be allowed to retry it.
+    this.updateAgentState(tab.sessionName, provider, { sessionId: detected }).then(() => {
+      this.pollBoundSessions.set(tabId, detected);
+      hookLog.debug({ tabId, sessionId: detected }, 'session id bound by poll — persisted');
+    }).catch((err) => {
       log.warn(`poll session persist failed: ${err instanceof Error ? err.message : err}`);
     });
   }
@@ -1929,6 +1958,7 @@ export class StatusManager {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
     entry.lastResumeOrStartedAt = Date.now();
+    this.inactiveSeenAt.delete(tabId);
     const provider = getProviderByPanelType(entry.panelType);
     const isCodex = entry.agentProviderId === CODEX_PROVIDER_ID || entry.panelType === 'codex-cli';
     const nextSessionId = isCodex
