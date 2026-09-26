@@ -26,6 +26,17 @@ export interface IGrant {
   expiryNotedAt: number | null;
 }
 
+/** A tab the web dialog lists as a possible grantee (story 28). */
+export interface IGrantee {
+  workspaceId: string;
+  workspaceName: string;
+  tabId: string;
+  name: string;
+  panelType: string;
+  /** Only `launch` may hold a grant (ADR-0014). */
+  identity: 'launch' | 'hook' | 'none';
+}
+
 export interface IGrantsState {
   grants: IGrant[];
 }

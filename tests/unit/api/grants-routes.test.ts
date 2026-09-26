@@ -10,6 +10,7 @@ import type { TCliScope } from '@/lib/workspace-token';
 
 const audit = vi.hoisted(() => vi.fn(async (_e: Record<string, unknown>) => {}));
 const scopeHolder = vi.hoisted(() => ({ scope: null as TCliScope | null }));
+const layouts = vi.hoisted(() => ({ dir: '', idsError: null as Error | null }));
 
 vi.mock('@/lib/auth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/auth')>()),
@@ -20,12 +21,19 @@ vi.mock('@/lib/config-store', async (importOriginal) => ({
   readConfig: vi.fn(async () => ({ authPassword: 'scrypt:stored' })),
   verifyPassword: vi.fn(async (plain: string) => plain === 'right'),
 }));
-vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: vi.fn(async (id: string) => (['ws-1', 'ws-2', 'ws-3'].includes(id) ? { id } : null)) }));
+vi.mock('@/lib/workspace-store', () => ({
+  getWorkspaceById: vi.fn(async (id: string) => (['ws-1', 'ws-2', 'ws-3'].includes(id) ? { id } : null)),
+  getWorkspaces: vi.fn(async () => ({ workspaces: [{ id: 'ws-1', name: 'Portfolio' }, { id: 'ws-2', name: 'Billing' }] })),
+  readWorkspaceIdsStrict: vi.fn(async () => {
+    if (layouts.idsError) throw layouts.idsError;
+    return ['ws-1', 'ws-2', 'ws-3'];
+  }),
+}));
 vi.mock('@/lib/layout-store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/layout-store')>()),
-  resolveLayoutFile: (ws: string) => ws,
-  readLayoutFile: vi.fn(async (ws: string) => (ws === 'ws-1' ? { root: {} } : null)),
-  collectAllTabs: () => [{ id: 'tab-a' }, { id: 'tab-old' }],
+  resolveLayoutFile: (ws: string) => `${layouts.dir}/${ws}.json`,
+  readLayoutFile: vi.fn(async (file: string) => (file.endsWith('/ws-1.json') ? { root: {} } : null)),
+  collectAllTabs: () => [{ id: 'tab-a', name: 'orch', panelType: 'claude-code' }, { id: 'tab-old', name: 'old' }, { id: 'tab-web', name: 'web', panelType: 'web-browser' }],
 }));
 vi.mock('@/lib/tab-token', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/tab-token')>()),
@@ -61,6 +69,11 @@ const create = (over: Record<string, unknown> = {}, opts: Parameters<typeof call
 
 describe('grant routes', () => {
   beforeEach(async () => {
+    layouts.idsError = null;
+    // ws-1 readable, ws-2 corrupt (unreadable, reported), ws-3 has no layout yet (no tabs).
+    layouts.dir = fs.mkdtempSync(`${(await import('os')).tmpdir()}/pmux-grant-layouts-`);
+    fs.writeFileSync(`${layouts.dir}/ws-1.json`, JSON.stringify({ root: {} }));
+    fs.writeFileSync(`${layouts.dir}/ws-2.json`, '{nope');
     const { grantsFile, reloadGrants } = await import('@/lib/grant-store');
     const { resetStepUp } = await import('@/lib/grant-service');
     fs.rmSync(grantsFile(), { force: true });
@@ -72,12 +85,44 @@ describe('grant routes', () => {
     const { grantsFile, reloadGrants } = await import('@/lib/grant-store');
     fs.rmSync(grantsFile(), { force: true });
     reloadGrants();
+    fs.rmSync(layouts.dir, { recursive: true, force: true });
   });
 
   it('refuses any caller without a human session: the admin CLI token alone is 401', async () => {
     const r = await create({}, { cookie: null });
     expect(r).toMatchObject({ status: 401, body: { code: 'unauthorized' } });
     expect((await call('@/pages/api/grants', 'GET', { cookie: null })).status).toBe(401);
+  });
+
+  it('GET lists the grants and every grantee tab with its identity (story 28); browser tabs are not grantees', async () => {
+    await create();
+    // A browser's same-origin GET over plain HTTP to a LAN address carries neither Origin nor
+    // Sec-Fetch-Site (story 28 review r1): the read needs the session only.
+    const r = await call('@/pages/api/grants', 'GET', { origin: null });
+    expect(r.status).toBe(200);
+    expect(r.body.grants).toHaveLength(1);
+    const body = r.body as unknown as { grantees: unknown[]; unreadableWorkspaceIds: string[]; granteesError: string | null; serverNow: number };
+    expect(body.grantees).toEqual([
+      { workspaceId: 'ws-1', workspaceName: 'Portfolio', tabId: 'tab-a', name: 'orch', panelType: 'claude-code', identity: 'launch' },
+      { workspaceId: 'ws-1', workspaceName: 'Portfolio', tabId: 'tab-old', name: 'old', panelType: 'terminal', identity: 'hook' },
+    ]);
+    // ws-2's layout is corrupt: reported, never listed as "no tabs"; ws-3 has none yet.
+    expect(body.unreadableWorkspaceIds).toEqual(['ws-2']);
+    expect(body.granteesError).toBeNull();
+    expect(typeof body.serverNow).toBe('number');
+    // Strict and read-only: the corrupt layout is not copied aside.
+    expect(fs.readdirSync(layouts.dir).sort()).toEqual(['ws-1.json', 'ws-2.json']);
+  });
+
+  it('GET with an unreadable workspaces.json still lists the grants and reports the tab-list error', async () => {
+    layouts.idsError = new Error('workspaces.json is malformed');
+    const r = await call('@/pages/api/grants', 'GET', { origin: null });
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ grantees: [], granteesError: 'workspaces.json is malformed' });
+  });
+
+  it('GET still needs the human session (401 without it)', async () => {
+    expect((await call('@/pages/api/grants', 'GET', { cookie: null, origin: null })).status).toBe(401);
   });
 
   it('refuses a cross-origin request even with a session (403)', async () => {
