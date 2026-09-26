@@ -107,6 +107,7 @@ WORK="$(mktemp -d)"
 LEASE_HELD=0
 CLI_DIR=""
 ANNOUNCE_ID=""
+total=0
 INTERRUPTED=0
 
 S_RELEASE="-"
@@ -138,20 +139,29 @@ token_cli() {
   (unset PMUX_TAB_TOKEN; PMUX_TOKEN="$token" purplemux_cli "$@")
 }
 
+# The announcement is over: re-read the delivered count, then take back every notice still
+# waiting, so none is typed after the restart with an out-of-date "restarts at ~T" (review rounds
+# 1-2). Runs before the restart on a deploy, and from finish() on every other path.
+close_announcement() {
+  [[ -n "${ANNOUNCE_ID:-}" ]] || return 0
+  local withdrawn
+  if admin_cli deploy status "$ANNOUNCE_ID" --json >"$WORK/announce-status.json" 2>/dev/null; then
+    read -r delivered _ < <(helper announce-progress "$WORK/announce-status.json")
+    S_ANNOUNCED="${delivered}/${total}"
+  fi
+  if admin_cli deploy withdraw "$ANNOUNCE_ID" >"$WORK/withdraw.json" 2>/dev/null; then
+    withdrawn="$(helper field "$WORK/withdraw.json" withdrawn)"
+    [[ "${withdrawn:-0}" != 0 ]] && S_ANNOUNCED="$S_ANNOUNCED; $withdrawn still waiting, withdrawn"
+  else
+    S_ANNOUNCED="$S_ANNOUNCED; withdraw failed"
+  fi
+  ANNOUNCE_ID=""
+}
+
 finish() {
   local code="$1" verdict="$2"
-  # The announcement is over whatever the verdict: a notice still waiting would tell a tab about a
-  # restart that already happened (or did not), so it is taken back (review round 1).
-  if [[ -n "${ANNOUNCE_ID:-}" ]]; then
-    local withdrawn
-    if admin_cli deploy withdraw "$ANNOUNCE_ID" >"$WORK/withdraw.json" 2>/dev/null; then
-      withdrawn="$(helper field "$WORK/withdraw.json" withdrawn)"
-      [[ "${withdrawn:-0}" != 0 ]] && S_ANNOUNCED="$S_ANNOUNCED; $withdrawn still waiting, withdrawn"
-    else
-      S_ANNOUNCED="$S_ANNOUNCED; withdraw failed"
-    fi
-    ANNOUNCE_ID=""
-  fi
+  # A refusal or an interrupt ends the announcement too (the backstop of close_announcement).
+  close_announcement
   if ((LEASE_HELD)); then
     if admin_cli lease release deploy:purplemux >"$WORK/lease-release.out" 2>&1; then
       S_LEASE="acquired, released"
@@ -520,6 +530,8 @@ else
     sleep "$POLL_S"
   done
 fi
+
+close_announcement
 
 # ---- backup (after the quiet wait, so it holds the state at the restart) ----
 

@@ -450,12 +450,16 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     const announced = order.indexOf('announce');
     expect(announced).toBeGreaterThan(order.findIndex((l) => l.includes('api/cli/leases')));
     expect(order.findIndex((l) => l.includes('api/cli/tabs'))).toBeGreaterThan(announced);
-    expect(order[order.length - 1]).toBe('withdraw');
+    // Taken back before the restart, so the new server never types an out-of-date line (review round 2).
+    const withdrawn = order.indexOf('withdraw');
+    expect(withdrawn).toBeGreaterThan(announced);
+    expect(order.findIndex((l) => l.includes('api/health'))).toBeGreaterThan(withdrawn);
     const log = h.log('purplemux');
     const short = h.sha().slice(0, 12);
     expect(log).toContain(`deploy announce --in 5 --reason deploy ${short} --except-tab tab-A --json | PMUX_TOKEN=admin-token PMUX_TAB_TOKEN=unset`);
     expect(log).toContain('deploy status d-fake1234 --json');
-    expect(fs.readFileSync(path.join(h.state, 'status-polls'), 'utf-8').trim()).toBe('2');
+    // Two polls until every notice settled, and one more when the announcement closes before the restart.
+    expect(fs.readFileSync(path.join(h.state, 'status-polls'), 'utf-8').trim()).toBe('3');
   });
 
   it('--announce stops waiting at its deadline, deploys, and withdraws the notices still waiting', () => {

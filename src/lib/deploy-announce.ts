@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
 import type { ICaller } from '@/lib/caller';
+import { createLogger } from '@/lib/logger';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import type { IInboxItem } from '@/types/inbox';
 import type { ILease } from '@/types/lease';
@@ -19,6 +20,8 @@ import type {
 // tells every enabled orchestrator tab and every live holder of a tab-bound
 // lease that the server restarts, through the inbox's fixed `deploy` line
 // (ADR-0012). The reason is stored and shown by `deploy status`; it is never typed.
+
+const log = createLogger('deploy-announce');
 
 export class DeployError extends Error {
   constructor(readonly code: TDeployErrorCode, message: string) {
@@ -237,7 +240,13 @@ export class DeployAnnouncer {
         return { state: { announcements: [...pruneAnnouncements(state, now).announcements, announcement] }, value: announcement };
       });
     } catch (err) {
-      await Promise.all(queued.map((itemId) => this.deps.withdraw(itemId, 'deploy-announce-failed').catch(() => false)));
+      const failed: string[] = [];
+      await Promise.all(queued.map((itemId) => this.deps.withdraw(itemId, 'deploy-announce-failed').catch((e) => {
+        failed.push(`${itemId} (${e instanceof Error ? e.message : e})`);
+        return false;
+      })));
+      // An inbox that refused the enqueue may refuse the withdrawal too: name what stays queued.
+      if (failed.length) log.error(`deploy ${id} failed; these notices could not be withdrawn: ${failed.join(', ')}`);
       throw err;
     }
   }
