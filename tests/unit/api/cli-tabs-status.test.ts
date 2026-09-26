@@ -11,6 +11,7 @@ const tmux = vi.hoisted(() => ({
 }));
 const modelObservation = vi.hoisted(() => ({ getCodexModelStatus: vi.fn() }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn() }));
+const statusManager = vi.hoisted(() => ({ getAllForClient: vi.fn() }));
 
 vi.mock('@/lib/cli-utils', () => cliUtils);
 vi.mock('@/lib/tmux', () => tmux);
@@ -22,6 +23,7 @@ vi.mock('@/lib/providers', () => ({
   }),
 }));
 vi.mock('@/lib/liveness-manager', () => ({ getLivenessManager: () => liveness }));
+vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => statusManager }));
 
 interface IFakeResponse {
   statusCode: number;
@@ -77,6 +79,40 @@ describe('GET /api/cli/tabs/[tabId]/status', () => {
       status: 'mismatch',
     });
     liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [] });
+    statusManager.getAllForClient.mockReturnValue({});
+  });
+
+  const get = async () => {
+    const { default: handler } = await import('@/pages/api/cli/tabs/[tabId]/status');
+    const res = response();
+    await handler({ method: 'GET', query: { workspaceId: 'ws-1', tabId: 'tab-1' } } as unknown as NextApiRequest, res.res);
+    return res;
+  };
+
+  it('reports the live cliState that `tab send` reads, not the layout copy (L8)', async () => {
+    const { resolveTabCliState } = await import('@/lib/tab-send');
+    const layoutTab = { ...tab, cliState: 'inactive' as const };
+    const live = { cliState: 'idle' as const, agentSessionId: null };
+    cliUtils.findTab.mockResolvedValue({ workspaceId: 'ws-1', paneId: 'pane-1', tab: layoutTab });
+    statusManager.getAllForClient.mockReturnValue({ 'tab-1': live });
+    const res = await get();
+    expect(res.body).toMatchObject({ cliState: 'idle' });
+    expect((res.body as { cliState: unknown }).cliState).toBe(resolveTabCliState(layoutTab as never, live));
+  });
+
+  it('falls back to the layout copy when the tab has no live entry', async () => {
+    cliUtils.findTab.mockResolvedValue({ workspaceId: 'ws-1', paneId: 'pane-1', tab: { ...tab, cliState: 'inactive' } });
+    const res = await get();
+    expect(res.body).toMatchObject({ cliState: 'inactive', agentSessionId: '11111111-1111-4111-8111-111111111111' });
+  });
+
+  it('reports the live session id when the poll bound one the layout does not have yet', async () => {
+    statusManager.getAllForClient.mockReturnValue({ 'tab-1': { cliState: 'idle', agentSessionId: '22222222-2222-4222-8222-222222222222' } });
+    const res = await get();
+    expect(res.body).toMatchObject({
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+      claudeSessionId: '22222222-2222-4222-8222-222222222222',
+    });
   });
 
   it('authorizes and locates the tab before exposing its model observation', async () => {

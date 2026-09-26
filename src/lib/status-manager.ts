@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo } from '@/lib/layout-store';
 import { onTabClosed } from '@/lib/tab-lifecycle';
-import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
+import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
@@ -15,6 +15,7 @@ import { createRateLimitsWatcher } from '@/lib/rate-limits-watcher';
 import { createClaudeUsagePoller } from '@/lib/claude-usage-poller';
 import { createLogger } from '@/lib/logger';
 import { capturePaneAtWidth } from '@/lib/capture-at-width';
+import { paneShowsEmptyComposer } from '@/lib/composer-readiness';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
 import { GROK_PROVIDER_ID } from '@/lib/providers/grok';
@@ -25,7 +26,7 @@ import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
 import { cacheCodexRateLimitsFromJsonl } from '@/lib/codex-rate-limits-cache';
 import { parsePermissionOptions } from '@/lib/permission-prompt';
 import type { IPaneInfo } from '@/lib/tmux';
-import type { ITab, IWorkspace } from '@/types/terminal';
+import type { ITab, IWorkspace, TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ITurnErrorEpisode, ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
@@ -88,6 +89,13 @@ const BUSY_STUCK_MS = 10 * 60 * 1000;
 const STOP_SETTLE_MS = 500;
 const PROCESS_START_CACHE_MS = 60_000;
 const AGENT_LAUNCH_GRACE_MS = 5_000;
+// A Claude or Grok tab whose SessionStart hook never fired stays `inactive` with
+// its prompt up, and `tab send` refuses it (L8: W1, 2026-09-26 01:06Z). After this
+// long inactive with the agent running, the poll looks at the pane (story 17).
+export const READINESS_PROBE_AFTER_MS = 8_000;
+// Claude only. grok-cli joins once a real grok pane is pinned as a fixture
+// (story 30 F8): its `[›❯>]` marker also matches a bare `>` line.
+const PANE_PROBE_PANELS: ReadonlySet<TPanelType> = new Set<TPanelType>(['claude-code']);
 const AGENT_GUARDED_STATES: Set<TCliState> = new Set(['busy', 'idle', 'needs-input', 'ready-for-review']);
 // tmux set-titles emits "<cmd>|<path>" once a shell takes over the pane.
 // An agent CLI normally writes its own title (no pipe), so this regex
@@ -96,7 +104,10 @@ const SHELL_TITLE_RE = /^[^|]+\|[^|]+$/;
 
 const PROCESS_RETRY_COUNT = 3;
 const JSONL_WATCH_DEBOUNCE_MS = 100;
-const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000] as const;
+// 9.5 s and 12 s: the first polls past READINESS_PROBE_AFTER_MS, counted from
+// the first poll that sees the agent running (~0.7 s), so a tab whose
+// SessionStart hook never fires is probed without waiting for the interval poll.
+export const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
 
 const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
@@ -125,6 +136,15 @@ export class StatusManager {
   private updateAgentState: typeof updateTabAgentState;
   private stuckNudgedTabs = new Set<string>();
   private transcriptFallbackLogged = new Set<string>();
+  /** When the poll first saw each tab `inactive` (the pane-probe clock). */
+  private inactiveSeenAt = new Map<string, number>();
+  /**
+   * Session ids the poll persisted because no hook bound one (L8). The poll may
+   * move its own binding (a hookless `/clear`), never one a hook or a launch set.
+   */
+  private pollBoundSessions = new Map<string, string>();
+  /** Bumped by every hook or launch binding: a poll write that lands after one never claims ownership. */
+  private sessionBindingEpoch = new Map<string, number>();
   private orphanResumesEscalated = new Set<string>();
   private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
@@ -469,6 +489,7 @@ export class StatusManager {
             eventSeq: 0,
           };
           this.tabs.set(tab.id, entry);
+          this.persistPolledSession(tab.id, tab, provider, detected.jsonlPath);
           this.reconcileJsonlWatch(tab.id, entry);
           this.persistToLayout(entry);
           this.broadcastUpdate(tab.id, entry);
@@ -491,6 +512,7 @@ export class StatusManager {
         existing.agentProviderId = provider?.id;
         existing.agentSessionId = provider?.sessionIdFromJsonlPath(refreshed.jsonlPath)
           ?? provider?.readSessionId(tab) ?? null;
+        this.persistPolledSession(tab.id, tab, provider, refreshed.jsonlPath);
         existing.jsonlPath = refreshed.jsonlPath ?? existing.jsonlPath;
         existing.lastUserMessage = tab.lastUserMessage;
         existing.reportsTo = tab.reportsTo ?? null;
@@ -579,8 +601,23 @@ export class StatusManager {
         }
 
         if (existing.cliState === 'inactive' && existing.panelType === 'codex-cli' && provider) {
-          if (await this.checkCodexTuiReady(existing, checkAgentRunning)) {
+          const seq = existing.eventSeq;
+          if (await this.checkCodexTuiReady(existing, checkAgentRunning)
+              && this.stillInactiveAt(tab.id, existing, seq)) {
             hookLog.debug({ tabId: tab.id }, 'codex tui ready — synthetic session-start');
+            this.updateTabFromHook(existing.tmuxSession, 'session-start');
+            continue;
+          }
+        }
+
+        if (existing.cliState !== 'inactive') {
+          this.inactiveSeenAt.delete(tab.id);
+        } else if (provider && existing.panelType && PANE_PROBE_PANELS.has(existing.panelType)) {
+          const seq = existing.eventSeq;
+          if (await this.checkAgentPaneReady(tab.id, existing, now, checkAgentRunning)
+              && this.stillInactiveAt(tab.id, existing, seq)) {
+            this.inactiveSeenAt.delete(tab.id);
+            hookLog.info({ tabId: tab.id, panelType: existing.panelType }, 'readiness: pane-probe — synthetic session-start');
             this.updateTabFromHook(existing.tmuxSession, 'session-start');
             continue;
           }
@@ -601,6 +638,9 @@ export class StatusManager {
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
         this.transcriptFallbackLogged.delete(tabId);
+        this.inactiveSeenAt.delete(tabId);
+        this.pollBoundSessions.delete(tabId);
+        this.sessionBindingEpoch.delete(tabId);
         this.processStartCache.delete(tabId);
         this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
@@ -1445,6 +1485,79 @@ export class StatusManager {
     return isCodexTuiReadyContent(content);
   }
 
+  /**
+   * The Claude/Grok readiness fallback (story 17): `inactive` for longer than
+   * READINESS_PROBE_AFTER_MS, the agent process running, and the pane showing an
+   * empty composer with no option list over it. A trust prompt or a first-run
+   * picker is not ready. Never inferred from a persisted `idle` (no process check).
+   */
+  private async checkAgentPaneReady(
+    tabId: string,
+    entry: ITabStatusEntry,
+    now: number,
+    checkAgentRunning: () => Promise<boolean>,
+  ): Promise<boolean> {
+    // The clock runs only while the agent runs: a tab idling at a shell does not
+    // age it, and a relaunch typed at the shell starts it again (review r1: a
+    // stale clock probed a booting TUI at +700 ms). A launch through
+    // markAgentLaunch is held off by the launch-stamp wait below.
+    if (!(await checkAgentRunning())) {
+      this.inactiveSeenAt.delete(tabId);
+      return false;
+    }
+    const since = this.inactiveSeenAt.get(tabId);
+    if (since === undefined) {
+      this.inactiveSeenAt.set(tabId, now);
+      return false;
+    }
+    if (now - since < READINESS_PROBE_AFTER_MS) return false;
+    const launch = entry.lastResumeOrStartedAt;
+    if (launch !== undefined && now - launch < READINESS_PROBE_AFTER_MS) return false;
+    // The pane at its own size: the marker check needs no width, and a resize
+    // would pause a narrow viewer on every poll while a trust prompt waits.
+    const content = await capturePaneContent(entry.tmuxSession, { escapes: true });
+    return !!content && paneShowsEmptyComposer(entry.panelType, content);
+  }
+
+  /**
+   * After a probe's awaits: the tab is still this entry, still inactive, and no
+   * event arrived meanwhile. A prompt-submit or notification in that window must
+   * not be overwritten by the synthetic session start (a false turn end).
+   */
+  private stillInactiveAt(tabId: string, entry: ITabStatusEntry, seq: number | undefined): boolean {
+    return this.tabs.get(tabId) === entry && entry.cliState === 'inactive' && entry.eventSeq === seq;
+  }
+
+  /** A hook or launch bound the session: the poll no longer owns it, and a write in flight does not reclaim it. */
+  private releasePollBinding(tabId: string): void {
+    this.pollBoundSessions.delete(tabId);
+    this.sessionBindingEpoch.set(tabId, (this.sessionBindingEpoch.get(tabId) ?? 0) + 1);
+  }
+
+  /**
+   * Persist a session id the poll detected when no hook bound one, so `tab
+   * status` / `tab list` show it and it survives a restart (L8: the binding
+   * lived in memory only). A hook's or a launch's binding is never overwritten.
+   */
+  private persistPolledSession(tabId: string, tab: ITab, provider: IAgentProvider | null, jsonlPath: string | null): void {
+    const detected = provider?.sessionIdFromJsonlPath(jsonlPath) ?? null;
+    if (!provider || !detected) return;
+    const persisted = provider.readSessionId(tab);
+    if (persisted === detected) return;
+    if (persisted && this.pollBoundSessions.get(tabId) !== persisted) return;
+    // Ownership is recorded only once the write lands: a failed move leaves the
+    // old id in the layout, and the next poll must still be allowed to retry it.
+    // A hook or launch binding during the write wins: the epoch moved.
+    const epoch = this.sessionBindingEpoch.get(tabId) ?? 0;
+    this.updateAgentState(tab.sessionName, provider, { sessionId: detected }).then(() => {
+      if ((this.sessionBindingEpoch.get(tabId) ?? 0) !== epoch) return;
+      this.pollBoundSessions.set(tabId, detected);
+      hookLog.debug({ tabId, sessionId: detected }, 'session id bound by poll — persisted');
+    }).catch((err) => {
+      log.warn(`poll session persist failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
   async recoverUnknownIfPending(tabId: string): Promise<{ recovered: boolean; reason?: string }> {
     const entry = this.tabs.get(tabId);
     if (!entry) return { recovered: false, reason: 'no-entry' };
@@ -1717,6 +1830,8 @@ export class StatusManager {
       changed = true;
     }
     const sessionBindingChanged = meta.sessionId !== undefined && entry.agentSessionId !== meta.sessionId;
+    // A hook's binding is the provider's own word; the poll never moves it.
+    if (meta.sessionId !== undefined) this.releasePollBinding(tabId);
     if (sessionBindingChanged) {
       entry.agentSessionId = meta.sessionId;
       changed = true;
@@ -1862,6 +1977,7 @@ export class StatusManager {
       ? undefined
       : options?.resumeSessionId ?? (options?.resetAgentSession ? null : undefined);
     if (nextSessionId !== undefined) {
+      this.releasePollBinding(tabId);
       entry.agentSessionId = nextSessionId;
       entry.jsonlPath = null;
       entry.agentSummary = null;

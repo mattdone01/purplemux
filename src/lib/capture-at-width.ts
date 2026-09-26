@@ -1,4 +1,4 @@
-import { capturePaneContent, capturePaneContentWithHistory } from '@/lib/tmux';
+import { capturePaneContent, capturePaneContentWithHistory, type ICaptureOptions } from '@/lib/tmux';
 import { pauseSession, resumeSession, resizeSessionPty, getActiveSessionSize } from '@/lib/terminal-server';
 
 const NARROW_COLS_THRESHOLD = 50;
@@ -12,15 +12,16 @@ export const capturePaneAtWidth = async (
   sessionName: string,
   cols: number,
   rows: number,
+  opts: ICaptureOptions = {},
 ): Promise<string | null> => {
   const current = getActiveSessionSize(sessionName);
 
   if (current && current.cols > NARROW_COLS_THRESHOLD && current.rows >= rows) {
-    return capturePaneContentWithHistory(sessionName, SCROLLBACK_LINES);
+    return capturePaneContentWithHistory(sessionName, SCROLLBACK_LINES, opts);
   }
 
   const orig = pauseSession(sessionName);
-  if (!orig) return capturePaneContent(sessionName);
+  if (!orig) return capturePaneContent(sessionName, opts);
 
   try {
     resizeSessionPty(
@@ -29,7 +30,7 @@ export const capturePaneAtWidth = async (
       Math.max(current?.rows ?? 0, rows),
     );
     await sleep(PRE_CAPTURE_DELAY_MS);
-    return await capturePaneContent(sessionName);
+    return await capturePaneContent(sessionName, opts);
   } finally {
     // Resume first, then resize. A paused connection DROPS pty output rather
     // than buffering it, so a restore issued while still paused loses the very
