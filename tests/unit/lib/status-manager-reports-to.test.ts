@@ -252,7 +252,8 @@ describe('human pages for liveness events (story 34, consult ruling A)', () => {
 
   // Review r2 finding 1: an orchestrator id may name a closed tab or an exited agent.
   it('a delivered self-notified failure still pages when the orchestrator is gone or not a live agent', async () => {
-    for (const o1 of [null, { cliState: 'inactive' as const }, { panelType: 'terminal' as const }]) {
+    // The last: an orchestrator id that names another workspace's live agent (review r3).
+    for (const o1 of [null, { cliState: 'inactive' as const }, { panelType: 'terminal' as const }, { workspaceId: 'ws-2' }]) {
       const env = await withAlerts(undefined, {});
       if (o1 === null) env.manager.removeTab('o1');
       else env.manager.registerTab('o1', entry('o1', o1));

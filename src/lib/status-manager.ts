@@ -754,7 +754,9 @@ export class StatusManager {
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
     const target = ws ? this.escalationTarget(tabId, entry, ws) : null;
     const targetEntry = target ? this.tabs.get(target) : undefined;
-    return liveAgent(targetEntry);
+    // An orchestrator id is stored as given; one naming another workspace's tab would drop the
+    // escalation (the dispatcher looks only in this workspace) — review r3.
+    return liveAgent(targetEntry) && targetEntry.workspaceId === entry.workspaceId;
   }
 
   /**
