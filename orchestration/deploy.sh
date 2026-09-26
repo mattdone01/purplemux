@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SUPERSEDED by scripts/deploy-live.sh (ADR-0017, docs/DEPLOY.md): this script
+# builds in the directory the service runs from and pulls `main`, with no quiet
+# wait, health gate or rollback. Do not use it on the live host.
+#
 # deploy.sh — roll out the purplemux fork on this box WITHOUT touching running agents.
 #
 # Safe while agents run: tmux sessions (claude/codex tabs) live on their own

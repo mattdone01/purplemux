@@ -90,7 +90,10 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 
 GET /api/cli/tabs?workspaceId=WS
   List tabs. Without workspaceId, lists tabs across all workspaces.
-  Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId" }] }
+  Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
+    "cliState", "lastEvent", "busySince" }] }
+  cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).
+  A busy tab whose lastEvent is "stop" waits only on open background work.
 
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
