@@ -315,6 +315,34 @@ POST /api/cli/notes/<id>/ack
   The recipient workspace only. Body: { "comment"? (≤ 500) }. Response: { "note" } in state "acked".
   404 note-not-found (exit 7); 403 forbidden (exit 3), also for a note that is not delivered.
 
+## Fleet config (ADR-0019)
+
+Versioned string values that tools read at call time, so changing one needs no message to
+anyone: no broadcast, no nudge, no inbox notice. Every change is audited to
+~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][a-z0-9.-]{1,63}$; values are one
+line of text, at most 256 characters, parsed by the reader. Writes need the admin token or the
+tab that is its workspace's enabled orchestrator (cooperative authority, not a boundary).
+
+Keys in use:
+  gate.slots   The host gate slot cap. skills gate.sh reads it after --slots and
+               $GATE_HOST_SLOTS, before its default 3 (story 25). Change it with
+               \`purplemux config set gate.slots <n>\` and tell nobody.
+
+GET /api/cli/fleet-config
+  Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
+GET /api/cli/fleet-config?key=KEY
+  Response: { "key", "value", "version", "setAt", "setBy" }; 404 { "code": "config-not-found" } (CLI exit 7) when unset.
+GET /api/cli/fleet-config?history=1[&key=KEY]
+  The last 200 changes, oldest first: { "history": [{ "key", "oldValue", "newValue", "version", "at", "by" }] }.
+  An unset shows as newValue null.
+PUT /api/cli/fleet-config/KEY   { "value": "6", "expectedVersion"?: 4 }
+  Response: { "key", "version", "value": { "value", "version", "setAt", "setBy" }, "changed" }. Setting the value a key already holds changes
+  nothing (no version, no audit line). 400 config-invalid (exit 2); 403 forbidden (exit 3);
+  409 config-version-conflict (exit 3) when expectedVersion is not the stored version (0 = never set).
+DELETE /api/cli/fleet-config/KEY   { "expectedVersion"?: 5 }
+  Same authority. Response: { "key", "version", "unset": { change } }. 404 config-not-found (exit 7) when unset. The version keeps counting, so a key
+  set again never repeats a version.
+
 ## Orchestration
 
 GET /api/cli/workspaces/<workspaceId>/orchestration
@@ -330,6 +358,9 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   or READY-TO-MERGE: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
   — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
   No marker and open background work → WAITING, no nudge. Otherwise READY FOR REVIEW.
+  A turn that ended on a provider API error is resumed ONCE through the inbox with no nudge;
+  a second failure (or a held resume) sends "API ERROR". A usage-limit halt is never typed
+  into and sends one "HALTED by a usage limit" nudge.
 
 ## Standup ticks
 

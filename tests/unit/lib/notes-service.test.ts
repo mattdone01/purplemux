@@ -71,7 +71,9 @@ class Fakes {
       },
       withdraw: async (id, reason) => {
         const item = this.inbox.get(id);
-        if (item && (item.state === 'queued' || item.state === 'held')) this.inbox.set(id, { ...item, state: 'dropped', droppedReason: reason } as IInboxItem);
+        if (!item || (item.state !== 'queued' && item.state !== 'held')) return false;
+        this.inbox.set(id, { ...item, state: 'dropped', droppedReason: reason } as IInboxItem);
+        return true;
       },
       inboxItems: async () => {
         this.reads.inboxItems += 1;

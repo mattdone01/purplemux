@@ -60,7 +60,7 @@ export interface INotesDeps {
   liveTabs: () => Promise<ILiveTabs>;
   enqueue: (req: IEnqueueRequest<'note'>) => Promise<{ item: IInboxItem }>;
   /** Drop a notice still waiting in the inbox (queued or held); a delivered one is left alone. */
-  withdraw: (itemId: string, reason: string) => Promise<void>;
+  withdraw: (itemId: string, reason: string) => Promise<boolean>;
   inboxItems: () => Promise<IInboxItem[]>;
 }
 

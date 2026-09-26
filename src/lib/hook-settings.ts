@@ -20,7 +20,7 @@ export const HOOK_SETTINGS_PATH = HOOKS_FILE;
 export const CODEX_HOOK_SCRIPT_PATH = CODEX_HOOK_SCRIPT;
 export const GROK_HOOK_SCRIPT_PATH = GROK_HOOK_SCRIPT;
 
-const HOOK_SCRIPT_CONTENT = `#!/bin/sh
+export const HOOK_SCRIPT_CONTENT = `#!/bin/sh
 EVENT="\${1:-poll}"
 PORT_FILE="$HOME/.purplemux/port"
 TOKEN_FILE="$HOME/.purplemux/cli-token"
@@ -49,9 +49,19 @@ if [ "$EVENT" = "notification" ]; then
   NOTIFICATION_TYPE=$(sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
 fi
 
+# SessionStart names why the session (re)started; after an auto-compaction it is
+# "compact", which is not a turn end (L30). Only a plain word is forwarded.
+SOURCE=""
+if [ "$EVENT" = "session-start" ]; then
+  SOURCE=$(sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\\([a-z]*\\)".*/\\1/p' | head -n 1)
+fi
+
 PAYLOAD="{\\"event\\":\\"\${EVENT}\\",\\"session\\":\\"\${SESSION}\\""
 if [ -n "$NOTIFICATION_TYPE" ]; then
   PAYLOAD="\${PAYLOAD},\\"notificationType\\":\\"\${NOTIFICATION_TYPE}\\""
+fi
+if [ -n "$SOURCE" ]; then
+  PAYLOAD="\${PAYLOAD},\\"source\\":\\"\${SOURCE}\\""
 fi
 PAYLOAD="\${PAYLOAD}}"
 

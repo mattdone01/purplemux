@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   capture: vi.fn(),
   deliverPrompt: vi.fn(),
   agentRunning: true,
+  halted: new Set<string>(),
 }));
 
 vi.mock('@/lib/cli-utils', () => ({ findTab: mocks.findTab }));
@@ -49,7 +50,7 @@ vi.mock('@/lib/tmux', async () => {
 });
 vi.mock('@/lib/process-utils', () => ({ getChildPids: vi.fn(async () => []) }));
 vi.mock('@/lib/status-manager', () => ({
-  getStatusManager: () => ({ getAllForClient: () => mocks.statuses }),
+  getStatusManager: () => ({ getAllForClient: () => mocks.statuses, isHaltedByUsageLimit: (tabId: string) => mocks.halted.has(tabId) }),
 }));
 vi.mock('@/lib/providers/registry', () => ({
   getProviderByPanelType: (panelType: string | undefined) => panelType === 'claude-code'
@@ -370,6 +371,17 @@ describe('Mission Control live delivery guard', () => {
     expect(result).toMatchObject({ delivered: false, retryable: false, reason: 'bound-agent-not-live' });
     expect(mocks.deliverPrompt).not.toHaveBeenCalled();
     expect(mocks.capture).not.toHaveBeenCalled();
+  });
+
+  it('never types into a tab halted by a usage limit (story 26): a retryable refusal', async () => {
+    mocks.halted.add('orch');
+    try {
+      const result = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
+      expect(result).toMatchObject({ delivered: false, retryable: true, reason: 'usage-limit-halt' });
+      expect(mocks.deliverPrompt).not.toHaveBeenCalled();
+    } finally {
+      mocks.halted.delete('orch');
+    }
   });
 
   it('defers native prompts and user composer drafts without typing', async () => {

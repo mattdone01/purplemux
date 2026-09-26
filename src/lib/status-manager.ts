@@ -6,7 +6,7 @@ import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessi
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
-import type { IAgentProvider, IAgentRuntimeSnapshot } from '@/lib/providers/types';
+import type { IAgentProvider, IAgentRuntimeSnapshot, ITurnError, TSessionStartSource } from '@/lib/providers/types';
 import type { IAgentHookMetaPatch, TAgentWorkStateEvent } from '@/lib/providers/types';
 import { deriveAgentCliState } from '@/lib/agent-state-transition';
 import { cwdToProjectPath } from '@/lib/session-list';
@@ -27,11 +27,13 @@ import { parsePermissionOptions } from '@/lib/permission-prompt';
 import type { IPaneInfo } from '@/lib/tmux';
 import type { ITab, IWorkspace } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
-import type { ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
+import type { ITurnErrorEpisode, ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import { classifyTurnEnd, isBackgroundWaitStalled } from '@/lib/turn-end';
+import { enqueueNotice, onInboxHeld, withdrawNotice } from '@/lib/inbox-store';
+import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
 import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
@@ -123,6 +125,7 @@ export class StatusManager {
   private updateAgentState: typeof updateTabAgentState;
   private stuckNudgedTabs = new Set<string>();
   private transcriptFallbackLogged = new Set<string>();
+  private orphanResumesEscalated = new Set<string>();
   private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
@@ -766,6 +769,8 @@ export class StatusManager {
         continue;
       }
       if (entry.cliState !== 'idle' && entry.cliState !== 'ready-for-review') continue;
+      // A usage-limit halt is not a stall: no heartbeat is typed and none is counted.
+      if (this.isHaltedByUsageLimit(orch.orchestratorTabId)) continue;
 
       let watchedWorkActive = false;
       const livenessManager = getLivenessManager();
@@ -883,6 +888,8 @@ export class StatusManager {
     }
     const prevBusySince = entry.busySince;
     entry.cliState = newState;
+    // The agent process is gone: its halt went with it.
+    if (newState === 'inactive' && entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'agent-exited');
     entry.readyForReviewAt = newState === 'ready-for-review' ? Date.now() : null;
     entry.busySince = newState === 'busy' ? Date.now() : null;
     if (newState === 'busy') entry.dismissedAt = null;
@@ -1012,18 +1019,22 @@ export class StatusManager {
     });
   }
 
-  private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<void> {
-    if (!isAgentPanelType(entry.panelType)) return;
+  /** Nudge the tab's target; false when it has none (no reportsTo, no other orchestrator). */
+  private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<boolean> {
+    if (!isAgentPanelType(entry.panelType)) return false;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
-    if (!ws) return;
+    if (!ws) return false;
     const orch = ws.orchestration;
     const targetTabId = this.liveReportsTo(tabId, entry)
       ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
-    if (!targetTabId) return;
+    if (!targetTabId) return false;
+    // A halted target would have the nudge withheld and dropped; report no target
+    // so an escalation falls back to the human alert (story 26 review r2).
+    if (this.isHaltedByUsageLimit(targetTabId)) return false;
 
     const now = Date.now();
     const last = this.lastNudgeByTab.get(tabId);
-    if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return;
+    if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return true;
     this.lastNudgeByTab.set(tabId, { kind, at: now });
 
     const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
@@ -1045,6 +1056,7 @@ export class StatusManager {
     }
     this.broadcast({ type: 'orchestration:nudge', nudge });
     log.info({ tabId, kind, targetTabId, delivered }, 'orchestrator nudge');
+    return true;
   }
 
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
@@ -1127,6 +1139,11 @@ export class StatusManager {
     message: string,
     context: string,
   ): Promise<boolean> {
+    // A usage-limit halt is never typed into, by any automated path (story 26).
+    if (this.isHaltedByUsageLimit(targetTabId)) {
+      log.info({ targetTabId, context }, 'automated prompt withheld: target halted by a usage limit');
+      return false;
+    }
     const result = await this.automatedPrompts.dispatch({ workspaceId, targetTabId, message });
     if (!result.delivered && result.error) {
       log.warn(`${context} delivery failed: ${result.error instanceof Error ? result.error.message : result.error}`);
@@ -1169,6 +1186,130 @@ export class StatusManager {
     if (!snapshot) return waitVerdict ?? true;
     if (waitVerdict !== null) return waitVerdict;
     return !(snapshot.lastEntryTs !== null && now - snapshot.lastEntryTs < BUSY_STUCK_MS);
+  }
+
+  /**
+   * A turn that ended on a provider error (story 26, ADR-0018 amendment).
+   * `api-error`: the worker is resumed ONCE through the inbox (composer gate,
+   * bounded) and no one is nudged; a second failure in the same episode, or a
+   * resume notice the inbox holds, nudges the target once. `usage-limit`:
+   * nothing is ever typed (typing cancels the provider's auto-continue); the
+   * target is nudged once. A clean stop ends the episode.
+   */
+  private applyTurnError(tabId: string, entry: ITabStatusEntry, error: ITurnError, stopSeq: number | undefined): void {
+    const at = Date.now();
+    entry.turnEnd = { kind: error.class === 'usage-limit' ? 'usage-limit' : 'api-error', at, seq: stopSeq };
+    if (entry.cliState !== 'ready-for-review') {
+      this.applyCliState(tabId, entry, 'ready-for-review', { silent: true });
+      this.persistToLayout(entry);
+    }
+    this.broadcastUpdate(tabId, entry);
+
+    const episode = entry.turnError?.class === error.class ? entry.turnError : null;
+    if (!episode) this.closeTurnErrorEpisode(entry, `episode-closed:${error.class}`);
+    if (error.class === 'usage-limit') {
+      if (episode) return;
+      entry.turnError = { class: 'usage-limit', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: true };
+      this.escalateTurnError(tabId, entry, 'usage-limit', error.text || error.code);
+      return;
+    }
+    if (episode) {
+      if (!episode.escalated) {
+        episode.escalated = true;
+        this.withdrawResume(episode, 'episode-escalated');
+        this.escalateTurnError(tabId, entry, 'api-error', error.text || error.code);
+      }
+      return;
+    }
+    const next: ITurnErrorEpisode = { class: 'api-error', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: false };
+    entry.turnError = next;
+    enqueueNotice({
+      kind: 'resume',
+      targetWorkspaceId: entry.workspaceId,
+      targetTabId: tabId,
+      dedupeKey: `resume-${tabId}-${error.turnId || at}`,
+      fields: { resumeId: `r-${nanoid(8)}` },
+    }).then(({ item }) => {
+      next.resumeItemId = item.id;
+      // The episode ended while the resume was being queued: withdraw it.
+      if (entry.turnError !== next || next.escalated) {
+        this.withdrawResume(next, 'episode-closed');
+        return;
+      }
+      log.info({ tabId, resume: item.id, code: error.code }, 'api-error stop: one resume queued');
+    }).catch((err) => {
+      // No resume can go out, so the episode escalates at once.
+      log.warn(`api-error resume could not be queued for ${tabId}: ${err instanceof Error ? err.message : err}`);
+      if (entry.turnError === next && !next.escalated) {
+        next.escalated = true;
+        this.escalateTurnError(tabId, entry, 'api-error', `${error.text || error.code} (the resume could not be queued)`);
+      }
+    });
+  }
+
+  /**
+   * Tell the tab's target. When there is none (the orchestrator itself, no
+   * orchestrator and no reportsTo, or a target that is itself halted, whose
+   * nudge would be withheld and dropped), the human is alerted directly,
+   * whatever the alert policy: an escalation that reaches no one is not one.
+   */
+  private escalateTurnError(tabId: string, entry: ITabStatusEntry, kind: 'api-error' | 'usage-limit', detail: string): void {
+    this.nudgeOrchestrator(tabId, entry, kind, detail).then(async (hadTarget) => {
+      if (hadTarget) return;
+      const ws = await getWorkspaceByIdCached(entry.workspaceId);
+      await this.dispatchAlert({
+        kind: 'review',
+        tabId,
+        workspace: ws,
+        workspaceId: entry.workspaceId,
+        tabName: entry.tabName,
+        providerId: toAlertProvider(entry.agentProviderId),
+        agentSessionId: entry.agentSessionId,
+        detail: `${kind === 'usage-limit' ? 'halted by a usage limit' : 'API error after its one automatic resume'}: ${detail}`,
+      });
+    }).catch((err) => {
+      log.warn(`${kind} nudge failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  private withdrawResume(episode: ITurnErrorEpisode, reason: string): void {
+    const id = episode.resumeItemId;
+    if (!id) return;
+    withdrawNotice(id, reason).then((withdrawn) => {
+      if (withdrawn) log.info({ resume: id, reason }, 'resume withdrawn');
+    }).catch((err) => log.warn(`resume ${id} could not be withdrawn: ${err instanceof Error ? err.message : err}`));
+  }
+
+  private closeTurnErrorEpisode(entry: ITabStatusEntry, reason: string): void {
+    if (entry.turnError) this.withdrawResume(entry.turnError, reason);
+    entry.turnError = null;
+  }
+
+  /** True while the tab's last stop was a usage-limit halt: nothing automated types into it. */
+  isHaltedByUsageLimit(tabId: string): boolean {
+    return this.tabs.get(tabId)?.turnError?.class === 'usage-limit';
+  }
+
+  /**
+   * The inbox held a resume notice: its episode escalates once. A resume
+   * queued before a server restart has no episode in memory; it escalates too,
+   * once per notice.
+   */
+  handleHeldResume(item: IInboxItem): void {
+    if (item.kind !== 'resume') return;
+    const entry = this.tabs.get(item.targetTabId);
+    if (!entry || entry.workspaceId !== item.targetWorkspaceId) return;
+    const held = `resume notice ${item.id} held: ${item.heldReason ?? 'undelivered'}`;
+    const episode = entry.turnError;
+    if (episode?.class === 'api-error' && episode.resumeItemId === item.id) {
+      if (episode.escalated) return;
+      episode.escalated = true;
+      this.escalateTurnError(item.targetTabId, entry, 'api-error', `${episode.text || episode.code} (${held})`);
+      return;
+    }
+    if (this.orphanResumesEscalated.has(item.id)) return;
+    this.orphanResumesEscalated.add(item.id);
+    this.escalateTurnError(item.targetTabId, entry, 'api-error', `the last automatic resume could not be delivered (${held})`);
   }
 
   private async liveRegisteredJobs(tabId: string): Promise<number> {
@@ -1379,6 +1520,15 @@ export class StatusManager {
     // so the one-stuck-nudge-per-busy-stretch latch re-arms here.
     this.stuckNudgedTabs.delete(tabId);
 
+    const turnError = snapshot?.lastTurnError ?? null;
+    if (turnError && turnError.class !== 'other') {
+      this.applyTurnError(tabId, entry, turnError, stopSeq);
+      return;
+    }
+    // A clean stop (or an unclassified error) ends any error episode, and a
+    // resume not yet typed is withdrawn: it would be stale.
+    this.closeTurnErrorEpisode(entry, 'episode-closed');
+
     const turnEnd = classifyTurnEnd({
       tail: snapshot?.lastAssistantTail,
       transcript: snapshot !== null,
@@ -1413,7 +1563,7 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string): void {
+  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ tmuxSession, event, notificationType }, 'no tabId for session');
@@ -1428,6 +1578,20 @@ export class StatusManager {
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');
       this.setCompacting(tabId, entry, event === 'pre-compact' ? Date.now() : null);
+      return;
+    }
+
+    // A compaction's own SessionStart (L30, measured 2026-09-26 08:29Z on W4):
+    // the agent compacted mid-turn and carries on, so it is neither a session
+    // start nor a turn end. Only the hook's `source` says so; status-hook.sh is
+    // rewritten on every server start, so the server that reads `source` also
+    // installed the script that sends it.
+    if (event === 'session-start' && source === 'compact') {
+      // No state change, no nudge, no relaunch stamp: the turn goes on.
+      entry.turnEnd = { kind: 'compacting', at: Date.now(), seq: entry.lastEvent?.seq };
+      hookLog.debug({ tabId, source, cliState: entry.cliState }, 'compaction session-start: turn continues');
+      this.setCompacting(tabId, entry, null);
+      this.broadcastUpdate(tabId, entry);
       return;
     }
 
@@ -1446,7 +1610,11 @@ export class StatusManager {
     const seq = (entry.eventSeq ?? 0) + 1;
     entry.eventSeq = seq;
     entry.lastEvent = { name: eventName, at: now, seq };
-    if (eventName === 'session-start') entry.lastResumeOrStartedAt = now;
+    if (eventName === 'session-start') {
+      entry.lastResumeOrStartedAt = now;
+      // A new agent session is not the halted one (story 26 review r2).
+      if (entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'session-start');
+    }
     this.broadcast({ type: 'status:hook-event', tabId, event: entry.lastEvent });
 
     const prevState = entry.cliState;
@@ -1657,6 +1825,8 @@ export class StatusManager {
     if (!entry) return;
     switch (event.kind) {
       case 'session-start':
+        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source);
+        break;
       case 'prompt-submit':
       case 'stop':
       case 'interrupt':
@@ -2039,6 +2209,7 @@ export const getStatusManager = (): StatusManager => {
       manager.removeTab(tabId);
       manager.forgetReportsTo(workspaceId, tabId);
     });
+    onInboxHeld((item) => manager.handleHeldResume(item));
     setLeaseAgentStateSource((tabId) => manager.getTabAgentState(tabId));
   }
   return g.__ptStatusManager;

@@ -248,6 +248,10 @@ export const dispatchMissionPrompt = async (request: IMissionDispatchRequest): P
         return { delivered: false, retryable: false, uncertain: false, reason: policy.error };
       }
 
+      // A usage-limit halt is never typed into (ADR-0018, story 26); retry later.
+      if (getStatusManager().isHaltedByUsageLimit(request.binding.tabId)) {
+        return { delivered: false, retryable: true, uncertain: false, reason: 'usage-limit-halt' };
+      }
       const readiness = await checkComposerReady({
         panelType: live.tab.panelType,
         status: getStatusManager().getAllForClient()[request.binding.tabId],

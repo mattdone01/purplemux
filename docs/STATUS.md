@@ -197,7 +197,7 @@ Uses Claude Code's [Hook](https://docs.anthropic.com/en/docs/claude-code/hooks) 
 
 | Claude Code Hook | Sent event | Result |
 | --- | --- | --- |
-| `SessionStart` | `session-start` | → `idle` |
+| `SessionStart` | `session-start` | → `idle`; with `source: compact` (an auto-compaction mid-turn, L30) no change and no nudge |
 | `UserPromptSubmit` | `prompt-submit` | → `busy` |
 | `Notification` | `notification` | → `needs-input` (filtered by notificationType) |
 | `Stop` | `stop` | → `ready-for-review` |
@@ -224,7 +224,7 @@ The hook script parses `notification_type` from the stdin JSON and includes it i
 
 - Looks up the session name with `tmux display-message` (so the server knows which tab)
 - If `event === 'notification'`, parses `notification_type` from stdin JSON and includes it in the payload
-- POSTs `{ event, session, notificationType? }` to `/api/status/hook` via `curl`
+- POSTs `{ event, session, notificationType?, source? }` to `/api/status/hook` via `curl` (`source` is SessionStart's, a plain word only)
 
 ### Synthetic Interrupt Event
 

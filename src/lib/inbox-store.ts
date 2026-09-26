@@ -116,12 +116,6 @@ export const dropForTabInState = (
   return { state: { items }, dropped };
 };
 
-/** Drop one item that is still waiting (queued or held): its owner withdrew it. A delivered item is left alone. */
-export const withdrawInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState =>
-  replace(state, id, (item) => (item.state === 'queued' || item.state === 'held'
-    ? { ...item, state: 'dropped', droppedReason: reason, transitionAt: now }
-    : item));
-
 /**
  * Queued items past 24 h become held; terminal items 7 days after their last
  * transition are pruned. The same state object comes back when nothing
@@ -144,6 +138,24 @@ export const sweepInState = (state: IInboxState, now: number): IInboxState => {
   }
   return changed ? { items } : state;
 };
+
+/**
+ * Withdraw one item still waiting to be typed — queued, or held for a manual retry — because its
+ * owner no longer wants it typed (an API-error resume whose episode closed; a note routed to
+ * another tab). A delivered or dropped item is untouched.
+ */
+export const withdrawInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState => {
+  const item = state.items.find((i) => i.id === id);
+  if (!item || (item.state !== 'queued' && item.state !== 'held')) return state;
+  return replace(state, id, (i) => ({ ...i, state: 'dropped', droppedReason: reason, transitionAt: now }));
+};
+
+/** Withdraw a waiting (queued or held) item by id; true when it was still waiting. */
+export const withdrawNotice = async (id: string, reason: string): Promise<boolean> =>
+  mutateInbox((state) => {
+    const next = withdrawInState(state, id, reason, Date.now());
+    return { state: next, value: next !== state };
+  });
 
 /** Drop the queued and held items of every tab `isGone` confirms closed (the boot pass). */
 export const dropGoneTargetsInState = (
@@ -199,8 +211,34 @@ export const dueItems = (state: IInboxState, now: number, wake: (item: IInboxIte
 
 // ─── I/O ─────────────────────────────────────────────────────────────────
 
-const g = globalThis as unknown as { __ptInboxLock?: Promise<void> };
+type TInboxHeldListener = (item: IInboxItem) => void;
+
+const g = globalThis as unknown as { __ptInboxLock?: Promise<void>; __ptInboxHeldListeners?: Set<TInboxHeldListener> };
 if (!g.__ptInboxLock) g.__ptInboxLock = Promise.resolve();
+if (!g.__ptInboxHeldListeners) g.__ptInboxHeldListeners = new Set();
+
+/**
+ * Told once per item that becomes `held`, after the write, whatever held it (a
+ * refusal budget, 24 h, an uncertain paste). The owning feature escalates.
+ */
+export const onInboxHeld = (listener: TInboxHeldListener): (() => void) => {
+  g.__ptInboxHeldListeners!.add(listener);
+  return () => { g.__ptInboxHeldListeners!.delete(listener); };
+};
+
+const notifyHeld = (before: IInboxState, after: IInboxState): void => {
+  const wasHeld = new Set(before.items.filter((i) => i.state === 'held').map((i) => i.id));
+  for (const item of after.items) {
+    if (item.state !== 'held' || wasHeld.has(item.id)) continue;
+    for (const listener of [...g.__ptInboxHeldListeners!]) {
+      try {
+        listener(item);
+      } catch {
+        // a listener's failure never undoes the write
+      }
+    }
+  }
+};
 
 export const inboxFile = (): string => path.join(os.homedir(), '.purplemux', 'inbox.json');
 
@@ -260,15 +298,14 @@ export const mutateInbox = async <T>(fn: (state: IInboxState) => { state: IInbox
   withLock(async () => {
     const before = await readInboxState();
     const { state, value } = fn(before);
-    if (state !== before) await writeInboxState(state);
+    if (state !== before) {
+      await writeInboxState(state);
+      notifyHeld(before, state);
+    }
     return value;
   });
 
 export const newInboxId = (): string => `i-${nanoid(10)}`;
-
-/** The owning feature takes back a notice it no longer wants typed (a note routed elsewhere). */
-export const withdrawNotice = async (id: string, reason: string): Promise<void> =>
-  mutateInbox((state) => ({ state: withdrawInState(state, id, reason, Date.now()), value: undefined }));
 
 /**
  * The ONLY entry point for a server-originated notice. The owning feature has

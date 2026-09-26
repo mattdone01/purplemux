@@ -34,6 +34,8 @@ export interface IInboxDispatcherDeps {
   status: (tabId: string) => IClientTabStatusEntry | undefined;
   /** ADR-0018 ruling A′: busy only because its ended turn waits on background work. */
   waitingAtPrompt: (tabId: string) => boolean;
+  /** Halted by a usage limit: never typed into — typing cancels the provider's auto-continue (story 26). */
+  halted: (tabId: string) => boolean;
   capture: (sessionName: string) => Promise<string | null>;
   withDispatchLock: <T>(workspaceId: string, tab: ITab, work: (checkPolicy: TAgentDispatchPolicyCheck) => Promise<T>) => Promise<T>;
   deliver: (sessionName: string, line: string) => Promise<void>;
@@ -45,7 +47,8 @@ type TAttempt =
   | { outcome: 'delivered' }
   | { outcome: 'refused'; reason: string }
   | { outcome: 'held'; reason: string }
-  | { outcome: 'dropped'; reason: string };
+  | { outcome: 'dropped'; reason: string }
+  | { outcome: 'withdrawn' };
 
 const STATE_REFUSAL = 'composer-not-ready:';
 
@@ -122,10 +125,11 @@ export class InboxDispatcher {
         case 'held': return { state: holdInState(state, item.id, attempt.reason, now), value: null };
         case 'dropped': return { state: dropForTabInState(state, item.targetWorkspaceId, item.targetTabId, attempt.reason, now).state, value: null };
         case 'refused': return { state: refuseInState(state, item.id, attempt.reason, now), value: null };
+        case 'withdrawn': return { state, value: null };
       }
     });
     if (attempt.outcome === 'delivered') log.info({ id: item.id, kind: item.kind, tabId: item.targetTabId }, 'inbox delivered');
-    else if (attempt.outcome !== 'refused') log.info({ id: item.id, tabId: item.targetTabId, ...attempt }, `inbox ${attempt.outcome}`);
+    else if (attempt.outcome !== 'refused' && attempt.outcome !== 'withdrawn') log.info({ id: item.id, tabId: item.targetTabId, ...attempt }, `inbox ${attempt.outcome}`);
   }
 
   private async missing(item: IInboxItem): Promise<TAttempt> {
@@ -147,6 +151,7 @@ export class InboxDispatcher {
       if (current.sessionName !== found.sessionName) return { outcome: 'refused', reason: 'target-changed' };
       const policy = await checkPolicy();
       if (!policy.ok) return { outcome: 'refused', reason: `policy:${policy.error ?? 'refused'}` };
+      if (this.deps.halted(item.targetTabId)) return { outcome: 'refused', reason: 'usage-limit-halt' };
       const readiness = await checkComposerReady({
         panelType: current.panelType,
         status: this.deps.status(item.targetTabId),
@@ -154,6 +159,12 @@ export class InboxDispatcher {
         capture: () => this.deps.capture(current.sessionName),
       });
       if (!readiness.ok) return { outcome: 'refused', reason: readiness.reason };
+      // Its owner may have withdrawn it since this tick picked it (a closed episode).
+      const stillQueued = await this.deps.mutate((state) => ({
+        state,
+        value: state.items.find((i) => i.id === item.id)?.state === 'queued',
+      }));
+      if (!stillQueued) return { outcome: 'withdrawn' };
       try {
         await this.deps.deliver(current.sessionName, item.line);
       } catch (err) {
@@ -223,6 +234,7 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
     hasSession,
     status: (tabId) => getStatusManager().getAllForClient()[tabId],
     waitingAtPrompt: (tabId) => getStatusManager().isWaitingAtPrompt(tabId),
+    halted: (tabId) => getStatusManager().isHaltedByUsageLimit(tabId),
     capture: (sessionName) => capturePaneAtWidth(sessionName, 120, 50),
     withDispatchLock: (workspaceId, tab, work) => withAgentDispatchLock(workspaceId, tab, work),
     deliver: deliverPrompt,

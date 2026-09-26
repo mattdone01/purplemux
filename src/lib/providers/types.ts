@@ -50,6 +50,21 @@ export interface IRuntimeSnapshotOptions {
   withActivity?: boolean;
 }
 
+/**
+ * How the current turn ended when it ended on a provider error (ADR-0018,
+ * story 26). Read from structured fields only, never from message text: a
+ * worker quoting "API Error:" or a pane's usage-warning footer is not an error.
+ */
+export interface ITurnError {
+  class: 'api-error' | 'usage-limit' | 'other';
+  /** The provider's error code (`server_error`, `usage_limit_exceeded` …). */
+  code: string;
+  /** The error message, ≤ 300 characters. */
+  text: string;
+  /** Identifies the failed turn: the error entry's uuid (Claude) or turn id (Codex). */
+  turnId: string;
+}
+
 export interface IOpenBackgroundTaskKinds {
   shell: number;
   agent: number;
@@ -88,6 +103,8 @@ export interface IAgentRuntimeSnapshot {
    * provider cannot read it.
    */
   lastAssistantTail?: string | null;
+  /** The current turn's terminal provider error; null for a clean end; absent when the provider cannot tell. */
+  lastTurnError?: ITurnError | null;
 }
 
 export interface IAgentSessionHistoryStats {
@@ -120,6 +137,10 @@ export interface IAgentHookTranslation {
  * Hook-shaped event kinds delivered from the agent CLI's hook protocol.
  * Single source of truth for the Claude hook translator + status-manager dispatcher.
  */
+/** Claude Code's SessionStart `source`. */
+export type TSessionStartSource = 'startup' | 'resume' | 'clear' | 'compact';
+export const SESSION_START_SOURCES: readonly TSessionStartSource[] = ['startup', 'resume', 'clear', 'compact'];
+
 export const HOOK_EVENT_KINDS = [
   'session-start',
   'prompt-submit',
@@ -133,7 +154,7 @@ export type THookEventKind = typeof HOOK_EVENT_KINDS[number];
 
 /**
  * Standardized work-state events that providers emit. Maps to TCliState transitions:
- *  - session-start → idle
+ *  - session-start → idle, except a compaction's own SessionStart (`source: compact`), which keeps the state (L30)
  *  - prompt-submit → busy
  *  - notification → needs-input (gated by notificationType)
  *  - stop → ready-for-review
@@ -144,7 +165,7 @@ export type THookEventKind = typeof HOOK_EVENT_KINDS[number];
  * sources (pane-title polling, jsonl watcher) and never come through the hook path.
  */
 export type TAgentWorkStateEvent =
-  | { kind: 'session-start' }
+  | { kind: 'session-start'; source?: TSessionStartSource }
   | { kind: 'prompt-submit' }
   | { kind: 'notification'; notificationType?: string }
   | { kind: 'stop' }
