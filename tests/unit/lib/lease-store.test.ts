@@ -111,9 +111,11 @@ describe('lease store', () => {
     await acquireLease({ name: 'merge:x/y' }, tabA, authority);
     expect((await fs.stat(leasesFile())).mode & 0o777).toBe(0o600);
 
-    await fs.writeFile(leasesFile(), '{broken');
-    await expect(listLeases()).rejects.toThrow(SyntaxError);
-    await expect(acquireLease({ name: 'merge:x/y' }, tabB, authority)).rejects.toThrow(SyntaxError);
+    for (const bad of ['{broken', 'null', '{}', '[]', '{"leases":{}}']) {
+      await fs.writeFile(leasesFile(), bad);
+      await expect(listLeases()).rejects.toThrow('leases are refused until it is repaired or moved aside');
+      await expect(acquireLease({ name: 'merge:x/y' }, tabB, authority)).rejects.toThrow('leases are refused');
+    }
   });
 
   it('releases only for the holder', async () => {
@@ -150,9 +152,9 @@ describe('lease store', () => {
     const { acquireLease, breakLease, findLease } = await store();
     await acquireLease({ name: 'merge:x/y' }, tabA, authority);
 
-    await expect(breakLease('merge:x/y', 'stuck', tabB)).rejects.toMatchObject({ code: 'forbidden' });
-    await expect(breakLease('merge:x/y', '  ', admin)).rejects.toMatchObject({ code: 'lease-policy' });
-    await breakLease('merge:x/y', 'holder crashed mid-merge', admin);
+    await expect(breakLease('merge:x/y', 'stuck', tabB, authority)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(breakLease('merge:x/y', '  ', admin, authority)).rejects.toMatchObject({ code: 'lease-policy' });
+    await breakLease('merge:x/y', 'holder crashed mid-merge', admin, authority);
 
     expect(await findLease('merge:x/y')).toBeNull();
     await drainLeaseLocks();
@@ -173,7 +175,7 @@ describe('lease store', () => {
       await claim('num:nomupay/treasury-api:adr:0374', tabA);
       await claim('num:nomupay/treasury-api:adr:0375', tabA, 'other');
 
-      const released = await releaseEpicClaims('p4', tabB);
+      const released = await releaseEpicClaims('p4', tabB, authority);
       expect(released.map((l) => l.name).sort()).toEqual(['num:nomupay/treasury-api:adr:0373', 'num:nomupay/treasury-api:adr:0374']);
       expect((await listLeases()).map((l) => l.name)).toEqual(['epic:p4', 'num:nomupay/treasury-api:adr:0375']);
     });
@@ -181,26 +183,128 @@ describe('lease store', () => {
     it('lets a tab of the claims\' holder workspace release them', async () => {
       const { releaseEpicClaims } = await store();
       await claim('num:nomupay/treasury-api:adr:0373', tabA);
-      expect(await releaseEpicClaims('p4', tabA2)).toHaveLength(1);
+      expect(await releaseEpicClaims('p4', tabA2, authority)).toHaveLength(1);
     });
 
     it('lets admin release them', async () => {
       const { releaseEpicClaims } = await store();
       await claim('num:nomupay/treasury-api:adr:0373', tabA);
-      expect(await releaseEpicClaims('p4', admin)).toHaveLength(1);
+      expect(await releaseEpicClaims('p4', admin, authority)).toHaveLength(1);
     });
 
     it('refuses anyone else', async () => {
       const { releaseEpicClaims, listLeases } = await store();
       await claim('num:nomupay/treasury-api:adr:0373', tabA);
-      await expect(releaseEpicClaims('p4', tabB)).rejects.toMatchObject({ code: 'forbidden' });
+      await expect(releaseEpicClaims('p4', tabB, authority)).rejects.toMatchObject({ code: 'forbidden' });
       expect(await listLeases()).toHaveLength(1);
     });
 
     it('filters by kind when asked', async () => {
       const { releaseEpicClaims } = await store();
       await claim('num:nomupay/treasury-api:adr:0373', tabA);
-      expect(await releaseEpicClaims('p4', admin, 'other-kind')).toEqual([]);
+      expect(await releaseEpicClaims('p4', admin, authority, 'other-kind')).toEqual([]);
+      await expect(releaseEpicClaims('p4', admin, authority, 'Bad Kind')).rejects.toMatchObject({ code: 'lease-policy' });
+    });
+  });
+
+  it('refuses a holder that is neither a tab nor admin with caller-unresolved', async () => {
+    const { acquireLease, renewLease, releaseLease, releaseEpicClaims } = await store();
+    const tabless: ILeaseHolder = { workspaceId: 'ws1', tabId: null, tabName: null, verified: false, admin: false };
+    for (const op of [
+      () => acquireLease({ name: 'merge:x/y', ttlSeconds: 60 }, tabless, authority),
+      () => renewLease('merge:x/y', undefined, tabless, authority),
+      () => releaseLease('merge:x/y', tabless, authority),
+      () => releaseEpicClaims('p4', tabless, authority),
+    ]) {
+      await expect(op()).rejects.toMatchObject({ code: 'caller-unresolved' });
+    }
+  });
+
+  it('keeps the TTL on a re-acquire without one (as renew does)', async () => {
+    const { acquireLease } = await store();
+    await acquireLease({ name: 'merge:x/y', ttlSeconds: 3 * 3600 }, tabA, authority);
+    now += 10 * 60 * 1000;
+    const { lease } = await acquireLease({ name: 'merge:x/y' }, tabA, authority);
+    expect(lease.ttlSeconds).toBe(3 * 3600);
+    expect(Date.parse(lease.expiresAt!)).toBe(now + 3 * 3600 * 1000);
+  });
+
+  it('records the latest proof: an unverified renew clears verified', async () => {
+    const { acquireLease } = await store();
+    await acquireLease({ name: 'merge:x/y' }, tabA, authority);
+    const { lease } = await acquireLease({ name: 'merge:x/y' }, { ...tabA, verified: false }, authority);
+    expect(lease.holder.verified).toBe(false);
+  });
+
+  it('treats an expired, unswept lease as absent: another caller acquires it, check and renew see nothing', async () => {
+    const { acquireLease, findLease, renewLease, listLeases } = await store();
+    await acquireLease({ name: 'merge:x/y', ttlSeconds: 60 }, tabA, authority);
+    await acquireLease({ name: 'merge:x/z', ttlSeconds: 60 }, tabA, authority);
+    now += 60_000;
+
+    expect(await findLease('merge:x/y', now)).toBeNull();
+    expect(await listLeases(undefined, now)).toEqual([]);
+    await expect(renewLease('merge:x/z', undefined, tabA, authority)).rejects.toMatchObject({ code: 'lease-not-found' });
+    expect((await acquireLease({ name: 'merge:x/y' }, tabB, authority)).outcome).toBe('acquired');
+
+    await drainLeaseLocks();
+    const audit = (await readAudit(mockHome.value)).slice(2);
+    expect(audit.map((e) => [e.event, e.name, e.reason ?? null])).toEqual([
+      ['lease-release', 'merge:x/y', 'expired'],
+      ['lease-release', 'merge:x/z', 'expired'],
+      ['lease-acquire', 'merge:x/y', null],
+    ]);
+  });
+
+  it('emits audit lines and hooks in mutation order even when a sweep and an acquire race', async () => {
+    const { acquireLease, onLeaseAcquired, onLeaseReleased, sweepLeases } = await store();
+    await acquireLease({ name: 'smoke:a', ttlSeconds: 1 }, tabA, authority);
+    await acquireLease({ name: 'smoke:b', ttlSeconds: 1 }, tabA, authority);
+    await acquireLease({ name: 'merge:x/y', ttlSeconds: 1 }, tabA, authority);
+    now += 1000;
+    const seen: string[] = [];
+    onLeaseAcquired((l) => seen.push(`acquired:${l.name}`));
+    onLeaseReleased((l, r) => seen.push(`${r}:${l.name}`));
+
+    await Promise.all([
+      sweepLeases({ now, liveTabIds: new Set(['tab-a']), agentGone: () => false }),
+      acquireLease({ name: 'merge:x/y' }, tabB, authority),
+    ]);
+    expect(seen.indexOf('expired:merge:x/y')).toBeLessThan(seen.indexOf('acquired:merge:x/y'));
+  });
+
+  describe('release-epic scoping', () => {
+    const wsBTab: ILeaseHolder = { workspaceId: 'ws2', tabId: 'tab-b2', tabName: null, verified: true, admin: false };
+    const seed = async () => {
+      const { acquireLease } = await store();
+      await acquireLease({ name: 'num:x/y:adr:0001', epic: 'p4' }, tabA, authority);
+      await acquireLease({ name: 'num:x/y:adr:0002', epic: 'p4' }, tabB, authority);
+    };
+
+    it('releases only its own workspace\'s claims for a workspace-authorised tab', async () => {
+      const { releaseEpicClaims, listLeases } = await store();
+      await seed();
+      expect((await releaseEpicClaims('p4', tabA2, authority)).map((l) => l.name)).toEqual(['num:x/y:adr:0001']);
+      expect((await listLeases()).map((l) => l.name)).toEqual(['num:x/y:adr:0002']);
+      expect((await releaseEpicClaims('p4', wsBTab, authority)).map((l) => l.name)).toEqual(['num:x/y:adr:0002']);
+    });
+
+    it('releases every claim for the epic holder', async () => {
+      const { acquireLease, releaseEpicClaims } = await store();
+      await seed();
+      const owner: ILeaseHolder = { workspaceId: 'ws3', tabId: 'tab-o', tabName: null, verified: true, admin: false };
+      await acquireLease({ name: 'epic:p4' }, owner, authority);
+      expect(await releaseEpicClaims('p4', owner, authority)).toHaveLength(2);
+    });
+
+    it('answers an empty list, not a refusal, when there is nothing to release, and writes nothing', async () => {
+      const { acquireLease, releaseLease, releaseEpicClaims, leasesFile } = await store();
+      await acquireLease({ name: 'epic:p4' }, tabB, authority);
+      await releaseLease('epic:p4', tabB, authority);
+      const before = await fs.stat(leasesFile());
+      expect(await releaseEpicClaims('p4', tabB, authority)).toEqual([]);
+      expect(await releaseEpicClaims('never-claimed', tabA, authority)).toEqual([]);
+      expect((await fs.stat(leasesFile())).mtimeMs).toBe(before.mtimeMs);
     });
   });
 

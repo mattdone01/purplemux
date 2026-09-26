@@ -48,4 +48,5 @@ export type TLeaseErrorCode =
   | 'lease-held'
   | 'lease-held-by-other'
   | 'lease-not-found'
+  | 'caller-unresolved'
   | 'forbidden';

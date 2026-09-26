@@ -27,7 +27,7 @@ export const LEASE_KINDS: Readonly<Record<string, IKindPolicy>> = Object.freeze(
   'dev-deploy': { defaultTtlSeconds: 45 * MIN, maxTtlSeconds: 3 * HOUR, survivesTab: false, requiresEpic: false, orchestratorOnly: false, resourcePattern: REPO, resourceForm: '<owner>/<repo>' },
   'dev-write': { defaultTtlSeconds: 60 * MIN, maxTtlSeconds: 8 * HOUR, survivesTab: false, requiresEpic: false, orchestratorOnly: false, resourcePattern: null, resourceForm: '<env>' },
   deploy: { defaultTtlSeconds: 30 * MIN, maxTtlSeconds: 2 * HOUR, survivesTab: false, requiresEpic: false, orchestratorOnly: true, resourcePattern: null, resourceForm: '<service>' },
-  epic: { defaultTtlSeconds: null, maxTtlSeconds: 7 * DAY, survivesTab: false, requiresEpic: false, orchestratorOnly: false, resourcePattern: null, resourceForm: '<slug>' },
+  epic: { defaultTtlSeconds: null, maxTtlSeconds: 7 * DAY, survivesTab: false, requiresEpic: false, orchestratorOnly: false, resourcePattern: /^[a-z0-9][a-z0-9._-]{0,99}$/, resourceForm: 'an epic slug (^[a-z0-9][a-z0-9._-]{0,99}$)' },
   num: { defaultTtlSeconds: 14 * DAY, maxTtlSeconds: 30 * DAY, survivesTab: true, requiresEpic: true, orchestratorOnly: false, resourcePattern: /^[a-z0-9._-]+\/[a-z0-9._-]+:(adr|migration):[0-9]{1,6}$/, resourceForm: '<owner>/<repo>:<adr|migration>:<nnnn>' },
 });
 

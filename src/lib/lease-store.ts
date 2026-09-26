@@ -75,7 +75,8 @@ export const acquireInState = (
     if (!sameHolder(existing.holder, req.holder)) throw heldError(existing, now);
     const lease: ILease = {
       ...existing,
-      holder: { ...existing.holder, tabName: req.holder.tabName ?? existing.holder.tabName, verified: existing.holder.verified || req.holder.verified },
+      // The latest proof counts: an unverified renew does not keep an earlier verified flag.
+      holder: { ...existing.holder, tabName: req.holder.tabName ?? existing.holder.tabName, verified: req.holder.verified },
       epic: req.epic ?? existing.epic,
       note: req.note ?? existing.note,
       renewedAt: iso(now),
@@ -143,11 +144,20 @@ export const epicClaims = (state: ILeaseState, epic: string, kind?: string): ILe
   state.leases.filter((l) => l.survivesTab && l.epic === epic && (!kind || l.kind === kind));
 
 export interface ISweepFacts {
+  /** Taken before the tab facts were gathered. */
   now: number;
   liveTabIds: ReadonlySet<string>;
+  /** Workspaces whose layout could not be read: their tabs are unknown, never gone. */
+  uncertainWorkspaceIds?: ReadonlySet<string>;
   /** True when the holder tab's agent has been inactive past the grace. */
   agentGone: (tabId: string) => boolean;
 }
+
+/** Pure: leases past their expiry leave the state before any operation looks at it. */
+export const pruneExpired = (state: ILeaseState, now: number): { state: ILeaseState; expired: ILease[] } => {
+  const expired = state.leases.filter((l) => l.expiresAt !== null && Date.parse(l.expiresAt) <= now);
+  return expired.length ? { state: { leases: state.leases.filter((l) => !expired.includes(l)) }, expired } : { state, expired };
+};
 
 /**
  * Pure: which leases a sweep ends. Expiry applies to every lease. Only a
@@ -161,8 +171,11 @@ export const sweepState = (state: ILeaseState, facts: ISweepFacts): { state: ILe
     const tabId = lease.holder.tabId;
     let reason: TLeaseReleaseReason | null = null;
     if (lease.expiresAt !== null && Date.parse(lease.expiresAt) <= facts.now) reason = 'expired';
-    else if (!lease.survivesTab && tabId && !lease.holder.admin) {
-      if (!facts.liveTabIds.has(tabId)) reason = 'holder-tab-gone';
+    // A lease renewed after the facts were taken is judged by the next sweep:
+    // its tab may have been created after the tab list was read.
+    else if (!lease.survivesTab && tabId && !lease.holder.admin && Date.parse(lease.renewedAt) <= facts.now) {
+      const uncertain = lease.holder.workspaceId !== null && !!facts.uncertainWorkspaceIds?.has(lease.holder.workspaceId);
+      if (!facts.liveTabIds.has(tabId)) reason = uncertain ? null : 'holder-tab-gone';
       else if (facts.agentGone(tabId)) reason = 'holder-agent-gone';
     }
     if (reason) released.push({ lease, reason });
@@ -202,6 +215,10 @@ export const toLeaseView = (lease: ILease, facts: IViewFacts): ILeaseView => ({
 
 // ─── file store ──────────────────────────────────────────────────────────
 
+type TLeaseEffect =
+  | { type: 'acquired'; lease: ILease; outcome: 'acquired' | 'renewed' }
+  | { type: 'released'; lease: ILease; reason: TLeaseReleaseReason; by: ILeaseHolder | null; extra?: Record<string, unknown> };
+
 const g = globalThis as unknown as {
   __ptLeaseLock?: Promise<void>;
   __ptLeaseListeners?: { acquired: Set<TLeaseAcquiredListener>; released: Set<TLeaseReleasedListener> };
@@ -230,23 +247,34 @@ const isLease = (value: unknown): value is ILease => {
   if (!value || typeof value !== 'object') return false;
   const l = value as Record<string, unknown>;
   return typeof l.name === 'string' && typeof l.kind === 'string' && typeof l.acquiredAt === 'string'
-    && !!l.holder && typeof l.holder === 'object';
+    && typeof l.renewedAt === 'string' && !!l.holder && typeof l.holder === 'object';
 };
 
+export class LeaseFileError extends Error {}
+
 /**
- * Absent file = no leases. An unparseable file is refused rather than read as
- * empty: an empty read would hand every held resource to the next caller.
+ * Absent file = no leases. Anything else that is not `{ leases: [...] }` is
+ * refused rather than read as empty: an empty read would hand every held
+ * resource to the next caller.
  */
 export const readLeaseState = async (): Promise<ILeaseState> => {
+  const file = leasesFile();
   let raw: string;
   try {
-    raw = await fs.readFile(leasesFile(), 'utf-8');
+    raw = await fs.readFile(file, 'utf-8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { leases: [] };
-    throw err;
+    throw new LeaseFileError(`${file} unreadable: ${err instanceof Error ? err.message : err}`);
   }
-  const parsed = JSON.parse(raw) as Partial<ILeaseState>;
-  return { leases: Array.isArray(parsed.leases) ? parsed.leases.filter(isLease) : [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new LeaseFileError(`${file} is not valid JSON (${err instanceof Error ? err.message : err}); leases are refused until it is repaired or moved aside`);
+  }
+  const leases = (parsed as { leases?: unknown } | null)?.leases;
+  if (!Array.isArray(leases)) throw new LeaseFileError(`${file} has no "leases" array; leases are refused until it is repaired or moved aside`);
+  return { leases: leases.filter(isLease) };
 };
 
 const writeLeaseState = async (state: ILeaseState): Promise<void> => {
@@ -261,15 +289,6 @@ const writeLeaseState = async (state: ILeaseState): Promise<void> => {
     throw err;
   }
 };
-
-/** Serialised read-modify-write. `fn` returns null to leave the file untouched. */
-const mutate = <T>(fn: (state: ILeaseState) => { state: ILeaseState; value: T } | null): Promise<T | null> =>
-  withLock(async () => {
-    const result = fn(await readLeaseState());
-    if (!result) return null;
-    await writeLeaseState(result.state);
-    return result.value;
-  });
 
 // ─── hooks ───────────────────────────────────────────────────────────────
 
@@ -298,14 +317,50 @@ const notify = <A extends unknown[]>(listeners: Set<(...args: A) => void>, ...ar
 
 const auditHolder = (h: ILeaseHolder) => ({ workspaceId: h.workspaceId, tabId: h.tabId, verified: h.verified, admin: h.admin });
 
-const recordReleased = async (released: IReleasedLease[], by: ILeaseHolder | null, extra: Record<string, unknown> = {}): Promise<void> => {
-  for (const { lease, reason } of released) {
-    await appendCoordinationAudit({
-      event: 'lease-release', name: lease.name, reason, holder: auditHolder(lease.holder), by: by ? auditHolder(by) : null, ...extra,
-    });
-    notify(g.__ptLeaseListeners!.released, lease, reason);
+/** Runs inside the lock, so audit lines and hooks follow the order of the mutations. */
+const applyEffects = async (effects: TLeaseEffect[]): Promise<void> => {
+  for (const effect of effects) {
+    if (effect.type === 'acquired') {
+      const { lease, outcome } = effect;
+      await appendCoordinationAudit({
+        event: outcome === 'acquired' ? 'lease-acquire' : 'lease-renew',
+        name: lease.name, holder: auditHolder(lease.holder), ttlSeconds: lease.ttlSeconds, epic: lease.epic,
+      });
+      notify(g.__ptLeaseListeners!.acquired, lease, outcome);
+    } else {
+      const { lease, reason, by, extra } = effect;
+      await appendCoordinationAudit({
+        event: 'lease-release', name: lease.name, reason, holder: auditHolder(lease.holder), by: by ? auditHolder(by) : null, ...extra,
+      });
+      notify(g.__ptLeaseListeners!.released, lease, reason);
+    }
   }
 };
+
+interface ITransaction<T> {
+  state: ILeaseState;
+  value: T;
+  effects: TLeaseEffect[];
+}
+
+/**
+ * Serialised read-modify-write. Expired leases are pruned first, in every
+ * transaction, so an expired lease never refuses anyone between sweeps.
+ * `fn` returns null to change nothing itself.
+ */
+const transact = <T>(
+  now: number,
+  fn: (state: ILeaseState) => ITransaction<T> | null,
+  expiredExtra?: Record<string, unknown>,
+): Promise<{ value: T | null; expired: ILease[] }> =>
+  withLock(async () => {
+    const pruned = pruneExpired(await readLeaseState(), now);
+    const expiredEffects: TLeaseEffect[] = pruned.expired.map((lease) => ({ type: 'released', lease, reason: 'expired', by: null, extra: expiredExtra }));
+    const result = fn(pruned.state);
+    if (result || pruned.expired.length) await writeLeaseState(result ? result.state : pruned.state);
+    await applyEffects([...expiredEffects, ...(result?.effects ?? [])]);
+    return { value: result ? result.value : null, expired: pruned.expired };
+  });
 
 // ─── operations ──────────────────────────────────────────────────────────
 
@@ -323,6 +378,18 @@ export const holderFromCaller = (caller: ICaller): ILeaseHolder => ({
   admin: caller.admin,
 });
 
+/**
+ * A lease holder is a tab or the admin token. A workspace token that names no
+ * tab could take a lease it could never renew or release, and no tab event
+ * would ever end it.
+ */
+const requireHolder = (holder: ILeaseHolder): void => {
+  if (holder.admin) return;
+  if (!holder.tabId || !holder.workspaceId) {
+    throw new LeaseError('caller-unresolved', 'the caller names no tab: use a tab token (PMUX_TAB_TOKEN), send X-Pmux-Session from a tab, or use the admin token');
+  }
+};
+
 export interface IAcquireInput {
   name: unknown;
   ttlSeconds?: number | null;
@@ -335,24 +402,26 @@ export const acquireLease = async (
   holder: ILeaseHolder,
   authority: ILeaseAuthority,
 ): Promise<{ lease: ILease; outcome: 'acquired' | 'renewed' }> => {
+  requireHolder(holder);
   const { name, kind, resource } = parseLeaseName(input.name);
-  const ttlSeconds = resolveTtl(kind, input.ttlSeconds, holder);
+  const requestedTtl = input.ttlSeconds === undefined ? undefined : resolveTtl(kind, input.ttlSeconds, holder);
   const epic = resolveEpic(kind, input.epic);
   const note = resolveNote(input.note);
   if (policyFor(kind).orchestratorOnly && !holder.admin) {
-    const allowed = holder.tabId && holder.workspaceId
-      ? await authority.isWorkspaceOrchestrator(holder.workspaceId, holder.tabId)
-      : false;
+    const allowed = await authority.isWorkspaceOrchestrator(holder.workspaceId!, holder.tabId!);
     if (!allowed) throw new LeasePolicyError(`${kind} leases need the admin token or the workspace's enabled orchestrator tab`);
   }
-  const result = await mutate((state) => {
-    const r = acquireInState(state, { name, kind, resource, holder, ttlSeconds, epic, note }, authority.now());
-    return { state: r.state, value: r };
+  const now = authority.now();
+  const result = await transact(now, (state) => {
+    const existing = state.leases.find((l) => l.name === name);
+    // A renew without a TTL keeps the lease's own, as `renew` does.
+    const ttlSeconds = requestedTtl !== undefined
+      ? requestedTtl
+      : existing && sameHolder(existing.holder, holder) ? existing.ttlSeconds : resolveTtl(kind, undefined, holder);
+    const r = acquireInState(state, { name, kind, resource, holder, ttlSeconds, epic, note }, now);
+    return { state: r.state, value: r, effects: [{ type: 'acquired', lease: r.lease, outcome: r.outcome }] };
   });
-  const { lease, outcome } = result!;
-  await appendCoordinationAudit({ event: outcome === 'acquired' ? 'lease-acquire' : 'lease-renew', name, holder: auditHolder(holder), ttlSeconds, epic });
-  notify(g.__ptLeaseListeners!.acquired, lease, outcome);
-  return { lease, outcome };
+  return { lease: result.value!.lease, outcome: result.value!.outcome };
 };
 
 export const renewLease = async (
@@ -361,93 +430,116 @@ export const renewLease = async (
   holder: ILeaseHolder,
   authority: ILeaseAuthority,
 ): Promise<ILease> => {
+  requireHolder(holder);
   const { name, kind } = parseLeaseName(rawName);
-  const lease = await mutate((state) => {
-    const existing = findHeld(state, name, holder, authority.now());
-    const ttl = ttlSeconds === undefined ? existing.ttlSeconds : resolveTtl(kind, ttlSeconds, holder);
-    const r = renewInState(state, name, holder, ttl, authority.now());
-    return { state: r.state, value: r.lease };
+  const requested = ttlSeconds === undefined ? undefined : resolveTtl(kind, ttlSeconds, holder);
+  const now = authority.now();
+  const lease = await transact(now, (state) => {
+    const existing = findHeld(state, name, holder, now);
+    const r = renewInState(state, name, holder, requested === undefined ? existing.ttlSeconds : requested, now);
+    return { state: r.state, value: r.lease, effects: [{ type: 'acquired', lease: r.lease, outcome: 'renewed' }] };
   });
-  await appendCoordinationAudit({ event: 'lease-renew', name, holder: auditHolder(holder), ttlSeconds: lease!.ttlSeconds });
-  notify(g.__ptLeaseListeners!.acquired, lease!, 'renewed');
-  return lease!;
+  return lease.value!;
 };
 
 export const releaseLease = async (rawName: unknown, holder: ILeaseHolder, authority: ILeaseAuthority): Promise<ILease> => {
+  requireHolder(holder);
   const { name } = parseLeaseName(rawName);
-  const lease = await mutate((state) => {
+  const lease = await transact(authority.now(), (state) => {
     const r = releaseInState(state, name, holder, authority.now());
-    return { state: r.state, value: r.lease };
+    return { state: r.state, value: r.lease, effects: [{ type: 'released', lease: r.lease, reason: 'released', by: holder }] };
   });
-  await recordReleased([{ lease: lease!, reason: 'released' }], holder);
-  return lease!;
+  return lease.value!;
 };
 
 /** Admin only, with a reason. Cooperative: the admin token is readable by every agent (C-312 class). */
-export const breakLease = async (rawName: unknown, reason: unknown, holder: ILeaseHolder): Promise<ILease> => {
+export const breakLease = async (rawName: unknown, reason: unknown, holder: ILeaseHolder, authority: ILeaseAuthority): Promise<ILease> => {
   if (!holder.admin) throw new LeaseError('forbidden', 'breaking a lease needs the admin token');
   const text = typeof reason === 'string' ? reason.trim() : '';
   if (!text) throw new LeasePolicyError('break needs a reason');
   const { name } = parseLeaseName(rawName);
-  const lease = await mutate((state) => {
+  const lease = await transact(authority.now(), (state) => {
     const r = removeInState(state, name);
-    return { state: r.state, value: r.lease };
+    return { state: r.state, value: r.lease, effects: [{ type: 'released', lease: r.lease, reason: 'broken', by: holder, extra: { breakReason: text.slice(0, 500) } }] };
   });
-  await recordReleased([{ lease: lease!, reason: 'broken' }], holder, { breakReason: text.slice(0, 500) });
-  return lease!;
+  return lease.value!;
 };
+
+const KIND = /^[a-z][a-z0-9-]{1,31}$/;
 
 /**
- * Release an epic's survives-tab claims. Allowed to the holder of
- * `epic:<slug>`, to any tab of a workspace that holds one of the claims, or to
- * admin.
+ * Release an epic's survives-tab claims. The `epic:<slug>` holder and admin
+ * release all of them; a tab of a workspace holding claims releases only its
+ * own workspace's. Nothing to release is not a refusal.
  */
-export const releaseEpicClaims = async (rawEpic: unknown, holder: ILeaseHolder, kind?: string): Promise<ILease[]> => {
+export const releaseEpicClaims = async (
+  rawEpic: unknown,
+  holder: ILeaseHolder,
+  authority: ILeaseAuthority,
+  rawKind?: unknown,
+): Promise<ILease[]> => {
+  requireHolder(holder);
   const epic = resolveEpic('epic', rawEpic);
   if (!epic) throw new LeasePolicyError('release-epic needs an epic slug');
-  const released = await mutate((state) => {
+  let kind: string | undefined;
+  if (rawKind !== undefined && rawKind !== null && rawKind !== '') {
+    kind = typeof rawKind === 'string' ? rawKind.trim().toLowerCase() : '';
+    if (!KIND.test(kind)) throw new LeasePolicyError(`kind "${String(rawKind)}" does not match ${KIND.source}`);
+  }
+  const released = await transact(authority.now(), (state) => {
     const claims = epicClaims(state, epic, kind);
+    if (claims.length === 0) return null;
     const owner = state.leases.find((l) => l.name === `epic:${epic}`);
-    const allowed = holder.admin
-      || (owner && sameHolder(owner.holder, holder))
-      || (holder.workspaceId !== null && claims.some((c) => c.holder.workspaceId === holder.workspaceId));
-    if (!allowed) {
+    const all = holder.admin || (!!owner && sameHolder(owner.holder, holder));
+    const mine = all ? claims : claims.filter((c) => c.holder.workspaceId === holder.workspaceId);
+    if (mine.length === 0) {
       throw new LeaseError('forbidden', `release-epic ${epic} needs the epic:${epic} holder, a tab of a workspace holding its claims, or the admin token`);
     }
-    if (claims.length === 0) return { state, value: [] as ILease[] };
-    return { state: { leases: state.leases.filter((l) => !claims.includes(l)) }, value: claims };
+    return {
+      state: { leases: state.leases.filter((l) => !mine.includes(l)) },
+      value: mine,
+      effects: mine.map((lease): TLeaseEffect => ({ type: 'released', lease, reason: 'release-epic', by: holder, extra: { epic } })),
+    };
   });
-  await recordReleased(released!.map((lease) => ({ lease, reason: 'release-epic' as const })), holder, { epic });
-  return released!;
+  return released.value ?? [];
 };
 
-export const listLeases = async (prefix?: string): Promise<ILease[]> => {
+const unexpired = (leases: ILease[], now: number): ILease[] =>
+  leases.filter((l) => l.expiresAt === null || Date.parse(l.expiresAt) > now);
+
+export const listLeases = async (prefix?: string, now: number = Date.now()): Promise<ILease[]> => {
   const { leases } = await readLeaseState();
   const p = prefix?.trim().toLowerCase();
-  return (p ? leases.filter((l) => l.name.startsWith(p)) : leases).sort((a, b) => a.name.localeCompare(b.name));
+  const live = unexpired(leases, now);
+  return (p ? live.filter((l) => l.name.startsWith(p)) : live).sort((a, b) => a.name.localeCompare(b.name));
 };
 
-/** Exact name only: a prefix match would also answer for `merge:x/y-z`. */
-export const findLease = async (rawName: unknown): Promise<ILease | null> => {
+/** Exact name only: a prefix match would also answer for `merge:x/y-z`. An expired lease is not held. */
+export const findLease = async (rawName: unknown, now: number = Date.now()): Promise<ILease | null> => {
   const { name } = parseLeaseName(rawName);
   const { leases } = await readLeaseState();
-  return leases.find((l) => l.name === name) ?? null;
+  return unexpired(leases, now).find((l) => l.name === name) ?? null;
 };
 
-export const releaseTabLeases = async (tabId: string, reason: TLeaseReleaseReason): Promise<ILease[]> => {
-  const released = await mutate((state) => {
+export const releaseTabLeases = async (tabId: string, reason: TLeaseReleaseReason, now: number = Date.now()): Promise<ILease[]> => {
+  const released = await transact(now, (state) => {
     const r = releaseTabInState(state, tabId);
-    return r.released.length ? { state: r.state, value: r.released } : null;
+    if (!r.released.length) return null;
+    return { state: r.state, value: r.released, effects: r.released.map((lease): TLeaseEffect => ({ type: 'released', lease, reason, by: null })) };
   });
-  if (released) await recordReleased(released.map((lease) => ({ lease, reason })), null);
-  return released ?? [];
+  return released.value ?? [];
 };
 
+/** Expiry is applied by the transaction's own prune; the sweep adds the tab and agent rules. */
 export const sweepLeases = async (facts: ISweepFacts): Promise<IReleasedLease[]> => {
-  const released = await mutate((state) => {
+  const { value, expired } = await transact(facts.now, (state) => {
     const r = sweepState(state, facts);
-    return r.released.length ? { state: r.state, value: r.released } : null;
-  });
-  if (released) await recordReleased(released, null, { sweep: true });
-  return released ?? [];
+    if (!r.released.length) return null;
+    return {
+      state: r.state,
+      value: r.released,
+      effects: r.released.map(({ lease, reason }): TLeaseEffect => ({ type: 'released', lease, reason, by: null, extra: { sweep: true } })),
+    };
+  }, { sweep: true });
+  return [...expired.map((lease): IReleasedLease => ({ lease, reason: 'expired' })), ...(value ?? [])];
 };

@@ -177,4 +177,22 @@ describe('tab lifecycle', () => {
     ]);
     expect(await listLiveTabIds()).toEqual(new Set(['tab-1', 'tab-2', 'tab-9']));
   });
+
+  it('reports a workspace whose layout is unreadable or unparseable as uncertain, and a missing layout as empty', async () => {
+    const { writeLayoutFile, resolveLayoutFile } = await import('@/lib/layout-store');
+    const { readLiveTabs } = await import('@/lib/tab-lifecycle');
+    workspaces.list = [{ id: 'ws-ok' }, { id: 'ws-corrupt' }, { id: 'ws-dir' }, { id: 'ws-missing' }];
+    await writeLayoutFile({
+      root: { type: 'pane', id: 'pane-1', activeTabId: 'tab-1', tabs: [{ id: 'tab-1', sessionName: 's1', name: '', order: 0 }] },
+      activePaneId: 'pane-1',
+      updatedAt: '2026-09-26T00:00:00.000Z',
+    }, resolveLayoutFile('ws-ok'));
+    await fs.mkdir(path.dirname(resolveLayoutFile('ws-corrupt')), { recursive: true });
+    await fs.writeFile(resolveLayoutFile('ws-corrupt'), '{not json');
+    await fs.mkdir(resolveLayoutFile('ws-dir'), { recursive: true });
+
+    const snapshot = await readLiveTabs();
+    expect(snapshot.tabs.map((t) => t.tabId)).toEqual(['tab-1']);
+    expect([...snapshot.uncertainWorkspaceIds].sort()).toEqual(['ws-corrupt', 'ws-dir']);
+  });
 });

@@ -21,6 +21,7 @@ const MIN = 60_000;
 
 let now: number;
 let live: Set<string>;
+let uncertain: Set<string>;
 let agents: Map<string, ITabAgentState>;
 const authority = { now: () => now, isWorkspaceOrchestrator: async () => false };
 
@@ -29,7 +30,7 @@ const setup = async () => {
   const { LeaseSweeper } = await import('@/lib/lease-sweeper');
   const sweeper = new LeaseSweeper({
     now: () => now,
-    listLiveTabIds: async () => live,
+    listLiveTabs: async () => ({ liveTabIds: live, uncertainWorkspaceIds: uncertain }),
     getAgentState: (id) => agents.get(id) ?? null,
   });
   return { ...store, sweeper };
@@ -44,6 +45,7 @@ describe('lease death', () => {
     mockHome.value = await makeHome();
     now = Date.parse('2026-09-26T03:00:00.000Z');
     live = new Set(['tab-a']);
+    uncertain = new Set();
     agents = new Map([['tab-a', { cliState: 'busy', isAgent: true }]]);
   });
 
@@ -134,6 +136,33 @@ describe('lease death', () => {
     expect(await names()).toEqual(['epic:alive', 'merge:x/alive', 'num:x/y:adr:0001']);
   });
 
+  it('never calls a tab gone when its workspace layout could not be read', async () => {
+    const { acquireLease, sweeper } = await setup();
+    await acquireLease({ name: 'epic:owned', ttlSeconds: null }, tabA, authority);
+    live = new Set();
+    uncertain = new Set(['ws1']);
+    now += 1000;
+    expect(await sweeper.sweep()).toEqual([]);
+    uncertain = new Set();
+    expect((await sweeper.sweep()).map((r) => r.reason)).toEqual(['holder-tab-gone']);
+  });
+
+  it('leaves a lease renewed after the tab facts were taken to the next sweep', async () => {
+    const { acquireLease } = await setup();
+    let facts: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { facts = resolve; });
+    const slow = new (await import('@/lib/lease-sweeper')).LeaseSweeper({
+      now: () => now,
+      listLiveTabs: async () => { await gate; return { liveTabIds: new Set(), uncertainWorkspaceIds: new Set() }; },
+      getAgentState: () => null,
+    });
+    const sweeping = slow.sweep();
+    now += 1000;
+    await acquireLease({ name: 'merge:x/new' }, { ...tabA, tabId: 'tab-new' }, authority);
+    facts();
+    expect(await sweeping).toEqual([]);
+  });
+
   it('ends an admin lease only by TTL', async () => {
     const { acquireLease, sweeper } = await setup();
     await acquireLease({ name: 'smoke:admin', ttlSeconds: 60 }, admin, authority);
@@ -157,6 +186,41 @@ describe('lease death', () => {
     agents.set('tab-a', { cliState: 'inactive', isAgent: true });
     expect(sweeper.isAgentInactive('tab-a')).toBe(true);
     expect(sweeper.isAgentInactive('tab-unknown')).toBe(false);
+  });
+});
+
+describe('boot sweep isolation', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    resetLeaseGlobals();
+    mockHome.value = await makeHome();
+  });
+
+  afterEach(async () => {
+    await drainLeaseLocks();
+    resetLeaseGlobals();
+    await fs.rm(mockHome.value, { recursive: true, force: true });
+  });
+
+  it('boots over a corrupt leases.json: initLeases logs and resolves, lease operations stay refused', async () => {
+    const errors: string[] = [];
+    vi.doMock('@/lib/logger', () => ({
+      createLogger: () => ({ info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: (m: string) => errors.push(m) }),
+    }));
+    vi.doMock('@/lib/tab-lifecycle', () => ({
+      onTabClosed: () => () => {},
+      readLiveTabs: async () => ({ tabs: [], uncertainWorkspaceIds: new Set() }),
+    }));
+    const { leasesFile, listLeases } = await import('@/lib/lease-store');
+    await fs.mkdir(leasesFile().replace(/\/[^/]+$/, ''), { recursive: true });
+    await fs.writeFile(leasesFile(), '');
+    const { initLeases } = await import('@/lib/lease-sweeper');
+
+    await expect(initLeases()).resolves.toBeUndefined();
+    expect(errors.some((m) => m.includes('boot lease sweep failed') && m.includes('leases.json'))).toBe(true);
+    await expect(listLeases()).rejects.toThrow('not valid JSON');
+    vi.doUnmock('@/lib/logger');
+    vi.doUnmock('@/lib/tab-lifecycle');
   });
 });
 

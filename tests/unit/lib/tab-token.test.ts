@@ -274,6 +274,14 @@ describe('planTabTokenSweep', () => {
     expect(plan.removed.map((r) => r.tabId)).toEqual(['tab-gone']);
   });
 
+  it('keeps the records of a workspace whose layout could not be read', async () => {
+    const { planTabTokenSweep } = await import('@/lib/tab-token');
+    const rec = record('ws-a', 's-unknown');
+    const plan = planTabTokenSweep({ 'tab-u': rec, 'tab-g': record('ws-b', 's-g') }, [], new Set(), new Set(['ws-a']));
+    expect(plan.keep).toEqual({ 'tab-u': rec });
+    expect(plan.removed.map((r) => r.tabId)).toEqual(['tab-g']);
+  });
+
   it('treats a record whose tab id now lives in another workspace as gone', async () => {
     const { planTabTokenSweep } = await import('@/lib/tab-token');
     const plan = planTabTokenSweep({ 'tab-1': record('ws-a', 's1') }, [live('ws-b', 'tab-1', 's-other')]);

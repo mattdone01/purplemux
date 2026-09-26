@@ -1,6 +1,6 @@
 import { createLogger } from '@/lib/logger';
 import { onTabClosed } from '@/lib/tab-lifecycle';
-import { releaseTabLeases, sweepLeases, type IReleasedLease } from '@/lib/lease-store';
+import { leasesFile, releaseTabLeases, sweepLeases, type IReleasedLease } from '@/lib/lease-store';
 import type { TCliState } from '@/types/timeline';
 
 const log = createLogger('lease-sweeper');
@@ -15,8 +15,11 @@ export interface ITabAgentState {
 
 export interface ILeaseSweeperDeps {
   now: () => number;
-  /** Tabs of every layout on disk — never the StatusManager map, which is empty until its first scan. */
-  listLiveTabIds: () => Promise<ReadonlySet<string>>;
+  /**
+   * Tabs of every layout on disk — never the StatusManager map, which is empty
+   * until its first scan — and the workspaces whose layout could not be read.
+   */
+  listLiveTabs: () => Promise<{ liveTabIds: ReadonlySet<string>; uncertainWorkspaceIds: ReadonlySet<string> }>;
   /** null when the StatusManager does not know the tab (yet). */
   getAgentState: (tabId: string) => ITabAgentState | null;
 }
@@ -48,11 +51,12 @@ export class LeaseSweeper {
     this.running = true;
     try {
       const now = this.deps.now();
-      const liveTabIds = await this.deps.listLiveTabIds();
+      const { liveTabIds, uncertainWorkspaceIds } = await this.deps.listLiveTabs();
       this.observeAgents(liveTabIds, now);
       const released = await sweepLeases({
         now,
         liveTabIds,
+        uncertainWorkspaceIds,
         agentGone: (tabId) => {
           const since = this.inactiveSince.get(tabId);
           return since !== undefined && now - since >= AGENT_GONE_GRACE_MS;
@@ -86,9 +90,10 @@ export const getLeaseSweeper = (): LeaseSweeper => {
   if (!g.__ptLeaseSweeper) {
     const sweeper = new LeaseSweeper({
       now: () => Date.now(),
-      listLiveTabIds: async () => {
-        const { listLiveTabIds } = await import('@/lib/tab-lifecycle');
-        return listLiveTabIds();
+      listLiveTabs: async () => {
+        const { readLiveTabs } = await import('@/lib/tab-lifecycle');
+        const { tabs, uncertainWorkspaceIds } = await readLiveTabs();
+        return { liveTabIds: new Set(tabs.map((t) => t.tabId)), uncertainWorkspaceIds };
       },
       getAgentState: (tabId) => g.__ptLeaseAgentStateSource?.(tabId) ?? null,
     });
@@ -108,6 +113,12 @@ export const getLeaseSweeper = (): LeaseSweeper => {
  * before a sweep may call an agent gone.
  */
 export const initLeases = async (): Promise<void> => {
-  const released = await getLeaseSweeper().sweep();
-  if (released.length) log.info(`boot lease sweep released ${released.length}: ${released.map((r) => `${r.lease.name} (${r.reason})`).join(', ')}`);
+  try {
+    const released = await getLeaseSweeper().sweep();
+    if (released.length) log.info(`boot lease sweep released ${released.length}: ${released.map((r) => `${r.lease.name} (${r.reason})`).join(', ')}`);
+  } catch (err) {
+    // The server boots regardless; every lease operation keeps failing closed
+    // on its own until the file is fixed.
+    log.error(`boot lease sweep failed, leases are refused until ${leasesFile()} is repaired or moved aside: ${err instanceof Error ? err.message : err}`);
+  }
 };
