@@ -8,6 +8,7 @@ import {
   applyBackgroundLine,
   createBackgroundLedger,
   latestBackgroundActivityAt,
+  mergeLedgers,
   openBackgroundTasks,
   readBackgroundLedger,
 } from '@/lib/providers/claude/background-ledger';
@@ -200,5 +201,231 @@ describe('readBackgroundLedger — whole transcript, incremental', () => {
     const newest = new Date('2026-09-26T01:45:00.000Z');
     await fs.utimes(path.join(subagents, 'agent-a1.jsonl'), newest, newest);
     expect(await latestBackgroundActivityAt(file, ledger, now)).toBe(newest.getTime());
+  });
+});
+
+// Story 37: tab-dTsAzt got four READY nudges on 2026-09-26 while three shells ran.
+// A subagent's foreground Bash, moved to the background on its timeout just before
+// the subagent returned, is recorded only in `<session>/subagents/agent-<id>.jsonl`
+// (sidechain lines); its completion lands later in the main transcript.
+describe('readBackgroundLedger — shells a subagent started (story 37)', () => {
+  const FIXTURE = path.join(FIXTURES, 'subagent-shells', 'sess-1.jsonl');
+  afterEach(() => __testing.ledgers.clear());
+
+  const openAt = async (file: string, iso: string) =>
+    openBackgroundTasks(await readBackgroundLedger(file), at(iso)).map((t) => `${t.kind}:${t.id}`).sort();
+
+  /** The fixture session as the server saw it at `iso`: every file cut to the lines written by then. */
+  const replayAt = async (iso: string): Promise<string[]> => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ledger-'));
+    try {
+      const upTo = (text: string) => text.split('\n').filter((l) => l.trim() && Date.parse(JSON.parse(l).timestamp) <= at(iso)).map((l) => `${l}\n`).join('');
+      const srcSub = path.join(path.dirname(FIXTURE), 'sess-1', 'subagents');
+      const sub = path.join(dir, 'sess-1', 'subagents');
+      await fs.mkdir(sub, { recursive: true });
+      await fs.writeFile(path.join(dir, 'sess-1.jsonl'), upTo(await fs.readFile(FIXTURE, 'utf-8')));
+      for (const name of await fs.readdir(srcSub)) {
+        const text = await fs.readFile(path.join(srcSub, name), 'utf-8');
+        await fs.writeFile(path.join(sub, name), name.endsWith('.jsonl') ? upTo(text) : text);
+      }
+      return await openAt(path.join(dir, 'sess-1.jsonl'), iso);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  };
+
+  it('replays tab-dTsAzt at each READY nudge: 2, 3 and 3 open shells, all started by subagents', async () => {
+    // Only the main file: the defect (every start is in a subagent file).
+    const mainOnly = ledgerOf(await fixtureLines('subagent-shells/sess-1.jsonl'));
+    expect(openBackgroundTasks(mainOnly, at('2026-09-26T15:52:55.000Z'))).toEqual([]);
+    expect(await replayAt('2026-09-26T15:21:20.000Z')).toEqual(['shell:bojj89i0e', 'shell:bpic9vrwt']);
+    expect(await replayAt('2026-09-26T15:49:47.000Z')).toEqual(['shell:b1tu3atis', 'shell:b6qc6fwtg', 'shell:bqk1wfdeb']);
+    expect(await replayAt('2026-09-26T15:52:55.000Z')).toEqual(['shell:b1tu3atis', 'shell:bchsaon9x', 'shell:bqk1wfdeb']);
+  });
+
+  it('a completed async subagent woken by its own shell\'s delivery is open until its next completion', async () => {
+    // adb9dae4: completed 15:46:11, woken 15:50:30 (b6qc6fwtg delivered into its file), completed 15:51:37.
+    // The main file records no resume, so the main file alone reads it as finished.
+    expect(await replayAt('2026-09-26T15:50:40.000Z')).toEqual(['agent:adb9dae4f7fcfa50e', 'shell:b1tu3atis', 'shell:bqk1wfdeb']);
+    // a749e9c8: resumed 15:32:56, completed 15:33:56, woken 15:42:15 by badbi4d6d, completed 15:42:35.
+    expect(await replayAt('2026-09-26T15:40:00.000Z')).toEqual(['agent:adb9dae4f7fcfa50e', 'shell:badbi4d6d']);
+    expect(await replayAt('2026-09-26T15:42:20.000Z')).toEqual(['agent:a749e9c84f6955c4c', 'agent:adb9dae4f7fcfa50e']);
+    expect(await replayAt('2026-09-26T15:42:40.000Z')).toEqual(['agent:adb9dae4f7fcfa50e', 'shell:b1tu3atis']);
+  });
+
+  it('a delivery into the file of an agent never started as async wakes nothing (a synchronous subagent has no completion notice)', () => {
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({
+      type: 'user', isSidechain: true, agentId: 'async-unknown', timestamp: '2026-09-26T01:00:00.000Z', origin: { kind: 'task-notification' },
+      message: { content: '[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>bz</task-id><status>completed</status></task-notification>' },
+    }), 'subagent');
+    expect(sub.wokenAt.get('async-unknown')).toBe(at('2026-09-26T01:00:00.000Z'));
+    expect(mergeLedgers([createBackgroundLedger(), sub]).open.size).toBe(0);
+  });
+
+  it('a shell ends on any end, even one stamped before its start (single-use ids); an agent needs an end not older than its start', () => {
+    const main = createBackgroundLedger();
+    // The notification line lands before the tool_result line (a shell that exits at once), and the clock steps back.
+    applyBackgroundLine(main, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:00:00.000Z', content: '<task-notification><task-id>bfast</task-id><status>completed</status></task-notification>' }));
+    applyBackgroundLine(main, toolResult({ backgroundTaskId: 'bfast' }, { timestamp: '2026-09-26T01:00:01.000Z' }));
+    applyBackgroundLine(main, toolResult({ taskId: 'bmonfast', timeoutMs: 10 ** 9 }, { timestamp: '2026-09-26T01:00:01.000Z' }));
+    applyBackgroundLine(main, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T00:59:00.000Z', content: '<task-notification><task-id>bmonfast</task-id><status>killed</status></task-notification>' }));
+    expect([...main.open.keys()].sort()).toEqual(['bfast']);
+    expect(openBackgroundTasks(mergeLedgers([main]), at('2026-09-26T01:05:00.000Z'))).toEqual([]);
+    // An agent resumed after an older end stays open.
+    applyBackgroundLine(main, toolResult({ resumedAgentId: 'aR' }, { timestamp: '2026-09-26T01:10:00.000Z' }));
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:09:00.000Z', content: '<task-notification><task-id>aR</task-id><status>completed</status></task-notification>' }), 'subagent');
+    expect(openBackgroundTasks(mergeLedgers([main, sub]), at('2026-09-26T01:11:00.000Z')).map((t) => t.id)).toEqual(['aR']);
+  });
+
+  it('an untimed delivery wakes nothing (no later end could close it)', () => {
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({
+      type: 'user', isSidechain: true, agentId: 'aU', origin: { kind: 'task-notification' },
+      message: { content: '[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>bz</task-id><status>completed</status></task-notification>' },
+    }), 'subagent');
+    expect(sub.wokenAt.size).toBe(0);
+  });
+
+  it('a subagent-started Monitor keeps the activity of its events reported in the main file', () => {
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({
+      type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+      message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { taskId: 'bmonsub', timeoutMs: 10 ** 9 },
+    }), 'subagent');
+    const main = createBackgroundLedger();
+    applyBackgroundLine(main, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:20:00.000Z', content: '<task-notification><task-id>bmonsub</task-id><event>gate slot free</event></task-notification>' }));
+    const merged = mergeLedgers([main, sub]);
+    expect([...merged.open.keys()]).toEqual(['bmonsub']);
+    expect(merged.lastEventAt.get('bmonsub')).toBe(at('2026-09-26T01:20:00.000Z'));
+  });
+
+  it('skips a subagent file last written before the agent process started', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ledger-'));
+    try {
+      const file = path.join(dir, 's.jsonl');
+      const sub = path.join(dir, 's', 'subagents');
+      await fs.mkdir(sub, { recursive: true });
+      await fs.writeFile(file, '');
+      const old = path.join(sub, 'agent-old.jsonl');
+      await fs.writeFile(old, JSON.stringify({
+        type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+        message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { backgroundTaskId: 'bold' },
+      }) + '\n');
+      const t = new Date('2026-09-26T01:00:00.000Z');
+      await fs.utimes(old, t, t);
+      await readBackgroundLedger(file, at('2026-09-26T02:00:00.000Z'));
+      expect(__testing.ledgers.has(old)).toBe(false);
+      await readBackgroundLedger(file, at('2026-09-26T00:30:00.000Z'));
+      expect(__testing.ledgers.has(old)).toBe(true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a subagent shell closes on its completion in the main transcript', async () => {
+    // b6qc6fwtg ended at 15:50:30 in both files; the main-file end alone closes it.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ledger-'));
+    try {
+      const file = path.join(dir, 's.jsonl');
+      const sub = path.join(dir, 's', 'subagents');
+      await fs.mkdir(sub, { recursive: true });
+      await fs.writeFile(path.join(sub, 'agent-a1.jsonl'), JSON.stringify({
+        type: 'user', isSidechain: true, agentId: 'a1', timestamp: '2026-09-26T01:00:00.000Z',
+        message: { content: [{ type: 'tool_result', content: 'moved to the background' }] }, toolUseResult: { backgroundTaskId: 'bsub1' },
+      }) + '\n');
+      await fs.writeFile(file, '');
+      expect(await openAt(file, '2026-09-26T01:05:00.000Z')).toEqual(['shell:bsub1']);
+      await fs.appendFile(file, JSON.stringify({
+        type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-26T01:10:00.000Z',
+        content: '<task-notification>\n<task-id>bsub1</task-id>\n<status>completed</status>\n</task-notification>',
+      }) + '\n');
+      expect(await openAt(file, '2026-09-26T01:11:00.000Z')).toEqual([]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a subagent file\'s own harness notification (prefixed, origin task-notification) ends the task', () => {
+    const ledger = createBackgroundLedger();
+    applyBackgroundLine(ledger, JSON.stringify({
+      type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+      message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { backgroundTaskId: 'bs' },
+    }), 'subagent');
+    expect([...ledger.open.keys()]).toEqual(['bs']);
+    applyBackgroundLine(ledger, JSON.stringify({
+      type: 'user', isSidechain: true, isMeta: true, timestamp: '2026-09-26T01:01:00.000Z', origin: { kind: 'task-notification' },
+      message: { content: '[SYSTEM NOTIFICATION - NOT USER INPUT]\nautomated.\n\n<task-notification>\n<task-id>bs</task-id>\n<status>completed</status>\n</task-notification>' },
+    }), 'subagent');
+    expect(ledger.open.size).toBe(0);
+    expect(ledger.endedAt.get('bs')).toBe(at('2026-09-26T01:01:00.000Z'));
+  });
+
+  it('a person quoting a notification (no harness origin) still ends nothing', () => {
+    const ledger = createBackgroundLedger();
+    applyBackgroundLine(ledger, toolResult({ backgroundTaskId: 'bq' }));
+    applyBackgroundLine(ledger, JSON.stringify({
+      type: 'user', timestamp: '2026-09-26T01:02:00.000Z',
+      message: { content: 'look: <task-notification><task-id>bq</task-id><status>completed</status></task-notification>' },
+    }));
+    expect([...ledger.open.keys()]).toEqual(['bq']);
+  });
+
+  it('the main file still ignores sidechain lines; a subagent file reads them', () => {
+    const line = JSON.stringify({
+      type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+      message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { backgroundTaskId: 'bside' },
+    });
+    const main = createBackgroundLedger();
+    applyBackgroundLine(main, line);
+    expect(main.open.size).toBe(0);
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, line, 'subagent');
+    expect([...sub.open.keys()]).toEqual(['bside']);
+  });
+
+  it('an agent resumed after its end (same id) is open again; an end in another file before the resume does not close it', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ledger-'));
+    try {
+      const file = path.join(dir, 's.jsonl');
+      const sub = path.join(dir, 's', 'subagents');
+      await fs.mkdir(sub, { recursive: true });
+      const note = (ts: string) => JSON.stringify({
+        type: 'user', isSidechain: true, timestamp: ts, origin: { kind: 'task-notification' },
+        message: { content: '[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>aX</task-id><status>completed</status></task-notification>' },
+      });
+      // An earlier end of aX recorded in a subagent file (01:00), then a resume in main (02:00).
+      await fs.writeFile(path.join(sub, 'agent-a2.jsonl'), note('2026-09-26T01:00:00.000Z') + '\n');
+      await fs.writeFile(file, toolResult({ resumedAgentId: 'aX' }, { timestamp: '2026-09-26T02:00:00.000Z' }) + '\n');
+      expect(await openAt(file, '2026-09-26T02:05:00.000Z')).toEqual(['agent:aX']);
+      // Its next end (03:00), wherever it is written, closes it.
+      await fs.appendFile(path.join(sub, 'agent-a2.jsonl'), note('2026-09-26T03:00:00.000Z') + '\n');
+      expect(await openAt(file, '2026-09-26T03:05:00.000Z')).toEqual([]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a subagent file added after the first read is picked up; files are read incrementally', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ledger-'));
+    try {
+      const file = path.join(dir, 's.jsonl');
+      await fs.writeFile(file, '');
+      expect(await openAt(file, '2026-09-26T01:05:00.000Z')).toEqual([]);
+      const sub = path.join(dir, 's', 'subagents');
+      await fs.mkdir(sub, { recursive: true });
+      const start = JSON.stringify({
+        type: 'user', isSidechain: true, timestamp: '2026-09-26T01:00:00.000Z',
+        message: { content: [{ type: 'tool_result', content: 'x' }] }, toolUseResult: { backgroundTaskId: 'blate' },
+      });
+      await fs.writeFile(path.join(sub, 'agent-a3.jsonl'), start + '\n');
+      await fs.writeFile(path.join(sub, 'agent-a3.meta.json'), '{}');
+      expect(await openAt(file, '2026-09-26T01:05:00.000Z')).toEqual(['shell:blate']);
+      expect(__testing.ledgers.has(path.join(sub, 'agent-a3.jsonl'))).toBe(true);
+      expect(__testing.ledgers.has(path.join(sub, 'agent-a3.meta.json'))).toBe(false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

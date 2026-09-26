@@ -48,6 +48,12 @@ export interface IRuntimeSnapshotOptions {
   tasksSince?: number | null;
   /** Compute `backgroundActivityAt` (file stats); only the stall check needs it. */
   withActivity?: boolean;
+  /**
+   * Read the background ledger (the main transcript and every subagent
+   * transcript). Only the watchdog's stop classification, unknown-state
+   * resolution and stall check use it, so the snippet and metadata reads skip it.
+   */
+  withBackground?: boolean;
 }
 
 /**
@@ -94,6 +100,12 @@ export interface IAgentRuntimeSnapshot {
    * open. The main transcript alone is quiet while a subagent works (L19).
    */
   backgroundActivityAt?: number | null;
+  /**
+   * False when the provider could not read the transcript at all (the snapshot
+   * is empty); absent when the provider cannot tell. `openBackgroundTasks` is
+   * absent when the background ledger could not be read.
+   */
+  transcriptRead?: boolean;
   /** The open background work by kind; judged differently for a stall (ADR-0018). */
   openBackgroundTaskKinds?: IOpenBackgroundTaskKinds;
   /**

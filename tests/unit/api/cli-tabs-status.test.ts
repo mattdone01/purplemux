@@ -107,6 +107,15 @@ describe('GET /api/cli/tabs/[tabId]/status', () => {
     expect(res.body).toMatchObject({ cliState: 'inactive', agentSessionId: '11111111-1111-4111-8111-111111111111' });
   });
 
+  it('reports how the watchdog classified the last stop (story 37), and null without a live entry', async () => {
+    expect((await get()).body).toMatchObject({ turnEnd: null });
+    const turnEnd = { kind: 'ready-for-review', at: 1, seq: 3, transcript: true, openBackgroundTasks: 0, liveRegisteredJobs: 0 };
+    statusManager.getAllForClient.mockReturnValue({ 'tab-1': { cliState: 'ready-for-review', agentSessionId: null, turnEnd } });
+    expect((await get()).body).toMatchObject({ turnEnd });
+    tmux.hasSession.mockResolvedValue(false);
+    expect((await get()).body).toMatchObject({ alive: false, turnEnd });
+  });
+
   it('reports the tab\'s identity (story 36)', async () => {
     expect((await get()).body).toMatchObject({ identity: 'hook' });
   });

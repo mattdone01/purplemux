@@ -22,6 +22,24 @@ import path from 'path';
  *
  * Starts can be many turns before the turn that waits on them, so the ledger
  * covers the whole transcript: it is read once, then only the appended bytes.
+ *
+ * A subagent's own starts live in `<session>/subagents/agent-<id>.jsonl`
+ * (sidechain lines). A foreground Bash it moves to the background on its
+ * timeout keeps running after the subagent returns, and the completion lands
+ * in the MAIN transcript (story 37: tab-dTsAzt, 2026-09-26, three such shells
+ * read as zero open work). So the session's ledger merges the main file and
+ * every subagent file. Shell and Monitor ids are single-use: any end closes
+ * them, whichever file holds it. An agent id is reused on resume, so an end
+ * closes an agent only when it is not older than that agent's start.
+ *
+ * A subagent file's notification is a user line the harness marks
+ * `origin.kind: "task-notification"`, its text prefixed with
+ * `[SYSTEM NOTIFICATION - NOT USER INPUT]`. It also WAKES that subagent: an
+ * async agent that had completed runs again to read it, and the main file
+ * records no resume, only the agent's second completion (agent adb9dae4,
+ * 15:46:11 → woken 15:50:30 → 15:51:37). Measured over the live sessions on
+ * 2026-09-26: all 94 such deliveries were followed by that agent's end in the
+ * main file. A wake counts only for an agent some file started as async.
  */
 
 export type TBackgroundTaskKind = 'shell' | 'agent' | 'monitor';
@@ -39,7 +57,20 @@ export interface IBackgroundLedger {
   open: Map<string, IBackgroundTask>;
   /** Newest Monitor event per open task; an event is activity. */
   lastEventAt: Map<string, number>;
+  /**
+   * Newest end per task id, including ids this file never opened: a subagent's
+   * shell ends in the main file. An end with no timestamp is recorded as
+   * +Infinity (it closes every start).
+   */
+  endedAt: Map<string, number>;
+  /** Ids this file started as async agents (launch or resume); only these can be woken. */
+  asyncAgents: Set<string>;
+  /** Newest harness delivery into a subagent file, by that file's agent id: the agent runs again from then. */
+  wokenAt: Map<string, number>;
 }
+
+/** Which file a line comes from: the main transcript skips sidechain lines; a subagent transcript is all sidechain. */
+export type TLedgerSource = 'main' | 'subagent';
 
 // A Monitor's expiry notice can land a little after its deadline; past this
 // grace the task is over even if the notice was never written.
@@ -56,6 +87,9 @@ const MONITOR_EXPIRED_PREFIX = '[Monitor expired';
 export const createBackgroundLedger = (): IBackgroundLedger => ({
   open: new Map(),
   lastEventAt: new Map(),
+  endedAt: new Map(),
+  asyncAgents: new Set(),
+  wokenAt: new Map(),
 });
 
 type TEntry = Record<string, unknown> & {
@@ -67,6 +101,8 @@ type TEntry = Record<string, unknown> & {
   operation?: string;
   content?: unknown;
   attachment?: { type?: string; prompt?: unknown };
+  origin?: { kind?: unknown };
+  agentId?: unknown;
 };
 
 const timestampOf = (entry: TEntry): number | null => {
@@ -114,6 +150,8 @@ const notificationTextOf = (entry: TEntry): string | null => {
           .map((b) => b.text as string)
           .join('\n')
       : '';
+  // The harness marks its own deliveries; a subagent's carry a warning prefix.
+  if (entry.origin?.kind === 'task-notification') return text;
   // A person quoting a notification mid-message is not a delivery.
   return text.trimStart().startsWith('<task-notification>') ? text : null;
 };
@@ -150,12 +188,14 @@ const stoppedTaskOf = (entry: TEntry): string | null => {
     : null;
 };
 
-const end = (ledger: IBackgroundLedger, id: string): void => {
+const end = (ledger: IBackgroundLedger, id: string, at: number | null): void => {
   ledger.open.delete(id);
   ledger.lastEventAt.delete(id);
+  const when = at ?? Number.POSITIVE_INFINITY;
+  ledger.endedAt.set(id, Math.max(ledger.endedAt.get(id) ?? Number.NEGATIVE_INFINITY, when));
 };
 
-export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string): void => {
+export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string, source: TLedgerSource = 'main'): void => {
   if (!LINE_HINTS.some((hint) => line.includes(hint))) return;
   let entry: TEntry;
   try {
@@ -163,17 +203,24 @@ export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string): vo
   } catch {
     return;
   }
-  if (typeof entry !== 'object' || entry === null || entry.isSidechain) return;
+  if (typeof entry !== 'object' || entry === null) return;
+  if (entry.isSidechain && source === 'main') return;
 
   if (entry.type === 'user') {
     const started = startOf(entry);
     if (started) ledger.open.set(started.id, { ...started, outputFile: started.outputFile ?? ledger.open.get(started.id)?.outputFile ?? null });
+    if (started?.kind === 'agent') ledger.asyncAgents.add(started.id);
     const stopped = stoppedTaskOf(entry);
-    if (stopped) end(ledger, stopped);
+    if (stopped) end(ledger, stopped, timestampOf(entry));
   }
 
   const text = notificationTextOf(entry);
   if (!text) return;
+  const deliveredAt = timestampOf(entry);
+  // A wake needs its time: an untimed wake could never be closed by a later end (review r2).
+  if (source === 'subagent' && deliveredAt !== null && entry.origin?.kind === 'task-notification' && typeof entry.agentId === 'string' && entry.agentId) {
+    ledger.wokenAt.set(entry.agentId, Math.max(ledger.wokenAt.get(entry.agentId) ?? Number.NEGATIVE_INFINITY, deliveredAt));
+  }
   for (const match of text.matchAll(NOTIFICATION_PATTERN)) {
     const body = match[1];
     const id = body.match(TASK_ID_PATTERN)?.[1];
@@ -182,10 +229,10 @@ export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string): vo
     // A Monitor event's own text may quote a status tag; only the envelope counts.
     const envelope = body.replace(EVENT_PATTERN, '');
     if (STATUS_PATTERN.test(envelope) || event.startsWith(MONITOR_EXPIRED_PREFIX)) {
-      end(ledger, id);
-    } else if (ledger.open.has(id)) {
-      const at = timestampOf(entry);
-      if (at !== null) ledger.lastEventAt.set(id, at);
+      end(ledger, id, deliveredAt);
+    } else if (deliveredAt !== null) {
+      // Kept for ids this file never opened too: a subagent's Monitor reports in the main file.
+      ledger.lastEventAt.set(id, deliveredAt);
     }
   }
 };
@@ -206,7 +253,9 @@ interface ILedgerFileState {
   ledger: IBackgroundLedger;
 }
 
-const MAX_LEDGER_FILES = 256;
+// One per transcript: the main file and each subagent file of every live tab.
+// Measured 2026-09-26: 151 subagent files over all sessions, at most 29 in one.
+const MAX_LEDGER_FILES = 4096;
 const READ_CHUNK = 1 << 20;
 
 const g = globalThis as unknown as { __ptClaudeBackgroundLedgers?: Map<string, ILedgerFileState> };
@@ -214,13 +263,17 @@ if (!g.__ptClaudeBackgroundLedgers) g.__ptClaudeBackgroundLedgers = new Map();
 const ledgers = g.__ptClaudeBackgroundLedgers;
 
 /**
- * The ledger of one transcript, brought up to date with the bytes appended
- * since the last read. A replaced or truncated file is read again from the
- * start. Only complete lines are consumed; a partial last line waits for the
- * next read.
+ * The ledger of one transcript file, brought up to date with the bytes
+ * appended since the last read. A replaced or truncated file is read again
+ * from the start. Only complete lines are consumed; a partial last line waits
+ * for the next read.
  */
-export const readBackgroundLedger = async (jsonlPath: string): Promise<IBackgroundLedger> => {
-  const stat = await fs.stat(jsonlPath);
+const readFileLedger = async (
+  jsonlPath: string,
+  source: TLedgerSource,
+  known?: { ino: number; size: number },
+): Promise<IBackgroundLedger> => {
+  const stat = known ?? await fs.stat(jsonlPath);
   let state = ledgers.get(jsonlPath);
   if (!state || state.ino !== stat.ino || stat.size < state.offset) {
     state = { ino: stat.ino, offset: 0, ledger: createBackgroundLedger() };
@@ -247,7 +300,7 @@ export const readBackgroundLedger = async (jsonlPath: string): Promise<IBackgrou
         continue;
       }
       for (const line of text.slice(0, lastNewline).split('\n')) {
-        if (line.trim()) applyBackgroundLine(state.ledger, line);
+        if (line.trim()) applyBackgroundLine(state.ledger, line, source);
       }
       carry = text.slice(lastNewline + 1);
     }
@@ -256,6 +309,80 @@ export const readBackgroundLedger = async (jsonlPath: string): Promise<IBackgrou
     await handle.close();
   }
   return state.ledger;
+};
+
+const subagentsDirOf = (jsonlPath: string): string => path.join(jsonlPath.replace(/\.jsonl$/, ''), 'subagents');
+
+const subagentFiles = async (jsonlPath: string): Promise<string[]> => {
+  const dir = subagentsDirOf(jsonlPath);
+  try {
+    return (await fs.readdir(dir)).filter((name) => name.endsWith('.jsonl')).sort().map((name) => path.join(dir, name));
+  } catch {
+    return [];
+  }
+};
+
+const maxInto = (map: Map<string, number>, id: string, at: number): void => {
+  map.set(id, Math.max(map.get(id) ?? Number.NEGATIVE_INFINITY, at));
+};
+
+/** Whether an end closes a start: always for single-use shell and Monitor ids; for an agent, only an end not older than the start. */
+const closes = (task: IBackgroundTask, endedAt: number | undefined): boolean =>
+  endedAt !== undefined && (task.kind !== 'agent' || task.startedAt === null || endedAt >= task.startedAt);
+
+/**
+ * One ledger from several files: a task is open when some file opened it (or
+ * woke it, for a known async agent) and no end closes it.
+ */
+export const mergeLedgers = (ledgers: IBackgroundLedger[]): IBackgroundLedger => {
+  const merged = createBackgroundLedger();
+  for (const ledger of ledgers) {
+    for (const [id, at] of ledger.endedAt) maxInto(merged.endedAt, id, at);
+    for (const id of ledger.asyncAgents) merged.asyncAgents.add(id);
+    for (const [id, at] of ledger.wokenAt) maxInto(merged.wokenAt, id, at);
+  }
+  const candidates: IBackgroundTask[] = ledgers.flatMap((ledger) => [...ledger.open.values()]);
+  for (const [id, at] of merged.wokenAt) {
+    if (merged.asyncAgents.has(id)) candidates.push({ id, kind: 'agent', startedAt: at, expiresAt: null, outputFile: null });
+  }
+  for (const task of candidates) {
+    if (closes(task, merged.endedAt.get(task.id))) continue;
+    const known = merged.open.get(task.id);
+    if (known && (known.startedAt ?? Number.NEGATIVE_INFINITY) >= (task.startedAt ?? Number.NEGATIVE_INFINITY)) {
+      if (!known.outputFile && task.outputFile) merged.open.set(task.id, { ...known, outputFile: task.outputFile });
+      continue;
+    }
+    merged.open.set(task.id, { ...task, outputFile: task.outputFile ?? known?.outputFile ?? null });
+  }
+  for (const ledger of ledgers) {
+    for (const [id, at] of ledger.lastEventAt) {
+      if (merged.open.has(id)) maxInto(merged.lastEventAt, id, at);
+    }
+  }
+  return merged;
+};
+
+/**
+ * The session's ledger: the main transcript plus every subagent transcript,
+ * each read incrementally. A subagent file last written before `since` (the
+ * agent process's start) is not read: every start and wake in it predates
+ * `since` and is filtered anyway, and its ends can only close those. A
+ * subagent file that cannot be read is skipped; the main file's read failure
+ * is thrown to the caller.
+ */
+export const readBackgroundLedger = async (jsonlPath: string, since?: number | null): Promise<IBackgroundLedger> => {
+  const main = await readFileLedger(jsonlPath, 'main');
+  const subs: IBackgroundLedger[] = [];
+  for (const file of await subagentFiles(jsonlPath)) {
+    try {
+      const stat = await fs.stat(file);
+      if (since != null && stat.mtimeMs < since) continue;
+      subs.push(await readFileLedger(file, 'subagent', stat));
+    } catch {
+      // Removed between the listing and the read.
+    }
+  }
+  return mergeLedgers([main, ...subs]);
 };
 
 const mtimeOf = async (file: string): Promise<number | null> => {
@@ -292,12 +419,7 @@ export const latestBackgroundActivityAt = async (
     if (task.outputFile) continue;
     for (const dir of taskDirs) candidates.push(await mtimeOf(path.join(dir, `${task.id}.output`)));
   }
-  const subagentsDir = path.join(jsonlPath.replace(/\.jsonl$/, ''), 'subagents');
-  try {
-    for (const name of await fs.readdir(subagentsDir)) {
-      if (name.endsWith('.jsonl')) candidates.push(await mtimeOf(path.join(subagentsDir, name)));
-    }
-  } catch { /* no subagents */ }
+  for (const file of await subagentFiles(jsonlPath)) candidates.push(await mtimeOf(file));
   const known = candidates.filter((t): t is number => t !== null);
   return known.length ? Math.max(...known) : null;
 };

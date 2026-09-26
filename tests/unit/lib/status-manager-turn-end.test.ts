@@ -156,6 +156,53 @@ describe('stop classification (ADR-0018)', () => {
     expect(entry.turnEnd).toMatchObject({ openBackgroundTasks: 1, liveRegisteredJobs: 0 });
   });
 
+  it('holds a stop while a shell a subagent moved to the background still runs (story 37, tab-dTsAzt)', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const file = await writeLines('claude/sess.jsonl', [claudeEnd('Still running: the 46-r2 gate.')]);
+    await writeLines('claude/sess/subagents/agent-a1.jsonl', [{
+      type: 'user', isSidechain: true, agentId: 'a1', timestamp: '2026-09-26T04:59:00.000Z',
+      message: { content: [{ type: 'tool_result', content: 'moved to the background (ID: bsub1)' }] },
+      toolUseResult: { backgroundTaskId: 'bsub1', timedOutAfterMs: 600000 },
+    }]);
+    const entry = worker('claude-code', file);
+    manager.registerTab('worker', entry);
+
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
+    await settle();
+
+    expect(paste).not.toHaveBeenCalled();
+    expect(entry.turnEnd).toMatchObject({ openBackgroundTasks: 1, liveRegisteredJobs: 0 });
+  });
+
+  it('records on a READY stop whether a transcript was read and how much was open', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('All set.')]));
+    manager.registerTab('worker', entry);
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    expect(entry.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: true, openBackgroundTasks: 0, liveRegisteredJobs: 0 });
+  });
+
+  it('serves turnEnd to clients through the real getAllForClient (the tab status route reads it there)', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('All set.')]));
+    manager.registerTab('worker', entry);
+    expect(manager.getAllForClient().worker.turnEnd).toBeNull();
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    expect(manager.getAllForClient().worker.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: true, openBackgroundTasks: 0 });
+  });
+
+  it('records an unreadable transcript as not read and the open count as unknown, never "read, 0 open"', async () => {
+    const { manager, paste } = await managerWithPaste();
+    const entry = worker('claude-code', path.join(mockHome.value, 'claude/missing.jsonl'));
+    manager.registerTab('worker', entry);
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    expect(entry.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: false, openBackgroundTasks: null });
+  });
+
   it('holds a stop with no marker while a registered tab bg job is alive', async () => {
     liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: true, registeredAt: 0, ageS: 1 }] });
     const { manager, paste } = await managerWithPaste();
@@ -194,6 +241,7 @@ describe('stop classification (ADR-0018)', () => {
     await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
     expect(paste.mock.calls[0][1]).toContain('is READY FOR REVIEW');
     expect(fallback.has('worker')).toBe(true);
+    expect(entry.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: false });
   });
 
   it('lets only the newest of two quick stops classify the tab (stop → prompt-submit → stop)', async () => {

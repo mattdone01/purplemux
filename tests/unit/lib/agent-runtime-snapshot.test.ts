@@ -130,29 +130,43 @@ describe('Claude snapshot — background work and turn tail', () => {
   it('counts a background shell started 20 turns and >8 KB earlier', async () => {
     const turns = Array.from({ length: 20 }, (_, i) => endTurn(`turn ${i} ${'x'.repeat(2000)}`));
     const jsonlPath = await writeJsonl([started('bfar1'), ...turns]);
-    const snapshot = await readClaudeRuntimeSnapshot(jsonlPath, { force: true });
+    const snapshot = await readClaudeRuntimeSnapshot(jsonlPath, { force: true, withBackground: true });
     expect(snapshot.openBackgroundTasks).toBe(1);
     expect(snapshot.openBackgroundTaskKinds).toEqual({ shell: 1, agent: 0, monitor: 0 });
     expect(snapshot.backgroundActivityAt).toBeNull();
-    expect((await readClaudeRuntimeSnapshot(jsonlPath, { withActivity: true })).backgroundActivityAt).toEqual(expect.any(Number));
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { withActivity: true, withBackground: true })).backgroundActivityAt).toEqual(expect.any(Number));
   });
 
   it('ignores tasks started before the agent process (orphaned by a restart)', async () => {
     const jsonlPath = await writeJsonl([started('bold1'), endTurn('resumed')]);
     const processStart = Date.parse('2026-09-26T05:00:30.000Z');
-    expect((await readClaudeRuntimeSnapshot(jsonlPath, { force: true })).openBackgroundTasks).toBe(1);
-    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart })).openBackgroundTasks).toBe(0);
-    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart - 60_000 })).openBackgroundTasks).toBe(1);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { force: true, withBackground: true })).openBackgroundTasks).toBe(1);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart, withBackground: true })).openBackgroundTasks).toBe(0);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { tasksSince: processStart - 60_000, withBackground: true })).openBackgroundTasks).toBe(1);
   });
 
   it('keeps the count on a cache hit and drops it once the task ends', async () => {
     const jsonlPath = await writeJsonl([started('b1'), endTurn('waiting')]);
-    await readClaudeRuntimeSnapshot(jsonlPath);
-    expect((await readClaudeRuntimeSnapshot(jsonlPath)).openBackgroundTasks).toBe(1);
+    await readClaudeRuntimeSnapshot(jsonlPath, { withBackground: true });
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { withBackground: true })).openBackgroundTasks).toBe(1);
     await fs.appendFile(jsonlPath, JSON.stringify(done('b1')) + '\n');
-    const after = await readClaudeRuntimeSnapshot(jsonlPath);
+    const after = await readClaudeRuntimeSnapshot(jsonlPath, { withBackground: true });
     expect(after.openBackgroundTasks).toBe(0);
     expect(after.backgroundActivityAt).toBeNull();
+  });
+
+  it('reads no ledger unless asked (story 37: the snippet and metadata reads skip it)', async () => {
+    const jsonlPath = await writeJsonl([started('bskip'), endTurn('waiting')]);
+    const plain = await readClaudeRuntimeSnapshot(jsonlPath, { force: true });
+    expect(plain.openBackgroundTasks).toBeUndefined();
+    expect(plain.transcriptRead).toBe(true);
+    expect((await readClaudeRuntimeSnapshot(jsonlPath, { force: true, withBackground: true })).openBackgroundTasks).toBe(1);
+  });
+
+  it('marks an unreadable transcript as not read (story 37), never as an empty read', async () => {
+    const snapshot = await readClaudeRuntimeSnapshot('/nonexistent/pmux-story-37.jsonl', { withBackground: true });
+    expect(snapshot.transcriptRead).toBe(false);
+    expect(snapshot.openBackgroundTasks).toBeUndefined();
   });
 
   it('returns the END of the last message as the tail, where the head snippet cuts it off', async () => {

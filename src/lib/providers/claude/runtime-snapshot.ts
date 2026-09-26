@@ -206,7 +206,7 @@ const withBackgroundWork = async (
 ): Promise<IAgentRuntimeSnapshot> => {
   try {
     const now = Date.now();
-    const ledger = await readBackgroundLedger(jsonlPath);
+    const ledger = await readBackgroundLedger(jsonlPath, options.tasksSince);
     const open = openBackgroundTasks(ledger, now, options.tasksSince);
     const openBackgroundTaskKinds = { shell: 0, agent: 0, monitor: 0 };
     for (const task of open) openBackgroundTaskKinds[task.kind] += 1;
@@ -301,11 +301,11 @@ export const readClaudeRuntimeSnapshot = async (
 ): Promise<IAgentRuntimeSnapshot> => {
   let snapshot: IAgentRuntimeSnapshot;
   try {
-    snapshot = await readTailSnapshot(jsonlPath, options);
+    snapshot = { ...await readTailSnapshot(jsonlPath, options), transcriptRead: true };
   } catch {
-    return emptySnapshot();
+    return { ...emptySnapshot(), transcriptRead: false };
   }
-  return withBackgroundWork(jsonlPath, snapshot, options);
+  return options.withBackground ? withBackgroundWork(jsonlPath, snapshot, options) : snapshot;
 };
 
 export const __testing = {
