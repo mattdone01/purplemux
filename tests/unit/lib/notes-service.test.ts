@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { ICaller } from '@/lib/caller';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import { renderInboxLine } from '@/lib/inbox-templates';
-import { NoteError, NOTE_EXPIRE_MS, NOTE_PRUNE_MS, NOTE_REMIND_MS, NOTE_SENDER_NOTICE_MS } from '@/lib/notes-store';
+import { NoteError, NOTE_EXPIRE_MS, NOTE_EXPIRE_NOTICE_GRACE_MS, NOTE_PRUNE_MS, NOTE_REMIND_MS, NOTE_SENDER_NOTICE_MS } from '@/lib/notes-store';
 import { NotesService, type INotesDeps } from '@/lib/notes-service';
 import type { IInboxItem } from '@/types/inbox';
 import type { INotesState } from '@/types/note';
@@ -68,6 +68,10 @@ class Fakes {
         const item = { id, state: 'queued', targetWorkspaceId: req.targetWorkspaceId, targetTabId: req.targetTabId, deliveredAt: null } as unknown as IInboxItem;
         this.inbox.set(id, item);
         return { item };
+      },
+      withdraw: async (id, reason) => {
+        const item = this.inbox.get(id);
+        if (item && (item.state === 'queued' || item.state === 'held')) this.inbox.set(id, { ...item, state: 'dropped', droppedReason: reason } as IInboxItem);
       },
       inboxItems: async () => {
         this.reads.inboxItems += 1;
@@ -234,6 +238,62 @@ describe('notes (ADR-0013)', () => {
     expect(f.note(id).deliveredTo).toEqual({ workspaceId: 'ws-3', tabId: 'tab-c' });
     await svc.tick();
     expect(f.sent.map((s) => s.targetTabId)).toEqual(['tab-a', 'tab-c']);
+  });
+
+  it('a line still waiting for the old owner is withdrawn when the note moves to the new one', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    const oldItem = f.note(id).inboxItemId!; // tab-a is busy: the line is still queued
+    f.epics.set('ddh', { workspaceId: 'ws-3', tabId: 'tab-c' });
+    await svc.tick('ddh');
+    expect(f.inbox.get(oldItem)).toMatchObject({ state: 'dropped', droppedReason: 'note-rerouted' });
+    expect(f.note(id)).toMatchObject({ deliveredTo: { workspaceId: 'ws-3', tabId: 'tab-c' } });
+    // The withdrawn item is the old one: the note does not treat its own drop as a new re-route.
+    await svc.tick();
+    expect(f.sent.map((s) => s.targetTabId)).toEqual(['tab-a', 'tab-c']);
+  });
+
+  it('a note to a workspace follows its orchestrator to a new live tab', async () => {
+    const { id } = await svc.send(C, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.live.add('ws-9/tab-orch2');
+    f.orchestrators.set('ws-9', 'tab-orch2'); // the old orchestrator tab stays open
+    await svc.tick();
+    expect(f.note(id).deliveredTo).toEqual({ workspaceId: 'ws-9', tabId: 'tab-orch2' });
+    await svc.tick();
+    expect(f.sent.map((s) => s.targetTabId)).toEqual(['tab-orch', 'tab-orch2']);
+  });
+
+  it('an unknown recipient does not hold back the sender\'s notice', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!);
+    f.live.delete('ws-1/tab-a');
+    f.uncertain.add('ws-1');
+    f.now += NOTE_SENDER_NOTICE_MS;
+    await svc.tick();
+    expect(f.sent.filter((s) => s.fields.event === 'unacked').map((s) => s.targetTabId)).toEqual(['tab-b']);
+    expect(f.note(id).remindedAt).toBeNull();
+  });
+
+  it('expiry waits up to a day for a sender whose liveness is unknown, so its one notice is not lost', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    const late = await svc.send(B, { toEpic: 'ddh', subject: 's2', body: 'b' });
+    f.live.delete('ws-2/tab-b');
+    f.uncertain.add('ws-2');
+    f.now = T0 + NOTE_EXPIRE_MS;
+    await svc.tick();
+    expect(f.note(id).state).toBe('delivered');
+    f.uncertain.delete('ws-2');
+    f.live.add('ws-2/tab-b');
+    await svc.tick();
+    expect(f.note(id).state).toBe('expired');
+    expect(f.sent.filter((s) => s.fields.event === 'expired').map((s) => s.fields.noteId)).toEqual([id, late.id]);
+
+    const third = await svc.send(B, { toEpic: 'ddh', subject: 's3', body: 'b' });
+    f.live.delete('ws-2/tab-b');
+    f.uncertain.add('ws-2');
+    f.now += NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS;
+    await svc.tick();
+    expect(f.note(third.id).state).toBe('expired'); // the grace is bounded
   });
 
   it('unknown liveness is not closed: no re-route, and the reminder waits instead of being used up', async () => {

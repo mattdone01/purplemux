@@ -116,6 +116,12 @@ export const dropForTabInState = (
   return { state: { items }, dropped };
 };
 
+/** Drop one item that is still waiting (queued or held): its owner withdrew it. A delivered item is left alone. */
+export const withdrawInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState =>
+  replace(state, id, (item) => (item.state === 'queued' || item.state === 'held'
+    ? { ...item, state: 'dropped', droppedReason: reason, transitionAt: now }
+    : item));
+
 /**
  * Queued items past 24 h become held; terminal items 7 days after their last
  * transition are pruned. The same state object comes back when nothing
@@ -259,6 +265,10 @@ export const mutateInbox = async <T>(fn: (state: IInboxState) => { state: IInbox
   });
 
 export const newInboxId = (): string => `i-${nanoid(10)}`;
+
+/** The owning feature takes back a notice it no longer wants typed (a note routed elsewhere). */
+export const withdrawNotice = async (id: string, reason: string): Promise<void> =>
+  mutateInbox((state) => ({ state: withdrawInState(state, id, reason, Date.now()), value: undefined }));
 
 /**
  * The ONLY entry point for a server-originated notice. The owning feature has

@@ -25,6 +25,8 @@ export const NOTE_REMIND_MS = 30 * MIN;
 export const NOTE_SENDER_NOTICE_MS = 60 * MIN;
 /** A note unacked (or undeliverable) this long after creation expires. */
 export const NOTE_EXPIRE_MS = 14 * DAY;
+/** How long expiry waits for a sender tab whose liveness is unknown, so its one notice is not lost. */
+export const NOTE_EXPIRE_NOTICE_GRACE_MS = DAY;
 /** Acked and expired notes are pruned this long after their transition. */
 export const NOTE_PRUNE_MS = 14 * DAY;
 

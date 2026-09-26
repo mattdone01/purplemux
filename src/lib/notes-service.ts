@@ -4,6 +4,7 @@ import type { TNoteEvent } from '@/lib/inbox-templates';
 import { createLogger } from '@/lib/logger';
 import {
   NOTE_EXPIRE_MS,
+  NOTE_EXPIRE_NOTICE_GRACE_MS,
   NOTE_OPEN_PER_SENDER,
   NOTE_REMIND_MS,
   NOTE_SENDER_NOTICE_MS,
@@ -58,6 +59,8 @@ export interface INotesDeps {
   /** Every live tab, and the workspaces whose layout could not be read (their tabs are unknown, not closed). */
   liveTabs: () => Promise<ILiveTabs>;
   enqueue: (req: IEnqueueRequest<'note'>) => Promise<{ item: IInboxItem }>;
+  /** Drop a notice still waiting in the inbox (queued or held); a delivered one is left alone. */
+  withdraw: (itemId: string, reason: string) => Promise<void>;
   inboxItems: () => Promise<IInboxItem[]>;
 }
 
@@ -68,7 +71,11 @@ export interface ILiveTabs {
 
 type TTabState = 'live' | 'closed' | 'unknown';
 
-/** The reads one pass shares: the inbox and the live tabs once each, each epic holder and orchestrator once. */
+/**
+ * The reads one pass shares: the notes' own inbox and live-tab reads happen once each, and each epic
+ * holder and orchestrator is resolved once. An epic holder's lease view reads the live tabs on its
+ * own, so it may lag the pass's snapshot by a moment; the next pass settles any difference.
+ */
 interface IReads {
   epicHolder: (slug: string) => Promise<{ workspaceId: string; tabId: string } | null>;
   /** The workspace's orchestrator tab while it is live; else null. */
@@ -148,16 +155,16 @@ export class NotesService {
   }
 
   /**
-   * The delivered line's tab can no longer act on it: that tab is confirmed closed (an epic lease
-   * dies with its tab), or the epic now has a different live holder. Unknown liveness is not gone.
+   * The routed tab can no longer act on the note: it is confirmed closed (an epic lease dies with
+   * its tab), or the recipient role moved to another live tab — a different holder of the epic, or
+   * a different orchestrator of the workspace (review round 3). Unknown liveness is not gone.
    */
   private async recipientGone(note: INote, r: IReads): Promise<boolean> {
     const to = note.deliveredTo;
     if (!to) return false;
     if ((await r.tabState(to.workspaceId, to.tabId)) === 'closed') return true;
-    if (!note.to.epic) return false;
-    const holder = await r.epicHolder(note.to.epic);
-    return !!holder && (holder.workspaceId !== to.workspaceId || holder.tabId !== to.tabId);
+    const now = await this.recipientOf(note, r);
+    return !!now && (now.workspaceId !== to.workspaceId || now.tabId !== to.tabId);
   }
 
   /**
@@ -166,7 +173,9 @@ export class NotesService {
    */
   private async advance(note: INote, now: number, r: IReads): Promise<INote> {
     if (OPEN_STATES.has(note.state) && now - note.createdAt >= NOTE_EXPIRE_MS) {
-      await this.noticeSender(note, 'expired', r);
+      // The one expiry notice waits while the sender's liveness is unknown, for at most a day.
+      const settled = await this.noticeSender(note, 'expired', r);
+      if (!settled && now - note.createdAt < NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS) return note;
       return expired(note, now);
     }
     if (note.state === 'queued' || note.state === 'undeliverable') return this.route(note, now, r);
@@ -179,21 +188,31 @@ export class NotesService {
     if (item?.state === 'dropped' || (!item && note.deliveredAt === null)) return this.route(requeued(note, now), now, r);
     // A line that reached a tab which is now closed, or an epic that changed hands, goes to the
     // current owner: `--to-me` is the routed tab, so nobody else would see it (review round 2).
-    if (await this.recipientGone(note, r)) return this.route(requeued(note, now), now, r);
+    if (await this.recipientGone(note, r)) {
+      // The old tab may still be open with the line waiting: take the line back first, so it is not
+      // typed there after the note has moved (review round 3). A failed withdrawal defers the move.
+      if (item && (item.state === 'queued' || item.state === 'held')) await this.deps.withdraw(item.id, 'note-rerouted');
+      return this.route(requeued(note, now), now, r);
+    }
     let next = note;
     if (item?.state === 'delivered' && next.deliveredAt === null) next = reachedComposer(next, item.deliveredAt ?? now);
     // The recipient's reminder counts from the line reaching its composer: a busy recipient is not
     // reminded of a line it has not seen. recipientGone() above leaves only a live or unknown tab;
     // an unknown one is tried again next pass, never marked as reminded.
     if (next.deliveredTo && next.deliveredAt !== null && next.remindedAt === null && now - next.deliveredAt >= NOTE_REMIND_MS) {
+      // Not live here means unknown: the reminder waits, and the sender's clock below still runs
+      // (review round 3: an unreadable recipient must not hold back the sender's escalation).
+      let sent = false;
       try {
-        if ((await r.tabState(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) !== 'live') return next;
-        await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'));
+        if ((await r.tabState(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) === 'live') {
+          await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'));
+          sent = true;
+        }
       } catch (err) {
         log.warn(`note ${note.id} reminder not sent: ${err instanceof Error ? err.message : err}`);
         return next;
       }
-      next = reminded(next, now);
+      if (sent) next = reminded(next, now);
     }
     // The sender's notice counts from the first routing, once per note: it is the escalation for a
     // recipient that never reads the line, so it must not wait for the line to be read.
@@ -407,6 +426,7 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     workspaceExists: async (workspaceId) => !!(await workspaceStore.getWorkspaceById(workspaceId)),
     liveTabs: tabLifecycle.readLiveTabs,
     enqueue: inboxStore.enqueueNotice,
+    withdraw: inboxStore.withdrawNotice,
     inboxItems: async () => (await inboxStore.readInboxState()).items,
   };
 };
