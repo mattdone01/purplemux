@@ -467,9 +467,14 @@ const E2E = process.env.ACCEPTANCE_E2E_CANDIDATE;
 describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
   it('passes every wave-1, story-15 and wave-2 check on an isolated instance', { timeout: 600_000 }, () => {
     const log = path.join(os.tmpdir(), `acceptance-e2e-${process.pid}.log`);
-    // The real HOME: the harness's own live-home refusal and live-port avoidance
-    // must look at the live instance, not at the test run's isolated HOME.
-    const env = { ...process.env, HOME: process.env.PMUX_TEST_REAL_HOME ?? process.env.HOME };
+    // The real HOME and the real tmux socket directory: the harness's live-home
+    // refusal, live-port avoidance and live-socket leak check must look at the
+    // live instance, not at the test run's isolated HOME and TMUX_TMPDIR.
+    const env = {
+      ...process.env,
+      HOME: process.env.PMUX_TEST_REAL_HOME ?? process.env.HOME,
+      ACCEPT_LIVE_TMUX_TMPDIR: process.env.PMUX_TEST_REAL_TMUX_TMPDIR ?? '/tmp',
+    };
     const r = spawnSync('bash', [RUN, '--candidate', E2E!, '--log', log], { encoding: 'utf-8', timeout: 590_000, env });
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');

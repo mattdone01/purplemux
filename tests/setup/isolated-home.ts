@@ -22,6 +22,8 @@ import path from 'path';
 
 export const REAL_HOME_ENV = 'PMUX_TEST_REAL_HOME';
 export const HOME_ROOT_ENV = 'PMUX_TEST_HOME_ROOT';
+/** The real TMUX_TMPDIR (default /tmp): the acceptance e2e names the LIVE socket directory with it. */
+export const REAL_TMUX_TMPDIR_ENV = 'PMUX_TEST_REAL_TMUX_TMPDIR';
 
 const OFFSETS_FILE = '.log-offsets.json';
 const PIDS_DIR = '.pids';
@@ -164,6 +166,7 @@ export default function setup(): () => void {
   // tmux sockets too: a test that reaches `tmux -L purple` must never reach the
   // LIVE server's sessions (story 16 review r2: a prefix `-t` match could kill one).
   const realTmuxTmpdir = process.env.TMUX_TMPDIR;
+  process.env[REAL_TMUX_TMPDIR_ENV] = realTmuxTmpdir ?? '/tmp';
   process.env.TMUX_TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-test-tmux-'));
   const tmuxDir = process.env.TMUX_TMPDIR;
 
