@@ -1,5 +1,6 @@
 import type { NextApiResponse } from 'next';
-import { DeployError } from '@/lib/deploy-announce';
+import { isCodedError } from '@/lib/coded-error';
+import type { DeployError } from '@/lib/deploy-announce';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('deploy-http');
@@ -12,7 +13,7 @@ const STATUS: Record<string, number> = {
 
 /** Every refusal carries `code`, which the CLI maps to its exit (ADR-0016). */
 export const sendDeployError = (res: NextApiResponse, err: unknown): void => {
-  if (err instanceof DeployError) {
+  if (isCodedError<DeployError>(err, 'DeployError', STATUS)) {
     res.status(STATUS[err.code] ?? 500).json({ error: err.message, code: err.code });
     return;
   }

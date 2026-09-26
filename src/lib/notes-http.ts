@@ -16,7 +16,7 @@ const STATUS: Record<string, number> = {
 
 /** Every note refusal carries `code`, which the CLI maps to its exit (ADR-0016). */
 export const sendNoteError = (res: NextApiResponse, err: unknown): void => {
-  if (isCodedError<NoteError>(err, 'NoteError')) {
+  if (isCodedError<NoteError>(err, 'NoteError', STATUS)) {
     res.status(STATUS[err.code] ?? 500).json({ error: err.message, code: err.code });
     return;
   }

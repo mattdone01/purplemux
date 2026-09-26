@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
+import { brandCodedError } from '@/lib/coded-error';
 import { EPIC_SLUG } from '@/lib/lease-policy';
 import type { INote, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode } from '@/types/note';
 
@@ -12,7 +13,7 @@ export class NoteError extends Error {
   constructor(readonly code: TNoteErrorCode, message: string) {
     super(message);
     // The brand the routes check (`isCodedError`): the class itself differs across bundles.
-    this.name = 'NoteError';
+    brandCodedError(this, 'NoteError');
   }
 }
 
