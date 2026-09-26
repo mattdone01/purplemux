@@ -1024,6 +1024,35 @@ export class MissionControlStore {
     return deliveryFromRow(this.database.prepare('SELECT * FROM deliveries WHERE id=?').get(id) as IDeliveryRow);
   };
 
+  /**
+   * Story 12 (consult ruling A′): claim a delivery whose notice waits in the inbox — `queued`, no
+   * `next_attempt_at`, marked `inbox:<itemId>` — for the paste the inbox is about to make. Same
+   * answered-and-bound guard as `claimDelivery`.
+   */
+  claimInboxDelivery = (id: string, marker: string): IMissionDelivery | null => {
+    const now = Date.now();
+    const result = this.database.prepare(`UPDATE deliveries SET state='dispatching', attempts=attempts+1,
+      updated_at=MAX(?,updated_at+1)
+      WHERE id=? AND state='queued' AND next_attempt_at IS NULL AND last_error=?
+      AND EXISTS (SELECT 1 FROM attention_items item JOIN runs run ON run.id=item.run_id
+        WHERE item.answer_id=deliveries.answer_id AND item.state='answered'
+          AND run.id=deliveries.run_id AND run.binding_json=deliveries.binding_json)`)
+      .run(now, id, marker);
+    if (!result.changes) return null;
+    return deliveryFromRow(this.database.prepare('SELECT * FROM deliveries WHERE id=?').get(id) as IDeliveryRow);
+  };
+
+  /** Story 12: every row handed to the inbox — waiting (`queued`, marked `inbox:…`) or in a paste (`dispatching`). */
+  listInboxHandoffs = (): { deliveries: IMissionDelivery[]; bootstrapEntries: IMissionBootstrapQueueEntry[] } => ({
+    deliveries: (this.database.prepare(`SELECT * FROM deliveries
+      WHERE state='dispatching' OR (state='queued' AND next_attempt_at IS NULL AND last_error LIKE 'inbox:%')`)
+      .all() as IDeliveryRow[]).map(deliveryFromRow),
+    bootstrapEntries: (this.database.prepare(`SELECT * FROM bootstrap_entries
+      WHERE state='dispatching' OR (state='queued' AND reason LIKE 'inbox:%')`)
+      .all() as IBootstrapEntryRow[])
+      .map((row) => ({ bootstrapId: row.bootstrap_id, entry: bootstrapEntryFromRow(row), attempts: row.attempts, nextAttemptAt: row.next_attempt_at })),
+  });
+
   private deliveryEligibility = (
     id: string,
     expectedUpdatedAt: number,
@@ -1233,7 +1262,9 @@ export class MissionControlStore {
 
   listQueuedBootstrapEntries = (limit: number): IMissionBootstrapQueueEntry[] => {
     const now = Date.now();
-    return (this.database.prepare(`SELECT * FROM bootstrap_entries WHERE state='queued' AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY COALESCE(next_attempt_at,updated_at) LIMIT ?`).all(now, limit) as IBootstrapEntryRow[])
+    // An entry waiting in the inbox (reason `inbox:…`, story 12) is not due: the inbox owns it.
+    return (this.database.prepare(`SELECT * FROM bootstrap_entries WHERE state='queued' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+      AND (reason IS NULL OR reason NOT LIKE 'inbox:%') ORDER BY COALESCE(next_attempt_at,updated_at) LIMIT ?`).all(now, limit) as IBootstrapEntryRow[])
       .map((row) => ({ bootstrapId: row.bootstrap_id, entry: bootstrapEntryFromRow(row), attempts: row.attempts, nextAttemptAt: row.next_attempt_at }));
   };
 

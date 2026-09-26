@@ -65,14 +65,16 @@ vi.mock('@/lib/providers/registry', () => ({
 
 import {
   discoverMissionControlWorkspaces,
-  dispatchMissionPrompt,
   hasEmptyAgentComposer,
+  missionBootstrapKey,
   missionLiveRunSourceKey,
   MissionControlRuntime,
   type IMissionControlRuntimeStore,
   type IMissionRuntimeDeps,
-  type TMissionDispatchResult,
 } from '@/lib/mission-control-runtime';
+import { renderInboxLine } from '@/lib/inbox-templates';
+import type { IMissionBootstrapQueueEntry } from '@/lib/mission-control-store';
+import type { IInboxItem } from '@/types/inbox';
 import type {
   IMissionBinding,
   IMissionBootstrapEntry,
@@ -306,141 +308,6 @@ describe('Mission Control composer guard', () => {
   });
 });
 
-describe('Mission Control live delivery guard', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-    const tab = { id: 'orch', sessionName: 'pt-ws-one-pane-orch', name: 'orchestrator', order: 0, panelType: 'claude-code' as const };
-    mocks.findTab.mockResolvedValue({ tab });
-    mocks.statuses = {
-      orch: {
-        workspaceId: 'ws-one',
-        agentProviderId: 'claude',
-        agentSessionId: 'session-orch',
-        cliState: 'idle',
-        permissionRequest: null,
-      },
-    };
-    mocks.panes = new Map([
-      [tab.sessionName, { command: 'claude', path: '/repo', pid: 10, windowActivity: NOW / 1_000 }],
-    ]);
-    mocks.getAllPanesInfo.mockImplementation(async () => mocks.panes);
-    mocks.agentRunning = true;
-    mocks.capture.mockResolvedValue('completed\n❯\u00a0');
-    mocks.deliverPrompt.mockResolvedValue(undefined);
-  });
-
-  it('submits once only after every binding and composer guard passes', async () => {
-    const result = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-
-    expect(result).toEqual({ delivered: true });
-    expect(mocks.deliverPrompt).toHaveBeenCalledOnce();
-    // With escapes, so a dim prompt suggestion reads as an empty composer (story 17).
-    expect(mocks.capture).toHaveBeenCalledWith('pt-ws-one-pane-orch', 120, 50, { escapes: true });
-  });
-
-  it('delivers to an idle orchestrator whose composer shows only a dim suggestion', async () => {
-    mocks.capture.mockResolvedValue('completed\n\x1b[39m❯\u00a0\x1b[2mBilling cleared: re-run the listed runs\x1b[0m');
-    expect(await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' })).toEqual({ delivered: true });
-  });
-
-  it('refuses a replaced provider session before terminal delivery', async () => {
-    mocks.statuses.orch.agentSessionId = 'replacement-session';
-
-    const result = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-
-    expect(result).toMatchObject({ delivered: false, retryable: false, reason: 'binding-identity-changed' });
-    expect(mocks.deliverPrompt).not.toHaveBeenCalled();
-  });
-
-  it('refuses when the provider process is no longer live', async () => {
-    mocks.agentRunning = false;
-
-    const result = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-
-    expect(result).toMatchObject({ delivered: false, retryable: false, reason: 'bound-agent-not-live' });
-    expect(mocks.deliverPrompt).not.toHaveBeenCalled();
-  });
-
-  it('refuses a shell foreground even when a descendant agent and stale composer remain observable', async () => {
-    mocks.panes.set('pt-ws-one-pane-orch', {
-      command: 'bash',
-      path: '/repo',
-      pid: 10,
-      windowActivity: NOW / 1_000,
-    });
-    mocks.agentRunning = true;
-    mocks.capture.mockResolvedValue('stale agent output\n❯\u00a0');
-
-    const result = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-
-    expect(result).toMatchObject({ delivered: false, retryable: false, reason: 'bound-agent-not-live' });
-    expect(mocks.deliverPrompt).not.toHaveBeenCalled();
-    expect(mocks.capture).not.toHaveBeenCalled();
-  });
-
-  it('never types into a tab halted by a usage limit (story 26): a retryable refusal', async () => {
-    mocks.halted.add('orch');
-    try {
-      const result = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-      expect(result).toMatchObject({ delivered: false, retryable: true, reason: 'usage-limit-halt' });
-      expect(mocks.deliverPrompt).not.toHaveBeenCalled();
-    } finally {
-      mocks.halted.delete('orch');
-    }
-  });
-
-  it('defers native prompts and user composer drafts without typing', async () => {
-    mocks.statuses.orch.permissionRequest = { id: 'permission-one' };
-    const nativePrompt = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-    expect(nativePrompt).toMatchObject({ delivered: false, retryable: true, reason: 'native-prompt-active' });
-
-    mocks.statuses.orch.permissionRequest = null;
-    mocks.capture.mockResolvedValue('old\n❯\u00a0\nnew\n❯ existing draft');
-    const draft = await dispatchMissionPrompt({ workspaceId: 'ws-one', binding, message: 'read answer' });
-    expect(draft).toMatchObject({ delivered: false, retryable: true, reason: 'composer-not-empty' });
-    expect(mocks.deliverPrompt).not.toHaveBeenCalled();
-  });
-
-  it('runs the durable eligibility preflight immediately before terminal delivery', async () => {
-    const order: string[] = [];
-    mocks.deliverPrompt.mockImplementation(async () => {
-      order.push('deliver');
-    });
-
-    const result = await dispatchMissionPrompt({
-      workspaceId: 'ws-one',
-      binding,
-      message: 'read answer',
-      preflight: () => {
-        order.push('preflight');
-        return { ok: true };
-      },
-    });
-
-    expect(result).toEqual({ delivered: true });
-    expect(order).toEqual(['preflight', 'deliver']);
-  });
-
-  it('does not paste when the durable record changed after dispatch guards passed', async () => {
-    const result = await dispatchMissionPrompt({
-      workspaceId: 'ws-one',
-      binding,
-      message: 'read answer',
-      preflight: () => ({ ok: false, reason: 'run-binding-changed' }),
-    });
-
-    expect(result).toEqual({
-      delivered: false,
-      retryable: false,
-      uncertain: false,
-      reason: 'dispatch-ineligible:run-binding-changed',
-    });
-    expect(mocks.deliverPrompt).not.toHaveBeenCalled();
-  });
-});
-
 const binding: IMissionBinding = {
   tabId: 'orch',
   providerId: 'claude',
@@ -527,14 +394,52 @@ const snapshot = (runBinding: IMissionBinding | null = binding, runRevision = 4)
   bootstrap: null,
 });
 
+const inboxItem = (overrides: Partial<IInboxItem> = {}): IInboxItem => ({
+  id: 'i-one',
+  kind: 'mission',
+  targetWorkspaceId: 'ws-one',
+  targetTabId: 'orch',
+  dedupeKey: 'mission:delivery:delivery-one',
+  line: '[purplemux mission x] an answer is ready',
+  createdAt: NOW,
+  notBefore: NOW,
+  attempts: 0,
+  lastAttemptAt: null,
+  lastRefusal: null,
+  state: 'queued',
+  deliveredAt: null,
+  heldReason: null,
+  droppedReason: null,
+  expiresAt: NOW + 86_400_000,
+  staleAt: null,
+  transitionAt: NOW,
+  ...overrides,
+});
+
+const liveIdentity = { tabId: 'orch', providerId: 'claude', sessionId: 'session-orch', runtimeGeneration: null };
+
+const bootstrapEntry = (overrides: Partial<IMissionBootstrapEntry> = {}): IMissionBootstrapEntry => ({
+  workspaceId: 'ws-one',
+  runId: 'run-one',
+  binding: { ...binding, generation: 0 },
+  state: 'queued',
+  reason: null,
+  updatedAt: 1,
+  ...overrides,
+});
+
 const runtimeHarness = (options: {
   due?: IMissionDelivery[];
   runBinding?: IMissionBinding | null;
-  dispatchResult?: Awaited<ReturnType<IMissionRuntimeDeps['dispatch']>>;
   deliveryValidation?: { ok: true } | { ok: false; reason: string };
   bootstrapValidation?: { ok: true } | { ok: false; reason: string };
   bootstrap?: { entry: IMissionBootstrapEntry; attempts: number };
   runRevision?: number;
+  handoffs?: { deliveries: IMissionDelivery[]; bootstrapEntries: IMissionBootstrapQueueEntry[] };
+  items?: IInboxItem[];
+  identity?: Omit<IMissionBinding, 'generation'> | null;
+  enqueueError?: Error;
+  snapshotDeliveries?: IMissionDelivery[];
 } = {}) => {
   const events: string[] = [];
   const claimed = delivery({
@@ -547,57 +452,65 @@ const runtimeHarness = (options: {
     events.push('validate-delivery');
     return options.deliveryValidation ?? { ok: true as const };
   });
-  const finalizeDeliveryAttempt = vi.fn(() => claimed);
-  const completeBootstrapAttempt = vi.fn(() => options.bootstrap?.entry ?? null);
+  const finalizeDeliveryAttempt = vi.fn((..._args: unknown[]) => {
+    events.push('complete');
+    return claimed;
+  });
+  const completeBootstrapAttempt = vi.fn((..._args: unknown[]) => {
+    events.push('complete-bootstrap');
+    return options.bootstrap?.entry ?? null;
+  });
   const store = {
-    snapshot: vi.fn(() => snapshot(
-      options.runBinding === undefined ? binding : options.runBinding,
-      options.runRevision,
-    )),
+    snapshot: vi.fn(() => ({
+      ...snapshot(options.runBinding === undefined ? binding : options.runBinding, options.runRevision),
+      deliveries: options.snapshotDeliveries ?? [],
+    })),
     reconcileDiscovery: vi.fn(),
     listDueDeliveries: vi.fn(() => options.due ?? []),
     claimDelivery: vi.fn(() => {
       events.push('claim');
       return claimed;
     }),
-    validateDeliveryAttempt,
-    finalizeDeliveryAttempt: vi.fn((...args: Parameters<typeof finalizeDeliveryAttempt>) => {
-      events.push('complete');
-      return finalizeDeliveryAttempt(...args);
+    claimInboxDelivery: vi.fn((_id: string, _marker: string) => {
+      events.push('claim-inbox');
+      return { ...claimed, updatedAt: 3 };
     }),
+    listInboxHandoffs: vi.fn(() => options.handoffs ?? { deliveries: [], bootstrapEntries: [] }),
+    validateDeliveryAttempt,
+    finalizeDeliveryAttempt,
     recoverDispatching: vi.fn(() => 0),
     listQueuedBootstrapEntries: vi.fn(() => options.bootstrap
       ? [{ bootstrapId: 'bootstrap-one', entry: options.bootstrap.entry, attempts: 0, nextAttemptAt: NOW }]
       : []),
-    claimBootstrapEntry: vi.fn(() => options.bootstrap
-      ? { bootstrapId: 'bootstrap-one', entry: { ...options.bootstrap.entry, state: 'dispatching', updatedAt: 2 }, attempts: options.bootstrap.attempts, nextAttemptAt: null }
-      : null),
+    claimBootstrapEntry: vi.fn((bootstrapId: string, _ws: string, _run: string, _updatedAt: number) => {
+      events.push('claim-bootstrap');
+      const entry = options.bootstrap?.entry ?? options.handoffs?.bootstrapEntries[0]?.entry ?? bootstrapEntry();
+      return { bootstrapId, entry: { ...entry, state: 'dispatching', updatedAt: 2 }, attempts: options.bootstrap?.attempts ?? 1, nextAttemptAt: null };
+    }),
     validateBootstrapAttempt: vi.fn(() => {
       events.push('validate-bootstrap');
       return options.bootstrapValidation ?? { ok: true as const };
     }),
     completeBootstrapAttempt,
   } as unknown as IMissionControlRuntimeStore;
-  const dispatch = vi.fn(async (_request: Parameters<IMissionRuntimeDeps['dispatch']>[0]) => {
-    events.push('dispatch');
-    const eligibility = _request.preflight?.();
-    if (eligibility && !eligibility.ok) {
-      return {
-        delivered: false as const,
-        retryable: false,
-        uncertain: false,
-        reason: `dispatch-ineligible:${eligibility.reason}`,
-      };
-    }
-    return options.dispatchResult ?? { delivered: true as const };
-  });
+  const unregister = vi.fn();
+  const inbox = {
+    enqueue: vi.fn(async (request: Parameters<IMissionRuntimeDeps['inbox']['enqueue']>[0]) => {
+      events.push('enqueue');
+      if (options.enqueueError) throw options.enqueueError;
+      return { item: inboxItem({ id: 'i-new', dedupeKey: request.dedupeKey }), created: true };
+    }),
+    items: vi.fn(async () => options.items ?? []),
+    withdraw: vi.fn(async () => true),
+    registerPreflight: vi.fn(() => unregister),
+  };
   const deps: IMissionRuntimeDeps = {
     getStore: () => store,
     now: () => NOW,
     discover: vi.fn(),
     workspaceViews: vi.fn(async () => []),
-    resolveIdentity: vi.fn(),
-    dispatch,
+    resolveIdentity: vi.fn(async () => (options.identity === undefined ? liveIdentity : options.identity)),
+    inbox,
     setInterval: vi.fn(() => 1 as unknown as ReturnType<typeof setInterval>),
     clearInterval: vi.fn(),
   };
@@ -605,13 +518,17 @@ const runtimeHarness = (options: {
     runtime: new MissionControlRuntime(deps),
     store,
     deps,
-    dispatch,
+    inbox,
+    unregister,
     validateDeliveryAttempt,
     finalizeDeliveryAttempt,
     completeBootstrapAttempt,
     events,
   };
 };
+
+const waitingDelivery = (itemId = 'i-one', overrides: Partial<IMissionDelivery> = {}): IMissionDelivery =>
+  delivery({ state: 'queued', nextAttemptAt: null, lastError: `inbox:${itemId}`, updatedAt: 2, ...overrides });
 
 describe('Mission Control durable delivery worker', () => {
   it('contains a rejected fire-and-forget worker pass after bootstrap succeeds', async () => {
@@ -651,7 +568,7 @@ describe('Mission Control durable delivery worker', () => {
     expect(harness.store.recoverDispatching).toHaveBeenCalledWith('server-restarted-during-uncertain-delivery');
   });
 
-  it('contains a worker-pass failure after store initialization and retries on a later pass', async () => {
+  it('contains a worker-pass failure after store initialization and recovers on a later pass', async () => {
     const harness = runtimeHarness();
     let storeReads = 0;
     harness.deps.getStore = () => {
@@ -668,6 +585,40 @@ describe('Mission Control durable delivery worker', () => {
     expect(harness.store.recoverDispatching).toHaveBeenCalledWith('server-restarted-during-uncertain-delivery');
   });
 
+  it('recovers once per process: a failure after recovery does not run it again (ruling A′ §6)', async () => {
+    const harness = runtimeHarness();
+    vi.mocked(harness.store.listDueDeliveries).mockImplementationOnce(() => {
+      throw new Error('one bad pass');
+    });
+
+    await expect(harness.runtime.tick()).rejects.toThrow('one bad pass');
+    await harness.runtime.tick();
+    await harness.runtime.tick();
+
+    expect(harness.store.recoverDispatching).toHaveBeenCalledOnce();
+  });
+
+  it('registers the mission preflight once, after recovery, and stop unregisters it', async () => {
+    const harness = runtimeHarness();
+    const order: string[] = [];
+    vi.mocked(harness.store.recoverDispatching).mockImplementation(() => {
+      order.push('recover');
+      return 0;
+    });
+    harness.inbox.registerPreflight.mockImplementation(() => {
+      order.push('register');
+      return harness.unregister;
+    });
+
+    await harness.runtime.start();
+    await harness.runtime.tick();
+    expect(order).toEqual(['recover', 'register']);
+    expect(harness.inbox.registerPreflight).toHaveBeenCalledWith('mission', expect.any(Function));
+
+    await harness.runtime.stop();
+    expect(harness.unregister).toHaveBeenCalledOnce();
+  });
+
   it('installs one interval when start is called concurrently', async () => {
     const harness = runtimeHarness();
 
@@ -679,138 +630,254 @@ describe('Mission Control durable delivery worker', () => {
 
   it('does not resurrect the interval when stop runs during the initial worker pass', async () => {
     const harness = runtimeHarness({ due: [delivery()] });
-    let completeDispatch: ((result: { delivered: true }) => void) | undefined;
-    harness.deps.dispatch = vi.fn(() => new Promise<TMissionDispatchResult>((resolve) => {
-      completeDispatch = resolve;
+    let finishEnqueue: (() => void) | undefined;
+    harness.inbox.enqueue.mockImplementation(() => new Promise((resolve) => {
+      finishEnqueue = () => resolve({ item: inboxItem({ id: 'i-new' }), created: true });
     }));
 
     const starting = harness.runtime.start();
+    await vi.waitFor(() => expect(finishEnqueue).toBeDefined());
     const stopping = harness.runtime.stop();
     expect(harness.deps.clearInterval).toHaveBeenCalledOnce();
-    completeDispatch?.({ delivered: true });
+    finishEnqueue?.();
     await Promise.all([starting, stopping]);
 
     vi.mocked(harness.store.listDueDeliveries).mockReturnValue([]);
     await harness.runtime.start();
     expect(harness.deps.setInterval).toHaveBeenCalledTimes(2);
   });
+});
 
-  it('claims before dispatch and durably schedules a bounded readiness retry', async () => {
-    const queued = delivery();
-    const harness = runtimeHarness({
-      due: [queued],
-      dispatchResult: { delivered: false, retryable: true, uncertain: false, reason: 'native-prompt-active' },
-    });
+describe('Mission Control hands deliveries to the inbox (story 12)', () => {
+  it('claims, re-validates, enqueues one notice, and leaves the row queued on the item', async () => {
+    const harness = runtimeHarness({ due: [delivery()] });
 
     await harness.runtime.tick();
 
-    expect(harness.events).toEqual(['claim', 'dispatch', 'validate-delivery', 'complete']);
+    expect(harness.events).toEqual(['claim', 'validate-delivery', 'enqueue', 'complete']);
+    expect(harness.inbox.enqueue).toHaveBeenCalledWith({
+      kind: 'mission',
+      targetWorkspaceId: 'ws-one',
+      targetTabId: 'orch',
+      dedupeKey: 'mission:delivery:delivery-one',
+      fields: { answerId: 'answer-one', workspaceId: 'ws-one', readyAt: NOW },
+    });
     expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 2, binding, {
       state: 'queued',
-      nextAttemptAt: NOW + 5_000,
-      lastError: 'native-prompt-active',
+      nextAttemptAt: null,
+      lastError: 'inbox:i-new',
     });
   });
 
-  it('holds an answer when its run binding changed and never dispatches it', async () => {
-    const harness = runtimeHarness({
-      due: [delivery()],
-      runBinding: { ...binding, generation: 3 },
-    });
+  it('holds an answer whose run binding changed and never enqueues it', async () => {
+    const harness = runtimeHarness({ due: [delivery()], runBinding: { ...binding, generation: 3 } });
 
     await harness.runtime.tick();
 
-    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.inbox.enqueue).not.toHaveBeenCalled();
     expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 2, binding, {
-      state: 'held',
-      nextAttemptAt: null,
-      lastError: 'run-binding-changed',
+      state: 'held', nextAttemptAt: null, lastError: 'run-binding-changed',
     });
   });
 
-  it('revalidates the durable delivery after claim and holds a concurrently invalidated send', async () => {
-    const harness = runtimeHarness({
-      due: [delivery()],
-      deliveryValidation: { ok: false, reason: 'attention-no-longer-answered' },
-    });
+  it('holds an answer that stopped being eligible after the claim', async () => {
+    const harness = runtimeHarness({ due: [delivery()], deliveryValidation: { ok: false, reason: 'attention-no-longer-answered' } });
 
     await harness.runtime.tick();
 
-    expect(harness.validateDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 2, binding);
+    expect(harness.inbox.enqueue).not.toHaveBeenCalled();
     expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 2, binding, {
-      state: 'held',
-      nextAttemptAt: null,
-      lastError: 'dispatch-ineligible:attention-no-longer-answered',
+      state: 'held', nextAttemptAt: null, lastError: 'dispatch-ineligible:attention-no-longer-answered',
     });
   });
 
-  it('holds an uncertain transport outcome instead of automatically resending', async () => {
-    const harness = runtimeHarness({
-      due: [delivery()],
-      dispatchResult: { delivered: false, retryable: false, uncertain: true, reason: 'transport-uncertain' },
-    });
+  it('holds an answer the inbox refuses to queue, with the refusal', async () => {
+    const harness = runtimeHarness({ due: [delivery()], enqueueError: new Error('inbox field answerId does not match its grammar (missionId)') });
 
     await harness.runtime.tick();
 
     expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 2, binding, {
       state: 'held',
       nextAttemptAt: null,
-      lastError: 'transport-uncertain',
+      lastError: 'inbox-enqueue-failed:inbox field answerId does not match its grammar (missionId)',
     });
   });
 
-  it('keeps known pre-send deferrals queued with a capped backoff', async () => {
+  it('hands a bootstrap entry to the inbox as one line keyed by a server-made id', async () => {
+    const harness = runtimeHarness({ bootstrap: { entry: bootstrapEntry(), attempts: 1 }, runRevision: 0 });
+
+    await harness.runtime.tick();
+
+    const key = missionBootstrapKey('bootstrap-one', 'ws-one', 'run-one');
+    expect(key).toMatch(/^boot-[0-9a-f]{32}$/);
+    expect(harness.events).toEqual(['claim-bootstrap', 'validate-bootstrap', 'enqueue', 'complete-bootstrap']);
+    const request = harness.inbox.enqueue.mock.calls[0][0];
+    expect(request).toEqual({
+      kind: 'mission',
+      targetWorkspaceId: 'ws-one',
+      targetTabId: 'orch',
+      dedupeKey: `mission:bootstrap:${key}`,
+      fields: { event: 'bootstrap', bootstrapKey: key, workspaceId: 'ws-one' },
+    });
+    const { line } = renderInboxLine('mission', request.fields);
+    expect(line).not.toContain('\n');
+    expect(line).not.toContain('bootstrap-one');
+    expect(harness.completeBootstrapAttempt).toHaveBeenCalledWith('bootstrap-one', 'ws-one', 'run-one', 2, {
+      state: 'queued', reason: 'inbox:i-new', nextAttemptAt: null,
+    });
+  });
+
+  it('holds a bootstrap entry without a binding, and one no longer eligible, without enqueueing', async () => {
+    const unbound = runtimeHarness({ bootstrap: { entry: bootstrapEntry({ binding: null }), attempts: 1 } });
+    await unbound.runtime.tick();
+    expect(unbound.inbox.enqueue).not.toHaveBeenCalled();
+    expect(unbound.completeBootstrapAttempt).toHaveBeenCalledWith('bootstrap-one', 'ws-one', 'run-one', 2, {
+      state: 'held', reason: 'orchestrator-binding-missing',
+    });
+
+    const stale = runtimeHarness({ bootstrap: { entry: bootstrapEntry(), attempts: 1 }, bootstrapValidation: { ok: false, reason: 'bootstrap-run-not-current' } });
+    await stale.runtime.tick();
+    expect(stale.inbox.enqueue).not.toHaveBeenCalled();
+    expect(stale.completeBootstrapAttempt).toHaveBeenCalledWith('bootstrap-one', 'ws-one', 'run-one', 2, {
+      state: 'held', reason: 'dispatch-ineligible:bootstrap-run-not-current',
+    });
+  });
+});
+
+describe('Mission Control paste-time preflight (story 12, ruling A′ §4)', () => {
+  it('claims the waiting row for this paste only when every check passes', async () => {
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } });
+
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: true });
+
+    expect(harness.store.claimInboxDelivery).toHaveBeenCalledWith('delivery-one', 'inbox:i-one');
+    expect(harness.validateDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding);
+    expect(harness.events).toEqual(['claim-inbox', 'validate-delivery']);
+  });
+
+  it.each<[string, Parameters<typeof runtimeHarness>[0], IInboxItem, string]>([
+    ['no row waits on this item', { handoffs: { deliveries: [waitingDelivery('i-other')], bootstrapEntries: [] } }, inboxItem(), 'mission-record-not-waiting'],
+    ['the row waits for another tab', { handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } }, inboxItem({ targetTabId: 'tab-else' }), 'binding-tab-changed'],
+    ['the bound agent is not live', { handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] }, identity: null }, inboxItem(), 'bound-agent-not-live'],
+    ['the provider session was replaced', { handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] }, identity: { ...liveIdentity, sessionId: 'replacement' } }, inboxItem(), 'binding-identity-changed'],
+  ])('refuses without claiming when %s', async (_name, options, item, reason) => {
+    const harness = runtimeHarness(options);
+
+    await expect(harness.runtime.preflight(item)).resolves.toEqual({ ok: false, reason });
+
+    expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
+  });
+
+  it('holds the claimed row when the record changed, and refuses the paste', async () => {
     const harness = runtimeHarness({
-      due: [delivery({ attempts: 8 })],
-      dispatchResult: { delivered: false, retryable: true, uncertain: false, reason: 'composer-not-ready:busy' },
+      handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] },
+      deliveryValidation: { ok: false, reason: 'run-binding-changed' },
+    });
+
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: false, reason: 'run-binding-changed' });
+
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding, {
+      state: 'held', nextAttemptAt: null, lastError: 'dispatch-ineligible:run-binding-changed',
+    });
+  });
+
+  it('claims a waiting bootstrap entry the same way', async () => {
+    const entry = bootstrapEntry({ reason: 'inbox:i-one', updatedAt: 2 });
+    const harness = runtimeHarness({
+      handoffs: { deliveries: [], bootstrapEntries: [{ bootstrapId: 'bootstrap-one', entry, attempts: 1, nextAttemptAt: null }] },
+    });
+
+    await expect(harness.runtime.preflight(inboxItem({ dedupeKey: 'mission:bootstrap:x' }))).resolves.toEqual({ ok: true });
+
+    expect(harness.store.claimBootstrapEntry).toHaveBeenCalledWith('bootstrap-one', 'ws-one', 'run-one', 2);
+    expect(harness.store.validateBootstrapAttempt).toHaveBeenCalledWith('bootstrap-one', 'ws-one', 'run-one', 2);
+  });
+});
+
+describe('Mission Control maps inbox outcomes onto its rows (story 12, ruling A′ §5)', () => {
+  const pasted = async (item: IInboxItem) => {
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } });
+    await harness.runtime.preflight(inboxItem());
+    vi.mocked(harness.store.listInboxHandoffs).mockReturnValue({ deliveries: [waitingDelivery('i-one', { state: 'dispatching', updatedAt: 3 })], bootstrapEntries: [] });
+    harness.inbox.items.mockResolvedValue([item]);
+    harness.finalizeDeliveryAttempt.mockClear();
+    await harness.runtime.tick();
+    return harness;
+  };
+
+  it('a delivered paste submits the row at the delivery time', async () => {
+    const harness = await pasted(inboxItem({ state: 'delivered', deliveredAt: NOW + 500 }));
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding, {
+      state: 'submitted', nextAttemptAt: null, lastError: null, submittedAt: NOW + 500,
+    });
+  });
+
+  it('an uncertain paste holds the row with the inbox reason', async () => {
+    const harness = await pasted(inboxItem({ state: 'held', heldReason: 'stranded-in-composer' }));
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding, {
+      state: 'held', nextAttemptAt: null, lastError: 'stranded-in-composer',
+    });
+  });
+
+  it('a paste still in flight changes nothing', async () => {
+    const harness = await pasted(inboxItem());
+    expect(harness.finalizeDeliveryAttempt).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [inboxItem({ state: 'held', heldReason: 'composer-not-ready:busy (undelivered after 24 h)' }), 'composer-not-ready:busy (undelivered after 24 h)'],
+    [inboxItem({ state: 'dropped', droppedReason: 'target-tab-closed' }), 'inbox-dropped:target-tab-closed'],
+    [undefined, 'inbox-item-missing'],
+  ])('a waiting row whose item ended unpasted is held (%#)', async (item, reason) => {
+    const harness = runtimeHarness({
+      handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] },
+      items: item ? [item] : [],
     });
 
     await harness.runtime.tick();
 
-    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 2, binding, {
-      state: 'queued',
-      nextAttemptAt: NOW + 60_000,
-      lastError: 'composer-not-ready:busy',
+    expect(harness.store.claimInboxDelivery).toHaveBeenCalledWith('delivery-one', 'inbox:i-one');
+    expect(harness.finalizeDeliveryAttempt).toHaveBeenCalledWith('delivery-one', 3, binding, {
+      state: 'held', nextAttemptAt: null, lastError: reason,
     });
   });
 
-  it('defers one-off bootstrap reconciliation until the composer is ready', async () => {
-    const entry: IMissionBootstrapEntry = {
-      workspaceId: 'ws-one',
-      runId: 'run-one',
-      binding: { ...binding, generation: 0 },
-      state: 'queued',
-      reason: null,
-      updatedAt: 1,
-    };
+  it('a waiting row whose item is still queued is left alone', async () => {
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] }, items: [inboxItem()] });
+    await harness.runtime.tick();
+    expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
+    expect(harness.inbox.withdraw).not.toHaveBeenCalled();
+  });
+
+  it('a waiting bootstrap entry whose item was held is held with the reason', async () => {
+    const entry = bootstrapEntry({ reason: 'inbox:i-one', updatedAt: 2 });
     const harness = runtimeHarness({
-      bootstrap: { entry, attempts: 1 },
-      runRevision: 0,
-      dispatchResult: { delivered: false, retryable: true, uncertain: false, reason: 'composer-not-ready:busy' },
+      handoffs: { deliveries: [], bootstrapEntries: [{ bootstrapId: 'bootstrap-one', entry, attempts: 1, nextAttemptAt: null }] },
+      items: [inboxItem({ state: 'held', heldReason: 'target-not-agent' })],
     });
 
     await harness.runtime.tick();
 
-    expect(harness.dispatch).toHaveBeenCalledWith(expect.objectContaining({
-      message: expect.stringContaining('First bind this provisional run by emitting run.resumed'),
-    }));
-    expect(harness.dispatch.mock.calls[0][0].message).toContain('expectedRevision 0, bindingGeneration 0');
-    expect(harness.store.validateBootstrapAttempt).toHaveBeenCalledWith(
-      'bootstrap-one',
-      'ws-one',
-      'run-one',
-      2,
-    );
-    expect(harness.completeBootstrapAttempt).toHaveBeenCalledWith(
-      'bootstrap-one',
-      'ws-one',
-      'run-one',
-      2,
-      {
-        state: 'queued',
-        reason: 'readiness-deferred:composer-not-ready:busy',
-        nextAttemptAt: NOW + 5_000,
-      },
-    );
+    expect(harness.completeBootstrapAttempt).toHaveBeenCalledWith('bootstrap-one', 'ws-one', 'run-one', 2, {
+      state: 'held', reason: 'target-not-agent',
+    });
+  });
+
+  it('withdraws a queued item whose row left the waiting state, but not one about to be handed off again', async () => {
+    const gone = runtimeHarness({
+      handoffs: { deliveries: [], bootstrapEntries: [] },
+      items: [inboxItem()],
+      snapshotDeliveries: [delivery({ state: 'held', lastError: 'attention item cancelled' })],
+    });
+    await gone.runtime.tick();
+    expect(gone.inbox.withdraw).toHaveBeenCalledWith('i-one', 'mission-record-not-waiting');
+
+    const transferred = runtimeHarness({
+      handoffs: { deliveries: [], bootstrapEntries: [] },
+      items: [inboxItem()],
+      snapshotDeliveries: [delivery({ state: 'queued', lastError: null })],
+    });
+    await transferred.runtime.tick();
+    expect(transferred.inbox.withdraw).not.toHaveBeenCalled();
   });
 });

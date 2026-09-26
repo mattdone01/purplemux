@@ -4,11 +4,13 @@ import type { TInboxKind } from '@/types/inbox';
 
 const AT = Date.parse('2026-09-26T06:00:00.000Z');
 
+const MISSION_ANSWER = { answerId: '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b', workspaceId: 'ws-fOvEfz', readyAt: AT };
+
 const VALID: IInboxFields = {
   note: { noteId: 'n-AbC123', fromWorkspaceId: 'ws-fOvEfz', fromTabId: 'tab-csMTHf', sentAt: AT },
   watch: { watchId: 'w-9xYz01', target: 'NomuPay/treasury-api#897', notice: 'merged', sha: '66f4647d0123456789abcdef0123456789abcdef' },
   deploy: { deployId: 'd-abcd12', restartAt: AT, inMinutes: 10 },
-  mission: { answerId: '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b', workspaceId: 'ws-fOvEfz', readyAt: AT },
+  mission: MISSION_ANSWER,
   resume: { resumeId: 'r-abcd12' },
 };
 
@@ -29,7 +31,7 @@ describe('inbox templates (ADR-0012)', () => {
     ['note', '[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z — purplemux note show n-AbC123, then purplemux note ack n-AbC123'],
     ['watch', '[purplemux watch w-9xYz01] NomuPay/treasury-api#897 is MERGED (66f4647d) — watch cleared'],
     ['deploy', '[purplemux deploy d-abcd12] purplemux restarts at ~2026-09-26T06:00:00Z (in 10 min) — details: purplemux deploy status d-abcd12; reach a checkpoint; tabs survive, in-flight hook events do not'],
-    ['mission', '[purplemux mission 3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b] an answer is ready at 2026-09-26T06:00:00Z — purplemux mission answers -w ws-fOvEfz'],
+    ['mission', '[purplemux mission 3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b] an answer is ready at 2026-09-26T06:00:00Z — purplemux mission answers -w ws-fOvEfz; ack it with the command shown there after applying it'],
     ['resume', '[purplemux resume r-abcd12] the last turn ended on an API error — continue from where it was cut off'],
   ] as Array<[TInboxKind, string]>)('renders the fixed %s line', (kind, line) => {
     expect(renderInboxLine(kind, VALID[kind] as never).line).toBe(line);
@@ -118,12 +120,24 @@ describe('inbox templates (ADR-0012)', () => {
     expect(line).not.toContain('ignore-previous');
   });
 
+  it('renders the bootstrap line from a server-made key only (story 12)', () => {
+    const key = `boot-${'ab'.repeat(16)}`;
+    expect(renderInboxLine('mission', { event: 'bootstrap', bootstrapKey: key, workspaceId: 'ws-fOvEfz' })).toEqual({
+      recordId: key,
+      line: `[purplemux mission ${key}] Mission Control asks this orchestrator to reconcile — read: purplemux mission bootstrap -w ws-fOvEfz`,
+    });
+    for (const bootstrapKey of ['bootstrap-one', 'reconcile now please', `boot-${'ab'.repeat(15)}`]) {
+      expect(() => renderInboxLine('mission', { event: 'bootstrap', bootstrapKey, workspaceId: 'ws-fOvEfz' })).toThrow(InboxFieldError);
+    }
+    expect(() => renderInboxLine('mission', { ...MISSION_ANSWER, event: 'other' } as never)).toThrow(InboxFieldError);
+  });
+
   it.each(['question-1', 'answer-17', 'item-XYZ', `item-${'0'.repeat(31)}`])('refuses a producer-chosen mission id %s', (answerId) => {
-    expect(() => renderInboxLine('mission', { ...VALID.mission, answerId })).toThrow(InboxFieldError);
+    expect(() => renderInboxLine('mission', { ...MISSION_ANSWER, answerId })).toThrow(InboxFieldError);
   });
 
   it('accepts a deterministic Mission Control id', () => {
-    expect(renderInboxLine('mission', { ...VALID.mission, answerId: `item-${'a1'.repeat(16)}` }).line).toContain(`item-${'a1'.repeat(16)}`);
+    expect(renderInboxLine('mission', { ...MISSION_ANSWER, answerId: `item-${'a1'.repeat(16)}` }).line).toContain(`item-${'a1'.repeat(16)}`);
   });
 
   it('refuses an unknown kind and non-object fields', () => {

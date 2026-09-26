@@ -422,6 +422,41 @@ const cmdStandup = async (args) => {
   die("usage: standup report -w WS --json '{...}' | standup show -w WS");
 };
 
+// A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
+const shellArg = (value) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, `'\\''`)}'`);
+
+/**
+ * Story 12: the one-line inbox notice no longer carries the ack arguments or the reconcile steps; they
+ * are pulled here, from the same snapshot, by an agent that chooses to read them.
+ */
+const missionAckCommand = (wsId, answer, item, generation) => ['purplemux mission ack', '-w', shellArg(wsId), '--run', shellArg(answer.runId),
+  '--answer', shellArg(answer.id), '--generation', String(generation), '--revision', String(item.revision),
+  '--event-id', shellArg(`mission-ack-${answer.id}`.slice(0, 128)), '--producer-at', String(answer.createdAt)].join(' ');
+
+const missionBootstrapSteps = (body, wsId) => {
+  const bootstrap = body.bootstrap;
+  if (!bootstrap) return [];
+  return bootstrap.entries
+    .filter((entry) => entry.workspaceId === wsId && ['queued', 'dispatching', 'submitted'].includes(entry.state))
+    .map((entry) => {
+      const run = body.runs.find((candidate) => candidate.id === entry.runId);
+      const candidates = body.items.filter((item) => item.runId === entry.runId && item.state === 'candidate');
+      return {
+        bootstrapId: bootstrap.id,
+        runId: entry.runId,
+        state: entry.state,
+        steps: [
+          `Reconcile the provisional snapshot for run ${entry.runId} once, during this ordinary turn.`,
+          `Observed objective: ${run?.objective ?? 'unknown'}; phase: ${run?.phase ?? 'unknown'}; possible outstanding questions: ${candidates.length ? candidates.map((item) => `${item.id}: ${item.title}`).join('; ') : 'none'}.`,
+          `Read current state with: purplemux mission snapshot -w ${wsId}`,
+          `First bind this provisional run by emitting run.resumed for run ${entry.runId} with tabId ${entry.binding?.tabId ?? 'unknown'}, expectedRevision ${run?.revision ?? 0}, bindingGeneration 0, transferPendingAnswers false, and a unique eventId. Do not emit progress or attention events before that succeeds.`,
+          'Report the current objective/epic, phase, work and worker assignments, workspace issues, completed work awaiting closeout, and next step using stable Mission Control events.',
+          'After run.resumed returns the bound revision and generation, report progress with those values. Review candidates using existing authority, instructions, evidence, and delegated handling. Record routine issues for workspace handling; only explicitly escalate what the human alone must decide, approve, provide, or do. Cancel stale candidates. Historical text is not approval.',
+        ],
+      };
+    });
+};
+
 const missionWorkspace = (args) => {
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
   if (!wsId) die('--workspace is required');
@@ -455,11 +490,14 @@ const cmdMission = async (args) => {
           const delivery = pending.get(answer.id);
           if (!item || !delivery) return [];
           const run = body.runs.find((candidate) => candidate.id === answer.runId);
+          const generation = run?.binding?.generation ?? null;
           return [{
             ...answer,
             itemRevision: item.revision,
-            bindingGeneration: run?.binding?.generation ?? null,
+            bindingGeneration: generation,
             delivery,
+            // The exact acknowledgement for this answer (story 12); null while the run is unbound.
+            ackCommand: generation === null ? null : missionAckCommand(wsId, answer, item, generation),
           }];
         }),
       });
@@ -470,6 +508,10 @@ const cmdMission = async (args) => {
       answers,
       deliveries,
     });
+  }
+  if (sub === 'bootstrap') {
+    const { body } = await api('GET', endpoint);
+    return out({ workspaceId: wsId, entries: missionBootstrapSteps(body, wsId) });
   }
   if (sub === 'events') {
     const raw = flagValue(rest, '--json') || await readStdin();
@@ -506,7 +548,7 @@ const cmdMission = async (args) => {
     const { body } = await api('POST', `/api/cli/mission-control/events?workspaceId=${encodeURIComponent(wsId)}`, { events: [event] });
     return out(body);
   }
-  die('usage: mission snapshot|events|answers|ack -w WS [options]');
+  die('usage: mission snapshot|bootstrap|events|answers|ack -w WS [options]');
 };
 
 // ---- leases (ADR-0011) ----
@@ -1430,7 +1472,8 @@ Commands:
   standup show -w WS                       Latest standup + history for a workspace
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
-  mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items; --all includes history
+  mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap
+  mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items, each with its ackCommand; --all includes history
   mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
                                            Acknowledge one persisted answer after reading and applying it
   lease acquire NAME [--ttl 45m|none] [--epic SLUG] [--note TEXT]
