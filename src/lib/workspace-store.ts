@@ -454,7 +454,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
       const tabs = collectAllTabs(layout.root);
       for (const tab of tabs) {
         try {
-          await killSession(tab.sessionName);
+          await killSession(tab.sessionName, { tabId: tab.id });
         } catch {}
       }
     }

@@ -1,4 +1,5 @@
 import { parsePermissionOptions } from '@/lib/permission-prompt';
+import { renderPaneResult } from '@/lib/pane-suggestions';
 import type { IClientTabStatusEntry } from '@/types/status';
 import type { TPanelType } from '@/types/terminal';
 
@@ -28,12 +29,32 @@ export const hasEmptyAgentComposer = (panelType: TPanelType | undefined, content
   return false;
 };
 
+/**
+ * A capture read as a person sees it: escapes stripped and the dim prompt
+ * suggestion on the composer line removed (L7). Measured 2026-09-26: 8 of 12
+ * idle Claude tabs showed one, and read plain it is a non-empty composer. A
+ * capture taken without escapes passes through unchanged.
+ */
+const withoutSuggestions = (panelType: TPanelType | undefined, content: string): string =>
+  renderPaneResult(content, panelType, 'no-suggestions').content;
+
+/**
+ * The screen half of readiness: no interactive option list and an empty
+ * composer. A trust prompt (`❯ No, exit`) or a first-run picker
+ * (`❯ 2. Dark mode`) shows the marker on a non-empty line, so it is not ready.
+ */
+export const paneShowsEmptyComposer = (panelType: TPanelType | undefined, content: string): boolean => {
+  const plain = withoutSuggestions(panelType, content);
+  if (parsePermissionOptions(tail(plain)).options.length > 0) return false;
+  return hasEmptyAgentComposer(panelType, plain);
+};
+
 export type TComposerReadiness = { ok: true } | { ok: false; reason: string };
 
 export interface IComposerReadinessInput {
   panelType: TPanelType | undefined;
   status: Pick<IClientTabStatusEntry, 'cliState' | 'permissionRequest'> | undefined;
-  /** The pane, captured only after the status checks pass. */
+  /** The pane, captured only after the status checks pass; with escapes, so a dim suggestion reads as empty. */
   capture: () => Promise<string | null>;
   /**
    * A `busy` tab that is only waiting on its own background work, at an empty
@@ -56,8 +77,9 @@ export const checkComposerReady = async (input: IComposerReadinessInput): Promis
     || (status.cliState === 'busy' && input.waitingAtPrompt === true);
   if (!stateReady) return { ok: false, reason: `composer-not-ready:${status.cliState}` };
 
-  const content = await input.capture().catch(() => null);
-  if (!content) return { ok: false, reason: 'composer-unreadable' };
+  const captured = await input.capture().catch(() => null);
+  if (!captured) return { ok: false, reason: 'composer-unreadable' };
+  const content = withoutSuggestions(input.panelType, captured);
   if (parsePermissionOptions(tail(content)).options.length > 0) return { ok: false, reason: 'interactive-prompt-active' };
   if (!hasEmptyAgentComposer(input.panelType, content)) return { ok: false, reason: 'composer-not-empty' };
   return { ok: true };

@@ -205,7 +205,8 @@ const liveTabsGone = async () => {
 
 const g = globalThis as unknown as { __ptInboxRuntime?: IInboxRuntime };
 
-const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
+/** The server's dispatcher dependencies (exported for the wiring test). */
+export const defaultInboxDeps = async (): Promise<IInboxDispatcherDeps> => {
   const [{ readLayoutFile, resolveLayoutFile, collectAllTabs }, { hasSession, isContentPendingInComposer }, { getStatusManager }, { capturePaneAtWidth }, { withAgentDispatchLock }, { deliverPrompt }] = await Promise.all([
     import('@/lib/layout-store'),
     import('@/lib/tmux'),
@@ -235,7 +236,7 @@ const defaultDeps = async (): Promise<IInboxDispatcherDeps> => {
     status: (tabId) => getStatusManager().getAllForClient()[tabId],
     waitingAtPrompt: (tabId) => getStatusManager().isWaitingAtPrompt(tabId),
     halted: (tabId) => getStatusManager().isHaltedByUsageLimit(tabId),
-    capture: (sessionName) => capturePaneAtWidth(sessionName, 120, 50),
+    capture: (sessionName) => capturePaneAtWidth(sessionName, 120, 50, { escapes: true }),
     withDispatchLock: (workspaceId, tab, work) => withAgentDispatchLock(workspaceId, tab, work),
     deliver: deliverPrompt,
     isPending: isContentPendingInComposer,
@@ -247,7 +248,7 @@ export const startInbox = async (): Promise<void> => {
   // Claimed before the first await, so two concurrent starts cannot both pass.
   const runtime: IInboxRuntime = { dispatcher: null, timer: null, unsubscribe: null };
   g.__ptInboxRuntime = runtime;
-  const dispatcher = new InboxDispatcher(await defaultDeps());
+  const dispatcher = new InboxDispatcher(await defaultInboxDeps());
   const { onTabClosed } = await import('@/lib/tab-lifecycle');
   // Stopped while starting: install nothing, or a timer would tick on a slot nobody holds.
   if (g.__ptInboxRuntime !== runtime) return;

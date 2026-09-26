@@ -163,6 +163,22 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     expect((await cli(['tab', 'steer', '-w', 'WS', 'tab-x', 'fix it'])).code).toBe(4);
   });
 
+  it('tab result passes --raw / --no-suggestions as query flags and refuses both together', async () => {
+    reply = json(200, { content: 'x', suggestion: null });
+    requests.length = 0;
+    expect((await cli(['tab', 'result', '-w', 'WS', 'tab-x', '--raw'])).code).toBe(0);
+    expect((await cli(['tab', 'result', '--no-suggestions', '-w', 'WS', 'tab-x'])).code).toBe(0);
+    expect((await cli(['tab', 'result', '-w', 'WS', 'tab-x'])).code).toBe(0);
+    expect(requests.map((r) => r.url)).toEqual([
+      '/api/cli/tabs/tab-x/result?workspaceId=WS&raw=1',
+      '/api/cli/tabs/tab-x/result?workspaceId=WS&suggestions=0',
+      '/api/cli/tabs/tab-x/result?workspaceId=WS',
+    ]);
+    const both = await cli(['tab', 'result', '-w', 'WS', 'tab-x', '--raw', '--no-suggestions']);
+    expect(both.code).not.toBe(0);
+    expect(both.stderr).toContain('exclusive');
+  });
+
   it('exits 1 for a success that is not JSON: another server holds the port', async () => {
     reply = (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -406,6 +422,26 @@ describe('tab close', () => {
     reply = json(404, { error: 'Tab not found', code: 'tab-not-found' });
 
     expect((await cli(['tab', 'close', '-w', 'WS', 'tab-x'])).code).toBe(4);
+  });
+
+  it('prints ok, then every process the close reaped and any survivor (ADR-0016)', async () => {
+    reply = json(200, {
+      ok: true, reaper: 'linux', envMarker: 'present',
+      killed: [{ pid: 101, comm: 'sleep', args: 'sleep 600' }],
+      survivors: [{ pid: 102, comm: 'D-state', args: 'stuck' }],
+    });
+    const { code, stdout } = await cli(['tab', 'close', '-w', 'WS', 'tab-x']);
+    expect(code).toBe(0);
+    expect(stdout).toBe('ok\nkilled 101 sleep sleep 600\nsurvivor 102 D-state stuck\n');
+    expect(requests[0].url).toBe('/api/cli/tabs/tab-x?workspaceId=WS');
+  });
+
+  it('asks for keepProcesses with --keep-processes, and names an absent marker and an unavailable reaper', async () => {
+    reply = json(200, { ok: true, reaper: 'unavailable', envMarker: 'absent', killed: [], survivors: [] });
+    const { stdout } = await cli(['tab', 'close', '-w', 'WS', 'tab-x', '--keep-processes']);
+    expect(requests[0].url).toBe('/api/cli/tabs/tab-x?workspaceId=WS&keepProcesses=1');
+    expect(stdout).toContain('reaper: unavailable');
+    expect(stdout).toContain('envMarker: absent');
   });
 });
 

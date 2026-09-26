@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, findTab } from '@/lib/cli-utils';
-import { capturePaneContent, hasSession } from '@/lib/tmux';
+import { capturePaneContentAnsi, hasSession } from '@/lib/tmux';
+import { renderPaneResult, type TResultMode } from '@/lib/pane-suggestions';
 import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
@@ -22,8 +23,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const alive = await hasSession(found.tab.sessionName);
   if (!alive) return res.status(409).json({ error: 'Tab session is not running', code: 'session-not-running' });
 
-  const content = await capturePaneContent(found.tab.sessionName);
-  return res.status(200).json({ content });
+  // Dim composer text is a suggestion the agent shows, not text anyone typed (L7).
+  const mode: TResultMode = req.query.raw === '1' ? 'raw' : req.query.suggestions === '0' ? 'no-suggestions' : 'default';
+  const captured = await capturePaneContentAnsi(found.tab.sessionName);
+  if (captured === null) return res.status(200).json({ content: null, suggestion: null });
+  const { content, suggestion } = renderPaneResult(captured, found.tab.panelType, mode);
+  return res.status(200).json({ content, suggestion });
 };
 
 export default handler;

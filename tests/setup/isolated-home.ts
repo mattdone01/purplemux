@@ -161,13 +161,21 @@ export default function setup(): () => void {
   process.env[REAL_HOME_ENV] = realHome;
   process.env[HOME_ROOT_ENV] = root;
   process.env.HOME = root;
+  // tmux sockets too: a test that reaches `tmux -L purple` must never reach the
+  // LIVE server's sessions (story 16 review r2: a prefix `-t` match could kill one).
+  const realTmuxTmpdir = process.env.TMUX_TMPDIR;
+  process.env.TMUX_TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-test-tmux-'));
+  const tmuxDir = process.env.TMUX_TMPDIR;
 
   return () => {
     try {
       verifyNoLeaks(realHome, root);
     } finally {
       process.env.HOME = realHome;
+      if (realTmuxTmpdir === undefined) delete process.env.TMUX_TMPDIR;
+      else process.env.TMUX_TMPDIR = realTmuxTmpdir;
       fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(tmuxDir, { recursive: true, force: true });
     }
   };
 }

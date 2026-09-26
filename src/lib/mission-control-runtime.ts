@@ -255,7 +255,7 @@ export const dispatchMissionPrompt = async (request: IMissionDispatchRequest): P
       const readiness = await checkComposerReady({
         panelType: live.tab.panelType,
         status: getStatusManager().getAllForClient()[request.binding.tabId],
-        capture: () => capturePaneAtWidth(live.tab.sessionName, 120, 50),
+        capture: () => capturePaneAtWidth(live.tab.sessionName, 120, 50, { escapes: true }),
       });
       if (!readiness.ok) return { delivered: false, retryable: true, uncertain: false, reason: readiness.reason };
 

@@ -23,6 +23,7 @@ import type { TCliState } from '@/types/timeline';
 import type { IAgentProvider } from '@/lib/providers/types';
 import { claudeProvider } from '@/lib/providers/claude';
 import { defaultTabNameForPanelType, resolveTabNameForPanelTypeChange } from '@/lib/tab-name';
+import type { IReapResult } from '@/lib/tab-reaper';
 
 const log = createLogger('layout');
 
@@ -352,7 +353,22 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     return tab;
   });
 
-export const removeTabFromPane = async (wsId: string, paneId: string, tabId: string): Promise<boolean> => {
+export interface ICloseTabResult {
+  ok: boolean;
+  /** The processes reaped with the tab (null for a browser tab or a session already gone). */
+  reap: IReapResult | null;
+}
+
+export const removeTabFromPane = async (wsId: string, paneId: string, tabId: string): Promise<boolean> =>
+  (await closeTab(wsId, paneId, tabId)).ok;
+
+/** Close a tab: reap its processes, kill its session, remove it from the layout (ADR-0016). */
+export const closeTab = async (
+  wsId: string,
+  paneId: string,
+  tabId: string,
+  opts: { keepProcesses?: boolean } = {},
+): Promise<ICloseTabResult> => {
   const tabInfo = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -366,13 +382,13 @@ export const removeTabFromPane = async (wsId: string, paneId: string, tabId: str
     return { sessionName: tab.sessionName, panelType: tab.panelType };
   });
 
-  if (!tabInfo) return false;
+  if (!tabInfo) return { ok: false, reap: null };
 
-  if (tabInfo.panelType !== 'web-browser') {
-    await killSession(tabInfo.sessionName);
-  }
+  const reap = tabInfo.panelType !== 'web-browser'
+    ? await killSession(tabInfo.sessionName, { tabId, keepProcesses: opts.keepProcesses })
+    : null;
 
-  return withLock(async () => {
+  const ok = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
     if (!layout) return false;
@@ -400,6 +416,7 @@ export const removeTabFromPane = async (wsId: string, paneId: string, tabId: str
 
     return true;
   });
+  return { ok, reap };
 };
 
 export const renameTabInPane = async (wsId: string, paneId: string, tabId: string, name: string): Promise<ITab | null> =>
@@ -771,7 +788,7 @@ export const splitPaneInLayout = async (
 };
 
 export const closePaneInLayout = async (wsId: string, paneId: string): Promise<ILayoutData | null> => {
-  let sessions: string[] = [];
+  let sessions: Array<{ sessionName: string; tabId: string }> = [];
 
   const result = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
@@ -782,7 +799,7 @@ export const closePaneInLayout = async (wsId: string, paneId: string): Promise<I
     if (!pane) return null;
     if (collectPanes(layout.root).length <= 1) return null;
 
-    sessions = pane.tabs.filter((t) => t.panelType !== 'web-browser').map((t) => t.sessionName);
+    sessions = pane.tabs.filter((t) => t.panelType !== 'web-browser').map((t) => ({ sessionName: t.sessionName, tabId: t.id }));
     const wasEqualized = isEqualized(layout.root);
     removePaneWithFocus(layout, paneId);
     if (wasEqualized) {
@@ -794,7 +811,7 @@ export const closePaneInLayout = async (wsId: string, paneId: string): Promise<I
     return layout;
   });
 
-  await Promise.all(sessions.map((s) => killSession(s).catch(() => {})));
+  await Promise.all(sessions.map((s) => killSession(s.sessionName, { tabId: s.tabId }).catch(() => {})));
 
   return result;
 };

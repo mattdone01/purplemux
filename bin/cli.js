@@ -709,6 +709,80 @@ const cmdDeploy = async (args) => {
   }
 };
 
+// Harness watches (ADR-0015): tab-owned, one-shot, server-evaluated. The
+// notice reaches the owner tab through the inbox; the label is list-only.
+const WATCH_USAGE = 'usage: watch pr OWNER/REPO#N --until merged|closed|head-moved|checks-settled | watch ref OWNER/REPO@REF --until moved | watch lease NAME --until free  [--ttl 24h] [--interval 120] [--label TEXT]; watch list [-w WS] [--json]; watch clear ID';
+const WATCH_VALUE_FLAGS = ['--until', '--ttl', '--interval', '--label', '-w', '--workspace'];
+
+const printWatches = (watches) => {
+  if (!watches.length) {
+    process.stdout.write('no watches\n');
+    return;
+  }
+  for (const w of watches) {
+    const parts = [
+      w.id,
+      `${w.kind} ${w.target} --until ${w.until}`,
+      `owner=${w.workspaceId}/${w.tabId} (${w.owner}${w.verified === false ? ', unverified' : ''})`,
+      `age=${age(w.ageSeconds)}`,
+      `expires-in=${age(w.expiresInSeconds)}`,
+      `last-check=${w.lastCheckedAt ? new Date(w.lastCheckedAt).toISOString() : 'never'}`,
+    ];
+    if (w.failures) parts.push(`failures=${w.failures}`);
+    if (w.lastError) parts.push(`error=${w.lastError.code}: ${JSON.stringify(w.lastError.message)}`);
+    if (w.label) parts.push(`label=${JSON.stringify(w.label)}`);
+    process.stdout.write(parts.join('  ') + '\n');
+  }
+};
+
+const cmdWatch = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const positional = stripBooleanFlags(stripFlags(rest, WATCH_VALUE_FLAGS), ['--json']);
+  switch (sub) {
+    case 'pr':
+    case 'ref':
+    case 'lease': {
+      if (positional.length !== 1) die(WATCH_USAGE);
+      const until = flagValue(rest, '--until');
+      if (!until) die('--until is required');
+      const data = { kind: sub, target: positional[0], until };
+      const ttl = flagValue(rest, '--ttl');
+      if (ttl !== null) {
+        const seconds = parseTtl(ttl);
+        if (seconds === null) die('--ttl needs a duration (a watch always expires, at most 7d)');
+        data.ttlSeconds = seconds;
+      }
+      const interval = flagValue(rest, '--interval');
+      if (interval !== null) {
+        if (!/^\d+$/.test(interval)) die('--interval needs whole seconds (60-3600)');
+        data.intervalS = Number(interval);
+      }
+      const label = flagValue(rest, '--label');
+      if (label !== null) data.label = label;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/watches', data);
+      return out(body);
+    }
+    case 'list': {
+      if (positional.length) die(WATCH_USAGE);
+      const ws = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/watches${ws ? `?workspaceId=${encodeURIComponent(ws)}` : ''}`);
+      if (rest.includes('--json')) return out(body);
+      return printWatches(body.watches || []);
+    }
+    case 'clear': {
+      if (positional.length !== 1) die(WATCH_USAGE);
+      requireEnv();
+      const { body } = await api('DELETE', `/api/cli/watches/${encodeURIComponent(positional[0])}`);
+      return out(body);
+    }
+    default:
+      die(WATCH_USAGE);
+  }
+};
+
 // The inbox (ADR-0012): server notices queued for this workspace's tabs.
 const cmdInbox = async (args) => {
   requireEnv();
@@ -1024,31 +1098,42 @@ const cmdTabStatus = async (args) => {
 
 const cmdTabResult = async (args) => {
   requireEnv();
-  const rest = stripFlags(args, ['--workspace', '-w']);
+  const raw = args.includes('--raw');
+  const noSuggestions = args.includes('--no-suggestions');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--raw', '--no-suggestions']);
   const tabId = rest[0];
   if (!tabId) die('tab ID is required');
+  if (raw && noSuggestions) die('--raw and --no-suggestions are exclusive');
   const wsId = resolveWsForTab(args);
+  const mode = raw ? '&raw=1' : noSuggestions ? '&suggestions=0' : '';
   const { body } = await api(
     'GET',
-    `/api/cli/tabs/${tabId}/result?workspaceId=${encodeURIComponent(wsId)}`,
+    `/api/cli/tabs/${tabId}/result?workspaceId=${encodeURIComponent(wsId)}${mode}`,
   );
   out(body);
 };
 
 const cmdTabClose = async (args) => {
   requireEnv();
-  const rest = stripFlags(args, ['--workspace', '-w']);
+  const keep = args.includes('--keep-processes');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--keep-processes']);
   const tabId = rest[0];
   if (!tabId) die('tab ID is required');
   const wsId = resolveWsForTab(args);
   const { body } = await api(
     'DELETE',
-    `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
+    `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}${keep ? '&keepProcesses=1' : ''}`,
   );
   // A 200 is not a close: the server answers `ok: false` when the layout kept
   // the tab, and printing ok over that hides a tab that is still running.
   if (body?.ok !== true) return fail('close-not-confirmed', `the server answered ${JSON.stringify(body)}`);
-  process.stdout.write('ok\n');
+  // `ok` stays the first line; what the close reaped follows (ADR-0016).
+  const lines = ['ok'];
+  for (const p of Array.isArray(body.killed) ? body.killed : []) lines.push(`killed ${p.pid} ${p.comm} ${p.args}`);
+  for (const p of Array.isArray(body.survivors) ? body.survivors : []) lines.push(`survivor ${p.pid} ${p.comm} ${p.args}`);
+  if (body.reaper === 'unavailable') lines.push('reaper: unavailable (no /proc): only the pane group was signalled');
+  if (body.envMarker === 'absent') lines.push('envMarker: absent (a tab created before per-tab identity): only its pane descendants were reaped');
+  process.stdout.write(`${lines.join('\n')}\n`);
 };
 
 // Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
@@ -1280,8 +1365,13 @@ Commands:
                                            the tab is gone: never retry it, and never loop on it.
            [-f FILE | -f -]                Send file contents (or stdin with '-') — use for multi-line briefs
   tab status -w WS TAB_ID                  Tab status (includes registered probes + background jobs)
-  tab result -w WS TAB_ID                  Capture tab pane content
-  tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close
+  tab result -w WS TAB_ID                  Capture tab pane content. Dim text the agent shows on its composer line
+             [--no-suggestions | --raw]    (a suggestion, never typed) reads "[suggestion] <text>" and is also in
+                                           "suggestion"; --no-suggestions drops it; --raw keeps every escape
+  tab close -w WS TAB_ID                   Close a tab; prints ok only when the server confirms the close, then
+             [--keep-processes]            every process it reaped: the pane's descendants and every process whose
+                                           environment carries PMUX_TAB_ID=TAB_ID (SIGTERM, 3 s, SIGKILL).
+                                           --keep-processes signals only the pane group, as before
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
@@ -1366,6 +1456,16 @@ Commands:
   deploy status ID [--json]                The reason and, per recipient, delivery state and cliState (7 unknown)
   deploy withdraw ID                       Take back the notices still waiting once the deploy is over (announcer
                                            authority); deploy-live.sh does this when it finishes
+  watch pr OWNER/REPO#N --until merged|closed|head-moved|checks-settled [--ttl 24h] [--interval 120] [--label TEXT]
+  watch ref OWNER/REPO@REF --until moved   (same options)
+  watch lease NAME --until free            A one-shot watch owned by this tab: the server checks it (GitHub every
+                                           120 s by default, a lease on each release) and sends ONE inbox line when
+                                           it holds, then clears it. Expires (default 24h, max 7d) with a notice;
+                                           3 failures in a row send one failing notice. Host cap 60 GitHub watches
+                                           (exit 3 watch-cap); 2 bad target/until; 7 unknown id on clear
+  watch list [-w WS] [--json]              Watches of your workspace: owner tab (live/closed), age, expiry, last check,
+                                           the last error text
+  watch clear ID                           Remove a watch (its owner tab or admin)
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -1434,6 +1534,8 @@ const main = async () => {
       return cmdConfig(args.slice(1));
     case 'deploy':
       return cmdDeploy(args.slice(1));
+    case 'watch':
+      return cmdWatch(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

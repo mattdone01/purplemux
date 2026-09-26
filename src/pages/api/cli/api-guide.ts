@@ -172,10 +172,15 @@ PATCH /api/cli/tabs/<tabId>?workspaceId=WS
   as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
   Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
-DELETE /api/cli/tabs/<tabId>?workspaceId=WS
-  Close the tab (kills tmux session and removes from layout).
-  Response: { "ok": boolean } — false means the layout kept the tab; the CLI then exits 1
-  (close-not-confirmed) instead of printing ok.
+DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
+  Close the tab: reap its processes, kill its tmux session, remove it from the layout.
+  Reaped (Linux, ADR-0016): every descendant of the pane and every process of the server's user
+  whose environment holds exactly PMUX_TAB_ID=<tabId> — which survives &, disown, nohup and
+  setsid. SIGTERM, up to 3 s, then SIGKILL. keepProcesses=1 signals only the pane's process group.
+  Response: { "ok": boolean, "reaper": "linux" | "unavailable", "envMarker": "present" | "absent" | "unknown",
+              "killed": [{ "pid", "comm", "args" }], "survivors": [...] } — ok false means the layout kept
+  the tab; the CLI then exits 1 (close-not-confirmed) instead of printing ok. Every kill is audited
+  in ~/.purplemux/audit/coordination.jsonl.
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
@@ -199,9 +204,11 @@ GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   so an idle tab that is HOLDING dead background work is distinguishable from an idle
   tab that is done.
 
-GET /api/cli/tabs/<tabId>/result?workspaceId=WS
-  Capture the current pane content.
-  Response: { "content": "..." }
+GET /api/cli/tabs/<tabId>/result?workspaceId=WS[&suggestions=0 | &raw=1]
+  Capture the current pane content (escapes stripped). On the agent's composer line and below,
+  text the agent renders DIM — a prompt suggestion, never typed by anyone — reads
+  "[suggestion] <text>". suggestions=0 drops it; raw=1 returns the escapes untouched.
+  Response: { "content": "...", "suggestion": "<the composer suggestion>" | null }
 
 ## Liveness watch
 
@@ -316,6 +323,34 @@ GET /api/cli/notes/<id>
 POST /api/cli/notes/<id>/ack
   The recipient workspace only. Body: { "comment"? (≤ 500) }. Response: { "note" } in state "acked".
   404 note-not-found (exit 7); 403 forbidden (exit 3), also for a note that is not delivered.
+
+## Harness watches (ADR-0015)
+
+A watch is a one-shot subscription owned by the calling tab. The server evaluates it and sends
+the owner ONE inbox line when the condition holds, then deletes it; it dies with its tab.
+  pr OWNER/REPO#N    --until merged | closed | head-moved | checks-settled
+  ref OWNER/REPO@REF --until moved
+  lease NAME         --until free   (no unexpired record: an acquire would succeed)
+GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a lease watch is
+evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
+max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
+server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
+text; after that notice the watch reads less often (2x, 4x, up to 8x its interval). A merged
+watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
+requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
+tab holds at most 30 watches.
+Lines: "[purplemux watch w-…] OWNER/REPO#N is MERGED (sha) — watch cleared", "… head moved a -> b",
+"… checks settled at sha: G green, R red", "… moved a -> b", "NAME is free", "… is failing:
+<token> …", "… expired without <until>". The label is shown by list, never typed.
+
+POST /api/cli/watches   { "kind", "target", "until", "ttlSeconds"?, "intervalS"?, "label"? (≤ 80) }
+  The calling tab owns it (a caller with no tab: 403 caller-unresolved, exit 3). 400 watch-invalid
+  (exit 2), also for a PR or ref gh cannot find; 503 gh-unavailable (exit 1). Response: { "watch" }.
+GET /api/cli/watches[?workspaceId=WS]
+  The caller's own workspace (admin: any, or all). Response: { "watches": [{ ...watch, "owner":
+  "live"|"closed"|"unknown", "ageSeconds", "expiresInSeconds", "failures", "lastError" }] }.
+DELETE /api/cli/watches/<id>
+  The owner tab or admin (else 403). 404 watch-not-found (exit 7). Response: { "removed" }.
 
 ## Fleet config (ADR-0019)
 
