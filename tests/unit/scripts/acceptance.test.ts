@@ -80,6 +80,44 @@ describe('checks.cjs judgements', () => {
   });
 });
 
+/** Pids whose environ carries a HOME under `dir` — what a leaked candidate would look like. */
+const pidsWithHomeUnder = (dir: string) =>
+  fs
+    .readdirSync('/proc')
+    .filter((p) => /^\d+$/.test(p))
+    .filter((p) => {
+      try {
+        const home = fs.readFileSync(`/proc/${p}/environ`, 'utf-8').split('\0').find((l) => l.startsWith('HOME='));
+        return Boolean(home && home.slice(5).startsWith(`${dir}/`));
+      } catch {
+        return false;
+      }
+    });
+
+// A fake server launcher: writes the port, token and lock files the real server writes, then runs as
+// `sleep` under the same pid. LEAK=1 re-execs with a live key in its environ.
+const FAKE_TSX = `#!/bin/bash
+mkdir -p "$HOME/.purplemux"
+echo "$PORT" > "$HOME/.purplemux/port"
+echo admin-token > "$HOME/.purplemux/cli-token"
+printf '{"pid":%s,"port":%s}' "$$" "$PORT" > "$HOME/.purplemux/pmux.lock"
+# HOME is <root>/s/pmxa.X/home, so the test root (where the flags live) is three levels up.
+[[ -e "$HOME/../../../no-port" ]] && rm -f "$HOME/.purplemux/port"
+[[ -e "$HOME/../../../leak" ]] && exec env PMUX_TOKEN=leaked sleep 600
+exec sleep 600
+`;
+
+// A fake curl: nothing answers on a bare port, /api/health is purplemux, and /api/workspace answers
+// an id unless the flag file ws-fail exists next to the fakes.
+const fakeCurl = (dir: string) => `#!/bin/bash
+url="\${@: -1}"
+case "$url" in
+  */api/health) echo '{"app":"purplemux","version":"0"}' ;;
+  */api/workspace) [[ -e "${dir}/ws-fail" ]] && exit 7; echo "{\\"id\\":\\"ws-$RANDOM\\"}" ;;
+  *) exit 7 ;;
+esac
+`;
+
 describe('isolated-instance.sh safety', { timeout: 60_000 }, () => {
   let root: string;
   let parent: string;
@@ -165,6 +203,82 @@ describe('isolated-instance.sh safety', { timeout: 60_000 }, () => {
     expect(r.stderr).toContain('REFUSED NODE-MISSING');
   });
 
+  const withFakes = (extra: Record<string, string> = {}) => {
+    built(candidate);
+    const tsx = path.join(root, 'tsx');
+    fs.writeFileSync(tsx, FAKE_TSX, { mode: 0o755 });
+    const curl = path.join(root, 'curl');
+    fs.writeFileSync(curl, fakeCurl(root), { mode: 0o755 });
+    return {
+      ACCEPT_TSX: tsx,
+      ACCEPT_CURL: curl,
+      ACCEPT_START_TIMEOUT_S: '5',
+      // What a shell inside a live tab carries; none of it may reach the candidate.
+      PMUX_TOKEN: 'live-token',
+      PMUX_TAB_TOKEN: 'live-tab-token',
+      TMUX: '/tmp/tmux-1000/purple,1,1',
+      __PMUX_PRISTINE_ENV: JSON.stringify({ HOME: '/home/live' }),
+      ...extra,
+    };
+  };
+  const flagForScratch = (name: string) => fs.writeFileSync(path.join(root, name), '');
+
+  it('up starts the candidate with none of the live keys, writes its state, and down leaves nothing', () => {
+    const state = path.join(root, 'state.json');
+    const r = instance(['up', '--candidate', candidate, '--state', state], withFakes());
+    expect(r.status, r.stderr).toBe(0);
+    const s = JSON.parse(fs.readFileSync(state, 'utf-8'));
+    expect(s.workspaces.a).toMatch(/^ws-/);
+    const environ = fs.readFileSync(`/proc/${s.pid}/environ`, 'utf-8').split('\0');
+    for (const key of ['PMUX_TOKEN', 'PMUX_TAB_TOKEN', 'TMUX', '__PMUX_PRISTINE_ENV']) {
+      expect(environ.some((l) => l.startsWith(`${key}=`)), key).toBe(false);
+    }
+    expect(environ).toContain(`HOME=${s.home}`);
+    const d = instance(['down', '--state', state]);
+    expect(d.status, d.stderr).toBe(0);
+    expect(pidsWithHomeUnder(parent)).toEqual([]);
+    expect(fs.readdirSync(parent)).toEqual([]);
+  });
+
+  it('a failure after the start tears the candidate down, removes the scratch dir and empties the state', () => {
+    fs.writeFileSync(path.join(root, 'ws-fail'), '');
+    const state = path.join(root, 'state.json');
+    const r = instance(['up', '--candidate', candidate, '--state', state], withFakes());
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('REFUSED WORKSPACES');
+    expect(r.stderr).toContain('candidate server.log');
+    expect(pidsWithHomeUnder(parent)).toEqual([]);
+    expect(fs.readdirSync(parent)).toEqual([]);
+    expect(fs.readFileSync(state, 'utf-8')).toBe('');
+  });
+
+  it('refuses NOT-ISOLATED when a live key reaches the candidate, and tears it down', () => {
+    flagForScratch('leak');
+    const r = instance(['up', '--candidate', candidate, '--state', path.join(root, 'state.json')], withFakes({ ACCEPT_SCRATCH_PARENT: parent }));
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('REFUSED NOT-ISOLATED');
+    expect(r.stderr).toContain('PMUX_TOKEN');
+    expect(pidsWithHomeUnder(parent)).toEqual([]);
+  });
+
+  it('a SIGTERM while up waits for the server tears the server down', async () => {
+    flagForScratch('no-port');
+    const state = path.join(root, 'state.json');
+    const child = spawn('bash', [INSTANCE, 'up', '--candidate', candidate, '--state', state], {
+      env: asEnv(env(withFakes({ ACCEPT_START_TIMEOUT_S: '30' }))),
+      stdio: 'ignore',
+    });
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && !(fs.existsSync(state) && fs.readFileSync(state, 'utf-8').includes('"pid"'))) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(pidsWithHomeUnder(parent).length).toBeGreaterThan(0);
+    child.kill('SIGTERM');
+    await new Promise((r) => child.on('exit', r));
+    expect(pidsWithHomeUnder(parent)).toEqual([]);
+    expect(fs.readdirSync(parent)).toEqual([]);
+  });
+
   it('down stops only processes started with the scratch HOME, and removes the scratch directory', async () => {
     const scratch = fs.mkdtempSync(path.join(parent, 'pmxa.'));
     const scratchHome = path.join(scratch, 'home');
@@ -180,20 +294,29 @@ describe('isolated-instance.sh safety', { timeout: 60_000 }, () => {
     );
     const r = instance(['down', '--state', state]);
     expect(r.status, r.stderr).toBe(0);
-    expect(r.stderr).toContain(`NOT-OURS pid ${live.pid}`);
     expect(live.exitCode).toBeNull();
     expect(fs.existsSync(`/proc/${live.pid}`)).toBe(true);
     expect(await oursExited).toBe('SIGTERM');
     expect(fs.existsSync(scratch)).toBe(false);
   });
 
-  it('down refuses a state file whose paths are not a scratch directory', () => {
+  it('down refuses a state file whose paths are not a scratch directory, including a .. escape', () => {
     const state = path.join(root, 'state.json');
-    fs.writeFileSync(state, JSON.stringify({ scratch: home, home: path.join(home, 'home'), tmuxTmpdir: path.join(home, 'tmux') }));
-    const r = instance(['down', '--state', state]);
-    expect(r.status).toBe(2);
-    expect(r.stderr).toContain('REFUSED STATE');
+    for (const scratch of [home, path.join(parent, 'pmxa.abcdef', '..', '..', 'home')]) {
+      fs.writeFileSync(state, JSON.stringify({ scratch, home: path.join(scratch, 'home'), tmuxTmpdir: path.join(scratch, 'tmux') }));
+      const r = instance(['down', '--state', state]);
+      expect(r.status, scratch).toBe(2);
+      expect(r.stderr).toContain('REFUSED STATE');
+    }
     expect(fs.existsSync(home)).toBe(true);
+  });
+
+  it('down with an empty state has nothing to do', () => {
+    const state = path.join(root, 'state.json');
+    fs.writeFileSync(state, '');
+    const r = instance(['down', '--state', state]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('NOTHING-TO-DO');
   });
 });
 
@@ -206,20 +329,36 @@ describe('run.sh verdicts', { timeout: 60_000 }, () => {
     return file;
   };
 
-  const runGate = (opts: { up?: number; checks?: number; live?: string[] } = {}) => {
+  const writeInstanceFake = (up = 0) =>
+    fake(
+      'instance',
+      `echo "$*" >> "${root}/instance.log"
+if [[ "$1" == up ]]; then
+  while (($#)); do [[ "$1" == --state ]] && state="$2"; shift; done
+  echo '{"workspaces":{"a":"ws-A","b":"ws-B"}}' > "$state"
+  [[ -e "${root}/up-hangs" ]] && { touch "${root}/up-started"; sleep 30; }
+  exit ${up}
+fi
+exit 0`,
+    );
+  const runGate = (opts: { up?: number; checks?: number; live?: string[]; tmuxRc?: number; tmuxErr?: string } = {}) => {
     const instance = fake(
       'instance',
       `echo "$*" >> "${root}/instance.log"
 if [[ "$1" == up ]]; then
   while (($#)); do [[ "$1" == --state ]] && state="$2"; shift; done
   echo '{"workspaces":{"a":"ws-A","b":"ws-B"}}' > "$state"
+  [[ -e "${root}/up-hangs" ]] && { touch "${root}/up-started"; sleep 30; }
   exit ${opts.up ?? 0}
 fi
 exit 0`,
     );
     const checksScript = path.join(root, 'checks.cjs');
     fs.writeFileSync(checksScript, `console.log('PASS x — fake'); process.exit(${opts.checks ?? 0});\n`);
-    const tmux = fake('tmux', `printf '%s\\n' ${(opts.live ?? ['pt-ws-live-p-tab-1']).map((s) => `'${s}'`).join(' ')}`);
+    const tmux = fake(
+      'tmux',
+      opts.tmuxRc ? `echo '${opts.tmuxErr ?? 'error'}' >&2; exit ${opts.tmuxRc}` : `printf '%s\\n' ${(opts.live ?? ['pt-ws-live-p-tab-1']).map((s) => `'${s}'`).join(' ')}`,
+    );
     const log = path.join(root, 'gate.log');
     const r = spawnSync('bash', [RUN, '--candidate', root, '--log', log], {
       env: asEnv({ PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, TMPDIR: root, ACCEPT_INSTANCE: instance, ACCEPT_CHECKS: checksScript, ACCEPT_TMUX: tmux, ACCEPT_NODE: process.execPath }),
@@ -249,7 +388,7 @@ exit 0`,
   it('fails when a check fails, still taking the instance down', () => {
     const r = runGate({ checks: 1 });
     expect(r.status).toBe(1);
-    expect(r.log).toMatch(/^ACCEPTANCE=FAIL checks_exit=1 leaked=no/m);
+    expect(r.log).toMatch(/^ACCEPTANCE=FAIL checks_exit=1 live_socket=ok/m);
     expect(r.calls).toMatch(/^down /m);
   });
 
@@ -258,14 +397,46 @@ exit 0`,
     expect(r.status).toBe(1);
     expect(r.log).toContain('FAIL live-socket-untouched');
     expect(r.log).toContain('pt-ws-B-pane-x-tab-y');
-    expect(r.log).toMatch(/leaked=yes/);
+    expect(r.log).toMatch(/live_socket=fail/);
   });
 
-  it('reports REFUSED with exit 2 when the instance cannot start, and never calls down', () => {
+  it('reports REFUSED with exit 2 when the instance cannot start, and still calls down on the state it wrote', () => {
     const r = runGate({ up: 2 });
     expect(r.status).toBe(2);
     expect(r.log).toMatch(/^ACCEPTANCE=REFUSED /m);
-    expect(r.calls).not.toMatch(/^down /m);
+    expect(r.calls).toMatch(/^down --state /m);
+  });
+
+  it('a SIGTERM to run.sh while up runs is acted on at once, and down still runs', async () => {
+    fs.writeFileSync(path.join(root, 'up-hangs'), '');
+    writeInstanceFake();
+    const started = Date.now();
+    const done = new Promise<number | null>((resolve) => {
+      const child = spawn('bash', [RUN, '--candidate', root, '--log', path.join(root, 'gate.log')], {
+        env: asEnv({ PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, TMPDIR: root, ACCEPT_INSTANCE: path.join(root, 'instance'), ACCEPT_NODE: process.execPath }),
+        stdio: 'ignore',
+      });
+      const poll = setInterval(() => {
+        if (fs.existsSync(path.join(root, 'up-started'))) {
+          clearInterval(poll);
+          child.kill('SIGTERM');
+        }
+      }, 50);
+      child.on('exit', (code) => resolve(code));
+    });
+    expect(await done).toBe(1);
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(fs.readFileSync(path.join(root, 'gate.log'), 'utf-8')).toContain('ACCEPTANCE=FAIL interrupted');
+    expect(fs.readFileSync(path.join(root, 'instance.log'), 'utf-8')).toMatch(/^down --state /m);
+  });
+
+  it('an unreadable live socket is a FAIL, never a silent pass; no live server at all is a pass that says so', () => {
+    const unreadable = runGate({ tmuxRc: 1, tmuxErr: 'error connecting to /tmp/tmux-1000/purple (Permission denied)' });
+    expect(unreadable.status).toBe(1);
+    expect(unreadable.log).toContain('FAIL live-socket-untouched — the live tmux socket could not be read');
+    const none = runGate({ tmuxRc: 1, tmuxErr: 'no server running on /tmp/tmux-1000/purple' });
+    expect(none.status).toBe(0);
+    expect(none.log).toContain('PASS live-socket-untouched — no live tmux server is running');
   });
 });
 

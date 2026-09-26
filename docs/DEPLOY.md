@@ -63,8 +63,13 @@ The gate starts the release as a second server that shares nothing with the live
 short whitelist, because a shell inside a live tab carries `PMUX_TOKEN`, `TMUX` and the live
 `__PMUX_PRISTINE_ENV`, which the candidate would hand to its own tabs. It refuses before starting
 when the scratch HOME or socket would resolve to the live ones, when the socket path exceeds the unix
-limit, or when the port is the live one or answers. Teardown stops only processes whose
-`/proc/<pid>/environ` carries the scratch HOME, and kills tmux only through the scratch socket.
+limit, or when the port is the live one or answers. After the start it reads the candidate
+processes' environ and refuses (`NOT-ISOLATED`) if any live key (`PMUX_TOKEN`, `PMUX_TAB_TOKEN`,
+`TMUX`, …) or a pristine env with another HOME got through. The state file is written as soon as the
+server starts, and any failure or signal after that tears the instance down. Teardown scans `/proc`
+and stops every process whose environ carries the scratch HOME (by process group when the group
+leader is one of them) and never signals any other process; tmux is killed only through the scratch
+socket. The gate runs without deploy-live's lock descriptor, so a leftover could never hold the lock.
 
 The checks (`scripts/acceptance/checks.cjs`) run the release's installed entry point `bin/purplemux.js`,
 and each prints `PASS`/`FAIL` with what it measured and expected:

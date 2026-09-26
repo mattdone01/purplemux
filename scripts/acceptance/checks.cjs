@@ -411,28 +411,23 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
     `a turn-marker nudge containing "${markerLine}"`,
   );
 
-  const job = spawn('sleep', ['600'], { stdio: 'ignore', detached: true });
-  job.unref();
+  // WAITING, proven by order and by timestamps rather than by a quiet interval (review round 1): a
+  // later plain stop (w3) must have produced its nudge before w2 is read, and once w2's job ends,
+  // w2's next stop must nudge READY with a timestamp after the job ended — a build that ignored the
+  // job would have nudged at the first stop instead.
+  const job = spawn('sleep', ['600'], { stdio: 'ignore', detached: true, env: { PATH: '/usr/bin:/bin', HOME: inst.state.home } });
+  const stopJob = () => {
+    try {
+      process.kill(job.pid);
+    } catch {
+      // already gone
+    }
+  };
+  process.on('exit', stopJob);
   const w2 = await worker('acc-waiting', 'Gate started; waiting on it.');
+  const w3 = await worker('acc-plain', 'Finished the task.');
   const registered = w2 ? await inst.cli(['tab', 'bg', 'add', '-w', wsB, w2.tabId, '--pid', String(job.pid), '--label', 'acc-gate']) : { rc: -1, out: '', err: 'no worker' };
   const w2Stopped = w2 && registered.rc === 0 ? await stopTurn(w2) : false;
-  await sleep(4000);
-  const w2State = w2 ? await inst.cliState(wsB, w2.tabId) : null;
-  const w2Nudges = w2 ? await inst.nudgesFor(wsB, w2.tabId) : [];
-  try {
-    process.kill(job.pid);
-  } catch {
-    // already gone
-  }
-  check(
-    'turn-waiting',
-    'a stop with no marker and a live registered background job is WAITING: busy, no nudge',
-    w2Stopped && w2State === 'busy' && w2Nudges.length === 0,
-    `bg add ${registered.rc}, stop posted ${w2Stopped}, cliState ${w2State}, nudges ${w2Nudges.map((n) => n.kind).join(',') || 'none'}`,
-    'bg add 0, stop posted, cliState busy, no nudge',
-  );
-
-  const w3 = await worker('acc-plain', 'Finished the task.');
   const w3Stopped = w3 ? await stopTurn(w3) : false;
   const ready = w3Stopped ? await within(10000, async () => (await inst.nudgesFor(wsB, w3.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
   check(
@@ -441,6 +436,20 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
     Boolean(ready),
     ready ? ready.kind : `stop ${w3Stopped ? 'posted' : 'not posted'}, no ready-for-review nudge`,
     'a ready-for-review nudge',
+  );
+  const w2State = w2 ? await inst.cliState(wsB, w2.tabId) : null;
+  const w2Early = w2 ? await inst.nudgesFor(wsB, w2.tabId) : [];
+  stopJob();
+  const jobEnded = await within(5000, async () => !fs.existsSync(`/proc/${job.pid}`) || readIf(`/proc/${job.pid}/stat`)?.split(' ')[2] === 'Z');
+  const endedAt = Date.now();
+  const w2Again = w2 && jobEnded ? await inst.hook('stop', w2.sessionName) : 0;
+  const woke = w2Again === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, w2.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  check(
+    'turn-waiting',
+    'a stop with no marker and a live registered job is WAITING (busy, no nudge); once the job ends the next stop is READY',
+    Boolean(w2Stopped && ready && w2State === 'busy' && w2Early.length === 0 && woke && woke.at >= endedAt),
+    `bg add ${registered.rc}, stop posted ${w2Stopped}, after w3's nudge: cliState ${w2State}, nudges ${w2Early.map((n) => n.kind).join(',') || 'none'}; after the job ended: ${woke ? `ready nudge at +${woke.at - endedAt} ms` : 'no ready nudge'}`,
+    'bg add 0, stop posted, cliState busy, no nudge; then a ready nudge stamped after the job ended',
   );
 };
 
