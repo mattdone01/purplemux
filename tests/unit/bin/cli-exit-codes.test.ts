@@ -505,3 +505,27 @@ describe('reportsTo and bg --notify (ADR-0018)', () => {
     expect(requests).toHaveLength(1);
   });
 });
+
+describe('inbox (ADR-0012)', () => {
+  it('lists with --all through the read route', async () => {
+    reply = json(200, { workspaceId: 'WS', items: [] });
+    expect((await cli(['inbox', 'list', '-w', 'WS', '--all'])).code).toBe(0);
+    expect(requests[0]).toMatchObject({ method: 'GET', url: '/api/cli/inbox?workspaceId=WS&all=1' });
+  });
+
+  it.each([
+    [409, 'inbox-not-held', 3],
+    [404, 'inbox-not-found', 7],
+  ])('maps a retry refused with %i %s to exit %i', async (status, code, exit) => {
+    reply = json(status, { error: code, code });
+    const result = await cli(['inbox', 'retry', 'i-abc123']);
+    expect(result.code).toBe(exit);
+    expect(result.stderr).toContain(code);
+    expect(requests[0]).toMatchObject({ method: 'POST', url: '/api/cli/inbox/i-abc123/retry' });
+  });
+
+  it.each([[['inbox', 'retry', 'n-not-an-inbox-id']], [['inbox', 'list']], [['inbox']]])('refuses %j before sending', async (args) => {
+    expect((await cli(args)).code).toBe(2);
+    expect(requests).toHaveLength(0);
+  });
+});

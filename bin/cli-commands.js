@@ -14,6 +14,7 @@ const CLI_COMMANDS = new Set([
   'standup',
   'mission',
   'lease',
+  'inbox',
   'api-guide',
   'help',
   '-h',
