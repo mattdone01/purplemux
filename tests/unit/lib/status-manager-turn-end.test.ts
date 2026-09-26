@@ -79,6 +79,9 @@ const claudeEnd = (text: string) => ({
   message: { stop_reason: 'end_turn', content: [{ type: 'text', text }] },
 });
 
+// Gate lanes run four vitest workers on a loaded host; 1 s (the default) flaked there.
+const waitFor = (check: () => void) => vi.waitFor(check, { timeout: 5000 });
+
 const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 describe('stop classification (ADR-0018)', () => {
@@ -117,7 +120,7 @@ describe('stop classification (ADR-0018)', () => {
     manager.registerTab('worker', entry);
 
     manager.updateTabFromHook('tmux-worker', 'stop');
-    await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
 
     expect(paste).toHaveBeenCalledWith(
       'tmux-root',
@@ -138,7 +141,7 @@ describe('stop classification (ADR-0018)', () => {
     manager.registerTab('worker', entry);
 
     manager.updateTabFromHook('tmux-worker', 'stop');
-    await vi.waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
+    await waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
     await settle();
 
     expect(paste).not.toHaveBeenCalled();
@@ -153,7 +156,7 @@ describe('stop classification (ADR-0018)', () => {
     manager.registerTab('worker', entry);
 
     manager.updateTabFromHook('tmux-worker', 'stop');
-    await vi.waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
+    await waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
     await settle();
 
     expect(paste).not.toHaveBeenCalled();
@@ -167,7 +170,7 @@ describe('stop classification (ADR-0018)', () => {
     manager.registerTab('worker', entry);
 
     manager.updateTabFromHook('tmux-worker', 'stop');
-    await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
 
     const { buildNudgeMessage } = await import('@/lib/orchestration');
     expect(paste).toHaveBeenCalledWith('tmux-root', buildNudgeMessage('ready-for-review', 'worker', 'w1', 'ws-1'));
@@ -181,7 +184,7 @@ describe('stop classification (ADR-0018)', () => {
     const fallback = (manager as unknown as { transcriptFallbackLogged: Set<string> }).transcriptFallbackLogged;
 
     manager.updateTabFromHook('tmux-worker', 'stop');
-    await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
     expect(paste.mock.calls[0][1]).toContain('is READY FOR REVIEW');
     expect(fallback.has('worker')).toBe(true);
   });
@@ -205,7 +208,7 @@ describe('stop classification (ADR-0018)', () => {
     manager.updateTabFromHook('tmux-worker', 'stop');
     manager.updateTabFromHook('tmux-worker', 'prompt-submit');
     manager.updateTabFromHook('tmux-worker', 'stop');
-    await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
     releaseFirst();
     await settle();
 
