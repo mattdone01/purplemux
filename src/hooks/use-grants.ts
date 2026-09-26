@@ -7,7 +7,7 @@ import { fetchGrantsView, GrantsReadError, type IGrantsView } from '@/lib/grants
  * refused read is thrown, so SWR keeps the last good view: a failed refresh
  * marks it stale instead of hiding active grants (review r1).
  */
-const fetcher = async (): Promise<IGrantsView> => {
+export const grantsFetcher = async (): Promise<IGrantsView> => {
   const r = await fetchGrantsView();
   if (!r.ok) throw new GrantsReadError(r);
   return r.value;
@@ -15,23 +15,49 @@ const fetcher = async (): Promise<IGrantsView> => {
 
 export type TGrantsRole = 'poller' | 'reader' | 'fresh';
 
-const OPTIONS: Record<TGrantsRole, SWRConfiguration<IGrantsView>> = {
-  // The one owner of the refresh.
-  poller: { refreshInterval: 30_000, revalidateOnFocus: true },
+export const GRANTS_POLL_MS = 30_000;
+
+export const GRANTS_SWR_OPTIONS: Record<TGrantsRole, SWRConfiguration<IGrantsView>> = {
+  // The one owner of the refresh. SWR skips its interval while the cache holds an
+  // error and backs off retries for up to ~32 min; a flat retry keeps the 30 s
+  // cadence through an outage (review r2).
+  poller: {
+    refreshInterval: GRANTS_POLL_MS,
+    revalidateOnFocus: true,
+    onErrorRetry: (_error, _key, _config, revalidate, revalidateOptions) => {
+      setTimeout(() => void revalidate(revalidateOptions), GRANTS_POLL_MS);
+    },
+  },
   // Tab badges: the cache only, no request of their own.
-  reader: { refreshInterval: 0, revalidateOnMount: false, revalidateIfStale: false, revalidateOnFocus: false },
+  reader: { refreshInterval: 0, revalidateOnMount: false, revalidateIfStale: false, revalidateOnFocus: false, shouldRetryOnError: false },
   // The dialog: one fresh read when it opens.
   fresh: { refreshInterval: 0, revalidateOnFocus: false },
 };
 
+export interface IGrantsHookState {
+  view: IGrantsView | null;
+  failure: { status: number; code: string | null; reason: string | null } | null;
+  /** The view shown is the last good one, and the latest read failed. */
+  stale: boolean;
+}
+
+/** What the hook returns for SWR's `data` and `error`: an error never clears the last good view. */
+export const grantsHookState = (data: IGrantsView | undefined, error: unknown): IGrantsHookState => {
+  const failure = error instanceof GrantsReadError
+    ? error.failure
+    : error
+      ? { status: 0, code: null, reason: error instanceof Error ? error.message : String(error) }
+      : null;
+  return { view: data ?? null, failure, stale: !!data && !!failure };
+};
+
+/** The server's clock for a client time: grant activity is judged on the time the server keeps. */
+export const serverTimeOf = (view: IGrantsView | null, clientNow: number): number => clientNow + (view?.skewMs ?? 0);
+
 const useGrants = (role: TGrantsRole = 'reader') => {
-  const { data, error, mutate, isLoading } = useSWR<IGrantsView>('/api/grants', fetcher, OPTIONS[role]);
-  const failure = error instanceof GrantsReadError ? error.failure : error ? { status: 0, code: null, reason: String(error) } : null;
+  const { data, error, mutate, isLoading } = useSWR<IGrantsView>('/api/grants', grantsFetcher, GRANTS_SWR_OPTIONS[role]);
   return {
-    view: data ?? null,
-    failure,
-    /** The view shown is the last good one, and the latest read failed. */
-    stale: !!data && !!failure,
+    ...grantsHookState(data, error),
     isLoading,
     refresh: () => mutate(),
   };

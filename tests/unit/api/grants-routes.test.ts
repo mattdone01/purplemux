@@ -85,6 +85,7 @@ describe('grant routes', () => {
     const { grantsFile, reloadGrants } = await import('@/lib/grant-store');
     fs.rmSync(grantsFile(), { force: true });
     reloadGrants();
+    fs.rmSync(layouts.dir, { recursive: true, force: true });
   });
 
   it('refuses any caller without a human session: the admin CLI token alone is 401', async () => {

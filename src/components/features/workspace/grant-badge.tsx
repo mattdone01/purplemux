@@ -1,9 +1,9 @@
 import { useFormatter, useTranslations } from 'next-intl';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import useGrants from '@/hooks/use-grants';
+import useGrants, { serverTimeOf } from '@/hooks/use-grants';
 import useNowTick from '@/hooks/use-now-tick';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
-import { grantBadgeOf, type IGrantBadge } from '@/lib/grant-view';
+import { describeGrantFailure, grantBadgeOf, type IGrantBadge } from '@/lib/grant-view';
 import { cn } from '@/lib/utils';
 
 // "drives N workspaces" on a grantee tab (story 28; ADR-0014), with the
@@ -42,18 +42,19 @@ export const GrantBadgeView = ({ badge, workspaceNames, staleReason = null }: {
 
 const GrantBadge = ({ workspaceId, tabId }: { workspaceId: string | null; tabId: string }) => {
   // A reader: the sidebar's poller owns the refresh; badges only read the shared cache.
+  const t = useTranslations('grants');
   const { view, failure, stale } = useGrants('reader');
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   // A minute clock: the badge goes at expiry without waiting for the next grants read.
   const now = useNowTick(60_000);
   if (!workspaceId || !view) return null;
-  const badge = grantBadgeOf(view.grants, workspaceId, tabId, now + view.skewMs);
+  const badge = grantBadgeOf(view.grants, workspaceId, tabId, serverTimeOf(view, now));
   if (!badge) return null;
   return (
     <GrantBadgeView
       badge={badge}
       workspaceNames={Object.fromEntries(workspaces.map((w) => [w.id, w.name]))}
-      staleReason={stale && failure ? failure.reason ?? String(failure.status) : null}
+      staleReason={stale && failure ? describeGrantFailure(failure, (key, values) => t(key, values)) : null}
     />
   );
 };

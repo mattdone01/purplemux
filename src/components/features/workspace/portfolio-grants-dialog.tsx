@@ -2,11 +2,11 @@ import { useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import PortfolioGrantsPanel from '@/components/features/workspace/portfolio-grants-panel';
-import useGrants from '@/hooks/use-grants';
+import useGrants, { serverTimeOf } from '@/hooks/use-grants';
 import useNowTick from '@/hooks/use-now-tick';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { createGrantRequest, revokeGrantRequest } from '@/lib/grants-client';
-import { describeGrantFailure, GRANT_DEFAULT_EXPIRY_HOURS, runGrantAction } from '@/lib/grant-view';
+import { describeGrantFailure, GRANT_DEFAULT_EXPIRY_HOURS, grantDialogError, runGrantAction, withoutKey } from '@/lib/grant-view';
 
 interface IPortfolioGrantsDialogProps {
   open: boolean;
@@ -32,6 +32,8 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [revokingIds, setRevokingIds] = useState<string[]>([]);
+  // One refusal per grant: a later revoke's success never wipes another grant's refusal.
+  const [revokeErrors, setRevokeErrors] = useState<Record<string, string>>({});
 
   const describe = (r: { status: number; code: string | null; reason: string | null }): string =>
     describeGrantFailure(r, (key, values) => t(key, values));
@@ -64,10 +66,10 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
 
   const revoke = async (id: string) => {
     setRevokingIds((ids) => [...ids, id]);
-    setError(null);
+    setRevokeErrors((errors) => withoutKey(errors, id));
     const result = await runGrantAction({ call: () => revokeGrantRequest(id), refresh, describe });
     setRevokingIds((ids) => ids.filter((x) => x !== id));
-    setError(result.error);
+    if (result.error) setRevokeErrors((errors) => ({ ...errors, [id]: result.error as string }));
   };
 
   // A failed refresh keeps the last good view (useGrants) and says so; with no view at all, the lists are unknown.
@@ -86,7 +88,7 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
           unreadableWorkspaceIds={view?.unreadableWorkspaceIds ?? []}
           grants={view?.grants ?? []}
           workspaceNames={Object.fromEntries(workspaces.map((w) => [w.id, w.name]))}
-          now={now + (view?.skewMs ?? 0)}
+          now={serverTimeOf(view, now)}
           granteeKey={granteeKey}
           onGranteeChange={(key) => { setGranteeKey(key); setTargets([]); }}
           workspaces={targets}
@@ -97,7 +99,7 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
           onReasonChange={setReason}
           password={password}
           onPasswordChange={setPassword}
-          error={error ?? readError}
+          error={grantDialogError(error, revokeErrors, readError)}
           submitting={submitting}
           revokingIds={revokingIds}
           onSubmit={submit}

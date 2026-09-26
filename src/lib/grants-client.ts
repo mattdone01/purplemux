@@ -47,9 +47,13 @@ export const fetchGrantsView = (): Promise<TGrantCall<IGrantsView>> =>
 
 /** A refused read, thrown so SWR keeps the last good view (review r1: a failed refresh never hides grants). */
 export class GrantsReadError extends Error {
-  constructor(readonly failure: { status: number; code: string | null; reason: string | null }) {
-    super(failure.reason ?? `grants read failed (${failure.status})`);
+  readonly failure: { status: number; code: string | null; reason: string | null };
+
+  constructor({ status, code, reason }: { status: number; code: string | null; reason: string | null }) {
+    super(reason ?? `grants read failed (${status})`);
     this.name = 'GrantsReadError';
+    // Only the served fields: a caller passes a whole TGrantCall refusal.
+    this.failure = { status, code, reason };
   }
 }
 
