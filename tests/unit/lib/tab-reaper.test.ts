@@ -6,6 +6,9 @@ import { getDescendantPids, getTmuxServerPid, killSession } from '@/lib/tmux';
 import { auditFile } from '@/lib/coordination-audit';
 
 const realDeps = () => defaultReaperDeps({ descendants: getDescendantPids, tmuxServerPid: getTmuxServerPid });
+// In these tests the "pane" is a child of the test process, which plays the
+// server; a real pane descends from the tmux server, never from the server.
+const paneDeps = (): ITabReaperDeps => ({ ...realDeps(), serverDescendants: async () => [] });
 
 const env = (...entries: string[]) => Buffer.from(entries.join('\0') + '\0');
 
@@ -25,6 +28,7 @@ describe('reapTabProcesses (fake /proc)', () => {
     descendants?: number[];
     proc?: boolean;
     protectedPids?: number[];
+    serverDescendants?: number[];
   }) => {
     const alive = new Set(Object.keys(opts.procs).map(Number));
     const starts = new Map([...alive].map((pid) => [pid, `start-${pid}`]));
@@ -42,6 +46,7 @@ describe('reapTabProcesses (fake /proc)', () => {
       isAlive: (pid) => alive.has(pid),
       startTime: async (pid) => (alive.has(pid) ? starts.get(pid) ?? null : null),
       protectedPids: async () => opts.protectedPids ?? [],
+      serverDescendants: async () => opts.serverDescendants ?? [],
       kill: (pid, sig) => {
         signals.push(`${sig}:${pid}`);
         if (sig === 'SIGCONT') stopped.delete(pid);
@@ -120,6 +125,23 @@ describe('reapTabProcesses (fake /proc)', () => {
     });
     deps.selfPid = 7;
     const result = await reapTabProcesses(deps, { tabId: 'tab-t', panePid: null });
+    expect(result.killed.map((p) => p.pid)).toEqual([20]);
+    expect(signals.every((s) => s.endsWith(':20'))).toBe(true);
+  });
+
+  it('never signals the server\'s own descendants, even marked ones in the pane\'s tree (architect CONCERN: a nohup server in a tab)', async () => {
+    const { deps, signals } = fake({
+      procs: {
+        10: { environ: ['PMUX_TAB_ID=tab-t'] }, // the pane shell
+        5: { environ: ['PMUX_TAB_ID=tab-t'] }, // the server, nohup'd in the tab
+        50: { environ: ['PMUX_TAB_ID=tab-t'] }, // a terminal connection the server spawned
+        20: { environ: ['PMUX_TAB_ID=tab-t'] }, // the tab's own job
+      },
+      descendants: [5, 50, 20],
+      serverDescendants: [50],
+    });
+    deps.selfPid = 5;
+    const result = await reapTabProcesses(deps, { tabId: 'tab-t', panePid: 10 });
     expect(result.killed.map((p) => p.pid)).toEqual([20]);
     expect(signals.every((s) => s.endsWith(':20'))).toBe(true);
   });
@@ -216,6 +238,7 @@ describe('reapTabForClose (the close step every path runs)', () => {
       isAlive: (pid) => alive.has(pid),
       startTime: async (pid) => (alive.has(pid) ? 's' : null),
       protectedPids: async () => [],
+      serverDescendants: async () => [],
       kill: (pid) => { alive.delete(pid); },
       sleep: async () => {},
       now: () => 0,
@@ -319,7 +342,7 @@ describe.runIf(process.platform === 'linux')('reapTabProcesses (real processes, 
     const mine = await pane(id, JOBS);
     const other = await pane(`${id}x`, 'sleep 120 & echo "other $!" >> "$PIDS_FILE"\necho ready >> "$PIDS_FILE"');
     const t0 = Date.now();
-    const reaping = reapTabProcesses(realDeps(), { tabId: id, panePid: mine.panePid });
+    const reaping = reapTabProcesses(paneDeps(), { tabId: id, panePid: mine.panePid });
     // The AC: the jobs are gone within 4 s (the call itself also rescans and settles).
     const jobs = ['disowned', 'setsid', 'ignores-term'].map((name) => mine.pids[name]);
     let goneAt: number | null = null;
@@ -343,7 +366,7 @@ describe.runIf(process.platform === 'linux')('reapTabProcesses (real processes, 
   it('keepProcesses: the setsid child survives and only the pane group is killed', { timeout: 15_000 }, async () => {
     const id = tabId();
     const mine = await pane(id, 'sleep 120 & echo "group $!" >> "$PIDS_FILE"\nsetsid nohup sleep 120 >/dev/null 2>&1 & echo "setsid $!" >> "$PIDS_FILE"\necho ready >> "$PIDS_FILE"');
-    const result = await reapTabProcesses(realDeps(), { tabId: id, panePid: mine.panePid, keepProcesses: true });
+    const result = await reapTabProcesses(paneDeps(), { tabId: id, panePid: mine.panePid, keepProcesses: true });
     const killed = result.killed.map((p) => p.pid);
     expect(killed).toContain(mine.pids.group);
     expect(killed).not.toContain(mine.pids.setsid);
@@ -352,7 +375,7 @@ describe.runIf(process.platform === 'linux')('reapTabProcesses (real processes, 
 
   it('a pane without the marker (created before per-tab identity) still has its descendants reaped', { timeout: 15_000 }, async () => {
     const mine = await pane(null, 'sleep 120 & echo "child $!" >> "$PIDS_FILE"\necho ready >> "$PIDS_FILE"');
-    const result = await reapTabProcesses(realDeps(), { tabId: tabId(), panePid: mine.panePid });
+    const result = await reapTabProcesses(paneDeps(), { tabId: tabId(), panePid: mine.panePid });
     expect(result.envMarker).toBe('absent');
     expect(result.killed.map((p) => p.pid)).toContain(mine.pids.child);
     expect(alive(mine.pids.child)).toBe(false);
@@ -376,5 +399,16 @@ describe.runIf(process.platform === 'linux')('reapTabProcesses (real processes, 
 
   it('protects the server\'s own parent in the real /proc sources', async () => {
     expect(await realDeps().protectedPids()).toContain(process.ppid);
+  });
+
+  it('the real sources never reap a marked process the server itself started', { timeout: 15_000 }, async () => {
+    const id = tabId();
+    const own = spawn('sleep', ['120'], { detached: false, stdio: 'ignore', env: { ...process.env, PMUX_TAB_ID: id } });
+    children.push(own);
+    started.push(own.pid!);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const result = await reapTabProcesses(realDeps(), { tabId: id, panePid: null });
+    expect(result.killed.map((p) => p.pid)).not.toContain(own.pid);
+    expect(alive(own.pid!)).toBe(true);
   });
 });

@@ -15,7 +15,7 @@ import os from 'os';
 //
 // Never signalled, whatever they carry: pid 0 and 1, the server itself, its
 // ancestors (a server started from inside a tab is a child of that tab's
-// shell) and the tmux server. A pid whose start time changed between the scan
+// shell), its own descendants, and the tmux server. A pid whose start time changed between the scan
 // and a signal is a different process (a reused pid) and is left alone.
 
 export const REAP_GRACE_MS = 3_000;
@@ -56,6 +56,11 @@ export interface ITabReaperDeps {
   startTime: (pid: number) => Promise<string | null>;
   /** Pids never signalled: the server's ancestors and the tmux server. */
   protectedPids: () => Promise<number[]>;
+  /**
+   * The server's own descendants (terminal connections, codex children): never
+   * a tab's, even when the server runs inside that tab's shell under nohup.
+   */
+  serverDescendants: () => Promise<number[]>;
   kill: (pid: number, signal: NodeJS.Signals) => void;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
@@ -152,6 +157,7 @@ export const defaultReaperDeps = ({ descendants, tmuxServerPid }: IDefaultReaper
     const raw = await readText(`/proc/${pid}/stat`);
     return raw ? statFields(raw)[19] ?? null : null;
   },
+  serverDescendants: () => descendants(process.pid),
   protectedPids: async () => {
     const tmux = await tmuxServerPid().catch(() => null);
     return [...(await ancestorsOf(process.pid)), ...(tmux ? [tmux] : [])];
@@ -263,7 +269,7 @@ export const reapTabProcesses = async (
     const paneEnviron = await deps.readEnviron(opts.panePid);
     if (paneEnviron) result.envMarker = environHasTabId(paneEnviron, opts.tabId) ? 'present' : 'absent';
   }
-  const protectedSet = new Set<number>([deps.selfPid, ...(await deps.protectedPids())]);
+  const protectedSet = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
   // The pane shell goes with the session.
   if (opts.panePid !== null) protectedSet.add(opts.panePid);
   const eligible = (pid: number) => Number.isInteger(pid) && pid > 1 && !protectedSet.has(pid);
