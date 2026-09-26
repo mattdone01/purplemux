@@ -33,7 +33,7 @@ const handleClaudeHook = (req: NextApiRequest, res: NextApiResponse) => {
   const { event, session, notificationType, source } = req.body ?? {};
   if (typeof event === 'string' && event !== 'poll' && typeof session === 'string' && session) {
     const type = typeof notificationType === 'string' && notificationType ? notificationType : undefined;
-    log.debug({ event, session, notificationType: type }, `received ${event}${type ? `(${type})` : ''}`);
+    log.debug({ event, session, notificationType: type, source }, `received ${event}${type ? `(${type})` : ''}${typeof source === 'string' ? `(source=${source})` : ''}`);
     const workEvent = translateClaudeHookEvent(event, type, source);
     if (workEvent) {
       getStatusManager().handleProviderEvent('claude', session, workEvent);

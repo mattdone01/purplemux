@@ -110,21 +110,13 @@ describe('a compaction is not a turn end (L30)', () => {
     expect(paste).not.toHaveBeenCalled();
   });
 
-  it('recognises the compaction without a source (hook script predating the field): during it and within a minute after', async () => {
-    const during = await setup();
-    during.manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'pre-compact' });
-    during.manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'session-start' });
-    await during.settle();
-    expect(during.entry.cliState).toBe('busy');
-    expect(during.paste).not.toHaveBeenCalled();
-
-    const after = await setup();
-    after.manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'pre-compact' });
-    after.manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'post-compact' });
-    after.manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'session-start' });
-    await after.settle();
-    expect(after.entry.cliState).toBe('busy');
-    expect(after.paste).not.toHaveBeenCalled();
+  it('has no fallback without a source: a sourceless session start during a compaction is today\'s session start (Grok sends none)', async () => {
+    const { manager, entry, paste } = await setup();
+    manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'pre-compact' });
+    manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'post-compact' });
+    manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'session-start' });
+    await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(entry.cliState).toBe('idle');
   });
 
   it.each(['startup', 'resume', 'clear'] as const)('keeps today\'s behaviour for source=%s: idle and a turn-ended nudge', async (source) => {
