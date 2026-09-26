@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import type { NextApiRequest } from 'next';
 import { verifyTokenValue } from '@/lib/cli-token';
+import { resolveTabToken } from '@/lib/tab-token';
 
 const TOKENS_FILE = path.join(os.homedir(), '.purplemux', 'workspace-tokens.json');
 
@@ -54,8 +55,12 @@ const matches = (a: string, b: string): boolean =>
 export type TCliScope =
   /** The global token: the UI and the user's own shell. Unrestricted. */
   | { type: 'admin' }
-  /** A token injected into one workspace's tabs. Confined to that workspace. */
-  | { type: 'workspace'; workspaceId: string };
+  /**
+   * A token injected into one workspace's tabs. Confined to that workspace.
+   * A per-tab token (ADR-0010) resolves to the same scope and additionally
+   * names its tab; the workspace predicates never read `tabId`.
+   */
+  | { type: 'workspace'; workspaceId: string; tabId?: string; tabVerified?: true };
 
 /**
  * Resolve what the caller is allowed to touch. Agents run with a workspace-scoped
@@ -74,5 +79,8 @@ export const resolveCliScope = (req: NextApiRequest): TCliScope | null => {
   for (const [wsId, token] of Object.entries(tokens)) {
     if (matches(value, token)) return { type: 'workspace', workspaceId: wsId };
   }
+
+  const tab = resolveTabToken(value);
+  if (tab) return { type: 'workspace', workspaceId: tab.record.workspaceId, tabId: tab.tabId, tabVerified: true };
   return null;
 };

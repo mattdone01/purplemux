@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, setLayoutReconciler } from '@/lib/layout-store';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName } from '@/lib/layout-store';
+import { onTabClosed } from '@/lib/tab-lifecycle';
 import { getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
@@ -1460,23 +1461,6 @@ export class StatusManager {
     this.broadcastRemove(tabId);
   }
 
-  reconcileWorkspaceTabs(wsId: string, validTabIds: readonly string[]): void {
-    const valid = new Set(validTabIds);
-    for (const [tabId, entry] of this.tabs) {
-      if (entry.workspaceId === wsId && !valid.has(tabId)) {
-        this.removeTab(tabId);
-      }
-    }
-  }
-
-  removeWorkspaceTabs(wsId: string): void {
-    for (const [tabId, entry] of this.tabs) {
-      if (entry.workspaceId === wsId) {
-        this.removeTab(tabId);
-      }
-    }
-  }
-
   registerTab(tabId: string, entry: ITabStatusEntry): void {
     this.tabs.set(tabId, entry);
     this.reconcileJsonlWatch(tabId, entry);
@@ -1854,10 +1838,7 @@ export const getStatusManager = (): StatusManager => {
     dispatcher.register(createStatusSocketChannel((frame) => manager.broadcast(frame)));
     dispatcher.register(createWebPushChannel());
     registerFcmChannel(dispatcher);
-    setLayoutReconciler({
-      reconcileWorkspaceTabs: (wsId, validTabIds) => manager.reconcileWorkspaceTabs(wsId, validTabIds),
-      removeWorkspaceTabs: (wsId) => manager.removeWorkspaceTabs(wsId),
-    });
+    onTabClosed(({ tabId }) => manager.removeTab(tabId));
   }
   return g.__ptStatusManager;
 };
