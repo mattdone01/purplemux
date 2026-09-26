@@ -55,8 +55,16 @@ describe('GET /api/mission-control/coordination', () => {
     m.inbox.mockResolvedValue({ items: [{ id: 'i-1', state: 'held' }, { id: 'i-2', state: 'queued' }] });
   });
 
-  it('refuses a CLI token without a human session (401)', async () => {
-    expect((await call({ 'x-pmux-token': 'admin-cli-token' })).status).toBe(401);
+  it('refuses a valid CLI token without a human session (401) and reads no store', async () => {
+    // Pin the token in memory so the test never touches ~/.purplemux/cli-token.
+    (globalThis as unknown as { __ptCliToken?: string }).__ptCliToken = 'c'.repeat(64);
+    const { getCliToken, verifyTokenValue } = await import('@/lib/cli-token');
+    expect(verifyTokenValue(getCliToken())).toBe(true);
+    expect((await call({ 'x-pmux-token': getCliToken() })).status).toBe(401);
+    expect(m.leases).not.toHaveBeenCalled();
+    expect(m.notes).not.toHaveBeenCalled();
+    expect(m.watches).not.toHaveBeenCalled();
+    expect(m.inbox).not.toHaveBeenCalled();
   });
 
   it('serves every section to a human: closed lease kept, open notes with age, active grants, held deliveries', async () => {

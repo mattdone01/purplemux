@@ -1,6 +1,8 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { CoordinationPanelView, formatAge } from '@/components/features/mission-control/coordination-panel';
+import {
+  CoordinationErrorBoundary, CoordinationPanelView, formatAge, formatStamp, heldReasonLabel,
+} from '@/components/features/mission-control/coordination-panel';
 import type { ICoordinationSnapshot } from '@/types/coordination';
 
 // Story 20: each section's empty, populated and error states; the AC warnings.
@@ -79,6 +81,75 @@ describe('coordination panel', () => {
     expect(html).not.toContain('head-moved');
     expect(html).toMatch(/owner closed/);
     expect(html).toContain('resume → ws-1/tab-a');
+  });
+
+  it('open notes: populated rows show subject, state label and age; undeliverable is a warning', () => {
+    const snap = empty();
+    snap.notes = { ok: true, items: [
+      { id: 'n-1', subject: 'merge window', state: 'delivered', ageSeconds: 120 },
+      { id: 'n-2', subject: 'rebase please', state: 'undeliverable', ageSeconds: 7200 },
+      { id: 'n-3', subject: 'odd', state: 'mystery-state', ageSeconds: 5 },
+    ] } as unknown as ICoordinationSnapshot['notes'];
+    const html = sectionHtml(render(snap), 'Open notes');
+    expect(html).toContain('data-state="populated"');
+    expect(html).toMatch(/data-note="n-1".*?merge window.*?<span class="shrink-0 text-muted-foreground">delivered · 2m<\/span>/);
+    expect(html).toMatch(/data-note="n-2".*?rebase please.*?<span class="shrink-0 text-ui-amber">undeliverable · 2h<\/span>/);
+    expect(html).toMatch(/data-note="n-3".*?>other · 5s</);
+    expect(html).not.toContain('mystery-state');
+  });
+
+  it('grants: populated rows show the grantee, the workspaces it drives and the expiry', () => {
+    const snap = empty();
+    snap.grants = { ok: true, items: [
+      { id: 'g-1', grantee: { workspaceId: 'ws-orch', tabId: 'tab-o' }, workspaces: ['ws-a', 'ws-b'], expiresAt: AT + 3_600_000 },
+    ] } as unknown as ICoordinationSnapshot['grants'];
+    const html = sectionHtml(render(snap), 'Grants');
+    expect(html).toContain('data-state="populated"');
+    expect(html).toMatch(/data-grant="g-1".*?ws-orch\/tab-o drives ws-a, ws-b.*?until [^<]+</);
+    expect(html).toContain(new Date(AT + 3_600_000).toLocaleString());
+  });
+
+  it('host signals: pending before the first run', () => {
+    expect(render({ ...empty(), signals: { state: 'pending' } })).toContain('data-signals="pending"');
+  });
+
+  it('a stamp Date cannot represent renders "—" instead of throwing', () => {
+    expect(formatStamp(1.79e18)).toBe('—');
+    expect(formatStamp(AT)).toBe('2026-09-26T15:00:00.000Z');
+    const ok = { ...empty(), signals: { state: 'ok', ranAt: AT, stale: false, value: { schemaVersion: 1, stampedAt: 1.79e18, gateSlots: { total: 1, held: 0, holders: [] }, worktrees: [], tmpInodesPct: 1 } } } as ICoordinationSnapshot;
+    expect(render(ok)).toContain('stamped —)');
+  });
+
+  it('held reasons read as labels plus the served detail, never the bare token', () => {
+    expect(heldReasonLabel('stranded-in-composer')).toBe('stranded in the composer');
+    expect(heldReasonLabel('transport-uncertain:tmux gone')).toBe('delivery uncertain: tmux gone');
+    expect(heldReasonLabel('composer-not-ready:busy (30 refusals)')).toBe('composer not ready: busy (30 refusals)');
+    expect(heldReasonLabel('session-not-running (undelivered after 24 h)')).toBe('session not running (undelivered after 24 h)');
+    expect(heldReasonLabel('brand-new-reason (8 refusals)')).toBe('other (8 refusals)');
+    expect(heldReasonLabel('Weird Reason')).toBe('other: Weird Reason');
+    expect(heldReasonLabel(null)).toBe('held');
+    const snap = empty();
+    snap.inboxHeld = { ok: true, items: [{ id: 'i-1', kind: 'note', targetWorkspaceId: 'ws-1', targetTabId: 'tab-a', heldReason: 'target-not-agent' }] } as unknown as ICoordinationSnapshot['inboxHeld'];
+    expect(render(snap)).toMatch(/data-held="i-1".*?target is not an agent tab/);
+  });
+
+  it('an unknown disk percentage reads "—" and never warns', () => {
+    const snap = empty();
+    if (snap.host.available) snap.host.disks[0].usedPct = null;
+    const html = render(snap);
+    expect(html).toContain('disk —');
+    expect(html).not.toContain('data-warn="true"');
+  });
+
+  it('the error boundary turns a render failure into this panel\'s error, with Retry', () => {
+    expect(CoordinationErrorBoundary.getDerivedStateFromError(new RangeError('Invalid time value'))).toEqual({ error: 'Invalid time value' });
+    const boundary = new CoordinationErrorBoundary({ children: <p>child</p> });
+    expect(renderToStaticMarkup(<>{boundary.render()}</>)).toBe('<p>child</p>');
+    boundary.state = { error: 'Invalid time value' };
+    const html = renderToStaticMarkup(<>{boundary.render()}</>);
+    expect(html).toContain('data-state="render-error"');
+    expect(html).toContain('Coordination panel failed to render: Invalid time value');
+    expect(html).toContain('Retry');
   });
 
   it('formats ages', () => {

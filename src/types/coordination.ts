@@ -15,7 +15,8 @@ export interface INoteRow extends INoteView {
 
 export interface IDiskUse {
   path: string;
-  usedPct: number;
+  /** null when the filesystem reports no blocks (unknown, never 0 %). */
+  usedPct: number | null;
   freeBytes: number;
   inodesUsedPct: number | null;
 }

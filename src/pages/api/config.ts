@@ -30,7 +30,8 @@ const isValidToastDuration = (value: unknown): value is number =>
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'GET') {
-    const { authPassword, authSecret: _, ...safe } = await getConfig();
+    // The host-signal command stays server-side (story 20): it may carry a path or an argument not meant for the page.
+    const { authPassword, authSecret: _, hostSignalCommand: _hostSignalCommand, ...safe } = await getConfig();
     const hostEnvLocked = typeof process.env.HOST === 'string' && process.env.HOST.trim().length > 0;
     return res.status(200).json({
       ...safe,

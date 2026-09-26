@@ -1,7 +1,7 @@
-import type { ReactNode } from 'react';
+import { Component, type ReactNode } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import useCoordination from '@/hooks/use-coordination';
-import { hostWarnings } from '@/lib/host-metrics';
+import { hostWarnings } from '@/lib/host-warnings';
 import { cn } from '@/lib/utils';
 import type { ICoordinationSnapshot, THostSignals, TSection } from '@/types/coordination';
 
@@ -17,9 +17,42 @@ const WATCH_UNTIL_LABEL: Record<string, string> = {
   merged: 'merged', closed: 'closed', 'head-moved': 'head moved', 'checks-settled': 'checks settled', moved: 'moved', free: 'free',
 };
 const INBOX_LABEL: Record<string, string> = { note: 'note', watch: 'watch', deploy: 'deploy notice', mission: 'Mission Control', resume: 'resume' };
+// The leading token of a held delivery's reason (inbox-dispatcher, composer-readiness, inbox-store refusals).
+const HELD_LABEL: Record<string, string> = {
+  'target-not-agent': 'target is not an agent tab',
+  'stranded-in-composer': 'stranded in the composer',
+  'transport-uncertain': 'delivery uncertain',
+  'target-unresolved': 'target not found',
+  'target-changed': 'target changed',
+  'session-not-running': 'session not running',
+  policy: 'refused by policy',
+  'usage-limit-halt': 'usage limit reached',
+  'dispatch-error': 'dispatch error',
+  'status-unavailable': 'status unavailable',
+  'native-prompt-active': 'prompt open',
+  'interactive-prompt-active': 'prompt open',
+  'composer-not-ready': 'composer not ready',
+  'composer-unreadable': 'composer unreadable',
+  'composer-not-empty': 'composer not empty',
+};
 
 /** A served token through its label map: an unmapped one reads "other", never the raw token. */
 const label = (map: Record<string, string>, token: string): string => (Object.hasOwn(map, token) ? map[token] : 'other');
+
+/** A held reason reads as its label plus the served detail (`: <message>`, `(N refusals)`); never the bare token. */
+export const heldReasonLabel = (reason: string | null): string => {
+  if (!reason) return 'held';
+  const match = /^([a-z][a-z-]*)([\s\S]*)$/.exec(reason);
+  if (!match) return `other: ${reason}`;
+  const detail = match[2].startsWith(':') ? `: ${match[2].slice(1)}` : match[2];
+  return `${label(HELD_LABEL, match[1])}${detail}`;
+};
+
+/** An epoch-ms stamp as ISO text; a value `Date` cannot represent reads "—", never a render crash. */
+export const formatStamp = (ms: number): string => {
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? '—' : d.toISOString();
+};
 
 export const formatAge = (seconds: number | null | undefined): string => {
   if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '—';
@@ -68,7 +101,7 @@ const SignalsView = ({ signals, now }: { signals: THostSignals; now: number }) =
   const worktrees = v.worktrees.reduce((sum, w) => sum + w.count, 0);
   return (
     <div className={cn('text-xs', signals.stale && 'text-muted-foreground')} data-signals="ok">
-      Host signals ({stamp}; stamped {new Date(v.stampedAt).toISOString()}): gate slots {v.gateSlots.held}/{v.gateSlots.total} held ·{' '}
+      Host signals ({stamp}; stamped {formatStamp(v.stampedAt)}): gate slots {v.gateSlots.held}/{v.gateSlots.total} held ·{' '}
       {worktrees} worktrees ({v.worktrees.map((w) => `${w.repo} ${w.count}`).join(', ') || 'none'}) · /tmp inodes {v.tmpInodesPct}%
     </div>
   );
@@ -129,7 +162,7 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
         <Section title="Held deliveries" section={snapshot.inboxHeld} empty="No held deliveries" render={(i) => (
           <li key={i.id} className="flex min-w-0 justify-between gap-2" data-held={i.id}>
             <span className="truncate">{label(INBOX_LABEL, i.kind)} → {i.targetWorkspaceId}/{i.targetTabId}</span>
-            <span className={cn('shrink-0', WARN)}>{i.heldReason ?? 'held'}</span>
+            <span className={cn('shrink-0', WARN)}>{heldReasonLabel(i.heldReason)}</span>
           </li>
         )} />
         <div className="min-w-0 space-y-1.5" data-section="Host">
@@ -141,7 +174,7 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
               {host.disks.map((d) => (
                 <li key={d.path} data-disk={d.path} data-warn={warn.disks.has(d.path) || warn.inodes.has(d.path) ? 'true' : undefined}>
                   <span className="font-mono">{d.path}</span>{' '}
-                  <span className={cn(warn.disks.has(d.path) && WARN)}>disk {d.usedPct}% ({formatBytes(d.freeBytes)} free)</span>
+                  <span className={cn(warn.disks.has(d.path) && WARN)}>disk {d.usedPct === null ? '—' : `${d.usedPct}%`} ({formatBytes(d.freeBytes)} free)</span>
                   {d.inodesUsedPct !== null && <span className={cn(warn.inodes.has(d.path) && WARN)}> · inodes {d.inodesUsedPct}%</span>}
                 </li>
               ))}
@@ -159,12 +192,39 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
   );
 };
 
+/** A render failure blanks this panel only, never the Mission Control page (which has no boundary of its own). */
+export class CoordinationErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
+  state: { error: string | null } = { error: null };
+
+  static getDerivedStateFromError(err: unknown): { error: string } {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  componentDidCatch(err: unknown) {
+    console.error('[coordination panel] render failed:', err);
+  }
+
+  render() {
+    if (this.state.error === null) return this.props.children;
+    return (
+      <Card className="border-foreground/10 shadow-none">
+        <CardContent className="space-y-2 p-4 text-xs">
+          <p className="text-destructive" data-state="render-error">Coordination panel failed to render: {this.state.error}</p>
+          <button type="button" className="underline" onClick={() => this.setState({ error: null })}>Retry</button>
+        </CardContent>
+      </Card>
+    );
+  }
+}
+
 const CoordinationPanel = () => {
   const { snapshot, error, loading } = useCoordination();
   return (
     <section className="space-y-3" aria-labelledby="coordination-heading">
       <h2 id="coordination-heading" className="text-sm font-semibold">Coordination</h2>
-      <CoordinationPanelView snapshot={snapshot} error={error} loading={loading} />
+      <CoordinationErrorBoundary>
+        <CoordinationPanelView snapshot={snapshot} error={error} loading={loading} />
+      </CoordinationErrorBoundary>
     </section>
   );
 };
