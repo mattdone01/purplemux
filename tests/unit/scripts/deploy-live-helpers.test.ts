@@ -18,6 +18,7 @@ interface ITab {
 interface IMidTurn { workspaceId: string; tabId: string; name: string; busyForS: number | null; reason: string }
 
 interface IHelpers {
+  announceProgress: (status: unknown) => { delivered: number; settled: number; total: number };
   listShape: (tabs: ITab[]) => 'new' | 'old';
   agentTabs: (tabs: ITab[]) => ITab[];
   midTurnTabs: (input: {
@@ -40,6 +41,15 @@ const agent = (tabId: string, extra: Partial<ITab> = {}): ITab => ({
   name: tabId,
   panelType: 'claude-code',
   ...extra,
+});
+
+describe('deploy-live helpers: announce progress', () => {
+  it('counts delivered, settled (anything not queued) and total; an unreadable body settles nothing', () => {
+    const { announceProgress } = helpers;
+    expect(announceProgress({ recipients: [{ state: 'delivered' }, { state: 'held' }, { state: 'queued' }, { state: 'pruned' }] }))
+      .toEqual({ delivered: 1, settled: 3, total: 4 });
+    expect(announceProgress(null)).toEqual({ delivered: 0, settled: 0, total: 0 });
+  });
 });
 
 describe('deploy-live helpers: list shape', () => {

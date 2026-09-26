@@ -77,6 +77,17 @@ const readStatuses = (dir) => {
   return statuses;
 };
 
+/**
+ * Delivery progress of a `deploy status --json` body: a notice is settled once it is delivered,
+ * held (it waits for a person), dropped (its tab closed) or pruned; only queued ones are pending.
+ */
+const announceProgress = (status) => {
+  const recipients = Array.isArray(status?.recipients) ? status.recipients : [];
+  const delivered = recipients.filter((r) => r.state === 'delivered').length;
+  const settled = recipients.filter((r) => r.state !== 'queued').length;
+  return { delivered, settled, total: recipients.length };
+};
+
 const commands = {
   // shape TABS_JSON -> new|old
   shape: ([file]) => console.log(listShape(readJson(file).tabs ?? [])),
@@ -113,6 +124,17 @@ const commands = {
       // not JSON: print nothing
     }
   },
+  // announce-progress STATUS_JSON -> "delivered settled total" (all 0 when unreadable)
+  'announce-progress': ([file]) => {
+    let status = null;
+    try {
+      status = readJson(file);
+    } catch {
+      // unreadable: nothing settled
+    }
+    const { delivered, settled, total } = announceProgress(status);
+    console.log(`${delivered} ${settled} ${total}`);
+  },
   // backup SRC DST BETTER_SQLITE3_MODULE
   backup: ([src, dst, modulePath]) => backupSqlite(src, dst, modulePath),
 };
@@ -132,4 +154,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { listShape, agentTabs, midTurnTabs, pickWorkspaceToken, backupSqlite };
+module.exports = { listShape, agentTabs, midTurnTabs, pickWorkspaceToken, backupSqlite, announceProgress };

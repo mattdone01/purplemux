@@ -37,3 +37,9 @@ Between the build (step 2) and the lease (step 3), the script runs the release's
 checked end to end for the wave-1 surfaces and ADR-0018 (docs/DEPLOY.md "Acceptance gate"). A failure
 refuses with exit 2 before the live service is touched. The restart of a live host touches every
 worker tab, so a defect found on a throwaway instance costs nothing that a defect found live does.
+
+## Amendment (story 13, 2026-09-26): the announce step
+
+- `purplemux deploy announce --in N --reason TEXT` (admin token or the `deploy:purplemux` holder) queues the inbox's fixed `deploy` line (ADR-0012) for every enabled orchestrator tab and every live holder of a tab-bound lease, once per tab. A tab confirmed closed and the announcing tab are left out; a tab whose workspace layout cannot be read is kept. The reason is stored in `~/.purplemux/deploy-announcements.json` (0600, pruned 7 days after creation) and shown by `deploy status`, never typed.
+- `deploy status ID` shows each recipient's inbox state and `cliState`. The line tells every recipient to run it, so a recipient's workspace may read it, as may the announcer's workspace, the deploy lease holder and admin (the architecture's API table said admin or holder; amended).
+- `deploy-live.sh --announce N` announces after the deploy lease and before the quiet wait, waits until each notice is settled (delivered, held, dropped or pruned) or N minutes pass, and prints `ANNOUNCED=<delivered>/<recipients>`. A server that predates the command does not block the deploy; any other announce failure refuses with exit 1 before the restart. New CLI code: `deploy-invalid` (exit 2).

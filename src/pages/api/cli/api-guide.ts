@@ -49,12 +49,14 @@ to an exit code through one table:
                                                  connection: check the state first)
      2  usage error                              bad or missing argument; lease-policy,     fix the command
                                                  watch-invalid, reports-to-invalid,
-                                                 note-too-large, config-invalid,
-                                                 note-target-missing
+                                                 note-too-large, note-invalid,
+                                                 config-invalid, note-target-missing,
+                                                 deploy-invalid
      3  conflict / refused by state              forbidden, lease-held, lease-held-by-other, after the state changes
                                                  watch-cap, inbox-not-held, caller-unresolved,
                                                  grant-tab-unverified, grant-password-invalid,
-                                                 grant-locked, config-version-conflict
+                                                 grant-locked, config-version-conflict,
+                                                 note-cap
      4  target gone (permanent)                  tab-not-found, session-not-running,        NEVER
                                                  target-changed
      5  not ready yet                            readiness-timeout                          yes, bounded
@@ -342,6 +344,25 @@ PUT /api/cli/fleet-config/KEY   { "value": "6", "expectedVersion"?: 4 }
 DELETE /api/cli/fleet-config/KEY   { "expectedVersion"?: 5 }
   Same authority. Response: { "key", "version", "unset": { change } }. 404 config-not-found (exit 7) when unset. The version keeps counting, so a key
   set again never repeats a version.
+
+## Deploy announce (story 13, ADR-0017)
+
+The one broadcast path before a restart. It queues the inbox's fixed deploy line for every
+workspace's enabled orchestrator tab and every live holder of a tab-bound lease (once per tab;
+a tab confirmed closed and the announcing tab are left out):
+  "[purplemux deploy d-…] purplemux restarts at ~<time> (in N min) — details: purplemux deploy
+  status d-…; reach a checkpoint; tabs survive, in-flight hook events do not"
+The reason is stored and shown by status; it is never typed. Records are pruned 7 days after
+creation.
+
+POST /api/cli/deploy/announce   { "inMinutes": 1-60, "reason": "≤ 120 chars", "exceptTabIds"?: ["tab-…"] }
+  The admin token or the deploy:purplemux holder; else 403 forbidden (CLI exit 3).
+  400 deploy-invalid (exit 2). Response: { "id", "reason", "inMinutes", "createdAt", "restartAt",
+  "by", "recipients": [{ "workspaceId", "tabId", "reasons", "itemId" }] }.
+GET /api/cli/deploy/status?id=d-…
+  A recipient's workspace, the announcer's workspace, the deploy:purplemux holder or admin
+  (else 403). 404 deploy-not-found (exit 7). Response: the record, each recipient with
+  "state" (queued | delivered | held | dropped | pruned) and "cliState".
 
 ## Orchestration
 

@@ -33,20 +33,25 @@ Options:
 | `--ignore-tab WS/TAB` | exclude one more tab from the quiet wait (repeatable) |
 | `--outside-tab` | the shell runs outside every purplemux tab, so there is no own tab to exclude |
 | `--rollback` | swap `current` and `previous`, restart, health-check |
+| `--announce MINUTES` | before the quiet wait, `deploy announce` (1-60 min) to every enabled orchestrator and tab-bound lease holder, then wait until each notice is delivered or held, at most MINUTES (story 13) |
 
 The tab in `PMUX_TAB_ID` is always excluded from the quiet wait. A tab created before story 01 has no `PMUX_TAB_ID`; the script then refuses with `REFUSED OWN-TAB-UNKNOWN` until you name your own tab with `--ignore-tab <ws>/<tab>` (or pass `--outside-tab` from a plain shell).
+
+### Announce
+
+`--announce N` runs `purplemux deploy announce --in N --reason "deploy <sha>" --except-tab <own tab>` with the admin token, after the deploy lease and before the quiet wait. Each orchestrator and each tab holding a tab-bound lease (merge, dev-deploy, epic, …) receives one fixed inbox line with the restart time and `purplemux deploy status <id>`; the reason is only shown by that command. The script polls `deploy status` every poll interval until every notice is delivered, held, dropped or pruned, or N minutes pass, then prints `ANNOUNCE_ID=` and later `ANNOUNCED=<delivered>/<recipients>`. The tab running the script is left out: it is mid-turn until the restart. A running server that predates the command (`routes-absent`) does not stop the deploy (`ANNOUNCED=unavailable …`); any other failure refuses with exit 1 before anything restarts. The deploy lease's TTL covers the announce wait too.
 
 ## Exit codes
 
 | Exit | Meaning | Live service |
 |---|---|---|
 | 0 | deployed, rolled back on demand, or dry run | new release (or unchanged on dry run) |
-| 1 | lease probe or acquire failed, backup failed, tmux sessions unreadable | unchanged |
+| 1 | lease probe or acquire failed, announce failed, backup failed, tmux sessions unreadable | unchanged |
 | 2 | refused: usage, ref, disk, build, own tab unknown, drop-in drift or rewrite, half-finished first install, rollback target missing or unbuilt | unchanged |
 | 3 | quiet timeout, deploy lease held, another deploy running | unchanged |
 | 4 | restart, `daemon-reload` or health gate failed; the previous release was restored (`VERDICT=rolled-back`); the automatic rollback failed too (`VERDICT=rollback-failed`, read `ROLLBACK_HEALTH=` and the journal); or an on-demand rollback failed its gate (`VERDICT=rollback-unhealthy`) | previous release, or check by hand on `rollback-failed` / `rollback-unhealthy` |
 
-The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `ACCEPTANCE=`, `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
+The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `ACCEPTANCE=`, `ANNOUNCED=<delivered>/<recipients>` (`-` without `--announce`; `unavailable (…)` against a server that predates it), `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
 
 ## Acceptance gate
 
