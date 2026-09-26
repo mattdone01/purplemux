@@ -36,6 +36,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   // Registered liveness watch, so idle-done and idle-holding-dead-work are
   // distinguishable from the status read alone.
   const { probes, backgroundJobs } = await getLivenessManager().statusForTab(tabId);
+  // How the watchdog classified the last stop (story 37): a READY nudge is explained by the status alone.
+  const turnEnd = live?.turnEnd ?? null;
   if (!alive) {
     return res.status(200).json({
       tabId,
@@ -47,6 +49,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       modelStatus,
       probes,
       backgroundJobs,
+      turnEnd,
       identity: tabIdentityOf(workspaceId, tabId),
     });
   }
@@ -65,6 +68,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     modelStatus,
     probes,
     backgroundJobs,
+    turnEnd,
     identity: tabIdentityOf(workspaceId, tabId),
   });
 };

@@ -1700,7 +1700,11 @@ export class StatusManager {
     if (turnEnd.kind === 'turn-marker') {
       entry.turnEnd = { kind: 'turn-marker', at, seq: stopSeq, marker: turnEnd.lines };
     } else {
-      entry.turnEnd = { kind: 'ready-for-review', at, seq: stopSeq };
+      // What the classifier saw, so `tab status` explains a READY nudge (story 37).
+      entry.turnEnd = {
+        kind: 'ready-for-review', at, seq: stopSeq, transcript: turnEnd.transcript,
+        openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0, liveRegisteredJobs,
+      };
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);
         log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');

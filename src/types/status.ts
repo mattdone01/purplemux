@@ -77,6 +77,8 @@ export interface ITurnEndRecord {
   marker?: string[];
   openBackgroundTasks?: number;
   liveRegisteredJobs?: number;
+  /** A `ready-for-review` stop: false when no transcript could be read (the fallback). */
+  transcript?: boolean;
 }
 
 export type TTabDisplayStatus = 'busy' | 'ready-for-review' | 'needs-input' | 'idle' | 'unknown';
