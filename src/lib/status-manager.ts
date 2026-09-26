@@ -32,6 +32,7 @@ import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import { getLivenessManager } from '@/lib/liveness-manager';
+import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
 import type { TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
@@ -587,6 +588,15 @@ export class StatusManager {
     }).catch((err) => {
       log.warn(`liveness tick failed: ${err instanceof Error ? err.message : err}`);
     });
+
+    await getLeaseSweeper().sweep().catch((err) => {
+      log.warn(`lease sweep failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  getTabAgentState(tabId: string): ITabAgentState | null {
+    const entry = this.tabs.get(tabId);
+    return entry ? { cliState: entry.cliState, isAgent: isAgentPanelType(entry.panelType) } : null;
   }
 
   // Milestone watchers are silent during both success-in-progress and total
@@ -1839,6 +1849,7 @@ export const getStatusManager = (): StatusManager => {
     dispatcher.register(createWebPushChannel());
     registerFcmChannel(dispatcher);
     onTabClosed(({ tabId }) => manager.removeTab(tabId));
+    setLeaseAgentStateSource((tabId) => manager.getTabAgentState(tabId));
   }
   return g.__ptStatusManager;
 };

@@ -21,6 +21,7 @@ import { acquireLock, releaseLock, registerLockCleanup } from './src/lib/lock';
 import { scanSessions, applyConfig } from './src/lib/tmux';
 import { initWorkspaceStore, getWorkspaces, writeAllWorkspacePrompts } from './src/lib/workspace-store';
 import { initTabTokens } from './src/lib/tab-token';
+import { initLeases } from './src/lib/lease-sweeper';
 import { startCredentialForkSync } from './src/lib/workspace-home';
 import { autoResumeOnStartup } from './src/lib/auto-resume';
 import { initAuthCredentials } from './src/lib/auth-credentials';
@@ -376,6 +377,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   startCredentialForkSync();
   await autoResumeOnStartup();
   await getStatusManager().init();
+  await initLeases();
   await getMissionControlRuntime().start();
 
   const envHost = process.env.HOST?.trim();
