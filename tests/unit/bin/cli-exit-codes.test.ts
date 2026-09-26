@@ -176,6 +176,23 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     expect(stderr).toContain('without a JSON body');
   });
 
+  it('exits 6 with routes-absent for a 404 without JSON: the server predates the route', async () => {
+    reply = (_req, res) => {
+      res.writeHead(404, { 'Content-Type': 'text/html' });
+      res.end('<html>404</html>');
+    };
+
+    const { code, stderr } = await cli(['tab', 'status', '-w', 'WS', 'tab-x']);
+
+    expect(code).toBe(6);
+    expect(stderr).toContain('routes-absent');
+  });
+
+  it('still exits 7 for a JSON not-found: the server answered, the thing is absent', async () => {
+    reply = json(404, { error: 'no lease named merge:x/y', code: 'lease-not-found' });
+    expect((await cli(['tab', 'status', '-w', 'WS', 'tab-x'])).code).toBe(7);
+  });
+
   it('accepts the longest wait the CLI can hold open', async () => {
     reply = json(200, { status: 'sent', submitted: true, cliState: 'idle' });
 

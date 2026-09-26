@@ -137,6 +137,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'target-changed': EXIT.GONE,
   'readiness-timeout': EXIT.NOT_READY,
   'server-unreachable': EXIT.UNREACHABLE,
+  'routes-absent': EXIT.UNREACHABLE,
   'lease-not-found': EXIT.NOT_FOUND,
   'note-not-found': EXIT.NOT_FOUND,
   'watch-not-found': EXIT.NOT_FOUND,
@@ -150,6 +151,7 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'tab-not-found': 'permanent — the tab is closed; do not retry',
   'session-not-running': "the tab's session is dead; do not retry — a person must restart the tab",
   'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
+  'routes-absent': 'the running server predates this command — retrying cannot help until it is deployed',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -269,6 +271,19 @@ const out = (body) => {
 
 const isJson = (resp) => (resp.headers.get('content-type') || '').includes('json');
 
+/**
+ * Every CLI route answers errors as JSON with a `code`. A 404 WITHOUT a JSON
+ * body is the framework's own not-found page: the running server has no such
+ * route (it predates this CLI). That exits 6 like any absent capability, and
+ * the `routes-absent` code tells a caller (deploy-live.sh, bash-guard) that
+ * the server answered, which `server-unreachable` does not.
+ */
+const failIfRouteAbsent = (resp, requestPath) => {
+  if (resp.status === 404 && !isJson(resp) && requestPath.startsWith('/api/cli/')) {
+    fail('routes-absent', `${requestPath.split('?')[0]} is not served by the purplemux on port ${PORT}`);
+  }
+};
+
 const api = async (method, path, data) => {
   const opts = {
     method,
@@ -276,6 +291,7 @@ const api = async (method, path, data) => {
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
   const resp = await request(method, path, opts);
+  failIfRouteAbsent(resp, path);
   const body = isJson(resp) ? await readBody(method, path, resp, 'json') : null;
   if (!resp.ok) failFromResponse(resp, body);
   // Every CLI route answers JSON; a success without it is not a purplemux
@@ -287,6 +303,7 @@ const api = async (method, path, data) => {
 
 const apiRaw = async (method, path) => {
   const resp = await request(method, path, { headers: headersFor(path) });
+  failIfRouteAbsent(resp, path);
   if (!resp.ok) failFromResponse(resp, isJson(resp) ? await readBody(method, path, resp, 'json') : null);
   return resp;
 };
@@ -487,6 +504,142 @@ const cmdMission = async (args) => {
     return out(body);
   }
   die('usage: mission snapshot|events|answers|ack -w WS [options]');
+};
+
+// ---- leases (ADR-0011) ----
+
+const TTL_UNITS = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/** `45m`, `3h`, `2d`, `90s`, `90` (seconds) or `none` (no expiry). */
+const parseTtl = (raw) => {
+  if (raw === 'none') return null;
+  const m = /^(\d+)([smhd]?)$/.exec(raw || '');
+  if (!m) die(`--ttl must be a duration such as 45m, 3h, 2d, 90s, or "none" — got "${raw}"`);
+  return Number(m[1]) * TTL_UNITS[m[2] || 's'];
+};
+
+const age = (seconds) => {
+  if (seconds === null || seconds === undefined) return '-';
+  if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d${Math.floor((seconds % 86400) / 3600)}h`;
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h${Math.floor((seconds % 3600) / 60)}m`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
+  return `${seconds}s`;
+};
+
+const holderText = (h) => {
+  if (h.admin) return 'admin';
+  const ws = h.workspaceName ? `${h.workspaceId} (${h.workspaceName})` : h.workspaceId;
+  const tab = h.tabName ? `${h.tabId} (${h.tabName})` : h.tabId;
+  return `${ws} / ${tab}${h.verified ? '' : ' unverified'}`;
+};
+
+const printLeases = (leases) => {
+  if (!leases.length) {
+    process.stdout.write('no leases\n');
+    return;
+  }
+  for (const l of leases) {
+    const parts = [
+      l.name,
+      `holder=${holderText(l.holder)}`,
+      `state=${l.holderState}`,
+      `age=${age(l.ageSeconds)}`,
+      `expires-in=${age(l.expiresInSeconds)}`,
+    ];
+    if (l.epic) parts.push(`epic=${l.epic}`);
+    if (l.note) parts.push(`note=${JSON.stringify(l.note)}`);
+    process.stdout.write(parts.join('  ') + '\n');
+  }
+};
+
+const LEASE_VALUE_FLAGS = ['--ttl', '--epic', '--note', '--prefix', '--reason', '--kind'];
+const LEASE_BOOL_FLAGS = ['--mine', '--json'];
+
+const leaseName = (args, what = 'NAME') => {
+  const positional = stripBooleanFlags(stripFlags(args, LEASE_VALUE_FLAGS), LEASE_BOOL_FLAGS);
+  if (positional.length !== 1) die(`exactly one ${what} is required`);
+  return positional[0];
+};
+
+const LEASE_USAGE = 'usage: lease acquire|renew|release|list|check|break|release-epic ... (purplemux help)';
+
+/**
+ * `check` prints `{ held, mine, lease }` on stdout and exits 0 (caller holds),
+ * 3 (another holds) or 7 (nobody holds). Its body is the contract bash-guard
+ * parses; the exit code alone answers the common question.
+ */
+const cmdLease = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const ttlRaw = flagValue(rest, '--ttl');
+  switch (sub) {
+    case 'acquire': {
+      const name = leaseName(rest);
+      const data = { name };
+      if (ttlRaw !== null) data.ttlSeconds = parseTtl(ttlRaw);
+      const epic = flagValue(rest, '--epic');
+      const note = flagValue(rest, '--note');
+      if (epic !== null) data.epic = epic;
+      if (note !== null) data.note = note;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/acquire', data);
+      return out(body);
+    }
+    case 'renew': {
+      const name = leaseName(rest);
+      const data = { name };
+      if (ttlRaw !== null) data.ttlSeconds = parseTtl(ttlRaw);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/renew', data);
+      return out(body);
+    }
+    case 'release': {
+      const name = leaseName(rest);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/release', { name });
+      return out(body);
+    }
+    case 'break': {
+      const name = leaseName(rest);
+      const reason = flagValue(rest, '--reason');
+      if (!reason || !reason.trim()) die('--reason is required');
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/break', { name, reason });
+      return out(body);
+    }
+    case 'release-epic': {
+      const epic = leaseName(rest, 'SLUG');
+      const data = { epic };
+      const kind = flagValue(rest, '--kind');
+      if (kind !== null) data.kind = kind;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/leases/release-epic', data);
+      return out(body);
+    }
+    case 'list': {
+      const positional = stripBooleanFlags(stripFlags(rest, LEASE_VALUE_FLAGS), LEASE_BOOL_FLAGS);
+      if (positional.length) die(`unexpected argument: ${positional[0]}`);
+      const qs = new URLSearchParams();
+      const prefix = flagValue(rest, '--prefix');
+      if (prefix !== null) qs.set('prefix', prefix);
+      if (rest.includes('--mine')) qs.set('mine', '1');
+      requireEnv();
+      const query = qs.toString();
+      const { body } = await api('GET', `/api/cli/leases${query ? `?${query}` : ''}`);
+      if (rest.includes('--json')) return out(body);
+      return printLeases(body.leases || []);
+    }
+    case 'check': {
+      const name = leaseName(rest);
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/leases/check?name=${encodeURIComponent(name)}`);
+      out(body);
+      process.exitCode = body.mine ? 0 : body.held ? EXIT.CONFLICT : EXIT.NOT_FOUND;
+      return;
+    }
+    default:
+      die(LEASE_USAGE);
+  }
 };
 
 const cmdTabCreate = async (args) => {
@@ -900,6 +1053,19 @@ Commands:
   mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items; --all includes history
   mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
                                            Acknowledge one persisted answer after reading and applying it
+  lease acquire NAME [--ttl 45m|none] [--epic SLUG] [--note TEXT]
+                                           Take a held-resource lease (<kind>:<resource>, e.g. merge:owner/repo,
+                                           epic:SLUG, num:owner/repo:adr:0373). Exit 0 acquired or renewed,
+                                           3 held by another (stderr names the holder), 2 policy (TTL/epic/name)
+  lease renew NAME [--ttl 45m]             Move the expiry forward (holder only)
+  lease release NAME                       Release a lease you hold. Exit 0, 3 held by another, 7 not held
+  lease list [--prefix P] [--mine] [--json]
+                                           Every lease on the host: holder, state, age, expiry, epic, note
+  lease check NAME                         Exact name only. Prints {held, mine, lease}; exit 0 you hold it,
+                                           3 another holds it, 7 nobody holds it
+  lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
+  lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
+                                           epic:SLUG; a tab of a claiming workspace releases its own claims)
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -954,6 +1120,8 @@ const main = async () => {
       return cmdOrchestration(args.slice(1));
     case 'standup':
       return cmdStandup(args.slice(1));
+    case 'lease':
+      return cmdLease(args.slice(1));
     case 'mission':
       return cmdMission(args.slice(1));
     case 'tab':

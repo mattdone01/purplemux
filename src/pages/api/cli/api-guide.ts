@@ -59,13 +59,54 @@ to an exit code through one table:
                                                  target-changed
      5  not ready yet                            readiness-timeout                          yes, bounded
      6  server unreachable                       connection refused, no port configured,    yes, bounded
-                                                 a read interrupted
+                                                 a read interrupted; routes-absent (the     (routes-absent:
+                                                 server answered 404 without JSON: it       not until the
+                                                 predates this command)                     server is deployed)
      7  not found                                lease-not-found, note-not-found,           —
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
+
+## Leases
+
+One host-wide register of held resources (ADR-0011). A name is \`<kind>:<resource>\`, lower
+case: \`merge:<owner>/<repo>\`, \`dev-deploy:<owner>/<repo>\`, \`dev-write:<env>\`,
+\`deploy:<service>\` (admin token or the workspace's enabled orchestrator tab only),
+\`epic:<slug>\` (no expiry allowed), \`num:<owner>/<repo>:<adr|migration>:<nnnn>\` (requires an
+epic; survives the tab), or any other kind (30 m default, 24 h max). A lease dies with its tab,
+by TTL, or 10 min after its agent goes inactive; \`num\` leases die only by TTL or release-epic.
+Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_TOKEN plus
+x-pmux-session) or the admin token — otherwise \`caller-unresolved\` (403).
+
+A lease view: { name, kind, resource, holder: { workspaceId, workspaceName, tabId, tabName,
+verified, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
+ageSeconds, expiresInSeconds, holderState: live|agent-gone|closed|admin }.
+
+GET /api/cli/leases?prefix=&mine=1
+  Response: { "leases": [lease view, ...] }
+
+GET /api/cli/leases/check?name=NAME
+  Exact name only (a prefix would also match merge:x/y-z). Always 200 when the store answers:
+  { "held": bool, "mine": bool, "lease": lease view | null }. The CLI prints it and exits
+  0 (you hold it), 3 (another holds it) or 7 (nobody holds it).
+
+POST /api/cli/leases/acquire   { "name", "ttlSeconds"?: number | null, "epic"?, "note"? }
+  Response: { "lease": view, "outcome": "acquired" | "renewed" } (re-acquire by the holder renews)
+  Errors: lease-held 409 (+ lease, holder), lease-policy 400, caller-unresolved 403
+
+POST /api/cli/leases/renew     { "name", "ttlSeconds"? }  → { "lease": view }
+POST /api/cli/leases/release   { "name" }                 → { "released": true }
+  Errors: lease-not-found 404, lease-held-by-other 409 (+ lease, holder)
+
+POST /api/cli/leases/break     { "name", "reason" }       → { "broken": view }   admin token only
+POST /api/cli/leases/release-epic { "epic", "kind"? }     → { "released": [names] }
+  The epic:<slug> holder or admin releases every claim; a tab of a claiming workspace releases
+  its own workspace's claims; nothing to release answers []. Errors: forbidden 403.
+
+An unreadable lease store answers 500 \`lease-store-unreadable\`: nothing is known about who holds
+what, so treat it as a refusal.
 
 ## Workspaces
 
