@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
 import type { ICaller } from '@/lib/caller';
+import { brandCodedError } from '@/lib/coded-error';
 import { createLogger } from '@/lib/logger';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import type { IInboxItem } from '@/types/inbox';
@@ -26,6 +27,9 @@ const log = createLogger('deploy-announce');
 export class DeployError extends Error {
   constructor(readonly code: TDeployErrorCode, message: string) {
     super(message);
+    // The brand the routes check (`isCodedError`): the announcer on `globalThis` may be another
+    // bundle's (story 35 review r1).
+    brandCodedError(this, 'DeployError');
   }
 }
 
