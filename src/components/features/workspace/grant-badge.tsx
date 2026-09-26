@@ -1,6 +1,6 @@
 import { useFormatter, useTranslations } from 'next-intl';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import useGrants, { serverTimeOf } from '@/hooks/use-grants';
+import useGrants, { GRANTS_POLL_MS, serverTimeOf } from '@/hooks/use-grants';
 import useNowTick from '@/hooks/use-now-tick';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { describeGrantFailure, grantBadgeOf, type IGrantBadge } from '@/lib/grant-view';
@@ -40,13 +40,16 @@ export const GrantBadgeView = ({ badge, workspaceNames, staleReason = null }: {
   );
 };
 
+/** The badge's clock: one poll, so an expired grant loses its badge within one poll (architect CONFIRM, story 28). */
+export const GRANT_BADGE_TICK_MS = GRANTS_POLL_MS;
+
 const GrantBadge = ({ workspaceId, tabId }: { workspaceId: string | null; tabId: string }) => {
   // A reader: the sidebar's poller owns the refresh; badges only read the shared cache.
   const t = useTranslations('grants');
   const { view, failure, stale } = useGrants('reader');
   const workspaces = useWorkspaceStore((s) => s.workspaces);
-  // A minute clock: the badge goes at expiry without waiting for the next grants read.
-  const now = useNowTick(60_000);
+  // A poll-length clock: the badge goes at expiry without waiting for the next grants read.
+  const now = useNowTick(GRANT_BADGE_TICK_MS);
   if (!workspaceId || !view) return null;
   const badge = grantBadgeOf(view.grants, workspaceId, tabId, serverTimeOf(view, now));
   if (!badge) return null;

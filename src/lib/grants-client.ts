@@ -1,7 +1,8 @@
 import type { IGrant, IGrantee } from '@/types/grant';
 
 // The web client of the grant routes (story 28; ADR-0014). Same-origin fetch:
-// the session cookie goes with it, and the server checks the Origin. A failure
+// the session cookie goes with it; the server checks the Origin on create and
+// revoke (the read needs the session only). A failure
 // keeps the SERVED reason and code, so the dialog never shows a generic error.
 
 export interface IGrantsView {

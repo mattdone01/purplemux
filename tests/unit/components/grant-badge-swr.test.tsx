@@ -3,7 +3,8 @@ import { NextIntlClientProvider } from 'next-intl';
 import { SWRConfig } from 'swr';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import grants from '../../../messages/en/grants.json';
-import GrantBadge from '@/components/features/workspace/grant-badge';
+import GrantBadge, { GRANT_BADGE_TICK_MS } from '@/components/features/workspace/grant-badge';
+import { GRANTS_POLL_MS } from '@/hooks/use-grants';
 import { GrantsReadError, type IGrantsView } from '@/lib/grants-client';
 import type { IGrant } from '@/types/grant';
 
@@ -29,6 +30,10 @@ const render = (fallback: IGrantsView, error?: unknown) => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('GrantBadge through the grants cache', () => {
+  it('ticks at most once per poll, so an expired grant loses its badge within one poll', () => {
+    expect(GRANT_BADGE_TICK_MS).toBeLessThanOrEqual(GRANTS_POLL_MS);
+  });
+
   it('shows a grant expired on the client clock but active on the server clock', () => {
     vi.spyOn(Date, 'now').mockReturnValue(CLIENT_NOW);
     expect(render(view(-100_000))).toContain('data-grant-badge="1"');
