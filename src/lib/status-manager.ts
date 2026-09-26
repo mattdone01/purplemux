@@ -244,8 +244,27 @@ export class StatusManager {
 
     const unknownStateHandle = this.runtimeHandle(entry);
     if (provider && unknownStateHandle) {
-      const { idle, stale, lastAssistantSnippet, openBackgroundTasks } = await provider.readRuntimeSnapshot(unknownStateHandle);
-      if (idle && !stale && lastAssistantSnippet && (openBackgroundTasks ?? 0) > 0) {
+      const snapshot = await provider.readRuntimeSnapshot(unknownStateHandle, {
+        tasksSince: await this.agentProcessStartedAt(tabId, entry),
+      });
+      const { idle, stale, lastAssistantSnippet } = snapshot;
+      if (this.tabs.get(tabId) !== entry || entry.cliState !== 'unknown') return;
+      const turnEnd = idle && !stale && lastAssistantSnippet
+        ? classifyTurnEnd({
+            tail: snapshot.lastAssistantTail,
+            transcript: true,
+            openBackgroundTasks: snapshot.openBackgroundTasks ?? 0,
+            liveRegisteredJobs: await this.liveRegisteredJobs(tabId),
+          })
+        : null;
+      if (turnEnd?.kind === 'waiting') {
+        // A restart lost the stop this tab ended on; rebuild it, silently, so
+        // `tab send` (ruling A′) and the stall check still see a WAITING tab.
+        const now = Date.now();
+        const seq = (entry.eventSeq ?? 0) + 1;
+        entry.eventSeq = seq;
+        entry.lastEvent = { name: 'stop', at: now, seq };
+        entry.turnEnd = { kind: 'waiting', at: now, seq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
         this.applyCliState(tabId, entry, 'busy', { silent: true });
         this.persistToLayout(entry);
         this.broadcastUpdate(tabId, entry);
@@ -1137,7 +1156,12 @@ export class StatusManager {
     const liveJobs = await this.liveRegisteredJobs(tabId);
     const open = snapshot?.openBackgroundTaskKinds ?? { shell: 0, agent: 0, monitor: 0 };
     const kinds = { ...open, shell: open.shell + liveJobs };
-    const activityAt = Math.max(snapshot?.lastEntryTs ?? -Infinity, snapshot?.backgroundActivityAt ?? -Infinity);
+    // The stop the tab waits from is itself a sign of life.
+    const activityAt = Math.max(
+      snapshot?.lastEntryTs ?? -Infinity,
+      snapshot?.backgroundActivityAt ?? -Infinity,
+      entry.lastEvent?.at ?? -Infinity,
+    );
     const waitVerdict = isBackgroundWaitStalled(kinds, Number.isFinite(activityAt) ? activityAt : null, now);
     if (!snapshot) return waitVerdict ?? true;
     if (waitVerdict !== null) return waitVerdict;
