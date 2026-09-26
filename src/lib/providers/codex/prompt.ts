@@ -46,9 +46,12 @@ purplemux lease release NAME                          # release what you hold; l
 purplemux inbox list -w ${ws.id}                        # server notices queued or held for this workspace's tabs
 purplemux note list --open --to-me                     # notes for you: run at turn start, then note show ID / note ack ID
 purplemux note send --to-epic SLUG --subject T -f FILE # a note to an epic's owner (its epic:SLUG holder); the body is pulled, never typed
+purplemux watch pr OWNER/REPO#N --until merged         # one inbox line when it holds (also closed, head-moved, checks-settled)
+purplemux watch lease NAME --until free                # wait for a lease without a polling loop; watch list / watch clear ID
 \`\`\`
 
 At turn start, run \`purplemux note list --open --to-me\` and ack each note you applied (\`purplemux note ack ID --comment ...\`).
+To wait for GitHub state or a lease, use \`purplemux watch\`, not a shell poller: it survives your turn, ends with your tab, and tells you once.
 
 The watchdog reads the LAST line of your turn: \`DONE:\`, \`BLOCKED:\`, \`NEEDS-DECISION:\` or
 \`READY-TO-MERGE:\` reaches your orchestrator verbatim. A turn that ends with no such line while

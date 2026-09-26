@@ -648,6 +648,80 @@ const cmdConfig = async (args) => {
   }
 };
 
+// Harness watches (ADR-0015): tab-owned, one-shot, server-evaluated. The
+// notice reaches the owner tab through the inbox; the label is list-only.
+const WATCH_USAGE = 'usage: watch pr OWNER/REPO#N --until merged|closed|head-moved|checks-settled | watch ref OWNER/REPO@REF --until moved | watch lease NAME --until free  [--ttl 24h] [--interval 120] [--label TEXT]; watch list [-w WS] [--json]; watch clear ID';
+const WATCH_VALUE_FLAGS = ['--until', '--ttl', '--interval', '--label', '-w', '--workspace'];
+
+const printWatches = (watches) => {
+  if (!watches.length) {
+    process.stdout.write('no watches\n');
+    return;
+  }
+  for (const w of watches) {
+    const parts = [
+      w.id,
+      `${w.kind} ${w.target} --until ${w.until}`,
+      `owner=${w.workspaceId}/${w.tabId} (${w.owner}${w.verified === false ? ', unverified' : ''})`,
+      `age=${age(w.ageSeconds)}`,
+      `expires-in=${age(w.expiresInSeconds)}`,
+      `last-check=${w.lastCheckedAt ? new Date(w.lastCheckedAt).toISOString() : 'never'}`,
+    ];
+    if (w.failures) parts.push(`failures=${w.failures}`);
+    if (w.lastError) parts.push(`error=${w.lastError.code}: ${JSON.stringify(w.lastError.message)}`);
+    if (w.label) parts.push(`label=${JSON.stringify(w.label)}`);
+    process.stdout.write(parts.join('  ') + '\n');
+  }
+};
+
+const cmdWatch = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const positional = stripBooleanFlags(stripFlags(rest, WATCH_VALUE_FLAGS), ['--json']);
+  switch (sub) {
+    case 'pr':
+    case 'ref':
+    case 'lease': {
+      if (positional.length !== 1) die(WATCH_USAGE);
+      const until = flagValue(rest, '--until');
+      if (!until) die('--until is required');
+      const data = { kind: sub, target: positional[0], until };
+      const ttl = flagValue(rest, '--ttl');
+      if (ttl !== null) {
+        const seconds = parseTtl(ttl);
+        if (seconds === null) die('--ttl needs a duration (a watch always expires, at most 7d)');
+        data.ttlSeconds = seconds;
+      }
+      const interval = flagValue(rest, '--interval');
+      if (interval !== null) {
+        if (!/^\d+$/.test(interval)) die('--interval needs whole seconds (60-3600)');
+        data.intervalS = Number(interval);
+      }
+      const label = flagValue(rest, '--label');
+      if (label !== null) data.label = label;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/watches', data);
+      return out(body);
+    }
+    case 'list': {
+      if (positional.length) die(WATCH_USAGE);
+      const ws = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/watches${ws ? `?workspaceId=${encodeURIComponent(ws)}` : ''}`);
+      if (rest.includes('--json')) return out(body);
+      return printWatches(body.watches || []);
+    }
+    case 'clear': {
+      if (positional.length !== 1) die(WATCH_USAGE);
+      requireEnv();
+      const { body } = await api('DELETE', `/api/cli/watches/${encodeURIComponent(positional[0])}`);
+      return out(body);
+    }
+    default:
+      die(WATCH_USAGE);
+  }
+};
+
 // The inbox (ADR-0012): server notices queued for this workspace's tabs.
 const cmdInbox = async (args) => {
   requireEnv();
@@ -1314,6 +1388,16 @@ Commands:
                                            A stale --expect-version exits 3 config-version-conflict
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
+  watch pr OWNER/REPO#N --until merged|closed|head-moved|checks-settled [--ttl 24h] [--interval 120] [--label TEXT]
+  watch ref OWNER/REPO@REF --until moved   (same options)
+  watch lease NAME --until free            A one-shot watch owned by this tab: the server checks it (GitHub every
+                                           120 s by default, a lease on each release) and sends ONE inbox line when
+                                           it holds, then clears it. Expires (default 24h, max 7d) with a notice;
+                                           3 failures in a row send one failing notice. Host cap 60 GitHub watches
+                                           (exit 3 watch-cap); 2 bad target/until; 7 unknown id on clear
+  watch list [-w WS] [--json]              Watches of your workspace: owner tab (live/closed), age, expiry, last check,
+                                           the last error text
+  watch clear ID                           Remove a watch (its owner tab or admin)
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -1380,6 +1464,8 @@ const main = async () => {
       return cmdNote(args.slice(1));
     case 'config':
       return cmdConfig(args.slice(1));
+    case 'watch':
+      return cmdWatch(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

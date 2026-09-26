@@ -322,6 +322,34 @@ POST /api/cli/notes/<id>/ack
   The recipient workspace only. Body: { "comment"? (≤ 500) }. Response: { "note" } in state "acked".
   404 note-not-found (exit 7); 403 forbidden (exit 3), also for a note that is not delivered.
 
+## Harness watches (ADR-0015)
+
+A watch is a one-shot subscription owned by the calling tab. The server evaluates it and sends
+the owner ONE inbox line when the condition holds, then deletes it; it dies with its tab.
+  pr OWNER/REPO#N    --until merged | closed | head-moved | checks-settled
+  ref OWNER/REPO@REF --until moved
+  lease NAME         --until free   (no unexpired record: an acquire would succeed)
+GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a lease watch is
+evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
+max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
+server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
+text; after that notice the watch reads less often (2x, 4x, up to 8x its interval). A merged
+watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
+requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
+tab holds at most 30 watches.
+Lines: "[purplemux watch w-…] OWNER/REPO#N is MERGED (sha) — watch cleared", "… head moved a -> b",
+"… checks settled at sha: G green, R red", "… moved a -> b", "NAME is free", "… is failing:
+<token> …", "… expired without <until>". The label is shown by list, never typed.
+
+POST /api/cli/watches   { "kind", "target", "until", "ttlSeconds"?, "intervalS"?, "label"? (≤ 80) }
+  The calling tab owns it (a caller with no tab: 403 caller-unresolved, exit 3). 400 watch-invalid
+  (exit 2), also for a PR or ref gh cannot find; 503 gh-unavailable (exit 1). Response: { "watch" }.
+GET /api/cli/watches[?workspaceId=WS]
+  The caller's own workspace (admin: any, or all). Response: { "watches": [{ ...watch, "owner":
+  "live"|"closed"|"unknown", "ageSeconds", "expiresInSeconds", "failures", "lastError" }] }.
+DELETE /api/cli/watches/<id>
+  The owner tab or admin (else 403). 404 watch-not-found (exit 7). Response: { "removed" }.
+
 ## Fleet config (ADR-0019)
 
 Versioned string values that tools read at call time, so changing one needs no message to
