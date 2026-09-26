@@ -81,7 +81,7 @@ export interface IWatchFields {
   code?: (typeof WATCH_FAILURES)[number];
   until?: (typeof WATCH_UNTILS)[number];
 }
-export interface IDeployFields { deployId: string; restartAt: number; quietSeconds: number }
+export interface IDeployFields { deployId: string; restartAt: number; inMinutes: number }
 export interface IMissionFields { answerId: string; workspaceId: string; readyAt: number }
 export interface IResumeFields { resumeId: string }
 
@@ -137,7 +137,10 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
   },
   deploy: (f) => {
     const id = field('deployId', f.deployId, 'deployId');
-    return { recordId: id, line: `[purplemux deploy ${id}] purplemux restarts at ${time('restartAt', f.restartAt)} after a quiet wait of up to ${count('quietSeconds', f.quietSeconds)} s — purplemux deploy status ${id}` };
+    // Story 13: when, how soon, and what to do. The reason is pulled with `deploy status`.
+    const at = time('restartAt', f.restartAt);
+    const minutes = count('inMinutes', f.inMinutes);
+    return { recordId: id, line: `[purplemux deploy ${id}] purplemux restarts at ~${at} (in ${minutes} min) — details: purplemux deploy status ${id}; reach a checkpoint; tabs survive, in-flight hook events do not` };
   },
   mission: (f) => {
     const id = field('answerId', f.answerId, 'missionId');

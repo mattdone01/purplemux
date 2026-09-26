@@ -57,6 +57,7 @@ while (($#)); do
   esac
 done
 echo "$url" >> "$FAKE_STATE/curl.log"
+echo "curl $url" >> "$FAKE_STATE/order.log"
 key=$(printf '%s' "\${url#http://127.0.0.1:*/}" | tr -c 'A-Za-z0-9' '_')
 n=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0)
 file="$FAKE_STATE/http.$n/$key"
@@ -84,6 +85,22 @@ case "$1 $2" in
     [[ "$code" == 3 ]] && echo '{"error":"lease held","holder":{"tabName":"other-orch"}}' >&2
     exit "$code" ;;
   "lease release") exit 0 ;;
+  "deploy announce")
+    echo "announce" >> "$FAKE_STATE/order.log"
+    code=$(cat "$FAKE_STATE/announce-exit" 2>/dev/null || echo 0)
+    if [[ "$code" != 0 ]]; then cat "$FAKE_STATE/announce-stderr" >&2; exit "$code"; fi
+    echo '{"id":"d-fake1234","recipients":[{},{},{}]}'
+    # The server committed; the deploy is interrupted before the script reads the id.
+    [[ -e "$FAKE_STATE/term-after-announce" ]] && kill -TERM "$(ps -o ppid= $PPID | tr -d ' ')" 2>/dev/null
+    exit 0 ;;
+  "deploy withdraw")
+    echo "withdraw" >> "$FAKE_STATE/order.log"
+    printf '{"id":"d-fake1234","withdrawn":%s}' "$(cat "$FAKE_STATE/withdrawn" 2>/dev/null || echo 0)"; exit 0 ;;
+  "deploy status")
+    n=$(( $(cat "$FAKE_STATE/status-polls" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$FAKE_STATE/status-polls"
+    f="$FAKE_STATE/announce-status.$n"; [[ -f "$f" ]] || f="$FAKE_STATE/announce-status"
+    cat "$f"; exit 0 ;;
   "tab list")
     n=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0)
     [[ -e "$FAKE_STATE/tablist-fail.$n" ]] && { echo "error: Forbidden" >&2; exit 3; }
@@ -419,6 +436,107 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     } finally {
       fs.rmSync(other.root, { recursive: true, force: true });
     }
+  });
+
+  const announceStatus = (states: string[], poll?: number) =>
+    h.flag(poll === undefined ? 'announce-status' : `announce-status.${poll}`, JSON.stringify({ id: 'd-fake1234', recipients: states.map((state) => ({ state })) }));
+
+  it('--announce tells the recipients before the quiet wait, waits until each notice is delivered or held, then deploys', () => {
+    announceStatus(['queued', 'delivered', 'queued'], 1);
+    announceStatus(['delivered', 'held', 'delivered']);
+    const { status, out } = h.run([h.sha(), '--announce', '5']);
+    expect(status, out).toBe(0);
+    expect(field(out, 'VERDICT')).toBe('deployed');
+    expect(field(out, 'ANNOUNCED')).toBe('2/3');
+    expect(field(out, 'ANNOUNCE_ID')).toBe('d-fake1234');
+    const order = h.log('order').split('\n').filter(Boolean);
+    const announced = order.indexOf('announce');
+    expect(announced).toBeGreaterThan(order.findIndex((l) => l.includes('api/cli/leases')));
+    expect(order.findIndex((l) => l.includes('api/cli/tabs'))).toBeGreaterThan(announced);
+    // Taken back before the restart, so the new server never types an out-of-date line (review round 2).
+    const withdrawn = order.indexOf('withdraw');
+    expect(withdrawn).toBeGreaterThan(announced);
+    expect(order.findIndex((l) => l.includes('api/health'))).toBeGreaterThan(withdrawn);
+    const log = h.log('purplemux');
+    const short = h.sha().slice(0, 12);
+    expect(log).toContain(`deploy announce --in 5 --reason deploy ${short} --except-tab tab-A --json | PMUX_TOKEN=admin-token PMUX_TAB_TOKEN=unset`);
+    expect(log).toContain('deploy status d-fake1234 --json');
+    // Two polls until every notice settled, and one more when the announcement closes before the restart.
+    expect(fs.readFileSync(path.join(h.state, 'status-polls'), 'utf-8').trim()).toBe('3');
+  });
+
+  it('--announce stops waiting at its deadline, deploys, and withdraws the notices still waiting', () => {
+    announceStatus(['delivered', 'queued', 'queued']);
+    h.flag('withdrawn', '2');
+    const { status, out } = h.run([h.sha(), '--announce', '1'], { DEPLOY_ANNOUNCE_WAIT_S: '1' });
+    expect(status, out).toBe(0);
+    expect(field(out, 'ANNOUNCED')).toBe('1/3; 2 still waiting, withdrawn');
+    expect(field(out, 'VERDICT')).toBe('deployed');
+  });
+
+  it('an unreadable status body settles nothing: the wait runs to its deadline against the announced count', () => {
+    h.flag('announce-status', 'not json');
+    const { status, out } = h.run([h.sha(), '--announce', '1'], { DEPLOY_ANNOUNCE_WAIT_S: '1' });
+    expect(status, out).toBe(0);
+    // The old code took the total from the unreadable body (0) and reported 0/0 after one poll.
+    expect(field(out, 'ANNOUNCED')).toBe('0/3');
+  });
+
+  it('--ignore-tab tabs are left out of the announce too', () => {
+    announceStatus(['delivered', 'delivered', 'delivered']);
+    const { status, out } = h.run([h.sha(), '--announce', '5', '--ignore-tab', 'ws-a/tab-X', '--ignore-tab', 'ws-b/tab-Y']);
+    expect(status, out).toBe(0);
+    expect(h.log('purplemux')).toContain('--except-tab tab-A --except-tab tab-X --except-tab tab-Y --json');
+  });
+
+  it('a refused deploy withdraws the notices it sent', () => {
+    announceStatus(['delivered', 'delivered', 'delivered']);
+    h.setTabs([
+      { tabId: 'tab-A', workspaceId: 'ws-a', name: 'orchestrator', panelType: 'claude-code', cliState: 'busy', lastEvent: { name: 'prompt-submit' }, busySince: 1 },
+      { tabId: 'tab-B', workspaceId: 'ws-a', name: 'worker', panelType: 'claude-code', cliState: 'busy', lastEvent: { name: 'prompt-submit' }, busySince: 1 },
+    ]);
+    const { status, out } = h.run([h.sha(), '--announce', '5', '--quiet-timeout', '0']);
+    expect(status, out).toBe(3);
+    expect(h.log('order')).toContain('withdraw');
+  });
+
+  it('--announce against a server that predates it (routes-absent) deploys and says so; any other failure refuses before the restart', () => {
+    h.flag('announce-exit', '6');
+    h.flag('announce-stderr', 'error: routes-absent (no such route on this server) — /api/cli/deploy/announce is not served\n');
+    let r = h.run([h.sha(), '--announce', '5']);
+    expect(r.status, r.out).toBe(0);
+    expect(field(r.out, 'ANNOUNCED')).toBe('unavailable (the running server predates deploy announce)');
+
+    h = makeHarness();
+    h.flag('announce-exit', '3');
+    h.flag('announce-stderr', 'error: forbidden (conflict — retry only after the state changes) — deploy announce needs the admin token\n');
+    r = h.run([h.sha(), '--announce', '5']);
+    expect(r.status, r.out).toBe(1);
+    expect(field(r.out, 'VERDICT')).toBe('refused (ANNOUNCE-FAILED)');
+    expect(field(r.out, 'LEASE')).toBe('acquired, released');
+    expect(restarts(h)).toBe(0);
+    expect(h.log('order')).not.toContain('api/cli/tabs');
+  });
+
+  it('an interrupt while the announce call is in flight still withdraws what the server queued and prints its summary', () => {
+    announceStatus(['queued', 'queued', 'queued']);
+    h.flag('term-after-announce');
+    h.flag('withdrawn', '3');
+    const { status, out } = h.run([h.sha(), '--announce', '5']);
+    expect(status, out).not.toBe(0);
+    expect(field(out, 'VERDICT')).toBe('interrupted');
+    expect(h.log('order')).toContain('withdraw');
+    expect(field(out, 'ANNOUNCED')).toContain('3 still waiting, withdrawn');
+    expect(restarts(h)).toBe(0);
+  });
+
+  it('--announce takes 1 to 60 minutes; --dry-run and a deploy without it announce nothing', () => {
+    for (const bad of ['0', '61', 'x']) expect(h.run([h.sha(), '--announce', bad]).status).toBe(2);
+    let r = h.run([h.sha(), '--announce', '5', '--dry-run']);
+    expect(field(r.out, 'ANNOUNCED')).toBe('skipped (dry run)');
+    r = h.run([h.sha()]);
+    expect(field(r.out, 'ANNOUNCED')).toBe('-');
+    expect(h.log('purplemux')).not.toContain('deploy announce');
   });
 
   it('a deploy lease held elsewhere exits 3 without restarting', () => {

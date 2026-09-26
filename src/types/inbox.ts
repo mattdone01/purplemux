@@ -27,6 +27,11 @@ export interface IInboxItem {
   droppedReason: string | null;
   /** A still-queued item is held at this time (24 h after creation). */
   expiresAt: number;
+  /**
+   * Optional: a queued or held item is dropped (`stale`) at this time instead of typed, because its
+   * line would be untrue after it (a deploy notice after its restart window). Absent: never stale.
+   */
+  staleAt?: number | null;
   /** Time of the last state change; terminal items are pruned 7 days after it. */
   transitionAt: number;
 }

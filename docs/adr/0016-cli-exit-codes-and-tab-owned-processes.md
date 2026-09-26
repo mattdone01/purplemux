@@ -18,8 +18,8 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 |---|---|---|---|
 | 0 | success; for `lease check`, the caller holds the lease | — | — |
 | 1 | unexpected error | any unmapped code; 5xx; a 2xx without JSON; `gh-unavailable`; `outcome-unknown`; `close-not-confirmed`; a request that could not be sent (malformed port or header) | investigate |
-| 2 | usage error | client-side argument errors, including an unknown command at the entry point; `lease-policy`, `watch-invalid`, `reports-to-invalid`, `note-too-large`, `config-invalid`, `note-target-missing` | fix the command |
-| 3 | conflict / refused by state | `lease-held`, `lease-held-by-other`, `watch-cap`, `forbidden`, `inbox-not-held`, `grant-tab-unverified`, `config-version-conflict`, `caller-unresolved`, `grant-password-invalid`, `grant-locked` | after the state changes |
+| 2 | usage error | client-side argument errors, including an unknown command at the entry point; `lease-policy`, `watch-invalid`, `reports-to-invalid`, `note-too-large`, `note-invalid`, `config-invalid`, `note-target-missing`, `deploy-invalid` | fix the command |
+| 3 | conflict / refused by state | `lease-held`, `lease-held-by-other`, `watch-cap`, `forbidden`, `inbox-not-held`, `grant-tab-unverified`, `config-version-conflict`, `caller-unresolved`, `grant-password-invalid`, `grant-locked`, `note-cap` | after the state changes |
 | 4 | target gone (permanent) | `tab-not-found`, `session-not-running`, `target-changed` | **never** |
 | 5 | not ready yet | `readiness-timeout` | yes, bounded |
 | 6 | server unreachable | `server-unreachable`: connection refused, no port or token configured, a read interrupted; `routes-absent`: a 404 without a JSON body on a `/api/cli/` route — no such route: an older server (the common case), a foreign server on the port, or a malformed id (story 27) | yes, bounded; `routes-absent` not until its cause is fixed |

@@ -4,21 +4,23 @@
 # (ADR-0017, docs/DEPLOY.md).
 #
 # usage: deploy-live.sh <git-ref> [--quiet-timeout SECONDS] [--force-after-timeout]
-#                       [--ignore-tab WS/TAB]... [--outside-tab] [--dry-run]
+#                       [--ignore-tab WS/TAB]... [--outside-tab] [--dry-run] [--announce MINUTES]
 #        deploy-live.sh --rollback [--quiet-timeout SECONDS] [--force-after-timeout]
 #                       [--ignore-tab WS/TAB]... [--outside-tab]
 #
 # Steps: build ~/.purplemux/releases/<sha> (a detached worktree of the primary
 # repository) → run the release's own acceptance gate (scripts/acceptance/run.sh:
 # an isolated instance of the release on a spare port and a throwaway HOME) → take the deploy:purplemux lease when the running server has
-# leases → wait until no agent tab is mid-turn (the tab in PMUX_TAB_ID and every
+# leases → with --announce N, tell every enabled orchestrator and tab-bound lease
+# holder through the inbox and wait until each notice is delivered or held (at
+# most N minutes; story 13) → wait until no agent tab is mid-turn (the tab in PMUX_TAB_ID and every
 # --ignore-tab are excluded) → back up ~/.purplemux state → point `current` at
 # the release, `previous` at the old one → restart → health gate → rollback on
 # failure. The script never types into a tab.
 #
 # Exit codes:
 #   0  deployed, rolled back on demand, or dry run finished
-#   1  unexpected error (lease probe or acquire failed, backup failed)
+#   1  unexpected error (lease probe or acquire failed, announce failed, backup failed)
 #   2  refused before the live service was touched (usage, ref, disk, build,
 #      acceptance failed or missing, own tab unknown, drop-in drift)
 #   3  refused by state: quiet timeout, deploy lease held, another deploy running
@@ -33,7 +35,8 @@
 # DEPLOY_CURL, DEPLOY_TMUX, DEPLOY_PURPLEMUX, DEPLOY_JOURNALCTL, DEPLOY_GIT.
 # Paths: DEPLOY_REPO (primary checkout), DEPLOY_DROPIN, DEPLOY_UNIT_FILE,
 # DEPLOY_CLI_LINK, DEPLOY_SQLITE_MODULE, DEPLOY_PORT, DEPLOY_PROC_ROOT (/proc). Timing: DEPLOY_POLL_S (15),
-# DEPLOY_HEALTH_TIMEOUT_S (90), DEPLOY_HEALTH_INTERVAL_S (3), DEPLOY_MIN_FREE_GIB (5).
+# DEPLOY_HEALTH_TIMEOUT_S (90), DEPLOY_HEALTH_INTERVAL_S (3), DEPLOY_MIN_FREE_GIB (5),
+# DEPLOY_ANNOUNCE_WAIT_S (the --announce minutes in seconds).
 # Acceptance: DEPLOY_ACCEPTANCE (default <release>/scripts/acceptance/run.sh),
 # DEPLOY_BASH_GUARD (a bash-guard.py the gate also exercises; optional).
 
@@ -52,6 +55,7 @@ DRY_RUN=0
 ROLLBACK=0
 OUTSIDE_TAB=0
 IGNORE_TABS=()
+ANNOUNCE_MIN=""
 
 while (($#)); do
   case "$1" in
@@ -60,6 +64,7 @@ while (($#)); do
     --ignore-tab) [[ $# -ge 2 && "$2" == */* ]] || usage; IGNORE_TABS+=("$2"); shift 2 ;;
     --outside-tab) OUTSIDE_TAB=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --announce) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] && (($2 >= 1 && $2 <= 60)) || usage; ANNOUNCE_MIN="$2"; shift 2 ;;
     --rollback) ROLLBACK=1; shift ;;
     -h|--help) usage ;;
     -*) echo "unknown option: $1" >&2; usage ;;
@@ -99,8 +104,12 @@ OWN_TAB="${PMUX_TAB_ID:-}"
 PROC_ROOT="${DEPLOY_PROC_ROOT:-/proc}"
 
 WORK="$(mktemp -d)"
+exec {SUMMARY_FD}>&1
 LEASE_HELD=0
 CLI_DIR=""
+ANNOUNCE_ID=""
+ANNOUNCE_CLOSED=0
+total=0
 INTERRUPTED=0
 
 S_RELEASE="-"
@@ -112,6 +121,7 @@ S_QUIET="-"
 S_LEASE="-"
 S_BACKUP="-"
 S_ACCEPTANCE="-"
+S_ANNOUNCED="-"
 
 purplemux_cli() {
   if [[ -n "${DEPLOY_PURPLEMUX:-}" ]]; then
@@ -131,8 +141,38 @@ token_cli() {
   (unset PMUX_TAB_TOKEN; PMUX_TOKEN="$token" purplemux_cli "$@")
 }
 
+# The announcement is over: re-read the delivered count, then take back every notice still
+# waiting, so none is typed after the restart with an out-of-date "restarts at ~T" (review rounds
+# 1-2). Runs before the restart on a deploy, and from finish() on every other path.
+close_announcement() {
+  ((ANNOUNCE_CLOSED)) && return 0
+  # An interrupt (or a client failure) during the announce call can land after the server queued the
+  # notices but before ANNOUNCE_ID was set: the id the server returned is then in announce.json.
+  [[ -n "${ANNOUNCE_ID:-}" ]] || ANNOUNCE_ID="$(helper field "$WORK/announce.json" id 2>/dev/null)"
+  [[ -n "${ANNOUNCE_ID:-}" ]] || return 0
+  local withdrawn=""
+  # Withdraw first, then count: a notice delivered between the two is counted exactly once.
+  if admin_cli deploy withdraw "$ANNOUNCE_ID" >"$WORK/withdraw.json" 2>/dev/null; then
+    withdrawn="$(helper field "$WORK/withdraw.json" withdrawn)"
+  fi
+  if admin_cli deploy status "$ANNOUNCE_ID" --json >"$WORK/announce-status.json" 2>/dev/null; then
+    read -r delivered _ < <(helper announce-progress "$WORK/announce-status.json")
+    [[ "${total:-0}" == 0 ]] && total="$(helper count "$WORK/announce-status.json" recipients)"
+    S_ANNOUNCED="${delivered}/${total}"
+  fi
+  if [[ -z "$withdrawn" ]]; then
+    S_ANNOUNCED="$S_ANNOUNCED; withdraw failed"
+  elif [[ "$withdrawn" != 0 ]]; then
+    S_ANNOUNCED="$S_ANNOUNCED; $withdrawn still waiting, withdrawn"
+  fi
+  ANNOUNCE_ID=""
+  ANNOUNCE_CLOSED=1
+}
+
 finish() {
   local code="$1" verdict="$2"
+  # A refusal or an interrupt ends the announcement too (the backstop of close_announcement).
+  close_announcement
   if ((LEASE_HELD)); then
     if admin_cli lease release deploy:purplemux >"$WORK/lease-release.out" 2>&1; then
       S_LEASE="acquired, released"
@@ -141,6 +181,9 @@ finish() {
     fi
     LEASE_HELD=0
   fi
+  # The summary goes to the stdout saved at start: a signal trap can run inside a command whose own
+  # stdout is redirected (the announce call writes announce.json), and would write the summary there.
+  exec 1>&"$SUMMARY_FD"
   echo "---- deploy-live summary ----"
   echo "RELEASE=$S_RELEASE"
   echo "PREVIOUS=$S_PREVIOUS"
@@ -151,6 +194,7 @@ finish() {
   echo "LEASE=$S_LEASE"
   echo "BACKUP=$S_BACKUP"
   echo "ACCEPTANCE=$S_ACCEPTANCE"
+  echo "ANNOUNCED=$S_ANNOUNCED"
   ((INTERRUPTED)) && echo "INTERRUPTED=deferred until the swap window closed"
   echo "VERDICT=$verdict"
   rm -rf "$WORK"
@@ -321,8 +365,9 @@ if ((!ROLLBACK)); then
   echo "ACCEPTANCE_LOG=$ACCEPTANCE_LOG"
   acceptance_args=(--candidate "$RELEASE_DIR" --log "$ACCEPTANCE_LOG")
   [[ -n "${DEPLOY_BASH_GUARD:-}" ]] && acceptance_args+=(--bash-guard "$DEPLOY_BASH_GUARD" --require-bash-guard)
-  # 9>&-: the gate and its candidate server must never hold deploy-live.lock (review round 1).
-  if "$ACCEPTANCE" "${acceptance_args[@]}" >/dev/null 2>&1 9>&-; then
+  # 9>&-: the gate and its candidate server must never hold deploy-live.lock (review round 1), nor the
+  # stdout saved for the summary: a lingering candidate would keep the caller's pipe open.
+  if "$ACCEPTANCE" "${acceptance_args[@]}" >/dev/null 2>&1 9>&- {SUMMARY_FD}>&-; then
     S_ACCEPTANCE="pass ($(grep -m 1 -o 'checks=[0-9]* passed=[0-9]* failed=[0-9]* skipped=[0-9]*' "$ACCEPTANCE_LOG" 2>/dev/null || echo 'see log'); $ACCEPTANCE_LOG)"
   else
     grep -E '^(FAIL|ACCEPTANCE=)' "$ACCEPTANCE_LOG" >&2 2>/dev/null || tail -n 20 "$ACCEPTANCE_LOG" >&2 2>/dev/null
@@ -336,7 +381,8 @@ fi
 
 # ---- lease ----
 
-TTL_MIN=$(((QUIET_TIMEOUT + 59) / 60 + 15))
+# The lease outlives the announce wait and the quiet wait together (capped at the deploy kind's 2 h).
+TTL_MIN=$(((QUIET_TIMEOUT + 59) / 60 + ${ANNOUNCE_MIN:-0} + 15))
 ((TTL_MIN < 30)) && TTL_MIN=30
 ((TTL_MIN > 120)) && TTL_MIN=120
 
@@ -368,6 +414,52 @@ case "$lease_code" in
     S_LEASE="unavailable (GET /api/cli/leases HTTP $lease_code; rollback proceeds)"
     ;;
 esac
+
+# ---- announce (story 13): tell the orchestrators and lease holders first ----
+
+# The notice is the inbox's fixed line; the reason is pulled with `deploy status`.
+# The tab running this script is left out: it is mid-turn until the restart.
+if [[ -n "$ANNOUNCE_MIN" ]]; then
+  if ((DRY_RUN)); then
+    S_ANNOUNCED="skipped (dry run)"
+  elif ((ROLLBACK)); then
+    S_ANNOUNCED="skipped (rollback)"
+  else
+    # The own tab and every --ignore-tab: all are left out of the quiet wait because they will not
+    # go idle, so a notice to them would never be delivered before the restart.
+    except=()
+    [[ -n "$OWN_TAB" ]] && except=(--except-tab "$OWN_TAB")
+    for ignored in "${IGNORE_TABS[@]}"; do except+=(--except-tab "${ignored#*/}"); done
+    if admin_cli deploy announce --in "$ANNOUNCE_MIN" --reason "deploy ${SHORT:-$REF}" "${except[@]}" --json \
+      >"$WORK/announce.json" 2>"$WORK/announce.err"; then
+      ANNOUNCE_ID="$(helper field "$WORK/announce.json" id)"
+      echo "ANNOUNCE_ID=$ANNOUNCE_ID"
+      announce_deadline=$((SECONDS + ${DEPLOY_ANNOUNCE_WAIT_S:-$((ANNOUNCE_MIN * 60))}))
+      # The recipient count is the announcement's, never an unreadable status body's.
+      total="$(helper count "$WORK/announce.json" recipients)"
+      delivered=0 settled=0
+      while :; do
+        if admin_cli deploy status "$ANNOUNCE_ID" --json >"$WORK/announce-status.json" 2>/dev/null; then
+          read -r delivered settled < <(helper announce-progress "$WORK/announce-status.json")
+          ((settled >= total)) && break
+        fi
+        ((SECONDS >= announce_deadline)) && break
+        sleep "$POLL_S"
+      done
+      S_ANNOUNCED="$delivered/$total"
+    else
+      rc=$?
+      cat "$WORK/announce.err" >&2
+      # routes-absent (exit 6 with that code): the running server predates announce; the
+      # restart is not blocked by a feature the release it replaces does not have.
+      if ((rc == 6)) && grep -q 'routes-absent' "$WORK/announce.err"; then
+        S_ANNOUNCED="unavailable (the running server predates deploy announce)"
+      else
+        refuse 1 ANNOUNCE-FAILED "deploy announce exited $rc" "exit 0, or routes-absent from a server that predates it"
+      fi
+    fi
+  fi
+fi
 
 # ---- quiet wait (read-only) ----
 
@@ -453,6 +545,8 @@ else
     sleep "$POLL_S"
   done
 fi
+
+close_announcement
 
 # ---- backup (after the quiet wait, so it holds the state at the restart) ----
 

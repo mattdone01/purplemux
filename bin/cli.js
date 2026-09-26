@@ -120,6 +120,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'watch-invalid': EXIT.USAGE,
   'reports-to-invalid': EXIT.USAGE,
   'note-too-large': EXIT.USAGE,
+  'deploy-invalid': EXIT.USAGE,
   'config-invalid': EXIT.USAGE,
   'note-target-missing': EXIT.USAGE,
   'note-invalid': EXIT.USAGE,
@@ -645,6 +646,66 @@ const cmdConfig = async (args) => {
     }
     default:
       die(CONFIG_USAGE);
+  }
+};
+
+// Deploy announce (story 13, ADR-0017): the one broadcast path. The reason is
+// stored and shown by `deploy status`; recipients get the inbox's fixed line.
+const DEPLOY_USAGE = 'usage: deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json] | deploy status ID [--json] | deploy withdraw ID';
+
+const flagValues = (args, name) => {
+  const values = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === name) {
+      if (i + 1 >= args.length) die(`${name} needs a value`);
+      values.push(args[i + 1]);
+      i++;
+    }
+  }
+  return values;
+};
+
+const cmdDeploy = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const positional = stripBooleanFlags(stripFlags(rest, ['--in', '--reason', '--except-tab']), ['--json']);
+  switch (sub) {
+    case 'announce': {
+      if (positional.length) die(DEPLOY_USAGE);
+      const minutes = flagValue(rest, '--in');
+      if (minutes === null || !/^\d+$/.test(minutes) || Number(minutes) < 1 || Number(minutes) > 60) die('--in needs whole minutes from 1 to 60');
+      const reason = flagValue(rest, '--reason');
+      if (!reason || !reason.trim()) die('--reason is required (at most 120 characters; shown by deploy status, never typed)');
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/deploy/announce', {
+        inMinutes: Number(minutes),
+        reason,
+        exceptTabIds: flagValues(rest, '--except-tab'),
+      });
+      if (rest.includes('--json')) return out(body);
+      process.stdout.write(`DEPLOY ${body.id} restarts ~${new Date(body.restartAt).toISOString()} recipients=${body.recipients.length}\n`);
+      for (const r of body.recipients) process.stdout.write(`  ${r.workspaceId}/${r.tabId}  ${r.reasons.join(', ')}\n`);
+      return;
+    }
+    case 'status': {
+      if (positional.length !== 1) die(DEPLOY_USAGE);
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/deploy/status?id=${encodeURIComponent(positional[0])}`);
+      if (rest.includes('--json')) return out(body);
+      process.stdout.write(`DEPLOY ${body.id} restarts ~${new Date(body.restartAt).toISOString()} reason: ${body.reason}\n`);
+      for (const r of body.recipients) {
+        process.stdout.write(`  ${r.workspaceId}/${r.tabId}  ${r.state}  cliState=${r.cliState ?? '-'}  ${r.reasons.join(', ')}\n`);
+      }
+      return;
+    }
+    case 'withdraw': {
+      if (positional.length !== 1) die(DEPLOY_USAGE);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/deploy/withdraw', { id: positional[0] });
+      return out(body);
+    }
+    default:
+      die(DEPLOY_USAGE);
   }
 };
 
@@ -1388,6 +1449,13 @@ Commands:
                                            A stale --expect-version exits 3 config-version-conflict
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
+  deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json]
+                                           Tell every enabled orchestrator and tab-bound lease holder that purplemux
+                                           restarts in 1-60 min (admin token or the deploy:purplemux holder; else
+                                           exit 3). Only a fixed inbox line is typed; the reason is shown by status
+  deploy status ID [--json]                The reason and, per recipient, delivery state and cliState (7 unknown)
+  deploy withdraw ID                       Take back the notices still waiting once the deploy is over (announcer
+                                           authority); deploy-live.sh does this when it finishes
   watch pr OWNER/REPO#N --until merged|closed|head-moved|checks-settled [--ttl 24h] [--interval 120] [--label TEXT]
   watch ref OWNER/REPO@REF --until moved   (same options)
   watch lease NAME --until free            A one-shot watch owned by this tab: the server checks it (GitHub every
@@ -1464,6 +1532,8 @@ const main = async () => {
       return cmdNote(args.slice(1));
     case 'config':
       return cmdConfig(args.slice(1));
+    case 'deploy':
+      return cmdDeploy(args.slice(1));
     case 'watch':
       return cmdWatch(args.slice(1));
     case 'tab':

@@ -17,6 +17,7 @@ const CLI_COMMANDS = new Set([
   'inbox',
   'note',
   'config',
+  'deploy',
   'watch',
   'api-guide',
   'help',

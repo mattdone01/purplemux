@@ -28,6 +28,8 @@ export interface IEnqueueRequest<K extends TInboxKind = TInboxKind> {
   targetTabId: string;
   dedupeKey: string;
   fields: IInboxFields[K];
+  /** Drop the item, never type it, once this time passes (IInboxItem.staleAt). */
+  staleAt?: number;
 }
 
 const TARGET_WORKSPACE = /^ws-[A-Za-z0-9_-]{1,32}$/;
@@ -67,6 +69,7 @@ export const enqueueInState = <K extends TInboxKind>(
     heldReason: null,
     droppedReason: null,
     expiresAt: now + INBOX_MAX_AGE_MS,
+    staleAt: typeof req.staleAt === 'number' && Number.isFinite(req.staleAt) ? req.staleAt : null,
     transitionAt: now,
   };
   return { state: { items: [...state.items, item] }, item, created: true };
@@ -117,9 +120,9 @@ export const dropForTabInState = (
 };
 
 /**
- * Queued items past 24 h become held; terminal items 7 days after their last
- * transition are pruned. The same state object comes back when nothing
- * changed, so a quiet tick writes nothing.
+ * Queued or held items past their `staleAt` are dropped (their line is no longer true); queued items
+ * past 24 h become held; terminal items 7 days after their last transition are pruned. The same state
+ * object comes back when nothing changed, so a quiet tick writes nothing.
  */
 export const sweepInState = (state: IInboxState, now: number): IInboxState => {
   let changed = false;
@@ -127,6 +130,11 @@ export const sweepInState = (state: IInboxState, now: number): IInboxState => {
   for (const item of state.items) {
     if (item.state !== 'queued' && now - item.transitionAt >= INBOX_RETENTION_MS) {
       changed = true;
+      continue;
+    }
+    if ((item.state === 'queued' || item.state === 'held') && typeof item.staleAt === 'number' && now >= item.staleAt) {
+      changed = true;
+      items.push({ ...item, state: 'dropped', droppedReason: 'stale', transitionAt: now });
       continue;
     }
     if (item.state === 'queued' && now >= item.expiresAt) {

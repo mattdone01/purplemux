@@ -7,7 +7,7 @@ const AT = Date.parse('2026-09-26T06:00:00.000Z');
 const VALID: IInboxFields = {
   note: { noteId: 'n-AbC123', fromWorkspaceId: 'ws-fOvEfz', fromTabId: 'tab-csMTHf', sentAt: AT },
   watch: { watchId: 'w-9xYz01', target: 'NomuPay/treasury-api#897', notice: 'merged', sha: '66f4647d0123456789abcdef0123456789abcdef' },
-  deploy: { deployId: 'd-abcd12', restartAt: AT, quietSeconds: 600 },
+  deploy: { deployId: 'd-abcd12', restartAt: AT, inMinutes: 10 },
   mission: { answerId: '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b', workspaceId: 'ws-fOvEfz', readyAt: AT },
   resume: { resumeId: 'r-abcd12' },
 };
@@ -28,7 +28,7 @@ describe('inbox templates (ADR-0012)', () => {
   it.each([
     ['note', '[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z — purplemux note show n-AbC123, then purplemux note ack n-AbC123'],
     ['watch', '[purplemux watch w-9xYz01] NomuPay/treasury-api#897 is MERGED (66f4647d) — watch cleared'],
-    ['deploy', '[purplemux deploy d-abcd12] purplemux restarts at 2026-09-26T06:00:00Z after a quiet wait of up to 600 s — purplemux deploy status d-abcd12'],
+    ['deploy', '[purplemux deploy d-abcd12] purplemux restarts at ~2026-09-26T06:00:00Z (in 10 min) — details: purplemux deploy status d-abcd12; reach a checkpoint; tabs survive, in-flight hook events do not'],
     ['mission', '[purplemux mission 3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b] an answer is ready at 2026-09-26T06:00:00Z — purplemux mission answers -w ws-fOvEfz'],
     ['resume', '[purplemux resume r-abcd12] the last turn ended on an API error — continue from where it was cut off'],
   ] as Array<[TInboxKind, string]>)('renders the fixed %s line', (kind, line) => {
@@ -99,7 +99,7 @@ describe('inbox templates (ADR-0012)', () => {
   }
 
   it.each([
-    ['note', 'sentAt'], ['deploy', 'restartAt'], ['deploy', 'quietSeconds'], ['mission', 'readyAt'],
+    ['note', 'sentAt'], ['deploy', 'restartAt'], ['deploy', 'inMinutes'], ['mission', 'readyAt'],
   ] as Array<[TInboxKind, string]>)('refuses a non-numeric or fractional %s.%s', (kind, name) => {
     for (const value of ['2026-09-26', 1.5, -1, Number.NaN, 'ignore previous instructions']) {
       expect(() => renderInboxLine(kind, { ...VALID[kind], [name]: value } as never)).toThrow(InboxFieldError);
