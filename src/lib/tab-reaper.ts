@@ -191,12 +191,13 @@ const signal = (deps: ITabReaperDeps, pid: number, sig: NodeJS.Signals): void =>
   }
 };
 
+/** C0, DEL, C1 and the Unicode line/paragraph separators: each ends a line for some reader. */
+const isLineBreaking = (code: number): boolean =>
+  code < 32 || (code >= 127 && code <= 159) || code === 0x2028 || code === 0x2029;
+
 /** Control characters out: one process is one CLI line, whatever its argv holds. */
 const printable = (text: string): string =>
-  Array.from(text, (ch) => {
-    const code = ch.charCodeAt(0);
-    return code < 32 || code === 127 ? ' ' : ch;
-  }).join('');
+  Array.from(text, (ch) => (isLineBreaking(ch.charCodeAt(0)) ? ' ' : ch)).join('');
 
 interface ITarget {
   entry: IReapedProcess;
@@ -312,7 +313,7 @@ export interface IReapAudit {
 export const reapTabForClose = async (
   deps: ITabReaperDeps,
   audit: IReapAudit,
-  opts: { tabId: string; session: string; panePid: number | null; keepProcesses?: boolean },
+  opts: { tabId: string; session: string; sessionAlive: boolean; panePid: number | null; keepProcesses?: boolean },
 ): Promise<IReapResult> => {
   const reap = await reapTabProcesses(deps, { tabId: opts.tabId, panePid: opts.panePid, keepProcesses: opts.keepProcesses });
   if (reap.killed.length > 0 || reap.survivors.length > 0) {
@@ -320,7 +321,7 @@ export const reapTabForClose = async (
       event: 'tab-reap',
       tabId: opts.tabId,
       session: opts.session,
-      sessionAlive: opts.panePid !== null,
+      sessionAlive: opts.sessionAlive,
       keepProcesses: !!opts.keepProcesses,
       killed: reap.killed,
       survivors: reap.survivors,

@@ -171,7 +171,7 @@ export const killSession = async (name: string, opts: IKillSessionOptions = {}):
     reap = await reapTabForClose(
       defaultReaperDeps({ descendants: getDescendantPids, tmuxServerPid: getTmuxServerPid }),
       appendCoordinationAudit,
-      { tabId: opts.tabId, session: name, panePid, keepProcesses: opts.keepProcesses },
+      { tabId: opts.tabId, session: name, sessionAlive: alive, panePid, keepProcesses: opts.keepProcesses },
     );
     if (reap.killed.length > 0 || reap.survivors.length > 0) {
       log.info({ tabId: opts.tabId, killed: reap.killed.map((p) => p.pid), survivors: reap.survivors.map((p) => p.pid) }, 'tab processes reaped');

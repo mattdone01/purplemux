@@ -3,6 +3,7 @@ import fs from 'fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultReaperDeps, environHasTabId, reapTabForClose, reapTabProcesses, REAP_GRACE_MS, type ITabReaperDeps } from '@/lib/tab-reaper';
 import { getDescendantPids, getTmuxServerPid, killSession } from '@/lib/tmux';
+import { auditFile } from '@/lib/coordination-audit';
 
 const realDeps = () => defaultReaperDeps({ descendants: getDescendantPids, tmuxServerPid: getTmuxServerPid });
 
@@ -195,9 +196,9 @@ describe('reapTabProcesses (fake /proc)', () => {
 
   it('reports one line per process: control characters in comm and args become spaces (review r1 finding 5)', async () => {
     const { deps } = fake({ procs: { 20: { environ: ['PMUX_TAB_ID=tab-t'] } } });
-    deps.describe = async (pid) => ({ pid, comm: 'ba\tsh', args: 'bash -c \nkilled 1\r\nok' });
+    deps.describe = async (pid) => ({ pid, comm: 'ba\tsh', args: 'bash -c \nkilled 1\r\nok\u0085a\u2028b\u2029c' });
     const result = await reapTabProcesses(deps, { tabId: 'tab-t', panePid: null });
-    expect(result.killed).toEqual([{ pid: 20, comm: 'ba sh', args: 'bash -c  killed 1  ok' }]);
+    expect(result.killed).toEqual([{ pid: 20, comm: 'ba sh', args: 'bash -c  killed 1  ok a b c' }]);
   });
 });
 
@@ -225,7 +226,7 @@ describe('reapTabForClose (the close step every path runs)', () => {
 
   it('writes one tab-reap audit entry when it signalled anything, saying whether the session was alive', async () => {
     const audit = vi.fn(async () => {});
-    await reapTabForClose(deps(true), audit, { tabId: 'tab-t', session: 's-t', panePid: null });
+    await reapTabForClose(deps(true), audit, { tabId: 'tab-t', session: 's-t', sessionAlive: false, panePid: null });
     expect(audit).toHaveBeenCalledTimes(1);
     expect(audit).toHaveBeenCalledWith({
       event: 'tab-reap', tabId: 'tab-t', session: 's-t', sessionAlive: false, keepProcesses: false,
@@ -233,9 +234,14 @@ describe('reapTabForClose (the close step every path runs)', () => {
     });
   });
 
+  it('protects the pid the tmux-server source returns', async () => {
+    const protectedPids = await defaultReaperDeps({ descendants: async () => [], tmuxServerPid: async () => 424242 }).protectedPids();
+    expect(protectedPids).toContain(424242);
+  });
+
   it('writes nothing when there was nothing to reap', async () => {
     const audit = vi.fn(async () => {});
-    await reapTabForClose(deps(false), audit, { tabId: 'tab-t', session: 's-t', panePid: 10 });
+    await reapTabForClose(deps(false), audit, { tabId: 'tab-t', session: 's-t', sessionAlive: true, panePid: 10 });
     expect(audit).not.toHaveBeenCalled();
   });
 });
@@ -313,8 +319,17 @@ describe.runIf(process.platform === 'linux')('reapTabProcesses (real processes, 
     const mine = await pane(id, JOBS);
     const other = await pane(`${id}x`, 'sleep 120 & echo "other $!" >> "$PIDS_FILE"\necho ready >> "$PIDS_FILE"');
     const t0 = Date.now();
-    const result = await reapTabProcesses(realDeps(), { tabId: id, panePid: mine.panePid });
-    expect(Date.now() - t0).toBeLessThan(REAP_GRACE_MS + 1000);
+    const reaping = reapTabProcesses(realDeps(), { tabId: id, panePid: mine.panePid });
+    // The AC: the jobs are gone within 4 s (the call itself also rescans and settles).
+    const jobs = ['disowned', 'setsid', 'ignores-term'].map((name) => mine.pids[name]);
+    let goneAt: number | null = null;
+    while (goneAt === null && Date.now() - t0 < 10_000) {
+      if (jobs.every((pid) => !alive(pid))) goneAt = Date.now();
+      else await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const result = await reaping;
+    expect(goneAt).not.toBeNull();
+    expect(goneAt! - t0).toBeLessThan(REAP_GRACE_MS + 1000);
     const killed = result.killed.map((p) => p.pid);
     for (const name of ['disowned', 'setsid', 'ignores-term']) {
       expect(killed).toContain(mine.pids[name]);
@@ -348,8 +363,18 @@ describe.runIf(process.platform === 'linux')('reapTabProcesses (real processes, 
     const mine = await pane(id, 'setsid nohup sleep 120 >/dev/null 2>&1 & echo "orphan $!" >> "$PIDS_FILE"\necho ready >> "$PIDS_FILE"');
     // The "shell exited": the pane bash is gone, its setsid child lives on.
     process.kill(mine.panePid, 'SIGKILL');
-    const result = await killSession(`pmux-reaper-test-no-such-session-${id}`, { tabId: id });
+    const session = `pmux-reaper-test-no-such-session-${id}`;
+    const result = await killSession(session, { tabId: id });
     expect(result?.killed.map((p) => p.pid)).toContain(mine.pids.orphan);
     expect(alive(mine.pids.orphan)).toBe(false);
+    // killSession writes the audit line itself (HOME is the test's own).
+    const lines = fs.readFileSync(auditFile(), 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      .filter((entry) => entry.event === 'tab-reap' && entry.tabId === id);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ session, sessionAlive: false });
+  });
+
+  it('protects the server\'s own parent in the real /proc sources', async () => {
+    expect(await realDeps().protectedPids()).toContain(process.ppid);
   });
 });
