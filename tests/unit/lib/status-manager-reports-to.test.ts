@@ -250,19 +250,39 @@ describe('human pages for liveness events (story 34, consult ruling A)', () => {
     expect(kinds(halted.alerts)).toEqual(['bg-job-died']);
   });
 
-  it('a delivered self-notified failure pages no one when the tab\'s own turn end reaches the human', async () => {
-    // The orchestrator itself: its turn end pushes under the default alert policy.
+  // Review r2 finding 1: an orchestrator id may name a closed tab or an exited agent.
+  it('a delivered self-notified failure still pages when the orchestrator is gone or not a live agent', async () => {
+    for (const o1 of [null, { cliState: 'inactive' as const }, { panelType: 'terminal' as const }]) {
+      const env = await withAlerts(undefined, {});
+      if (o1 === null) env.manager.removeTab('o1');
+      else env.manager.registerTab('o1', entry('o1', o1));
+      await env.internals.handleLivenessEvent(bgFailed('self'));
+      expect(env.targets()).toEqual(['w']);
+      expect(kinds(env.alerts)).toEqual(['bg-job-died']);
+    }
+  });
+
+  // Review r2 finding 2: the alert policy is no substitute for a live target (no stall alert follows).
+  it('a delivered self-notified failure still pages when only the alert policy would hear the tab', async () => {
+    // The orchestrator's own gate: its turn end pushes, but nothing covers it if it hangs busy.
     const orch = await withAlerts();
     await orch.internals.handleLivenessEvent(bgFailed('self', 'o1'));
     expect(orch.targets()).toEqual(['o1']);
-    expect(orch.alerts).not.toHaveBeenCalled();
+    expect(kinds(orch.alerts)).toEqual(['bg-job-died']);
 
     // An un-orchestrated worker when the policy alerts every agent tab.
     alertConfig.orchestratorOnly = false;
     const worker = await withAlerts({ enabled: false, orchestratorTabId: null }, {});
     await worker.internals.handleLivenessEvent(bgFailed('self'));
     expect(worker.targets()).toEqual(['w']);
-    expect(worker.alerts).not.toHaveBeenCalled();
+    expect(kinds(worker.alerts)).toEqual(['bg-job-died']);
+  });
+
+  it('a delivered self-notified failure pages no one when the orchestrator is a live agent', async () => {
+    const { internals, targets, alerts } = await withAlerts(undefined, {});
+    await internals.handleLivenessEvent(bgFailed('self'));
+    expect(targets()).toEqual(['w']);
+    expect(alerts).not.toHaveBeenCalled();
   });
 
   // The ruling's premise, chained: the woken tab's next stop still escalates to its target.

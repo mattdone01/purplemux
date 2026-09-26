@@ -716,8 +716,8 @@ export class StatusManager {
 
     if (event.kind === 'bg-completed') return;
     // A `--notify self` job whose known failure reached the tab that registered it is that tab's to
-    // act on (a red gate in a TDD loop): it escalates through its own turn-end marker (ADR-0018), and
-    // the stall watchdog still covers a tab that goes silent. Paging the human for each one would bury
+    // act on (a red gate in a TDD loop): it escalates through its own turn-end marker (ADR-0018) to a
+    // live agent that also gets its `stuck` nudge if it hangs. Paging the human for each one would bury
     // the page that matters (story 34, consult ruling A) — but only when the tab can carry it on.
     if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered && await this.carriesSelfFailure(src.tabId, entry)) return;
 
@@ -742,15 +742,19 @@ export class StatusManager {
 
   /**
    * Whether a tab that received its own job's failure can carry it on without a page (story 34
-   * review r1): it is a live agent — a shell would run the notice and an exited agent never reads
-   * it, though tmux accepts the keys for both — and its turn end reaches someone: an escalation
-   * target, or the human under the alert policy (whose stall alert then covers a silent tab too).
+   * reviews r1, r2): the tab is a live agent — a shell would run the notice and an exited agent never
+   * reads it, though tmux accepts the keys for both — and so is its escalation target, which gets
+   * both its turn-end marker and its `stuck` nudge. The alert policy is no substitute: the human's
+   * stall alert runs only for an idle orchestrator, so a woken tab that hung would reach no one.
    */
   private async carriesSelfFailure(tabId: string, entry: ITabStatusEntry | undefined): Promise<boolean> {
-    if (!entry || !isAgentPanelType(entry.panelType) || entry.cliState === 'inactive' || entry.cliState === 'unknown') return false;
+    const liveAgent = (e: ITabStatusEntry | undefined): e is ITabStatusEntry =>
+      !!e && isAgentPanelType(e.panelType) && e.cliState !== 'inactive' && e.cliState !== 'unknown';
+    if (!liveAgent(entry)) return false;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
-    if (!ws) return false;
-    return this.escalationTarget(tabId, entry, ws) !== null || shouldAlert({ id: tabId }, ws, await getConfig());
+    const target = ws ? this.escalationTarget(tabId, entry, ws) : null;
+    const targetEntry = target ? this.tabs.get(target) : undefined;
+    return liveAgent(targetEntry);
   }
 
   /**
