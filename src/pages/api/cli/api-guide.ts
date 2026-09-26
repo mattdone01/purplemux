@@ -283,6 +283,38 @@ POST /api/cli/inbox/<id>/retry
   for another workspace's item; 409 { "code": "inbox-not-held" } (CLI exit 3) when the item
   is not held, or when a newer notice with its key is already queued for that tab.
 
+## Notes (ADR-0013)
+
+A note is a body the recipient pulls. It is addressed to an epic (--to-epic SLUG: routed at delivery
+time to the live holder of lease epic:SLUG) or to a workspace (--to-workspace WS: its enabled
+orchestrator tab). With no live recipient the note is "undeliverable" (listed, never dropped) until
+an owner claims the epic or orchestration is turned on; then it is delivered. The recipient's tab
+receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
+show n-…, then purplemux note ack n-…"; the subject and body are never typed. If that tab closes
+before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
+the line reached its composer, and one notice reaches the sender's tab (if live) at 60 min; no
+more. A note unacked or undeliverable for 14 days expires (one notice to a live sender); acked and
+expired notes are pruned 14 days later. At turn start, run \`note list --open --to-me\`.
+
+POST /api/cli/notes
+  Any resolved caller. Body: { "toEpic"? , "toWorkspace"? (exactly one), "subject" (≤ 120, control
+  characters removed), "body" (≤ 16 KiB UTF-8), "fromEpic"? (only the holder of epic:<slug>) }.
+  Response: { "note": INoteView }. 413 note-too-large (exit 2), 400 note-target-missing / note-invalid
+  (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold.
+
+GET /api/cli/notes[?open=1][&toMe=1][&fromMe=1][&epic=SLUG]
+  Notes the caller's workspace sent or receives (admin: all), without bodies.
+  Response: { "notes": [{ "id", "from", "to", "subject", "state", "deliveredTo", "routedAt",
+    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", ... }] }
+
+GET /api/cli/notes/<id>
+  The recipient workspace, the sender workspace, or admin. Response: { "note", "body" }.
+  404 note-not-found (exit 7); 403 forbidden (exit 3).
+
+POST /api/cli/notes/<id>/ack
+  The recipient workspace only. Body: { "comment"? (≤ 500) }. Response: { "note" } in state "acked".
+  404 note-not-found (exit 7); 403 forbidden (exit 3), also for a note that is not delivered.
+
 ## Orchestration
 
 GET /api/cli/workspaces/<workspaceId>/orchestration
