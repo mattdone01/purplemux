@@ -30,3 +30,10 @@ Option 2, as `scripts/deploy-live.sh <ref>`:
 - Rolling back to a build without leases while the engineering bash-guard rules are live blocks merges until `MERGE_LEASE_OK=1` is set fleet-wide or the engineering change is reverted (architecture "Migration strategy").
 - The quiet wait is bounded and reports its blockers; the operator decides with `--force-after-timeout`. Story 13's announcement makes quiet arrive sooner.
 - The script runs longer than the 10-minute foreground limit of an agent's shell tool; it must run under the host's background mechanism.
+
+## Amendment (story 07, 2026-09-26): an isolated acceptance gate before any switch
+Between the build (step 2) and the lease (step 3), the script runs the release's own
+`scripts/acceptance/run.sh`: the release on a spare port with a throwaway HOME and tmux socket,
+checked end to end for the wave-1 surfaces and ADR-0018 (docs/DEPLOY.md "Acceptance gate"). A failure
+refuses with exit 2 before the live service is touched. The restart of a live host touches every
+worker tab, so a defect found on a throwaway instance costs nothing that a defect found live does.

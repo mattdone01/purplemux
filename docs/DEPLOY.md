@@ -27,7 +27,7 @@ Options:
 
 | Option | Effect |
 |---|---|
-| `--dry-run` | build and report the quiet state; no backup, no swap, no restart |
+| `--dry-run` | build, run the acceptance gate and report the quiet state; no backup, no swap, no restart |
 | `--quiet-timeout SECONDS` | bound of the quiet wait (default 900) |
 | `--force-after-timeout` | deploy even if tabs are still mid-turn at the timeout |
 | `--ignore-tab WS/TAB` | exclude one more tab from the quiet wait (repeatable) |
@@ -46,7 +46,43 @@ The tab in `PMUX_TAB_ID` is always excluded from the quiet wait. A tab created b
 | 3 | quiet timeout, deploy lease held, another deploy running | unchanged |
 | 4 | restart, `daemon-reload` or health gate failed; the previous release was restored (`VERDICT=rolled-back`); the automatic rollback failed too (`VERDICT=rollback-failed`, read `ROLLBACK_HEALTH=` and the journal); or an on-demand rollback failed its gate (`VERDICT=rollback-unhealthy`) | previous release, or check by hand on `rollback-failed` / `rollback-unhealthy` |
 
-The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
+The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `ACCEPTANCE=`, `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
+
+## Acceptance gate
+
+After the build and before the lease, the quiet wait, the backup or any switch, the script runs the
+release's OWN `scripts/acceptance/run.sh --candidate <release>`. A failure, or a release without the
+harness, refuses with exit 2 (`ACCEPTANCE-FAILED` / `ACCEPTANCE-MISSING`); the live service is
+untouched. `--rollback` skips it: the target already ran live. `DEPLOY_BASH_GUARD=<bash-guard.py>`
+adds the engineering guard check and makes it required. The log is
+`~/.purplemux/logs/acceptance-<stamp>-<sha12>.log`.
+
+The gate starts the release as a second server that shares nothing with the live one:
+`HOME=/tmp/pmxa.XXXXXX/home` (so `~/.purplemux` is throwaway), `TMUX_TMPDIR=/tmp/pmxa.XXXXXX/tmux`
+(its own `tmux -L purple` socket), `HOST=localhost` on a spare port >= 18000, and `env -i` with a
+short whitelist, because a shell inside a live tab carries `PMUX_TOKEN`, `TMUX` and the live
+`__PMUX_PRISTINE_ENV`, which the candidate would hand to its own tabs. It refuses before starting
+when the scratch HOME or socket would resolve to the live ones, when the socket path exceeds the unix
+limit, or when the port is the live one or answers. Teardown stops only processes whose
+`/proc/<pid>/environ` carries the scratch HOME, and kills tmux only through the scratch socket.
+
+The checks (`scripts/acceptance/checks.cjs`) run the release's installed entry point `bin/purplemux.js`,
+and each prints `PASS`/`FAIL` with what it measured and expected:
+
+| Check | Proves |
+|---|---|
+| `tab-create`, `tab-list`, `tab-send-result`, `tab-status` | tab create/list/send/result/status in two workspaces |
+| `identity-env` | a tab carries `PMUX_TAB_ID` and `PMUX_TAB_TOKEN` (ADR-0010) |
+| `lease-race`, `lease-verified` | two tabs race one merge lease: one wins, one gets exit 3 naming the holder, the holder is verified |
+| `lease-renew-release`, `lease-expiry` | renew and release by the holder only; a 2 s lease expires (ADR-0011) |
+| `epic-ownership`, `num-claim` | an epic claim frees when its tab closes; a number claim survives its tab until `release-epic` |
+| `exit-4-target-gone`, `exit-2-usage`, `exit-7-not-found`, `exit-6-unreachable`, `exit-6-routes-absent` | the CLI exit-code contract (ADR-0016) |
+| `bash-guard` | with `--bash-guard`: the guard allows the holder's merge and refuses another tab's |
+| `turn-marker`, `turn-waiting`, `turn-ready` | ADR-0018 with a scratch `claude` stand-in and posted hook events: a marker line reaches the orchestrator nudge; a stop with a live `tab bg` job stays busy with no nudge; a plain stop keeps READY FOR REVIEW |
+| `live-socket-untouched` | no isolated session appeared on the live tmux socket |
+
+Run it by hand against any built checkout:
+`scripts/acceptance/run.sh --candidate <dir> [--log FILE] [--bash-guard PATH] [--keep]`.
 
 ## Health gate
 
