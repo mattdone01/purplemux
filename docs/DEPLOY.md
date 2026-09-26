@@ -41,12 +41,24 @@ The tab in `PMUX_TAB_ID` is always excluded from the quiet wait. A tab created b
 | Exit | Meaning | Live service |
 |---|---|---|
 | 0 | deployed, rolled back on demand, or dry run | new release (or unchanged on dry run) |
-| 1 | lease probe or acquire failed, backup failed | unchanged |
-| 2 | refused: usage, ref, disk, build, own tab unknown, drop-in drift | unchanged |
+| 1 | lease probe or acquire failed, backup failed, tmux sessions unreadable | unchanged |
+| 2 | refused: usage, ref, disk, build, own tab unknown, drop-in drift or rewrite, half-finished first install, rollback target missing or unbuilt | unchanged |
 | 3 | quiet timeout, deploy lease held, another deploy running | unchanged |
-| 4 | health gate failed; the previous release was restored | previous release |
+| 4 | restart, `daemon-reload` or health gate failed; the previous release was restored (`VERDICT=rolled-back`), or an on-demand rollback failed its gate (`VERDICT=rollback-unhealthy`) | previous release |
 
-The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `VERDICT=`.
+The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
+
+## Health gate
+
+Within 90 s after the restart, all of these must hold:
+
+1. `systemctl --user restart` exited 0.
+2. The service has a new `MainPID`, and `/proc/<pid>/cwd` resolves to the release directory. `/api/health` answers the same for every release, so this check is what proves the new code runs.
+3. `GET /api/health` answers `app: purplemux`.
+4. Every tmux session name recorded before the restart still exists. New sessions are allowed.
+5. A workspace-token `purplemux tab list` answers. With no workspace token on the host the check is reported as skipped (`HEALTH=pass (tab-list skipped: no workspace token)`).
+
+From the first link change until the gate or the rollback ends, the script defers INT and TERM. A `SIGKILL` in that window can still leave the links swapped; run `--rollback` or check `releases/current` by hand.
 
 ## The first install
 
@@ -62,7 +74,7 @@ The first wave-1 deploy runs against the b428f4d1 server: `LEASE=unavailable (se
 ## Roll back
 
 - Automatic: a failed health gate restores the links from before the run and exits 4. The summary and the journal lines show why.
-- On demand: `scripts/deploy-live.sh --rollback` from `releases/current/scripts/`. Right after a first install it restores the saved drop-in and CLI link and removes `current` and `previous`.
+- On demand: `scripts/deploy-live.sh --rollback` from `releases/current/scripts/`. Right after a first install it restores the saved drop-in and CLI link and removes `current` and `previous`. It continues past a broken lease route or lease CLI (`LEASE=unavailable (…; rollback proceeds)`); only a live `deploy:purplemux` holder elsewhere stops it.
 - A rollback swaps code only and never restores a backup. Restore a backup by hand only with the service stopped.
 - **bash-guard coupling.** Rolling back to a build without leases while the engineering bash-guard lease rules are live makes every merge fail closed. Set `MERGE_LEASE_OK=1` for the orchestrator (fleet-wide if needed) or revert the engineering change until a lease-capable release runs again.
 

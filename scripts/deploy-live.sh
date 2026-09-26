@@ -21,12 +21,15 @@
 #   2  refused before the live service was touched (usage, ref, disk, build,
 #      own tab unknown, drop-in drift)
 #   3  refused by state: quiet timeout, deploy lease held, another deploy running
-#   4  health gate failed and the previous release was restored
+#   4  restart or health gate failed and the previous release was restored
+#
+# From the first link change to the end of the gate or rollback, INT and TERM
+# are deferred, so a signal never leaves the service on an unverified release.
 #
 # Every external binary is injectable: DEPLOY_SYSTEMCTL, DEPLOY_PNPM,
 # DEPLOY_CURL, DEPLOY_TMUX, DEPLOY_PURPLEMUX, DEPLOY_JOURNALCTL, DEPLOY_GIT.
 # Paths: DEPLOY_REPO (primary checkout), DEPLOY_DROPIN, DEPLOY_UNIT_FILE,
-# DEPLOY_CLI_LINK, DEPLOY_SQLITE_MODULE, DEPLOY_PORT. Timing: DEPLOY_POLL_S (15),
+# DEPLOY_CLI_LINK, DEPLOY_SQLITE_MODULE, DEPLOY_PORT, DEPLOY_PROC_ROOT (/proc). Timing: DEPLOY_POLL_S (15),
 # DEPLOY_HEALTH_TIMEOUT_S (90), DEPLOY_HEALTH_INTERVAL_S (3), DEPLOY_MIN_FREE_GIB (5).
 
 set -u
@@ -88,10 +91,12 @@ HEALTH_INTERVAL_S="${DEPLOY_HEALTH_INTERVAL_S:-3}"
 MIN_FREE_GIB="${DEPLOY_MIN_FREE_GIB:-5}"
 HELPERS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/deploy-live-helpers.cjs"
 OWN_TAB="${PMUX_TAB_ID:-}"
+PROC_ROOT="${DEPLOY_PROC_ROOT:-/proc}"
 
 WORK="$(mktemp -d)"
 LEASE_HELD=0
 CLI_DIR=""
+INTERRUPTED=0
 
 S_RELEASE="-"
 S_PREVIOUS="-"
@@ -139,6 +144,7 @@ finish() {
   echo "QUIET=$S_QUIET"
   echo "LEASE=$S_LEASE"
   echo "BACKUP=$S_BACKUP"
+  ((INTERRUPTED)) && echo "INTERRUPTED=deferred until the swap window closed"
   echo "VERDICT=$verdict"
   rm -rf "$WORK"
   exit "$code"
@@ -203,14 +209,32 @@ if ((FIRST_INSTALL)); then
   [[ -n "$LIVE_DIR" ]] || LIVE_DIR="$(dropin_workdir "$UNIT_FILE")"
   [[ -n "$LIVE_DIR" ]] || refuse 2 LIVE-DIR-UNKNOWN "no WorkingDirectory in $DROPIN or $UNIT_FILE" \
     "the directory the service runs today"
+  # A drop-in that already names a release while `current` is gone is a half
+  # finished install; saving it as the rollback target would lose the real one.
+  [[ "$LIVE_DIR" != "$RELEASES" && "$LIVE_DIR" != "$RELEASES/"* ]] || refuse 2 FIRST-INSTALL-STATE \
+    "no $CURRENT but the service runs WorkingDirectory=$LIVE_DIR" \
+    "restore the drop-in from $FIRST_INSTALL_SAVE/drop-in.conf by hand"
+  if [[ -f "$DROPIN" ]]; then
+    old_dropin="$(cat "$DROPIN")"
+    NEW_DROPIN="${old_dropin//"$LIVE_DIR"/"$CURRENT"}"
+  else
+    exec_start="$(sed -n 's/^ExecStart=\(..*\)$/\1/p' "$UNIT_FILE" | tail -n 1)"
+    NEW_DROPIN="$(printf '[Service]\nWorkingDirectory=%s\nExecStart=\nExecStart=%s\n' "$CURRENT" "${exec_start//"$LIVE_DIR"/"$CURRENT"}")"
+  fi
+  if ! grep -qxF "WorkingDirectory=$CURRENT" <<<"$NEW_DROPIN" || [[ $'\n'"$NEW_DROPIN" != *$'\n'"ExecStart=$CURRENT/"* ]]; then
+    refuse 2 DROPIN-REWRITE "the rewritten drop-in does not run $CURRENT: $(tr '\n' ' ' <<<"$NEW_DROPIN")" \
+      "WorkingDirectory=$CURRENT and an ExecStart under $CURRENT/"
+  fi
 else
   running="$(dropin_workdir "$DROPIN")"
   [[ "$running" == "$CURRENT" ]] || refuse 2 DROPIN-DRIFT "$DROPIN WorkingDirectory=${running:-<none>}" \
-    "WorkingDirectory=$CURRENT (a release install); restore the drop-in or run --rollback"
+    "WorkingDirectory=$CURRENT (a release install); restore the drop-in by hand before any deploy or rollback"
 fi
 
 # ---- rollback on demand ----
 
+# Restores the drop-in and CLI link saved by the first install; returns the
+# daemon-reload status.
 rollback_first_install() {
   if [[ -f "$FIRST_INSTALL_SAVE/drop-in.conf" ]]; then
     cp -f "$FIRST_INSTALL_SAVE/drop-in.conf" "$DROPIN.tmp.$$" && mv -f "$DROPIN.tmp.$$" "$DROPIN"
@@ -233,6 +257,8 @@ if ((ROLLBACK)); then
     refuse 2 ROLLBACK-STATE-UNKNOWN "previous=$prev is not a release and $FIRST_INSTALL_SAVE is missing" \
       "the first-install save that restores the drop-in and CLI link"
   fi
+  [[ -f "$prev/.next/standalone/server.js" ]] || refuse 2 ROLLBACK-TARGET-UNBUILT \
+    "no $prev/.next/standalone/server.js" "a built rollback target"
   CLI_DIR="$cur"
   S_RELEASE="$prev"
   S_PREVIOUS="$cur"
@@ -247,7 +273,7 @@ if ((!ROLLBACK)); then
   RELEASE_DIR="$RELEASES/$SHORT"
   CLI_DIR="$RELEASE_DIR"
   S_RELEASE="$RELEASE_DIR"
-  if ((!FIRST_INSTALL)) && [[ "$(readlink -f "$CURRENT")" == "$RELEASE_DIR" ]]; then
+  if ((!FIRST_INSTALL)) && [[ "$(readlink -f "$CURRENT")" == "$(readlink -f "$RELEASE_DIR")" ]]; then
     refuse 2 ALREADY-CURRENT "$CURRENT -> $RELEASE_DIR" "a commit other than the running release"
   fi
 
@@ -278,6 +304,8 @@ TTL_MIN=$(((QUIET_TIMEOUT + 59) / 60 + 15))
 ((TTL_MIN < 30)) && TTL_MIN=30
 ((TTL_MIN > 120)) && TTL_MIN=120
 
+# A rollback must not depend on the lease feature of the release it escapes:
+# only a live holder elsewhere (exit 3) stops it.
 lease_code="$(http_get api/cli/leases "$WORK/leases.json")"
 case "$lease_code" in
   404) S_LEASE="unavailable (server predates leases)" ;;
@@ -294,17 +322,15 @@ case "$lease_code" in
         S_LEASE="held elsewhere"
         finish 3 "lease-held"
       fi
-      refuse 1 LEASE-ACQUIRE-FAILED "lease acquire exited $rc" "exit 0 (acquired) or 3 (held elsewhere)"
+      ((ROLLBACK)) || refuse 1 LEASE-ACQUIRE-FAILED "lease acquire exited $rc" "exit 0 (acquired) or 3 (held elsewhere)"
+      S_LEASE="unavailable (lease acquire exited $rc; rollback proceeds)"
     fi
     ;;
-  000)
-    if ((ROLLBACK)); then
-      S_LEASE="unavailable (server unreachable)"
-    else
-      refuse 1 LEASE-PROBE-FAILED "GET /api/cli/leases unreachable" "HTTP 200 (leases) or 404 (server predates leases)"
-    fi
+  *)
+    ((ROLLBACK)) || refuse 1 LEASE-PROBE-FAILED "GET /api/cli/leases answered HTTP $lease_code (000 = unreachable)" \
+      "HTTP 200 (leases) or 404 (server predates leases)"
+    S_LEASE="unavailable (GET /api/cli/leases HTTP $lease_code; rollback proceeds)"
     ;;
-  *) refuse 1 LEASE-PROBE-FAILED "GET /api/cli/leases answered HTTP $lease_code" "HTTP 200 (leases) or 404 (server predates leases)" ;;
 esac
 
 # ---- quiet wait (read-only) ----
@@ -375,7 +401,9 @@ else
       S_QUIET="quiet"
       break
     fi
-    if ((SECONDS >= deadline)); then
+    # A quiet poll at the deadline earns the confirming poll; the wait is
+    # bounded by one extra interval.
+    if ((SECONDS >= deadline && quiet_polls == 0)); then
       [[ -n "$LIST_ERROR" ]] && echo "tab list unreadable: $LIST_ERROR" >&2
       print_midturn
       blockers="$(wc -l <"$WORK/midturn.tsv")"
@@ -412,30 +440,60 @@ backup_state() {
 backup_state "${SHORT:-rollback}" || refuse 1 BACKUP-FAILED "backup into $BACKUPS failed" \
   "a copy of $PMUX_HOME/*.json and mission-control.sqlite before the restart"
 
-# ---- swap and restart ----
+# ---- swap, restart, health gate ----
 
-"$TMUX_BIN" -L purple list-sessions -F '#{session_name}' 2>/dev/null | sort -u >"$WORK/sessions.before" || true
+# Session names; "no server" is an empty list, any other failure is an error.
+list_sessions() {
+  if "$TMUX_BIN" -L purple list-sessions -F '#{session_name}' 2>"$WORK/tmux.err" | sort -u >"$1"; then
+    return 0
+  fi
+  if grep -qiE 'no server running|error connecting' "$WORK/tmux.err"; then
+    : >"$1"
+    return 0
+  fi
+  SESSIONS_ERROR="tmux list-sessions failed: $(tr '\n' ' ' <"$WORK/tmux.err")"
+  return 1
+}
 
-OLD_CURRENT="$(link_target "$CURRENT")"
-OLD_PREVIOUS="$(link_target "$PREVIOUS")"
+main_pid() { "$SYSTEMCTL" --user show -p MainPID --value "$SERVICE" 2>/dev/null | head -n 1; }
 
-restart_service() { "$SYSTEMCTL" --user restart "$SERVICE"; }
+list_sessions "$WORK/sessions.before" || refuse 1 SESSIONS-UNREADABLE "$SESSIONS_ERROR" \
+  "the tmux session names before the restart (the health gate compares them)"
 
+# health_gate EXPECTED_DIR PID_BEFORE: a new MainPID running in EXPECTED_DIR,
+# /api/health, every pre-restart session name, a workspace-token tab list.
 health_gate() {
-  local deadline=$((SECONDS + HEALTH_TIMEOUT_S)) code app missing kept before reason ws_token ws token
+  local expected="$1" pid_before="$2" deadline=$((SECONDS + HEALTH_TIMEOUT_S))
+  local pid cwd code app missing before reason ws_token ws token tablist
   before="$(wc -l <"$WORK/sessions.before")"
   while :; do
     reason=""
-    code="$(http_get api/health "$WORK/health.json")"
-    app="$(helper field "$WORK/health.json" app 2>/dev/null)"
-    [[ "$code" == 200 && "$app" == purplemux ]] || reason="GET /api/health: HTTP $code app=${app:-<none>}"
-    "$TMUX_BIN" -L purple list-sessions -F '#{session_name}' 2>/dev/null | sort -u >"$WORK/sessions.after" || true
-    comm -23 "$WORK/sessions.before" "$WORK/sessions.after" >"$WORK/sessions.missing"
-    missing="$(wc -l <"$WORK/sessions.missing")"
-    kept=$((before - missing))
-    S_SESSIONS="$kept/$before"
-    if [[ -z "$reason" ]] && ((missing > 0)); then
-      reason="$missing tmux session(s) missing after the restart"
+    tablist=""
+    pid="$(main_pid)"
+    if [[ -z "$pid" || "$pid" == 0 ]]; then
+      reason="no MainPID for $SERVICE"
+    elif [[ "$pid" == "$pid_before" ]]; then
+      reason="MainPID $pid unchanged by the restart"
+    else
+      cwd="$(readlink -f "$PROC_ROOT/$pid/cwd" 2>/dev/null)"
+      [[ "$cwd" == "$expected" ]] || reason="MainPID $pid runs in ${cwd:-<unreadable>}, expected $expected"
+    fi
+    if [[ -z "$reason" ]]; then
+      code="$(http_get api/health "$WORK/health.json")"
+      app="$(helper field "$WORK/health.json" app 2>/dev/null)"
+      [[ "$code" == 200 && "$app" == purplemux ]] || reason="GET /api/health: HTTP $code app=${app:-<none>}"
+    fi
+    if list_sessions "$WORK/sessions.after"; then
+      comm -23 "$WORK/sessions.before" "$WORK/sessions.after" >"$WORK/sessions.missing"
+      missing="$(wc -l <"$WORK/sessions.missing")"
+      S_SESSIONS="$((before - missing))/$before"
+      if [[ -z "$reason" ]] && ((missing > 0)); then
+        reason="$missing tmux session(s) missing after the restart"
+      fi
+    else
+      : >"$WORK/sessions.missing"
+      S_SESSIONS="unreadable/$before"
+      [[ -n "$reason" ]] || reason="$SESSIONS_ERROR"
     fi
     if [[ -z "$reason" ]]; then
       ws_token="$(helper ws-token "$WORK/tabs.json" "$PMUX_HOME/workspace-tokens.json")"
@@ -444,10 +502,12 @@ health_gate() {
         token="${ws_token#*$'\t'}"
         token_cli "$token" tab list -w "$ws" >/dev/null 2>"$WORK/tablist.err" \
           || reason="workspace-token tab list failed: $(tr '\n' ' ' <"$WORK/tablist.err")"
+      else
+        tablist=" (tab-list skipped: no workspace token)"
       fi
     fi
     if [[ -z "$reason" ]]; then
-      HEALTH_RESULT="pass"
+      HEALTH_RESULT="pass$tablist"
       return 0
     fi
     if ((SECONDS >= deadline)); then
@@ -459,20 +519,39 @@ health_gate() {
   done
 }
 
+# restart_and_gate EXPECTED_DIR: a restart that systemctl refuses is a failed gate.
+restart_and_gate() {
+  local pid_before
+  pid_before="$(main_pid)"
+  if ! "$SYSTEMCTL" --user restart "$SERVICE"; then
+    HEALTH_RESULT="fail (systemctl --user restart $SERVICE exited non-zero)"
+    return 1
+  fi
+  health_gate "$1" "$pid_before"
+}
+
 print_journal() {
   echo "---- journalctl --user -u purplemux -n 80 ----" >&2
   "$JOURNALCTL" --user -u purplemux -n 80 --no-pager >&2 2>&1 || true
 }
 
+OLD_CURRENT="$(link_target "$CURRENT")"
+OLD_PREVIOUS="$(link_target "$PREVIOUS")"
+
+# From here to the verdict a signal would strand the service on an unverified
+# release, so INT and TERM wait for the gate or the rollback.
+trap 'INTERRUPTED=1; echo "deploy-live: signal deferred until the health gate or rollback finishes" >&2' INT TERM
+
 if ((ROLLBACK)); then
+  back_dir="$(readlink -f "$prev")"
+  rolled=1
   if [[ "$prev" == "$RELEASES/"* ]]; then
     swap_link "$prev" "$CURRENT"
     swap_link "$cur" "$PREVIOUS"
   else
-    rollback_first_install
+    rollback_first_install || { HEALTH_RESULT="fail (systemctl --user daemon-reload exited non-zero)"; rolled=0; }
   fi
-  restart_service
-  if health_gate; then
+  if ((rolled)) && restart_and_gate "$back_dir"; then
     S_HEALTH="$HEALTH_RESULT"
     finish 0 "rolled-back"
   fi
@@ -487,39 +566,43 @@ if ((FIRST_INSTALL)); then
   [[ -f "$DROPIN" ]] && cp -p "$DROPIN" "$FIRST_INSTALL_SAVE/drop-in.conf"
   if [[ -L "$CLI_LINK" ]]; then readlink "$CLI_LINK" >"$FIRST_INSTALL_SAVE/cli-link-target"; else : >"$FIRST_INSTALL_SAVE/cli-link-target"; fi
   swap_link "$LIVE_DIR" "$PREVIOUS"
-  if [[ -f "$DROPIN" ]]; then
-    old_dropin="$(cat "$DROPIN")"
-    new_dropin="${old_dropin//"$LIVE_DIR"/"$CURRENT"}"
+  mkdir -p "$(dirname "$DROPIN")"
+  write_file_atomic "$NEW_DROPIN" "$DROPIN"
+  if [[ -f "$FIRST_INSTALL_SAVE/drop-in.conf" ]]; then
+    diff -u "$FIRST_INSTALL_SAVE/drop-in.conf" "$DROPIN"
   else
-    exec_start="$(sed -n 's/^ExecStart=\(..*\)$/\1/p' "$UNIT_FILE" | tail -n 1)"
-    new_dropin="$(printf '[Service]\nWorkingDirectory=%s\nExecStart=\nExecStart=%s\n' "$CURRENT" "${exec_start//"$LIVE_DIR"/"$CURRENT"}")"
-    mkdir -p "$(dirname "$DROPIN")"
+    diff -u /dev/null "$DROPIN"
   fi
-  write_file_atomic "$new_dropin" "$DROPIN"
-  diff -u "$FIRST_INSTALL_SAVE/drop-in.conf" "$DROPIN" 2>/dev/null || diff -u /dev/null "$DROPIN"
+  back_dir="$(readlink -f "$LIVE_DIR")"
 else
   swap_link "$OLD_CURRENT" "$PREVIOUS"
+  back_dir="$(readlink -f "$OLD_CURRENT")"
 fi
 S_PREVIOUS="$(link_target "$PREVIOUS")"
 swap_link "$RELEASE_DIR" "$CURRENT"
 mkdir -p "$(dirname "$CLI_LINK")"
 swap_link "$CURRENT/bin/purplemux.js" "$CLI_LINK"
-((FIRST_INSTALL)) && "$SYSTEMCTL" --user daemon-reload
-restart_service
 
-# ---- health gate and rollback ----
+deployed=1
+if ((FIRST_INSTALL)) && ! "$SYSTEMCTL" --user daemon-reload; then
+  HEALTH_RESULT="fail (systemctl --user daemon-reload exited non-zero)"
+  deployed=0
+fi
+((deployed)) && { restart_and_gate "$(readlink -f "$RELEASE_DIR")" || deployed=0; }
 
-if ! health_gate; then
+# ---- rollback: restore the links exactly as they were before this run ----
+
+if ((!deployed)); then
   S_HEALTH="$HEALTH_RESULT"
   deploy_sessions="$S_SESSIONS"
+  rolled=1
   if ((FIRST_INSTALL)); then
-    rollback_first_install
+    rollback_first_install || { HEALTH_RESULT="fail (systemctl --user daemon-reload exited non-zero)"; rolled=0; }
   else
     swap_link "$OLD_CURRENT" "$CURRENT"
     if [[ -n "$OLD_PREVIOUS" ]]; then swap_link "$OLD_PREVIOUS" "$PREVIOUS"; else rm -f "$PREVIOUS"; fi
   fi
-  restart_service
-  if health_gate; then S_ROLLBACK_HEALTH="pass"; else S_ROLLBACK_HEALTH="$HEALTH_RESULT"; fi
+  if ((rolled)) && restart_and_gate "$back_dir"; then S_ROLLBACK_HEALTH="pass"; else S_ROLLBACK_HEALTH="$HEALTH_RESULT"; fi
   S_SESSIONS="$deploy_sessions"
   S_PREVIOUS="${OLD_PREVIOUS:--}"
   print_journal
@@ -534,7 +617,8 @@ keep_previous="$(readlink -f "$PREVIOUS")"
 for dir in "$RELEASES"/*; do
   name="${dir##*/}"
   [[ -d "$dir" && ! -L "$dir" && "$name" =~ ^[0-9a-f]{7,40}$ ]] || continue
-  [[ "$dir" == "$keep_current" || "$dir" == "$keep_previous" ]] && continue
+  real="$(readlink -f "$dir")"
+  [[ "$real" == "$keep_current" || "$real" == "$keep_previous" ]] && continue
   if "$GIT" -C "$REPO" worktree remove --force "$dir" >/dev/null 2>&1; then
     echo "PRUNED $dir"
   else

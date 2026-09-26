@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,11 +10,25 @@ const SCRIPT = path.resolve(__dirname, '../../../scripts/deploy-live.sh');
 const SQLITE_MODULE = createRequire(import.meta.url).resolve('better-sqlite3');
 
 const FAKES: Record<string, string> = {
+  // Simulates systemd: a restart starts a new MainPID whose cwd is the drop-in's
+  // resolved WorkingDirectory; switch files make one restart fail, do nothing,
+  // or deliver SIGTERM to the deploy script.
   systemctl: `#!/usr/bin/env bash
 echo "$*" >> "$FAKE_STATE/systemctl.log"
+if [[ " $* " == *" show "* ]]; then cat "$FAKE_STATE/mainpid"; exit 0; fi
+if [[ " $* " == *" daemon-reload "* ]]; then [[ -e "$FAKE_STATE/reload-fail" ]] && exit 1; exit 0; fi
 if [[ " $* " == *" restart "* ]]; then
-  n=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0)
-  echo $((n + 1)) > "$FAKE_STATE/restarts"
+  n=$(( $(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$FAKE_STATE/restarts"
+  [[ -e "$FAKE_STATE/term-on-restart.$n" ]] && kill -TERM "$PPID"
+  [[ -e "$FAKE_STATE/restart-fail.$n" ]] && exit 1
+  [[ -e "$FAKE_STATE/restart-noop.$n" ]] && exit 0
+  pid=$((1000 + n))
+  echo "$pid" > "$FAKE_STATE/mainpid"
+  wd=$(sed -n 's/^WorkingDirectory=//p' "$HOME/.config/systemd/user/purplemux.service.d/50-mission-control.conf" | tail -n 1)
+  [[ -e "$FAKE_STATE/stale-cwd.$n" ]] && wd="$FAKE_STATE"
+  mkdir -p "$DEPLOY_PROC_ROOT/$pid"
+  ln -sfn "$(readlink -f "$wd")" "$DEPLOY_PROC_ROOT/$pid/cwd"
 fi
 exit 0
 `,
@@ -52,6 +66,7 @@ exit 0
 `,
   tmux: `#!/usr/bin/env bash
 n=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0)
+if [[ -f "$FAKE_STATE/tmux-error.$n" ]]; then cat "$FAKE_STATE/tmux-error.$n" >&2; exit 1; fi
 file="$FAKE_STATE/sessions.$n"
 [[ -f "$file" ]] || file="$FAKE_STATE/sessions"
 cat "$file"
@@ -64,7 +79,10 @@ case "$1 $2" in
     [[ "$code" == 3 ]] && echo '{"error":"lease held","holder":{"tabName":"other-orch"}}' >&2
     exit "$code" ;;
   "lease release") exit 0 ;;
-  "tab list") echo '{"tabs":[]}'; exit 0 ;;
+  "tab list")
+    n=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0)
+    [[ -e "$FAKE_STATE/tablist-fail.$n" ]] && { echo "error: Forbidden" >&2; exit 3; }
+    echo '{"tabs":[]}'; exit 0 ;;
 esac
 exit 0
 `,
@@ -92,6 +110,7 @@ interface IHarness {
   setSessions: (names: string[], phase?: number) => void;
   run: (args: string[], extraEnv?: TEnv) => { status: number | null; out: string };
   log: (name: string) => string;
+  flag: (name: string, content?: string) => void;
 }
 
 const routeKey = (route: string) => route.replace(/[^A-Za-z0-9]/g, '_');
@@ -102,9 +121,11 @@ const git = (cwd: string, ...args: string[]) => {
   return result.stdout.trim();
 };
 
-const makeHarness = (): IHarness => {
+const makeHarness = (options: { homeViaSymlink?: boolean } = {}): IHarness => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-live-'));
-  const home = path.join(root, 'home');
+  const realHome = path.join(root, 'home');
+  const home = options.homeViaSymlink ? path.join(root, 'home-link') : realHome;
+  const proc = path.join(root, 'proc');
   const state = path.join(root, 'state');
   const bin = path.join(root, 'bin');
   const repo = path.join(root, 'repo');
@@ -113,9 +134,14 @@ const makeHarness = (): IHarness => {
   const unitDir = path.join(home, '.config', 'systemd', 'user');
   const dropIn = path.join(unitDir, 'purplemux.service.d', '50-mission-control.conf');
   const cliLink = path.join(home, '.local', 'bin', 'purplemux');
-  for (const dir of [state, bin, repo, path.join(liveDir, 'bin'), pmuxDir, path.dirname(dropIn), path.dirname(cliLink)]) {
+  fs.mkdirSync(realHome, { recursive: true });
+  if (options.homeViaSymlink) fs.symlinkSync(realHome, home);
+  for (const dir of [state, bin, repo, path.join(liveDir, 'bin'), path.join(liveDir, '.next', 'standalone'), pmuxDir, path.dirname(dropIn), path.dirname(cliLink), path.join(proc, '100')]) {
     fs.mkdirSync(dir, { recursive: true });
   }
+  fs.writeFileSync(path.join(liveDir, '.next', 'standalone', 'server.js'), '');
+  fs.writeFileSync(path.join(state, 'mainpid'), '100\n');
+  fs.symlinkSync(liveDir, path.join(proc, '100', 'cwd'));
   for (const [name, body] of Object.entries(FAKES)) {
     fs.writeFileSync(path.join(bin, name), body, { mode: 0o755 });
   }
@@ -179,6 +205,7 @@ const makeHarness = (): IHarness => {
       DEPLOY_PURPLEMUX: path.join(bin, 'purplemux'),
       DEPLOY_JOURNALCTL: path.join(bin, 'journalctl'),
       DEPLOY_SQLITE_MODULE: SQLITE_MODULE,
+      DEPLOY_PROC_ROOT: proc,
       DEPLOY_POLL_S: '0.05',
       DEPLOY_HEALTH_INTERVAL_S: '0.05',
       DEPLOY_HEALTH_TIMEOUT_S: '1',
@@ -196,6 +223,7 @@ const makeHarness = (): IHarness => {
       const result = spawnSync('bash', [SCRIPT, ...args], { env: env as NodeJS.ProcessEnv, encoding: 'utf-8', timeout: 60_000 });
       return { status: result.status, out: `${result.stdout}\n${result.stderr}` };
     },
+    flag: (name, content = '') => fs.writeFileSync(path.join(state, name), content),
     log: (name) => {
       const file = path.join(state, `${name}.log`);
       return fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
@@ -546,6 +574,221 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     expect(link(h.cliLink)).toBe(path.join(h.liveDir, 'bin', 'purplemux.js'));
     expect(link(path.join(h.releases, 'current'))).toBeNull();
     expect(link(path.join(h.releases, 'previous'))).toBeNull();
+  });
+
+  it('--rollback proceeds when the release it escapes has a broken lease route or lease CLI', () => {
+    const first = h.sha();
+    expect(h.run([first]).status).toBe(0);
+    expect(h.run([h.commit('second')]).status).toBe(0);
+    h.setHttp('api/cli/leases', 500, { error: 'lease store corrupt' });
+    const probe = h.run(['--rollback']);
+    expect(probe.status, probe.out).toBe(0);
+    expect(field(probe.out, 'LEASE')).toBe('unavailable (GET /api/cli/leases HTTP 500; rollback proceeds)');
+    expect(link(path.join(h.releases, 'current'))).toBe(path.join(h.releases, first.slice(0, 12)));
+
+    h.setHttp('api/cli/leases', 200, { leases: [] });
+    h.flag('lease-acquire-exit', '1');
+    const acquire = h.run(['--rollback']);
+    expect(acquire.status, acquire.out).toBe(0);
+    expect(field(acquire.out, 'LEASE')).toBe('unavailable (lease acquire exited 1; rollback proceeds)');
+  });
+
+  it('a lease acquire failure other than held exits 1 before anything restarts', () => {
+    h.flag('lease-acquire-exit', '1');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(1);
+    expect(out).toContain('REFUSED LEASE-ACQUIRE-FAILED');
+    expect(restarts(h)).toBe(0);
+  });
+
+  it('a restart that systemctl refuses rolls back', () => {
+    h.flag('restart-fail.1');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(4);
+    expect(field(out, 'HEALTH')).toBe('fail (systemctl --user restart purplemux.service exited non-zero)');
+    expect(field(out, 'ROLLBACK_HEALTH')).toBe('pass');
+    expect(link(path.join(h.releases, 'current'))).toBeNull();
+  });
+
+  it('a failed daemon-reload on the first install rolls back without restarting the new release', () => {
+    h.flag('reload-fail');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(4);
+    expect(field(out, 'HEALTH')).toBe('fail (systemctl --user daemon-reload exited non-zero)');
+    expect(restarts(h)).toBe(0);
+    expect(link(h.cliLink)).toBe(path.join(h.liveDir, 'bin', 'purplemux.js'));
+  });
+
+  it('health fails when the restart leaves the old MainPID or the process runs another directory', () => {
+    h.flag('restart-noop.1');
+    const noop = h.run([h.sha()]);
+    expect(noop.status, noop.out).toBe(4);
+    expect(field(noop.out, 'HEALTH')).toBe('fail (MainPID 100 unchanged by the restart)');
+
+    const other = makeHarness();
+    try {
+      other.flag('stale-cwd.1');
+      const stale = other.run([other.sha()]);
+      expect(stale.status, stale.out).toBe(4);
+      expect(field(stale.out, 'HEALTH')).toMatch(/^fail \(MainPID 1001 runs in .*, expected .*releases\/[0-9a-f]{12}\)$/);
+      expect(field(stale.out, 'ROLLBACK_HEALTH')).toBe('pass');
+    } finally {
+      fs.rmSync(other.root, { recursive: true, force: true });
+    }
+  });
+
+  it('a failing workspace-token tab list after the restart fails health', () => {
+    h.flag('tablist-fail.1');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(4);
+    expect(field(out, 'HEALTH')).toMatch(/^fail \(workspace-token tab list failed: error: Forbidden/);
+  });
+
+  it('reports a skipped tab-list check when no workspace token exists', () => {
+    fs.writeFileSync(path.join(h.home, '.purplemux', 'workspace-tokens.json'), '{}');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(0);
+    expect(field(out, 'HEALTH')).toBe('pass (tab-list skipped: no workspace token)');
+    expect(h.log('purplemux')).not.toContain('tab list');
+  });
+
+  it('a later install that fails health restores the exact pre-deploy current and previous', () => {
+    const first = h.sha();
+    expect(h.run([first]).status).toBe(0);
+    const second = h.commit('second');
+    expect(h.run([second]).status).toBe(0);
+    const third = h.commit('third');
+    h.setHttp('api/health', 503, 'down', 3);
+    const { status, out } = h.run([third]);
+    expect(status, out).toBe(4);
+    expect(link(path.join(h.releases, 'current'))).toBe(path.join(h.releases, second.slice(0, 12)));
+    expect(link(path.join(h.releases, 'previous'))).toBe(path.join(h.releases, first.slice(0, 12)));
+    expect(field(out, 'PREVIOUS')).toBe(path.join(h.releases, first.slice(0, 12)));
+  });
+
+  it('a signal during the swap window is deferred until the gate finishes', () => {
+    h.flag('term-on-restart.1');
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(0);
+    expect(field(out, 'VERDICT')).toBe('deployed');
+    expect(field(out, 'INTERRUPTED')).toBe('deferred until the swap window closed');
+    expect(out).toContain('signal deferred until the health gate or rollback finishes');
+  });
+
+  it('prints the first-install drop-in diff once', () => {
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(0);
+    expect(out.match(/^\+WorkingDirectory=/gm)).toHaveLength(1);
+  });
+
+  it('refuses a first install when the drop-in already names a release but current is gone', () => {
+    fs.writeFileSync(h.dropIn, `[Service]\nWorkingDirectory=${path.join(h.releases, 'current')}\n`);
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(2);
+    expect(out).toContain('REFUSED FIRST-INSTALL-STATE');
+    expect(h.log('pnpm')).toBe('');
+  });
+
+  it('refuses a first install whose rewritten drop-in would not run releases/current', () => {
+    fs.writeFileSync(h.dropIn, `[Service]\nWorkingDirectory=${h.liveDir}\nExecStart=\nExecStart=/opt/other/tsx server.ts\n`);
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(2);
+    expect(out).toContain('REFUSED DROPIN-REWRITE');
+  });
+
+  it('--quiet-timeout 0 still deploys when every poll is quiet', () => {
+    const { status, out } = h.run([h.sha(), '--quiet-timeout', '0']);
+    expect(status, out).toBe(0);
+    expect(field(out, 'QUIET')).toBe('quiet');
+  });
+
+  it('a tmux list failure other than "no server" refuses before the swap; no server is an empty list', () => {
+    h.flag('tmux-error.0', 'permission denied on socket');
+    const failed = h.run([h.sha()]);
+    expect(failed.status, failed.out).toBe(1);
+    expect(failed.out).toContain('REFUSED SESSIONS-UNREADABLE');
+    expect(restarts(h)).toBe(0);
+
+    const other = makeHarness();
+    try {
+      other.flag('tmux-error.0', 'no server running on /tmp/tmux-1000/purple');
+      const empty = other.run([other.sha()]);
+      expect(empty.status, empty.out).toBe(0);
+      expect(field(empty.out, 'SESSIONS')).toBe('0/0');
+    } finally {
+      fs.rmSync(other.root, { recursive: true, force: true });
+    }
+  });
+
+  it('a backup failure refuses before the swap and releases the lease', () => {
+    fs.writeFileSync(path.join(h.home, '.purplemux', 'mission-control.sqlite'), '');
+    const { status, out } = h.run([h.sha()], { DEPLOY_SQLITE_MODULE: path.join(h.root, 'no-such-module') });
+    expect(status, out).toBe(1);
+    expect(out).toContain('REFUSED BACKUP-FAILED');
+    expect(field(out, 'LEASE')).toBe('acquired, released');
+    expect(restarts(h)).toBe(0);
+  });
+
+  it('refuses a release directory that is not a worktree at the ref', () => {
+    fs.mkdirSync(path.join(h.releases, h.sha().slice(0, 12)), { recursive: true });
+    const { status, out } = h.run([h.sha()]);
+    expect(status, out).toBe(2);
+    expect(out).toContain('REFUSED RELEASE-DIR-CONFLICT');
+  });
+
+  it('refuses while another deploy holds the lock', () => {
+    const lock = path.join(h.home, '.purplemux', 'deploy-live.lock');
+    const holder = spawn('flock', [lock, 'sleep', '30'], { stdio: 'ignore' });
+    try {
+      for (let i = 0; i < 100 && spawnSync('flock', ['-n', lock, 'true']).status === 0; i += 1) {
+        spawnSync('sleep', ['0.05']);
+      }
+      const { status, out } = h.run([h.sha()]);
+      expect(status, out).toBe(3);
+      expect(out).toContain('REFUSED DEPLOY-RUNNING');
+    } finally {
+      holder.kill('SIGKILL');
+    }
+  });
+
+  it('--rollback refuses without both links, without the first-install save, or with an unbuilt target', () => {
+    const none = h.run(['--rollback']);
+    expect(none.status, none.out).toBe(2);
+    expect(none.out).toContain('REFUSED NOTHING-TO-ROLL-BACK');
+
+    expect(h.run([h.sha()]).status).toBe(0);
+    fs.rmSync(path.join(h.releases, 'first-install-rollback'), { recursive: true });
+    const unknown = h.run(['--rollback']);
+    expect(unknown.status, unknown.out).toBe(2);
+    expect(unknown.out).toContain('REFUSED ROLLBACK-STATE-UNKNOWN');
+
+    const other = makeHarness();
+    try {
+      expect(other.run([other.sha()]).status).toBe(0);
+      fs.rmSync(path.join(other.liveDir, '.next'), { recursive: true });
+      const unbuilt = other.run(['--rollback']);
+      expect(unbuilt.status, unbuilt.out).toBe(2);
+      expect(unbuilt.out).toContain('REFUSED ROLLBACK-TARGET-UNBUILT');
+    } finally {
+      fs.rmSync(other.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rotation compares resolved paths, so a symlinked HOME never prunes the running release', () => {
+    const linked = makeHarness({ homeViaSymlink: true });
+    try {
+      expect(linked.run([linked.sha()]).status).toBe(0);
+      const second = linked.commit('second');
+      expect(linked.run([second]).status).toBe(0);
+      const third = linked.commit('third');
+      const { status, out } = linked.run([third]);
+      expect(status, out).toBe(0);
+      expect(fs.existsSync(path.join(linked.releases, third.slice(0, 12)))).toBe(true);
+      expect(fs.existsSync(path.join(linked.releases, second.slice(0, 12)))).toBe(true);
+      expect(out.match(/^PRUNED /gm)).toHaveLength(1);
+    } finally {
+      fs.rmSync(linked.root, { recursive: true, force: true });
+    }
   });
 
   it('prints usage and exits 2 on unknown options', () => {
