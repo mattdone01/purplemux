@@ -22,11 +22,13 @@ export const HOST_SIGNALS_OUTPUT_MAX_BYTES = 256 * 1024;
 export const HOST_SIGNALS_KILL_GRACE_MS = 2 * 1000;
 /** The latest valid stamp `new Date()` can render (ECMAScript time value limit). */
 const MAX_TIME_VALUE = 8.64e15;
+/** 2001-09-09 in epoch ms: a smaller stamp is epoch SECONDS, which would render as January 1970. */
+const MIN_EPOCH_MS = 1e12;
 
 /** Unknown keys are ignored; a missing required key is a validation error. */
 export const HOST_SIGNALS_SCHEMA = z.object({
   schemaVersion: z.literal(1),
-  stampedAt: z.number().int().positive().max(MAX_TIME_VALUE, 'must be epoch milliseconds'),
+  stampedAt: z.number().int().min(MIN_EPOCH_MS, 'must be epoch milliseconds').max(MAX_TIME_VALUE, 'must be epoch milliseconds'),
   gateSlots: z.object({
     total: z.number().int().nonnegative(),
     held: z.number().int().nonnegative(),
@@ -120,7 +122,11 @@ export const runShellBounded = (command: string, limits: IShellLimits): Promise<
       }
     };
     const stop = (why: string) => {
+      if (settled) return;
       signalGroup('SIGTERM');
+      // Release our ends of the pipes: a grandchild that left the group must not hold them open.
+      child.stdout.destroy();
+      child.stderr.destroy();
       setTimeout(() => signalGroup('SIGKILL'), limits.graceMs).unref?.();
       finish({ error: why });
     };

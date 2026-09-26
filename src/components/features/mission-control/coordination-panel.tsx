@@ -34,6 +34,8 @@ const HELD_LABEL: Record<string, string> = {
   'composer-not-ready': 'composer not ready',
   'composer-unreadable': 'composer unreadable',
   'composer-not-empty': 'composer not empty',
+  // inbox-store: a notice that expired with no refusal at all.
+  'never ready': 'target never ready',
 };
 
 /** A served token through its label map: an unmapped one reads "other", never the raw token. */
@@ -42,9 +44,11 @@ const label = (map: Record<string, string>, token: string): string => (Object.ha
 /** A held reason reads as its label plus the served detail (`: <message>`, `(N refusals)`); never the bare token. */
 export const heldReasonLabel = (reason: string | null): string => {
   if (!reason) return 'held';
-  const match = /^([a-z][a-z-]*)([\s\S]*)$/.exec(reason);
+  // The token is the text before the first ':' or ' (' ("never ready" has a space).
+  const match = /^([a-z][a-z -]*?)((?::| \()[\s\S]*)?$/.exec(reason);
   if (!match) return `other: ${reason}`;
-  const detail = match[2].startsWith(':') ? `: ${match[2].slice(1)}` : match[2];
+  const rest = match[2] ?? '';
+  const detail = rest.startsWith(':') ? `: ${rest.slice(1)}` : rest;
   return `${label(HELD_LABEL, match[1])}${detail}`;
 };
 
@@ -222,7 +226,8 @@ const CoordinationPanel = () => {
   return (
     <section className="space-y-3" aria-labelledby="coordination-heading">
       <h2 id="coordination-heading" className="text-sm font-semibold">Coordination</h2>
-      <CoordinationErrorBoundary>
+      {/* Keyed on the snapshot: a new poll clears a render error without a Retry click. */}
+      <CoordinationErrorBoundary key={snapshot?.at ?? 'none'}>
         <CoordinationPanelView snapshot={snapshot} error={error} loading={loading} />
       </CoordinationErrorBoundary>
     </section>

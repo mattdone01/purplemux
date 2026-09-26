@@ -4,7 +4,7 @@ import type { GetServerSideProps } from 'next';
 import { SWRConfig } from 'swr';
 import os from 'os';
 import { getWorkspaces, createWorkspace } from '@/lib/workspace-store';
-import { getConfig } from '@/lib/config-store';
+import { clientSafeConfig, getConfig } from '@/lib/config-store';
 import { readQuickPrompts } from '@/lib/quick-prompts-store';
 import type { IQuickPromptsData } from '@/lib/quick-prompts-store';
 import { readSidebarItems } from '@/lib/sidebar-items-store';
@@ -75,11 +75,11 @@ export const getServerSideProps: GetServerSideProps<IIndexProps> = async (contex
       data.workspaces.push(ws);
     }
 
-    const { authPassword, authSecret: _, ...safeConfig } = configData;
+    const { safe: safeConfig, hasAuthPassword } = clientSafeConfig(configData);
     const hostEnvLocked = typeof process.env.HOST === 'string' && process.env.HOST.trim().length > 0;
     const { isBoundToLocalhostOnly } = await import('@/lib/access-filter');
     const bindHostIsLocal = isBoundToLocalhostOnly();
-    return { props: { initialWorkspace: data, initialConfig: { ...safeConfig, hasAuthPassword: !!authPassword, hostEnvLocked, bindHostIsLocal }, initialQuickPrompts: quickPrompts, initialSidebarItems: sidebarItems, messages } };
+    return { props: { initialWorkspace: data, initialConfig: { ...safeConfig, hasAuthPassword, hostEnvLocked, bindHostIsLocal }, initialQuickPrompts: quickPrompts, initialSidebarItems: sidebarItems, messages } };
   });
 
 export default Index;

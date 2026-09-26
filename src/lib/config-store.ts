@@ -77,6 +77,16 @@ const emptyConfig = (): IConfigData => ({
   updatedAt: new Date().toISOString(),
 });
 
+/**
+ * The config a browser may see: never the password hash, the session secret or
+ * the host-signal command (story 20: it may carry a path or an argument not meant
+ * for the page). The one helper for every place that serves config to a client.
+ */
+export const clientSafeConfig = (config: IConfigData): { safe: Omit<IConfigData, 'authPassword' | 'authSecret' | 'hostSignalCommand'>; hasAuthPassword: boolean } => {
+  const { authPassword, authSecret: _authSecret, hostSignalCommand: _hostSignalCommand, ...safe } = config;
+  return { safe, hasAuthPassword: !!authPassword };
+};
+
 export const readConfig = async (): Promise<IConfigData | null> => {
   try {
     const raw = await fs.readFile(CONFIG_FILE, 'utf-8');

@@ -23,3 +23,22 @@ describe('GET /api/config', () => {
     expect(state.body).not.toHaveProperty('authSecret');
   });
 });
+
+describe('clientSafeConfig (the page props and GET /api/config share it)', () => {
+  it('drops the password hash, the secret and the host-signal command', async () => {
+    const { clientSafeConfig } = await vi.importActual<typeof import('@/lib/config-store')>('@/lib/config-store');
+    const { safe, hasAuthPassword } = clientSafeConfig({ authPassword: 'scrypt:x', authSecret: 's', hostSignalCommand: 'cmd --token abc', locale: 'en', updatedAt: 't' });
+    expect(hasAuthPassword).toBe(true);
+    expect(safe).toEqual({ locale: 'en', updatedAt: 't' });
+    expect(clientSafeConfig({ updatedAt: 't' }).hasAuthPassword).toBe(false);
+  });
+
+  it('the index page serves config through it (no second stripping site)', async () => {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const page = await fs.readFile(path.resolve(__dirname, '../../../src/pages/index.tsx'), 'utf-8');
+    expect(page).toContain('clientSafeConfig(configData)');
+    expect(page).not.toMatch(/authSecret:\s*_/);
+  });
+});
+

@@ -128,6 +128,8 @@ describe('coordination panel', () => {
     expect(heldReasonLabel('brand-new-reason (8 refusals)')).toBe('other (8 refusals)');
     expect(heldReasonLabel('Weird Reason')).toBe('other: Weird Reason');
     expect(heldReasonLabel(null)).toBe('held');
+    // The exact string inbox-store holds for a notice that expired with no refusal (story 20 r2 N1).
+    expect(heldReasonLabel('never ready (undelivered after 24 h)')).toBe('target never ready (undelivered after 24 h)');
     const snap = empty();
     snap.inboxHeld = { ok: true, items: [{ id: 'i-1', kind: 'note', targetWorkspaceId: 'ws-1', targetTabId: 'tab-a', heldReason: 'target-not-agent' }] } as unknown as ICoordinationSnapshot['inboxHeld'];
     expect(render(snap)).toMatch(/data-held="i-1".*?target is not an agent tab/);

@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { getConfig, updateConfig, hashPassword, generateSecret } from '@/lib/config-store';
+import { clientSafeConfig, getConfig, updateConfig, hashPassword, generateSecret } from '@/lib/config-store';
 import type { IConfigData } from '@/lib/config-store';
 import type { TNetworkAccess } from '@/lib/network-access';
 import { isBoundToLocalhostOnly, updateAccessFromConfig } from '@/lib/access-filter';
@@ -30,12 +30,11 @@ const isValidToastDuration = (value: unknown): value is number =>
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'GET') {
-    // The host-signal command stays server-side (story 20): it may carry a path or an argument not meant for the page.
-    const { authPassword, authSecret: _, hostSignalCommand: _hostSignalCommand, ...safe } = await getConfig();
+    const { safe, hasAuthPassword } = clientSafeConfig(await getConfig());
     const hostEnvLocked = typeof process.env.HOST === 'string' && process.env.HOST.trim().length > 0;
     return res.status(200).json({
       ...safe,
-      hasAuthPassword: !!authPassword,
+      hasAuthPassword,
       hostEnvLocked,
       bindHostIsLocal: isBoundToLocalhostOnly(),
     });

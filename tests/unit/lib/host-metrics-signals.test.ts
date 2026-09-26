@@ -91,6 +91,7 @@ describe('host signals', () => {
     ['a nanosecond stamp Date cannot render', JSON.stringify({ ...VALID, stampedAt: 1.79e18 }), /^invalid: stampedAt/],
     ['a seconds-with-fraction stamp', JSON.stringify({ ...VALID, stampedAt: 1790000000.5 }), /^invalid: stampedAt/],
     ['a negative stamp', JSON.stringify({ ...VALID, stampedAt: -1 }), /^invalid: stampedAt/],
+    ['an epoch-seconds stamp (would render as January 1970)', JSON.stringify({ ...VALID, stampedAt: 1790000000 }), /^invalid: stampedAt — must be epoch milliseconds/],
   ])('refuses %s with the validation error', (_label, stdout, error) => {
     const r = parseHostSignals(stdout);
     expect(r.ok).toBe(false);
