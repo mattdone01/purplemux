@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
+import { brandCodedError } from '@/lib/coded-error';
 import { EPIC_SLUG } from '@/lib/lease-policy';
 import type { INote, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode } from '@/types/note';
 
@@ -11,23 +12,10 @@ import type { INote, INoteParty, INoteTarget, INotesState, INoteView, TNoteError
 export class NoteError extends Error {
   constructor(readonly code: TNoteErrorCode, message: string) {
     super(message);
-    this.name = 'NoteError';
+    // The brand the routes check (`isCodedError`): the class itself differs across bundles.
+    brandCodedError(this, 'NoteError');
   }
 }
-
-/**
- * A note refusal, by name as well as by class. The notes service is a
- * `globalThis` singleton the server bundle creates at boot; a Next API route
- * holds its own copy of this module, so `instanceof` fails across the two and
- * every refusal answered 500 `note-internal` (story 22 acceptance, measured).
- */
-const NOTE_ERROR_CODES: ReadonlySet<string> = new Set<TNoteErrorCode>([
-  'note-not-found', 'note-too-large', 'note-target-missing', 'forbidden', 'note-invalid', 'note-cap',
-]);
-
-export const isNoteError = (err: unknown): err is NoteError =>
-  err instanceof NoteError
-  || (err instanceof Error && err.name === 'NoteError' && NOTE_ERROR_CODES.has(String((err as { code?: unknown }).code)));
 
 export const NOTE_SUBJECT_MAX = 120;
 export const NOTE_BODY_MAX_BYTES = 16 * 1024;
