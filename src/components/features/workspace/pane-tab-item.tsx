@@ -19,6 +19,7 @@ import {
 import { useLayoutStore } from '@/hooks/use-layout';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { patchWorkspaceOrchestration } from '@/lib/orchestration-client';
+import GrantBadge from '@/components/features/workspace/grant-badge';
 
 interface IPaneTabItemProps {
   tab: ITab;
@@ -145,6 +146,7 @@ const PaneTabItem = ({
           {isOrchestrator && (
             <Crown className="h-3 w-3 shrink-0 text-ui-amber" aria-label={to('orchestratorBadge')} />
           )}
+          <GrantBadge workspaceId={wsId} tabId={tab.id} />
           {tab.panelType === 'claude-code' ? (
             <ClaudeCodeIcon className="mx-0.5 h-3 w-3 shrink-0" />
           ) : tab.panelType === 'codex-cli' ? (

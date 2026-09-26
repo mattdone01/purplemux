@@ -20,12 +20,15 @@ vi.mock('@/lib/config-store', async (importOriginal) => ({
   readConfig: vi.fn(async () => ({ authPassword: 'scrypt:stored' })),
   verifyPassword: vi.fn(async (plain: string) => plain === 'right'),
 }));
-vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: vi.fn(async (id: string) => (['ws-1', 'ws-2', 'ws-3'].includes(id) ? { id } : null)) }));
+vi.mock('@/lib/workspace-store', () => ({
+  getWorkspaceById: vi.fn(async (id: string) => (['ws-1', 'ws-2', 'ws-3'].includes(id) ? { id } : null)),
+  getWorkspaces: vi.fn(async () => ({ workspaces: [{ id: 'ws-1', name: 'Portfolio' }, { id: 'ws-2', name: 'Billing' }] })),
+}));
 vi.mock('@/lib/layout-store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/layout-store')>()),
   resolveLayoutFile: (ws: string) => ws,
   readLayoutFile: vi.fn(async (ws: string) => (ws === 'ws-1' ? { root: {} } : null)),
-  collectAllTabs: () => [{ id: 'tab-a' }, { id: 'tab-old' }],
+  collectAllTabs: () => [{ id: 'tab-a', name: 'orch', panelType: 'claude-code' }, { id: 'tab-old', name: 'old' }, { id: 'tab-web', name: 'web', panelType: 'web-browser' }],
 }));
 vi.mock('@/lib/tab-token', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/tab-token')>()),
@@ -78,6 +81,17 @@ describe('grant routes', () => {
     const r = await create({}, { cookie: null });
     expect(r).toMatchObject({ status: 401, body: { code: 'unauthorized' } });
     expect((await call('@/pages/api/grants', 'GET', { cookie: null })).status).toBe(401);
+  });
+
+  it('GET lists the grants and every grantee tab with its identity (story 28); browser tabs are not grantees', async () => {
+    await create();
+    const r = await call('@/pages/api/grants', 'GET');
+    expect(r.status).toBe(200);
+    expect(r.body.grants).toHaveLength(1);
+    expect((r.body as unknown as { grantees: unknown[] }).grantees).toEqual([
+      { workspaceId: 'ws-1', workspaceName: 'Portfolio', tabId: 'tab-a', name: 'orch', panelType: 'claude-code', identity: 'launch' },
+      { workspaceId: 'ws-1', workspaceName: 'Portfolio', tabId: 'tab-old', name: 'old', panelType: 'terminal', identity: 'hook' },
+    ]);
   });
 
   it('refuses a cross-origin request even with a session (403)', async () => {

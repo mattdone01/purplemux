@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { bodyOf, defaultGrantDeps, requireGrantHuman, sendGrantError } from '@/lib/grant-http';
+import { bodyOf, defaultGrantDeps, listGrantees, requireGrantHuman, sendGrantError } from '@/lib/grant-http';
 import { createGrant } from '@/lib/grant-service';
 import { grantsRefusal, grantsSnapshot } from '@/lib/grant-store';
 
@@ -14,7 +14,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       await requireGrantHuman(req);
       const refusal = grantsRefusal();
       if (refusal) return res.status(500).json({ error: refusal, code: 'grant-store-unreadable' });
-      return res.status(200).json({ grants: grantsSnapshot().grants });
+      return res.status(200).json({ grants: grantsSnapshot().grants, grantees: await listGrantees() });
     }
     if (req.method === 'POST') {
       const subject = await requireGrantHuman(req);

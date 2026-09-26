@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   Settings,
   LogOut,
+  KeyRound,
 } from 'lucide-react';
 import useTabStore from '@/hooks/use-tab-store';
 import { useNotificationCount, NotificationPanel } from '@/components/features/workspace/notification-sheet';
@@ -36,6 +37,10 @@ import dynamic from 'next/dynamic';
 
 const SettingsDialog = dynamic(
   () => import('@/components/features/workspace/settings-dialog'),
+  { ssr: false },
+);
+const PortfolioGrantsDialog = dynamic(
+  () => import('@/components/features/workspace/portfolio-grants-dialog'),
   { ssr: false },
 );
 const CheatSheetDialog = dynamic(
@@ -90,6 +95,8 @@ const Sidebar = () => {
 
   const settingsOpen = useWorkspaceStore((s) => s.isSettingsDialogOpen);
   const setSettingsOpen = useWorkspaceStore((s) => s.setSettingsDialogOpen);
+  const [grantsOpen, setGrantsOpen] = useState(false);
+  const tg = useTranslations('grants');
   const storedSidebarTab = useWorkspaceStore((s) => s.sidebarTab);
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
@@ -687,6 +694,14 @@ const Sidebar = () => {
                   </div>
                 );
               })}
+              <button
+                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-sidebar-accent"
+                onClick={() => setGrantsOpen(true)}
+                aria-label={tg('open')}
+                title={tg('open')}
+              >
+                <KeyRound className="h-3.5 w-3.5" />
+              </button>
               <div className="relative">
                 <button
                   className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-sidebar-accent"
@@ -780,6 +795,7 @@ const Sidebar = () => {
       )}
 
       {settingsOpen && <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />}
+      {grantsOpen && <PortfolioGrantsDialog open={grantsOpen} onOpenChange={setGrantsOpen} />}
       <CheatSheetDialog />
 
       <AlertDialog
