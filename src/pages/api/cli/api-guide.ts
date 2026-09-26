@@ -226,7 +226,8 @@ GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   turnEnd is how the watchdog classified the last stop (null before the first stop): "kind"
   (turn-marker, waiting, ready-for-review, ...). A waiting or ready-for-review stop carries
   "openBackgroundTasks" (Claude only: its shells, async subagents and monitors, including
-  shells its subagents started; always 0 for Codex and Grok; null when it could not be read)
+  shells its subagents started; null when a Claude ledger could not be read, and null on a
+  Codex or Grok ready-for-review stop, which has no ledger — read null there as "not tracked")
   and "liveRegisteredJobs"; a ready-for-review stop also carries "transcript" (false: no
   transcript was read, the fallback). A turn-marker stop carries "marker" and no counts.
 

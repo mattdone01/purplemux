@@ -217,9 +217,9 @@ export const applyBackgroundLine = (ledger: IBackgroundLedger, line: string, sou
   const text = notificationTextOf(entry);
   if (!text) return;
   const deliveredAt = timestampOf(entry);
-  if (source === 'subagent' && entry.origin?.kind === 'task-notification' && typeof entry.agentId === 'string' && entry.agentId) {
-    const woken = deliveredAt ?? Number.POSITIVE_INFINITY;
-    ledger.wokenAt.set(entry.agentId, Math.max(ledger.wokenAt.get(entry.agentId) ?? Number.NEGATIVE_INFINITY, woken));
+  // A wake needs its time: an untimed wake could never be closed by a later end (review r2).
+  if (source === 'subagent' && deliveredAt !== null && entry.origin?.kind === 'task-notification' && typeof entry.agentId === 'string' && entry.agentId) {
+    ledger.wokenAt.set(entry.agentId, Math.max(ledger.wokenAt.get(entry.agentId) ?? Number.NEGATIVE_INFINITY, deliveredAt));
   }
   for (const match of text.matchAll(NOTIFICATION_PATTERN)) {
     const body = match[1];
@@ -268,8 +268,12 @@ const ledgers = g.__ptClaudeBackgroundLedgers;
  * from the start. Only complete lines are consumed; a partial last line waits
  * for the next read.
  */
-const readFileLedger = async (jsonlPath: string, source: TLedgerSource): Promise<IBackgroundLedger> => {
-  const stat = await fs.stat(jsonlPath);
+const readFileLedger = async (
+  jsonlPath: string,
+  source: TLedgerSource,
+  known?: { ino: number; size: number },
+): Promise<IBackgroundLedger> => {
+  const stat = known ?? await fs.stat(jsonlPath);
   let state = ledgers.get(jsonlPath);
   if (!state || state.ino !== stat.ino || stat.size < state.offset) {
     state = { ino: stat.ino, offset: 0, ledger: createBackgroundLedger() };
@@ -371,8 +375,9 @@ export const readBackgroundLedger = async (jsonlPath: string, since?: number | n
   const subs: IBackgroundLedger[] = [];
   for (const file of await subagentFiles(jsonlPath)) {
     try {
-      if (since != null && (await fs.stat(file)).mtimeMs < since) continue;
-      subs.push(await readFileLedger(file, 'subagent'));
+      const stat = await fs.stat(file);
+      if (since != null && stat.mtimeMs < since) continue;
+      subs.push(await readFileLedger(file, 'subagent', stat));
     } catch {
       // Removed between the listing and the read.
     }

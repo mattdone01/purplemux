@@ -279,6 +279,15 @@ describe('readBackgroundLedger — shells a subagent started (story 37)', () => 
     expect(openBackgroundTasks(mergeLedgers([main, sub]), at('2026-09-26T01:11:00.000Z')).map((t) => t.id)).toEqual(['aR']);
   });
 
+  it('an untimed delivery wakes nothing (no later end could close it)', () => {
+    const sub = createBackgroundLedger();
+    applyBackgroundLine(sub, JSON.stringify({
+      type: 'user', isSidechain: true, agentId: 'aU', origin: { kind: 'task-notification' },
+      message: { content: '[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>bz</task-id><status>completed</status></task-notification>' },
+    }), 'subagent');
+    expect(sub.wokenAt.size).toBe(0);
+  });
+
   it('a subagent-started Monitor keeps the activity of its events reported in the main file', () => {
     const sub = createBackgroundLedger();
     applyBackgroundLine(sub, JSON.stringify({
