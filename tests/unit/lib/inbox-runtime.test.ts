@@ -4,12 +4,18 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
+// The file logger writes under the temp HOME, which each test removes; a write
+// still pending at removal surfaced as an unhandled ENOENT (gate 26-r1).
+vi.mock('@/lib/logger', () => {
+  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
+  return { createLogger: () => logger };
+});
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => mockHome.value }, homedir: () => mockHome.value };
 });
 vi.mock('@/lib/status-manager', () => ({
-  getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false }),
+  getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false, isHaltedByUsageLimit: () => false }),
 }));
 
 const base = () => path.join(mockHome.value, '.purplemux');

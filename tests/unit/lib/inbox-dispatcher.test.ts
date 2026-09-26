@@ -23,6 +23,7 @@ interface IWorld {
   alive: boolean;
   policy: { ok: boolean; error?: string };
   permission: boolean;
+  halted: boolean;
   deliverFails: boolean;
   stranded: boolean;
 }
@@ -30,7 +31,7 @@ interface IWorld {
 const setup = (overrides: Partial<IWorld> = {}) => {
   const world: IWorld = {
     clock: T0, state: { items: [] }, cliState: 'idle', waiting: false, pane: EMPTY_CLAUDE, panelType: 'claude-code',
-    tabPresent: true, gone: true, sessionName: 'pt-ws-1-pane-a-tab-w', alive: true, policy: { ok: true }, permission: false, deliverFails: false, stranded: false,
+    tabPresent: true, gone: true, sessionName: 'pt-ws-1-pane-a-tab-w', alive: true, policy: { ok: true }, permission: false, halted: false, deliverFails: false, stranded: false,
     ...overrides,
   };
   const deliver = vi.fn(async (_session: string, _line: string) => {
@@ -50,6 +51,7 @@ const setup = (overrides: Partial<IWorld> = {}) => {
     hasSession: async () => world.alive,
     status: () => ({ cliState: world.cliState, permissionRequest: world.permission ? { id: 'p' } : null } as unknown as IClientTabStatusEntry),
     waitingAtPrompt: () => world.waiting,
+    halted: () => world.halted,
     capture: async () => { calls.push('capture'); return world.pane; },
     withDispatchLock: async (_ws, _tab, work) => {
       calls.push('lock:enter');
@@ -152,6 +154,7 @@ describe('inbox dispatcher (ADR-0012)', () => {
     ['an unreadable pane', { pane: null }, 'composer-unreadable'],
     ['a dead session', { alive: false }, 'session-not-running'],
     ['a model-policy hold', { policy: { ok: false, error: 'agent-model-mismatch' } }, 'policy:agent-model-mismatch'],
+    ['a usage-limit halt (story 26)', { halted: true }, 'usage-limit-halt'],
   ] as Array<[string, Partial<IWorld>, string]>)('refuses %s', async (_label, overrides, reason) => {
     const { dispatcher, deliver, enqueue, item } = setup(overrides);
     enqueue();
@@ -214,6 +217,27 @@ describe('inbox dispatcher (ADR-0012)', () => {
     await dispatcher.tick();
     expect(deliver).not.toHaveBeenCalled();
     expect(item().lastRefusal).toBe('target-changed');
+  });
+
+  it('does not paste a notice its owner withdrew while the attempt was under way', async () => {
+    const { world, dispatcher, deliver, enqueue, item } = setup();
+    enqueue();
+    const original = world.pane;
+    world.pane = null;
+    let withdrawn = false;
+    Object.defineProperty(world, 'pane', {
+      configurable: true,
+      get: () => {
+        if (!withdrawn) {
+          withdrawn = true;
+          world.state = { items: world.state.items.map((i) => ({ ...i, state: 'dropped', droppedReason: 'episode-closed' })) };
+        }
+        return original;
+      },
+    });
+    await dispatcher.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(item()).toMatchObject({ state: 'dropped', droppedReason: 'episode-closed' });
   });
 
   it('lets shutdown wait for a delivery in flight to be recorded', async () => {

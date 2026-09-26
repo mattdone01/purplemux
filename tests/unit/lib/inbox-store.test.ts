@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IInboxState } from '@/types/inbox';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
+// The file logger writes under the temp HOME, which each test removes; a write
+// still pending at removal surfaced as an unhandled ENOENT (gate 26-r1).
+vi.mock('@/lib/logger', () => {
+  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
+  return { createLogger: () => logger };
+});
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => mockHome.value }, homedir: () => mockHome.value };
@@ -228,5 +234,52 @@ describe('inbox store — file', () => {
     const { enqueueNotice, readInboxState } = await load();
     await Promise.all(Array.from({ length: 12 }, (_, i) => enqueueNotice(req({ dedupeKey: `k${i}` }))));
     expect((await readInboxState()).items).toHaveLength(12);
+  });
+
+  it('tells onInboxHeld once per item that becomes held, after the write', async () => {
+    const { enqueueNotice, mutateInbox, holdInState, refuseInState, onInboxHeld, readInboxState } = await load();
+    const seen: string[] = [];
+    const off = onInboxHeld((item) => seen.push(`${item.id}:${item.heldReason}`));
+    try {
+      const { item } = await enqueueNotice(req());
+      await mutateInbox((s) => ({ state: refuseInState(s, item.id, 'composer-not-empty', Date.now()), value: null }));
+      expect(seen).toEqual([]);
+      await mutateInbox((s) => ({ state: holdInState(s, item.id, 'stranded-in-composer', Date.now()), value: null }));
+      expect((await readInboxState()).items[0].state).toBe('held');
+      await mutateInbox((s) => ({ state: holdInState(s, item.id, 'again', Date.now()), value: null }));
+      expect(seen).toEqual([`${item.id}:stranded-in-composer`]);
+    } finally {
+      off();
+    }
+  });
+
+  it('calls onInboxHeld after the write, and a throwing listener never undoes it', async () => {
+    const { enqueueNotice, mutateInbox, holdInState, onInboxHeld, readInboxState } = await load();
+    const onDisk: string[] = [];
+    const offRead = onInboxHeld(() => {
+      readInboxState().then((s) => onDisk.push(s.items[0].state)).catch(() => onDisk.push('unreadable'));
+    });
+    const offThrow = onInboxHeld(() => { throw new Error('listener bug'); });
+    try {
+      const { item } = await enqueueNotice(req());
+      await mutateInbox((s) => ({ state: holdInState(s, item.id, 'x', Date.now()), value: null }));
+      await vi.waitFor(() => expect(onDisk).toEqual(['held']));
+      expect((await readInboxState()).items[0].state).toBe('held');
+    } finally {
+      offRead();
+      offThrow();
+    }
+  });
+
+  it('withdraws a still-queued notice and leaves any other state alone', async () => {
+    const { enqueueNotice, withdrawNotice, mutateInbox, deliverInState, readInboxState } = await load();
+    const a = await enqueueNotice(req({ dedupeKey: 'a' }));
+    const b = await enqueueNotice(req({ dedupeKey: 'b' }));
+    await mutateInbox((s) => ({ state: deliverInState(s, b.item.id, Date.now()), value: null }));
+    expect(await withdrawNotice(a.item.id, 'episode-closed')).toBe(true);
+    expect(await withdrawNotice(b.item.id, 'episode-closed')).toBe(false);
+    expect(await withdrawNotice('i-none', 'x')).toBe(false);
+    const states = Object.fromEntries((await readInboxState()).items.map((i) => [i.dedupeKey, [i.state, i.droppedReason]]));
+    expect(states).toEqual({ a: ['dropped', 'episode-closed'], b: ['delivered', null] });
   });
 });

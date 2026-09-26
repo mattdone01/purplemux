@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import { INTERRUPT_PREFIX, summarizeToolCall } from '@/lib/session-parser';
-import type { IAgentRuntimeSnapshot, IRuntimeSnapshotOptions } from '@/lib/providers/types';
+import type { IAgentRuntimeSnapshot, IRuntimeSnapshotOptions, ITurnError } from '@/lib/providers/types';
 import { TURN_TAIL_CHARS } from '@/lib/turn-end';
 import {
   latestBackgroundActivityAt,
@@ -25,6 +25,7 @@ interface IJsonlIdleCache {
   staleMs: number;
   lastAssistantSnippet: string | null;
   lastAssistantTail: string | null;
+  lastTurnError: ITurnError | null;
   currentAction: ICurrentAction | null;
   reset: boolean;
   lastEntryTs: number | null;
@@ -34,6 +35,7 @@ interface IJsonlIdleCache {
 interface IAssistantExtract {
   lastAssistantSnippet: string | null;
   lastAssistantTail: string | null;
+  lastTurnError: ITurnError | null;
   currentAction: ICurrentAction | null;
   reset: boolean;
 }
@@ -57,6 +59,7 @@ const emptySnapshot = (): IAgentRuntimeSnapshot => ({
   stale: false,
   lastAssistantSnippet: null,
   lastAssistantTail: null,
+  lastTurnError: null,
   currentAction: null,
   reset: false,
   lastEntryTs: null,
@@ -68,6 +71,28 @@ const toCurrentAction = (block: { name?: string; input?: Record<string, unknown>
   const toolName = (block.name ?? 'Tool') as TToolName;
   const input = (block.input ?? {}) as Record<string, unknown>;
   return { toolName, summary: summarizeToolCall(toolName, input) };
+};
+
+// Claude Code writes a provider failure as a synthetic assistant entry flagged
+// `isApiErrorMessage` with an `error` code (measured 2026-09-26: `server_error`
+// "API Error: Server error mid-response…", `authentication_failed`). Only a code
+// measured as transient is resumed; every other code is `other` (today's
+// READY nudge, nothing typed). No usage-limit entry has been observed, so none
+// is classified as one: the halt stays with the human-facing READY nudge.
+const CLAUDE_RESUMABLE_ERRORS: ReadonlySet<string> = new Set(['server_error']);
+const MAX_TURN_ERROR_TEXT = 300;
+
+const turnErrorOf = (entry: { isApiErrorMessage?: unknown; error?: unknown; uuid?: unknown; message?: { content?: unknown } }): ITurnError | null => {
+  if (entry.isApiErrorMessage !== true) return null;
+  const code = typeof entry.error === 'string' && entry.error ? entry.error : 'unknown';
+  const content = Array.isArray(entry.message?.content) ? entry.message!.content as Array<{ text?: unknown }> : [];
+  const text = content.map((b) => (typeof b.text === 'string' ? b.text : '')).join(' ').trim().slice(0, MAX_TURN_ERROR_TEXT);
+  return {
+    class: CLAUDE_RESUMABLE_ERRORS.has(code) ? 'api-error' : 'other',
+    code,
+    text,
+    turnId: typeof entry.uuid === 'string' ? entry.uuid : '',
+  };
 };
 
 const extractAssistantInfo = (lines: string[]): IAssistantExtract => {
@@ -87,7 +112,7 @@ const extractAssistantInfo = (lines: string[]): IAssistantExtract => {
 
       if (entry.type !== 'assistant' || !entry.message?.content) continue;
 
-      if (userMessageSeen) return { lastAssistantSnippet: null, lastAssistantTail: null, currentAction: null, reset: true };
+      if (userMessageSeen) return { lastAssistantSnippet: null, lastAssistantTail: null, lastTurnError: null, currentAction: null, reset: true };
 
       const content = entry.message.content;
       if (!Array.isArray(content)) continue;
@@ -124,10 +149,10 @@ const extractAssistantInfo = (lines: string[]): IAssistantExtract => {
         }
       }
 
-      return { lastAssistantSnippet, lastAssistantTail, currentAction, reset: false };
+      return { lastAssistantSnippet, lastAssistantTail, lastTurnError: turnErrorOf(entry), currentAction, reset: false };
     } catch { continue; }
   }
-  return { lastAssistantSnippet: null, lastAssistantTail: null, currentAction: null, reset: false };
+  return { lastAssistantSnippet: null, lastAssistantTail: null, lastTurnError: null, currentAction: null, reset: false };
 };
 
 const scanLines = (lines: string[], elapsed: number): IScanResult => {
@@ -199,6 +224,7 @@ const fromCache = (cached: IJsonlIdleCache, idle: boolean, stale: boolean): IAge
   stale,
   lastAssistantSnippet: cached.lastAssistantSnippet,
   lastAssistantTail: cached.lastAssistantTail,
+  lastTurnError: cached.lastTurnError,
   currentAction: cached.currentAction,
   reset: cached.reset,
   lastEntryTs: cached.lastEntryTs,
@@ -256,6 +282,7 @@ const readTailSnapshot = async (
       staleMs: scan.staleMs,
       lastAssistantSnippet: extracted.lastAssistantSnippet,
       lastAssistantTail: extracted.lastAssistantTail,
+      lastTurnError: extracted.lastTurnError,
       currentAction: extracted.currentAction,
       reset: extracted.reset,
       lastEntryTs: scan.lastEntryTs,

@@ -139,6 +139,20 @@ export const sweepInState = (state: IInboxState, now: number): IInboxState => {
   return changed ? { items } : state;
 };
 
+/** Withdraw one still-queued item (its owner no longer wants it typed); anything else is untouched. */
+export const withdrawInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState => {
+  const item = state.items.find((i) => i.id === id);
+  if (!item || item.state !== 'queued') return state;
+  return replace(state, id, (i) => ({ ...i, state: 'dropped', droppedReason: reason, transitionAt: now }));
+};
+
+/** Withdraw a queued item by id; true when it was still queued. */
+export const withdrawNotice = async (id: string, reason: string): Promise<boolean> =>
+  mutateInbox((state) => {
+    const next = withdrawInState(state, id, reason, Date.now());
+    return { state: next, value: next !== state };
+  });
+
 /** Drop the queued and held items of every tab `isGone` confirms closed (the boot pass). */
 export const dropGoneTargetsInState = (
   state: IInboxState,
@@ -193,8 +207,34 @@ export const dueItems = (state: IInboxState, now: number, wake: (item: IInboxIte
 
 // ─── I/O ─────────────────────────────────────────────────────────────────
 
-const g = globalThis as unknown as { __ptInboxLock?: Promise<void> };
+type TInboxHeldListener = (item: IInboxItem) => void;
+
+const g = globalThis as unknown as { __ptInboxLock?: Promise<void>; __ptInboxHeldListeners?: Set<TInboxHeldListener> };
 if (!g.__ptInboxLock) g.__ptInboxLock = Promise.resolve();
+if (!g.__ptInboxHeldListeners) g.__ptInboxHeldListeners = new Set();
+
+/**
+ * Told once per item that becomes `held`, after the write, whatever held it (a
+ * refusal budget, 24 h, an uncertain paste). The owning feature escalates.
+ */
+export const onInboxHeld = (listener: TInboxHeldListener): (() => void) => {
+  g.__ptInboxHeldListeners!.add(listener);
+  return () => { g.__ptInboxHeldListeners!.delete(listener); };
+};
+
+const notifyHeld = (before: IInboxState, after: IInboxState): void => {
+  const wasHeld = new Set(before.items.filter((i) => i.state === 'held').map((i) => i.id));
+  for (const item of after.items) {
+    if (item.state !== 'held' || wasHeld.has(item.id)) continue;
+    for (const listener of [...g.__ptInboxHeldListeners!]) {
+      try {
+        listener(item);
+      } catch {
+        // a listener's failure never undoes the write
+      }
+    }
+  }
+};
 
 export const inboxFile = (): string => path.join(os.homedir(), '.purplemux', 'inbox.json');
 
@@ -254,7 +294,10 @@ export const mutateInbox = async <T>(fn: (state: IInboxState) => { state: IInbox
   withLock(async () => {
     const before = await readInboxState();
     const { state, value } = fn(before);
-    if (state !== before) await writeInboxState(state);
+    if (state !== before) {
+      await writeInboxState(state);
+      notifyHeld(before, state);
+    }
     return value;
   });
 
