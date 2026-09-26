@@ -5,7 +5,7 @@ import { capturePaneAtWidth } from '@/lib/capture-at-width';
 import { findTab } from '@/lib/cli-utils';
 import { collectAllTabs, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
 import { createLogger } from '@/lib/logger';
-import { parsePermissionOptions } from '@/lib/permission-prompt';
+import { checkComposerReady } from '@/lib/composer-readiness';
 import { getProviderByPanelType } from '@/lib/providers/registry';
 import { verifyCodexActiveRuntime } from '@/lib/providers/codex/launch-lifecycle';
 import { getChildPids } from '@/lib/process-utils';
@@ -36,7 +36,7 @@ import type {
   TMissionActivity,
 } from '@/types/mission-control';
 import type { IWorkspaceStandup } from '@/types/status';
-import type { ITab, TPanelType } from '@/types/terminal';
+import type { ITab } from '@/types/terminal';
 
 const log = createLogger('mission-control-runtime');
 
@@ -182,26 +182,8 @@ const sameIdentity = (
   && binding.sessionId === identity.sessionId
   && binding.runtimeGeneration === identity.runtimeGeneration;
 
-const tail = (content: string, lines = 24): string => content.split('\n').slice(-lines).join('\n');
-
-export const hasEmptyAgentComposer = (panelType: TPanelType | undefined, content: string): boolean => {
-  const marker = panelType === 'codex-cli'
-    ? '›'
-    : panelType === 'claude-code'
-      ? '❯'
-      : panelType === 'grok-cli'
-        ? '[›❯>]'
-        : null;
-  if (!marker) return false;
-  const composerLines = tail(content, 12).split('\n');
-  const composerPattern = new RegExp(`^[ \\t]*${marker}([ \\t\\u00a0].*)?$`);
-  for (let index = composerLines.length - 1; index >= 0; index -= 1) {
-    const match = composerLines[index].match(composerPattern);
-    if (!match) continue;
-    return (match[1] ?? '').trim() === '';
-  }
-  return false;
-};
+// Moved to composer-readiness (story 09); re-exported for existing importers.
+export { hasEmptyAgentComposer } from '@/lib/composer-readiness';
 
 const inspectLiveTab = async (workspaceId: string, tabId: string): Promise<ILiveTab | null> => {
   const found = await findTab(workspaceId, tabId);
@@ -266,23 +248,12 @@ export const dispatchMissionPrompt = async (request: IMissionDispatchRequest): P
         return { delivered: false, retryable: false, uncertain: false, reason: policy.error };
       }
 
-      const status = getStatusManager().getAllForClient()[request.binding.tabId];
-      if (!status) return { delivered: false, retryable: true, uncertain: false, reason: 'status-unavailable' };
-      if (status.permissionRequest) {
-        return { delivered: false, retryable: true, uncertain: false, reason: 'native-prompt-active' };
-      }
-      if (status.cliState !== 'idle' && status.cliState !== 'ready-for-review') {
-        return { delivered: false, retryable: true, uncertain: false, reason: `composer-not-ready:${status.cliState}` };
-      }
-
-      const content = await capturePaneAtWidth(live.tab.sessionName, 120, 50).catch(() => null);
-      if (!content) return { delivered: false, retryable: true, uncertain: false, reason: 'composer-unreadable' };
-      if (parsePermissionOptions(tail(content)).options.length > 0) {
-        return { delivered: false, retryable: true, uncertain: false, reason: 'interactive-prompt-active' };
-      }
-      if (!hasEmptyAgentComposer(live.tab.panelType, content)) {
-        return { delivered: false, retryable: true, uncertain: false, reason: 'composer-not-empty' };
-      }
+      const readiness = await checkComposerReady({
+        panelType: live.tab.panelType,
+        status: getStatusManager().getAllForClient()[request.binding.tabId],
+        capture: () => capturePaneAtWidth(live.tab.sessionName, 120, 50),
+      });
+      if (!readiness.ok) return { delivered: false, retryable: true, uncertain: false, reason: readiness.reason };
 
       const eligibility = request.preflight?.();
       if (eligibility && !eligibility.ok) {
