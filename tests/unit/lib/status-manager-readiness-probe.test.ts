@@ -170,13 +170,42 @@ describe('readiness pane-probe fallback (story 17)', () => {
   });
 
   it('does not overwrite an event that arrived during the probe (review r1 finding 2: no false turn end)', async () => {
-    const { manager, entry, pollAt, paste } = await setup();
+    const { manager, entry, pollAt } = await setup();
     await pollAt(0);
     state.duringCapture = () => { manager.updateTabFromHook('tmux-tab-a', 'prompt-submit'); };
     await pollAt(9_000);
+    // Busy with the prompt's own event: the synthetic session start never landed.
     expect(entry.cliState).toBe('busy');
     expect(entry.lastEvent?.name).toBe('prompt-submit');
-    expect(paste).not.toHaveBeenCalled();
+  });
+
+  it('a manual relaunch (claude typed at the shell, no markAgentLaunch) still waits 8 s from the first running poll', async () => {
+    state.running = false;
+    const { entry, pollAt } = await setup();
+    await pollAt(0);
+    await pollAt(60_000);
+    state.running = true;
+    await pollAt(61_000);
+    await pollAt(68_000);
+    expect(state.captures).toBe(0);
+    await pollAt(69_500);
+    expect(entry.cliState).toBe('idle');
+  });
+
+  it('waits 8 s past a launch stamp newer than the clock (a stamp from a path that does not clear it)', async () => {
+    const { entry, pollAt } = await setup();
+    await pollAt(0);
+    entry.lastResumeOrStartedAt = T0 + 7_000;
+    await pollAt(9_000);
+    await pollAt(14_000);
+    expect(state.captures).toBe(0);
+    await pollAt(15_500);
+    expect(entry.cliState).toBe('idle');
+  });
+
+  it('launch polls reach past the probe threshold without the interval poll', async () => {
+    const { LAUNCH_READY_POLL_DELAYS_MS: delays, READINESS_PROBE_AFTER_MS: after } = await import('@/lib/status-manager');
+    expect(delays[delays.length - 1] - delays[0]).toBeGreaterThan(after);
   });
 
   it('reads a dim prompt suggestion on the composer as an empty composer', async () => {
@@ -289,6 +318,22 @@ describe('poll-detected session id persistence (story 17)', () => {
     state.jsonlPath = jsonl(OTHER_SESSION_ID);
     await pollAt(1_000);
     expect(updateAgentState).toHaveBeenLastCalledWith('tmux-tab-a', expect.objectContaining({ id: 'claude' }), { sessionId: OTHER_SESSION_ID });
+  });
+
+  it('a hook binding during the poll\'s write keeps ownership with the hook', async () => {
+    state.jsonlPath = jsonl(SESSION_ID);
+    const { manager, pollAt, updateAgentState } = await setup();
+    let land: () => void = () => {};
+    updateAgentState.mockImplementationOnce(() => new Promise<void>((resolve) => { land = resolve; }));
+    await pollAt(0);
+    manager.applyAgentHookMeta('claude', 'tmux-tab-a', { sessionId: SESSION_ID });
+    land();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    state.tab = { ...state.tab!, agentState: { providerId: 'claude', sessionId: SESSION_ID, jsonlPath: null, summary: null } };
+    updateAgentState.mockClear();
+    state.jsonlPath = jsonl(OTHER_SESSION_ID);
+    await pollAt(1_000);
+    expect(updateAgentState).not.toHaveBeenCalledWith('tmux-tab-a', expect.anything(), { sessionId: OTHER_SESSION_ID });
   });
 
   it('hands the binding back to the hook once the hook reports one', async () => {

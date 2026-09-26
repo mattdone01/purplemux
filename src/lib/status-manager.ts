@@ -107,7 +107,7 @@ const JSONL_WATCH_DEBOUNCE_MS = 100;
 // 9.5 s and 12 s: the first polls past READINESS_PROBE_AFTER_MS, counted from
 // the first poll that sees the agent running (~0.7 s), so a tab whose
 // SessionStart hook never fires is probed without waiting for the interval poll.
-const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
+export const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
 
 const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
@@ -143,6 +143,8 @@ export class StatusManager {
    * move its own binding (a hookless `/clear`), never one a hook or a launch set.
    */
   private pollBoundSessions = new Map<string, string>();
+  /** Bumped by every hook or launch binding: a poll write that lands after one never claims ownership. */
+  private sessionBindingEpoch = new Map<string, number>();
   private orphanResumesEscalated = new Set<string>();
   private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
@@ -638,6 +640,7 @@ export class StatusManager {
         this.transcriptFallbackLogged.delete(tabId);
         this.inactiveSeenAt.delete(tabId);
         this.pollBoundSessions.delete(tabId);
+        this.sessionBindingEpoch.delete(tabId);
         this.processStartCache.delete(tabId);
         this.clearPendingKickoff(tabId);
         this.broadcastRemove(tabId);
@@ -1495,8 +1498,9 @@ export class StatusManager {
     checkAgentRunning: () => Promise<boolean>,
   ): Promise<boolean> {
     // The clock runs only while the agent runs: a tab idling at a shell does not
-    // age it, and a relaunch starts it again (review r1: a stale clock probed a
-    // booting TUI at +700 ms).
+    // age it, and a relaunch typed at the shell starts it again (review r1: a
+    // stale clock probed a booting TUI at +700 ms). A launch through
+    // markAgentLaunch is held off by the launch-stamp wait below.
     if (!(await checkAgentRunning())) {
       this.inactiveSeenAt.delete(tabId);
       return false;
@@ -1524,6 +1528,12 @@ export class StatusManager {
     return this.tabs.get(tabId) === entry && entry.cliState === 'inactive' && entry.eventSeq === seq;
   }
 
+  /** A hook or launch bound the session: the poll no longer owns it, and a write in flight does not reclaim it. */
+  private releasePollBinding(tabId: string): void {
+    this.pollBoundSessions.delete(tabId);
+    this.sessionBindingEpoch.set(tabId, (this.sessionBindingEpoch.get(tabId) ?? 0) + 1);
+  }
+
   /**
    * Persist a session id the poll detected when no hook bound one, so `tab
    * status` / `tab list` show it and it survives a restart (L8: the binding
@@ -1537,7 +1547,10 @@ export class StatusManager {
     if (persisted && this.pollBoundSessions.get(tabId) !== persisted) return;
     // Ownership is recorded only once the write lands: a failed move leaves the
     // old id in the layout, and the next poll must still be allowed to retry it.
+    // A hook or launch binding during the write wins: the epoch moved.
+    const epoch = this.sessionBindingEpoch.get(tabId) ?? 0;
     this.updateAgentState(tab.sessionName, provider, { sessionId: detected }).then(() => {
+      if ((this.sessionBindingEpoch.get(tabId) ?? 0) !== epoch) return;
       this.pollBoundSessions.set(tabId, detected);
       hookLog.debug({ tabId, sessionId: detected }, 'session id bound by poll — persisted');
     }).catch((err) => {
@@ -1818,7 +1831,7 @@ export class StatusManager {
     }
     const sessionBindingChanged = meta.sessionId !== undefined && entry.agentSessionId !== meta.sessionId;
     // A hook's binding is the provider's own word; the poll never moves it.
-    if (meta.sessionId !== undefined) this.pollBoundSessions.delete(tabId);
+    if (meta.sessionId !== undefined) this.releasePollBinding(tabId);
     if (sessionBindingChanged) {
       entry.agentSessionId = meta.sessionId;
       changed = true;
@@ -1958,14 +1971,13 @@ export class StatusManager {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
     entry.lastResumeOrStartedAt = Date.now();
-    this.inactiveSeenAt.delete(tabId);
     const provider = getProviderByPanelType(entry.panelType);
     const isCodex = entry.agentProviderId === CODEX_PROVIDER_ID || entry.panelType === 'codex-cli';
     const nextSessionId = isCodex
       ? undefined
       : options?.resumeSessionId ?? (options?.resetAgentSession ? null : undefined);
     if (nextSessionId !== undefined) {
-      this.pollBoundSessions.delete(tabId);
+      this.releasePollBinding(tabId);
       entry.agentSessionId = nextSessionId;
       entry.jsonlPath = null;
       entry.agentSummary = null;
