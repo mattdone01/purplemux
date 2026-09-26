@@ -769,6 +769,8 @@ export class StatusManager {
         continue;
       }
       if (entry.cliState !== 'idle' && entry.cliState !== 'ready-for-review') continue;
+      // A usage-limit halt is not a stall: no heartbeat is typed and none is counted.
+      if (this.isHaltedByUsageLimit(orch.orchestratorTabId)) continue;
 
       let watchedWorkActive = false;
       const livenessManager = getLivenessManager();
@@ -886,6 +888,8 @@ export class StatusManager {
     }
     const prevBusySince = entry.busySince;
     entry.cliState = newState;
+    // The agent process is gone: its halt went with it.
+    if (newState === 'inactive' && entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'agent-exited');
     entry.readyForReviewAt = newState === 'ready-for-review' ? Date.now() : null;
     entry.busySince = newState === 'busy' ? Date.now() : null;
     if (newState === 'busy') entry.dismissedAt = null;
@@ -1024,6 +1028,9 @@ export class StatusManager {
     const targetTabId = this.liveReportsTo(tabId, entry)
       ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
     if (!targetTabId) return false;
+    // A halted target would have the nudge withheld and dropped; report no target
+    // so an escalation falls back to the human alert (story 26 review r2).
+    if (this.isHaltedByUsageLimit(targetTabId)) return false;
 
     const now = Date.now();
     const last = this.lastNudgeByTab.get(tabId);
@@ -1241,13 +1248,25 @@ export class StatusManager {
   }
 
   /**
-   * Tell the tab's target. A tab with none (the orchestrator itself, or no
-   * orchestrator and no reportsTo) gets the human review alert its stop would
-   * have sent before story 26 made these stops silent.
+   * Tell the tab's target. When there is none (the orchestrator itself, no
+   * orchestrator and no reportsTo, or a target that is itself halted, whose
+   * nudge would be withheld and dropped), the human is alerted directly,
+   * whatever the alert policy: an escalation that reaches no one is not one.
    */
   private escalateTurnError(tabId: string, entry: ITabStatusEntry, kind: 'api-error' | 'usage-limit', detail: string): void {
-    this.nudgeOrchestrator(tabId, entry, kind, detail).then((hadTarget) => {
-      if (!hadTarget) void this.dispatchTransitionAlert(tabId, entry, 'review');
+    this.nudgeOrchestrator(tabId, entry, kind, detail).then(async (hadTarget) => {
+      if (hadTarget) return;
+      const ws = await getWorkspaceByIdCached(entry.workspaceId);
+      await this.dispatchAlert({
+        kind: 'review',
+        tabId,
+        workspace: ws,
+        workspaceId: entry.workspaceId,
+        tabName: entry.tabName,
+        providerId: toAlertProvider(entry.agentProviderId),
+        agentSessionId: entry.agentSessionId,
+        detail: `${kind === 'usage-limit' ? 'halted by a usage limit' : 'API error after its one automatic resume'}: ${detail}`,
+      });
     }).catch((err) => {
       log.warn(`${kind} nudge failed: ${err instanceof Error ? err.message : err}`);
     });
@@ -1577,7 +1596,11 @@ export class StatusManager {
     const seq = (entry.eventSeq ?? 0) + 1;
     entry.eventSeq = seq;
     entry.lastEvent = { name: eventName, at: now, seq };
-    if (eventName === 'session-start') entry.lastResumeOrStartedAt = now;
+    if (eventName === 'session-start') {
+      entry.lastResumeOrStartedAt = now;
+      // A new agent session is not the halted one (story 26 review r2).
+      if (entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'session-start');
+    }
     this.broadcast({ type: 'status:hook-event', tabId, event: entry.lastEvent });
 
     const prevState = entry.cliState;

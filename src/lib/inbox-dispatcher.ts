@@ -47,7 +47,8 @@ type TAttempt =
   | { outcome: 'delivered' }
   | { outcome: 'refused'; reason: string }
   | { outcome: 'held'; reason: string }
-  | { outcome: 'dropped'; reason: string };
+  | { outcome: 'dropped'; reason: string }
+  | { outcome: 'withdrawn' };
 
 const STATE_REFUSAL = 'composer-not-ready:';
 
@@ -124,10 +125,11 @@ export class InboxDispatcher {
         case 'held': return { state: holdInState(state, item.id, attempt.reason, now), value: null };
         case 'dropped': return { state: dropForTabInState(state, item.targetWorkspaceId, item.targetTabId, attempt.reason, now).state, value: null };
         case 'refused': return { state: refuseInState(state, item.id, attempt.reason, now), value: null };
+        case 'withdrawn': return { state, value: null };
       }
     });
     if (attempt.outcome === 'delivered') log.info({ id: item.id, kind: item.kind, tabId: item.targetTabId }, 'inbox delivered');
-    else if (attempt.outcome !== 'refused') log.info({ id: item.id, tabId: item.targetTabId, ...attempt }, `inbox ${attempt.outcome}`);
+    else if (attempt.outcome !== 'refused' && attempt.outcome !== 'withdrawn') log.info({ id: item.id, tabId: item.targetTabId, ...attempt }, `inbox ${attempt.outcome}`);
   }
 
   private async missing(item: IInboxItem): Promise<TAttempt> {
@@ -157,6 +159,12 @@ export class InboxDispatcher {
         capture: () => this.deps.capture(current.sessionName),
       });
       if (!readiness.ok) return { outcome: 'refused', reason: readiness.reason };
+      // Its owner may have withdrawn it since this tick picked it (a closed episode).
+      const stillQueued = await this.deps.mutate((state) => ({
+        state,
+        value: state.items.find((i) => i.id === item.id)?.state === 'queued',
+      }));
+      if (!stillQueued) return { outcome: 'withdrawn' };
       try {
         await this.deps.deliver(current.sessionName, item.line);
       } catch (err) {

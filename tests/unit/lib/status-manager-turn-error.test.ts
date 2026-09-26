@@ -331,4 +331,59 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
     expect(held).toHaveBeenCalledWith(expect.objectContaining({ id: item.id, state: 'held' }));
     held.mockRestore();
   });
+
+  it('falls back to the human alert when the target itself is halted (shared-account halt)', async () => {
+    const { manager, paste } = await setup();
+    // The orchestrator halts first …
+    manager.registerTab('tab-o', { ...worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl')), tmuxSession: 'tmux-tab-o', tabName: 'o' });
+    manager.updateTabFromHook('tmux-tab-o', 'stop');
+    await waitFor(() => expect(manager.isHaltedByUsageLimit('tab-o')).toBe(true));
+    alerts.dispatch.mockClear();
+    // … then its worker: the nudge would be withheld, so the human is alerted instead.
+    const w = worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl'));
+    manager.registerTab('tab-w', w);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(alerts.dispatch).toHaveBeenCalledWith(expect.objectContaining({ kind: 'review', tabId: 'tab-w' }), expect.anything()));
+    expect(paste).not.toHaveBeenCalled();
+  });
+
+  it('ends the halt at a new session start and when the agent exits', async () => {
+    const { manager } = await setup();
+    const entry = worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(manager.isHaltedByUsageLimit('tab-w')).toBe(true));
+    manager.updateTabFromHook('tmux-tab-w', 'session-start');
+    expect(manager.isHaltedByUsageLimit('tab-w')).toBe(false);
+
+    const again = worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl'));
+    manager.registerTab('tab-x', { ...again, tmuxSession: 'tmux-tab-x' });
+    manager.updateTabFromHook('tmux-tab-x', 'stop');
+    await waitFor(() => expect(manager.isHaltedByUsageLimit('tab-x')).toBe(true));
+    const x = manager.getAllForClient()['tab-x'];
+    expect(x).toBeTruthy();
+    (manager as unknown as { applyCliState: (id: string, e: unknown, s: string, o: unknown) => void })
+      .applyCliState('tab-x', (manager as unknown as { tabs: Map<string, ITabStatusEntry> }).tabs.get('tab-x'), 'inactive', { silent: true });
+    expect(manager.isHaltedByUsageLimit('tab-x')).toBe(false);
+  });
+
+  it('sends no heartbeat to, and counts none against, a halted idle orchestrator', async () => {
+    const { manager, paste } = await setup();
+    const o: ITabStatusEntry = { ...worker('codex-cli', await transcript('codex-usage-limit-exceeded.jsonl')), tmuxSession: 'tmux-tab-o', tabName: 'o' };
+    manager.registerTab('tab-o', o);
+    manager.updateTabFromHook('tmux-tab-o', 'stop');
+    await waitFor(() => expect(manager.isHaltedByUsageLimit('tab-o')).toBe(true));
+    const keeper = manager as unknown as { runOrchestratorKeeper: () => Promise<void>; orchKeeper: Map<string, { beats: number }> };
+    const realNow = Date.now;
+    try {
+      for (const minutes of [0, 11, 22, 33, 44]) {
+        Date.now = () => realNow() + minutes * 60_000;
+        await keeper.runOrchestratorKeeper();
+      }
+    } finally {
+      Date.now = realNow;
+    }
+    expect(paste).not.toHaveBeenCalled();
+    expect(keeper.orchKeeper.get('ws-1')?.beats ?? 0).toBe(0);
+  });
 });

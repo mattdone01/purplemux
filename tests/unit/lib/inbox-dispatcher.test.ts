@@ -219,6 +219,27 @@ describe('inbox dispatcher (ADR-0012)', () => {
     expect(item().lastRefusal).toBe('target-changed');
   });
 
+  it('does not paste a notice its owner withdrew while the attempt was under way', async () => {
+    const { world, dispatcher, deliver, enqueue, item } = setup();
+    enqueue();
+    const original = world.pane;
+    world.pane = null;
+    let withdrawn = false;
+    Object.defineProperty(world, 'pane', {
+      configurable: true,
+      get: () => {
+        if (!withdrawn) {
+          withdrawn = true;
+          world.state = { items: world.state.items.map((i) => ({ ...i, state: 'dropped', droppedReason: 'episode-closed' })) };
+        }
+        return original;
+      },
+    });
+    await dispatcher.tick();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(item()).toMatchObject({ state: 'dropped', droppedReason: 'episode-closed' });
+  });
+
   it('lets shutdown wait for a delivery in flight to be recorded', async () => {
     const { world, dispatcher, deliver, enqueue } = setup();
     let release!: () => void;
