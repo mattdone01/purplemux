@@ -57,7 +57,7 @@ export interface ITabReaperDeps {
   /** Pids never signalled: the server's ancestors and the tmux server. */
   protectedPids: () => Promise<number[]>;
   /**
-   * The server's own descendants (terminal connections, codex children): never
+   * The server's own descendants (terminal connections, tmux calls): never
    * a tab's, even when the server runs inside that tab's shell under nohup.
    */
   serverDescendants: () => Promise<number[]>;
@@ -269,11 +269,6 @@ export const reapTabProcesses = async (
     const paneEnviron = await deps.readEnviron(opts.panePid);
     if (paneEnviron) result.envMarker = environHasTabId(paneEnviron, opts.tabId) ? 'present' : 'absent';
   }
-  const protectedSet = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
-  // The pane shell goes with the session.
-  if (opts.panePid !== null) protectedSet.add(opts.panePid);
-  const eligible = (pid: number) => Number.isInteger(pid) && pid > 1 && !protectedSet.has(pid);
-
   const candidates: number[] = [];
   if (opts.panePid !== null) {
     for (const pid of await deps.descendants(opts.panePid)) {
@@ -283,6 +278,13 @@ export const reapTabProcesses = async (
     }
   }
   if (!opts.keepProcesses) candidates.push(...(await markedPids(deps, opts.tabId)));
+
+  // Read AFTER the candidates: a server child started between the two reads is
+  // then in the protected set, never a candidate the protection missed.
+  const protectedSet = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
+  // The pane shell goes with the session.
+  if (opts.panePid !== null) protectedSet.add(opts.panePid);
+  const eligible = (pid: number) => Number.isInteger(pid) && pid > 1 && !protectedSet.has(pid);
 
   const targets = new Map<number, ITarget>();
   const first = await describeTargets(deps, candidates.filter(eligible), targets);
