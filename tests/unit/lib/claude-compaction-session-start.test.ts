@@ -110,13 +110,17 @@ describe('a compaction is not a turn end (L30)', () => {
     expect(paste).not.toHaveBeenCalled();
   });
 
-  it('has no fallback without a source: a sourceless session start during a compaction is today\'s session start (Grok sends none)', async () => {
+  it.each([
+    ['during a compaction (compactingSince set)', ['pre-compact'] as const],
+    ['after a compaction', ['pre-compact', 'post-compact'] as const],
+  ])('has no fallback without a source: a sourceless session start %s is today\'s session start (Grok sends none)', async (_label, before) => {
     const { manager, entry, paste } = await setup();
-    manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'pre-compact' });
-    manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'post-compact' });
+    for (const kind of before) manager.handleProviderEvent('claude', 'tmux-tab-w', { kind });
+    if (before.length === 1) expect(entry.compactingSince).toEqual(expect.any(Number));
     manager.handleProviderEvent('claude', 'tmux-tab-w', { kind: 'session-start' });
     await vi.waitFor(() => expect(paste).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(entry.cliState).toBe('idle');
+    expect(paste.mock.calls[0][1]).toContain('finished its turn');
   });
 
   it.each(['startup', 'resume', 'clear'] as const)('keeps today\'s behaviour for source=%s: idle and a turn-ended nudge', async (source) => {
