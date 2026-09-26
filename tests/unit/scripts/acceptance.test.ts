@@ -77,7 +77,10 @@ describe('checks.cjs judgements', () => {
       state: 's.json',
       bashGuard: 'g.py',
       requireBashGuard: true,
+      onlyWave: null,
     });
+    // Debugging one wave against a kept instance (story 39); run.sh never passes it.
+    expect(checks.parseArgs(['--state', 's.json', '--only-wave', '4']).onlyWave).toBe(4);
     expect(() => checks.parseArgs([])).toThrow(/usage/);
     expect(() => checks.parseArgs(['--state', 's', '--nope'])).toThrow(/unknown argument/);
   });
@@ -89,6 +92,118 @@ describe('checks.cjs judgements', () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('REFUSED STATE');
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('checks-wave4.cjs fixtures (story 39)', () => {
+  const wave4 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave4.cjs'));
+  const ledgerOf = async (main: unknown[], subagents: unknown[][]) => {
+    const { applyBackgroundLine, createBackgroundLedger, mergeLedgers, openBackgroundTasks } = await import('@/lib/providers/claude/background-ledger');
+    const parts = [main, ...subagents].map((entries, i) => {
+      const ledger = createBackgroundLedger();
+      for (const e of entries) applyBackgroundLine(ledger, JSON.stringify(e), i === 0 ? 'main' : 'subagent');
+      return ledger;
+    });
+    return openBackgroundTasks(mergeLedgers(parts), Date.now() + 3_600_000).map((t) => `${t.kind}:${t.id}`);
+  };
+
+  it('the subagent-shell fixture reads as one open shell until its completion (what the live check asserts)', async () => {
+    const t0 = Date.now();
+    const main = [wave4.userLine(t0, 'go'), wave4.asyncAgentLaunch(t0 + 1000, 'aS'), wave4.queuedCompletion(t0 + 20000, 'aS', 'done'), wave4.assistantEnd(t0 + 21000, 'x')];
+    const sub = [wave4.subagentMovedShell(t0 + 19000, 'aS', 'bS')];
+    expect(await ledgerOf(main, [sub])).toEqual(['shell:bS']);
+    expect(await ledgerOf([...main, wave4.queuedCompletion(t0 + 40000, 'bS', 'done')], [sub])).toEqual([]);
+  });
+
+  it('the woken-agent fixture reads as one open agent until its second completion', async () => {
+    const t0 = Date.now();
+    const main = [wave4.userLine(t0, 'go'), wave4.asyncAgentLaunch(t0 + 1000, 'aW'), wave4.queuedCompletion(t0 + 10000, 'aW', 'done'), wave4.assistantEnd(t0 + 30000, 'x')];
+    const sub = [wave4.subagentMovedShell(t0 + 5000, 'aW', 'bW'), wave4.subagentDelivery(t0 + 25000, 'aW', 'bW')];
+    expect(await ledgerOf(main, [sub])).toEqual(['agent:aW']);
+    expect(await ledgerOf([...main, wave4.queuedCompletion(t0 + 40000, 'aW', 'done')], [sub])).toEqual([]);
+  });
+
+  it('the live stand-in writes Claude\'s session pid file and execs as `claude` with its environment kept', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w4-'));
+    try {
+      const file = wave4.liveStandIn(dir);
+      const text = fs.readFileSync(file, 'utf-8');
+      expect(text.startsWith('#!/bin/bash\n')).toBe(true);
+      expect(text).toContain('d="$HOME/.claude/sessions"');
+      expect(text).toContain('"startedAt":%s');
+      // Milliseconds on any `date` (uutils printed nanoseconds for %3N and the process start filter dropped every task).
+      expect(text).toContain('$(( $(date +%s%N) / 1000000 ))');
+      expect(text).toContain('exec -a claude cat >> "${ACC_INPUT:-/dev/null}"');
+      expect(text).not.toContain('perl');
+      expect(fs.statSync(file).mode & 0o111).not.toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the live stand-in, run: a millisecond start in its pid file, the piped line appended, HOME kept, argv[0] claude (review r2 N3)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w4-run-'));
+    const home = path.join(dir, 'home');
+    const input = path.join(dir, 'input.txt');
+    const uuid = '11111111-2222-4333-8444-555555555555';
+    try {
+      fs.mkdirSync(home);
+      const script = wave4.liveStandIn(dir);
+      const before = Date.now();
+      const child = spawn(script, ['--resume', uuid], { cwd: dir, env: asEnv({ PATH: '/usr/bin:/bin', HOME: home, ACC_INPUT: input }), stdio: ['pipe', 'ignore', 'ignore'] });
+      let startedAt: number | null = null;
+      for (let i = 0; i < 100 && startedAt === null; i++) {
+        startedAt = wave4.standInStart(home, uuid);
+        if (startedAt === null) await new Promise((r) => setTimeout(r, 50));
+      }
+      const after = Date.now();
+      expect(startedAt).not.toBeNull();
+      expect(startedAt!).toBeGreaterThanOrEqual(before - 1000);
+      expect(startedAt!).toBeLessThanOrEqual(after + 1000);
+      if (fs.existsSync(`/proc/${child.pid}/environ`)) {
+        // After the exec: argv[0] claude, HOME still in the environment (teardown sweeps by HOME).
+        for (let i = 0; i < 40 && !fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').startsWith('claude'); i++) await new Promise((r) => setTimeout(r, 50));
+        expect(fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').split('\0')[0]).toBe('claude');
+        expect(fs.readFileSync(`/proc/${child.pid}/environ`, 'utf8').split('\0')).toContain(`HOME=${home}`);
+      }
+      child.stdin!.write('typed line\n');
+      child.stdin!.end();
+      await new Promise((r) => child.on('exit', r));
+      expect(fs.readFileSync(input, 'utf8')).toBe('typed line\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('judgeMissionTyped: only the whole input being the one fixed notice line for this workspace passes', () => {
+    const line = '[purplemux mission boot-4f7e4283b1df7a108ab484805afec717] Mission Control asks this orchestrator to reconcile — read: purplemux mission bootstrap -w ws-5wqnrB';
+    expect(wave4.judgeMissionTyped(`${line}\n`, 'ws-5wqnrB').ok).toBe(true);
+    expect(wave4.judgeMissionTyped(`\u001b[200~${line}\u001b[201~\n`, 'ws-5wqnrB').ok).toBe(true);
+    // Review r1: the multi-line prompt story 12 removed, typed around the notice, must fail.
+    expect(wave4.judgeMissionTyped(`Reconcile Mission Control:\n1. read the snapshot\n${line}\n`, 'ws-5wqnrB')).toMatchObject({ ok: false, measured: expect.stringContaining('3 non-empty line(s)') });
+    expect(wave4.judgeMissionTyped(`${line}\n${line}\n`, 'ws-5wqnrB').ok).toBe(false);
+    expect(wave4.judgeMissionTyped(`${line}\n`, 'ws-OTHER').ok).toBe(false);
+    expect(wave4.judgeMissionTyped('', 'ws-5wqnrB').ok).toBe(false);
+  });
+
+  it('judgeSubagentWait: WAITING needs the control READY first, busy, no nudge, turnEnd waiting with the open count, then a READY stamped after the end', () => {
+    const good = {
+      controlReady: { kind: 'ready-for-review', at: 1 },
+      early: { stopped: true, cliState: 'busy', nudges: [], turnEnd: { kind: 'waiting', openBackgroundTasks: 1 } },
+      later: { kind: 'ready-for-review', at: 2000 },
+      endedAt: 1000,
+    };
+    expect(wave4.judgeSubagentWait(good).ok).toBe(true);
+    const bad = (over: Record<string, unknown>) => wave4.judgeSubagentWait({ ...good, ...over }).ok;
+    expect(bad({ controlReady: null })).toBe(false);
+    expect(bad({ early: { ...good.early, turnEnd: null } })).toBe(false);
+    expect(bad({ early: { ...good.early, nudges: ['ready-for-review'] } })).toBe(false);
+    expect(bad({ early: { ...good.early, cliState: 'ready-for-review' } })).toBe(false);
+    // Two open: the pre-process orphan was counted, so the start filter did not run.
+    expect(bad({ early: { ...good.early, turnEnd: { kind: 'waiting', openBackgroundTasks: 2 } } })).toBe(false);
+    expect(bad({ early: { ...good.early, turnEnd: { kind: 'ready-for-review', transcript: false, openBackgroundTasks: 0 } } })).toBe(false);
+    expect(bad({ later: null })).toBe(false);
+    expect(bad({ later: { at: 999 } })).toBe(false);
   });
 });
 
