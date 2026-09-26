@@ -712,13 +712,26 @@ export class StatusManager {
       detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
     }
 
-    await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
+    const delivered = await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
 
     if (event.kind === 'bg-completed') return;
+    // A `--notify self` job whose known failure reached the tab that registered it is that tab's to
+    // act on (a red gate in a TDD loop): it escalates through its own turn-end marker (ADR-0018) to a
+    // live agent that also gets its `stuck` nudge if it hangs. Paging the human for each one would bury
+    // the page that matters (story 34, consult ruling A) — but only when the tab can carry it on.
+    if (event.kind === 'bg-failed' && event.job.notify === 'self' && delivered && await this.carriesSelfFailure(src.tabId, entry)) {
+      // The wake starts a new episode: re-arm the once-per-wait stuck nudge, which this skip relies
+      // on if the woken tab hangs (story 34 CONFIRM).
+      this.stuckNudgedTabs.delete(src.tabId);
+      return;
+    }
 
-    // Registering a probe or pid is an explicit opt-in to being watched, so a
-    // firing always reaches the human too (push), regardless of alert policy —
-    // an escalation that only lands in a log is not an escalation.
+    // Registering a probe or pid is an explicit opt-in to being watched, so a firing reaches the human
+    // too (push), regardless of alert policy — an escalation that only lands in a log is not an
+    // escalation. The one exception is above: a self-notified failure its own tab received and can
+    // carry on. A job that vanished (`bg-exited-unknown`), a stall, a failing probe, an
+    // orchestrator-notified job and any self-notice that was NOT delivered (e.g. a tab halted by a
+    // usage limit) or reached a tab that cannot carry it on still page.
     const ws = await getWorkspaceByIdCached(src.workspaceId);
     await this.dispatchAlert({
       kind: event.kind === 'bg-exited-unknown' ? 'bg-job-unknown' : 'job' in event ? 'bg-job-died' : 'work-stalled',
@@ -730,6 +743,38 @@ export class StatusManager {
       agentSessionId: entry?.agentSessionId,
       detail,
     });
+  }
+
+  /**
+   * Whether a tab that received its own job's failure can carry it on without a page (story 34
+   * reviews r1, r2): the tab is a live agent — a shell would run the notice and an exited agent never
+   * reads it, though tmux accepts the keys for both — and so is its escalation target, which gets
+   * both its turn-end marker and its `stuck` nudge. The alert policy is no substitute: the human's
+   * stall alert runs only for an idle orchestrator, so a woken tab that hung would reach no one.
+   */
+  private async carriesSelfFailure(tabId: string, entry: ITabStatusEntry | undefined): Promise<boolean> {
+    const liveAgent = (e: ITabStatusEntry | undefined): e is ITabStatusEntry =>
+      !!e && isAgentPanelType(e.panelType) && e.cliState !== 'inactive' && e.cliState !== 'unknown';
+    if (!liveAgent(entry)) return false;
+    const ws = await getWorkspaceByIdCached(entry.workspaceId);
+    const target = ws ? this.escalationTarget(tabId, entry, ws) : null;
+    const targetEntry = target ? this.tabs.get(target) : undefined;
+    // An orchestrator id is stored as given; one naming another workspace's tab would drop the
+    // escalation (the dispatcher looks only in this workspace) — review r3.
+    return liveAgent(targetEntry) && targetEntry.workspaceId === entry.workspaceId;
+  }
+
+  /**
+   * Where a tab's turn-end escalation goes (ADR-0018): its live `reportsTo`, else the enabled
+   * orchestrator when that is another tab. A target halted by a usage limit would have the nudge
+   * withheld and dropped, so it counts as no target and an escalation falls back to the human
+   * (story 26 review r2).
+   */
+  private escalationTarget(tabId: string, entry: ITabStatusEntry, ws: IWorkspace): string | null {
+    const orch = ws.orchestration;
+    const target = this.liveReportsTo(tabId, entry)
+      ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
+    return target && !this.isHaltedByUsageLimit(target) ? target : null;
   }
 
   /** The tab's `reportsTo` while that tab is live in the same workspace (ADR-0018). */
@@ -1064,13 +1109,8 @@ export class StatusManager {
     if (!isAgentPanelType(entry.panelType)) return false;
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
     if (!ws) return false;
-    const orch = ws.orchestration;
-    const targetTabId = this.liveReportsTo(tabId, entry)
-      ?? (orch?.enabled && orch.orchestratorTabId && orch.orchestratorTabId !== tabId ? orch.orchestratorTabId : null);
+    const targetTabId = this.escalationTarget(tabId, entry, ws);
     if (!targetTabId) return false;
-    // A halted target would have the nudge withheld and dropped; report no target
-    // so an escalation falls back to the human alert (story 26 review r2).
-    if (this.isHaltedByUsageLimit(targetTabId)) return false;
 
     const now = Date.now();
     const last = this.lastNudgeByTab.get(tabId);
