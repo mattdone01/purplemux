@@ -311,6 +311,22 @@ describe('stop classification (ADR-0018)', () => {
     expect(entry.turnEnd ?? null).toBeNull();
   });
 
+  it('re-arms the stuck nudge on every classified stop, so each wait in a WAITING chain can report a stall', async () => {
+    const { manager } = await managerWithPaste();
+    const shapes = (await fs.readFile(path.join(FIXTURES, 'claude-background/shapes-2.1.283.jsonl'), 'utf-8')).trim().split('\n');
+    const start = shapes.find((l) => l.includes('"backgroundTaskId": "bshell01"'))!;
+    const entry = worker('claude-code', await writeLines('claude/c.jsonl', [start, claudeEnd('Waiting on the gate.')]));
+    manager.registerTab('worker', entry);
+    const latch = (manager as unknown as { stuckNudgedTabs: Set<string> }).stuckNudgedTabs;
+    latch.add('worker'); // a stuck nudge fired during the previous wait
+
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(entry.turnEnd?.kind).toBe('waiting'));
+
+    expect(entry.cliState).toBe('busy');
+    expect(latch.has('worker')).toBe(false);
+  });
+
   it('drops a stale classification when a newer event moved the tab on', async () => {
     const { manager, paste } = await managerWithPaste();
     const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('DONE: x')]));

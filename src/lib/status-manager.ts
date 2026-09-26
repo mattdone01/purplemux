@@ -1375,6 +1375,9 @@ export class StatusManager {
     if (!current || current !== entry) return;
     // A newer event — even a newer stop — owns the tab now.
     if (entry.lastEvent?.name !== 'stop' || entry.lastEvent.seq !== stopSeq) return;
+    // Each classified stop opens a new wait: a WAITING chain never leaves busy,
+    // so the one-stuck-nudge-per-busy-stretch latch re-arms here.
+    this.stuckNudgedTabs.delete(tabId);
 
     const turnEnd = classifyTurnEnd({
       tail: snapshot?.lastAssistantTail,

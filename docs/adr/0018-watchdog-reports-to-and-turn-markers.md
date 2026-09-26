@@ -41,6 +41,8 @@ The Stop hook can fire before the final entry reaches the file, so a read that i
 | Monitors only | never on their own; a Monitor ends at its timeout |
 | nothing open | today's 10 min on the main transcript |
 
+A stall is reported once per wait: every classified stop re-arms the stuck latch, because a chain of WAITING turns never leaves `busy`.
+
 **Routing.** `ITab.reportsTo` — set by `tab create --reports-to`, `tab reports-to`, or `PATCH /api/cli/tabs/<id> { reportsTo }` — must name a live agent tab (a nudge is typed and submitted; a shell would run it) of the SAME workspace (research Q15; crossing workspaces is ADR-0014's grant), else `reports-to-invalid` (CLI exit 2). Worker-state and liveness nudges go to it while it is live, else to the workspace orchestrator (today's rule), else — liveness only — to the tab itself. It is cleared in memory and in the layout on the target's `tab-closed`. `tab bg add --notify self` sends the job's outcome nudge to the registering tab, so a worker wakes on its own gate; the default `orchestrator` keeps today's behaviour. `alert-policy.ts` (human pushes) is unchanged.
 
 **Planned amendment (L15, story 26 — not built by story 15).** The classifier will also read `lastTurnError`: `api-error` → one resume notice to the worker through the inbox, no orchestrator nudge; a second consecutive failure → one `api-error` nudge. `usage-limit` → never any input, one nudge. Story 26 records the decision when it lands.
