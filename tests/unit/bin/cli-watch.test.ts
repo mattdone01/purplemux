@@ -99,9 +99,10 @@ describe('purplemux watch — the installed CLI against the real watch routes (A
     return JSON.parse(raw).items as Array<{ targetTabId: string; line: string; kind: string }>;
   };
 
-  it('B waits for merge:x/y held by A; when A releases, B gets one notice within moments and the watch is gone', async () => {
+  it('B waits for merge:x/y held by A; when A releases, the release event alone delivers B one notice', async () => {
     const { startWatches } = await import('@/lib/watch-manager');
-    await startWatches();
+    // No timer: only the lease release event can deliver the notice.
+    await startWatches({ tickMs: 3_600_000 });
     expect((await cli(['lease', 'acquire', 'merge:x/y'], tabA)).code).toBe(0);
     const made = await cli(['watch', 'lease', 'merge:x/y', '--until', 'free', '--label', 'land after A'], tabB);
     expect(made.code, made.stderr).toBe(0);
@@ -114,13 +115,26 @@ describe('purplemux watch — the installed CLI against the real watch routes (A
 
     expect((await cli(['lease', 'release', 'merge:x/y'], tabA)).code).toBe(0);
     let lines: Array<{ targetTabId: string; line: string }> = [];
-    // The release event reaches the watch at once; the bound only covers CLI spawns on a busy host.
-    for (let i = 0; i < 200 && !lines.length; i++) {
+    // The release event reaches the watch at once; the bound covers CLI spawns on a busy host.
+    for (let i = 0; i < 100 && !lines.length; i++) {
       await new Promise((r) => setTimeout(r, 100));
       lines = (await inbox()).filter((l) => l.targetTabId === 'tab-b');
     }
     expect(lines.map((l) => l.line)).toEqual([`[purplemux watch ${watch.id}] merge:x/y is free — watch cleared`]);
     expect(JSON.parse((await cli(['watch', 'list', '--json'], tabB)).stdout).watches).toEqual([]);
+  });
+
+  it('a lease held by the admin token is not free: no notice while any record of it remains', async () => {
+    const { startWatches } = await import('@/lib/watch-manager');
+    await startWatches({ tickMs: 100 });
+    const { getCliToken } = await import('@/lib/cli-token');
+    const admin = { PMUX_PORT: tabA.PMUX_PORT, PMUX_TOKEN: getCliToken() };
+    expect((await cli(['lease', 'acquire', 'merge:x/y'], admin)).code).toBe(0);
+    expect((await cli(['watch', 'lease', 'merge:x/y', '--until', 'free'], tabB)).code).toBe(0);
+    await new Promise((r) => setTimeout(r, 1000)); // several passes
+    expect((await inbox()).filter((l) => l.kind === 'watch')).toEqual([]);
+    expect((await cli(['lease', 'release', 'merge:x/y'], admin)).code).toBe(0);
+    await vi.waitFor(async () => expect((await inbox()).filter((l) => l.kind === 'watch')).toHaveLength(1), { timeout: 10_000 });
   });
 
   it('the owner tab closing removes its watches', async () => {

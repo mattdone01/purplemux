@@ -326,12 +326,15 @@ A watch is a one-shot subscription owned by the calling tab. The server evaluate
 the owner ONE inbox line when the condition holds, then deletes it; it dies with its tab.
   pr OWNER/REPO#N    --until merged | closed | head-moved | checks-settled
   ref OWNER/REPO@REF --until moved
-  lease NAME         --until free   (no holder, or a holder that is not live)
+  lease NAME         --until free   (no unexpired record: an acquire would succeed)
 GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a lease watch is
 evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
 max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
 server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
-text. Host cap: 60 GitHub watches (409 watch-cap, CLI exit 3); a tab holds at most 30 watches.
+text; a failing watch reads less often (the interval doubles per failure, up to 8x). A merged
+watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
+requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
+tab holds at most 30 watches.
 Lines: "[purplemux watch w-…] OWNER/REPO#N is MERGED (sha) — watch cleared", "… head moved a -> b",
 "… checks settled at sha: G green, R red", "… moved a -> b", "NAME is free", "… is failing:
 <token> …", "… expired without <until>". The label is shown by list, never typed.

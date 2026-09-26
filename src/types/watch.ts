@@ -25,6 +25,13 @@ export interface IWatch {
   lastError: { code: TWatchFailure; message: string; at: number } | null;
   /** Caller text, ≤ 80 characters: shown by `watch list`, never typed. */
   label: string | null;
+  /** True when the owner was resolved by its tab token; false for the session-header fallback (ADR-0010). */
+  verified: boolean;
+  /**
+   * The notice of a condition that held (or of expiry) whose enqueue failed: the next pass retries the
+   * enqueue alone, never the GitHub read.
+   */
+  pendingNotice?: Record<string, unknown> | null;
 }
 
 export interface IWatchesState {

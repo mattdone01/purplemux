@@ -3,7 +3,7 @@ import type { ICaller } from '@/lib/caller';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import { renderInboxLine } from '@/lib/inbox-templates';
 import { WatchManager, classifyGhError, settleChecks, type IWatchDeps, type TGhResult } from '@/lib/watch-manager';
-import { WATCH_DEFAULT_TTL_S, WATCH_GITHUB_CAP, WATCH_TAB_CAP, WatchError, checkSpec } from '@/lib/watch-store';
+import { WATCH_DEFAULT_TTL_S, WATCH_GITHUB_CAP, WATCH_TAB_CAP, WatchError, checkSpec, isDue } from '@/lib/watch-store';
 import type { IInboxItem } from '@/types/inbox';
 import type { IWatchesState } from '@/types/watch';
 
@@ -15,6 +15,7 @@ const SHA_B = 'bbbbbbbb22222222bbbbbbbb22222222bbbbbbbb';
 const caller = (workspaceId: string | null, tabId: string | null, admin = false): ICaller =>
   ({ scope: {}, workspaceId, tabId, tabName: tabId, verified: true, admin } as unknown as ICaller);
 const B = caller('ws-b', 'tab-b');
+const LEGACY = { ...caller('ws-b', 'tab-b'), verified: false } as ICaller;
 const ADMIN = caller(null, null, true);
 
 /** A fake gh keyed by the api path; each answer is a queue, the last one repeats. */
@@ -92,10 +93,12 @@ describe('harness watches (ADR-0015)', () => {
   it('merged false then true: exactly one notice reaches the owner tab and the watch is gone', async () => {
     f.answer('/pulls/517', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A), f.pull(true, 'closed', SHA_A));
     const w = await m.create(B, { kind: 'pr', target: 'NomuPay/treasury-ui#517', until: 'merged' });
-    expect(w).toMatchObject({ baseline: SHA_A, workspaceId: 'ws-b', tabId: 'tab-b', intervalS: 120 });
+    expect(w).toMatchObject({ baseline: SHA_A, workspaceId: 'ws-b', tabId: 'tab-b', intervalS: 120, verified: true, lastCheckedAt: T0 });
     await m.tick();
+    await tickAt(1); // the baseline read at creation was the first check: nothing due yet
+    expect(f.ghCalls).toHaveLength(1);
+    await tickAt(2);
     expect(f.sent).toEqual([]);
-    await tickAt(1); // not due yet: no GitHub read
     expect(f.ghCalls).toHaveLength(2);
     await tickAt(2);
     expect(f.sent.map((s) => [s.targetWorkspaceId, s.targetTabId, s.line])).toEqual([
@@ -108,15 +111,29 @@ describe('harness watches (ADR-0015)', () => {
 
   it('closed reports MERGED when it merged and CLOSED when it did not', async () => {
     f.answer('/pulls/1', f.pull(false, 'open', SHA_A), f.pull(false, 'closed', SHA_A));
+    f.answer('/pulls/2', f.pull(false, 'open', SHA_A), f.pull(true, 'closed', SHA_B));
     await m.create(B, { kind: 'pr', target: 'o/r#1', until: 'closed' });
-    await m.tick();
-    expect(f.sent[0].line).toContain('o/r#1 is CLOSED without a merge (aaaaaaaa)');
+    await m.create(B, { kind: 'pr', target: 'o/r#2', until: 'closed' });
+    await tickAt(2);
+    expect(f.sent.map((x) => x.line)).toEqual([
+      expect.stringContaining('o/r#1 is CLOSED without a merge (aaaaaaaa)'),
+      expect.stringContaining('o/r#2 is MERGED (bbbbbbbb)'),
+    ]);
+  });
+
+  it('a merged watch on a PR closed without a merge reports CLOSED instead of waiting for expiry', async () => {
+    f.answer('/pulls/4', f.pull(false, 'open', SHA_A), f.pull(false, 'closed', SHA_A));
+    await m.create(B, { kind: 'pr', target: 'o/r#4', until: 'merged' });
+    await tickAt(2);
+    expect(f.sent.map((x) => x.line)).toEqual([expect.stringContaining('o/r#4 is CLOSED without a merge')]);
+    expect(f.state.watches).toEqual([]);
   });
 
   it('head-moved carries the old and the new sha', async () => {
     f.answer('/pulls/9', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_B));
     await m.create(B, { kind: 'pr', target: 'o/r#9', until: 'head-moved' });
-    await m.tick();
+    await tickAt(2);
+    expect(f.sent).toEqual([]);
     await tickAt(2);
     expect(f.sent.map((s) => s.line)).toEqual([expect.stringContaining('o/r#9 head moved aaaaaaaa -> bbbbbbbb — watch cleared')]);
   });
@@ -126,8 +143,9 @@ describe('harness watches (ADR-0015)', () => {
     f.answer('/check-runs', { ok: true, stdout: 'completed\tsuccess\nin_progress\t\n' }, { ok: true, stdout: 'completed\tsuccess\ncompleted\tfailure\ncompleted\tskipped\n' });
     f.answer('/status', { ok: true, stdout: 'success\n' });
     await m.create(B, { kind: 'pr', target: 'o/r#5', until: 'checks-settled' });
-    await m.tick();
+    await tickAt(2);
     expect(f.sent).toEqual([]);
+    expect(f.ghCalls.find((c) => c.some((a) => a.includes('/check-runs')))).toEqual(expect.arrayContaining(['--paginate']));
     await tickAt(2);
     expect(f.sent.map((s) => s.line)).toEqual([expect.stringContaining('o/r#5 checks settled at aaaaaaaa: 3 green, 1 red — watch cleared')]);
   });
@@ -135,7 +153,7 @@ describe('harness watches (ADR-0015)', () => {
   it('ref moved reports both shas', async () => {
     f.answer('/commits/feature%2Fx', { ok: true, stdout: `${SHA_A}\n` }, { ok: true, stdout: `${SHA_B}\n` });
     await m.create(B, { kind: 'ref', target: 'o/r@feature/x', until: 'moved' });
-    await m.tick();
+    await tickAt(2);
     expect(f.sent[0].line).toContain('o/r@feature/x moved aaaaaaaa -> bbbbbbbb');
   });
 
@@ -155,14 +173,15 @@ describe('harness watches (ADR-0015)', () => {
     f.answer('/pulls/7', f.pull(false, 'open', SHA_A));
     const w = await m.create(B, { kind: 'pr', target: 'o/r#7', until: 'merged' });
     f.answer('/pulls/7', { ok: false, code: 'http-403', message: 'HTTP 403: API rate limit exceeded for user ID 1 <script>' });
-    for (let i = 0; i < 5; i++) await tickAt(2);
+    // Reads back off (2x, 4x, 8x the interval): 20-minute steps pass every backed-off interval.
+    for (let i = 0; i < 5; i++) await tickAt(20);
     expect(f.sent.map((s) => s.line)).toEqual([`[purplemux watch ${w.id}] o/r#7 is failing: http-403 — purplemux watch list shows the error; still trying until it expires`]);
     expect(f.state.watches[0]).toMatchObject({ failures: 5, lastError: { code: 'http-403', message: expect.stringContaining('rate limit') } });
     f.answer('/pulls/7', f.pull(false, 'open', SHA_A));
-    await tickAt(2);
+    await tickAt(20);
     expect(f.state.watches[0]).toMatchObject({ failures: 0, failingNotified: false, lastError: null });
     f.answer('/pulls/7', { ok: false, code: 'timeout', message: 'timed out' });
-    for (let i = 0; i < 3; i++) await tickAt(2);
+    for (let i = 0; i < 3; i++) await tickAt(20);
     expect(f.sent.map((s) => s.fields.code)).toEqual(['http-403', 'timeout']);
   });
 
@@ -229,6 +248,67 @@ describe('harness watches (ADR-0015)', () => {
     expect(await code(m.clear(B, '../x'))).toBe('watch-not-found');
   });
 
+  it('a failing watch backs off: the next read waits twice the interval, then four times, capped at eight', () => {
+    const w = { kind: 'pr', intervalS: 120, lastCheckedAt: T0, failures: 0, pendingNotice: null } as never;
+    expect(isDue(w, T0 + 120_000)).toBe(true);
+    expect(isDue({ ...(w as object), failures: 1 } as never, T0 + 120_000)).toBe(false);
+    expect(isDue({ ...(w as object), failures: 1 } as never, T0 + 240_000)).toBe(true);
+    expect(isDue({ ...(w as object), failures: 9 } as never, T0 + 8 * 120_000)).toBe(true);
+  });
+
+  it('refuses a GitHub watch that would take the host past its request budget', async () => {
+    f.answer('/pulls/', f.pull(false, 'open', SHA_A));
+    // checks-settled reads 3 times per check: 3 x 3600 / 120 = 90 requests/h each; 22 of them ask 1,980/h.
+    for (let i = 0; i < 22; i++) await m.create(caller('ws-x', `tab-${i}`), { kind: 'pr', target: `o/r#${i + 1}`, until: 'checks-settled' });
+    const refused = m.create(B, { kind: 'pr', target: 'o/r#99', until: 'checks-settled' });
+    await expect(refused).rejects.toThrow(/requests\/h/);
+    expect(await code(m.create(B, { kind: 'pr', target: 'o/r#99', until: 'checks-settled', intervalS: 3600 }))).toBe('none');
+  });
+
+  it('records whether the owner tab was verified', async () => {
+    expect((await m.create(LEGACY, { kind: 'lease', target: 'merge:x/y', until: 'free' })).verified).toBe(false);
+  });
+
+  it('a notice whose enqueue fails is kept and retried alone, never with another GitHub read', async () => {
+    f.answer('/pulls/6', f.pull(false, 'open', SHA_A), f.pull(true, 'closed', SHA_A));
+    const w = await m.create(B, { kind: 'pr', target: 'o/r#6', until: 'merged' });
+    const deps = f.deps();
+    let broken = true;
+    const flaky = new WatchManager({
+      ...deps,
+      enqueue: async (req) => {
+        if (broken) throw new Error('inbox.json unwritable');
+        return deps.enqueue(req);
+      },
+    });
+    f.now += 2 * MIN;
+    await flaky.tick();
+    expect(f.state.watches[0]).toMatchObject({ id: w.id, pendingNotice: { notice: 'merged' } });
+    const reads = f.ghCalls.length;
+    broken = false;
+    await flaky.tick();
+    expect(f.ghCalls).toHaveLength(reads);
+    expect(f.sent.map((x) => x.line)).toEqual([expect.stringContaining('is MERGED')]);
+    expect(f.state.watches).toEqual([]);
+  });
+
+  it('a lease notice never waits behind a slow GitHub read', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    f.answer('/pulls/8', f.pull(false, 'open', SHA_A));
+    await m.create(B, { kind: 'pr', target: 'o/r#8', until: 'merged' });
+    await m.create(B, { kind: 'lease', target: 'merge:x/y', until: 'free' });
+    const deps = f.deps();
+    const slow = new WatchManager({ ...deps, runGh: async (args) => { await gate; return deps.runGh(args); } });
+    f.now += 3 * MIN;
+    const github = slow.tick();
+    f.freeLeases.add('merge:x/y');
+    await slow.tick('merge:x/y');
+    expect(f.sent.map((x) => x.line)).toEqual([expect.stringContaining('merge:x/y is free')]);
+    release();
+    await github;
+  });
+
   it('a watch cleared while its GitHub read is in flight is not reported', async () => {
     const w = await (async () => {
       f.answer('/pulls/8', f.pull(false, 'open', SHA_A));
@@ -242,12 +322,13 @@ describe('harness watches (ADR-0015)', () => {
         return f.pull(true, 'closed', SHA_A);
       },
     });
+    f.now += 3 * MIN;
     await racing.tick();
     expect(f.sent).toEqual([]);
     expect(f.state.watches).toEqual([]);
   });
 
-  it('never runs two passes at once; a pass asked for meanwhile runs once afterwards', async () => {
+  it('never runs two passes of one lane at once; a pass asked for meanwhile runs once afterwards', async () => {
     let reads = 0;
     let running = 0;
     let most = 0;
@@ -263,7 +344,7 @@ describe('harness watches (ADR-0015)', () => {
         return deps.read();
       },
     });
-    await Promise.all([slow.tick(), slow.tick('merge:x/y'), slow.tick()]);
+    await Promise.all([slow.tick('merge:x/y'), slow.tick('merge:x/y'), slow.tick('merge:p/q')]);
     expect(most).toBe(1);
     expect(reads).toBe(2);
   });

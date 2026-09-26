@@ -36,7 +36,7 @@ export interface IWatchDeps {
   now: () => number;
   newId: () => string;
   runGh: (args: string[]) => Promise<TGhResult>;
-  /** True when nobody holds the lease, or its holder is not live. */
+  /** True when no unexpired record of the lease exists: an acquire by anyone would succeed. */
   leaseFree: (name: string) => Promise<boolean>;
   /** Live tabs, and the workspaces whose layout could not be read (their tabs are unknown, not closed). */
   liveTabs: () => Promise<{ tabs: ReadonlyArray<{ workspaceId: string; tabId: string }>; uncertainWorkspaceIds: ReadonlySet<string> }>;
@@ -45,14 +45,18 @@ export interface IWatchDeps {
   mutate: typeof mutateWatches;
 }
 
+type TFired = Omit<IWatchFields, 'watchId' | 'target'>;
+
 type TOutcome =
-  | { type: 'fire'; fields: Omit<IWatchFields, 'watchId' | 'target'> }
+  | { type: 'fire'; fields: TFired }
   | { type: 'wait' }
   | { type: 'fail'; code: TWatchFailure; message: string };
 
 /** Classify a failed `gh` run into a server token; the raw text is kept for `watch list` only. */
 export const classifyGhError = (err: NodeJS.ErrnoException & { killed?: boolean; signal?: string | null }, stderr: string): TWatchFailure => {
   if (err.code === 'ENOENT') return 'gh-missing';
+  // A reply larger than maxBuffer also kills the child; it is not a timeout.
+  if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'other';
   if (err.killed || err.signal === 'SIGTERM') return 'timeout';
   if (/HTTP 404/.test(stderr)) return 'http-404';
   if (/HTTP 401|gh auth login|authentication/i.test(stderr)) return 'auth';
@@ -135,7 +139,12 @@ export class WatchManager {
     }
     const p = await this.pull(w.target);
     if (!p.ok) return { type: 'fail', code: p.code, message: p.message };
-    if (w.until === 'merged') return p.merged ? { type: 'fire', fields: { notice: 'merged', sha: p.head } } : { type: 'wait' };
+    // A PR closed without a merge will never satisfy `merged`: say so rather than wait for expiry
+    // (review round 1; the abandoned-blocker half of pft-1385).
+    if (w.until === 'merged') {
+      if (p.merged) return { type: 'fire', fields: { notice: 'merged', sha: p.head } };
+      return p.state === 'closed' ? { type: 'fire', fields: { notice: 'closed', sha: p.head } } : { type: 'wait' };
+    }
     if (w.until === 'closed') {
       if (p.state !== 'closed') return { type: 'wait' };
       return { type: 'fire', fields: { notice: p.merged ? 'merged' : 'closed', sha: p.head } };
@@ -165,45 +174,60 @@ export class WatchManager {
     };
   }
 
-  private ticking: Promise<void> | null = null;
-  private again: string | undefined | null = null;
-
   /**
-   * Every due watch once: expire, evaluate, report. `onlyLease` evaluates the lease watches on one
-   * name (a release event). One pass at a time; a pass asked for meanwhile runs once afterwards.
+   * Two lanes, each one pass at a time: lease watches (a local read) and GitHub watches (reads of up
+   * to 20 s each). A lease notice never waits behind a GitHub read (review round 1). A pass asked for
+   * while its lane runs runs once afterwards; `onlyLease` runs the lease lane for one name.
    */
+  private lanes: Record<'lease' | 'github', { running: Promise<void> | null; again: string | undefined | null }> = {
+    lease: { running: null, again: null },
+    github: { running: null, again: null },
+  };
+
   async tick(onlyLease?: string): Promise<void> {
-    if (this.ticking) {
-      this.again = this.again === null ? onlyLease : undefined;
-      return this.ticking;
+    const runs = [this.lane('lease', onlyLease)];
+    if (onlyLease === undefined) runs.push(this.lane('github'));
+    await Promise.all(runs);
+  }
+
+  private lane(name: 'lease' | 'github', onlyLease?: string): Promise<void> {
+    const lane = this.lanes[name];
+    if (lane.running) {
+      lane.again = lane.again === null ? onlyLease : undefined;
+      return lane.running;
     }
-    this.ticking = (async () => {
+    lane.running = (async () => {
       try {
         let scope: string | undefined | null = onlyLease;
         while (scope !== null) {
-          this.again = null;
-          await this.pass(scope);
-          scope = this.again;
+          lane.again = null;
+          await this.pass(name, scope);
+          scope = lane.again;
         }
       } finally {
-        this.ticking = null;
+        lane.running = null;
       }
     })();
-    return this.ticking;
+    return lane.running;
   }
 
-  private async pass(onlyLease?: string): Promise<void> {
+  private async pass(lane: 'lease' | 'github', onlyLease?: string): Promise<void> {
     const now = this.deps.now();
     const { watches } = await this.deps.read();
     const outcomes = new Map<string, TOutcome | 'expired'>();
     // Evaluated outside the lock: a GitHub read may take its full timeout.
     for (const w of watches) {
-      if (onlyLease !== undefined && !(w.kind === 'lease' && w.target === onlyLease)) continue;
-      if (now >= w.expiresAt) {
+      if ((w.kind === 'lease') !== (lane === 'lease')) continue;
+      if (onlyLease !== undefined && w.target !== onlyLease) continue;
+      if (now >= w.expiresAt && !w.pendingNotice) {
         outcomes.set(w.id, 'expired');
         continue;
       }
       if (!isDue(w, now)) continue;
+      if (w.pendingNotice) {
+        outcomes.set(w.id, { type: 'fire', fields: w.pendingNotice as TFired });
+        continue;
+      }
       try {
         outcomes.set(w.id, await this.evaluate(w));
       } catch (err) {
@@ -216,11 +240,7 @@ export class WatchManager {
       for (const [id, outcome] of outcomes) {
         const w = next.find((x) => x.id === id);
         if (!w) continue; // cleared or removed with its tab meanwhile
-        try {
-          next = await this.apply(next, w, outcome, now);
-        } catch (err) {
-          log.warn(`watch ${id} could not be reported: ${err instanceof Error ? err.message : err}`);
-        }
+        next = await this.apply(next, w, outcome, now);
       }
       return { state: next === state.watches ? state : { watches: next }, value: undefined };
     });
@@ -229,12 +249,15 @@ export class WatchManager {
   private async apply(list: IWatch[], w: IWatch, outcome: TOutcome | 'expired', now: number): Promise<IWatch[]> {
     const without = () => list.filter((x) => x.id !== w.id);
     const replace = (x: IWatch) => list.map((y) => (y.id === w.id ? x : y));
-    if (outcome === 'expired') {
-      await this.deps.enqueue(this.notice(w, { notice: 'expired', until: w.until }));
-      return without();
-    }
-    if (outcome.type === 'fire') {
-      await this.deps.enqueue(this.notice(w, outcome.fields));
+    if (outcome === 'expired' || outcome.type === 'fire') {
+      const fields: TFired = outcome === 'expired' ? { notice: 'expired', until: w.until } : outcome.fields;
+      try {
+        await this.deps.enqueue(this.notice(w, fields));
+      } catch (err) {
+        // The condition held; only the notice is missing. Keep it, and retry the enqueue alone.
+        log.warn(`watch ${w.id} notice not queued: ${err instanceof Error ? err.message : err}`);
+        return replace({ ...w, pendingNotice: fields as Record<string, unknown>, lastCheckedAt: now });
+      }
       return without();
     }
     if (outcome.type === 'wait') {
@@ -244,8 +267,12 @@ export class WatchManager {
     let failingNotified = w.failingNotified;
     // One failing notice per run of failures: a broken watch is never silence, never a stream.
     if (failures >= WATCH_FAILURES_BEFORE_NOTICE && !failingNotified) {
-      await this.deps.enqueue(this.notice(w, { notice: 'failing', code: outcome.code }));
-      failingNotified = true;
+      try {
+        await this.deps.enqueue(this.notice(w, { notice: 'failing', code: outcome.code }));
+        failingNotified = true;
+      } catch (err) {
+        log.warn(`watch ${w.id} failing notice not queued (retried on the next failure): ${err instanceof Error ? err.message : err}`);
+      }
     }
     return replace({ ...w, lastCheckedAt: now, failures, failingNotified, lastError: { code: outcome.code, message: outcome.message, at: now } });
   }
@@ -284,7 +311,7 @@ export class WatchManager {
       throw new WatchError('caller-unresolved', 'a watch belongs to a tab: call from the tab that will receive its notice');
     }
     const spec = checkSpec(input);
-    const owner = { workspaceId: caller.workspaceId, tabId: caller.tabId };
+    const owner = { workspaceId: caller.workspaceId, tabId: caller.tabId, verified: caller.verified };
     // A cheap cap check before the GitHub read, then the binding one under the lock.
     checkCaps(await this.deps.read(), spec, owner);
     const baseline = await this.baseline(spec);
@@ -329,9 +356,8 @@ export class WatchManager {
 // ─── runtime ──────────────────────────────────────────────────────────────
 
 const defaultDeps = async (): Promise<IWatchDeps> => {
-  const [leaseStore, leaseHttp, tabLifecycle, inboxStore] = await Promise.all([
+  const [leaseStore, tabLifecycle, inboxStore] = await Promise.all([
     import('@/lib/lease-store'),
-    import('@/lib/lease-http'),
     import('@/lib/tab-lifecycle'),
     import('@/lib/inbox-store'),
   ]);
@@ -339,11 +365,11 @@ const defaultDeps = async (): Promise<IWatchDeps> => {
     now: () => Date.now(),
     newId: newWatchId,
     runGh: runGhDefault,
-    leaseFree: async (name) => {
-      const lease = leaseStore.pruneExpired(await leaseStore.readLeaseState(), Date.now()).state.leases.find((l) => l.name === name);
-      if (!lease) return true;
-      return (await leaseHttp.viewOf(lease)).holderState !== 'live';
-    },
+    // Free means an acquire by another tab would succeed: no unexpired record. A dead holder is
+    // released by the lease sweeper, which fires the release event (review round 1: holder state
+    // `admin`, `agent-gone` or `closed` still refuses every other acquire).
+    leaseFree: async (name) =>
+      !leaseStore.pruneExpired(await leaseStore.readLeaseState(), Date.now()).state.leases.some((l) => l.name === name),
     liveTabs: tabLifecycle.readLiveTabs,
     enqueue: inboxStore.enqueueNotice,
     read: readWatches,
@@ -367,7 +393,7 @@ export const getWatchManager = async (): Promise<WatchManager> => {
  * Its own timer, not a slot in StatusManager.poll: a GitHub read may take 20 s, and the status
  * poll awaits each step, so 60 watches there would stall tab status for minutes.
  */
-export const startWatches = async (): Promise<void> => {
+export const startWatches = async (options: { tickMs?: number } = {}): Promise<void> => {
   if (g.__ptWatchRuntime) return;
   const runtime: IWatchRuntime = { timer: null, unsubscribe: [] };
   g.__ptWatchRuntime = runtime;
@@ -387,7 +413,7 @@ export const startWatches = async (): Promise<void> => {
     if (n) log.info({ removed: n }, 'watch boot pass: owner tabs closed while down');
   }).catch((err) => log.warn(`watch boot pass skipped: ${err instanceof Error ? err.message : err}`));
   if (g.__ptWatchRuntime !== runtime) return;
-  const timer = setInterval(() => tick(), WATCH_TICK_MS);
+  const timer = setInterval(() => tick(), options.tickMs ?? WATCH_TICK_MS);
   timer.unref?.();
   runtime.timer = timer;
   tick();

@@ -24,8 +24,16 @@ export const WATCH_MIN_TTL_S = MIN;
 export const WATCH_DEFAULT_INTERVAL_S = 120;
 export const WATCH_MIN_INTERVAL_S = 60;
 export const WATCH_MAX_INTERVAL_S = HOUR;
-/** Active pr and ref watches on the host: 60 × 2 calls / 120 s stays inside the shared gh budget. */
+/** Active pr and ref watches on the host. */
 export const WATCH_GITHUB_CAP = 60;
+/**
+ * GitHub requests per hour all watches together may spend: 40 % of the 5,000/h user budget, which
+ * every session's `gh` and `pr-poll.sh` share (review round 1: 60 checks-settled watches at 60 s
+ * would ask for 10,800/h).
+ */
+export const WATCH_GITHUB_REQUESTS_PER_HOUR = 2_000;
+/** A failing watch waits up to this many intervals between reads (doubling per failure). */
+export const WATCH_BACKOFF_MAX = 8;
 /** Watches one tab may hold, of any kind. */
 export const WATCH_TAB_CAP = 30;
 export const WATCH_FAILURES_BEFORE_NOTICE = 3;
@@ -109,12 +117,24 @@ export const checkSpec = (input: Record<string, unknown>): IWatchSpec => {
 
 export const isGithub = (w: Pick<IWatch, 'kind'>): boolean => w.kind !== 'lease';
 
+/** Reads per check: a PR, plus check runs and commit status for checks-settled; a ref, one. */
+export const readsPerCheck = (w: Pick<IWatch, 'kind' | 'until'>): number => (w.kind === 'pr' && w.until === 'checks-settled' ? 3 : 1);
+
+/** The GitHub requests per hour a watch asks for at its interval. */
+export const requestsPerHour = (w: Pick<IWatch, 'kind' | 'until' | 'intervalS'>): number =>
+  (isGithub(w) ? (readsPerCheck(w) * 3600) / w.intervalS : 0);
+
 /** The caps, counted on the state the new watch joins. */
 export const checkCaps = (state: IWatchesState, spec: IWatchSpec, owner: { workspaceId: string; tabId: string }): void => {
   if (isGithub(spec)) {
     const github = state.watches.filter(isGithub).length;
     if (github >= WATCH_GITHUB_CAP) {
       throw new WatchError('watch-cap', `the host holds ${github} GitHub watches; the cap is ${WATCH_GITHUB_CAP} (clear one with purplemux watch clear)`);
+    }
+    const rate = state.watches.reduce((sum, w) => sum + requestsPerHour(w), 0);
+    const mine = requestsPerHour(spec);
+    if (rate + mine > WATCH_GITHUB_REQUESTS_PER_HOUR) {
+      throw new WatchError('watch-cap', `GitHub watches already ask for ${Math.round(rate)} requests/h; this one adds ${Math.round(mine)} and the budget is ${WATCH_GITHUB_REQUESTS_PER_HOUR} (a longer --interval asks for less)`);
     }
   }
   const mine = state.watches.filter((w) => w.workspaceId === owner.workspaceId && w.tabId === owner.tabId).length;
@@ -123,7 +143,7 @@ export const checkCaps = (state: IWatchesState, spec: IWatchSpec, owner: { works
 
 export const createWatch = (
   spec: IWatchSpec,
-  owner: { workspaceId: string; tabId: string },
+  owner: { workspaceId: string; tabId: string; verified: boolean },
   baseline: string | null,
   now: number,
   id: string,
@@ -138,16 +158,26 @@ export const createWatch = (
   intervalS: spec.intervalS,
   createdAt: now,
   expiresAt: now + spec.ttlSeconds * 1000,
-  lastCheckedAt: null,
+  // The baseline read at creation is the first check of a GitHub watch.
+  lastCheckedAt: spec.kind === 'lease' ? null : now,
   failures: 0,
   failingNotified: false,
   lastError: null,
   label: spec.label,
+  verified: owner.verified,
+  pendingNotice: null,
 });
 
-/** A lease watch is evaluated every pass (a local read); a GitHub watch when its interval is due. */
-export const isDue = (w: IWatch, now: number): boolean =>
-  w.kind === 'lease' || w.lastCheckedAt === null || now - w.lastCheckedAt >= w.intervalS * 1000;
+/**
+ * A lease watch is evaluated every pass (a local read); a GitHub watch when its interval is due,
+ * the interval doubling per consecutive failure up to WATCH_BACKOFF_MAX (a rate-limited `gh` is
+ * not hammered). A pending notice is always due: only its enqueue is retried.
+ */
+export const isDue = (w: IWatch, now: number): boolean => {
+  if (w.kind === 'lease' || w.lastCheckedAt === null || w.pendingNotice) return true;
+  const backoff = w.failures > 0 ? Math.min(2 ** w.failures, WATCH_BACKOFF_MAX) : 1;
+  return now - w.lastCheckedAt >= w.intervalS * 1000 * backoff;
+};
 
 // ─── the file store ───────────────────────────────────────────────────────
 

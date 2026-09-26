@@ -662,7 +662,7 @@ const printWatches = (watches) => {
     const parts = [
       w.id,
       `${w.kind} ${w.target} --until ${w.until}`,
-      `owner=${w.workspaceId}/${w.tabId} (${w.owner})`,
+      `owner=${w.workspaceId}/${w.tabId} (${w.owner}${w.verified === false ? ', unverified' : ''})`,
       `age=${age(w.ageSeconds)}`,
       `expires-in=${age(w.expiresInSeconds)}`,
       `last-check=${w.lastCheckedAt ? new Date(w.lastCheckedAt).toISOString() : 'never'}`,
