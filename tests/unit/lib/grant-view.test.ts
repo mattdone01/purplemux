@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { describeGrantFailure, grantBadgeOf, grantErrorKey } from '@/lib/grant-view';
+import { canSubmitGrant, describeGrantFailure, grantBadgeOf, grantErrorKey, runGrantAction } from '@/lib/grant-view';
 import { createGrantRequest, fetchGrantsView, revokeGrantRequest } from '@/lib/grants-client';
 import type { IGrant } from '@/types/grant';
 
@@ -78,5 +78,33 @@ describe('grants client', () => {
   it('a network failure is status 0 with its message', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
     expect(await fetchGrantsView()).toEqual({ ok: false, status: 0, code: null, reason: 'offline' });
+  });
+});
+
+describe('dialog actions (story 28 review r1)', () => {
+  const describeIt = (r: { status: number; code: string | null; reason: string | null }) => `label: ${r.reason}`;
+
+  it('a success refreshes and clears the error', async () => {
+    const refresh = vi.fn(async () => {});
+    expect(await runGrantAction({ call: async () => ({ ok: true, value: {} }), refresh, describe: describeIt })).toEqual({ ok: true, error: null });
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('a refusal shows the described served reason and still refreshes (a closed tab leaves the picker)', async () => {
+    const refresh = vi.fn(async () => {});
+    const r = await runGrantAction({ call: async () => ({ ok: false, status: 400, code: 'grant-invalid', reason: 'no tab tab-a in ws-1' }), refresh, describe: describeIt });
+    expect(r).toEqual({ ok: false, error: 'label: no tab tab-a in ws-1' });
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('canSubmitGrant needs a launch grantee, a workspace, a reason and a password, and no submit in flight', () => {
+    const form = { workspaces: ['ws-2'], reason: 'r', password: 'p' };
+    expect(canSubmitGrant({ identity: 'launch' }, form, false)).toBe(true);
+    expect(canSubmitGrant({ identity: 'hook' }, form, false)).toBe(false);
+    expect(canSubmitGrant(null, form, false)).toBe(false);
+    expect(canSubmitGrant({ identity: 'launch' }, { ...form, workspaces: [] }, false)).toBe(false);
+    expect(canSubmitGrant({ identity: 'launch' }, { ...form, reason: '  ' }, false)).toBe(false);
+    expect(canSubmitGrant({ identity: 'launch' }, { ...form, password: '' }, false)).toBe(false);
+    expect(canSubmitGrant({ identity: 'launch' }, form, true)).toBe(false);
   });
 });

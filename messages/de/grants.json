@@ -23,7 +23,7 @@
   "until": "bis {time}",
   "revoke": "Widerrufen",
   "loadFailed": "Freigaben konnten nicht geladen werden",
-  "badge": "steuert {count}",
+  "badge": "steuert {count, plural, one {# Workspace} other {# Workspaces}}",
   "badgeTooltip": "Steuert {workspaces} bis {time}",
   "errorPassword": "Falsches Passwort",
   "errorLocked": "Freigabeänderungen sind gesperrt",
@@ -34,5 +34,8 @@
   "errorNotFound": "Freigabe nicht gefunden",
   "errorStore": "Die Freigabedatei ist nicht lesbar",
   "errorNetwork": "Der Server hat nicht geantwortet",
-  "errorUnknown": "Die Anfrage ist fehlgeschlagen ({status})"
+  "errorUnknown": "Die Anfrage ist fehlgeschlagen ({status})",
+  "granteesUnreadable": "Tabs von {workspaces} konnten nicht gelesen werden",
+  "granteesFailed": "Die Tab-Liste konnte nicht gelesen werden: {error}",
+  "staleSuffix": "nicht aktualisiert: {reason}"
 }

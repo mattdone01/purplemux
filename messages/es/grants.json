@@ -23,7 +23,7 @@
   "until": "hasta {time}",
   "revoke": "Revocar",
   "loadFailed": "No se pudieron cargar los permisos",
-  "badge": "controla {count}",
+  "badge": "controla {count, plural, one {# espacio} other {# espacios}}",
   "badgeTooltip": "Controla {workspaces} hasta {time}",
   "errorPassword": "Contraseña incorrecta",
   "errorLocked": "Los cambios de permisos están bloqueados",
@@ -34,5 +34,8 @@
   "errorNotFound": "Permiso no encontrado",
   "errorStore": "El archivo de permisos no se puede leer",
   "errorNetwork": "El servidor no respondió",
-  "errorUnknown": "La solicitud falló ({status})"
+  "errorUnknown": "La solicitud falló ({status})",
+  "granteesUnreadable": "No se pudieron leer las pestañas de {workspaces}",
+  "granteesFailed": "No se pudo leer la lista de pestañas: {error}",
+  "staleSuffix": "no actualizado: {reason}"
 }

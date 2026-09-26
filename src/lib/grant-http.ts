@@ -8,7 +8,8 @@ import { createLogger } from '@/lib/logger';
 import { isMissionControlError } from '@/lib/mission-control-errors';
 import { requireMissionHuman, requireMissionSameOrigin, sendMissionError } from '@/lib/mission-control-http';
 import { tabIdentityOf } from '@/lib/tab-token';
-import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
+import fs from 'fs/promises';
+import { getWorkspaceById, getWorkspaces, readWorkspaceIdsStrict } from '@/lib/workspace-store';
 import type { IGrantee } from '@/types/grant';
 
 const log = createLogger('grants-http');
@@ -39,14 +40,24 @@ export const defaultGrantDeps = (): IGrantDeps => ({
 /**
  * Every tab a human may pick as a grantee, with its identity (story 28): only a
  * `launch` identity can hold a grant, and the dialog says so before a submit.
- * Read-only: an unreadable layout lists none of its tabs.
+ * Strict and read-only (review r1): an unreadable workspaces.json throws; an
+ * unreadable or unparseable layout is reported, never listed as "no tabs", and
+ * nothing is written (no `.bak` copy).
  */
-export const listGrantees = async (): Promise<IGrantee[]> => {
-  const { workspaces } = await getWorkspaces();
+export const listGrantees = async (): Promise<{ grantees: IGrantee[]; unreadableWorkspaceIds: string[] }> => {
+  const ids = await readWorkspaceIdsStrict();
+  const names = new Map((await getWorkspaces()).workspaces.map((w) => [w.id, w.name]));
   const grantees: IGrantee[] = [];
-  for (const ws of workspaces) {
-    const layout = await readLayoutFile(resolveLayoutFile(ws.id)).catch(() => null);
-    if (!layout) continue;
+  const unreadableWorkspaceIds: string[] = [];
+  for (const id of ids) {
+    const ws = { id, name: names.get(id) ?? id };
+    let layout: { root: Parameters<typeof collectAllTabs>[0] };
+    try {
+      layout = JSON.parse(await fs.readFile(resolveLayoutFile(id), 'utf-8'));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') unreadableWorkspaceIds.push(id);
+      continue;
+    }
     for (const tab of collectAllTabs(layout.root)) {
       if (tab.panelType === 'web-browser') continue;
       grantees.push({
@@ -59,7 +70,7 @@ export const listGrantees = async (): Promise<IGrantee[]> => {
       });
     }
   }
-  return grantees;
+  return { grantees, unreadableWorkspaceIds };
 };
 
 /** The human gate of every grant mutation (ADR-0014): a web session and this server's Origin. */

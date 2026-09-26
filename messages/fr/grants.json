@@ -23,7 +23,7 @@
   "until": "jusqu'à {time}",
   "revoke": "Révoquer",
   "loadFailed": "Impossible de charger les autorisations",
-  "badge": "pilote {count}",
+  "badge": "pilote {count, plural, one {# espace} other {# espaces}}",
   "badgeTooltip": "Pilote {workspaces} jusqu'à {time}",
   "errorPassword": "Mot de passe incorrect",
   "errorLocked": "Les modifications d'autorisations sont verrouillées",
@@ -34,5 +34,8 @@
   "errorNotFound": "Autorisation introuvable",
   "errorStore": "Le fichier des autorisations est illisible",
   "errorNetwork": "Le serveur n'a pas répondu",
-  "errorUnknown": "La requête a échoué ({status})"
+  "errorUnknown": "La requête a échoué ({status})",
+  "granteesUnreadable": "Les onglets de {workspaces} sont illisibles",
+  "granteesFailed": "La liste des onglets est illisible : {error}",
+  "staleSuffix": "non actualisé : {reason}"
 }

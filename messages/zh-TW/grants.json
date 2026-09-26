@@ -23,7 +23,7 @@
   "until": "至 {time}",
   "revoke": "撤銷",
   "loadFailed": "無法載入授權",
-  "badge": "操作 {count} 個",
+  "badge": "操作 {count} 個工作區",
   "badgeTooltip": "至 {time} 可操作 {workspaces}",
   "errorPassword": "密碼錯誤",
   "errorLocked": "授權變更已鎖定",
@@ -34,5 +34,8 @@
   "errorNotFound": "找不到授權",
   "errorStore": "授權檔案無法讀取",
   "errorNetwork": "伺服器沒有回應",
-  "errorUnknown": "請求失敗（{status}）"
+  "errorUnknown": "請求失敗（{status}）",
+  "granteesUnreadable": "無法讀取 {workspaces} 的分頁",
+  "granteesFailed": "無法讀取分頁列表：{error}",
+  "staleSuffix": "未重新整理：{reason}"
 }

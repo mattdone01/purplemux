@@ -23,7 +23,7 @@
   "until": "{time} まで",
   "revoke": "取り消す",
   "loadFailed": "権限を読み込めませんでした",
-  "badge": "{count} を操作",
+  "badge": "{count} 個のワークスペースを操作",
   "badgeTooltip": "{time} まで {workspaces} を操作",
   "errorPassword": "パスワードが違います",
   "errorLocked": "権限の変更はロックされています",
@@ -34,5 +34,8 @@
   "errorNotFound": "権限が見つかりません",
   "errorStore": "権限ファイルを読み込めません",
   "errorNetwork": "サーバーが応答しませんでした",
-  "errorUnknown": "リクエストに失敗しました ({status})"
+  "errorUnknown": "リクエストに失敗しました ({status})",
+  "granteesUnreadable": "{workspaces} のタブを読み込めませんでした",
+  "granteesFailed": "タブ一覧を読み込めませんでした: {error}",
+  "staleSuffix": "未更新: {reason}"
 }

@@ -23,7 +23,7 @@
   "until": "até {time}",
   "revoke": "Revogar",
   "loadFailed": "Não foi possível carregar as permissões",
-  "badge": "controla {count}",
+  "badge": "controla {count, plural, one {# espaço} other {# espaços}}",
   "badgeTooltip": "Controla {workspaces} até {time}",
   "errorPassword": "Senha incorreta",
   "errorLocked": "As alterações de permissões estão bloqueadas",
@@ -34,5 +34,8 @@
   "errorNotFound": "Permissão não encontrada",
   "errorStore": "O arquivo de permissões está ilegível",
   "errorNetwork": "O servidor não respondeu",
-  "errorUnknown": "A solicitação falhou ({status})"
+  "errorUnknown": "A solicitação falhou ({status})",
+  "granteesUnreadable": "Não foi possível ler as abas de {workspaces}",
+  "granteesFailed": "Não foi possível ler a lista de abas: {error}",
+  "staleSuffix": "não atualizado: {reason}"
 }

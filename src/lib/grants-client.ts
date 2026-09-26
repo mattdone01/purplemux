@@ -7,6 +7,12 @@ import type { IGrant, IGrantee } from '@/types/grant';
 export interface IGrantsView {
   grants: IGrant[];
   grantees: IGrantee[];
+  /** Workspaces whose tabs could not be read: unknown, never "no tabs". */
+  unreadableWorkspaceIds: string[];
+  /** The tab list itself could not be read. */
+  granteesError: string | null;
+  /** Server clock minus client clock at the read: activity is judged on the server's time. */
+  skewMs: number;
 }
 
 export type TGrantCall<T> =
@@ -34,7 +40,18 @@ export const fetchGrantsView = (): Promise<TGrantCall<IGrantsView>> =>
   call('/api/grants', { method: 'GET' }, (b) => ({
     grants: Array.isArray(b.grants) ? (b.grants as IGrant[]) : [],
     grantees: Array.isArray(b.grantees) ? (b.grantees as IGrantee[]) : [],
+    unreadableWorkspaceIds: Array.isArray(b.unreadableWorkspaceIds) ? (b.unreadableWorkspaceIds as string[]) : [],
+    granteesError: typeof b.granteesError === 'string' ? b.granteesError : null,
+    skewMs: typeof b.serverNow === 'number' ? b.serverNow - Date.now() : 0,
   }));
+
+/** A refused read, thrown so SWR keeps the last good view (review r1: a failed refresh never hides grants). */
+export class GrantsReadError extends Error {
+  constructor(readonly failure: { status: number; code: string | null; reason: string | null }) {
+    super(failure.reason ?? `grants read failed (${failure.status})`);
+    this.name = 'GrantsReadError';
+  }
+}
 
 export interface ICreateGrantForm {
   granteeWorkspaceId: string;

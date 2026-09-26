@@ -23,7 +23,7 @@
   "until": "до {time}",
   "revoke": "Отозвать",
   "loadFailed": "Не удалось загрузить разрешения",
-  "badge": "управляет {count}",
+  "badge": "управляет {count, plural, one {# пространством} other {# пространствами}}",
   "badgeTooltip": "Управляет {workspaces} до {time}",
   "errorPassword": "Неверный пароль",
   "errorLocked": "Изменение разрешений заблокировано",
@@ -34,5 +34,8 @@
   "errorNotFound": "Разрешение не найдено",
   "errorStore": "Файл разрешений не читается",
   "errorNetwork": "Сервер не ответил",
-  "errorUnknown": "Запрос не выполнен ({status})"
+  "errorUnknown": "Запрос не выполнен ({status})",
+  "granteesUnreadable": "Не удалось прочитать вкладки {workspaces}",
+  "granteesFailed": "Не удалось прочитать список вкладок: {error}",
+  "staleSuffix": "не обновлено: {reason}"
 }

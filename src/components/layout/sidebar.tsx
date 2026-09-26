@@ -31,6 +31,7 @@ import {
 } from '@/components/ui/alert-dialog';
 import type { ITab, IWorkspace, IWorkspaceGroup } from '@/types/terminal';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
+import useGrants from '@/hooks/use-grants';
 import WorkspaceItem from '@/components/features/workspace/workspace-item';
 import WorkspaceGroupHeader from '@/components/features/workspace/workspace-group-header';
 import dynamic from 'next/dynamic';
@@ -96,6 +97,8 @@ const Sidebar = () => {
   const settingsOpen = useWorkspaceStore((s) => s.isSettingsDialogOpen);
   const setSettingsOpen = useWorkspaceStore((s) => s.setSettingsDialogOpen);
   const [grantsOpen, setGrantsOpen] = useState(false);
+  // The one owner of the grants refresh (story 28): the tab badges read its cache.
+  useGrants('poller');
   const tg = useTranslations('grants');
   const storedSidebarTab = useWorkspaceStore((s) => s.sidebarTab);
   const [mounted, setMounted] = useState(false);

@@ -23,7 +23,7 @@
   "until": "until {time}",
   "revoke": "Revoke",
   "loadFailed": "Could not load the grants",
-  "badge": "drives {count}",
+  "badge": "drives {count, plural, one {# workspace} other {# workspaces}}",
   "badgeTooltip": "Drives {workspaces} until {time}",
   "errorPassword": "Wrong password",
   "errorLocked": "Grant changes are locked",
@@ -34,5 +34,8 @@
   "errorNotFound": "Grant not found",
   "errorStore": "The grants file is unreadable",
   "errorNetwork": "The server did not answer",
-  "errorUnknown": "The request failed ({status})"
+  "errorUnknown": "The request failed ({status})",
+  "granteesUnreadable": "Tabs of {workspaces} could not be read",
+  "granteesFailed": "The tab list could not be read: {error}",
+  "staleSuffix": "not refreshed: {reason}"
 }

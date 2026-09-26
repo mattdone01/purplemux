@@ -23,7 +23,7 @@
   "until": "{time}까지",
   "revoke": "취소",
   "loadFailed": "권한을 불러오지 못했습니다",
-  "badge": "{count}개 조작",
+  "badge": "워크스페이스 {count}개 조작",
   "badgeTooltip": "{time}까지 {workspaces} 조작",
   "errorPassword": "비밀번호가 틀렸습니다",
   "errorLocked": "권한 변경이 잠겨 있습니다",
@@ -34,5 +34,8 @@
   "errorNotFound": "권한을 찾을 수 없습니다",
   "errorStore": "권한 파일을 읽을 수 없습니다",
   "errorNetwork": "서버가 응답하지 않았습니다",
-  "errorUnknown": "요청이 실패했습니다 ({status})"
+  "errorUnknown": "요청이 실패했습니다 ({status})",
+  "granteesUnreadable": "{workspaces}의 탭을 읽을 수 없습니다",
+  "granteesFailed": "탭 목록을 읽을 수 없습니다: {error}",
+  "staleSuffix": "새로 고침 안 됨: {reason}"
 }

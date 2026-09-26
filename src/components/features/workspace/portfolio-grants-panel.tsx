@@ -1,4 +1,4 @@
-import { useTranslations } from 'next-intl';
+import { useFormatter, useTranslations } from 'next-intl';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
@@ -6,7 +6,7 @@ import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import Spinner from '@/components/ui/spinner';
-import { GRANT_EXPIRY_HOURS, isGrantActive } from '@/lib/grant-view';
+import { canSubmitGrant, GRANT_EXPIRY_HOURS, isGrantActive } from '@/lib/grant-view';
 import type { IGrant, IGrantee } from '@/types/grant';
 
 // The grant dialog's content, props only (story 28): every state is rendered
@@ -16,6 +16,10 @@ export interface IPortfolioGrantsPanelProps {
   /** False while loading or after a failed read: the lists are unknown, never shown as empty. */
   available: boolean;
   grantees: IGrantee[];
+  /** The tab list could not be read at all (the grants themselves may still be known). */
+  granteesError: string | null;
+  /** Workspaces whose tabs could not be read: listed as unknown, never as "no tabs". */
+  unreadableWorkspaceIds: string[];
   grants: IGrant[];
   /** Workspace names by id, for the lists. */
   workspaceNames: Record<string, string>;
@@ -33,7 +37,7 @@ export interface IPortfolioGrantsPanelProps {
   /** The served refusal, already labelled; never a raw code. */
   error: string | null;
   submitting: boolean;
-  revokingId: string | null;
+  revokingIds: string[];
   onSubmit: () => void;
   onRevoke: (id: string) => void;
 }
@@ -42,14 +46,15 @@ export const granteeKeyOf = (g: { workspaceId: string; tabId: string }): string 
 
 const PortfolioGrantsPanel = (props: IPortfolioGrantsPanelProps) => {
   const t = useTranslations('grants');
+  const format = useFormatter();
   const { grantees, grants, workspaceNames, now } = props;
   const grantee = grantees.find((g) => granteeKeyOf(g) === props.granteeKey) ?? null;
   const targets = Object.keys(workspaceNames).filter((id) => id !== grantee?.workspaceId);
   const active = grants.filter((g) => isGrantActive(g, now));
   const nameOf = (id: string) => workspaceNames[id] ?? id;
-  const timeOf = (ms: number) => new Date(ms).toLocaleString();
-  const canSubmit = !!grantee && grantee.identity === 'launch' && props.workspaces.length > 0
-    && props.reason.trim().length > 0 && props.password.length > 0 && !props.submitting;
+  const timeOf = (ms: number) => format.dateTime(new Date(ms), { dateStyle: 'medium', timeStyle: 'short' });
+  const canSubmit = canSubmitGrant(grantee, { workspaces: props.workspaces, reason: props.reason, password: props.password }, props.submitting);
+  const granteesKnown = props.available && props.granteesError === null;
 
   return (
     <div className="flex flex-col gap-4">
@@ -57,11 +62,19 @@ const PortfolioGrantsPanel = (props: IPortfolioGrantsPanelProps) => {
 
       <div className="flex flex-col gap-1.5">
         <Label>{t('granteeLabel')}</Label>
-        {!props.available ? (
+        {props.available && props.granteesError !== null && (
+          <p className="text-xs text-destructive" data-grantees-error="">{t('granteesFailed', { error: props.granteesError })}</p>
+        )}
+        {granteesKnown && props.unreadableWorkspaceIds.length > 0 && (
+          <p className="text-xs text-muted-foreground" data-unreadable-workspaces="">
+            {t('granteesUnreadable', { workspaces: props.unreadableWorkspaceIds.map(nameOf).join(', ') })}
+          </p>
+        )}
+        {!granteesKnown ? (
           <p className="text-xs text-muted-foreground" data-unavailable="grantees">—</p>
-        ) : grantees.length === 0 ? (
+        ) : grantees.length === 0 && props.unreadableWorkspaceIds.length === 0 ? (
           <p className="text-xs text-muted-foreground">{t('noGrantees')}</p>
-        ) : (
+        ) : grantees.length === 0 ? null : (
           <RadioGroup value={props.granteeKey ?? ''} onValueChange={(v) => props.onGranteeChange(String(v))} className="max-h-40 gap-1 overflow-y-auto">
             {grantees.map((g) => {
               const key = granteeKeyOf(g);
@@ -145,8 +158,8 @@ const PortfolioGrantsPanel = (props: IPortfolioGrantsPanelProps) => {
                 {who?.name || g.grantee.tabId} · {nameOf(g.grantee.workspaceId)} — {t('drives', { workspaces: g.workspaces.map(nameOf).join(', ') })}{' '}
                 <span className="text-muted-foreground">{t('until', { time: timeOf(g.expiresAt) })}</span>
               </span>
-              <Button variant="outline" size="sm" onClick={() => props.onRevoke(g.id)} disabled={props.revokingId === g.id}>
-                {props.revokingId === g.id && <Spinner className="mr-1.5 h-3 w-3" />}
+              <Button variant="outline" size="sm" onClick={() => props.onRevoke(g.id)} disabled={props.revokingIds.includes(g.id)}>
+                {props.revokingIds.includes(g.id) && <Spinner className="mr-1.5 h-3 w-3" />}
                 {t('revoke')}
               </Button>
             </div>

@@ -23,7 +23,7 @@
   "until": "至 {time}",
   "revoke": "撤销",
   "loadFailed": "无法加载授权",
-  "badge": "操作 {count} 个",
+  "badge": "操作 {count} 个工作区",
   "badgeTooltip": "至 {time} 可操作 {workspaces}",
   "errorPassword": "密码错误",
   "errorLocked": "授权更改已锁定",
@@ -34,5 +34,8 @@
   "errorNotFound": "未找到授权",
   "errorStore": "授权文件无法读取",
   "errorNetwork": "服务器没有响应",
-  "errorUnknown": "请求失败（{status}）"
+  "errorUnknown": "请求失败（{status}）",
+  "granteesUnreadable": "无法读取 {workspaces} 的标签页",
+  "granteesFailed": "无法读取标签页列表：{error}",
+  "staleSuffix": "未刷新：{reason}"
 }

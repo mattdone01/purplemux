@@ -23,7 +23,7 @@
   "until": "{time} saatine kadar",
   "revoke": "İptal et",
   "loadFailed": "İzinler yüklenemedi",
-  "badge": "{count} yönetiyor",
+  "badge": "{count} çalışma alanını yönetiyor",
   "badgeTooltip": "{time} saatine kadar {workspaces} yönetiyor",
   "errorPassword": "Yanlış parola",
   "errorLocked": "İzin değişiklikleri kilitli",
@@ -34,5 +34,8 @@
   "errorNotFound": "İzin bulunamadı",
   "errorStore": "İzin dosyası okunamıyor",
   "errorNetwork": "Sunucu yanıt vermedi",
-  "errorUnknown": "İstek başarısız oldu ({status})"
+  "errorUnknown": "İstek başarısız oldu ({status})",
+  "granteesUnreadable": "{workspaces} sekmeleri okunamadı",
+  "granteesFailed": "Sekme listesi okunamadı: {error}",
+  "staleSuffix": "yenilenmedi: {reason}"
 }

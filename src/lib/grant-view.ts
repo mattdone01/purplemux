@@ -65,3 +65,25 @@ export const describeGrantFailure = (
   const text = key === 'errorUnknown' ? label(key, { status: r.status }) : label(key);
   return r.reason ? `${text}: ${r.reason}` : text;
 };
+
+export interface IGrantActionDeps<T> {
+  call: () => Promise<{ ok: true; value: T } | { ok: false; status: number; code: string | null; reason: string | null }>;
+  /** Re-read the grants and tabs: after a success, and after a refusal too (a closed tab, a revoked grant). */
+  refresh: () => Promise<unknown>;
+  describe: (failure: { status: number; code: string | null; reason: string | null }) => string;
+}
+
+/** One create or revoke (story 28): the dialog's error is the described refusal, or null on success. */
+export const runGrantAction = async <T>(deps: IGrantActionDeps<T>): Promise<{ ok: boolean; error: string | null }> => {
+  const r = await deps.call();
+  await deps.refresh();
+  return r.ok ? { ok: true, error: null } : { ok: false, error: deps.describe(r) };
+};
+
+/** Whether the dialog may submit: a launch-identity grantee, at least one workspace, a reason and a password. */
+export const canSubmitGrant = (
+  grantee: { identity: string } | null,
+  form: { workspaces: string[]; reason: string; password: string },
+  submitting: boolean,
+): boolean => !!grantee && grantee.identity === 'launch' && form.workspaces.length > 0
+  && form.reason.trim().length > 0 && form.password.length > 0 && !submitting;
