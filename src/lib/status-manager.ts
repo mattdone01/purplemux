@@ -248,23 +248,26 @@ export class StatusManager {
         tasksSince: await this.agentProcessStartedAt(tabId, entry),
       });
       const { idle, stale, lastAssistantSnippet } = snapshot;
+      const liveRegisteredJobs = await this.liveRegisteredJobs(tabId);
+      // No await past this point: a hook event must not be overwritten.
       if (this.tabs.get(tabId) !== entry || entry.cliState !== 'unknown') return;
       const turnEnd = idle && !stale && lastAssistantSnippet
         ? classifyTurnEnd({
             tail: snapshot.lastAssistantTail,
             transcript: true,
             openBackgroundTasks: snapshot.openBackgroundTasks ?? 0,
-            liveRegisteredJobs: await this.liveRegisteredJobs(tabId),
+            liveRegisteredJobs,
           })
         : null;
       if (turnEnd?.kind === 'waiting') {
         // A restart lost the stop this tab ended on; rebuild it, silently, so
         // `tab send` (ruling A′) and the stall check still see a WAITING tab.
-        const now = Date.now();
+        // Dated at the transcript's last entry, so the stall clocks do not restart.
+        const at = snapshot.lastEntryTs ?? Date.now();
         const seq = (entry.eventSeq ?? 0) + 1;
         entry.eventSeq = seq;
-        entry.lastEvent = { name: 'stop', at: now, seq };
-        entry.turnEnd = { kind: 'waiting', at: now, seq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
+        entry.lastEvent = { name: 'stop', at, seq };
+        entry.turnEnd = { kind: 'waiting', at, seq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
         this.applyCliState(tabId, entry, 'busy', { silent: true });
         this.persistToLayout(entry);
         this.broadcastUpdate(tabId, entry);

@@ -256,6 +256,8 @@ describe('stop classification (ADR-0018)', () => {
     const shapes = (await fs.readFile(path.join(FIXTURES, 'claude-background/shapes-2.1.283.jsonl'), 'utf-8')).trim().split('\n');
     const start = shapes.find((l) => l.includes('"backgroundTaskId": "bshell01"'))!;
     const file = await writeLines('claude/r.jsonl', [start, claudeEnd('Waiting on the gate.')]);
+    const ended = new Date('2026-09-26T05:00:00.000Z');
+    await fs.utimes(file, ended, ended);
     // What the poll restores from a persisted `busy`: unknown, no lastEvent, no turnEnd.
     const entry: ITabStatusEntry = { ...worker('claude-code', file), cliState: 'unknown', lastEvent: null, eventSeq: 0 };
     manager.registerTab('worker', entry);
@@ -272,12 +274,41 @@ describe('stop classification (ADR-0018)', () => {
 
     expect(entry.cliState).toBe('busy');
     expect(entry.turnEnd).toMatchObject({ kind: 'waiting', openBackgroundTasks: 1, seq: entry.lastEvent?.seq });
-    expect(entry.lastEvent?.name).toBe('stop');
+    expect(entry.lastEvent).toMatchObject({ name: 'stop', at: Date.parse('2026-09-26T05:00:00.000Z') });
     expect(manager.isWaitingAtPrompt('worker')).toBe(true);
     const looksStalled = (manager as unknown as { looksStalled: (id: string, e: ITabStatusEntry, n: number) => Promise<boolean> }).looksStalled.bind(manager);
     const at = entry.lastEvent!.at;
     expect(await looksStalled('worker', entry, at + 40 * 60 * 1000)).toBe(false);
     expect(await looksStalled('worker', entry, at + 91 * 60 * 1000)).toBe(true);
+  });
+
+  it('applies the process-start cutoff when it rebuilds a tab after a restart', async () => {
+    const { manager } = await managerWithPaste();
+    const shapes = (await fs.readFile(path.join(FIXTURES, 'claude-background/shapes-2.1.283.jsonl'), 'utf-8')).trim().split('\n');
+    const start = shapes.find((l) => l.includes('"backgroundTaskId": "bshell01"'))!;
+    const file = await writeLines('claude/o.jsonl', [start, claudeEnd('Waiting on the gate.')]);
+    const entry: ITabStatusEntry = { ...worker('claude-code', file), cliState: 'unknown', lastEvent: null, eventSeq: 0 };
+    manager.registerTab('worker', entry);
+    const tmux = await import('@/lib/tmux');
+    vi.mocked(tmux.getAllPanesInfo).mockResolvedValue(new Map([['tmux-worker', { pid: 999_999_999 }]]) as never);
+    vi.mocked(tmux.getSessionPanePid).mockResolvedValue(4242);
+    const { getProviderByPanelType } = await import('@/lib/providers/registry');
+    const claude = getProviderByPanelType('claude-code')!;
+    const running = vi.spyOn(claude, 'isAgentRunning').mockResolvedValue(true);
+    // The shell (02:00:01Z) started before this Claude process: an orphan.
+    const detect = vi.spyOn(claude, 'detectActiveSession').mockResolvedValue({
+      status: 'running', sessionId: 's', jsonlPath: file, pid: 4243, startedAt: Date.parse('2026-09-26T03:00:00.000Z'), cwd: '/',
+    });
+    try {
+      await (manager as unknown as { resolveUnknown: (id: string) => Promise<void> }).resolveUnknown('worker');
+    } finally {
+      running.mockRestore();
+      detect.mockRestore();
+      vi.mocked(tmux.getAllPanesInfo).mockResolvedValue(new Map());
+      vi.mocked(tmux.getSessionPanePid).mockResolvedValue(null);
+    }
+    expect(entry.cliState).toBe('ready-for-review');
+    expect(entry.turnEnd ?? null).toBeNull();
   });
 
   it('drops a stale classification when a newer event moved the tab on', async () => {
