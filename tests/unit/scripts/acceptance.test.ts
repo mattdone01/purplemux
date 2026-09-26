@@ -92,6 +92,64 @@ describe('checks.cjs judgements', () => {
   });
 });
 
+describe('checks-wave3.cjs judgements (story 23)', () => {
+  const wave3 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave3.cjs'));
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w3-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('judgeDeployLine: the fixed template passes; caller text or another template fails', () => {
+    const line = '[purplemux deploy d-abcd1] purplemux restarts at ~2026-09-26T12:00:00Z (in 5 min) — details: purplemux deploy status d-abcd1; reach a checkpoint; tabs survive, in-flight hook events do not';
+    expect(wave3.judgeDeployLine(line, 'd-abcd1', 'SECRET').ok).toBe(true);
+    expect(wave3.judgeDeployLine(`${line} SECRET`, 'd-abcd1', 'SECRET').ok).toBe(false);
+    expect(wave3.judgeDeployLine(line, 'd-other', 'SECRET').ok).toBe(false);
+    expect(wave3.judgeDeployLine(undefined, 'd-abcd1', 'SECRET')).toEqual({ ok: false, measured: 'null' });
+  });
+
+  it('judgeWatchLine: needs the watch prefix, the target with its text, and the cleared tail', () => {
+    const line = '[purplemux watch w-abcd1] o/r#1 is MERGED (aaaaaaaa) — watch cleared';
+    expect(wave3.judgeWatchLine(line, 'o/r#1', 'is MERGED (aaaaaaaa)').ok).toBe(true);
+    expect(wave3.judgeWatchLine(line, 'o/r#11', 'is MERGED (aaaaaaaa)').ok).toBe(false);
+    expect(wave3.judgeWatchLine(line.replace(' — watch cleared', ''), 'o/r#1', 'is MERGED (aaaaaaaa)').ok).toBe(false);
+    expect(wave3.judgeWatchLine('[purplemux note n-abcd] o/r#1 is MERGED (aaaaaaaa) — watch cleared', 'o/r#1', 'is MERGED (aaaaaaaa)').ok).toBe(false);
+  });
+
+  it('alertsFor: reads the kinds of `alert dispatched` records for one tab from every purplemux log', () => {
+    const logs = path.join(dir, '.purplemux', 'logs');
+    fs.mkdirSync(logs, { recursive: true });
+    const rec = (o: object) => JSON.stringify({ level: 30, ...o });
+    fs.writeFileSync(path.join(logs, 'purplemux.1.log'), [
+      rec({ msg: 'alert dispatched', kind: 'bg-job-died', tabId: 'tab-a' }),
+      rec({ msg: 'alert dispatched', kind: 'review', tabId: 'tab-b' }),
+      'not json alert dispatched',
+      rec({ msg: 'liveness nudge', kind: 'bg-failed', tabId: 'tab-a' }),
+    ].join('\n'));
+    fs.writeFileSync(path.join(logs, 'purplemux.2.log'), rec({ msg: 'alert dispatched', kind: 'bg-job-unknown', tabId: 'tab-a' }));
+    fs.writeFileSync(path.join(logs, 'other.log'), rec({ msg: 'alert dispatched', kind: 'x', tabId: 'tab-a' }));
+    expect(wave3.alertsFor(dir, 'tab-a').sort()).toEqual(['bg-job-died', 'bg-job-unknown']);
+    expect(wave3.alertsFor(dir, 'tab-c')).toEqual([]);
+    expect(wave3.alertsFor(path.join(dir, 'none'), 'tab-a')).toEqual([]);
+  });
+
+  it('the fake gh answers the nth read of a path, then the default, and 404s an unknown path', () => {
+    fs.mkdirSync(path.join(dir, 'bin'));
+    const answers = wave3.installFakeGh(dir);
+    fs.writeFileSync(path.join(answers, 'repos_o_r_pulls_2.1'), 'first');
+    fs.writeFileSync(path.join(answers, 'repos_o_r_pulls_2'), 'later');
+    fs.writeFileSync(path.join(answers, 'repos_o_r_commits_c_check_runs_per_page_100'), 'runs');
+    const gh = (...args: string[]) => spawnSync(path.join(dir, 'bin', 'gh'), args, { encoding: 'utf-8' });
+    expect(gh('api', 'repos/o/r/pulls/2').stdout).toBe('first');
+    expect(gh('api', 'repos/o/r/pulls/2').stdout).toBe('later');
+    expect(gh('api', 'repos/o/r/pulls/2').stdout).toBe('later');
+    expect(gh('api', '--paginate', 'repos/o/r/commits/c/check-runs?per_page=100', '--jq', '.x').stdout).toBe('runs');
+    const missing = gh('api', 'repos/o/r/pulls/9');
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain('HTTP 404');
+  });
+});
+
 /** Pids whose environ carries a HOME under `dir` — what a leaked candidate would look like. */
 const pidsWithHomeUnder = (dir: string) =>
   fs
