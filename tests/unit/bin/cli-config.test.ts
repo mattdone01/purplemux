@@ -78,6 +78,10 @@ describe('purplemux config — the installed CLI against the real fleet-config r
         req.query.key = 'gate.slots';
         return (await import('@/pages/api/cli/fleet-config/[key]')).default(req, res);
       },
+      '/api/cli/fleet-config/constructor': async (req, res) => {
+        req.query.key = 'constructor';
+        return (await import('@/pages/api/cli/fleet-config/[key]')).default(req, res);
+      },
     });
     const port = String(server.port);
     orch = { PMUX_PORT: port, PMUX_TAB_TOKEN: await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-o' }, 'pt-ws-a-pane-1-tab-o') };
@@ -202,6 +206,18 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     expect((await cli(['config', 'list'], worker)).stdout).toBe('no fleet config set\n');
     await cli(['config', 'set', 'gate.slots', '6'], orch);
     expect((await cli(['config', 'list'], worker)).stdout).toMatch(/^gate\.slots=6 {2}v4 {2}set \S+Z by ws-a\/tab-o\n$/);
+  });
+
+  it('the key constructor is not the built-in: unset exits 7, and a set, get and unset keep the store readable', async () => {
+    expect(await cli(['config', 'get', 'constructor'], worker)).toMatchObject({ code: 7, stdout: '' });
+    expect((await cli(['config', 'unset', 'constructor'], orch)).code).toBe(7);
+    const set = await cli(['config', 'set', 'constructor', 'x', '--expect-version', '0'], orch);
+    expect(set.code, set.stderr).toBe(0);
+    expect(JSON.parse(set.stdout)).toMatchObject({ key: 'constructor', version: 1 });
+    expect(await cli(['config', 'get', 'constructor'], worker)).toEqual({ code: 0, stdout: 'x\n', stderr: '' });
+    expect((await cli(['config', 'unset', 'constructor'], orch)).code).toBe(0);
+    expect((await cli(['config', 'set', 'gate.slots', '6'], orch)).code).toBe(0);
+    expect((await cli(['config', 'get', 'gate.slots'], worker)).stdout).toBe('6\n');
   });
 
   it('refuses a malformed command with exit 2 before anything is sent', async () => {

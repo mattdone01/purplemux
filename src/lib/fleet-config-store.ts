@@ -61,7 +61,13 @@ export const checkExpectedVersion = (raw: unknown): number | undefined => {
   return raw;
 };
 
-export const versionOf = (state: IFleetConfigState, key: string): number => state.versions[key] ?? 0;
+// Own-property lookups only: `constructor` is a valid key, and plain indexing would find the
+// built-in Object on the store's plain objects (final confirmation).
+export const versionOf = (state: IFleetConfigState, key: string): number =>
+  (Object.hasOwn(state.versions, key) ? state.versions[key] : 0);
+
+export const valueOf = (state: IFleetConfigState, key: string): IFleetConfigValue | null =>
+  (Object.hasOwn(state.values, key) ? state.values[key] : null);
 
 const requireVersion = (state: IFleetConfigState, key: string, expected: number | undefined): void => {
   const current = versionOf(state, key);
@@ -95,7 +101,7 @@ export const setValue = (
   now: number,
 ): IFleetConfigResult => {
   requireVersion(state, input.key, input.expectedVersion);
-  const old = state.values[input.key] ?? null;
+  const old = valueOf(state, input.key);
   if (old?.value === input.value) return { state, change: null };
   const version = versionOf(state, input.key) + 1;
   const change: IFleetConfigChange = { key: input.key, oldValue: old?.value ?? null, newValue: input.value, version, at: now, by };
@@ -108,7 +114,7 @@ export const unsetValue = (
   by: IFleetConfigSetter,
   now: number,
 ): IFleetConfigResult => {
-  const old = state.values[input.key];
+  const old = valueOf(state, input.key);
   if (!old) throw new FleetConfigError('config-not-found', `${input.key} is not set`);
   requireVersion(state, input.key, input.expectedVersion);
   const change: IFleetConfigChange = { key: input.key, oldValue: old.value, newValue: null, version: versionOf(state, input.key) + 1, at: now, by };
@@ -167,7 +173,7 @@ export const readFleetConfig = async (): Promise<IFleetConfigState> => {
   // hand-edited "4" would make the next version "41", a missing one would repeat a version.
   const versions = parsed.versions as Record<string, unknown>;
   const badVersion = Object.entries(versions).find(([k, v]) => !FLEET_KEY.test(k) || !Number.isSafeInteger(v) || (v as number) < 0)
-    ?? Object.entries(parsed.values as Record<string, IFleetConfigValue>).find(([k, v]) => !Number.isSafeInteger(versions[k]) || (versions[k] as number) < v.version);
+    ?? Object.entries(parsed.values as Record<string, IFleetConfigValue>).find(([k, v]) => !Object.hasOwn(versions, k) || !Number.isSafeInteger(versions[k]) || (versions[k] as number) < v.version);
   if (badVersion) throw refuse(`has a malformed version for ${JSON.stringify(badVersion[0])}`);
   if (parsed.history.some((c) => !isRecord(c) || typeof c.key !== 'string' || !Number.isSafeInteger(c.version))) throw refuse('has a malformed history entry');
   return parsed as unknown as IFleetConfigState;

@@ -11,6 +11,7 @@ import {
   readFleetConfig,
   setValue,
   unsetValue,
+  valueOf,
 } from '@/lib/fleet-config-store';
 import { leaseAuthority } from '@/lib/lease-http';
 import { createLogger } from '@/lib/logger';
@@ -68,7 +69,8 @@ export const putValue = async (
   await requireWriter(caller, authority);
   const { state, change } = await mutateFleetConfig((s) => setValue(s, { key, value, expectedVersion }, setterOf(caller), authority.now()));
   if (change) await audit(change, caller);
-  return { key, version: state.values[key].version, value: state.values[key], changed: change !== null };
+  const stored = valueOf(state, key)!;
+  return { key, version: stored.version, value: stored, changed: change !== null };
 };
 
 export const deleteValue = async (
@@ -95,7 +97,7 @@ export const readValues = async (query: NextApiRequest['query']): Promise<Record
     return { history: key ? state.history.filter((c) => c.key === key) : state.history };
   }
   if (key) {
-    const value = state.values[key];
+    const value = valueOf(state, key);
     if (!value) throw new FleetConfigError('config-not-found', `${key} is not set`);
     return { key, ...value };
   }

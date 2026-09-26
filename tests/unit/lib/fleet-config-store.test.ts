@@ -75,6 +75,17 @@ describe('fleet config transitions (ADR-0019)', () => {
     expect(codeOf(() => unsetValue(one.state, { key: 'gate.slots', expectedVersion: 7 }, ADMIN, 1))).toBe('config-version-conflict');
   });
 
+  it('a key named like a built-in property (constructor) is an ordinary key', () => {
+    expect(checkKey('constructor')).toBe('constructor');
+    expect(codeOf(() => unsetValue(emptyFleetConfig(), { key: 'constructor' }, ADMIN, 1))).toBe('config-not-found');
+    const one = set(emptyFleetConfig(), 'constructor', 'x', 0);
+    expect(one.state.values.constructor).toEqual({ value: 'x', version: 1, setAt: 1000, setBy: ORCH });
+    expect(one.state.versions.constructor).toBe(1);
+    const gone = unsetValue(one.state, { key: 'constructor', expectedVersion: 1 }, ADMIN, 2);
+    expect(gone.state.versions.constructor).toBe(2);
+    expect(Object.hasOwn(gone.state.values, 'constructor')).toBe(false);
+  });
+
   it(`keeps only the last ${FLEET_HISTORY_MAX} changes`, () => {
     let s = emptyFleetConfig();
     for (let i = 1; i <= FLEET_HISTORY_MAX + 5; i++) s = set(s, 'gate.slots', String(i)).state;
