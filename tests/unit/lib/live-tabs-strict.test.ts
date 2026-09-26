@@ -32,7 +32,7 @@ describe('the live-tab snapshot never reads an unreadable workspace list as "no 
   beforeEach(async () => {
     vi.resetModules();
     resetLeaseGlobals();
-    for (const key of ['__purplemuxWorkspaceLock', '__purplemuxWorkspacesContentCache', '__ptLayoutContentCache', '__ptLayoutLock']) {
+    for (const key of ['__purplemuxWorkspaceLock', '__purplemuxWorkspacesContentCache', '__ptLayoutContentCache', '__ptLayoutLock', '__ptTabTokens', '__ptTabTokenLock', '__ptTabTokenRevokeInstalled']) {
       delete (globalThis as Record<string, unknown>)[key];
     }
     mockHome.value = await makeHome();
@@ -69,6 +69,19 @@ describe('the live-tab snapshot never reads an unreadable workspace list as "no 
     await corrupt();
     const { readLiveTabs } = await import('@/lib/tab-lifecycle');
     await expect(readLiveTabs()).rejects.toThrow('workspaces.json');
+  });
+
+  it('boot survives an unreadable workspace list: the token sweep is skipped, revocation still installed', async () => {
+    await fs.writeFile(workspacesFile(), '{broken');
+    const { initTabTokens, ensureTabToken, resolveTabToken } = await import('@/lib/tab-token');
+    const { emitTabClosed } = await import('@/lib/tab-lifecycle');
+    const token = await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-1' }, 's1');
+
+    await expect(initTabTokens()).resolves.toBeUndefined();
+    expect(resolveTabToken(token)?.tabId).toBe('tab-1');
+    emitTabClosed({ workspaceId: 'ws-a', tabId: 'tab-1', sessionName: 's1', reason: 'layout-removed' });
+    expect(resolveTabToken(token)).toBeNull();
+    await (globalThis as { __ptTabTokenLock?: Promise<void> }).__ptTabTokenLock;
   });
 
   it('a runtime sweep over an unreadable workspace list releases nothing', async () => {

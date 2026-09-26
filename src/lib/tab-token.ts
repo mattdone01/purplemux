@@ -279,7 +279,13 @@ export const installTabTokenRevocation = (): void => {
 /** Boot: after the workspace store's cross-check, so adopted orphans are already in the layouts. */
 export const initTabTokens = async (): Promise<void> => {
   installTabTokenRevocation();
-  const { listSessions } = await import('@/lib/tmux');
-  const [live, sessions] = await Promise.all([readLiveTabs(), listSessions()]);
-  await sweepTabTokens(live.tabs, new Set(sessions), live.uncertainWorkspaceIds);
+  try {
+    const { listSessions } = await import('@/lib/tmux');
+    const [live, sessions] = await Promise.all([readLiveTabs(), listSessions()]);
+    await sweepTabTokens(live.tabs, new Set(sessions), live.uncertainWorkspaceIds);
+  } catch (err) {
+    // A token of a vanished tab outliving one boot costs nothing; a server that
+    // does not start costs everything.
+    log.error(`boot tab-token sweep skipped: ${err instanceof Error ? err.message : err}`);
+  }
 };
