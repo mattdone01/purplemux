@@ -122,7 +122,9 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'note-too-large': EXIT.USAGE,
   'config-invalid': EXIT.USAGE,
   'note-target-missing': EXIT.USAGE,
+  'note-invalid': EXIT.USAGE,
   'lease-held': EXIT.CONFLICT,
+  'note-cap': EXIT.CONFLICT,
   'lease-held-by-other': EXIT.CONFLICT,
   'watch-cap': EXIT.CONFLICT,
   forbidden: EXIT.CONFLICT,
@@ -561,6 +563,91 @@ const leaseName = (args, what = 'NAME') => {
   return positional[0];
 };
 
+// Fleet config (ADR-0019): versioned values tools read at call time. A change
+// is audited and sent to nobody.
+const CONFIG_USAGE = 'usage: config get KEY | list [--json] | set KEY VALUE [--expect-version N] | unset KEY [--expect-version N] | history [KEY] [--json]';
+const CONFIG_KEY = /^[a-z][a-z0-9.-]{1,63}$/;
+
+const configKey = (key) => {
+  if (!key || !CONFIG_KEY.test(key)) die(`KEY must match ${CONFIG_KEY.source}, got ${JSON.stringify(key ?? '')}`);
+  return key;
+};
+
+const expectVersion = (args) => {
+  if (!args.includes('--expect-version')) return {};
+  const raw = flagValue(args, '--expect-version');
+  if (raw === null || !/^\d+$/.test(raw)) die(`--expect-version needs a whole number, got ${JSON.stringify(raw ?? '')}`);
+  return { expectedVersion: Number(raw) };
+};
+
+const setterText = (by) => (by.admin ? 'admin' : `${by.workspaceId}/${by.tabId}`);
+
+const cmdConfig = async (args) => {
+  const sub = args[0];
+  const positional = stripBooleanFlags(stripFlags(args.slice(1), ['--expect-version']), ['--json']);
+  switch (sub) {
+    case 'get': {
+      if (positional.length !== 1) die(CONFIG_USAGE);
+      const key = configKey(positional[0]);
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/fleet-config?key=${encodeURIComponent(key)}`);
+      // The bare value, so a script reads it with $(purplemux config get KEY).
+      process.stdout.write(`${body.value}\n`);
+      return;
+    }
+    case 'list': {
+      if (positional.length) die(CONFIG_USAGE);
+      requireEnv();
+      const { body } = await api('GET', '/api/cli/fleet-config');
+      if (args.includes('--json')) return out(body);
+      const entries = Object.entries(body.values || {}).sort(([a], [b]) => a.localeCompare(b));
+      if (!entries.length) {
+        process.stdout.write('no fleet config set\n');
+        return;
+      }
+      for (const [key, v] of entries) {
+        process.stdout.write(`${key}=${v.value}  v${v.version}  set ${new Date(v.setAt).toISOString()} by ${setterText(v.setBy)}\n`);
+      }
+      return;
+    }
+    case 'set': {
+      if (positional.length !== 2) die(CONFIG_USAGE);
+      const key = configKey(positional[0]);
+      const data = { value: positional[1], ...expectVersion(args) };
+      requireEnv();
+      const { body } = await api('PUT', `/api/cli/fleet-config/${encodeURIComponent(key)}`, data);
+      return out(body);
+    }
+    case 'unset': {
+      if (positional.length !== 1) die(CONFIG_USAGE);
+      const key = configKey(positional[0]);
+      requireEnv();
+      const { body } = await api('DELETE', `/api/cli/fleet-config/${encodeURIComponent(key)}`, expectVersion(args));
+      return out(body);
+    }
+    case 'history': {
+      if (positional.length > 1) die(CONFIG_USAGE);
+      const key = positional.length ? configKey(positional[0]) : null;
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/fleet-config?history=1${key ? `&key=${encodeURIComponent(key)}` : ''}`);
+      if (args.includes('--json')) return out(body);
+      const history = body.history || [];
+      if (!history.length) {
+        process.stdout.write('no changes\n');
+        return;
+      }
+      for (const c of history) {
+        const from = c.oldValue === null ? '(unset)' : c.oldValue;
+        const to = c.newValue === null ? '(unset)' : c.newValue;
+        process.stdout.write(`${new Date(c.at).toISOString()}  ${c.key}  ${from} -> ${to}  v${c.version}  by ${setterText(c.by)}\n`);
+      }
+      return;
+    }
+    default:
+      die(CONFIG_USAGE);
+  }
+};
+
 // The inbox (ADR-0012): server notices queued for this workspace's tabs.
 const cmdInbox = async (args) => {
   requireEnv();
@@ -582,6 +669,76 @@ const cmdInbox = async (args) => {
     }
     default:
       die('usage: inbox list -w WS [--all] | inbox retry ID');
+  }
+};
+
+// Notes (ADR-0013): a body the recipient pulls; only the inbox's fixed line is typed.
+const NOTE_BODY_MAX_BYTES = 16 * 1024;
+const NOTE_USAGE = 'usage: note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]'
+  + ' | note list [--open] [--to-me] [--from-me] [--epic SLUG] | note show ID | note ack ID [--comment TEXT]';
+const NOTE_VALUE_FLAGS = ['--to-epic', '--to-workspace', '--subject', '--file', '-f', '--from-epic', '--epic', '--comment'];
+const NOTE_BOOL_FLAGS = ['--open', '--to-me', '--from-me'];
+const NOTE_ID = /^n-[A-Za-z0-9_-]{4,32}$/;
+
+const noteId = (rest) => {
+  const positional = stripBooleanFlags(stripFlags(rest, NOTE_VALUE_FLAGS), NOTE_BOOL_FLAGS);
+  if (positional.length !== 1 || !NOTE_ID.test(positional[0])) die(`exactly one note id (n-…) is required — ${NOTE_USAGE}`);
+  return positional[0];
+};
+
+const cmdNote = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'send': {
+      const toEpic = flagValue(rest, '--to-epic');
+      const toWorkspace = flagValue(rest, '--to-workspace');
+      if ((toEpic === null) === (toWorkspace === null)) die(`exactly one of --to-epic or --to-workspace is required — ${NOTE_USAGE}`);
+      const subject = flagValue(rest, '--subject');
+      if (!subject) die(`--subject is required — ${NOTE_USAGE}`);
+      const file = flagValue(rest, '--file') || flagValue(rest, '-f');
+      if (!file) die(`the body comes from -f FILE or -f - (stdin) — ${NOTE_USAGE}`);
+      const body = file === '-' ? await readStdin() : require('fs').readFileSync(file, 'utf8');
+      const bytes = Buffer.byteLength(body, 'utf8');
+      if (bytes > NOTE_BODY_MAX_BYTES) die(`note body is ${bytes} bytes; the limit is 16 KiB (${NOTE_BODY_MAX_BYTES} bytes)`);
+      const data = { subject, body };
+      if (toEpic !== null) data.toEpic = toEpic;
+      if (toWorkspace !== null) data.toWorkspace = toWorkspace;
+      const fromEpic = flagValue(rest, '--from-epic');
+      if (fromEpic !== null) data.fromEpic = fromEpic;
+      requireEnv();
+      const { body: resp } = await api('POST', '/api/cli/notes', data);
+      return out(resp);
+    }
+    case 'list': {
+      const positional = stripBooleanFlags(stripFlags(rest, NOTE_VALUE_FLAGS), NOTE_BOOL_FLAGS);
+      if (positional.length) die(`unexpected argument: ${positional[0]} — ${NOTE_USAGE}`);
+      const qs = new URLSearchParams();
+      if (rest.includes('--open')) qs.set('open', '1');
+      if (rest.includes('--to-me')) qs.set('toMe', '1');
+      if (rest.includes('--from-me')) qs.set('fromMe', '1');
+      const epic = flagValue(rest, '--epic');
+      if (epic !== null) qs.set('epic', epic);
+      requireEnv();
+      const query = qs.toString();
+      const { body } = await api('GET', `/api/cli/notes${query ? `?${query}` : ''}`);
+      return out(body);
+    }
+    case 'show': {
+      const id = noteId(rest);
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/notes/${id}`);
+      return out(body);
+    }
+    case 'ack': {
+      const id = noteId(rest);
+      const comment = flagValue(rest, '--comment');
+      requireEnv();
+      const { body } = await api('POST', `/api/cli/notes/${id}/ack`, comment === null ? {} : { comment });
+      return out(body);
+    }
+    default:
+      die(NOTE_USAGE);
   }
 };
 
@@ -1135,6 +1292,22 @@ Commands:
                                            for WS's tabs; --all adds delivered and dropped (kept 7 days)
   inbox retry ID                           Re-queue a held notice once (the target workspace's token or admin).
                                            Exit 3 inbox-not-held, 7 inbox-not-found
+  note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]
+                                           A note to an epic's owner (the live epic:SLUG holder) or a workspace's
+                                           orchestrator; body <= 16 KiB (exit 2). Only a fixed notice line is typed
+                                           into the recipient; it pulls the body. --from-epic needs that epic lease (3)
+  note list [--open] [--to-me] [--from-me] [--epic SLUG]
+                                           Notes your workspace sent or receives (no bodies). Run --open --to-me at turn start
+  note show ID                             The note and its body (recipient or sender workspace, or admin; else exit 3; 7 unknown)
+  note ack ID [--comment TEXT]             Acknowledge a note delivered to your workspace (else exit 3)
+  config get KEY                           Print a fleet config value bare (e.g. gate.slots); exit 7 when unset
+  config list [--json]                     Every fleet config value with its version, time and setter
+  config set KEY VALUE [--expect-version N]
+                                           Set a value (admin token or the workspace's enabled orchestrator tab;
+                                           else exit 3 forbidden). Nobody is messaged: tools read it at call time.
+                                           A stale --expect-version exits 3 config-version-conflict
+  config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
+  config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -1197,6 +1370,10 @@ const main = async () => {
       return cmdMission(args.slice(1));
     case 'inbox':
       return cmdInbox(args.slice(1));
+    case 'note':
+      return cmdNote(args.slice(1));
+    case 'config':
+      return cmdConfig(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

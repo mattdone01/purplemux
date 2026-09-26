@@ -139,14 +139,18 @@ export const sweepInState = (state: IInboxState, now: number): IInboxState => {
   return changed ? { items } : state;
 };
 
-/** Withdraw one still-queued item (its owner no longer wants it typed); anything else is untouched. */
+/**
+ * Withdraw one item still waiting to be typed — queued, or held for a manual retry — because its
+ * owner no longer wants it typed (an API-error resume whose episode closed; a note routed to
+ * another tab). A delivered or dropped item is untouched.
+ */
 export const withdrawInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState => {
   const item = state.items.find((i) => i.id === id);
-  if (!item || item.state !== 'queued') return state;
+  if (!item || (item.state !== 'queued' && item.state !== 'held')) return state;
   return replace(state, id, (i) => ({ ...i, state: 'dropped', droppedReason: reason, transitionAt: now }));
 };
 
-/** Withdraw a queued item by id; true when it was still queued. */
+/** Withdraw a waiting (queued or held) item by id; true when it was still waiting. */
 export const withdrawNotice = async (id: string, reason: string): Promise<boolean> =>
   mutateInbox((state) => {
     const next = withdrawInState(state, id, reason, Date.now());
