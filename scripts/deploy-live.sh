@@ -390,7 +390,14 @@ fi
 
 if ((ROLLBACK)); then
   HOOK_INSTALL="${DEPLOY_HOOK_INSTALL:-$prev/scripts/install-hook-scripts.sh}"
-  [[ -x "$HOOK_INSTALL" ]] || { HOOK_INSTALL=""; S_HOOKS="skipped (rollback target has no scripts/install-hook-scripts.sh)"; }
+  if [[ "$prev" != "$RELEASES/"* ]]; then
+    # A first install's live checkout: its working tree need not match the build it runs.
+    HOOK_INSTALL=""
+    S_HOOKS="skipped (rollback target is not a release)"
+  elif [[ ! -x "$HOOK_INSTALL" ]]; then
+    HOOK_INSTALL=""
+    S_HOOKS="skipped (rollback target has no scripts/install-hook-scripts.sh)"
+  fi
 else
   HOOK_INSTALL="${DEPLOY_HOOK_INSTALL:-$RELEASE_DIR/scripts/install-hook-scripts.sh}"
   [[ -x "$HOOK_INSTALL" ]] || refuse 2 HOOK-INSTALL-MISSING "no executable $HOOK_INSTALL" \
@@ -410,19 +417,29 @@ install_hooks() {
   HOOKS_RESULT="$((wrote + same)) scripts ($wrote changed)"
 }
 
-# set_spool_aside TARGET: after a rollback restart into a release without scripts/install-hook-scripts.sh.
-# That release predates ADR-0020: its server never drains the spool and persists no hook floor, so a
-# later server could not order these files against the events it applied live. They are moved into a
-# dated directory under hook-spool/bad/ (pruned after 7 days), never replayed.
+# set_spool_aside TARGET: after a HEALTHY rollback restart into TARGET, unless TARGET is a release
+# directory with scripts/install-hook-scripts.sh. A release's scripts and build come from one commit;
+# a first install's live checkout is a working tree whose scripts need not match the build it runs,
+# so it counts as a server without ADR-0020. Such a server never drains the spool and saves no hook
+# floor, so a later server could not order these files against the events it applied live. They are
+# moved into a dated directory under hook-spool/bad/ (pruned after 7 days), never replayed. The
+# floors file (.floors.json) is not an event and stays.
 set_spool_aside() {
-  local target="$1" spool="$PMUX_HOME/hook-spool" dest moved=0 file
-  [[ -x "$target/scripts/install-hook-scripts.sh" ]] && return 0
+  local target="$1" spool="$PMUX_HOME/hook-spool" dest moved=0 file releases
+  releases="$(readlink -f "$RELEASES")"
+  [[ "$target" == "$releases/"* && -x "$target/scripts/install-hook-scripts.sh" ]] && return 0
   dest="$spool/bad/rollback-$(date -u +%Y%m%dT%H%M%SZ)"
   for file in "$spool"/*.json; do
     [[ -f "$file" ]] || continue
     mkdir -p -m 700 "$dest" && mv -f "$file" "$dest/" && moved=$((moved + 1))
   done
   S_HOOKS="$S_HOOKS; $moved spooled event(s) set aside in ${dest#"$PMUX_HOME/"} (the rollback target does not drain the spool)"
+}
+
+# keep_spool_unhealthy: the rollback failed its health gate, so no server of known shape runs. The
+# spool stays: the next server that comes up drains it against its own floor (ADR-0020).
+keep_spool_unhealthy() {
+  S_HOOKS="$S_HOOKS; rollback-unhealthy; spool kept"
 }
 
 # ---- lease ----
@@ -753,9 +770,11 @@ if ((ROLLBACK)); then
     rollback_first_install || { HEALTH_RESULT="fail (systemctl --user daemon-reload exited non-zero)"; rolled=0; }
   fi
   healthy=0
-  if ((rolled)); then
-    restart_and_gate "$back_dir" && healthy=1
+  ((rolled)) && restart_and_gate "$back_dir" && healthy=1
+  if ((healthy)); then
     set_spool_aside "$back_dir"
+  else
+    keep_spool_unhealthy
   fi
   S_HEALTH="$HEALTH_RESULT"
   ((healthy)) && finish 0 "rolled-back"
@@ -806,7 +825,7 @@ if ((!deployed)); then
     if [[ -n "$OLD_PREVIOUS" ]]; then swap_link "$OLD_PREVIOUS" "$PREVIOUS"; else rm -f "$PREVIOUS"; fi
   fi
   if ((rolled)) && restart_and_gate "$back_dir"; then S_ROLLBACK_HEALTH="pass"; else S_ROLLBACK_HEALTH="$HEALTH_RESULT"; fi
-  ((rolled)) && set_spool_aside "$back_dir"
+  if [[ "$S_ROLLBACK_HEALTH" == pass ]]; then set_spool_aside "$back_dir"; else keep_spool_unhealthy; fi
   S_SESSIONS="$deploy_sessions"
   S_PREVIOUS="${OLD_PREVIOUS:--}"
   print_journal

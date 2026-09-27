@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { createLogger } from '@/lib/logger';
 import { HOOK_SPOOL_DIRNAME } from '@/lib/hook-scripts';
+import { HOOK_FLOORS_FILENAME } from '@/lib/hook-floors';
 import type { IHookDelivery } from '@/lib/hook-dispatch';
 
 const log = createLogger('hook-spool');
@@ -103,7 +104,9 @@ const listSpool = async (dir: string): Promise<ISpoolListing> => {
   const listing: ISpoolListing = { entries: [], unnamed: [], temporaries: [] };
   for (const dirent of dirents) {
     if (!dirent.isFile()) continue;
-    // Dot files are a hook's temporaries, still being written or orphaned.
+    // The server's own floors file (ADR-0020) is neither an event nor a temporary.
+    if (dirent.name === HOOK_FLOORS_FILENAME) continue;
+    // Other dot files are temporaries, still being written or orphaned.
     if (dirent.name.startsWith('.')) {
       listing.temporaries.push(dirent.name);
       continue;

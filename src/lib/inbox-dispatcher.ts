@@ -20,6 +20,8 @@ import type { ITab } from '@/types/terminal';
 const log = createLogger('inbox');
 
 export const INBOX_TICK_MS = 2_000;
+/** The longest the first tick waits for `firstTickAfter` (the boot drain of the hook spool, ADR-0020). */
+export const INBOX_FIRST_TICK_MAX_WAIT_MS = 10_000;
 
 /**
  * A kind's owner re-validates its own record at paste time (story 12, consult ruling A′): called inside
@@ -282,7 +284,30 @@ export const defaultInboxDeps = async (): Promise<IInboxDispatcherDeps> => {
   };
 };
 
-export const startInbox = async (): Promise<void> => {
+export interface IStartInboxOptions {
+  /**
+   * Ticks are skipped until this settles, or until `firstTickMaxWaitMs` passes
+   * (then the inbox starts anyway and logs it). The server passes the first boot
+   * drain of the hook spool: until it has run, a tab whose `prompt-submit` was
+   * spooled during the restart still looks ready (ADR-0020).
+   */
+  firstTickAfter?: Promise<unknown>;
+  firstTickMaxWaitMs?: number;
+}
+
+/** Resolves when `gate` settles or `maxWaitMs` passes, whichever is first; says which. */
+const waitForGate = (gate: Promise<unknown>, maxWaitMs: number): Promise<'settled' | 'timed-out'> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(() => resolve('timed-out'), maxWaitMs);
+    timer.unref?.();
+    const settle = () => {
+      clearTimeout(timer);
+      resolve('settled');
+    };
+    gate.then(settle, settle);
+  });
+
+export const startInbox = async (options: IStartInboxOptions = {}): Promise<void> => {
   if (g.__ptInboxRuntime) return;
   // Claimed before the first await, so two concurrent starts cannot both pass.
   const runtime: IInboxRuntime = { dispatcher: null, timer: null, unsubscribe: null };
@@ -306,8 +331,20 @@ export const startInbox = async (): Promise<void> => {
     log.warn(`inbox boot pass skipped: ${err instanceof Error ? err.message : err}`);
   }
   if (g.__ptInboxRuntime !== runtime) return;
+  let gateOpen = !options.firstTickAfter;
+  if (options.firstTickAfter) {
+    const maxWaitMs = options.firstTickMaxWaitMs ?? INBOX_FIRST_TICK_MAX_WAIT_MS;
+    // Awaited once, in the background: the boot drain starts only after the server listens.
+    void waitForGate(options.firstTickAfter, maxWaitMs).then((outcome) => {
+      if (outcome === 'timed-out') {
+        log.warn(`inbox: the first boot drain of the hook spool took over ${maxWaitMs} ms; the inbox starts anyway`);
+      }
+      gateOpen = true;
+    });
+  }
   let lastTickError: string | null = null;
   const timer = setInterval(() => {
+    if (!gateOpen) return;
     dispatcher.tick().then(() => { lastTickError = null; }).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       // A corrupt inbox fails every tick; say so once per distinct cause.

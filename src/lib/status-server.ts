@@ -92,6 +92,5 @@ export const handleStatusConnection = (ws: WebSocket, request?: IncomingMessage)
   });
 };
 
-export const gracefulStatusShutdown = () => {
-  getStatusManager().shutdown();
-};
+/** Awaited by the server's shutdown: the hook floors are saved before the process exits (ADR-0020). */
+export const gracefulStatusShutdown = (): Promise<void> => getStatusManager().shutdown();

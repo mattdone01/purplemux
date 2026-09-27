@@ -9,11 +9,17 @@ import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
 
 // ADR-0020: the server replays what hooks spooled while no server answered —
-// at boot before the first poll and on every poll, oldest first, through the
-// hook route's own dispatcher, with each event's original time.
+// once it listens and on every poll, oldest first, through the hook route's own
+// dispatcher, with each event's original time.
 
 const state = vi.hoisted(() => ({ tabs: [] as ITab[], home: '' }));
-const layoutWrites = vi.hoisted(() => ({ updateTabHookFloor: vi.fn(async (_session: string, _at: number) => {}) }));
+const layoutWrites = vi.hoisted(() => ({
+  updateTabCliStatus: vi.fn(async () => {}),
+  updateTabAgentSummary: vi.fn(async () => {}),
+  updateTabAgentState: vi.fn(async () => {}),
+  updateTabWatchdogTurnEnd: vi.fn(async () => {}),
+}));
+const sync = vi.hoisted(() => ({ broadcastSync: vi.fn((_message: { type: string }) => {}) }));
 const WS = { id: 'ws-1', name: 'w', directories: ['/tmp'], orchestration: { enabled: true, orchestratorTabId: 'root' } };
 
 vi.mock('@/lib/logger', () => {
@@ -34,11 +40,17 @@ vi.mock('@/lib/layout-store', async (importOriginal) => ({
   resolveLayoutFile: () => '/nonexistent/layout.json',
   readLayoutFile: vi.fn(async () => ({ root: {} })),
   collectAllTabs: () => state.tabs,
-  updateTabCliStatus: vi.fn(async () => {}),
-  updateTabAgentSummary: vi.fn(async () => {}),
-  updateTabAgentState: vi.fn(async () => {}),
-  updateTabWatchdogTurnEnd: vi.fn(async () => {}),
-  updateTabHookFloor: layoutWrites.updateTabHookFloor,
+  ...layoutWrites,
+}));
+vi.mock('@/lib/sync-server', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/sync-server')>()),
+  broadcastSync: sync.broadcastSync,
+}));
+// The generation proof is the launch lifecycle's own test; here a Codex hook of the active generation applies.
+vi.mock('@/lib/providers/codex/launch-lifecycle', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/providers/codex/launch-lifecycle')>()),
+  withValidatedCodexHookGeneration: vi.fn(async (_session: string, generation: string, work: (identity: unknown) => unknown) =>
+    ({ ok: true, value: await work({ workspaceId: 'ws-1', tabId: 'c', generation }) })),
 }));
 vi.mock('@/lib/liveness-manager', () => ({
   getLivenessManager: () => ({
@@ -126,9 +138,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  g.__ptStatusManager?.shutdown();
-  delete g.__ptStatusManager;
   vi.useRealTimers();
+  vi.restoreAllMocks();
+  await g.__ptStatusManager?.shutdown();
+  delete g.__ptStatusManager;
   await fs.rm(state.home, { recursive: true, force: true });
 });
 
@@ -180,8 +193,72 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     expect(await fs.readdir(spoolDir())).toEqual([]);
   });
 
+  it('bootHookSpoolDrained settles only once the first boot drain has applied the spool (the inbox waits for it)', async () => {
+    state.tabs = [tab('w')];
+    const { manager, applied } = await managerWithPaste();
+    await spoolEvent(Date.now() - 5_000, claudePrompt());
+    await manager.init();
+    let settled = false;
+    void manager.bootHookSpoolDrained().then(() => { settled = true; });
+    await settle();
+    expect(settled).toBe(false);
+
+    manager.startBootHookSpoolDrains(60_000);
+    await manager.bootHookSpoolDrained();
+    expect(applied).toHaveLength(1);
+    expect(await fs.readdir(spoolDir())).toEqual([]);
+  });
+
+  it('a drain before init, or while init\'s scan builds the tabs, is a no-op: the files wait for a later drain', async () => {
+    state.tabs = [tab('w')];
+    const { manager, applied } = await managerWithPaste();
+    const name = await spoolEvent(Date.now() - 5_000, claudePrompt());
+    await manager.drainHookSpool();
+    await manager.poll();
+    expect(applied).toEqual([]);
+
+    // Hold init's scan inside getWorkspaces, after init has started it.
+    const workspaceStore = await import('@/lib/workspace-store');
+    let releaseScan!: () => void;
+    const scanHeld = new Promise<void>((resolve) => { releaseScan = resolve; });
+    vi.mocked(workspaceStore.getWorkspaces).mockImplementationOnce(async () => {
+      await scanHeld;
+      return { workspaces: [WS] } as never;
+    });
+    const initializing = manager.init();
+    await settle();
+    await manager.drainHookSpool();
+    expect(applied).toEqual([]);
+    expect(await fs.readdir(spoolDir())).toEqual([name]);
+
+    releaseScan();
+    await initializing;
+    await manager.drainHookSpool();
+    expect(applied).toHaveLength(1);
+    expect(internalsOf(manager).tabs.get('w')!.lastEvent).toMatchObject({ name: 'prompt-submit' });
+    expect(await fs.readdir(spoolDir())).toEqual([]);
+
+    // A rescan rebuilds the tabs the same way: no drain while it runs.
+    let releaseRescan!: () => void;
+    const rescanHeld = new Promise<void>((resolve) => { releaseRescan = resolve; });
+    vi.mocked(workspaceStore.getWorkspaces).mockImplementationOnce(async () => {
+      await rescanHeld;
+      return { workspaces: [WS] } as never;
+    });
+    const rescanning = manager.rescan();
+    await settle();
+    await spoolEvent(Date.now() - 1_000, claudeStop());
+    await manager.drainHookSpool();
+    expect(applied).toHaveLength(1);
+    releaseRescan();
+    await rescanning;
+    await manager.drainHookSpool();
+    expect(applied).toHaveLength(2);
+  });
+
   it('drains on every poll', async () => {
     const { manager, applied } = await managerWithPaste();
+    await manager.init();
     manager.registerTab('w', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code' });
     state.tabs = [tab('w')];
     await spoolEvent(Date.now() - 5_000, claudePrompt());
@@ -194,6 +271,7 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
 
   it('an event older than the tab\'s floor updates history only, never the newer state', async () => {
     const { manager } = await managerWithPaste();
+    await manager.init();
     const entry: ITabStatusEntry = {
       cliState: 'busy', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code',
       agentProviderId: 'claude', jsonlPath: null, lastEvent: { name: 'prompt-submit', at: Date.now() - 60_000, seq: 1 }, eventSeq: 1,
@@ -216,9 +294,12 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     expect(await fs.readdir(spoolDir())).toEqual([]);
   });
 
-  it('a floor persisted by a previous server orders replays after a restart: an older DONE stop is history only, a newer one nudges once', async () => {
+  it('a floor saved in hook-spool/.floors.json by a previous server orders replays after a restart: an older DONE stop is history only, a newer one nudges once', async () => {
     const floor = Date.now() - 60_000;
-    state.tabs = [tab('root'), { ...tab('w'), hookFloorAt: floor }];
+    await fs.mkdir(spoolDir(), { recursive: true });
+    await fs.writeFile(path.join(spoolDir(), '.floors.json'), JSON.stringify({ w: floor, gone: floor }));
+    // A layout written by the round-1 build still carries `hookFloorAt`: it is read without error and ignored.
+    state.tabs = [tab('root'), { ...tab('w'), hookFloorAt: floor + 60_000 } as ITab];
     const { manager, paste, applied } = await managerWithPaste();
     await manager.init();
     const entry = internalsOf(manager).tabs.get('w')!;
@@ -235,7 +316,8 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     expect(entry.cliState).toBe('busy');
     expect(manager.getHookHistory('w')).toEqual([{ event: 'stop', at: floor - 5_000, replayed: true, stale: true }]);
 
-    // Control: the same transcript does nudge for a stop newer than the floor, and only once.
+    // Control: the same transcript does nudge for a stop newer than the file's floor (older than
+    // the layout's stray value), and only once.
     await spoolEvent(floor + 5_000, claudeStop());
     await spoolEvent(floor + 5_000, claudeStop());
     await manager.drainHookSpool();
@@ -243,10 +325,15 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     await settle();
     expect(paste).toHaveBeenCalledTimes(1);
     expect(paste).toHaveBeenCalledWith('tmux-root', expect.stringContaining('DONE: story 41 merged'));
+
+    // The shutdown saves the raised floor; the floor of a tab that is gone is not kept.
+    await manager.shutdown();
+    expect(JSON.parse(await fs.readFile(path.join(spoolDir(), '.floors.json'), 'utf-8'))).toEqual({ w: floor + 5_000 });
   });
 
-  it('persists the floor, raised by state events and by metadata patches, coalesced per tab', async () => {
+  it('only state events raise the floor; the shutdown saves it to the floors file, never the layout', async () => {
     const { manager } = await managerWithPaste();
+    await manager.init();
     manager.registerTab('w', {
       cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code',
       agentProviderId: 'claude', lastEvent: null, eventSeq: 0,
@@ -254,22 +341,74 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     manager.updateTabFromHook('tmux-w', 'prompt-submit');
     const promptAt = manager.getHookHistory('w')[0].at;
     await new Promise((resolve) => setTimeout(resolve, 5));
-    // A live metadata patch is an applied event: it raises the floor past the prompt.
+    // A live metadata patch does not raise the floor: a replayed patch after the prompt still applies.
     manager.applyAgentHookMeta('claude', 'tmux-w', { lastUserMessage: 'newer' });
-    expect(manager.applyAgentHookMeta('claude', 'tmux-w', { lastUserMessage: 'older' }, promptAt + 1))
-      .toMatchObject({ stale: true });
-    expect(internalsOf(manager).tabs.get('w')!.lastUserMessage).toBe('newer');
-    expect(layoutWrites.updateTabHookFloor).not.toHaveBeenCalled();
+    expect(manager.applyAgentHookMeta('claude', 'tmux-w', { lastUserMessage: 'replayed' }, promptAt + 1)).toEqual({ tabId: 'w', cliState: 'busy' });
+    expect(internalsOf(manager).tabs.get('w')!.lastUserMessage).toBe('replayed');
+    // One older than the floor does not.
+    expect(manager.applyAgentHookMeta('claude', 'tmux-w', { lastUserMessage: 'older' }, promptAt - 1)).toMatchObject({ stale: true });
+    const floorsFile = path.join(spoolDir(), '.floors.json');
+    await expect(fs.access(floorsFile)).rejects.toThrow();
 
-    manager.shutdown();
-    expect(layoutWrites.updateTabHookFloor).toHaveBeenCalledTimes(1);
-    const [session, at] = layoutWrites.updateTabHookFloor.mock.calls[0];
-    expect(session).toBe('tmux-w');
-    expect(at).toBeGreaterThan(promptAt);
+    await manager.shutdown();
+    expect(JSON.parse(await fs.readFile(floorsFile, 'utf-8'))).toEqual({ w: promptAt });
+    expect(sync.broadcastSync.mock.calls.filter(([message]) => message.type === 'layout')).toEqual([]);
+  });
+
+  it('a burst of 200 Codex tool hooks sends no layout sync message and writes the floors file at most once per 5 s', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    manager.registerTab('c', {
+      cliState: 'busy', workspaceId: 'ws-1', tabName: 'c', tmuxSession: 'tmux-c', panelType: 'codex-cli',
+      agentProviderId: 'codex', agentSessionId: 'sess-c', jsonlPath: '/tmp/c.jsonl', lastEvent: null, eventSeq: 0,
+    });
+    const { dispatchHook } = await import('@/lib/hook-dispatch');
+    const floorsFile = path.join(spoolDir(), '.floors.json');
+    const rename = vi.spyOn(fs, 'rename');
+    const floorWrites = () => rename.mock.calls.filter(([, to]) => to === floorsFile).length;
+    const burst = async () => {
+      for (let i = 0; i < 200; i += 1) {
+        await dispatchHook({
+          query: { provider: 'codex', tmuxSession: 'tmux-c', generation: 'g1' },
+          body: { hook_event_name: i % 2 ? 'PostToolUse' : 'PreToolUse', session_id: 'sess-c', transcript_path: '/tmp/c.jsonl', tool_name: 'shell' },
+        });
+        await vi.advanceTimersByTimeAsync(10);
+      }
+    };
+    // The write itself is real I/O: yield to the event loop until it has started (bounded).
+    const flushed = async (expected: number) => {
+      for (let i = 0; i < 5_000 && floorWrites() < expected; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    };
+    sync.broadcastSync.mockClear();
+    for (const writer of Object.values(layoutWrites)) writer.mockClear();
+
+    await burst(); // 0 s to 2 s
+    await flushed(1);
+    expect(floorWrites()).toBe(0);
+    await vi.advanceTimersByTimeAsync(3_000); // 5 s
+    await flushed(1);
+    expect(floorWrites()).toBe(1);
+    await burst(); // 5 s to 7 s
+    await vi.advanceTimersByTimeAsync(2_900); // 9.9 s
+    await flushed(2);
+    expect(floorWrites()).toBe(1);
+    await vi.advanceTimersByTimeAsync(200); // 10.1 s
+    await flushed(2);
+    expect(floorWrites()).toBe(2);
+    await manager.shutdown(); // the last write has landed
+
+    const entry = internalsOf(manager).tabs.get('c')!;
+    expect(entry.cliState).toBe('busy');
+    expect(entry.lastEvent).toMatchObject({ name: 'prompt-submit' });
+    expect(JSON.parse(await fs.readFile(floorsFile, 'utf-8'))).toEqual({ c: entry.lastEvent!.at });
+    expect(sync.broadcastSync.mock.calls.filter(([message]) => message.type === 'layout')).toEqual([]);
+    for (const writer of Object.values(layoutWrites)) expect(writer).not.toHaveBeenCalled();
   });
 
   it('a stale replayed hook meta patch changes nothing and says stale', async () => {
     const { manager } = await managerWithPaste();
+    await manager.init();
     manager.registerTab('w', {
       cliState: 'busy', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code',
       agentProviderId: 'claude', lastUserMessage: 'newer', lastEvent: null, eventSeq: 0,
@@ -283,6 +422,7 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
 
   it('a replayed stop is classified as it would have been, and nudges once, however often the spool is drained', async () => {
     const { manager, paste } = await managerWithPaste();
+    await manager.init();
     manager.registerTab('root', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'root', tmuxSession: 'tmux-root', panelType: 'claude-code' });
     const entry: ITabStatusEntry = {
       cliState: 'busy', workspaceId: 'ws-1', tabName: 'w1', tmuxSession: 'tmux-w', panelType: 'claude-code',
@@ -304,6 +444,7 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
 
   it('replays a spooled Claude tool event into the signal engine', async () => {
     const { manager } = await managerWithPaste();
+    await manager.init();
     manager.registerTab('w', { cliState: 'busy', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code' });
     const tool = vi.spyOn(manager, 'handleToolActivity');
     await spoolEvent(Date.now() - 1_000, { tool_name: 'Edit', tool_input: { file_path: '/tmp/a.ts' } }, 'kind=tool&session=tmux-w');
@@ -313,6 +454,7 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
 
   it('a file past the replay window is dropped without dispatch; a direct replay that old changes no state and feeds no signal', async () => {
     const { manager, applied } = await managerWithPaste();
+    await manager.init();
     const { HOOK_REPLAY_WINDOW_MS } = await import('@/lib/hook-spool');
     const entry: ITabStatusEntry = { cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code', lastEvent: null, eventSeq: 0 };
     manager.registerTab('w', entry);
@@ -331,6 +473,63 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     expect(entry.lastEvent).toBeNull();
     expect(manager.getHookHistory('w')).toEqual([{ event: 'prompt-submit', at: old, replayed: true, stale: true }]);
     expect(record).not.toHaveBeenCalled();
+  });
+});
+
+describe('HookFloorStore (ADR-0020)', () => {
+  const store = async (saveMs = 60_000) => {
+    const { HookFloorStore } = await import('@/lib/hook-floors');
+    return new HookFloorStore({ dir: spoolDir(), saveMs });
+  };
+  const floorsFile = () => path.join(spoolDir(), '.floors.json');
+
+  it('only raises; flush writes one file by rename and leaves no temporary; load reads it back', async () => {
+    const floors = await store();
+    floors.raise('a', 200);
+    floors.raise('a', 100);
+    floors.raise('b', 50);
+    expect(floors.get('a')).toBe(200);
+    await floors.flush();
+    expect(JSON.parse(await fs.readFile(floorsFile(), 'utf-8'))).toEqual({ a: 200, b: 50 });
+    expect(await fs.readdir(spoolDir())).toEqual(['.floors.json']);
+    expect((await fs.stat(spoolDir())).mode & 0o777).toBe(0o700);
+
+    const reloaded = await store();
+    await reloaded.load();
+    expect([reloaded.get('a'), reloaded.get('b'), reloaded.get('c')]).toEqual([200, 50, undefined]);
+  });
+
+  it('a flush with nothing changed writes nothing; forget and retain drop floors and write on the next flush', async () => {
+    const floors = await store();
+    floors.raise('a', 1);
+    floors.raise('b', 2);
+    floors.raise('c', 3);
+    await floors.flush();
+    const rename = vi.spyOn(fs, 'rename');
+    await floors.flush();
+    expect(rename).not.toHaveBeenCalled();
+    floors.forget('a');
+    floors.retain(new Set(['b']));
+    await floors.flush();
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(await fs.readFile(floorsFile(), 'utf-8'))).toEqual({ b: 2 });
+  });
+
+  it('an absent or corrupt file is no floors, never an error; entries that are not finite numbers are skipped', async () => {
+    const absent = await store();
+    await absent.load();
+    expect(absent.get('a')).toBeUndefined();
+
+    await fs.mkdir(spoolDir(), { recursive: true });
+    await fs.writeFile(floorsFile(), '{ not json');
+    const corrupt = await store();
+    await corrupt.load();
+    expect(corrupt.get('a')).toBeUndefined();
+
+    await fs.writeFile(floorsFile(), JSON.stringify({ a: 5, b: 'x', c: null }));
+    const mixed = await store();
+    await mixed.load();
+    expect([mixed.get('a'), mixed.get('b'), mixed.get('c')]).toEqual([5, undefined, undefined]);
   });
 });
 
@@ -430,6 +629,17 @@ describe('drainHookSpool (ADR-0020)', () => {
     expect((await fs.readdir(spoolDir())).sort()).toEqual(['.2-1-young.json.tmp', 'bad']);
   });
 
+  it('never prunes, quarantines or replays the server\'s own .floors.json, however old', async () => {
+    const { seen, apply } = collect();
+    await fs.mkdir(spoolDir(), { recursive: true });
+    const floors = path.join(spoolDir(), '.floors.json');
+    await fs.writeFile(floors, '{"w":1}\n');
+    await age(floors, 30 * 24 * 60 * MIN);
+    expect(await drain(apply)).toEqual({ applied: 0, bad: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 });
+    expect(seen).toEqual([]);
+    expect(await fs.readdir(spoolDir())).toEqual(['.floors.json']);
+  });
+
   it('dates no event after now', async () => {
     const { seen, apply } = collect();
     const now = Date.now();
@@ -468,18 +678,24 @@ describe('drainHookSpool (ADR-0020)', () => {
 });
 
 describe('server boot wiring (ADR-0020)', () => {
-  it('sets the drain before the status manager starts, and starts the boot drains, unawaited, once the server listens and the port file exists', async () => {
+  it('sets the drain before the status manager starts, starts the boot drains, unawaited, once the server listens and the port file exists, gates the inbox on them, and awaits the floors at shutdown', async () => {
     const server = await fs.readFile(path.join(__dirname, '..', '..', '..', 'server.ts'), 'utf-8');
     const wire = server.indexOf('getStatusManager().setHookSpoolDrain(() => drainHookSpool(dispatchHook));');
     const init = server.indexOf('await getStatusManager().init();');
     const listen = server.indexOf('? await startDev(port, appDir, bindPlan.host)');
     const portFile = server.indexOf('await ensureHookSettings(result.port);');
     const boot = server.indexOf('  getStatusManager().startBootHookSpoolDrains();');
+    const inbox = server.indexOf('  await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });');
     expect(wire).toBeGreaterThan(0);
     expect(wire).toBeLessThan(init);
     expect(listen).toBeGreaterThan(init);
     expect(portFile).toBeGreaterThan(listen);
     expect(boot).toBeGreaterThan(portFile);
+    // The inbox starts before listen but holds its first tick for the first boot drain.
+    expect(inbox).toBeGreaterThan(init);
+    expect(inbox).toBeLessThan(listen);
+    // The graceful shutdown awaits the status manager, which saves the hook floors.
+    expect(server).toContain('  await gracefulStatusShutdown();');
     expect(server).not.toContain('await getStatusManager().drainHookSpool()');
     expect(server).not.toContain('await getStatusManager().startBootHookSpoolDrains()');
   });

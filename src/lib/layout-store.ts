@@ -666,14 +666,6 @@ export const updateTabWatchdogTurnEnd = (
     return true;
   });
 
-/** Raise the tab's hook ordering floor (ADR-0020); a lower value changes nothing. */
-export const updateTabHookFloor = (sessionName: string, at: number): Promise<void> =>
-  mutateTab(sessionName, (tab) => {
-    if (!Number.isFinite(at) || (tab.hookFloorAt ?? -Infinity) >= at) return false;
-    tab.hookFloorAt = at;
-    return true;
-  });
-
 export const updateTabAgentLaunchConfig = async (
   wsId: string,
   paneId: string,

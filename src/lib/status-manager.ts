@@ -1,7 +1,8 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd, updateTabHookFloor } from '@/lib/layout-store';
-import { HOOK_REPLAY_WINDOW_MS } from '@/lib/hook-spool';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
+import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR } from '@/lib/hook-spool';
+import { HookFloorStore } from '@/lib/hook-floors';
 import { onTabClosed, onTabClosing } from '@/lib/tab-lifecycle';
 import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
@@ -134,8 +135,6 @@ const JSONL_WATCH_DEBOUNCE_MS = 100;
 export const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
 /** Hook events kept per tab in `getHookHistory`. */
 export const HOOK_HISTORY_LIMIT = 32;
-/** A raised hook floor reaches the layout at most this often per tab (ADR-0020). */
-export const HOOK_FLOOR_PERSIST_MS = 1_000;
 /** The second boot drain, for hooks that renamed their file after the first one listed the spool. */
 export const HOOK_SPOOL_LATE_DRAIN_MS = 5_000;
 
@@ -194,12 +193,18 @@ export class StatusManager {
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
   /**
-   * Each tab's hook floor: when its latest applied hook event (state or
-   * metadata) happened. Persisted as `hookFloorAt` and restored at boot, so an
-   * older replayed event is history only across restarts too (ADR-0020).
+   * Each tab's hook floor: when its latest applied hook STATE event happened.
+   * Saved in `hook-spool/.floors.json` (never the layout) and loaded at boot,
+   * so an older replayed event is history only across restarts too (ADR-0020).
    */
-  private hookAppliedAt = new Map<string, number>();
-  private hookFloorWrites = new Map<string, { at: number; timer: ReturnType<typeof setTimeout> }>();
+  private hookFloors = new HookFloorStore({ dir: HOOK_SPOOL_DIR });
+  /** Set once `init()`'s scan has built every tab: a drain before it would find no tabs (ADR-0020). */
+  private hookScanReady = false;
+  private scansInFlight = 0;
+  private settleBootHookSpoolDrain!: () => void;
+  private readonly bootHookSpoolDrain = new Promise<void>((resolve) => {
+    this.settleBootHookSpoolDrain = resolve;
+  });
   private hookHistory = new Map<string, IHookHistoryItem[]>();
   private hookSpoolDrain: (() => Promise<unknown>) | null = null;
   private hookSpoolDraining: Promise<void> | null = null;
@@ -229,7 +234,11 @@ export class StatusManager {
       }
     }).catch(() => {});
 
+    await this.hookFloors.load();
     await this.scanAll();
+    // Floors of tabs closed while no server ran go; a missing floor is only too low, never wrong.
+    this.hookFloors.retain(new Set(this.tabs.keys()));
+    this.hookScanReady = true;
     this.startPolling();
 
     this.rateLimitsWatcher = createRateLimitsWatcher((data) => {
@@ -242,6 +251,15 @@ export class StatusManager {
   }
 
   private async scanAll(): Promise<void> {
+    this.scansInFlight += 1;
+    try {
+      await this.scanAllTabs();
+    } finally {
+      this.scansInFlight -= 1;
+    }
+  }
+
+  private async scanAllTabs(): Promise<void> {
     const { workspaces } = await getWorkspaces();
     const panesInfo = await getAllPanesInfo();
     for (const tabId of [...this.jsonlWatchers.keys()]) {
@@ -461,9 +479,14 @@ export class StatusManager {
     this.hookSpoolDrain = drain;
   }
 
-  /** Replay the hook spool; one drain at a time, a caller during one waits for it. */
+  /**
+   * Replay the hook spool; one drain at a time, a caller during one waits for it.
+   * A no-op until `init()`'s scan has built the tabs, and while a rescan
+   * rebuilds them: an event for a tab not yet built would be deleted unapplied.
+   * The files wait for the next drain.
+   */
   drainHookSpool(): Promise<void> {
-    if (!this.hookSpoolDrain) return Promise.resolve();
+    if (!this.hookSpoolDrain || !this.hookScanReady || this.scansInFlight > 0) return Promise.resolve();
     if (!this.hookSpoolDraining) {
       this.hookSpoolDraining = this.hookSpoolDrain()
         .then(() => {}, (err) => {
@@ -483,9 +506,14 @@ export class StatusManager {
    * file and renamed its spool file after the first drain listed the spool.
    */
   startBootHookSpoolDrains(lateDelayMs = HOOK_SPOOL_LATE_DRAIN_MS): void {
-    void this.drainHookSpool();
+    void this.drainHookSpool().then(() => this.settleBootHookSpoolDrain());
     const timer = setTimeout(() => { void this.drainHookSpool(); }, lateDelayMs);
     timer.unref?.();
+  }
+
+  /** Settles when the first boot drain has finished; the inbox holds its first tick for it. */
+  bootHookSpoolDrained(): Promise<void> {
+    return this.bootHookSpoolDrain;
   }
 
   getHookHistory(tabId: string): IHookHistoryItem[] {
@@ -495,8 +523,8 @@ export class StatusManager {
   private isStaleReplay(tabId: string, replayedAt: number | undefined): boolean {
     if (replayedAt === undefined) return false;
     if (Date.now() - replayedAt > HOOK_REPLAY_WINDOW_MS) return true;
-    const latest = this.hookAppliedAt.get(tabId);
-    return latest !== undefined && replayedAt < latest;
+    const floor = this.hookFloors.get(tabId);
+    return floor !== undefined && replayedAt < floor;
   }
 
   /**
@@ -514,44 +542,11 @@ export class StatusManager {
     if (history.length > HOOK_HISTORY_LIMIT) history.splice(0, history.length - HOOK_HISTORY_LIMIT);
     this.hookHistory.set(tabId, history);
     if (stale) {
-      hookLog.info({ tabId, event, at, latest: this.hookAppliedAt.get(tabId) }, 'replayed hook event older than the tab\'s latest or the replay window: history only');
+      hookLog.info({ tabId, event, at, floor: this.hookFloors.get(tabId) }, 'replayed hook event older than the tab\'s floor or the replay window: history only');
       return null;
     }
-    this.raiseHookFloor(tabId, at);
+    this.hookFloors.raise(tabId, at);
     return at;
-  }
-
-  /** Raise the tab's hook floor; the layout copy follows within `HOOK_FLOOR_PERSIST_MS`. */
-  private raiseHookFloor(tabId: string, at: number): void {
-    if (at <= (this.hookAppliedAt.get(tabId) ?? -Infinity)) return;
-    this.hookAppliedAt.set(tabId, at);
-    const pending = this.hookFloorWrites.get(tabId);
-    if (pending) {
-      pending.at = at;
-      return;
-    }
-    const timer = setTimeout(() => this.flushHookFloor(tabId), HOOK_FLOOR_PERSIST_MS);
-    timer.unref?.();
-    this.hookFloorWrites.set(tabId, { at, timer });
-  }
-
-  private flushHookFloor(tabId: string): void {
-    const pending = this.hookFloorWrites.get(tabId);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.hookFloorWrites.delete(tabId);
-    const entry = this.tabs.get(tabId);
-    if (!entry) return;
-    updateTabHookFloor(entry.tmuxSession, pending.at).catch((err) => {
-      hookLog.warn({ tabId, err: String(err) }, 'hook floor not persisted');
-    });
-  }
-
-  /** The floor a previous server persisted, restored when the tab's entry is built. */
-  private restoreHookFloor(tab: ITab): void {
-    const floor = tab.hookFloorAt;
-    if (typeof floor !== 'number' || !Number.isFinite(floor)) return;
-    if (floor > (this.hookAppliedAt.get(tab.id) ?? -Infinity)) this.hookAppliedAt.set(tab.id, floor);
   }
 
   async poll(): Promise<void> {
@@ -1802,7 +1797,6 @@ export class StatusManager {
    * down) is dropped, on disk too, so a stale stop is never nudged (r2 nit 2).
    */
   private applyRestoredStop(tab: ITab, entry: ITabStatusEntry): void {
-    this.restoreHookFloor(tab);
     const record = tab.watchdogTurnEnd;
     if (!record) return;
     const usable = entry.cliState === 'ready-for-review' && record.kind === 'ready-for-review'
@@ -1817,7 +1811,7 @@ export class StatusManager {
     entry.turnEnd = { ...record };
     entry.lastEvent = { name: 'stop', at: record.at, seq };
     entry.eventSeq = seq;
-    if (record.at > (this.hookAppliedAt.get(tab.id) ?? -Infinity)) this.hookAppliedAt.set(tab.id, record.at);
+    this.hookFloors.raise(tab.id, record.at);
   }
 
   /**
@@ -2310,9 +2304,8 @@ export class StatusManager {
       );
       return null;
     }
+    // Ordered against the floor, but never raises it: only state events do (ADR-0020).
     if (this.isStaleReplay(tabId, replayedAt)) return { tabId, cliState: entry.cliState, stale: true };
-    // A metadata patch is an applied event too: an older replay must not undo it.
-    this.raiseHookFloor(tabId, replayedAt ?? Date.now());
 
     let changed = false;
 
@@ -2421,10 +2414,7 @@ export class StatusManager {
     this.tabs.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
     this.processStartCache.delete(tabId);
-    const floorWrite = this.hookFloorWrites.get(tabId);
-    if (floorWrite) clearTimeout(floorWrite.timer);
-    this.hookFloorWrites.delete(tabId);
-    this.hookAppliedAt.delete(tabId);
+    this.hookFloors.forget(tabId);
     this.hookHistory.delete(tabId);
     this.broadcastRemove(tabId);
   }
@@ -2778,8 +2768,9 @@ export class StatusManager {
     }
   }
 
-  shutdown(): void {
-    for (const tabId of [...this.hookFloorWrites.keys()]) this.flushHookFloor(tabId);
+  /** Stops at once; the returned promise settles when the hook floors are saved (the graceful shutdown awaits it). */
+  shutdown(): Promise<void> {
+    const floorsSaved = this.hookFloors.flush();
     this.stopPolling();
     this.rateLimitsWatcher?.stop();
     this.claudeUsagePoller?.stop();
@@ -2792,6 +2783,7 @@ export class StatusManager {
       }
     }
     this.clients.clear();
+    return floorsSaved;
   }
 
   /** A closed tab stops receiving nudges at once; the layout copy is cleared too. */

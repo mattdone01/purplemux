@@ -349,9 +349,12 @@ stop          → lastEvent{name:'stop', seq:4}          → ready-for-review
 
 The route's handler is `dispatchHook` (`src/lib/hook-dispatch.ts`). A live POST calls it without
 `replayedAt`; `drainHookSpool` (`src/lib/hook-spool.ts`) calls it with each spooled event's time.
-`init` does not drain. `server.ts` calls `startBootHookSpoolDrains()` once the server listens and
-has written its port file, never awaited: one drain at once, one 5 s later. Every `poll()` drains
-first too; one drain runs at a time and yields every 50 files. Files apply oldest first and are
+`init` does not drain, and a drain is a no-op until `init`'s scan has built the tabs and while a
+rescan rebuilds them (the files wait). `server.ts` calls `startBootHookSpoolDrains()` once the
+server listens and has written its port file, never awaited: one drain at once, one 5 s later.
+`bootHookSpoolDrained()` settles when the first one has finished; the inbox skips its ticks until
+then, at most 10 s (`startInbox({ firstTickAfter })`). Every `poll()` drains first too; one drain
+runs at a time and yields every 50 files. Files apply oldest first and are
 deleted when applied; unreadable ones and replays that throw move to `hook-spool/bad/` once.
 Files past `HOOK_REPLAY_WINDOW_MS` (1 h) and metadata-only files (body over 256 KiB) are deleted
 without dispatch. A replayed Codex hook never holds its generation (`holdOnFailedProof: false`).
@@ -359,10 +362,12 @@ without dispatch. A replayed Codex hook never holds its generation (`holdOnFaile
 `replayedAt` threads through `handleProviderEvent`, `updateTabFromHook`, `applyAgentHookMeta` and
 `handleToolActivity`:
 
-- `hookAppliedAt` is each tab's floor: the latest applied hook event time (live: receipt time;
-  replayed: `at`), raised by state events and by non-stale metadata patches. It is persisted as
-  `ITab.hookFloorAt` (one coalesced layout write per tab per second) and restored when the tab's
-  entry is built (`applyRestoredStop`), together with a restored watchdog stop's `at`.
+- `hookFloors` (`HookFloorStore`, `src/lib/hook-floors.ts`) holds each tab's floor: the latest
+  applied hook STATE event time (live: receipt time; replayed: `at`), or a restored watchdog stop's
+  `at`. Metadata patches are ordered against it but never raise it. It is saved in
+  `hook-spool/.floors.json` (temporary file + rename, at most once per 5 s, and on shutdown, which
+  `gracefulStatusShutdown` awaits), never in the layout, and sends no sync message. `init` loads it
+  before the scan and drops the floors of tabs that no longer exist.
 - A replayed event older than the floor, or past the replay window, is recorded in
   `getHookHistory(tabId)` with `stale: true` and changes nothing: no `lastEvent`, no `cliState`,
   no metadata, no broadcast.

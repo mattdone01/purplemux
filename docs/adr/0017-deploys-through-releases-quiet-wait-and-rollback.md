@@ -51,4 +51,6 @@ After the backup (step 5) and before the swap (step 6), the script runs the rele
 `scripts/install-hook-scripts.sh --dir ~/.purplemux`, so the hooks that fire while no server
 answers spool their events for the new server to replay. A forward deploy without the installer
 refuses with exit 2 before the lease; a failed pre-install refuses with exit 1 before the swap; a
-dry run renders into a scratch directory and reports `HOOKS=`.
+dry run renders into a scratch directory and reports `HOOKS=`. After a healthy rollback restart into a
+target that is not a release with the installer, the script sets `hook-spool/*.json` aside; after an
+unhealthy one it keeps the spool (`HOOKS=…; rollback-unhealthy; spool kept`).

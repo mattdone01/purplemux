@@ -1117,6 +1117,59 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
       expect(setAside()).toEqual([]);
       expect(fs.readdirSync(spool())).toContain('1000-1-aa.json');
     });
+
+    it('an automatic rollback that fails its own health gate keeps the spool and says so', () => {
+      h.setHttp('api/health', 503, 'down', 1);
+      h.setHttp('api/health', 503, 'down', 2);
+      seedSpool(['1000-1-aa.json']);
+      const { status, out } = h.run([h.sha()]);
+      expect(status, out).toBe(4);
+      expect(field(out, 'VERDICT')).toBe('rollback-failed');
+      expect(field(out, 'HOOKS')).toMatch(/^pre-installed 4 scripts \(4 changed\) from .*; rollback-unhealthy; spool kept$/);
+      expect(setAside()).toEqual([]);
+      expect(fs.readdirSync(spool())).toEqual(['1000-1-aa.json']);
+    });
+
+    it('a --rollback that fails its own health gate keeps the spool and says so', () => {
+      expect(h.run([h.sha()]).status).toBe(0);
+      expect(h.run([h.commit('second')]).status).toBe(0);
+      h.setHttp('api/health', 503, 'down', 3);
+      seedSpool(['1000-1-aa.json']);
+      const { status, out } = h.run(['--rollback'], { DEPLOY_HOOK_INSTALL: undefined });
+      expect(status, out).toBe(4);
+      expect(field(out, 'VERDICT')).toBe('rollback-unhealthy');
+      expect(field(out, 'HOOKS')).toBe('skipped (rollback target has no scripts/install-hook-scripts.sh); rollback-unhealthy; spool kept');
+      expect(setAside()).toEqual([]);
+      expect(fs.readdirSync(spool())).toEqual(['1000-1-aa.json']);
+    });
+
+    it('a first-install rollback sets the spool aside even when the live checkout\'s working tree has the installer; the floors file stays', () => {
+      fs.mkdirSync(path.join(h.liveDir, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(h.liveDir, 'scripts', 'install-hook-scripts.sh'), '#!/bin/sh\n', { mode: 0o755 });
+      h.setHttp('api/health', 503, 'down', 1);
+      seedSpool(['1000-1-aa.json', '.floors.json']);
+      const { status, out } = h.run([h.sha()]);
+      expect(status, out).toBe(4);
+      expect(field(out, 'VERDICT')).toBe('rolled-back');
+      expect(field(out, 'HOOKS')).toMatch(/; 1 spooled event\(s\) set aside in hook-spool\/bad\/rollback-\d{8}T\d{6}Z \(the rollback target does not drain the spool\)$/);
+      expect(setAside().map((f) => f.split('/')[1])).toEqual(['1000-1-aa.json']);
+      expect(fs.readdirSync(spool()).sort()).toEqual(['.floors.json', 'bad']);
+    });
+
+    it('--rollback to a first install\'s live checkout runs no installer from its working tree and sets the spool aside', () => {
+      expect(h.run([h.sha()]).status).toBe(0);
+      fs.mkdirSync(path.join(h.liveDir, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(h.liveDir, 'scripts', 'install-hook-scripts.sh'), '#!/bin/sh\necho "live tree installer" >> "$FAKE_STATE/order.log"\n', { mode: 0o755 });
+      const installsBefore = h.log('hook-install');
+      seedSpool(['1000-1-aa.json']);
+      const { status, out } = h.run(['--rollback'], { DEPLOY_HOOK_INSTALL: undefined });
+      expect(status, out).toBe(0);
+      expect(field(out, 'VERDICT')).toBe('rolled-back');
+      expect(field(out, 'HOOKS')).toMatch(/^skipped \(rollback target is not a release\); 1 spooled event\(s\) set aside in hook-spool\/bad\/rollback-/);
+      expect(h.log('order')).not.toContain('live tree installer');
+      expect(h.log('hook-install')).toBe(installsBefore);
+      expect(setAside().map((f) => f.split('/')[1])).toEqual(['1000-1-aa.json']);
+    });
   });
 
   it('prints usage and exits 2 on unknown options', () => {

@@ -118,7 +118,7 @@ const shutdownWs = async () => {
   stopHostSignals();
   gracefulTimelineShutdown();
   gracefulSyncShutdown();
-  gracefulStatusShutdown();
+  await gracefulStatusShutdown();
   gracefulInstallShutdown();
   await gracefulShutdown();
 };
@@ -401,7 +401,9 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   // The Mission Control coordination panel's optional host signals (story 20).
   startHostSignals();
   await getMissionControlRuntime().start();
-  await startInbox();
+  // The inbox's first tick waits for the first boot drain of the hook spool (at most
+  // 10 s): a tab's state from before the restart gap must not look ready (ADR-0020).
+  await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });
   await startNotes();
   await startWatches();
 
