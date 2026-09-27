@@ -29,6 +29,11 @@ if [[ " $* " == *" restart "* ]]; then
   [[ -e "$FAKE_STATE/restart-fail.$n" ]] && exit 1
   [[ -e "$FAKE_STATE/restart-noop.$n" ]] && exit 0
   echo "restart $n" >> "$FAKE_STATE/order.log"
+  # Events the release's hooks spooled while no server answered, during this restart's gap.
+  if [[ -f "$FAKE_STATE/spool-on-restart.$n" ]]; then
+    mkdir -p "$HOME/.purplemux/hook-spool"
+    while read -r name; do echo '{"v":1}' > "$HOME/.purplemux/hook-spool/$name"; done < "$FAKE_STATE/spool-on-restart.$n"
+  fi
   pid=$((1000 + n))
   echo "$pid" > "$FAKE_STATE/mainpid"
   wd=$(sed -n 's/^WorkingDirectory=//p' "$HOME/.config/systemd/user/purplemux.service.d/50-mission-control.conf" | tail -n 1)
@@ -134,6 +139,7 @@ while (($#)); do case "$1" in --dir) dir="$2"; shift 2 ;; *) shift ;; esac; done
 fd9=closed; [[ -e /proc/$$/fd/9 ]] && fd9=open
 echo "hook-install $dir" >> "$FAKE_STATE/order.log"
 echo "$dir | restarts=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0) fd9=$fd9" >> "$FAKE_STATE/hook-install.log"
+ls -A "$dir/hook-spool" 2>/dev/null > "$FAKE_STATE/spool-at-install"
 [[ -e "$FAKE_STATE/hook-install-fail" ]] && { echo "render exploded" >&2; exit 1; }
 mkdir -p "$dir"
 for name in status-hook.sh statusline.sh codex-hook.sh grok-hook.sh; do
@@ -1075,11 +1081,13 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
       fs.mkdirSync(spool(), { recursive: true });
       for (const name of names) fs.writeFileSync(path.join(spool(), name), '{"v":1}');
     };
-    const setAside = () => {
+    const setAside = (prefix = 'rollback-') => {
       const bad = path.join(spool(), 'bad');
-      const dirs = fs.existsSync(bad) ? fs.readdirSync(bad).filter((d) => d.startsWith('rollback-')) : [];
+      const dirs = fs.existsSync(bad) ? fs.readdirSync(bad).filter((d) => d.startsWith(prefix)) : [];
       return dirs.flatMap((d) => fs.readdirSync(path.join(bad, d)).map((f) => `${d}/${f}`));
     };
+    /** Files the hooks spool during restart N's gap, after the pre-install. */
+    const spoolOnRestart = (n: number, names: string[]) => h.flag(`spool-on-restart.${n}`, names.map((name) => `${name}\n`).join(''));
 
     it('--rollback to a release without the installer skips the step, rolls back, then sets the spool aside', () => {
       expect(h.run([h.sha()]).status).toBe(0);
@@ -1095,7 +1103,7 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
 
     it('an automatic rollback to a release without the installer sets the spool aside after the rollback restart', () => {
       h.setHttp('api/health', 503, 'down', 1);
-      seedSpool(['1000-1-aa.json']);
+      spoolOnRestart(1, ['1000-1-aa.json']);
       const { status, out } = h.run([h.sha()]);
       expect(status, out).toBe(4);
       expect(field(out, 'VERDICT')).toBe('rolled-back');
@@ -1121,7 +1129,7 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     it('an automatic rollback that fails its own health gate keeps the spool and says so', () => {
       h.setHttp('api/health', 503, 'down', 1);
       h.setHttp('api/health', 503, 'down', 2);
-      seedSpool(['1000-1-aa.json']);
+      spoolOnRestart(1, ['1000-1-aa.json']);
       const { status, out } = h.run([h.sha()]);
       expect(status, out).toBe(4);
       expect(field(out, 'VERDICT')).toBe('rollback-failed');
@@ -1147,7 +1155,8 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
       fs.mkdirSync(path.join(h.liveDir, 'scripts'), { recursive: true });
       fs.writeFileSync(path.join(h.liveDir, 'scripts', 'install-hook-scripts.sh'), '#!/bin/sh\n', { mode: 0o755 });
       h.setHttp('api/health', 503, 'down', 1);
-      seedSpool(['1000-1-aa.json', '.floors.json']);
+      seedSpool(['.floors.json']);
+      spoolOnRestart(1, ['1000-1-aa.json']);
       const { status, out } = h.run([h.sha()]);
       expect(status, out).toBe(4);
       expect(field(out, 'VERDICT')).toBe('rolled-back');
@@ -1169,6 +1178,48 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
       expect(h.log('order')).not.toContain('live tree installer');
       expect(h.log('hook-install')).toBe(installsBefore);
       expect(setAside().map((f) => f.split('/')[1])).toEqual(['1000-1-aa.json']);
+    });
+
+    it('a forward deploy from a running release without the installer sets leftover spool files aside before installing the new scripts', () => {
+      expect(h.run([h.sha()]).status).toBe(0);
+      seedSpool(['1000-1-aa.json', '2000-1-bb.json', '.floors.json']);
+      const { status, out } = h.run([h.commit('second')]);
+      expect(status, out).toBe(0);
+      expect(field(out, 'HOOKS')).toMatch(/^pre-installed 4 scripts \(4 changed\) from .*; 2 stale spooled event\(s\) set aside in hook-spool\/bad\/stale-\d{8}T\d{6}Z \(the running server does not drain the spool\)$/);
+      expect(setAside('stale-').map((f) => f.split('/')[1]).sort()).toEqual(['1000-1-aa.json', '2000-1-bb.json']);
+      // Already gone when the new scripts went in; the floors file is not an event.
+      expect(fs.readFileSync(path.join(h.state, 'spool-at-install'), 'utf-8').split('\n').filter(Boolean).sort()).toEqual(['.floors.json', 'bad']);
+      expect(fs.readdirSync(spool()).sort()).toEqual(['.floors.json', 'bad']);
+    });
+
+    it('a first install sets leftover spool files aside too: the live checkout counts as a server that does not drain', () => {
+      seedSpool(['1000-1-aa.json']);
+      const { status, out } = h.run([h.sha()]);
+      expect(status, out).toBe(0);
+      expect(field(out, 'HOOKS')).toMatch(/; 1 stale spooled event\(s\) set aside in hook-spool\/bad\/stale-/);
+      expect(setAside('stale-').map((f) => f.split('/')[1])).toEqual(['1000-1-aa.json']);
+    });
+
+    it('a forward deploy from a running release that drains the spool leaves it for the new server', () => {
+      const first = h.sha();
+      expect(h.run([first]).status).toBe(0);
+      const scripts = path.join(h.releases, first.slice(0, 12), 'scripts');
+      fs.mkdirSync(scripts, { recursive: true });
+      fs.writeFileSync(path.join(scripts, 'install-hook-scripts.sh'), '#!/bin/sh\n', { mode: 0o755 });
+      seedSpool(['1000-1-aa.json']);
+      const { status, out } = h.run([h.commit('second')]);
+      expect(status, out).toBe(0);
+      expect(field(out, 'HOOKS')).toBe(`pre-installed 4 scripts (4 changed) from ${h.env.DEPLOY_HOOK_INSTALL}`);
+      expect(setAside('stale-')).toEqual([]);
+      expect(fs.readdirSync(spool())).toEqual(['1000-1-aa.json']);
+    });
+
+    it('a dry run sets nothing aside', () => {
+      expect(h.run([h.sha()]).status).toBe(0);
+      seedSpool(['1000-1-aa.json']);
+      const { status, out } = h.run([h.commit('second'), '--dry-run']);
+      expect(status, out).toBe(0);
+      expect(fs.readdirSync(spool())).toEqual(['1000-1-aa.json']);
     });
   });
 

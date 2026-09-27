@@ -201,6 +201,8 @@ export class StatusManager {
   /** Set once `init()`'s scan has built every tab: a drain before it would find no tabs (ADR-0020). */
   private hookScanReady = false;
   private scansInFlight = 0;
+  /** The latest scan started, settled either way; the boot drain waits for it (ADR-0020). */
+  private latestScan: Promise<void> = Promise.resolve();
   private settleBootHookSpoolDrain!: () => void;
   private readonly bootHookSpoolDrain = new Promise<void>((resolve) => {
     this.settleBootHookSpoolDrain = resolve;
@@ -252,11 +254,22 @@ export class StatusManager {
 
   private async scanAll(): Promise<void> {
     this.scansInFlight += 1;
+    const scan = this.scanAllTabs();
+    this.latestScan = scan.then(() => {}, () => {});
     try {
-      await this.scanAllTabs();
+      await scan;
     } finally {
       this.scansInFlight -= 1;
     }
+  }
+
+  /**
+   * Drain once no scan runs: waits for a scan in flight (a rescan overlapping
+   * the boot) instead of skipping, so the boot drain is a real one.
+   */
+  private async drainHookSpoolAfterScans(): Promise<void> {
+    while (this.scansInFlight > 0) await this.latestScan;
+    await this.drainHookSpool();
   }
 
   private async scanAllTabs(): Promise<void> {
@@ -504,10 +517,12 @@ export class StatusManager {
    * file, and never awaited: a large spool must not hold up startup or the
    * deploy's health gate. The second drain catches a hook that saw no port
    * file and renamed its spool file after the first drain listed the spool.
+   * Both wait for a scan in flight rather than skip; `bootHookSpoolDrained()`
+   * settles only after the first has drained (the inbox caps its wait at 10 s).
    */
   startBootHookSpoolDrains(lateDelayMs = HOOK_SPOOL_LATE_DRAIN_MS): void {
-    void this.drainHookSpool().then(() => this.settleBootHookSpoolDrain());
-    const timer = setTimeout(() => { void this.drainHookSpool(); }, lateDelayMs);
+    void this.drainHookSpoolAfterScans().then(() => this.settleBootHookSpoolDrain());
+    const timer = setTimeout(() => { void this.drainHookSpoolAfterScans(); }, lateDelayMs);
     timer.unref?.();
   }
 

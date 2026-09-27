@@ -425,15 +425,30 @@ install_hooks() {
 # moved into a dated directory under hook-spool/bad/ (pruned after 7 days), never replayed. The
 # floors file (.floors.json) is not an event and stays.
 set_spool_aside() {
-  local target="$1" spool="$PMUX_HOME/hook-spool" dest moved=0 file releases
+  drains_spool "$1" && return 0
+  move_spool_aside rollback
+  S_HOOKS="$S_HOOKS; $SPOOL_MOVED spooled event(s) set aside in $SPOOL_DEST (the rollback target does not drain the spool)"
+}
+
+# drains_spool DIR: DIR (resolved) is a release directory with scripts/install-hook-scripts.sh, so
+# its server drains the spool and saves hook floors (ADR-0020).
+drains_spool() {
+  local releases
   releases="$(readlink -f "$RELEASES")"
-  [[ "$target" == "$releases/"* && -x "$target/scripts/install-hook-scripts.sh" ]] && return 0
-  dest="$spool/bad/rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  [[ "$1" == "$releases/"* && -x "$1/scripts/install-hook-scripts.sh" ]]
+}
+
+# move_spool_aside LABEL: moves hook-spool/*.json into hook-spool/bad/LABEL-<stamp>/ (pruned after 7
+# days, never replayed); sets SPOOL_MOVED and SPOOL_DEST. Dot files (.floors.json) stay.
+move_spool_aside() {
+  local spool="$PMUX_HOME/hook-spool" dest file
+  dest="$spool/bad/$1-$(date -u +%Y%m%dT%H%M%SZ)"
+  SPOOL_MOVED=0
   for file in "$spool"/*.json; do
     [[ -f "$file" ]] || continue
-    mkdir -p -m 700 "$dest" && mv -f "$file" "$dest/" && moved=$((moved + 1))
+    mkdir -p -m 700 "$dest" && mv -f "$file" "$dest/" && SPOOL_MOVED=$((SPOOL_MOVED + 1))
   done
-  S_HOOKS="$S_HOOKS; $moved spooled event(s) set aside in ${dest#"$PMUX_HOME/"} (the rollback target does not drain the spool)"
+  SPOOL_DEST="${dest#"$PMUX_HOME/"}"
 }
 
 # keep_spool_unhealthy: the rollback failed its health gate, so no server of known shape runs. The
@@ -646,13 +661,26 @@ backup_state "${SHORT:-rollback}" || refuse 1 BACKUP-FAILED "backup into $BACKUP
 # restart the old server keeps answering them exactly as before: the POST is unchanged, and it
 # never reads the spool. Each script is replaced in one rename.
 
+# A forward deploy from a running server that does not drain the spool (a release without the
+# installer, or a first install's live checkout): any hook-spool/*.json already there is a leftover
+# that server never replayed, from before events it then applied live with no floor saved. It is set
+# aside before the new scripts go in, so the new server never replays it.
+STALE_SPOOL=""
+if ((!ROLLBACK)); then
+  if ((FIRST_INSTALL)); then running_dir="$(readlink -f "$LIVE_DIR")"; else running_dir="$(readlink -f "$CURRENT")"; fi
+  if ! drains_spool "$running_dir"; then
+    move_spool_aside stale
+    ((SPOOL_MOVED)) && STALE_SPOOL="; $SPOOL_MOVED stale spooled event(s) set aside in $SPOOL_DEST (the running server does not drain the spool)"
+  fi
+fi
+
 if [[ -n "$HOOK_INSTALL" ]]; then
   if install_hooks "$PMUX_HOME"; then
-    S_HOOKS="pre-installed $HOOKS_RESULT from $HOOK_INSTALL"
+    S_HOOKS="pre-installed $HOOKS_RESULT from $HOOK_INSTALL$STALE_SPOOL"
   elif ((ROLLBACK)); then
     S_HOOKS="failed ($HOOKS_ERROR); rollback proceeds"
   else
-    S_HOOKS="failed ($HOOKS_ERROR)"
+    S_HOOKS="failed ($HOOKS_ERROR)$STALE_SPOOL"
     refuse 1 HOOK-PREINSTALL-FAILED "$HOOKS_ERROR" \
       "the release's hook scripts in $PMUX_HOME before the restart, so the restart drops no hook event"
   fi

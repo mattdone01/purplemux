@@ -209,6 +209,45 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     expect(await fs.readdir(spoolDir())).toEqual([]);
   });
 
+  it('a boot drain that meets a rescan waits for it and drains; the inbox ticks only after the files are applied', async () => {
+    state.tabs = [tab('w')];
+    const { manager, applied } = await managerWithPaste();
+    await manager.init();
+    await spoolEvent(Date.now() - 5_000, claudePrompt());
+    const workspaceStore = await import('@/lib/workspace-store');
+    let releaseRescan!: () => void;
+    const rescanHeld = new Promise<void>((resolve) => { releaseRescan = resolve; });
+    vi.mocked(workspaceStore.getWorkspaces).mockImplementationOnce(async () => {
+      await rescanHeld;
+      return { workspaces: [WS] } as never;
+    });
+    const rescanning = manager.rescan();
+    await settle();
+
+    // The server's wiring: the inbox starts gated on the first boot drain, which starts after listen.
+    const inbox = await import('@/lib/inbox-dispatcher');
+    await inbox.startInbox({ firstTickAfter: manager.bootHookSpoolDrained() });
+    const runtime = (globalThis as unknown as { __ptInboxRuntime: { dispatcher: { tick: () => Promise<void> } } }).__ptInboxRuntime;
+    const appliedAtTick: number[] = [];
+    vi.spyOn(runtime.dispatcher, 'tick').mockImplementation(async () => { appliedAtTick.push(applied.length); });
+    try {
+      manager.startBootHookSpoolDrains(60_000);
+      await new Promise((resolve) => setTimeout(resolve, inbox.INBOX_TICK_MS + 500));
+      expect(applied).toEqual([]);
+      expect(appliedAtTick).toEqual([]);
+
+      releaseRescan();
+      await rescanning;
+      await manager.bootHookSpoolDrained();
+      expect(applied).toHaveLength(1);
+      await waitFor(() => expect(appliedAtTick.length).toBeGreaterThan(0));
+      expect(appliedAtTick[0]).toBe(1);
+      expect(internalsOf(manager).tabs.get('w')!.lastEvent).toMatchObject({ name: 'prompt-submit' });
+    } finally {
+      await inbox.stopInbox();
+    }
+  }, 15_000);
+
   it('a drain before init, or while init\'s scan builds the tabs, is a no-op: the files wait for a later drain', async () => {
     state.tabs = [tab('w')];
     const { manager, applied } = await managerWithPaste();

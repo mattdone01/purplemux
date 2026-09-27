@@ -352,6 +352,7 @@ The route's handler is `dispatchHook` (`src/lib/hook-dispatch.ts`). A live POST 
 `init` does not drain, and a drain is a no-op until `init`'s scan has built the tabs and while a
 rescan rebuilds them (the files wait). `server.ts` calls `startBootHookSpoolDrains()` once the
 server listens and has written its port file, never awaited: one drain at once, one 5 s later.
+Both wait for a scan in flight (a rescan) instead of skipping it.
 `bootHookSpoolDrained()` settles when the first one has finished; the inbox skips its ticks until
 then, at most 10 s (`startInbox({ firstTickAfter })`). Every `poll()` drains first too; one drain
 runs at a time and yields every 50 files. Files apply oldest first and are
