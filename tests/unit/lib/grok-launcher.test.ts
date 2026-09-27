@@ -69,8 +69,11 @@ describe('grok launch command', () => {
     const { grokProvider } = await importProvider();
 
     const command = await grokProvider.buildLaunchCommand({ model: 'grok 4.6; rm -rf /', effort: 'ultra' });
-    expect(command).not.toContain('-m');
-    expect(command).not.toContain('--effort');
+    // Match the flag as a shell word, never a substring: the command embeds a mkdtemp path whose random suffix
+    // can begin with "m" (`pmux-grok-launch-m3UdQb`), which a substring check read as a `-m` flag (flaky ~1 in 60).
+    expect(command).not.toMatch(/(^|\s)-m(\s|$)/);
+    expect(command).not.toMatch(/(^|\s)--effort(\s|$)/);
+    expect(command).not.toContain('rm -rf');
   });
 
   it('every fresh launch gets its OWN session id — two tabs must never share one', async () => {
