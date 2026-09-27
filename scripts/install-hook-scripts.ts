@@ -1,6 +1,6 @@
 import os from 'os';
 import path from 'path';
-import { installHookScripts } from '@/lib/hook-scripts';
+import { installHookScripts } from '@/lib/hook-scripts-install';
 
 const USAGE = 'usage: install-hook-scripts.sh [--dir DIR]   (default ~/.purplemux)';
 

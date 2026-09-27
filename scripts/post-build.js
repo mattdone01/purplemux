@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('fs');
 const path = require('path');
+const { describeWholeProjectTrace } = require('./standalone-trace-check.cjs');
 
 const electronMode = process.argv.includes('--electron');
 
@@ -9,6 +10,14 @@ const standalone = path.join(root, '.next', 'standalone');
 
 if (!fs.existsSync(standalone)) {
   console.error('[post-build] .next/standalone not found — did next build run with output: "standalone"?');
+  process.exit(1);
+}
+
+// A whole-project trace ships a copy of server.ts that tsx loads in place of
+// standalone/server.js, so the release cannot start: refuse it here.
+const wholeProjectTrace = describeWholeProjectTrace(standalone);
+if (wholeProjectTrace) {
+  console.error(wholeProjectTrace);
   process.exit(1);
 }
 

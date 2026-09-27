@@ -1,11 +1,15 @@
 import fs from 'fs/promises';
-import path from 'path';
 import { STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
 
 /**
  * The hook scripts the server installs into `~/.purplemux/`. Pure: no logger,
  * no server state, so `scripts/install-hook-scripts.ts` can render a release's
  * scripts before that release's server starts (ADR-0020).
+ *
+ * Next routes import this module, so Turbopack traces every file operation in
+ * it. Keep each path here a constant: a path built from a function argument
+ * (`path.join(dir, name)`) makes the trace take the whole project into
+ * `.next/standalone`. The directory installer is in `hook-scripts-install.ts`.
  */
 
 export const HOOK_SPOOL_DIRNAME = 'hook-spool';
@@ -232,20 +236,4 @@ export const writeScriptAtomic = async (target: string, content: string, mode: n
     throw err;
   }
   return true;
-};
-
-export interface IInstalledHookScript {
-  path: string;
-  changed: boolean;
-}
-
-/** Write every hook script into `dir` (`~/.purplemux` on a live install). */
-export const installHookScripts = async (dir: string): Promise<IInstalledHookScript[]> => {
-  await fs.mkdir(dir, { recursive: true });
-  const installed: IInstalledHookScript[] = [];
-  for (const file of HOOK_SCRIPT_FILES) {
-    const target = path.join(dir, file.name);
-    installed.push({ path: target, changed: await writeScriptAtomic(target, file.content, file.mode) });
-  }
-  return installed;
 };

@@ -7,8 +7,8 @@ import {
   CODEX_HOOK_SCRIPT_CONTENT,
   GROK_HOOK_SCRIPT_CONTENT,
   HOOK_SCRIPT_CONTENT,
-  installHookScripts,
 } from '@/lib/hook-scripts';
+import { installHookScripts } from '@/lib/hook-scripts-install';
 import { parseSpooledHook } from '@/lib/hook-spool';
 
 // ADR-0020: the rendered hook scripts, run with a fake curl on PATH. A POST no
