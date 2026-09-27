@@ -410,6 +410,21 @@ install_hooks() {
   HOOKS_RESULT="$((wrote + same)) scripts ($wrote changed)"
 }
 
+# set_spool_aside TARGET: after a rollback restart into a release without scripts/install-hook-scripts.sh.
+# That release predates ADR-0020: its server never drains the spool and persists no hook floor, so a
+# later server could not order these files against the events it applied live. They are moved into a
+# dated directory under hook-spool/bad/ (pruned after 7 days), never replayed.
+set_spool_aside() {
+  local target="$1" spool="$PMUX_HOME/hook-spool" dest moved=0 file
+  [[ -x "$target/scripts/install-hook-scripts.sh" ]] && return 0
+  dest="$spool/bad/rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  for file in "$spool"/*.json; do
+    [[ -f "$file" ]] || continue
+    mkdir -p -m 700 "$dest" && mv -f "$file" "$dest/" && moved=$((moved + 1))
+  done
+  S_HOOKS="$S_HOOKS; $moved spooled event(s) set aside in ${dest#"$PMUX_HOME/"} (the rollback target does not drain the spool)"
+}
+
 # ---- lease ----
 
 # The lease outlives the announce wait and the quiet wait together (capped at the deploy kind's 2 h).
@@ -737,11 +752,13 @@ if ((ROLLBACK)); then
   else
     rollback_first_install || { HEALTH_RESULT="fail (systemctl --user daemon-reload exited non-zero)"; rolled=0; }
   fi
-  if ((rolled)) && restart_and_gate "$back_dir"; then
-    S_HEALTH="$HEALTH_RESULT"
-    finish 0 "rolled-back"
+  healthy=0
+  if ((rolled)); then
+    restart_and_gate "$back_dir" && healthy=1
+    set_spool_aside "$back_dir"
   fi
   S_HEALTH="$HEALTH_RESULT"
+  ((healthy)) && finish 0 "rolled-back"
   print_journal
   finish 4 "rollback-unhealthy"
 fi
@@ -789,6 +806,7 @@ if ((!deployed)); then
     if [[ -n "$OLD_PREVIOUS" ]]; then swap_link "$OLD_PREVIOUS" "$PREVIOUS"; else rm -f "$PREVIOUS"; fi
   fi
   if ((rolled)) && restart_and_gate "$back_dir"; then S_ROLLBACK_HEALTH="pass"; else S_ROLLBACK_HEALTH="$HEALTH_RESULT"; fi
+  ((rolled)) && set_spool_aside "$back_dir"
   S_SESSIONS="$deploy_sessions"
   S_PREVIOUS="${OLD_PREVIOUS:--}"
   print_journal

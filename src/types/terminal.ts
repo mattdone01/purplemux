@@ -123,6 +123,12 @@ export interface ITab {
    * and never sends a sent one again.
    */
   watchdogTurnEnd?: import('@/types/status').ITurnEndRecord | null;
+  /**
+   * When the latest hook event the server applied to this tab happened (epoch
+   * ms). A spooled event replayed by a later server is ordered against it, so
+   * it never overwrites newer state across a restart (ADR-0020). Only raised.
+   */
+  hookFloorAt?: number;
   webUrl?: string | null;
   terminalRatio?: number;
   terminalCollapsed?: boolean;

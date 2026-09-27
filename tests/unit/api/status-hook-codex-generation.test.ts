@@ -54,7 +54,7 @@ describe('Codex hook generation gate', () => {
     const { default: handler } = await import('@/pages/api/status/hook');
     await handler(request(), response());
     expect(lifecycle.withValidatedCodexHookGeneration).toHaveBeenCalledWith(
-      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function),
+      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function), { holdOnFailedProof: true },
     );
     expect(status.applyAgentHookMeta).toHaveBeenCalled();
     expect(status.handleProviderEvent).toHaveBeenCalledWith(

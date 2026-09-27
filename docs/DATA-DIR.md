@@ -35,7 +35,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── port                     # current server port (hook scripts read it)
 ├── hook-spool/              # hook events no server answered (0700; ADR-0020)
 │   ├── {epochMs}-{pid}-{rand}.json
-│   └── bad/                 # spool files that could not be replayed
+│   └── bad/                 # unreplayable files and rollback-<stamp>/ set-asides (pruned after 7 days)
 ├── pmux.lock                # single-instance lock {pid, port, startedAt}
 ├── logs/                    # pino-roll log files
 │   └── purplemux.YYYY-MM-DD.N.log
@@ -119,7 +119,7 @@ Auto-generated from `HOOK_SCRIPT_CONTENT`, `CODEX_HOOK_SCRIPT_CONTENT` and `GROK
 2. `POST` to the local server with `x-pmux-token` header
 3. Exit 0 whatever the answer
 
-When no server answers (no port or token file, a refused or never-finished connect, or a 5xx), the three hook scripts write the event to `hook-spool/` instead of dropping it; `statusline.sh` does not. The next server replays the spool in time order at boot and on every poll. Contract: [ADR-0020](adr/0020-hook-spool-across-restarts.md). `scripts/install-hook-scripts.sh` renders the four scripts from a checkout's own templates (`deploy-live.sh` runs it before a restart).
+When no server answers (no port or token file, a refused or never-finished connect, or a 5xx), the three hook scripts write the event to `hook-spool/` instead of dropping it; `statusline.sh` does not. Codex `PreToolUse` is never spooled, and a body over 256 KiB is spooled as metadata only. The next server replays the spool in time order once it listens and on every poll, ordered against each tab's persisted `hookFloorAt` (layout). Contract: [ADR-0020](adr/0020-hook-spool-across-restarts.md). `scripts/install-hook-scripts.sh` renders the four scripts from a checkout's own templates (`deploy-live.sh` runs it before a restart).
 
 `grok-hook.sh` reads Grok Build's payload from **stdin** (grok pipes the event JSON to the hook process; the keys are camelCase and the `hookEventName` VALUE is snake_case), forwards it verbatim, and also passes `GROK_HOOK_EVENT` — which grok injects into every hook process — as a query parameter so an empty stdin still reports. It time-boxes the request with `curl --max-time 2`, backgrounds it, and always exits 0: `Stop` runs on the turn's critical path and a non-zero exit there would block grok from finishing.
 

@@ -84,6 +84,8 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     const r = spawnSync(shell, [script, ...args], { input: stdin, env: env as NodeJS.ProcessEnv, encoding: 'utf-8' });
     const after = Date.now();
     expect(r.status, r.stderr).toBe(0);
+    // Claude adds SessionStart and UserPromptSubmit hook stdout to the model's context; Codex reads it too.
+    expect(r.stdout).toBe('');
     return { before, after };
   };
 
@@ -176,6 +178,25 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     fs.rmSync(spool, { recursive: true });
     run(CODEX_HOOK_SCRIPT_CONTENT, [], '{"hook_event_name":"Stop"}', DELIVERED, {}, 'bash');
     expect(spoolFiles()).toEqual([]);
+  });
+
+  it('the codex hook never spools PreToolUse (one per tool call, no state), and still spools PostToolUse', () => {
+    run(CODEX_HOOK_SCRIPT_CONTENT, [], '{"hook_event_name": "PreToolUse","tool_name":"shell"}', REFUSED, {}, 'bash');
+    expect(spoolFiles()).toEqual([]);
+    run(CODEX_HOOK_SCRIPT_CONTENT, [], '{"hook_event_name":"PostToolUse","tool_name":"shell"}', REFUSED, {}, 'bash');
+    expect(readOnly().body).toEqual({ hook_event_name: 'PostToolUse', tool_name: 'shell' });
+  });
+
+  it('spools a post-tool body over 256 KiB as metadata only: kind, session, time and size, no body', () => {
+    const body = JSON.stringify({ tool_name: 'Write', tool_input: { file_path: '/tmp/big.txt', content: 'x'.repeat(300 * 1024) } });
+    run(HOOK_SCRIPT_CONTENT, ['post-tool'], body, REFUSED);
+    settle(() => spoolFiles().length > 0);
+    const spooled = readOnly();
+    expect(spooled.query).toBe(`kind=tool&session=${SESSION}`);
+    expect(spooled.session).toBe(SESSION);
+    expect(spooled.body).toBeNull();
+    expect(spooled.bodyDropped).toBe(true);
+    expect(spooled.bodyLength).toBe(body.length);
   });
 
   it('the detached grok hook spools its stdin body with the provider query', () => {

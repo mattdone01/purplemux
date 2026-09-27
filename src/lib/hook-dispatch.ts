@@ -101,7 +101,7 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
     return { applied };
   };
   const guarded = generation
-    ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook)
+    ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook, { holdOnFailedProof: replayedAt === undefined })
     : await withValidatedLegacyCodexHook(tmuxSession, {
         sessionId: translation.meta?.sessionId ?? null,
         jsonlPath: translation.meta?.jsonlPath,

@@ -349,18 +349,23 @@ stop          → lastEvent{name:'stop', seq:4}          → ready-for-review
 
 The route's handler is `dispatchHook` (`src/lib/hook-dispatch.ts`). A live POST calls it without
 `replayedAt`; `drainHookSpool` (`src/lib/hook-spool.ts`) calls it with each spooled event's time.
-`StatusManager` drains the spool at boot (after `scanAll`, before `startPolling`), at the start of
-every `poll()`, and once after the server writes its port file. Files apply oldest first and are
-deleted when applied; unreadable ones move to `hook-spool/bad/`.
+`init` does not drain. `server.ts` calls `startBootHookSpoolDrains()` once the server listens and
+has written its port file, never awaited: one drain at once, one 5 s later. Every `poll()` drains
+first too; one drain runs at a time and yields every 50 files. Files apply oldest first and are
+deleted when applied; unreadable ones and replays that throw move to `hook-spool/bad/` once.
+Files past `HOOK_REPLAY_WINDOW_MS` (1 h) and metadata-only files (body over 256 KiB) are deleted
+without dispatch. A replayed Codex hook never holds its generation (`holdOnFailedProof: false`).
 
-`replayedAt` threads through `handleProviderEvent`, `updateTabFromHook` and `applyAgentHookMeta`:
+`replayedAt` threads through `handleProviderEvent`, `updateTabFromHook`, `applyAgentHookMeta` and
+`handleToolActivity`:
 
-- `hookAppliedAt` holds each tab's latest applied hook event time (live: receipt time; replayed:
-  `at`; a restored watchdog stop: its `at`).
-- A replayed event older than it, or older than `HOOK_REPLAY_WINDOW_MS` (1 h; `hookAppliedAt` is
-  not persisted, so an older file cannot be ordered against events an earlier server received), is
-  recorded in `getHookHistory(tabId)` with `stale: true` and changes nothing: no `lastEvent`, no
-  `cliState`, no metadata, no broadcast.
+- `hookAppliedAt` is each tab's floor: the latest applied hook event time (live: receipt time;
+  replayed: `at`), raised by state events and by non-stale metadata patches. It is persisted as
+  `ITab.hookFloorAt` (one coalesced layout write per tab per second) and restored when the tab's
+  entry is built (`applyRestoredStop`), together with a restored watchdog stop's `at`.
+- A replayed event older than the floor, or past the replay window, is recorded in
+  `getHookHistory(tabId)` with `stale: true` and changes nothing: no `lastEvent`, no `cliState`,
+  no metadata, no broadcast.
 - Otherwise it applies like a live event, dated at `at`: `lastEvent.at`, `lastResumeOrStartedAt`,
   `compactingSince`, and a stop's `turnEnd.at`, so the turn end is classified and nudged as it
   would have been and the idle clock counts from the real stop.

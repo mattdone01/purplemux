@@ -9,6 +9,8 @@ import { STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
  */
 
 export const HOOK_SPOOL_DIRNAME = 'hook-spool';
+/** A body longer than this (a Write's content, a long Bash output) is spooled as metadata only. */
+export const HOOK_SPOOL_MAX_BODY = 256 * 1024;
 
 /**
  * Shared shell functions. `post_hook TARGET BODY [curl options]` POSTs one
@@ -16,9 +18,14 @@ export const HOOK_SPOOL_DIRNAME = 'hook-spool';
  * connect, or a 5xx — the event goes to `hook-spool/` as one JSON file, written
  * to a dot-named temporary and renamed, which the next server replays in time
  * order. A server that answered (2xx-4xx), or a timeout after the connect, is
- * never spooled: the server may have applied it. Only purplemux sessions
- * (`pt-*`) spool, because the Codex hook is global and also fires outside
- * purplemux. Nothing retries: the hook stays one round trip.
+ * never spooled: the server may have applied it. So is a connection the
+ * server cut while it exited (curl 52/56): it may have applied the event, and a
+ * replay would repeat it on a tab whose floor that server never persisted.
+ * Only purplemux sessions (`pt-*`) spool, because the Codex hook is global and
+ * also fires outside purplemux. `SPOOL_SKIP_EVENT` names a hook event never
+ * spooled (Codex PreToolUse: one per tool call, and it changes no state). A
+ * body over `HOOK_SPOOL_MAX_BODY` is spooled as metadata only (`body: null`,
+ * `bodyDropped`, `bodyLength`). Nothing retries: the hook stays one round trip.
  */
 const SPOOL_FUNCTIONS = `json_escape() {
   printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
@@ -27,13 +34,23 @@ const SPOOL_FUNCTIONS = `json_escape() {
 spool_hook() {
   [ "\${EVENT:-}" = "poll" ] && return 0
   case "$SESSION" in pt-*) ;; *) return 0 ;; esac
+  if [ -n "\${SPOOL_SKIP_EVENT:-}" ] \\
+    && printf '%s' "$2" | grep -q "\\"hook_event_name\\"[[:space:]]*:[[:space:]]*\\"\${SPOOL_SKIP_EVENT}\\""; then
+    return 0
+  fi
+  SPOOL_BODY="\${2:-null}"
+  SPOOL_META=""
+  if [ \${#SPOOL_BODY} -gt ${HOOK_SPOOL_MAX_BODY} ]; then
+    SPOOL_META=",\\"bodyDropped\\":true,\\"bodyLength\\":\${#SPOOL_BODY}"
+    SPOOL_BODY="null"
+  fi
   SPOOL_DIR="$HOME/.purplemux/${HOOK_SPOOL_DIRNAME}"
   mkdir -p -m 700 "$SPOOL_DIR" 2>/dev/null || return 0
   SPOOL_RAND=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \\n')
   SPOOL_NAME="\${AT}-$$-\${SPOOL_RAND:-0}"
   SPOOL_TMP="$SPOOL_DIR/.\${SPOOL_NAME}.tmp"
-  if { printf '{"v":1,"at":%s,"session":"%s","query":"%s","body":' "$AT" "$(json_escape "$SESSION")" "$(json_escape "$1")"
-       printf '%s' "\${2:-null}"
+  if { printf '{"v":1,"at":%s,"session":"%s","query":"%s"%s,"body":' "$AT" "$(json_escape "$SESSION")" "$(json_escape "$1")" "$SPOOL_META"
+       printf '%s' "$SPOOL_BODY"
        printf '}\\n'; } > "$SPOOL_TMP" 2>/dev/null; then
     mv -f "$SPOOL_TMP" "$SPOOL_DIR/\${SPOOL_NAME}.json" 2>/dev/null || rm -f "$SPOOL_TMP"
   else
@@ -77,6 +94,7 @@ case "$AT" in *[!0-9]*) AT="" ;; esac
 if [ \${#AT} -eq 19 ]; then AT="\${AT%??????}"; else AT=$(( $(date +%s) * 1000 )); fi
 PORT=""
 TOKEN=""
+SPOOL_SKIP_EVENT=""
 [ -f "$PORT_FILE" ] && PORT=$(cat "$PORT_FILE")
 [ -f "$TOKEN_FILE" ] && TOKEN=$(cat "$TOKEN_FILE")
 SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""`;
@@ -148,6 +166,7 @@ export const CODEX_HOOK_SCRIPT_CONTENT = `#!/usr/bin/env bash
 set -u
 ${PROLOGUE}
 GENERATION="\${PURPLEMUX_CODEX_GENERATION:-}"
+SPOOL_SKIP_EVENT="PreToolUse"
 
 ${SPOOL_FUNCTIONS}
 

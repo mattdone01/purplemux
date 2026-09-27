@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd, updateTabHookFloor } from '@/lib/layout-store';
+import { HOOK_REPLAY_WINDOW_MS } from '@/lib/hook-spool';
 import { onTabClosed, onTabClosing } from '@/lib/tab-lifecycle';
 import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
@@ -133,20 +134,17 @@ const JSONL_WATCH_DEBOUNCE_MS = 100;
 export const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
 /** Hook events kept per tab in `getHookHistory`. */
 export const HOOK_HISTORY_LIMIT = 32;
-/**
- * A replayed hook event older than this changes no state (ADR-0020). A restart
- * gap is seconds to minutes; an older spool file may predate events a server
- * without the spool received live, and the poll and `resolveUnknown` recover
- * the state of a long outage from the process and the transcript instead.
- */
-export const HOOK_REPLAY_WINDOW_MS = 60 * 60 * 1000;
+/** A raised hook floor reaches the layout at most this often per tab (ADR-0020). */
+export const HOOK_FLOOR_PERSIST_MS = 1_000;
+/** The second boot drain, for hooks that renamed their file after the first one listed the spool. */
+export const HOOK_SPOOL_LATE_DRAIN_MS = 5_000;
 
 /** One hook event a tab received, live or replayed from the spool (ADR-0020). */
 export interface IHookHistoryItem {
   event: string;
   at: number;
   replayed: boolean;
-  /** Older than the tab's latest applied event or the replay window: recorded here, never applied to its state. */
+  /** Older than the tab's hook floor or the replay window: recorded here, never applied to its state. */
   stale: boolean;
 }
 
@@ -195,8 +193,13 @@ export class StatusManager {
   private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
-  /** When each tab's latest applied hook event happened; an older replayed event is history only (ADR-0020). */
+  /**
+   * Each tab's hook floor: when its latest applied hook event (state or
+   * metadata) happened. Persisted as `hookFloorAt` and restored at boot, so an
+   * older replayed event is history only across restarts too (ADR-0020).
+   */
   private hookAppliedAt = new Map<string, number>();
+  private hookFloorWrites = new Map<string, { at: number; timer: ReturnType<typeof setTimeout> }>();
   private hookHistory = new Map<string, IHookHistoryItem[]>();
   private hookSpoolDrain: (() => Promise<unknown>) | null = null;
   private hookSpoolDraining: Promise<void> | null = null;
@@ -227,8 +230,6 @@ export class StatusManager {
     }).catch(() => {});
 
     await this.scanAll();
-    // Events hooks spooled while no server answered, before the first poll (ADR-0020).
-    await this.drainHookSpool();
     this.startPolling();
 
     this.rateLimitsWatcher = createRateLimitsWatcher((data) => {
@@ -475,6 +476,18 @@ export class StatusManager {
     return this.hookSpoolDraining;
   }
 
+  /**
+   * The boot drains, started once the server listens and has written its port
+   * file, and never awaited: a large spool must not hold up startup or the
+   * deploy's health gate. The second drain catches a hook that saw no port
+   * file and renamed its spool file after the first drain listed the spool.
+   */
+  startBootHookSpoolDrains(lateDelayMs = HOOK_SPOOL_LATE_DRAIN_MS): void {
+    void this.drainHookSpool();
+    const timer = setTimeout(() => { void this.drainHookSpool(); }, lateDelayMs);
+    timer.unref?.();
+  }
+
   getHookHistory(tabId: string): IHookHistoryItem[] {
     return [...(this.hookHistory.get(tabId) ?? [])];
   }
@@ -504,8 +517,41 @@ export class StatusManager {
       hookLog.info({ tabId, event, at, latest: this.hookAppliedAt.get(tabId) }, 'replayed hook event older than the tab\'s latest or the replay window: history only');
       return null;
     }
-    if (at > (this.hookAppliedAt.get(tabId) ?? -Infinity)) this.hookAppliedAt.set(tabId, at);
+    this.raiseHookFloor(tabId, at);
     return at;
+  }
+
+  /** Raise the tab's hook floor; the layout copy follows within `HOOK_FLOOR_PERSIST_MS`. */
+  private raiseHookFloor(tabId: string, at: number): void {
+    if (at <= (this.hookAppliedAt.get(tabId) ?? -Infinity)) return;
+    this.hookAppliedAt.set(tabId, at);
+    const pending = this.hookFloorWrites.get(tabId);
+    if (pending) {
+      pending.at = at;
+      return;
+    }
+    const timer = setTimeout(() => this.flushHookFloor(tabId), HOOK_FLOOR_PERSIST_MS);
+    timer.unref?.();
+    this.hookFloorWrites.set(tabId, { at, timer });
+  }
+
+  private flushHookFloor(tabId: string): void {
+    const pending = this.hookFloorWrites.get(tabId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.hookFloorWrites.delete(tabId);
+    const entry = this.tabs.get(tabId);
+    if (!entry) return;
+    updateTabHookFloor(entry.tmuxSession, pending.at).catch((err) => {
+      hookLog.warn({ tabId, err: String(err) }, 'hook floor not persisted');
+    });
+  }
+
+  /** The floor a previous server persisted, restored when the tab's entry is built. */
+  private restoreHookFloor(tab: ITab): void {
+    const floor = tab.hookFloorAt;
+    if (typeof floor !== 'number' || !Number.isFinite(floor)) return;
+    if (floor > (this.hookAppliedAt.get(tab.id) ?? -Infinity)) this.hookAppliedAt.set(tab.id, floor);
   }
 
   async poll(): Promise<void> {
@@ -1756,6 +1802,7 @@ export class StatusManager {
    * down) is dropped, on disk too, so a stale stop is never nudged (r2 nit 2).
    */
   private applyRestoredStop(tab: ITab, entry: ITabStatusEntry): void {
+    this.restoreHookFloor(tab);
     const record = tab.watchdogTurnEnd;
     if (!record) return;
     const usable = entry.cliState === 'ready-for-review' && record.kind === 'ready-for-review'
@@ -1770,7 +1817,7 @@ export class StatusManager {
     entry.turnEnd = { ...record };
     entry.lastEvent = { name: 'stop', at: record.at, seq };
     entry.eventSeq = seq;
-    this.hookAppliedAt.set(tab.id, record.at);
+    if (record.at > (this.hookAppliedAt.get(tab.id) ?? -Infinity)) this.hookAppliedAt.set(tab.id, record.at);
   }
 
   /**
@@ -2264,6 +2311,8 @@ export class StatusManager {
       return null;
     }
     if (this.isStaleReplay(tabId, replayedAt)) return { tabId, cliState: entry.cliState, stale: true };
+    // A metadata patch is an applied event too: an older replay must not undo it.
+    this.raiseHookFloor(tabId, replayedAt ?? Date.now());
 
     let changed = false;
 
@@ -2372,6 +2421,9 @@ export class StatusManager {
     this.tabs.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
     this.processStartCache.delete(tabId);
+    const floorWrite = this.hookFloorWrites.get(tabId);
+    if (floorWrite) clearTimeout(floorWrite.timer);
+    this.hookFloorWrites.delete(tabId);
     this.hookAppliedAt.delete(tabId);
     this.hookHistory.delete(tabId);
     this.broadcastRemove(tabId);
@@ -2727,6 +2779,7 @@ export class StatusManager {
   }
 
   shutdown(): void {
+    for (const tabId of [...this.hookFloorWrites.keys()]) this.flushHookFloor(tabId);
     this.stopPolling();
     this.rateLimitsWatcher?.stop();
     this.claudeUsagePoller?.stop();

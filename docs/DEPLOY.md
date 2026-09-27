@@ -104,14 +104,18 @@ every event of that window: a turn that ended then left its tab `busy` and its o
 unnudged. After the quiet wait and the backup, and before the swap, the script runs the release's
 own `scripts/install-hook-scripts.sh --dir ~/.purplemux`. It renders `status-hook.sh`,
 `statusline.sh`, `codex-hook.sh` and `grok-hook.sh` from the release's templates and replaces each
-in one rename. Those scripts POST exactly as before, so the old server keeps answering them until it
-stops. When no server answers, they write the event to `~/.purplemux/hook-spool/`, and the new
-server replays the spool, in time order, at boot and on every poll (ADR-0020).
+in one rename. Those scripts post the same headers, URL and body, now on stdin (a Claude post-tool
+body over the 128 KiB argument limit now reaches the server; the parser reads only paths and the
+command), so the old server keeps answering them until it stops. When no server answers, they write
+the event to `~/.purplemux/hook-spool/`, and the new server replays the spool in time order once it
+listens and on every poll (ADR-0020). A POST that the exiting server cuts (curl 52/56) is lost, not
+spooled: that server may have applied it and persists no floor, so a replay could repeat it.
 
 - A forward deploy of a release without the installer refuses before the lease: `HOOK-INSTALL-MISSING`, exit 2.
 - A failed pre-install refuses before the swap: `HOOK-PREINSTALL-FAILED`, exit 1.
 - `--dry-run` runs the installer into a scratch directory and reports it in `HOOKS=`; `~/.purplemux` is untouched. A render failure refuses (`HOOK-RENDER-FAILED`).
 - `--rollback` runs the target's installer when it has one; otherwise `HOOKS=skipped (…)`, and the target's server writes its own scripts when it starts.
+- After a rollback restart (automatic or `--rollback`) into a release without the installer, the script moves `hook-spool/*.json` into `hook-spool/bad/rollback-<stamp>/` and appends `N spooled event(s) set aside in …` to `HOOKS=`. That release never drains the spool and persists no hook floor, so a later server could not order those files against the events it applied live.
 - `DEPLOY_HOOK_INSTALL` overrides the installer path (tests).
 
 Check the spool after a deploy: `ls ~/.purplemux/hook-spool/` is empty once the new server has

@@ -684,10 +684,16 @@ export interface IValidatedCodexHookGeneration {
   generation: string;
 }
 
+/**
+ * `holdOnFailedProof: false` for a replayed hook (ADR-0020): an event spooled
+ * during a restart says nothing about the process running now, so its failed
+ * proof skips the event and never holds the generation.
+ */
 export const withValidatedCodexHookGeneration = async <T>(
   sessionName: string,
   generation: string | null | undefined,
   work: (identity: IValidatedCodexHookGeneration) => Promise<T> | T,
+  options: { holdOnFailedProof?: boolean } = {},
 ): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
   if (!generation) return { ok: false, reason: 'generation-required' };
   const parsed = (await import('@/lib/layout-store')).parseSessionName(sessionName);
@@ -701,7 +707,9 @@ export const withValidatedCodexHookGeneration = async <T>(
     }
     const proof = await verifyCodexActiveRuntime(found.tab);
     if (!proof.ok) {
-      await holdCodexActiveGeneration(parsed.wsId, parsed.tabId, generation, proof.reason);
+      if (options.holdOnFailedProof !== false) {
+        await holdCodexActiveGeneration(parsed.wsId, parsed.tabId, generation, proof.reason);
+      }
       return { ok: false, reason: proof.reason };
     }
     const value = await work({ workspaceId: parsed.wsId, tabId: parsed.tabId, generation });

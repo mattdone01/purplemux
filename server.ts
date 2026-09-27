@@ -419,8 +419,9 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   process.env.PORT = String(result.port);
 
   const hookResult = await ensureHookSettings(result.port);
-  // Hooks spooled until the port file existed; the next poll may be 30 s away.
-  await getStatusManager().drainHookSpool();
+  // Hooks spooled while no server answered: replayed now that the server
+  // listens and the port file exists, never awaited (ADR-0020).
+  getStatusManager().startBootHookSpoolDrains();
   if (hookResult.codexHookInstallFailed) {
     enqueueSystemToast({
       type: 'system-toast',

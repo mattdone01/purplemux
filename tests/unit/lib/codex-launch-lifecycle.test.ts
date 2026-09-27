@@ -64,6 +64,7 @@ import {
   reconcileCodexLaunchTimeout,
   resolveCodexLaunchIntent,
   validateCodexHookGeneration,
+  withValidatedCodexHookGeneration,
   withValidatedLegacyCodexHook,
 } from '@/lib/providers/codex/launch-lifecycle';
 
@@ -473,6 +474,34 @@ describe('Codex managed launch lifecycle', () => {
       mocks.tab!.sessionName,
       prepared.intent.generation,
     )).toMatchObject({ ok: true, tabId: 'tab-t' });
+  });
+
+  it('a replayed hook whose process proof fails is skipped and never holds the generation (ADR-0020)', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test',
+      tabId: 'tab-t',
+      generation: prepared.intent.generation,
+      launcherPid: 20,
+      childPid: 30,
+    });
+    expect(mocks.tab!.codexLaunchRuntime!.active!.phase).toBe('active');
+    // The process the spooled event came from has exited since.
+    mocks.running.mockResolvedValue(false);
+    const work = vi.fn();
+
+    const replay = await withValidatedCodexHookGeneration(
+      mocks.tab!.sessionName, prepared.intent.generation, work, { holdOnFailedProof: false },
+    );
+    expect(replay.ok).toBe(false);
+    expect(work).not.toHaveBeenCalled();
+    expect(mocks.tab!.codexLaunchRuntime!.active!.phase).toBe('active');
+
+    const live = await withValidatedCodexHookGeneration(mocks.tab!.sessionName, prepared.intent.generation, work);
+    expect(live.ok).toBe(false);
+    expect(mocks.tab!.codexLaunchRuntime!.active!.phase).toBe('held');
   });
 
   it('does not claim when PATCH changed desired pins after launch', async () => {
