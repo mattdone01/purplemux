@@ -55,7 +55,6 @@ const setup = async (orchestration: { enabled: boolean; orchestratorTabId: strin
   const internals = manager as unknown as {
     nudgeOrchestrator: (tabId: string, e: ITabStatusEntry, kind: 'stuck', detail?: string) => Promise<void>;
     handleLivenessEvent: (event: TLivenessEvent) => Promise<void>;
-    lastNudgeByTab: Map<string, unknown>;
     stuckNudgedTabs: Set<string>;
   };
   const targets = () => paste.mock.calls.map(([session]) => session.replace('tmux-', ''));
@@ -103,7 +102,6 @@ describe('nudge routing — reportsTo and notify self (ADR-0018)', () => {
     manager.forgetReportsTo('ws-1', 'o2');
     expect(w.reportsTo).toBeNull();
     expect(layout.clearReportsTo).toHaveBeenCalledWith('ws-1', 'o2');
-    internals.lastNudgeByTab.clear();
 
     await internals.nudgeOrchestrator('w', w, 'stuck');
     expect(targets()).toEqual(['o2', 'o1']);
@@ -176,8 +174,15 @@ describe('nudge routing — reportsTo and notify self (ADR-0018)', () => {
     manager.registerTab('o2', entry('o2'));
     manager.registerTab('w', entry('w', { reportsTo: 'o2' }));
 
+    // Two jobs (two pids): an identical repeat within 60 s would be dropped as a duplicate (L49).
+    const secondJob: TLivenessEvent = {
+      kind: 'bg-completed',
+      job: { workspaceId: 'ws-1', tabId: 'w', pid: 43, label: 'gate', registeredAt: 0, notify: 'orchestrator' },
+      exitCode: 0,
+      stderrTail: null,
+    };
     await internals.handleLivenessEvent(bgCompleted());
-    await internals.handleLivenessEvent(bgCompleted('orchestrator'));
+    await internals.handleLivenessEvent(secondJob);
     manager.removeTab('o2');
     await internals.handleLivenessEvent(bgCompleted());
     expect(targets()).toEqual(['o2', 'o2', 'o1']);
@@ -303,15 +308,21 @@ describe('human pages for liveness events (story 34, consult ruling A)', () => {
     expect(paged.internals.stuckNudgedTabs.has('w')).toBe(true);
   });
 
-  // The ruling's premise, chained: the woken tab's next stop still escalates to its target.
+  // The ruling's premise, chained: the woken tab's next stop still escalates to its target — at once
+  // with an end line, and through the one idle nudge after the quiet window without one (L49).
   it('after a delivered self-notified failure, the tab\'s next stop nudges its target', async () => {
-    const { manager, internals, targets, alerts } = await withAlerts(undefined, {
+    const { manager, internals, targets, alerts, paste } = await withAlerts(undefined, {
       reportsTo: 'o1', cliState: 'busy', jsonlPath: null, lastEvent: { name: 'prompt-submit', at: Date.now(), seq: 1 }, eventSeq: 1,
     });
     await internals.handleLivenessEvent(bgFailed('self'));
     expect(alerts).not.toHaveBeenCalled();
     manager.updateTabFromHook('tmux-w', 'stop');
+    await vi.waitFor(() => expect(manager.getAllForClient().w.turnEnd?.kind).toBe('ready-for-review'), { timeout: 5000 });
+    expect(targets()).toEqual(['w']);
+    const at = manager.getAllForClient().w.turnEnd!.at;
+    await (manager as unknown as { runWatchdogTimers: (n: number) => Promise<void> }).runWatchdogTimers(at + 15 * 60 * 1000);
     await vi.waitFor(() => expect(targets()).toEqual(['w', 'o1']), { timeout: 5000 });
+    expect(paste.mock.calls[1][1]).toContain('idle without an end line');
   });
 
   it('a completed self-notified job pages no one (unchanged)', async () => {

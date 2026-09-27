@@ -66,6 +66,8 @@ export interface ITurnErrorEpisode {
   resumeItemId: string | null;
   /** The orchestrator was told; nothing more is sent this episode. */
   escalated: boolean;
+  /** The failed turn this episode last saw; a repeated stop of the same turn is no second failure (review r2 nit 1). */
+  turnId?: string;
 }
 
 export interface ITurnEndRecord {
@@ -78,8 +80,16 @@ export interface ITurnEndRecord {
   /** null on a `ready-for-review` stop whose background ledger could not be read. */
   openBackgroundTasks?: number | null;
   liveRegisteredJobs?: number;
+  /** `purplemux watch` records the tab owned at the stop (a `waiting` or `ready-for-review` stop). */
+  armedWatches?: number;
   /** A `ready-for-review` stop: false when no transcript could be read (the fallback). */
   transcript?: boolean;
+  /** The stop seq whose `idle-no-end-line` nudge went out (or was skipped); persisted with the record. */
+  idleNudgeSentSeq?: number;
+  /** The stop seq whose `long-wait` nudge went out. */
+  longWaitSentSeq?: number;
+  /** The agent session the stop belongs to; a restored record of another session is dropped (review r2 nit 2). */
+  agentSessionId?: string | null;
 }
 
 export type TTabDisplayStatus = 'busy' | 'ready-for-review' | 'needs-input' | 'idle' | 'unknown';
@@ -199,7 +209,7 @@ export interface IStandupUpdateMessage {
   standup: IWorkspaceStandup;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'api-error' | 'usage-limit' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-died' | 'model-drift';
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'idle-no-end-line' | 'long-wait' | 'api-error' | 'usage-limit' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-died' | 'model-drift';
 
 export interface IOrchestrationNudge {
   id: string;

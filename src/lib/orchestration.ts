@@ -5,7 +5,6 @@ import type { TOrchestrationNudgeKind } from '@/types/status';
 import { STANDUP_SCHEMA_HINT } from '@/lib/standup';
 
 export const NUDGE_PREFIX = '[orchestrator-watchdog]';
-export const NUDGE_DEBOUNCE_MS = 30_000;
 export const MAX_NUDGE_HISTORY = 200;
 export const KICKOFF_FALLBACK_DELAY_MS = 20_000;
 export const ORCH_IDLE_HEARTBEAT_MS = 10 * 60 * 1000;
@@ -46,10 +45,12 @@ export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace 
 ## Event loop (your whole job)
 purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a worker changes state. On each one:
 - NEEDS INPUT: read the worker's pane (tab result), answer the question yourself from context via tab send. Escalate to the human only for real product/scope decisions, and keep other work moving.
-- "ended: DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE: …": the worker's own end line, verbatim — act on it. A worker that ends its turn with no marker while its background jobs or subagents run is WAITING and sends no nudge; the job's completion wakes it.
+- "ended: DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE: …": the worker's own end line, verbatim — act on it. Only a turn whose last line is one of these markers nudges you when it ends. A worker that ends its turn with no marker while its background jobs, subagents or purplemux watches run is WAITING and sends no nudge; the job's completion wakes it.
+- IDLE WITHOUT AN END LINE: the worker stopped with no marker and nothing it waits on, and stayed quiet for the idle window (default 15 min). Read its output, then accept it, send follow-up work, or ask it for its end line.
+- WAITING (long wait): the worker has waited hours (default 4) on a registered job or watch with no end line. The work is still live; check it is still expected to finish, else stop it or tell the worker to end its turn.
 - API ERROR: the worker's turn failed at the provider and its one automatic resume failed too (or could not be delivered). Re-prompt it when the provider recovers, or park its task.
 - HALTED by a usage limit: never type into that tab — typing cancels its auto-continue; wait for the reset or move its task.
-- READY FOR REVIEW / turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept or send concrete fix-up instructions. On accept: immediately assign the next task to that tab, or CLOSE it (purplemux tab close). Never leave a finished or abandoned worker tab open — the tab strip is the human's dashboard, and stale tabs hide real state.
+- turn ended: read the output, check for DONE:/BLOCKED:, run the verification commands, then accept or send concrete fix-up instructions. On accept: immediately assign the next task to that tab, or CLOSE it (purplemux tab close). Never leave a finished or abandoned worker tab open — the tab strip is the human's dashboard, and stale tabs hide real state.
 - STALLED: read the pane. If genuinely working (long build/tests), wait. If hung, interrupt (tmux send-keys Escape) and re-prompt tighter; if that fails, close and respawn with an amended brief.
 - BACKGROUND JOB COMPLETED: verify its artifacts and acceptance criteria, then accept the result or send concrete follow-up work. Do not restart successful work.
 - BACKGROUND JOB FAILED: inspect its stderr and artifacts, diagnose, then restart only when retrying is justified and bounded. Repeated failures are systematic — stop restarting and escalate.
@@ -105,8 +106,16 @@ export const buildNudgeMessage = (
       return `${NUDGE_PREFIX} ${who} NEEDS INPUT. ${capture} — then answer via tab send.`;
     case 'ready-for-review':
       return `${NUDGE_PREFIX} ${who} is READY FOR REVIEW. ${capture} — verify, then accept or send follow-up work.`;
+    // L49: a stop with no end line sends nothing at once; this one delayed
+    // nudge goes out only if the tab stayed quiet with nothing live.
+    case 'idle-no-end-line':
+      return `${NUDGE_PREFIX} ${who} is idle without an end line: it stopped ${detail ?? 'a while ago'} with no DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE: line and nothing it waits on (no background task, registered job or watch). ${capture} — then accept it, send follow-up work, or ask it for its end line.`;
     // The worker's own end line, verbatim: the orchestrator acts on it without
     // a capture turn (ADR-0018).
+    // Review r1 finding 4: the one backstop for a tab that waits on registered
+    // work for hours. It is never a stall verdict: the work is still live.
+    case 'long-wait':
+      return `${NUDGE_PREFIX} ${who} has been WAITING ${detail ?? 'for a long time on registered work'} with no end line. The work is still registered and live, so this is one reminder, not an alarm. ${capture} — check that the work is still expected to finish; if not, stop it or tell the worker to end its turn with a marker line.`;
     case 'turn-marker':
       return `${NUDGE_PREFIX} ${who} ended: ${detail ?? '(marker unavailable)'} — read with: purplemux tab result -w ${workspaceId} ${tabId}`;
     // Story 26: the worker was resumed once through the inbox; this is the

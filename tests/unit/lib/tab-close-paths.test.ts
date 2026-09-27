@@ -119,4 +119,70 @@ describe('every close path reaps by tab id (ADR-0016)', () => {
       ['s-b1', { tabId: 'tab-b1' }],
     ]));
   });
+
+  // L38: a deliberate close announces itself BEFORE the reap, so the watchdog never reads it as a death.
+  describe('tab-closing is announced before the reap (L38)', () => {
+    const record = async () => {
+      const { onTabClosing } = await import('@/lib/tab-lifecycle');
+      const events: string[] = [];
+      tmux.killSession.mockImplementation(async (session: string) => {
+        events.push(`kill:${session}`);
+        return REAP;
+      });
+      const off = onTabClosing((e) => events.push(`${e.phase}:${e.tabId}:${e.sessionName}:${e.workspaceId}`));
+      return { events, off };
+    };
+
+    it('closeTab announces closing, then reaps; no abort on success', async () => {
+      const { events, off } = await record();
+      const store = await import('@/lib/layout-store');
+      try {
+        expect((await store.closeTab(WS, 'pane-a', 'tab-a2')).ok).toBe(true);
+        expect(events).toEqual([`closing:tab-a2:s-a2:${WS}`, 'kill:s-a2']);
+      } finally {
+        off();
+      }
+    });
+
+    it('closeTab announces aborted when the reap throws, and rethrows', async () => {
+      const { events, off } = await record();
+      tmux.killSession.mockRejectedValueOnce(new Error('tmux unreachable'));
+      const store = await import('@/lib/layout-store');
+      try {
+        await expect(store.closeTab(WS, 'pane-a', 'tab-a2')).rejects.toThrow('tmux unreachable');
+        expect(events).toEqual([`closing:tab-a2:s-a2:${WS}`, `aborted:tab-a2:s-a2:${WS}`]);
+      } finally {
+        off();
+      }
+    });
+
+    it('closeTab announces nothing for a tab it cannot find', async () => {
+      const { events, off } = await record();
+      const store = await import('@/lib/layout-store');
+      try {
+        expect((await store.closeTab(WS, 'pane-a', 'tab-nope')).ok).toBe(false);
+        expect(events).toEqual([]);
+      } finally {
+        off();
+      }
+    });
+
+    it('deleteWorkspace announces each tab before its reap', async () => {
+      const workspaces = await import('@/lib/workspace-store');
+      const dir = path.join(mockHome.value, 'proj2');
+      await fs.mkdir(dir);
+      const ws = await workspaces.createWorkspace(dir);
+      const store = await import('@/lib/layout-store');
+      await store.writeLayoutFile(layout(), store.resolveLayoutFile(ws.id));
+      const { events, off } = await record();
+      try {
+        expect(await workspaces.deleteWorkspace(ws.id)).toBe(true);
+        const closingA1 = events.indexOf(`closing:tab-a1:s-a1:${ws.id}`);
+        expect(closingA1).toBeGreaterThanOrEqual(0);
+        expect(events.indexOf('kill:s-a1')).toBeGreaterThan(closingA1);
+      } finally {
+        off();
+      }
+    });
+  });
 });

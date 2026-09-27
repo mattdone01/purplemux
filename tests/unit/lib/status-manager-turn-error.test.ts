@@ -61,8 +61,11 @@ const setup = async () => {
   const store = await import('@/lib/inbox-store');
   const nudges = () => paste.mock.calls.map(([, message]) => message);
   const resumes = async () => (await store.readInboxState()).items.filter((i) => i.kind === 'resume');
-  // Past the 30 s per-(tab, kind) debounce, so a "once per episode" guard is what keeps a repeat quiet.
-  const clearDebounce = () => (manager as unknown as { lastNudgeByTab: Map<string, unknown> }).lastNudgeByTab.clear();
+  // Past the 60 s duplicate filter (L49), so a "once per episode" guard is what keeps a repeat quiet.
+  const { NudgeDeduper } = await import('@/lib/nudge-dedupe');
+  const clearDebounce = () => {
+    (manager as unknown as { nudgeDedupe: InstanceType<typeof NudgeDeduper> }).nudgeDedupe = new NudgeDeduper();
+  };
   return { manager, paste, nudges, resumes, store, clearDebounce };
 };
 
@@ -113,6 +116,42 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
     expect(nudges()).toEqual([]);
     expect(entry.cliState).toBe('ready-for-review');
     expect(entry.turnError).toMatchObject({ class: 'api-error', code: 'server_error', resumeItemId: resume.id, escalated: false });
+  });
+
+  it('ignores a repeated stop of the SAME failed turn: no second failure, the resume stays queued (review r2 nit 1)', async () => {
+    const { manager, nudges, resumes } = await setup();
+    const entry = worker('claude-code', await transcript('claude-server-error-2.1.283.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(entry.turnError?.resumeItemId).toBeTruthy());
+    const seq = entry.lastEvent!.seq;
+
+    // The same stop again, with no new prompt: the tab is already ready-for-review.
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(entry.turnEnd?.seq).toBe(seq + 1));
+    await settle();
+
+    expect(nudges()).toEqual([]);
+    expect(entry.turnError).toMatchObject({ escalated: false, turnId: 'cbb7ecd3-be79-4c44-ac45-0fa53331e1c0' });
+    expect((await resumes()).map((r) => r.state)).toEqual(['queued']);
+  });
+
+  it('treats a stop of a DIFFERENT failed turn while ready-for-review as the second failure (today\'s behaviour)', async () => {
+    const { manager, nudges, resumes } = await setup();
+    const entry = worker('claude-code', await transcript('claude-server-error-2.1.283.jsonl'));
+    manager.registerTab('tab-w', entry);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(entry.turnError?.resumeItemId).toBeTruthy());
+
+    entry.jsonlPath = await transcript('claude-server-error-2.1.283.jsonl', [
+      { type: 'user', timestamp: '2026-09-26T01:31:00.000Z', message: { content: 'resume' } },
+      { type: 'assistant', isApiErrorMessage: true, error: 'server_error', uuid: 'other-turn', timestamp: '2026-09-26T01:32:00.000Z', message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'API Error: again.' }] } },
+      { type: 'system', subtype: 'stop_hook_summary', timestamp: '2026-09-26T01:32:01.000Z' },
+    ]);
+    manager.updateTabFromHook('tmux-tab-w', 'stop');
+    await waitFor(() => expect(nudges()).toHaveLength(1));
+    expect(nudges()[0]).toContain('API ERROR after its one automatic resume: API Error: again.');
+    await waitFor(async () => expect((await resumes())[0].state).toBe('dropped'));
   });
 
   it('nudges api-error once, with the text, when the resumed turn fails again; no second resume', async () => {
@@ -186,13 +225,15 @@ describe('API-error turn ends (story 26, ADR-0018 amendment)', () => {
     ['claude-authentication-failed.jsonl', 'claude-code'],
     ['codex-other-401.jsonl', 'codex-cli'],
     ['claude-usage-warning-footer-negative.jsonl', 'claude-code'],
-  ] as Array<[string, TPanelType]>)('keeps story 15 behaviour for %s: READY nudge, no resume', async (fixture, panelType) => {
+  ] as Array<[string, TPanelType]>)('keeps story 15 classification for %s: a ready stop with no end line (no immediate nudge, L49), no resume', async (fixture, panelType) => {
     const { manager, nudges, resumes } = await setup();
     const entry = worker(panelType, await transcript(fixture));
     manager.registerTab('tab-w', entry);
     manager.updateTabFromHook('tmux-tab-w', 'stop');
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain('READY FOR REVIEW');
+    await waitFor(() => expect(entry.turnEnd?.kind).toBe('ready-for-review'));
+    await settle();
+    expect(entry.cliState).toBe('ready-for-review');
+    expect(nudges()).toEqual([]);
     expect(await resumes()).toEqual([]);
     expect(entry.turnError ?? null).toBeNull();
   });

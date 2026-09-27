@@ -100,4 +100,116 @@ describe('automated prompt delivery', () => {
     });
     expect(paste).not.toHaveBeenCalled();
   });
+
+  // L37 (27 Sep ~00:40Z): a nudge sat typed but unsubmitted in a worker's composer.
+  describe('the Enter a busy or booting agent swallowed (L37)', () => {
+    const verified = (pending: boolean[]) => {
+      const order: string[] = [];
+      const isPending = vi.fn(async (_session: string, _message: string) => {
+        order.push('check');
+        return pending.shift() ?? false;
+      });
+      const pressEnter = vi.fn(async (_session: string) => { order.push('enter'); });
+      const paste = vi.fn(async () => { order.push('paste'); });
+      const settle = vi.fn(async (ms: number) => { order.push(`wait:${ms}`); });
+      const dispatcher = new AutomatedPromptDispatcher({
+        findTarget: vi.fn(async () => target),
+        withPolicyLock: policyLock(vi.fn(async () => ({ ok: true as const }))),
+        hasSession: vi.fn(async () => true),
+        paste,
+        isPending,
+        pressEnter,
+        settle,
+      });
+      return { dispatcher, isPending, pressEnter, order };
+    };
+
+    it('checks the composer after the Enter and presses nothing more when it is empty', async () => {
+      const { dispatcher, isPending, pressEnter, order } = verified([false]);
+      await expect(dispatcher.dispatch(request('nudge text'))).resolves.toEqual({ delivered: true });
+      expect(isPending).toHaveBeenCalledWith('tmux-root', 'nudge text');
+      expect(pressEnter).not.toHaveBeenCalled();
+      expect(order).toEqual(['paste', 'wait:300', 'check']);
+    });
+
+    it('presses Enter once more when the text is still in the composer, and checks again', async () => {
+      const { dispatcher, pressEnter, order } = verified([true, false]);
+      await expect(dispatcher.dispatch(request('nudge text'))).resolves.toEqual({ delivered: true, resubmitted: true });
+      expect(pressEnter).toHaveBeenCalledTimes(1);
+      expect(pressEnter).toHaveBeenCalledWith('tmux-root');
+      expect(order).toEqual(['paste', 'wait:300', 'check', 'enter', 'wait:300', 'check']);
+    });
+
+    it('presses Enter only once, and reports the text still pending, when the retry did not take', async () => {
+      const { dispatcher, pressEnter } = verified([true, true]);
+      await expect(dispatcher.dispatch(request('nudge text'))).resolves.toEqual({ delivered: true, resubmitted: true, stillPending: true });
+      expect(pressEnter).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads a failed pane check as submitted (a capture failure is not a stranded paste)', async () => {
+      const { dispatcher, isPending, pressEnter } = verified([]);
+      isPending.mockRejectedValueOnce(new Error('capture failed'));
+      await expect(dispatcher.dispatch(request('nudge text'))).resolves.toEqual({ delivered: true });
+      expect(pressEnter).not.toHaveBeenCalled();
+    });
+
+    it('keeps the delivery when the second Enter itself fails', async () => {
+      const { dispatcher, pressEnter } = verified([true]);
+      pressEnter.mockRejectedValueOnce(new Error('tmux gone'));
+      await expect(dispatcher.dispatch(request('nudge text'))).resolves.toEqual({ delivered: true, stillPending: true });
+    });
+
+    it('wires the send API\'s composer check and a single Enter into the production dispatcher', async () => {
+      const isLinePendingInComposer = vi.fn(async () => true);
+      const pressEnter = vi.fn(async () => {});
+      vi.resetModules();
+      vi.doMock('@/lib/tmux', async (importOriginal) => ({ ...(await importOriginal<typeof import('@/lib/tmux')>()), isLinePendingInComposer, pressEnter }));
+      try {
+        const { AutomatedPromptDispatcher: Fresh } = await import('@/lib/automated-prompt-dispatcher');
+        const deps = (new Fresh() as unknown as { deps: IAutomatedPromptDispatcherDeps }).deps;
+        expect(await deps.isPending!('tmux-root', 'nudge text')).toBe(true);
+        await deps.pressEnter!('tmux-root');
+        expect(isLinePendingInComposer).toHaveBeenCalledWith('tmux-root', 'nudge text');
+        expect(typeof deps.settle).toBe('function');
+        expect(pressEnter).toHaveBeenCalledWith('tmux-root');
+      } finally {
+        vi.doUnmock('@/lib/tmux');
+        vi.resetModules();
+      }
+    });
+
+    it('treats a pane check that throws synchronously (a tmux mock without the export) as submitted', async () => {
+      const { dispatcher, isPending, pressEnter } = verified([]);
+      isPending.mockImplementationOnce(() => { throw new Error('No "isContentPendingInComposer" export'); });
+      await expect(dispatcher.dispatch(request('nudge text'))).resolves.toEqual({ delivered: true });
+      expect(pressEnter).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('the whole-line composer match (review r1 finding 5)', () => {
+    const rule = '─'.repeat(60);
+    const box = (...lines: string[]) => ['● earlier transcript line', rule, ...lines, rule, '  ? for shortcuts'].join('\n');
+    const mine = '[orchestrator-watchdog] worker tab-w1 (w1) BACKGROUND JOB COMPLETED: "gate-ui" pid 4711 exited with code 0. Read it with: purplemux tab result -w ws-1 tab-w1';
+    const other = '[orchestrator-watchdog] worker tab-w1 (w1) BACKGROUND JOB FAILED: "gate-api" pid 4712 exited with code 2. Read it with: purplemux tab result -w ws-1 tab-w1';
+
+    it('matches the nudge itself, also when the TUI wrapped it across lines', async () => {
+      const { isPaneShowingPendingLine } = await import('@/lib/tmux');
+      expect(isPaneShowingPendingLine(box(`❯ ${mine}`), mine)).toBe(true);
+      expect(isPaneShowingPendingLine(box(`❯ ${mine.slice(0, 70)}`, `  ${mine.slice(70)}`), mine)).toBe(true);
+    });
+
+    it('does not match a DIFFERENT stranded nudge from the same worker (same 40-character prefix)', async () => {
+      const { isPaneShowingPendingLine, isPaneShowingPendingContent } = await import('@/lib/tmux');
+      expect(mine.slice(0, 40)).toBe(other.slice(0, 40));
+      // The send API's 40-character needle cannot tell them apart; the whole line can.
+      expect(isPaneShowingPendingContent(box(`❯ ${other}`), mine)).toBe(true);
+      expect(isPaneShowingPendingLine(box(`❯ ${other}`), mine)).toBe(false);
+    });
+
+    it('does not match an empty composer or the nudge echoed above the box', async () => {
+      const { isPaneShowingPendingLine } = await import('@/lib/tmux');
+      expect(isPaneShowingPendingLine(box('❯ '), mine)).toBe(false);
+      expect(isPaneShowingPendingLine([`❯ ${mine}`, rule, '❯ ', rule].join('\n'), mine)).toBe(false);
+    });
+  });
 });

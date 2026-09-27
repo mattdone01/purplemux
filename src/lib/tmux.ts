@@ -529,6 +529,15 @@ export const sendTypedText = async (
   }
 };
 
+/** Press Enter once: the retry for a composer that kept its text (L37). */
+export const pressEnter = async (sessionName: string): Promise<void> => {
+  await execFile(
+    'tmux',
+    ['-L', TMUX_SOCKET, 'send-keys', '-t', sessionName, 'Enter'],
+    { timeout: CMD_TIMEOUT },
+  );
+};
+
 /** Press Enter twice (handles Claude Code long input confirmation) */
 export const submitComposer = async (sessionName: string): Promise<void> => {
   await execFile(
@@ -667,6 +676,37 @@ export const isPaneShowingPendingContent = (pane: string, content: string): bool
   if (needle.length < 3) return false;
   return composerRegion(pane.split('\n'))
     .some((line) => /[>❯│|]/.test(line) && line.includes(needle));
+};
+
+const squash = (text: string): string => text.replace(/\s+/g, '');
+
+/**
+ * Whether the WHOLE first line of `content` sits unsubmitted in the input box
+ * (review r1 finding 5). Every watchdog nudge starts
+ * `[orchestrator-watchdog] worker tab-… (…)`, so the 40-character needle of
+ * {@link isPaneShowingPendingContent} also matches a DIFFERENT stranded nudge
+ * from the same worker. Here the box's lines are joined without their marker
+ * and edge characters, and whitespace is ignored on both sides, so a line the
+ * TUI wrapped still matches and a different line never does. With no drawn
+ * box (fewer than two rules), one marker line must hold the whole line.
+ */
+export const isPaneShowingPendingLine = (pane: string, content: string): boolean => {
+  const needle = squash(content.trim().split('\n')[0]);
+  if (needle.length < 3) return false;
+  const lines = pane.split('\n');
+  const rules = lines.filter((line) => COMPOSER_RULE.test(line)).length;
+  if (rules < 2) {
+    return lines.slice(-8).some((line) => /[>❯│|]/.test(line) && squash(line).includes(needle));
+  }
+  const box = composerRegion(lines).map((line) => line.replace(/^[\s│|]*(?:[❯>][\s\u00a0]?)?/, '').replace(/[\s│|]*$/, ''));
+  return squash(box.join('')).includes(needle);
+};
+
+/** The capture behind {@link isPaneShowingPendingLine}; false when the pane cannot be read. */
+export const isLinePendingInComposer = async (sessionName: string, content: string): Promise<boolean> => {
+  const pane = await capturePaneContent(sessionName);
+  if (!pane) return false;
+  return isPaneShowingPendingLine(pane, content);
 };
 
 export const isContentPendingInComposer = async (

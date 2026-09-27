@@ -228,8 +228,9 @@ GET /api/cli/tabs/<tabId>/status?workspaceId=WS
   "openBackgroundTasks" (Claude only: its shells, async subagents and monitors, including
   shells its subagents started; null when a Claude ledger could not be read, and null on a
   Codex or Grok ready-for-review stop, which has no ledger — read null there as "not tracked")
-  and "liveRegisteredJobs"; a ready-for-review stop also carries "transcript" (false: no
-  transcript was read, the fallback). A turn-marker stop carries "marker" and no counts.
+  and "liveRegisteredJobs" (jobs whose pid was alive AT THAT STOP; "backgroundJobs" above is live)
+  and "armedWatches" (purplemux watches the tab owned); a ready-for-review stop also carries
+  "transcript" (false: no transcript was read). A turn-marker stop carries "marker" and no counts.
 
 GET /api/cli/tabs/<tabId>/result?workspaceId=WS[&suggestions=0 | &raw=1]
   Capture the current pane content (escapes stripped). On the agent's composer line and below,
@@ -276,7 +277,9 @@ POST /api/cli/tabs/<tabId>/bg?workspaceId=WS
           "notify"?: "self" | "orchestrator" }
   "notify": "self" sends the outcome nudge to this tab (a worker waking on its own gate);
   the default is the routing above. While the pid is alive, a turn end with no marker line
-  is WAITING and sends no READY FOR REVIEW nudge.
+  is WAITING and sends no nudge, and while the tab waits on that stop it is never reported
+  "possibly stalled" (a tab busy mid-turn keeps the staleness rule). A pid that
+  exits (or turns zombie) reports once, on the next watchdog pass, before its tab's stall is judged.
   Watch a background pid. A strict integer read from exitCodeFile classifies exit 0 as
   BACKGROUND JOB COMPLETED and nonzero as BACKGROUND JOB FAILED. If the file is missing
   or malformed after a short grace, BACKGROUND JOB EXITED fires with unknown status;
@@ -391,6 +394,13 @@ Keys in use:
   gate.slots   The host gate slot cap. skills gate.sh reads it after --slots and
                $GATE_HOST_SLOTS, before its default 3 (story 25). Change it with
                \`purplemux config set gate.slots <n>\` and tell nobody.
+  watchdog.idle-nudge-minutes
+               The quiet window, in minutes (0, 1440], decimals allowed, after a stop with no end
+               line and nothing live before the one "idle without an end line" nudge (L49). Read
+               by every status poll; unset or invalid means 15.
+  watchdog.wait-backstop-hours
+               Hours (0, 168], decimals allowed, a tab may wait on a live registered job or armed
+               watch before its one "has been WAITING" nudge. Unset or invalid means 4.
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
@@ -444,7 +454,17 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:
   or READY-TO-MERGE: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
   — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
-  No marker and open background work → WAITING, no nudge. Otherwise READY FOR REVIEW.
+  No marker and open background work (the agent's own tasks, a live tab bg job, or an armed
+  purplemux watch the tab owns) → WAITING, no nudge. Otherwise no nudge at once: if the tab stays
+  on that stop for the idle window (fleet config watchdog.idle-nudge-minutes, default 15) with
+  nothing live, ONE "[orchestrator-watchdog] worker <tab> (<name>) is idle without an end line"
+  nudge follows (the status poll derives it from the recorded stop, so a server restart keeps
+  it). A newer prompt, stop, permission request or session start, a close, or a job or watch
+  registered meanwhile voids it; Claude's idle_prompt notification does not. A tab WAITING on a
+  live job or armed watch for watchdog.wait-backstop-hours (default 4) gets ONE "has been
+  WAITING" nudge naming the job or watch, per waiting stop. A tab closed through tab close /
+  DELETE raises no INACTIVE and no job-exit nudge. The same episode (hook event, job pid) of the
+  same class from the same tab to the same recipient within 60 s is nudged once.
   A turn that ended on a provider API error is resumed ONCE through the inbox with no nudge;
   a second failure (or a held resume) sends "API ERROR". A usage-limit halt is never typed
   into and sends one "HALTED by a usage limit" nudge.

@@ -1,8 +1,11 @@
 import { withAgentDispatchLock, type IAgentDispatchPolicyOptions } from '@/lib/agent-dispatch-policy';
 import { findTab } from '@/lib/cli-utils';
-import { hasSession } from '@/lib/tmux';
+import { hasSession, isLinePendingInComposer, pressEnter } from '@/lib/tmux';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
+import { createLogger } from '@/lib/logger';
 import type { ITab } from '@/types/terminal';
+
+const log = createLogger('automated-prompt');
 
 interface IPolicyResult {
   ok: boolean;
@@ -16,7 +19,8 @@ export interface IAutomatedPromptRequest {
 }
 
 export type TAutomatedPromptResult =
-  | { delivered: true }
+  /** `resubmitted`: the text was still in the composer after the Enter, so Enter was pressed once more (L37). */
+  | { delivered: true; resubmitted?: true; stillPending?: true }
   | { delivered: false; reason: 'target-not-found' | 'session-not-found' | 'model-policy' | 'policy-error' | 'delivery-error'; error?: unknown; policy?: IPolicyResult };
 
 export interface IAutomatedPromptDispatcherDeps {
@@ -28,13 +32,29 @@ export interface IAutomatedPromptDispatcherDeps {
   ) => Promise<TAutomatedPromptResult>;
   hasSession: (sessionName: string) => Promise<boolean>;
   paste: (sessionName: string, message: string) => Promise<void>;
+  /**
+   * The post-submit pane check the send API uses ("a booting or mid-turn agent
+   * swallows the Enter"). Absent: no check, today's behaviour.
+   */
+  isPending?: (sessionName: string, message: string) => Promise<boolean>;
+  /** One Enter, for a message the check found still in the composer. */
+  pressEnter?: (sessionName: string) => Promise<void>;
+  /** The settle wait before the check, so the TUI has drawn the submit (review r1 finding 5). */
+  settle?: (ms: number) => Promise<void>;
 }
+
+/** How long the TUI gets to clear its composer after the Enter before the check reads it. */
+export const SUBMIT_SETTLE_MS = 300;
 
 const defaultDeps: IAutomatedPromptDispatcherDeps = {
   findTarget: async (workspaceId, tabId) => (await findTab(workspaceId, tabId))?.tab ?? null,
   withPolicyLock: withAgentDispatchLock,
   hasSession,
   paste: deliverPrompt,
+  // Resolved at call time: a module that mocks tmux without these keeps working.
+  isPending: (sessionName, message) => isLinePendingInComposer(sessionName, message),
+  pressEnter: (sessionName) => pressEnter(sessionName),
+  settle: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
 };
 
 export class AutomatedPromptDispatcher {
@@ -103,9 +123,41 @@ export class AutomatedPromptDispatcher {
 
     try {
       await this.deps.paste(target.sessionName, message);
-      return { delivered: true };
     } catch (error) {
       return { delivered: false, reason: 'delivery-error', error };
     }
+    return this.confirmSubmitted(target, message);
+  }
+
+  /**
+   * L37 (27 Sep ~00:40Z): a watchdog nudge sat typed but unsubmitted in a
+   * worker's composer, because the Enter landed while the tab was finishing a
+   * turn. The text was pasted either way, so every outcome here is `delivered`;
+   * a stranded one gets ONE more Enter, and both are logged. The check waits
+   * 300 ms for the TUI to draw, and matches the nudge's whole first line.
+   */
+  private async confirmSubmitted(target: ITab, message: string): Promise<TAutomatedPromptResult> {
+    const { isPending, pressEnter: enter, settle } = this.deps;
+    if (!isPending || !enter) return { delivered: true };
+    await settle?.(SUBMIT_SETTLE_MS);
+    // A failed pane check is not evidence of a stranded paste (the send API reads it the same way).
+    const pending = async (): Promise<boolean> => {
+      try {
+        return await isPending(target.sessionName, message);
+      } catch {
+        return false;
+      }
+    };
+    if (!(await pending())) return { delivered: true };
+    try {
+      await enter(target.sessionName);
+    } catch (err) {
+      log.warn({ tabId: target.id, err: String(err) }, 'automated prompt stranded in the composer; the second Enter failed');
+      return { delivered: true, stillPending: true };
+    }
+    await settle?.(SUBMIT_SETTLE_MS);
+    const still = await pending();
+    log.warn({ tabId: target.id, stillPending: still }, 'automated prompt was still in the composer after Enter; pressed Enter once more');
+    return still ? { delivered: true, resubmitted: true, stillPending: true } : { delivered: true, resubmitted: true };
   }
 }

@@ -4,6 +4,7 @@ import os from 'os';
 import { nanoid } from 'nanoid';
 import { listSessions, killSession } from '@/lib/tmux';
 import { createLogger } from '@/lib/logger';
+import { emitTabClosing } from '@/lib/tab-lifecycle';
 import { broadcastSync } from '@/lib/sync-server';
 import {
   readLayoutFile,
@@ -453,6 +454,8 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
     if (layout) {
       const tabs = collectAllTabs(layout.root);
       for (const tab of tabs) {
+        // Deliberate: the watchdog must not read this reap as a death (L38).
+        emitTabClosing({ workspaceId, tabId: tab.id, sessionName: tab.sessionName, phase: 'closing' });
         try {
           await killSession(tab.sessionName, { tabId: tab.id });
         } catch {}

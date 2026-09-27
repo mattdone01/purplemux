@@ -15,6 +15,22 @@ export interface ITabClosedEvent {
 
 export type TTabClosedListener = (event: ITabClosedEvent) => void;
 
+/**
+ * A deliberate close (`closeTab`: the CLI, the API, the web UI) announces itself
+ * BEFORE the tab's processes are reaped, so a watcher can retire what would read
+ * the reap as a death (L38: four "INACTIVE (agent process gone)" alarms on
+ * 27 Sep, each on a tab its orchestrator had just closed). `aborted` follows
+ * when the close fails before the layout write; `tab-closed` follows otherwise.
+ */
+export interface ITabClosingEvent {
+  workspaceId: string;
+  tabId: string;
+  sessionName: string;
+  phase: 'closing' | 'aborted';
+}
+
+export type TTabClosingListener = (event: ITabClosingEvent) => void;
+
 export interface ILiveTab {
   workspaceId: string;
   tabId: string;
@@ -28,6 +44,7 @@ export interface ITabRef {
 
 interface ITabLifecycleState {
   listeners: Set<TTabClosedListener>;
+  closingListeners?: Set<TTabClosingListener>;
   /** Per workspace, the tabs of the last layout written. Removals are computed from this, not from the layout's own reconciler slot. */
   known: Map<string, Map<string, string>>;
 }
@@ -35,6 +52,9 @@ interface ITabLifecycleState {
 const g = globalThis as unknown as { __ptTabLifecycle?: ITabLifecycleState };
 if (!g.__ptTabLifecycle) g.__ptTabLifecycle = { listeners: new Set(), known: new Map() };
 const state = g.__ptTabLifecycle;
+// A state object made by an older module instance (a hot reload) has no closing set yet.
+if (!state.closingListeners) state.closingListeners = new Set();
+const closingListeners = state.closingListeners;
 
 export const onTabClosed = (listener: TTabClosedListener): (() => void) => {
   state.listeners.add(listener);
@@ -49,6 +69,23 @@ export const emitTabClosed = (event: ITabClosedEvent): void => {
       listener(event);
     } catch (err) {
       log.warn(`tab-closed listener failed for ${event.tabId}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+};
+
+export const onTabClosing = (listener: TTabClosingListener): (() => void) => {
+  closingListeners.add(listener);
+  return () => {
+    closingListeners.delete(listener);
+  };
+};
+
+export const emitTabClosing = (event: ITabClosingEvent): void => {
+  for (const listener of [...closingListeners]) {
+    try {
+      listener(event);
+    } catch (err) {
+      log.warn(`tab-closing listener failed for ${event.tabId}: ${err instanceof Error ? err.message : err}`);
     }
   }
 };

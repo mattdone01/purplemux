@@ -117,6 +117,12 @@ export interface ITab {
   reportsTo?: string;
   cliState?: TCliState;
   dismissedAt?: number | null;
+  /**
+   * The watchdog's record of the last markerless stop (ADR-0018, L49): the poll
+   * derives the idle nudge from it, so a server restart keeps a pending nudge
+   * and never sends a sent one again.
+   */
+  watchdogTurnEnd?: import('@/types/status').ITurnEndRecord | null;
   webUrl?: string | null;
   terminalRatio?: number;
   terminalCollapsed?: boolean;

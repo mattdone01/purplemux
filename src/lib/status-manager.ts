@@ -1,7 +1,7 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo } from '@/lib/layout-store';
-import { onTabClosed } from '@/lib/tab-lifecycle';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
+import { onTabClosed, onTabClosing } from '@/lib/tab-lifecycle';
 import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
@@ -30,9 +30,24 @@ import type { ITab, IWorkspace, TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ITurnErrorEpisode, ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
-import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, NUDGE_DEBOUNCE_MS, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
+import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
-import { classifyTurnEnd, isBackgroundWaitStalled } from '@/lib/turn-end';
+import {
+  IDLE_NUDGE_CONFIG_KEY,
+  IDLE_NUDGE_DEFAULT_MS,
+  WAIT_BACKSTOP_CONFIG_KEY,
+  WAIT_BACKSTOP_DEFAULT_MS,
+  classifyTurnEnd,
+  holdsOffStall,
+  idleNudgeDue,
+  isBackgroundWaitStalled,
+  longWaitDue,
+  parseIdleNudgeMinutes,
+  parseWaitBackstopHours,
+} from '@/lib/turn-end';
+import { NudgeDeduper } from '@/lib/nudge-dedupe';
+import { readWatches } from '@/lib/watch-store';
+import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { enqueueNotice, onInboxHeld, withdrawNotice } from '@/lib/inbox-store';
 import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
@@ -103,6 +118,14 @@ const AGENT_GUARDED_STATES: Set<TCliState> = new Set(['busy', 'idle', 'needs-inp
 const SHELL_TITLE_RE = /^[^|]+\|[^|]+$/;
 
 const PROCESS_RETRY_COUNT = 3;
+/**
+ * A tab announced as closing (`tab-closing`) is retired for this long, or until
+ * its `tab-closed` or `aborted` event: a close reaps within seconds. A closed
+ * tab stays retired this long again, so a poll that read the layout before the
+ * close cannot bring its entry back (L38: a poll 38 s after the close did).
+ */
+const CLOSING_RETIRE_MS = 60_000;
+const CLOSED_RETIRE_MS = 5 * 60_000;
 const JSONL_WATCH_DEBOUNCE_MS = 100;
 // 9.5 s and 12 s: the first polls past READINESS_PROBE_AFTER_MS, counted from
 // the first poll that sees the agent running (~0.7 s), so a tab whose
@@ -129,7 +152,12 @@ export class StatusManager {
   // tool call. Cached with a short TTL and refreshed off the hot path.
   private tabScopeCache = new Map<string, { scope?: string[]; cwd?: string; at: number }>();
   private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean }>();
-  private lastNudgeByTab = new Map<string, { kind: TOrchestrationNudgeKind; at: number }>();
+  /** Identical nudges within 60 s are dropped and counted (L49). */
+  private nudgeDedupe = new NudgeDeduper();
+  /** When each tab's last registered job reported its exit: a sign of life for the stall check. */
+  private jobEventAt = new Map<string, number>();
+  /** Tabs being closed, or just closed, with the time their retirement ends (L38). */
+  private retiredTabs = new Map<string, number>();
   private modelWatch = new AgentModelWatch();
   private automatedPrompts: AutomatedPromptDispatcher;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
@@ -239,6 +267,7 @@ export class StatusManager {
           lastEvent: syntheticLastEvent,
           eventSeq: 0,
         });
+        this.applyRestoredStop(tab, this.tabs.get(tab.id)!);
         this.reconcileJsonlWatch(tab.id, this.tabs.get(tab.id)!);
         if (cliState === 'unknown') {
           this.resolveUnknown(tab.id).catch((err) => log.warn('resolveUnknown failed: %s', err));
@@ -273,6 +302,7 @@ export class StatusManager {
       });
       const { idle, stale, lastAssistantSnippet } = snapshot;
       const liveRegisteredJobs = await this.liveRegisteredJobs(tabId);
+      const armedWatches = await this.armedWatches(entry.workspaceId, tabId);
       // No await past this point: a hook event must not be overwritten.
       if (this.tabs.get(tabId) !== entry || entry.cliState !== 'unknown') return;
       const turnEnd = idle && !stale && lastAssistantSnippet
@@ -281,6 +311,7 @@ export class StatusManager {
             transcript: true,
             openBackgroundTasks: snapshot.openBackgroundTasks ?? 0,
             liveRegisteredJobs,
+            armedWatches,
           })
         : null;
       if (turnEnd?.kind === 'waiting') {
@@ -291,7 +322,7 @@ export class StatusManager {
         const seq = (entry.eventSeq ?? 0) + 1;
         entry.eventSeq = seq;
         entry.lastEvent = { name: 'stop', at, seq };
-        entry.turnEnd = { kind: 'waiting', at, seq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
+        entry.turnEnd = { kind: 'waiting', at, seq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs, armedWatches: turnEnd.armedWatches };
         this.applyCliState(tabId, entry, 'busy', { silent: true });
         this.persistToLayout(entry);
         this.broadcastUpdate(tabId, entry);
@@ -405,6 +436,9 @@ export class StatusManager {
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
     const now = Date.now();
+    for (const [tabId, until] of this.retiredTabs) {
+      if (until <= now) this.retiredTabs.delete(tabId);
+    }
 
     for (const ws of workspaces) {
       const layout = await readLayoutFile(resolveLayoutFile(ws.id));
@@ -432,6 +466,8 @@ export class StatusManager {
         }
         const lifecycleEpoch = trackedLifecycle?.epoch ?? 0;
         knownTabIds.add(tab.id);
+        // Being closed, or closed after this layout was read: its reap is no death (L38).
+        if (this.isRetired(tab.id)) continue;
         const existing = this.tabs.get(tab.id);
         const provider = getProviderByPanelType(tab.panelType);
         const persistedSessionId = provider?.readSessionId(tab) ?? null;
@@ -449,7 +485,7 @@ export class StatusManager {
           existing.permissionRequest = null;
         }
         await this.modelWatch.check(tab, async (detail) => {
-          await this.nudgeLiveness(ws.id, tab.id, tab.name, 'model-drift', detail);
+          await this.nudgeLiveness(ws.id, tab.id, tab.name, 'model-drift', detail, undefined, `model-drift:${detail}`);
           return true;
         }).catch((err) => log.warn(`model policy check failed: ${err instanceof Error ? err.message : err}`));
         if ((this.codexLifecycleEpoch.get(tab.id)?.epoch ?? 0) !== lifecycleEpoch) continue;
@@ -489,6 +525,7 @@ export class StatusManager {
             lastEvent: syntheticLastEvent,
             eventSeq: 0,
           };
+          this.applyRestoredStop(tab, entry);
           this.tabs.set(tab.id, entry);
           this.persistPolledSession(tab.id, tab, provider, detected.jsonlPath);
           this.reconcileJsonlWatch(tab.id, entry);
@@ -577,7 +614,9 @@ export class StatusManager {
             this.broadcastUpdate(tab.id, existing);
             continue;
           }
-          if (!this.stuckNudgedTabs.has(tab.id) && await this.looksStalled(tab.id, existing, now)) {
+          // A registered job that died speaks first: its completion event, not a stall (L49, tab-peo88o).
+          if (!this.stuckNudgedTabs.has(tab.id) && !(await this.reportDeadJobs(tab.id))
+              && await this.looksStalled(tab.id, existing, now)) {
             this.stuckNudgedTabs.add(tab.id);
             this.nudgeOrchestrator(tab.id, existing, 'stuck').catch((err) => {
               log.warn(`stuck nudge failed: ${err instanceof Error ? err.message : err}`);
@@ -634,7 +673,7 @@ export class StatusManager {
       if (!knownTabIds.has(tabId) && this.tabs.has(tabId)) {
         this.stopJsonlWatch(tabId);
         this.tabs.delete(tabId);
-        this.lastNudgeByTab.delete(tabId);
+        this.jobEventAt.delete(tabId);
         this.modelWatch.forget(tabId);
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
@@ -652,6 +691,10 @@ export class StatusManager {
     if (this.pollingTimer && newInterval !== this.currentInterval) {
       this.startPolling();
     }
+
+    await this.runWatchdogTimers(Date.now()).catch((err) => {
+      log.warn(`watchdog timers failed: ${err instanceof Error ? err.message : err}`);
+    });
 
     await this.runOrchestratorKeeper().catch((err) => {
       log.warn(`orchestrator keeper failed: ${err instanceof Error ? err.message : err}`);
@@ -691,10 +734,35 @@ export class StatusManager {
     return entry ? { cliState: entry.cliState, isAgent: isAgentPanelType(entry.panelType) } : null;
   }
 
+  /**
+   * Report the tab's dead registered jobs before its stall is judged. True when
+   * one was reported now or is dead and not yet reportable (its exit file is in
+   * its grace): either way the stall check waits for a later pass.
+   */
+  private async reportDeadJobs(tabId: string): Promise<boolean> {
+    try {
+      const { reported, pendingDead } = await getLivenessManager().reconcileJobs(tabId, (event) => {
+        this.handleLivenessEvent(event).catch((err) => {
+          log.warn(`liveness event handling failed: ${err instanceof Error ? err.message : err}`);
+        });
+      });
+      return reported + pendingDead > 0;
+    } catch (err) {
+      hookLog.debug({ tabId, err: String(err) }, 'registered job reconcile failed');
+      return false;
+    }
+  }
+
   // Milestone watchers are silent during both success-in-progress and total
   // failure; these events are the freshness watcher that tells them apart.
   private async handleLivenessEvent(event: TLivenessEvent): Promise<void> {
     const src = 'probe' in event ? event.probe : event.job;
+    if ('job' in event) this.jobEventAt.set(src.tabId, Date.now());
+    // The close reaps the tab's registered jobs: their exit is the close, not a failure (L38).
+    if (this.isRetired(src.tabId)) {
+      log.info({ tabId: src.tabId, kind: event.kind }, 'liveness event dropped: its tab is being closed');
+      return;
+    }
     const entry = this.tabs.get(src.tabId);
     const tabName = entry?.tabName ?? '';
 
@@ -713,7 +781,10 @@ export class StatusManager {
       detail = `${label}pid ${event.job.pid} exited with ${code}${event.stderrTail ? `; stderr tail:\n${event.stderrTail}` : ''}`;
     }
 
-    const delivered = await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined);
+    const episode = 'job' in event
+      ? `pid:${event.job.pid}`
+      : event.kind === 'stalled' ? `probe:${event.probe.label}:age:${event.ageS}` : `probe:${event.probe.label}:failures:${event.failures}`;
+    const delivered = await this.nudgeLiveness(src.workspaceId, src.tabId, tabName, kind, detail, 'job' in event ? event.job.notify : undefined, episode);
 
     if (event.kind === 'bg-completed') return;
     // A `--notify self` job whose known failure reached the tab that registered it is that tab's to
@@ -798,7 +869,9 @@ export class StatusManager {
     tabName: string,
     kind: TOrchestrationNudgeKind,
     detail: string,
-    notify?: TBackgroundJobNotify,
+    notify: TBackgroundJobNotify | undefined,
+    /** What triggered it (a job's pid, a probe's reading), for the duplicate filter. */
+    episode: string,
   ): Promise<boolean> {
     const now = Date.now();
     // Sources deduplicate their own episodes. Debouncing by tab/kind here
@@ -810,6 +883,7 @@ export class StatusManager {
       ? tabId
       : this.liveReportsTo(tabId, this.tabs.get(tabId))
         ?? (orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId);
+    if (!this.admitNudge(tabId, targetTabId, kind, episode, now)) return true;
     const message = buildNudgeMessage(kind, tabId, tabName, workspaceId, detail);
     const delivered = await this.deliverAutomatedPrompt(workspaceId, targetTabId, message, 'liveness nudge');
 
@@ -966,7 +1040,8 @@ export class StatusManager {
     tabId: string,
     entry: ITabStatusEntry,
     newState: TCliState,
-    opts: { silent?: boolean; nudge?: { kind: TOrchestrationNudgeKind; detail: string } } = {},
+    /** `nudge: null` keeps the human alert and sends the orchestrator nothing (a stop with no end line, L49). */
+    opts: { silent?: boolean; nudge?: { kind: TOrchestrationNudgeKind; detail: string } | null } = {},
   ): void {
     const prevState = entry.cliState;
     if (prevState === newState) {
@@ -1005,7 +1080,7 @@ export class StatusManager {
     if (newState === 'idle' && this.pendingKickoffs.has(tabId)) {
       this.deliverKickoff(tabId);
     }
-    const nudgeKind = nudgeKindForTransition(prevState, newState, !!opts.silent);
+    const nudgeKind = opts.nudge === null ? null : nudgeKindForTransition(prevState, newState, !!opts.silent);
     if (nudgeKind) {
       const nudge = opts.nudge && !opts.silent ? opts.nudge : { kind: nudgeKind, detail: undefined };
       this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail).catch((err) => {
@@ -1101,24 +1176,38 @@ export class StatusManager {
     const entry = this.tabs.get(signal.tabId);
     if (!entry) return;
     const evidence = signal.evidence.length ? ` (${signal.evidence.join(', ')})` : '';
-    this.nudgeOrchestrator(signal.tabId, entry, signal.kind, `${signal.detail}${evidence}`).catch((err) => {
+    // The signal engine keeps its own per-kind cooldown; its fire time is the episode.
+    this.nudgeOrchestrator(signal.tabId, entry, signal.kind, `${signal.detail}${evidence}`, `signal:${signal.at}`).catch((err) => {
       log.warn(`signal nudge failed: ${err instanceof Error ? err.message : err}`);
     });
   }
 
   /** Nudge the tab's target; false when it has none (no reportsTo, no other orchestrator). */
-  private async nudgeOrchestrator(tabId: string, entry: ITabStatusEntry, kind: TOrchestrationNudgeKind, detail?: string): Promise<boolean> {
+  /**
+   * `episode` names what triggered the nudge, for the 60 s duplicate filter
+   * (review r1 finding 3); by default the tab's latest hook event, which every
+   * transition, stop and stuck check follows.
+   */
+  private async nudgeOrchestrator(
+    tabId: string,
+    entry: ITabStatusEntry,
+    kind: TOrchestrationNudgeKind,
+    detail?: string,
+    episode = `seq:${entry.lastEvent?.seq ?? 'none'}`,
+  ): Promise<boolean> {
     if (!isAgentPanelType(entry.panelType)) return false;
+    // A tab being closed raises nothing: the close is deliberate (L38).
+    if (this.isRetired(tabId)) {
+      log.info({ tabId, kind }, 'orchestrator nudge dropped: its tab is being closed');
+      return false;
+    }
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
     if (!ws) return false;
     const targetTabId = this.escalationTarget(tabId, entry, ws);
     if (!targetTabId) return false;
 
     const now = Date.now();
-    const last = this.lastNudgeByTab.get(tabId);
-    if (last && last.kind === kind && now - last.at < NUDGE_DEBOUNCE_MS) return true;
-    this.lastNudgeByTab.set(tabId, { kind, at: now });
-
+    if (!this.admitNudge(tabId, targetTabId, kind, episode, now)) return true;
     const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
     const delivered = await this.deliverAutomatedPrompt(ws.id, targetTabId, message, 'orchestrator nudge');
 
@@ -1139,6 +1228,22 @@ export class StatusManager {
     this.broadcast({ type: 'orchestration:nudge', nudge });
     log.info({ tabId, kind, targetTabId, delivered }, 'orchestrator nudge');
     return true;
+  }
+
+  /**
+   * The one filter both nudge paths share (L49, review r1 finding 3): the same
+   * episode of the same class from the same tab to the same recipient within
+   * 60 s is dropped and counted.
+   */
+  private admitNudge(tabId: string, targetTabId: string, kind: TOrchestrationNudgeKind, episode: string, now: number): boolean {
+    if (this.nudgeDedupe.admit({ sourceTabId: tabId, recipientTabId: targetTabId, kind, episode }, now)) return true;
+    log.info({ tabId, kind, targetTabId, episode, deduplicated: this.nudgeDedupe.dropped }, 'nudge deduplicated: the same episode was nudged within 60 s');
+    return false;
+  }
+
+  /** How many nudges the 60 s duplicate filter dropped since the server started. */
+  getNudgeDedupeCount(): number {
+    return this.nudgeDedupe.dropped;
   }
 
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
@@ -1237,9 +1342,21 @@ export class StatusManager {
    * A tab busy past BUSY_STUCK_MS is stalled when its transcript has been quiet
    * that long — unless it waits on its own background work, which is judged by
    * that work's activity and kind (ADR-0018, L19, L25): the main transcript
-   * alone is silent while a subagent or a gate waiter runs.
+   * alone is silent while a subagent or a gate waiter runs. A live registered
+   * job or an armed watch holds the tab off STALLED altogether (L49), but only
+   * while the tab WAITS on it: its latest event is the stop classified
+   * `waiting`. A tab busy past a newer event is mid-turn, so a job that happens
+   * to be alive says nothing about it; it keeps the staleness rule (review r2
+   * nit 3: an agent hung in a foreground tool next to a live server).
    */
   private async looksStalled(tabId: string, entry: ITabStatusEntry, now: number): Promise<boolean> {
+    const waitingOnStop = entry.turnEnd?.kind === 'waiting' && entry.lastEvent?.name === 'stop'
+      && entry.turnEnd.seq === entry.lastEvent.seq;
+    if (waitingOnStop && holdsOffStall(await this.liveRegisteredJobs(tabId), await this.armedWatches(entry.workspaceId, tabId))) return false;
+    // A job that just reported its exit told its recipient what happened; the
+    // tab gets the no-open window from that report before it can be STALLED.
+    const jobEvent = this.jobEventAt.get(tabId);
+    if (jobEvent !== undefined && now - jobEvent < BUSY_STUCK_MS) return false;
     const handle = this.runtimeHandle(entry);
     const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
     let snapshot: IAgentRuntimeSnapshot | null = null;
@@ -1254,11 +1371,7 @@ export class StatusManager {
         snapshot = null;
       }
     }
-    // A live registered pid is a silent waiter like a background shell: it
-    // gets the shell backstop, and an open subagent's rule outranks it.
-    const liveJobs = await this.liveRegisteredJobs(tabId);
-    const open = snapshot?.openBackgroundTaskKinds ?? { shell: 0, agent: 0, monitor: 0 };
-    const kinds = { ...open, shell: open.shell + liveJobs };
+    const kinds = snapshot?.openBackgroundTaskKinds ?? { shell: 0, agent: 0, monitor: 0 };
     // The stop the tab waits from is itself a sign of life.
     const activityAt = Math.max(
       snapshot?.lastEntryTs ?? -Infinity,
@@ -1289,10 +1402,17 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
 
     const episode = entry.turnError?.class === error.class ? entry.turnError : null;
+    // A stop on a tab already ready-for-review is classified since review r1, so the
+    // same failed turn can arrive twice; only a NEW failed turn is a second failure.
+    if (episode && error.turnId && episode.turnId === error.turnId) {
+      hookLog.debug({ tabId, turnId: error.turnId }, 'repeated stop of the same failed turn: ignored');
+      return;
+    }
+    if (episode) episode.turnId = error.turnId || episode.turnId;
     if (!episode) this.closeTurnErrorEpisode(entry, `episode-closed:${error.class}`);
     if (error.class === 'usage-limit') {
       if (episode) return;
-      entry.turnError = { class: 'usage-limit', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: true };
+      entry.turnError = { class: 'usage-limit', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: true, turnId: error.turnId };
       this.escalateTurnError(tabId, entry, 'usage-limit', error.text || error.code);
       return;
     }
@@ -1304,7 +1424,7 @@ export class StatusManager {
       }
       return;
     }
-    const next: ITurnErrorEpisode = { class: 'api-error', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: false };
+    const next: ITurnErrorEpisode = { class: 'api-error', code: error.code, text: error.text, startedAt: at, resumeItemId: null, escalated: false, turnId: error.turnId };
     entry.turnError = next;
     enqueueNotice({
       kind: 'resume',
@@ -1402,6 +1522,172 @@ export class StatusManager {
       hookLog.debug({ tabId, err: String(err) }, 'registered job read failed');
       return 0;
     }
+  }
+
+  /**
+   * The `purplemux watch` records this tab owns (ADR-0015). A record stays in the
+   * store until its notice is queued, so each one will wake the tab: when its
+   * condition holds, when it fails, or when it expires. An unreadable store
+   * counts none, which errs toward today's nudges rather than silence.
+   */
+  private async armedWatches(workspaceId: string, tabId: string): Promise<number> {
+    try {
+      return (await readWatches()).watches.filter((w) => w.workspaceId === workspaceId && w.tabId === tabId).length;
+    } catch (err) {
+      hookLog.debug({ tabId, err: String(err) }, 'watch store read failed');
+      return 0;
+    }
+  }
+
+  /** Whether the tab is being closed, or was closed less than CLOSED_RETIRE_MS ago (L38). */
+  private isRetired(tabId: string): boolean {
+    const until = this.retiredTabs.get(tabId);
+    return until !== undefined && until > Date.now();
+  }
+
+  /**
+   * `tab-closing`: the close reaps the tab's processes next. Retire its liveness
+   * checks — the poll's agent-process check, the stuck check, registered-job
+   * events — and its pending idle nudge, so the reap raises no INACTIVE and no
+   * job failure (L38). `aborted` restores them; `tab-closed` keeps them retired
+   * a while longer (`removeTab`).
+   */
+  handleTabClosing(tabId: string, phase: 'closing' | 'aborted'): void {
+    if (phase === 'aborted') {
+      this.retiredTabs.delete(tabId);
+      log.info({ tabId }, 'tab close aborted: watchdog checks restored');
+      return;
+    }
+    this.retiredTabs.set(tabId, Date.now() + CLOSING_RETIRE_MS);
+    this.stuckNudgedTabs.delete(tabId);
+    log.info({ tabId }, 'tab closing: watchdog checks retired');
+  }
+
+  /** A fleet-config duration (ADR-0019), read at each pass; the default on any problem. */
+  private async fleetDurationMs(
+    state: Awaited<ReturnType<typeof readFleetConfig>> | null,
+    key: string,
+    parse: (raw: string) => number | null,
+    fallback: number,
+  ): Promise<number> {
+    const raw = state ? valueOf(state, key)?.value ?? null : null;
+    if (raw === null) return fallback;
+    const parsed = parse(raw);
+    if (parsed === null) log.warn({ key, value: raw }, 'fleet config value out of range; the default applies');
+    return parsed ?? fallback;
+  }
+
+  /**
+   * The watchdog's derived timers, run by every poll (review r1 finding 2: one
+   * mechanism, derived from the recorded stop, so a restart neither loses a
+   * pending nudge nor repeats a sent one):
+   * - `idle-no-end-line`: ONE nudge per markerless stop with nothing live, once
+   *   the tab has stayed on that stop for the idle window (L49). Any newer hook
+   *   event that counts (a prompt, a stop, a permission request, a session start)
+   *   moves `lastEvent` on, so the record no longer matches; a Claude
+   *   `idle_prompt` notification does not.
+   * - `long-wait`: ONE nudge per WAITING stretch on a live registered job or an
+   *   armed watch that outlasts the backstop (review r1 finding 4). A new
+   *   classified stop starts a new stretch.
+   */
+  private async runWatchdogTimers(now: number): Promise<void> {
+    let fleet: Awaited<ReturnType<typeof readFleetConfig>> | null = null;
+    try {
+      fleet = await readFleetConfig();
+    } catch (err) {
+      log.warn(`fleet config unreadable; watchdog windows stay at their defaults: ${err instanceof Error ? err.message : err}`);
+    }
+    const idleMs = await this.fleetDurationMs(fleet, IDLE_NUDGE_CONFIG_KEY, parseIdleNudgeMinutes, IDLE_NUDGE_DEFAULT_MS);
+    const waitMs = await this.fleetDurationMs(fleet, WAIT_BACKSTOP_CONFIG_KEY, parseWaitBackstopHours, WAIT_BACKSTOP_DEFAULT_MS);
+    for (const [tabId, entry] of [...this.tabs]) {
+      if (this.isRetired(tabId)) continue;
+      if (idleNudgeDue(entry.turnEnd, entry.lastEvent, entry.cliState, idleMs, now)) {
+        await this.fireIdleNudge(tabId, entry, now);
+      } else if (longWaitDue(entry.turnEnd, entry.lastEvent, entry.cliState, waitMs, now)) {
+        await this.fireLongWait(tabId, entry, now);
+      }
+    }
+  }
+
+  private async fireIdleNudge(tabId: string, entry: ITabStatusEntry, now: number): Promise<void> {
+    const record = entry.turnEnd!;
+    const seq = record.seq!;
+    // Marked before any await: a concurrent pass cannot send it twice.
+    entry.turnEnd = { ...record, idleNudgeSentSeq: seq };
+    this.persistTurnEnd(entry);
+    const jobs = await this.liveRegisteredJobs(tabId);
+    const watches = await this.armedWatches(entry.workspaceId, tabId);
+    if (this.tabs.get(tabId) !== entry || entry.lastEvent?.seq !== seq || this.isRetired(tabId)) return;
+    if (jobs > 0 || watches > 0) {
+      // The tab waits on registered work now; that work reports its own outcome.
+      hookLog.debug({ tabId, jobs, watches }, 'idle nudge skipped: the tab now waits on registered work');
+      return;
+    }
+    // The real time since the stop, which after a restart can exceed the window (review r2 nit 2).
+    const minutes = Math.round(((now - record.at) / 60_000) * 100) / 100;
+    const detail = `${minutes} min ago${record.transcript === false ? ' (its transcript could not be read, so any end line is unknown)' : ''}`;
+    await this.nudgeOrchestrator(tabId, entry, 'idle-no-end-line', detail, `idle:${seq}`);
+  }
+
+  private async fireLongWait(tabId: string, entry: ITabStatusEntry, now: number): Promise<void> {
+    const record = entry.turnEnd!;
+    const seq = record.seq!;
+    entry.turnEnd = { ...record, longWaitSentSeq: seq };
+    let jobs: Array<{ pid: number; label?: string | null }> = [];
+    try {
+      jobs = (await getLivenessManager().statusForTab(tabId)).backgroundJobs.filter((job) => job.alive);
+    } catch {
+      jobs = [];
+    }
+    let watches: Array<{ id: string; target: string; until: string }> = [];
+    try {
+      watches = (await readWatches()).watches.filter((w) => w.workspaceId === entry.workspaceId && w.tabId === tabId);
+    } catch {
+      watches = [];
+    }
+    if (this.tabs.get(tabId) !== entry || entry.lastEvent?.seq !== seq || this.isRetired(tabId)) return;
+    // WAITING on the provider's own tasks alone keeps the 15 / 90 min stall rules instead.
+    if (jobs.length === 0 && watches.length === 0) return;
+    const hours = Math.round(((now - record.at) / 3_600_000) * 10) / 10;
+    const named = [
+      ...jobs.map((job) => `job pid ${job.pid}${job.label ? ` "${job.label}"` : ''}`),
+      ...watches.map((w) => `watch ${w.id} on ${w.target} until ${w.until}`),
+    ].slice(0, 5).join(', ');
+    await this.nudgeOrchestrator(tabId, entry, 'long-wait', `${hours} h on ${named}`, `long-wait:${seq}`);
+  }
+
+  /** The stop record the idle nudge is derived from survives a restart (finding 2). */
+  private persistTurnEnd(entry: ITabStatusEntry): void {
+    const record = entry.turnEnd?.kind === 'ready-for-review'
+      ? { ...entry.turnEnd, agentSessionId: entry.agentSessionId ?? null }
+      : null;
+    updateTabWatchdogTurnEnd(entry.tmuxSession, record).catch((err) => {
+      hookLog.debug({ tmuxSession: entry.tmuxSession, err: String(err) }, 'watchdog turn-end persist failed');
+    });
+  }
+
+  /**
+   * A tab restored at boot from a persisted markerless stop gets that stop back
+   * as its latest event, so the poll's idle check applies to it (finding 2) —
+   * only when the record belongs to the agent session the tab runs now. A
+   * record of another session (the agent was relaunched while the server was
+   * down) is dropped, on disk too, so a stale stop is never nudged (r2 nit 2).
+   */
+  private applyRestoredStop(tab: ITab, entry: ITabStatusEntry): void {
+    const record = tab.watchdogTurnEnd;
+    if (!record) return;
+    const usable = entry.cliState === 'ready-for-review' && record.kind === 'ready-for-review'
+      && Number.isSafeInteger(record.seq) && Number.isFinite(record.at)
+      && (record.agentSessionId ?? null) === (entry.agentSessionId ?? null);
+    if (!usable) {
+      hookLog.debug({ tabId: tab.id, recordSession: record.agentSessionId ?? null, session: entry.agentSessionId ?? null }, 'persisted watchdog stop dropped: not this session\'s latest stop');
+      updateTabWatchdogTurnEnd(tab.sessionName, null).catch(() => {});
+      return;
+    }
+    const seq = record.seq!;
+    entry.turnEnd = { ...record };
+    entry.lastEvent = { name: 'stop', at: record.at, seq };
+    entry.eventSeq = seq;
   }
 
   /**
@@ -1646,6 +1932,10 @@ export class StatusManager {
    */
   private async applyStopTurnEnd(tabId: string, entry: ITabStatusEntry, tmuxSession: string): Promise<void> {
     const stopSeq = entry.lastEvent?.seq;
+    // A stop on a tab already ready-for-review makes no transition, so its end
+    // line is sent here, unless it repeats the line the tab already reported
+    // (a second stop event of the same turn).
+    const previous = entry.turnEnd;
     let snapshot: IAgentRuntimeSnapshot | null = null;
     try {
       if (!this.runtimeHandle(entry)) await this.resolveAndWatchJsonl(tabId, tmuxSession);
@@ -1668,6 +1958,7 @@ export class StatusManager {
       hookLog.debug({ tabId, err: String(err) }, 'turn-end read failed; treating stop as ready');
     }
     const liveRegisteredJobs = await this.liveRegisteredJobs(tabId);
+    const armedWatches = await this.armedWatches(entry.workspaceId, tabId);
 
     const current = this.tabs.get(tabId);
     if (!current || current !== entry) return;
@@ -1680,6 +1971,7 @@ export class StatusManager {
     const turnError = snapshot?.lastTurnError ?? null;
     if (turnError && turnError.class !== 'other') {
       this.applyTurnError(tabId, entry, turnError, stopSeq);
+      this.persistTurnEnd(entry);
       return;
     }
     // A clean stop (or an unclassified error) ends any error episode, and a
@@ -1692,13 +1984,18 @@ export class StatusManager {
       transcript: snapshot !== null && snapshot.transcriptRead !== false,
       openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0,
       liveRegisteredJobs,
+      armedWatches,
     });
     const at = Date.now();
     if (turnEnd.kind === 'waiting') {
-      entry.turnEnd = { kind: 'waiting', at, seq: stopSeq, openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs };
+      entry.turnEnd = {
+        kind: 'waiting', at, seq: stopSeq,
+        openBackgroundTasks: turnEnd.openBackgroundTasks, liveRegisteredJobs: turnEnd.liveRegisteredJobs, armedWatches: turnEnd.armedWatches,
+      };
       hookLog.debug({ tabId, ...entry.turnEnd }, 'stop with open background work: waiting, no nudge');
       if (entry.cliState !== 'busy') this.applyCliState(tabId, entry, 'busy', { silent: true });
       this.persistToLayout(entry);
+      this.persistTurnEnd(entry);
       this.broadcastUpdate(tabId, entry);
       return;
     }
@@ -1709,20 +2006,26 @@ export class StatusManager {
       entry.turnEnd = {
         kind: 'ready-for-review', at, seq: stopSeq, transcript: turnEnd.transcript,
         // null: the background ledger was not read, which differs from "read, nothing open".
-        openBackgroundTasks: snapshot?.openBackgroundTasks ?? null, liveRegisteredJobs,
+        openBackgroundTasks: snapshot?.openBackgroundTasks ?? null, liveRegisteredJobs, armedWatches,
       };
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);
         log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');
       }
     }
+    // Only an end line nudges at once (L49); a stop without one waits out the idle window.
     const nudge = turnEnd.kind === 'turn-marker'
       ? { kind: 'turn-marker' as const, detail: turnEnd.lines.join('\n') }
-      : undefined;
+      : null;
     if (entry.cliState !== 'ready-for-review') {
       this.applyCliState(tabId, entry, 'ready-for-review', { nudge });
       this.persistToLayout(entry);
+    } else if (nudge && !(previous?.kind === 'turn-marker' && previous.marker?.join('\n') === nudge.detail)) {
+      this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail).catch((err) => {
+        log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
+      });
     }
+    this.persistTurnEnd(entry);
     this.broadcastUpdate(tabId, entry);
   }
 
@@ -1788,14 +2091,14 @@ export class StatusManager {
       `processed ${eventName}${notificationType ? `(${notificationType})` : ''} ${prevState}→${newState}`,
     );
 
-    if (prevState !== newState) {
-      if (newState === 'ready-for-review' && eventName === 'stop') {
-        void this.applyStopTurnEnd(tabId, entry, tmuxSession);
-      } else {
-        this.applyCliState(tabId, entry, newState);
-        this.persistToLayout(entry);
-        this.broadcastUpdate(tabId, entry);
-      }
+    if (newState === 'ready-for-review' && eventName === 'stop') {
+      // A stop while already ready-for-review is classified too (review r1
+      // finding 1): its record re-arms the idle nudge from THIS stop.
+      void this.applyStopTurnEnd(tabId, entry, tmuxSession);
+    } else if (prevState !== newState) {
+      this.applyCliState(tabId, entry, newState);
+      this.persistToLayout(entry);
+      this.broadcastUpdate(tabId, entry);
     }
 
     if ((newState === 'busy' || newState === 'needs-input') && !entry.jsonlPath) {
@@ -1973,6 +2276,10 @@ export class StatusManager {
       clearTimeout(compactTimer);
       this.compactStaleTimers.delete(tabId);
     }
+    this.stuckNudgedTabs.delete(tabId);
+    this.jobEventAt.delete(tabId);
+    // A poll that read the layout before the close must not bring the tab back (L38).
+    this.retiredTabs.set(tabId, Date.now() + CLOSED_RETIRE_MS);
     this.tabs.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
     this.processStartCache.delete(tabId);
@@ -2371,6 +2678,7 @@ export const getStatusManager = (): StatusManager => {
     dispatcher.register(createStatusSocketChannel((frame) => manager.broadcast(frame)));
     dispatcher.register(createWebPushChannel());
     registerFcmChannel(dispatcher);
+    onTabClosing(({ tabId, phase }) => manager.handleTabClosing(tabId, phase));
     onTabClosed(({ tabId, workspaceId }) => {
       manager.removeTab(tabId);
       manager.forgetReportsTo(workspaceId, tabId);

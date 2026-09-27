@@ -6,7 +6,7 @@ import { createSession, hasSession, killSession, resolveExistingDir, sendKeys, w
 import { broadcastSync } from '@/lib/sync-server';
 import { isAgentPanelType as isAgentPanel } from '@/lib/agent-panel-types';
 import { createLogger } from '@/lib/logger';
-import { hasKnownTabs, observeLayoutTabs, observeWorkspaceRemoved } from '@/lib/tab-lifecycle';
+import { emitTabClosing, hasKnownTabs, observeLayoutTabs, observeWorkspaceRemoved } from '@/lib/tab-lifecycle';
 import { findTabIdBySession, revokeTabToken } from '@/lib/tab-token';
 import {
   collectPanes,
@@ -384,6 +384,27 @@ export const closeTab = async (
 
   if (!tabInfo) return { ok: false, reap: null };
 
+  // Before the reap: the watchdog retires the tab's liveness checks and pending
+  // nudges, so the processes this close kills never read as a death (L38).
+  const closing = { workspaceId: wsId, tabId, sessionName: tabInfo.sessionName };
+  emitTabClosing({ ...closing, phase: 'closing' });
+  try {
+    const result = await removeClosedTab(wsId, paneId, tabId, tabInfo, opts);
+    if (!result.ok) emitTabClosing({ ...closing, phase: 'aborted' });
+    return result;
+  } catch (err) {
+    emitTabClosing({ ...closing, phase: 'aborted' });
+    throw err;
+  }
+};
+
+const removeClosedTab = async (
+  wsId: string,
+  paneId: string,
+  tabId: string,
+  tabInfo: { sessionName: string; panelType: TPanelType | undefined },
+  opts: { keepProcesses?: boolean },
+): Promise<ICloseTabResult> => {
   const reap = tabInfo.panelType !== 'web-browser'
     ? await killSession(tabInfo.sessionName, { tabId, keepProcesses: opts.keepProcesses })
     : null;
@@ -629,6 +650,19 @@ export const updateTabCliStatus = (
     if (tab.cliState === cliState && tab.dismissedAt === dismissedAt) return false;
     tab.cliState = cliState;
     tab.dismissedAt = dismissedAt;
+    return true;
+  });
+
+/** Persist the watchdog's stop record (or clear it with null); unchanged content is not written. */
+export const updateTabWatchdogTurnEnd = (
+  sessionName: string,
+  record: ITab['watchdogTurnEnd'],
+): Promise<void> =>
+  mutateTab(sessionName, (tab) => {
+    const next = record ?? null;
+    if (JSON.stringify(tab.watchdogTurnEnd ?? null) === JSON.stringify(next)) return false;
+    if (next) tab.watchdogTurnEnd = next;
+    else delete tab.watchdogTurnEnd;
     return true;
   });
 

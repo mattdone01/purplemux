@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   BACKGROUND_EXIT_FILE_GRACE_MS,
   LivenessManager,
+  isPidAliveReal,
+  procStateOf,
+  readProcState,
   parseProbeAge,
   tailLines,
   PROBE_FAILURE_ALERT_THRESHOLD,
@@ -376,5 +379,96 @@ describe('unregistration', () => {
     await h.manager.unregisterProbes('ws-1', 'tab-1', 'a');
     const { probes } = await h.manager.statusForTab('tab-1');
     expect(probes.map((p) => p.label)).toEqual(['b']);
+  });
+});
+
+// Behaviour 6 (orchestrator, 27 Sep ~11:41Z, tab-peo88o): a registered job whose process
+// died must report exactly once, even when nobody saw it die, and before its tab is judged.
+describe('a job that died unseen reports once (behaviour 6)', () => {
+  it('reports a job hydrated from the store whose pid was gone before the first tick, then never again', async () => {
+    const store = await import('@/lib/liveness-store');
+    vi.mocked(store.readAllLiveness).mockResolvedValueOnce({ probes: [], jobs: [job({ pid: 777, exitCodeFile: '/tmp/gate.exit' })] });
+    const h = harness();
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockResolvedValue('0\n');
+
+    await h.tick();
+    await h.tick();
+
+    expect(h.events).toEqual([expect.objectContaining({ kind: 'bg-completed', exitCode: 0, job: expect.objectContaining({ pid: 777 }) })]);
+    expect(store.removeJobs).toHaveBeenCalledWith('ws-1', 'tab-1', 777);
+  });
+
+  it('reports a job whose pid is gone before any watcher looks, with an unknown status when it left no exit file', async () => {
+    const h = harness();
+    h.deps.isPidAlive.mockReturnValue(false);
+    await h.manager.registerJob(job());
+    await h.tick();
+    await h.tick();
+    expect(h.events).toEqual([expect.objectContaining({ kind: 'bg-exited-unknown' })]);
+  });
+
+  it('reconcileJobs reports one tab\'s dead job now, and a tick running beside it adds nothing', async () => {
+    const h = harness();
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    await h.manager.registerJob(job({ tabId: 'tab-2', pid: 5151 }));
+    h.deps.isPidAlive.mockImplementation((pid: number) => pid === 5151);
+    h.deps.readTail.mockResolvedValue('0\n');
+    const seen: TLivenessEvent[] = [];
+
+    const [result] = await Promise.all([h.manager.reconcileJobs('tab-1', (e) => seen.push(e)), h.tick()]);
+
+    expect([...seen, ...h.events]).toEqual([expect.objectContaining({ kind: 'bg-completed', job: expect.objectContaining({ tabId: 'tab-1' }) })]);
+    expect(result.pendingDead).toBe(0);
+    expect(result.reported + h.events.length).toBe(1);
+    // The other tab's live job is untouched.
+    expect((await h.manager.statusForTab('tab-2')).backgroundJobs).toEqual([expect.objectContaining({ pid: 5151, alive: true })]);
+  });
+
+  it('reconcileJobs names a dead job whose exit file is still inside its grace as pending, not reported', async () => {
+    const h = harness();
+    await h.manager.registerJob(job({ exitCodeFile: '/tmp/j.exit' }));
+    h.deps.isPidAlive.mockReturnValue(false);
+    h.deps.readTail.mockResolvedValue(null);
+    const seen: TLivenessEvent[] = [];
+    expect(await h.manager.reconcileJobs('tab-1', (e) => seen.push(e))).toEqual({ reported: 0, pendingDead: 1 });
+    h.setNow(1_000_000 + BACKGROUND_EXIT_FILE_GRACE_MS);
+    expect(await h.manager.reconcileJobs('tab-1', (e) => seen.push(e))).toEqual({ reported: 1, pendingDead: 0 });
+    expect(seen).toEqual([expect.objectContaining({ kind: 'bg-exited-unknown' })]);
+  });
+});
+
+describe('isPidAliveReal: a zombie is an exit (behaviour 6)', () => {
+  it('reads the procfs state: Z and X are exits, a running or sleeping pid is alive, a gone pid is dead', () => {
+    expect(isPidAliveReal(process.pid, () => 'S')).toBe(true);
+    expect(isPidAliveReal(process.pid, () => 'R')).toBe(true);
+    expect(isPidAliveReal(process.pid, () => 'Z')).toBe(false);
+    expect(isPidAliveReal(process.pid, () => 'X')).toBe(false);
+    // No procfs: the kill verdict stands.
+    expect(isPidAliveReal(process.pid, () => null)).toBe(true);
+    expect(isPidAliveReal(2 ** 22 + 12345, () => 'S')).toBe(false);
+  });
+
+  it('parses the state after a command name that holds spaces and parentheses', () => {
+    expect(procStateOf('4242 (gate (r1) wait) Z 1 4242 4242 0 -1')).toBe('Z');
+    expect(procStateOf('4242 (sleep) S 1 4242')).toBe('S');
+    expect(procStateOf('garbage')).toBeNull();
+    expect(procStateOf('4242 (x)')).toBeNull();
+    expect(readProcState(process.pid)).toMatch(/^[RSDTtWXZIKP]$/);
+    expect(readProcState(2 ** 22 + 12345)).toBeNull();
+  });
+
+  it.runIf(process.platform === 'linux')('sees a real unreaped child as dead although kill(pid, 0) still succeeds', async () => {
+    // `sleep 30` becomes the parent of the short sleep and never reaps it: a zombie.
+    const { spawn } = await import('child_process');
+    const parent = spawn('/bin/sh', ['-c', 'sleep 0.2 & echo $!; exec sleep 30'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      const pid = await new Promise<number>((resolve) => parent.stdout!.once('data', (d: Buffer) => resolve(Number(String(d).trim()))));
+      await vi.waitFor(() => expect(readProcState(pid)).toBe('Z'), { timeout: 5000, interval: 50 });
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      expect(isPidAliveReal(pid)).toBe(false);
+    } finally {
+      parent.kill('SIGKILL');
+    }
   });
 });

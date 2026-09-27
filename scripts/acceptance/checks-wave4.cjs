@@ -232,6 +232,8 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
   const orch = await tab(wsB, `acc4-orch-${nonce}`);
   await sleep(1000);
   const on = orch?.tabId ? await inst.cli(['orchestration', 'on', '-w', wsB, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
+  // A stop with no end line nudges only after the idle window (L49); 3 s instead of the 15 min default.
+  await inst.cli(['config', 'set', 'watchdog.idle-nudge-minutes', '0.05']);
   if (!orch?.tabId || on.rc !== 0) {
     for (const id of ids) fail(id, 'story 37 needs an orchestrated workspace B', `orchestration on: ${brief(on)}`, 'exit 0');
     return;
@@ -297,15 +299,17 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
   const shellStopped = shell ? await stopTurn(shell) : false;
   const wokenStopped = woken ? await stopTurn(woken) : false;
   const plainStopped = plain ? await stopTurn(plain) : false;
-  // Order, not a quiet interval: the plain stop, posted AFTER both, must already have its READY nudge.
-  const ready = plainStopped ? await within(30000, async () => (await inst.nudgesFor(wsB, plain.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  // Order, not a quiet interval: the plain stop, posted AFTER both, must already have its idle nudge
+  // (a stop with no end line nudges only after the window, L49).
+  // The status poll derives the idle nudge (every 30–60 s): up to two polls past the 3 s window.
+  const ready = plainStopped ? await within(130000, async () => (await inst.nudgesFor(wsB, plain.tabId)).find((n) => n.kind === 'idle-no-end-line')) : null;
   const plainStatus = plain ? await status(wsB, plain.tabId) : null;
   check(
     'turn-end-served',
     'tab status serves the watchdog\'s classification of the last stop: a plain READY stop read its transcript and found nothing open',
     Boolean(ready && plainStatus?.turnEnd?.kind === 'ready-for-review' && plainStatus.turnEnd.transcript === true && plainStatus.turnEnd.openBackgroundTasks === 0),
-    `ready nudge ${Boolean(ready)}; turnEnd ${JSON.stringify(plainStatus?.turnEnd ?? null)}`,
-    'a ready-for-review nudge; turnEnd { kind: ready-for-review, transcript: true, openBackgroundTasks: 0 }',
+    `idle nudge ${Boolean(ready)}; turnEnd ${JSON.stringify(plainStatus?.turnEnd ?? null)}`,
+    'an idle-no-end-line nudge; turnEnd { kind: ready-for-review, transcript: true, openBackgroundTasks: 0 }',
   );
 
   const judgeWait = async (w, stopped) => {
@@ -323,7 +327,7 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
   if (shell) appendLines(shell, [queuedCompletion(stamp, shellTask, 'Background command "gate wait" completed (exit code 0)')]);
   if (woken) appendLines(woken, [queuedCompletion(stamp, wokenAgent, 'Agent "acc" completed')]);
   const again = async (w) => (w && (await inst.hook('stop', w.sessionName)) === 204
-    ? within(30000, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'ready-for-review'))
+    ? within(130000, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'idle-no-end-line'))
     : null);
   const shellReady = await again(shell);
   const wokenReady = await again(woken);

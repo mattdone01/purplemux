@@ -20,8 +20,11 @@
 // runs the scratch stand-in `claude --resume <uuid>` (how purplemux finds a tab's transcript), a
 // fixture transcript ends the turn, and the Claude hook events (`session-start`, `prompt-submit`,
 // `stop`) are posted to /api/status/hook the way the installed hook script posts them. The real
-// classifier then decides turn-marker, WAITING or READY FOR REVIEW, and `orchestration status`
-// shows the nudge it recorded.
+// classifier then decides turn-marker, WAITING or a stop with no end line, and `orchestration status`
+// shows the nudge it recorded. A stop with no end line sends no immediate nudge (L49): one
+// `idle-no-end-line` nudge follows after the fleet-config window `watchdog.idle-nudge-minutes`,
+// which the run sets to IDLE_WINDOW_MIN so the checks need not wait the 15 min default. The
+// status poll derives that nudge (every 30–60 s), so the checks wait up to IDLE_WAIT_MS for it.
 //
 // Wave 2 (story 22) adds: notes delivered to an empty composer and acked (story 10), fleet config
 // get/set/unset with its authority and the `constructor` key (story 24), tab close reaping only the
@@ -44,6 +47,11 @@ const { wave3 } = require('./checks-wave3.cjs');
 const { wave4 } = require('./checks-wave4.cjs');
 
 const POLL_MS = 200;
+/** The idle window the run sets (fleet config, minutes): 3 s. */
+const IDLE_WINDOW_MIN = '0.05';
+const IDLE_WINDOW_MS = 3000;
+/** The window plus two status polls of the largest interval. */
+const IDLE_WAIT_MS = 130000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -471,12 +479,13 @@ const within = async (ms, probe) => {
   }
 };
 
-/** Story 15 (ADR-0018): turn-end markers, WAITING, and today's READY FOR REVIEW, in workspace B. */
+/** Story 15 (ADR-0018): turn-end markers, WAITING, and the idle nudge of a stop with no end line (L49), in workspace B. */
 const story15 = async (inst, { nonce, wsB, fail, check }) => {
   const orch = parseJson((await inst.cli(['tab', 'create', '-w', wsB, '-n', 'acc-orch', '-t', 'terminal'])).out)?.tabId;
   const on = orch ? await inst.cli(['orchestration', 'on', '-w', wsB, orch]) : { rc: -1, out: '', err: 'no orchestrator tab' };
-  if (!orch || on.rc !== 0) {
-    for (const id of ['turn-marker', 'turn-waiting', 'turn-ready']) fail(id, 'story 15 turn-end classification', `orchestration on: ${brief(on)}`, 'an orchestrator tab in workspace B');
+  const windowSet = await inst.cli(['config', 'set', 'watchdog.idle-nudge-minutes', IDLE_WINDOW_MIN]);
+  if (!orch || on.rc !== 0 || windowSet.rc !== 0) {
+    for (const id of ['turn-marker', 'turn-waiting', 'turn-ready']) fail(id, 'story 15 turn-end classification', `orchestration on: ${brief(on)}; idle window: ${brief(windowSet)}`, 'an orchestrator tab in workspace B and the idle window set');
     return;
   }
   const worker = async (name, transcript) => {
@@ -491,6 +500,7 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
     await inst.hook('session-start', w.sessionName);
     await inst.hook('prompt-submit', w.sessionName);
     const busy = await within(10000, async () => (await inst.cliState(wsB, w.tabId)) === 'busy');
+    w.stoppedAt = Date.now();
     const stopped = await inst.hook('stop', w.sessionName);
     return busy && stopped === 204;
   };
@@ -525,13 +535,14 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
   const registered = w2 ? await inst.cli(['tab', 'bg', 'add', '-w', wsB, w2.tabId, '--pid', String(job.pid), '--label', 'acc-gate']) : { rc: -1, out: '', err: 'no worker' };
   const w2Stopped = w2 && registered.rc === 0 ? await stopTurn(w2) : false;
   const w3Stopped = w3 ? await stopTurn(w3) : false;
-  const ready = w3Stopped ? await within(10000, async () => (await inst.nudgesFor(wsB, w3.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  const ready = w3Stopped ? await within(IDLE_WAIT_MS, async () => (await inst.nudgesFor(wsB, w3.tabId)).find((n) => n.kind === 'idle-no-end-line')) : null;
+  const w3Nudges = w3 ? await inst.nudgesFor(wsB, w3.tabId) : [];
   check(
     'turn-ready',
-    'a stop with no marker and no open work keeps today\'s READY FOR REVIEW nudge',
-    Boolean(ready),
-    ready ? ready.kind : `stop ${w3Stopped ? 'posted' : 'not posted'}, no ready-for-review nudge`,
-    'a ready-for-review nudge',
+    'a stop with no end line and no open work sends no immediate nudge, then ONE idle nudge after the window (L49)',
+    Boolean(ready && ready.at - w3.stoppedAt >= IDLE_WINDOW_MS - 500 && w3Nudges.length === 1 && ready.message.includes('idle without an end line')),
+    ready ? `${w3Nudges.map((n) => n.kind).join(',')}; idle nudge at +${ready.at - w3.stoppedAt} ms after the stop` : `stop ${w3Stopped ? 'posted' : 'not posted'}, no idle-no-end-line nudge`,
+    `only an idle-no-end-line nudge, at least ${IDLE_WINDOW_MS - 500} ms after the stop`,
   );
   const w2State = w2 ? await inst.cliState(wsB, w2.tabId) : null;
   const w2Early = w2 ? await inst.nudgesFor(wsB, w2.tabId) : [];
@@ -540,13 +551,15 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
   const jobEnded = await within(5000, async () => !fs.existsSync(`/proc/${job.pid}`));
   const endedAt = Date.now();
   const w2Again = w2 && jobEnded ? await inst.hook('stop', w2.sessionName) : 0;
-  const woke = w2Again === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, w2.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  // The job's own exit nudge (bg-*) goes out first; the stop after it has no end line and nothing
+  // live, so its only nudge is the idle one after the window.
+  const woke = w2Again === 204 ? await within(IDLE_WAIT_MS, async () => (await inst.nudgesFor(wsB, w2.tabId)).find((n) => n.kind === 'idle-no-end-line')) : null;
   check(
     'turn-waiting',
-    'a stop with no marker and a live registered job is WAITING (busy, no nudge); once the job ends the next stop is READY',
+    'a stop with no marker and a live registered job is WAITING (busy, no nudge); once the job ends the next stop is READY (idle nudge after the window)',
     Boolean(w2Stopped && ready && w2State === 'busy' && w2Early.length === 0 && woke && woke.at >= endedAt),
-    `bg add ${registered.rc}, stop posted ${w2Stopped}, after w3's nudge: cliState ${w2State}, nudges ${w2Early.map((n) => n.kind).join(',') || 'none'}; after the job ended: ${woke ? `ready nudge at +${woke.at - endedAt} ms` : 'no ready nudge'}`,
-    'bg add 0, stop posted, cliState busy, no nudge; then a ready nudge stamped after the job ended',
+    `bg add ${registered.rc}, stop posted ${w2Stopped}, after w3's nudge: cliState ${w2State}, nudges ${w2Early.map((n) => n.kind).join(',') || 'none'}; after the job ended: ${woke ? `idle nudge at +${woke.at - endedAt} ms` : 'no idle nudge'}`,
+    'bg add 0, stop posted, cliState busy, no nudge; then an idle nudge stamped after the job ended',
   );
 };
 
@@ -771,13 +784,13 @@ const compaction = async (inst, { wsB, check, created }) => {
   const after = w ? await inst.nudgesFor(wsB, w.tabId) : [];
   // The same tab still ends its turn normally afterwards: the check is not passing on a dead tab.
   const stopped = w ? await inst.hook('stop', w.sessionName) : 0;
-  const ready = stopped === 204 ? await within(10000, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'ready-for-review')) : null;
+  const ready = stopped === 204 ? await within(IDLE_WAIT_MS, async () => (await inst.nudgesFor(wsB, w.tabId)).find((n) => n.kind === 'idle-no-end-line')) : null;
   check(
     'compaction-no-turn-end',
-    'a SessionStart with source=compact mid-turn leaves the tab busy and sends no nudge; its later stop is READY',
+    'a SessionStart with source=compact mid-turn leaves the tab busy and sends no nudge; its later stop is READY (idle nudge after the window)',
     state === 'busy' && after.length === before && Boolean(ready),
-    `cliState ${state}, nudges ${before} → ${after.length} (${after.map((n) => n.kind).join(',') || 'none'}), later ready ${Boolean(ready)}`,
-    'busy, no new nudge, then a ready-for-review nudge on the stop',
+    `cliState ${state}, nudges ${before} → ${after.length} (${after.map((n) => n.kind).join(',') || 'none'}), later idle nudge ${Boolean(ready)}`,
+    'busy, no new nudge, then an idle-no-end-line nudge after the stop',
   );
   if (w) await inst.cli(['tab', 'close', '-w', wsB, w.tabId]);
 };

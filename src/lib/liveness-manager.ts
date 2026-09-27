@@ -2,6 +2,7 @@
 // background job is dead looks identical to an idle healthy one — these
 // registrations are how the watchdog tells them apart.
 import { execFile } from 'child_process';
+import { readFileSync } from 'fs';
 import fs from 'fs/promises';
 import { createLogger } from '@/lib/logger';
 import {
@@ -213,8 +214,31 @@ export class LivenessManager {
     await this.checkProbes(emit);
   }
 
-  private async checkJobs(emit: (event: TLivenessEvent) => void): Promise<void> {
+  /**
+   * Report one tab's dead jobs now, before anyone judges the tab by them (the
+   * watchdog's stall check). Measured 27 Sep: tab-peo88o's gate job was dead
+   * while the status poll judged the tab, and the job's completion came after
+   * a "possibly stalled" nudge. Returns the jobs still registered and dead: an
+   * exit file inside its grace keeps its job unreported until a later pass.
+   * Safe beside a running tick: each job reports once (the runtime check).
+   */
+  async reconcileJobs(tabId: string, emit: (event: TLivenessEvent) => void): Promise<{ reported: number; pendingDead: number }> {
+    await this.ensureHydrated();
+    let reported = 0;
+    await this.checkJobs((event) => {
+      reported += 1;
+      emit(event);
+    }, tabId);
+    let pendingDead = 0;
+    for (const { job } of this.jobs.values()) {
+      if (job.tabId === tabId && !this.deps.isPidAlive(job.pid)) pendingDead += 1;
+    }
+    return { reported, pendingDead };
+  }
+
+  private async checkJobs(emit: (event: TLivenessEvent) => void, onlyTabId?: string): Promise<void> {
     for (const [key, { job, runtime }] of [...this.jobs]) {
+      if (onlyTabId !== undefined && job.tabId !== onlyTabId) continue;
       if (this.deps.isPidAlive(job.pid)) {
         runtime.deadSince = null;
         continue;
@@ -333,14 +357,41 @@ const runCommandReal = (command: string, cwd: string | undefined, timeoutMs: num
     });
   });
 
-const isPidAliveReal = (pid: number): boolean => {
+/**
+ * The process state letter from `/proc/<pid>/stat` (the field after the
+ * command name, which may itself hold spaces and parentheses), or null when it
+ * cannot be read: no procfs, or the pid is gone.
+ */
+export const procStateOf = (stat: string): string | null => {
+  const close = stat.lastIndexOf(')');
+  if (close === -1) return null;
+  return stat.slice(close + 1).trim().charAt(0) || null;
+};
+
+export const readProcState = (pid: number): string | null => {
+  try {
+    return procStateOf(readFileSync(`/proc/${pid}/stat`, 'utf-8'));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Whether a registered pid is still running. `kill(pid, 0)` also succeeds for a
+ * zombie — a process that exited and was never reaped by its parent — so the
+ * procfs state decides: `Z` (zombie) and `X` (dead) are exits, and the job is
+ * reported instead of holding its tab forever. Without procfs the kill verdict
+ * stands.
+ */
+export const isPidAliveReal = (pid: number, procState: (pid: number) => string | null = readProcState): boolean => {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
     // EPERM means the pid exists but belongs to someone else — still alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
+    if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false;
   }
+  const state = procState(pid);
+  return state !== 'Z' && state !== 'X';
 };
 
 const readTailReal = async (file: string, maxBytes: number): Promise<string | null> => {
@@ -368,7 +419,7 @@ export const getLivenessManager = (): LivenessManager => {
   if (!g.__ptLivenessManager) {
     g.__ptLivenessManager = new LivenessManager({
       runCommand: runCommandReal,
-      isPidAlive: isPidAliveReal,
+      isPidAlive: (pid) => isPidAliveReal(pid),
       readTail: readTailReal,
       resolveCwd: async (workspaceId) => {
         const { getWorkspaceByIdCached } = await import('@/lib/workspace-store');

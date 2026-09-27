@@ -1,11 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { AGENT_STALL_WINDOW_MS, SHELL_STALL_BACKSTOP_MS, classifyTurnEnd, extractTurnMarker, isBackgroundWaitStalled } from '@/lib/turn-end';
+import {
+  AGENT_STALL_WINDOW_MS,
+  IDLE_NUDGE_DEFAULT_MS,
+  SHELL_STALL_BACKSTOP_MS,
+  classifyTurnEnd,
+  extractTurnMarker,
+  holdsOffStall,
+  isBackgroundWaitStalled,
+  parseIdleNudgeMinutes,
+} from '@/lib/turn-end';
 
-const input = (tail: string | null | undefined, open = 0, jobs = 0, transcript = true) => ({
+const input = (tail: string | null | undefined, open = 0, jobs = 0, transcript = true, watches = 0) => ({
   tail,
   transcript,
   openBackgroundTasks: open,
   liveRegisteredJobs: jobs,
+  armedWatches: watches,
 });
 
 describe('extractTurnMarker', () => {
@@ -60,11 +70,19 @@ describe('classifyTurnEnd', () => {
   });
 
   it('is waiting with no marker and an open provider task', () => {
-    expect(classifyTurnEnd(input('Waiting on the gate.', 1))).toEqual({ kind: 'waiting', openBackgroundTasks: 1, liveRegisteredJobs: 0 });
+    expect(classifyTurnEnd(input('Waiting on the gate.', 1))).toEqual({ kind: 'waiting', openBackgroundTasks: 1, liveRegisteredJobs: 0, armedWatches: 0 });
   });
 
   it('is waiting with no marker and a live registered tab bg job', () => {
-    expect(classifyTurnEnd(input('Waiting.', 0, 1))).toEqual({ kind: 'waiting', openBackgroundTasks: 0, liveRegisteredJobs: 1 });
+    expect(classifyTurnEnd(input('Waiting.', 0, 1))).toEqual({ kind: 'waiting', openBackgroundTasks: 0, liveRegisteredJobs: 1, armedWatches: 0 });
+  });
+
+  it('is waiting with no marker and an armed purplemux watch (L49)', () => {
+    expect(classifyTurnEnd(input('Watching the PR.', 0, 0, true, 1))).toEqual({ kind: 'waiting', openBackgroundTasks: 0, liveRegisteredJobs: 0, armedWatches: 1 });
+  });
+
+  it('lets a marker win over an armed watch', () => {
+    expect(classifyTurnEnd(input('DONE: merged', 0, 0, true, 2))).toEqual({ kind: 'turn-marker', lines: ['DONE: merged'] });
   });
 
   it('is ready-for-review with no marker and nothing open', () => {
@@ -105,5 +123,71 @@ describe('isBackgroundWaitStalled (architect ruling C)', () => {
 
   it('treats unknown activity as silence', () => {
     expect(isBackgroundWaitStalled(kinds(0, 1, 0), null, now)).toBe(true);
+  });
+});
+
+describe('idle nudge window (L49)', () => {
+  it('defaults to 15 min', () => {
+    expect(IDLE_NUDGE_DEFAULT_MS).toBe(15 * 60 * 1000);
+  });
+
+  it.each([
+    ['15', 15 * 60 * 1000],
+    ['5', 5 * 60 * 1000],
+    [' 30 ', 30 * 60 * 1000],
+    ['0.05', 3000],
+    ['1440', 1440 * 60 * 1000],
+  ])('reads %j minutes', (raw, ms) => {
+    expect(parseIdleNudgeMinutes(raw)).toBe(ms);
+  });
+
+  it.each([null, undefined, '', '0', '0.0', '-5', '1441', 'abc', '15m', '1e3', 'Infinity', 'NaN'])('refuses %j (the caller keeps the default)', (raw) => {
+    expect(parseIdleNudgeMinutes(raw)).toBeNull();
+  });
+});
+
+describe('holdsOffStall (L49)', () => {
+  it('holds while a registered job lives or a watch is armed, and not otherwise', () => {
+    expect(holdsOffStall(1, 0)).toBe(true);
+    expect(holdsOffStall(0, 1)).toBe(true);
+    expect(holdsOffStall(0, 0)).toBe(false);
+  });
+});
+
+describe('derived watchdog timers (review r1 findings 2 and 4)', () => {
+  const stop = { name: 'stop', seq: 4 };
+  const ready = { kind: 'ready-for-review', at: 1_000, seq: 4 };
+
+  it('idle nudge: due once the window passed on the stop that is still the latest event, and not after it was sent', async () => {
+    const { idleNudgeDue } = await import('@/lib/turn-end');
+    expect(idleNudgeDue(ready, stop, 'ready-for-review', 900, 1_899)).toBe(false);
+    expect(idleNudgeDue(ready, stop, 'ready-for-review', 900, 1_900)).toBe(true);
+    expect(idleNudgeDue({ ...ready, idleNudgeSentSeq: 4 }, stop, 'ready-for-review', 900, 5_000)).toBe(false);
+    expect(idleNudgeDue({ ...ready, idleNudgeSentSeq: 3 }, stop, 'ready-for-review', 900, 5_000)).toBe(true);
+    expect(idleNudgeDue(ready, { name: 'prompt-submit', seq: 5 }, 'busy', 900, 5_000)).toBe(false);
+    expect(idleNudgeDue(ready, { name: 'stop', seq: 5 }, 'ready-for-review', 900, 5_000)).toBe(false);
+    expect(idleNudgeDue(ready, stop, 'idle', 900, 5_000)).toBe(false);
+    expect(idleNudgeDue({ ...ready, kind: 'turn-marker' }, stop, 'ready-for-review', 900, 5_000)).toBe(false);
+    expect(idleNudgeDue(null, stop, 'ready-for-review', 900, 5_000)).toBe(false);
+  });
+
+  it('long wait: due on a WAITING stop past the backstop, once per stop', async () => {
+    const { longWaitDue } = await import('@/lib/turn-end');
+    const waiting = { kind: 'waiting', at: 1_000, seq: 4 };
+    expect(longWaitDue(waiting, stop, 'busy', 900, 1_899)).toBe(false);
+    expect(longWaitDue(waiting, stop, 'busy', 900, 1_900)).toBe(true);
+    expect(longWaitDue({ ...waiting, longWaitSentSeq: 4 }, stop, 'busy', 900, 9_000)).toBe(false);
+    expect(longWaitDue(waiting, { name: 'prompt-submit', seq: 5 }, 'busy', 900, 9_000)).toBe(false);
+  });
+
+  it.each([['4', 4 * 3_600_000], ['0.5', 1_800_000], ['168', 168 * 3_600_000]])('reads %j backstop hours', async (raw, ms) => {
+    const { parseWaitBackstopHours } = await import('@/lib/turn-end');
+    expect(parseWaitBackstopHours(raw)).toBe(ms);
+  });
+
+  it.each([null, '', '0', '169', 'x', '-1'])('refuses %j backstop hours', async (raw) => {
+    const { parseWaitBackstopHours, WAIT_BACKSTOP_DEFAULT_MS } = await import('@/lib/turn-end');
+    expect(parseWaitBackstopHours(raw)).toBeNull();
+    expect(WAIT_BACKSTOP_DEFAULT_MS).toBe(4 * 3_600_000);
   });
 });
