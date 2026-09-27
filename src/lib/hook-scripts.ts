@@ -1,0 +1,232 @@
+import fs from 'fs/promises';
+import path from 'path';
+import { STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
+
+/**
+ * The hook scripts the server installs into `~/.purplemux/`. Pure: no logger,
+ * no server state, so `scripts/install-hook-scripts.ts` can render a release's
+ * scripts before that release's server starts (ADR-0020).
+ */
+
+export const HOOK_SPOOL_DIRNAME = 'hook-spool';
+
+/**
+ * Shared shell functions. `post_hook TARGET BODY [curl options]` POSTs one
+ * event; when no server answers — no port file, a refused or timed-out
+ * connect, or a 5xx — the event goes to `hook-spool/` as one JSON file, written
+ * to a dot-named temporary and renamed, which the next server replays in time
+ * order. A server that answered (2xx-4xx), or a timeout after the connect, is
+ * never spooled: the server may have applied it. Only purplemux sessions
+ * (`pt-*`) spool, because the Codex hook is global and also fires outside
+ * purplemux. Nothing retries: the hook stays one round trip.
+ */
+const SPOOL_FUNCTIONS = `json_escape() {
+  printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
+}
+
+spool_hook() {
+  [ "\${EVENT:-}" = "poll" ] && return 0
+  case "$SESSION" in pt-*) ;; *) return 0 ;; esac
+  SPOOL_DIR="$HOME/.purplemux/${HOOK_SPOOL_DIRNAME}"
+  mkdir -p -m 700 "$SPOOL_DIR" 2>/dev/null || return 0
+  SPOOL_RAND=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \\n')
+  SPOOL_NAME="\${AT}-$$-\${SPOOL_RAND:-0}"
+  SPOOL_TMP="$SPOOL_DIR/.\${SPOOL_NAME}.tmp"
+  if { printf '{"v":1,"at":%s,"session":"%s","query":"%s","body":' "$AT" "$(json_escape "$SESSION")" "$(json_escape "$1")"
+       printf '%s' "\${2:-null}"
+       printf '}\\n'; } > "$SPOOL_TMP" 2>/dev/null; then
+    mv -f "$SPOOL_TMP" "$SPOOL_DIR/\${SPOOL_NAME}.json" 2>/dev/null || rm -f "$SPOOL_TMP"
+  else
+    rm -f "$SPOOL_TMP"
+  fi
+  return 0
+}
+
+post_hook() {
+  HOOK_TARGET="$1"
+  HOOK_BODY="$2"
+  shift 2
+  case "$HOOK_TARGET" in *\\?*) HOOK_QUERY="\${HOOK_TARGET#*\\?}" ;; *) HOOK_QUERY="" ;; esac
+  if [ -z "$PORT" ] || [ -z "$TOKEN" ]; then
+    spool_hook "$HOOK_QUERY" "$HOOK_BODY"
+    return 0
+  fi
+  HOOK_RESULT=$(printf '%s' "$HOOK_BODY" | curl -s -X POST -o /dev/null -w '%{http_code} %{time_connect}' \\
+    --connect-timeout 1 "$@" -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
+    --data-binary @- "http://localhost:\${PORT}\${HOOK_TARGET}" 2>/dev/null)
+  HOOK_RC=$?
+  HOOK_HTTP="\${HOOK_RESULT%% *}"
+  case "$HOOK_RC:$HOOK_HTTP" in
+    7:*|*:5[0-9][0-9]) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;;
+    28:*) case "\${HOOK_RESULT#* }" in *[1-9]*) ;; *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;; esac ;;
+  esac
+  return 0
+}`;
+
+/**
+ * The prologue every script shares. The event time is taken first, so a
+ * spooled event carries when it happened, not when the POST gave up. It is
+ * `%s%N` cut to milliseconds, never `%3N`: uutils `date` (Ubuntu 26.04)
+ * prints `%3N` as untruncated, unpadded nanoseconds. A `date` without `%N`
+ * (BSD) falls back to whole seconds.
+ */
+const PROLOGUE = `PORT_FILE="$HOME/.purplemux/port"
+TOKEN_FILE="$HOME/.purplemux/cli-token"
+AT=$(date +%s%N 2>/dev/null)
+case "$AT" in *[!0-9]*) AT="" ;; esac
+if [ \${#AT} -eq 19 ]; then AT="\${AT%??????}"; else AT=$(( $(date +%s) * 1000 )); fi
+PORT=""
+TOKEN=""
+[ -f "$PORT_FILE" ] && PORT=$(cat "$PORT_FILE")
+[ -f "$TOKEN_FILE" ] && TOKEN=$(cat "$TOKEN_FILE")
+SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""`;
+
+export const HOOK_SCRIPT_CONTENT = `#!/bin/sh
+EVENT="\${1:-poll}"
+${PROLOGUE}
+
+${SPOOL_FUNCTIONS}
+
+# Tool activity feeds the signal engine, not the work-state machine. Forward the
+# raw hook JSON so the server parses it — sed cannot survive a command string
+# containing quotes. Detached, because this fires on every mutating tool call
+# and no edit should wait on the round trip.
+if [ "$EVENT" = "post-tool" ]; then
+  BODY=$(cat)
+  [ -n "$BODY" ] || exit 0
+  post_hook "/api/status/hook?kind=tool&session=\${SESSION}" "$BODY" --max-time 2 >/dev/null 2>&1 &
+  exit 0
+fi
+
+NOTIFICATION_TYPE=""
+if [ "$EVENT" = "notification" ]; then
+  NOTIFICATION_TYPE=$(sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+fi
+
+# SessionStart names why the session (re)started; after an auto-compaction it is
+# "compact", which is not a turn end (L30). Only a plain word is forwarded.
+SOURCE=""
+if [ "$EVENT" = "session-start" ]; then
+  SOURCE=$(sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\\([a-z]*\\)".*/\\1/p' | head -n 1)
+fi
+
+PAYLOAD="{\\"event\\":\\"\${EVENT}\\",\\"session\\":\\"\${SESSION}\\""
+if [ -n "$NOTIFICATION_TYPE" ]; then
+  PAYLOAD="\${PAYLOAD},\\"notificationType\\":\\"\${NOTIFICATION_TYPE}\\""
+fi
+if [ -n "$SOURCE" ]; then
+  PAYLOAD="\${PAYLOAD},\\"source\\":\\"\${SOURCE}\\""
+fi
+PAYLOAD="\${PAYLOAD}}"
+
+post_hook "/api/status/hook" "$PAYLOAD"
+
+# A tab created before tab tokens has no PMUX_TAB_ID (story 36). At a session
+# start, Claude hands this hook a file whose exports reach every later Bash
+# command; ask for the tab's hook-time identity with the pane's own workspace
+# token and the exact pane's session, and write it there. Never verified.
+if [ "$EVENT" = "session-start" ] && [ -n "$PORT" ] && [ -z "\${PMUX_TAB_ID:-}" ] && [ -n "\${PMUX_TOKEN:-}" ] \\
+  && [ -n "\${CLAUDE_ENV_FILE:-}" ] && [ -n "\${TMUX_PANE:-}" ]; then
+  PANE_SESSION=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || PANE_SESSION=""
+  if [ -n "$PANE_SESSION" ]; then
+    IDENT=$(curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H "x-pmux-token: \${PMUX_TOKEN}" \\
+      -d "{\\"session\\":\\"\${PANE_SESSION}\\"}" "http://localhost:\${PORT}/api/cli/tab-identity" 2>/dev/null)
+    ID_TAB=$(printf '%s' "$IDENT" | sed -n 's/.*"tabId"[[:space:]]*:[[:space:]]*"\\([A-Za-z0-9_-]*\\)".*/\\1/p')
+    ID_WS=$(printf '%s' "$IDENT" | sed -n 's/.*"workspaceId"[[:space:]]*:[[:space:]]*"\\([A-Za-z0-9_-]*\\)".*/\\1/p')
+    ID_TOKEN=$(printf '%s' "$IDENT" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([0-9a-f]\\{64\\}\\)".*/\\1/p')
+    if [ -n "$ID_TAB" ] && [ -n "$ID_WS" ] && [ -n "$ID_TOKEN" ]; then
+      # Guarded: a session the server recreates carries its own launch identity, which wins
+      # over a stale env file sourced again on resume.
+      printf '[ -n "\${PMUX_TAB_ID:-}" ] || { export PMUX_TAB_ID=%s; export PMUX_WORKSPACE_ID=%s; export PMUX_TAB_TOKEN=%s; }\\n' "$ID_TAB" "$ID_WS" "$ID_TOKEN" >> "$CLAUDE_ENV_FILE"
+    fi
+  fi
+fi
+exit 0
+`;
+
+export const CODEX_HOOK_SCRIPT_CONTENT = `#!/usr/bin/env bash
+set -u
+${PROLOGUE}
+GENERATION="\${PURPLEMUX_CODEX_GENERATION:-}"
+
+${SPOOL_FUNCTIONS}
+
+BODY=$(cat)
+post_hook "/api/status/hook?provider=codex&tmuxSession=\${SESSION}&generation=\${GENERATION}" "$BODY"
+exit 0
+`;
+
+/**
+ * Grok Build pipes the hook payload as JSON on stdin. The body is forwarded
+ * verbatim and the route reads its camelCase fields — `hookEventName` included,
+ * so the event needs no query parameter of its own.
+ *
+ * The POST is detached and time-boxed: a `Stop` hook runs on the turn's
+ * critical path, `PostToolUse` fires on every mutating tool call, and neither
+ * may wait on the round trip. Always exits 0, because a non-zero exit from a
+ * `Stop` hook would block grok from finishing its turn.
+ */
+export const GROK_HOOK_SCRIPT_CONTENT = `#!/bin/sh
+${PROLOGUE}
+[ -n "$SESSION" ] || exit 0
+
+${SPOOL_FUNCTIONS}
+
+BODY=$(cat)
+[ -z "$BODY" ] && BODY='{}'
+
+post_hook "/api/status/hook?provider=grok&tmuxSession=\${SESSION}" "$BODY" --max-time 2 >/dev/null 2>&1 &
+exit 0
+`;
+
+export interface IHookScriptFile {
+  name: string;
+  content: string;
+  mode: number;
+}
+
+export const HOOK_SCRIPT_FILES: readonly IHookScriptFile[] = [
+  { name: 'status-hook.sh', content: HOOK_SCRIPT_CONTENT, mode: 0o755 },
+  { name: 'statusline.sh', content: STATUSLINE_SCRIPT_CONTENT, mode: 0o755 },
+  { name: 'codex-hook.sh', content: CODEX_HOOK_SCRIPT_CONTENT, mode: 0o700 },
+  { name: 'grok-hook.sh', content: GROK_HOOK_SCRIPT_CONTENT, mode: 0o700 },
+];
+
+/**
+ * Replace a script in one rename. `sh` reads a script as it runs it, so a hook
+ * that starts during a plain rewrite can execute half of the old file and half
+ * of the new one. Returns whether the file changed.
+ */
+export const writeScriptAtomic = async (target: string, content: string, mode: number): Promise<boolean> => {
+  try {
+    if ((await fs.readFile(target, 'utf-8')) === content) return false;
+  } catch {
+    // absent or unreadable: write it
+  }
+  const tmp = `${target}.tmp.${process.pid}`;
+  try {
+    await fs.writeFile(tmp, content, { mode });
+    await fs.chmod(tmp, mode);
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true });
+    throw err;
+  }
+  return true;
+};
+
+export interface IInstalledHookScript {
+  path: string;
+  changed: boolean;
+}
+
+/** Write every hook script into `dir` (`~/.purplemux` on a live install). */
+export const installHookScripts = async (dir: string): Promise<IInstalledHookScript[]> => {
+  await fs.mkdir(dir, { recursive: true });
+  const installed: IInstalledHookScript[] = [];
+  for (const file of HOOK_SCRIPT_FILES) {
+    const target = path.join(dir, file.name);
+    installed.push({ path: target, changed: await writeScriptAtomic(target, file.content, file.mode) });
+  }
+  return installed;
+};

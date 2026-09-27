@@ -11,6 +11,7 @@
 | `~/.purplemux/releases/previous` | symlink to the rollback target |
 | `~/.purplemux/releases/first-install-rollback/` | the drop-in and CLI link target from before the first release install |
 | `~/.purplemux/backups/<stamp>-<sha12>/` | `*.json` stores and `mission-control.sqlite`, newest 5 |
+| `~/.purplemux/hook-spool/` | hook events no server answered, replayed by the next server ([ADR-0020](adr/0020-hook-spool-across-restarts.md)) |
 | `~/.purplemux/logs/deploy-live-<stamp>-<sha12>.log` | build output |
 | `~/.config/systemd/user/purplemux.service.d/50-mission-control.conf` | runs `releases/current` after the first install |
 | `~/.local/bin/purplemux` | symlink to `releases/current/bin/purplemux.js` |
@@ -27,7 +28,7 @@ Options:
 
 | Option | Effect |
 |---|---|
-| `--dry-run` | build, run the acceptance gate and report the quiet state; no backup, no swap, no restart |
+| `--dry-run` | build, run the acceptance gate, render the release's hook scripts into a scratch directory and report the quiet state; no backup, no hook install, no swap, no restart |
 | `--quiet-timeout SECONDS` | bound of the quiet wait (default 900) |
 | `--force-after-timeout` | deploy even if tabs are still mid-turn at the timeout |
 | `--ignore-tab WS/TAB` | exclude one more tab from the quiet wait (repeatable) |
@@ -46,12 +47,12 @@ The tab in `PMUX_TAB_ID` is always excluded from the quiet wait. A tab created b
 | Exit | Meaning | Live service |
 |---|---|---|
 | 0 | deployed, rolled back on demand, or dry run | new release (or unchanged on dry run) |
-| 1 | lease probe or acquire failed, announce failed, backup failed, tmux sessions unreadable | unchanged |
-| 2 | refused: usage, ref, disk, build, own tab unknown, drop-in drift or rewrite, half-finished first install, rollback target missing or unbuilt | unchanged |
+| 1 | lease probe or acquire failed, announce failed, backup failed, hook pre-install failed, tmux sessions unreadable | unchanged (the hook scripts may already be the release's; they work with the old server) |
+| 2 | refused: usage, ref, disk, build, acceptance, hook installer missing or dry-run render failed, own tab unknown, drop-in drift or rewrite, half-finished first install, rollback target missing or unbuilt | unchanged |
 | 3 | quiet timeout, deploy lease held, another deploy running | unchanged |
 | 4 | restart, `daemon-reload` or health gate failed; the previous release was restored (`VERDICT=rolled-back`); the automatic rollback failed too (`VERDICT=rollback-failed`, read `ROLLBACK_HEALTH=` and the journal); or an on-demand rollback failed its gate (`VERDICT=rollback-unhealthy`) | previous release, or check by hand on `rollback-failed` / `rollback-unhealthy` |
 
-The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `ACCEPTANCE=`, `ANNOUNCED=<delivered>/<recipients>` (`-` without `--announce`; `unavailable (…)` against a server that predates it), `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
+The last lines are one summary block: `RELEASE=`, `PREVIOUS=`, `SESSIONS=kept/before`, `HEALTH=`, `ROLLBACK_HEALTH=` (after a rollback), `QUIET=`, `LEASE=`, `BACKUP=`, `ACCEPTANCE=`, `ANNOUNCED=<delivered>/<recipients>` (`-` without `--announce`; `unavailable (…)` against a server that predates it), `HOOKS=` (`pre-installed 4 scripts (N changed) from …`, `dry run: the release rendered …`, or `skipped (…)` on a rollback to a release without the installer), `INTERRUPTED=` (when a signal arrived in the swap window), `VERDICT=`.
 
 ## Acceptance gate
 
@@ -96,6 +97,27 @@ and each prints `PASS`/`FAIL` with what it measured and expected:
 Run it by hand against any built checkout:
 `scripts/acceptance/run.sh --candidate <dir> [--log FILE] [--bash-guard PATH] [--keep]`.
 
+## Hook scripts before the restart
+
+From the stop to the new server's start no server answers a hook, and the old scripts dropped
+every event of that window: a turn that ended then left its tab `busy` and its orchestrator
+unnudged. After the quiet wait and the backup, and before the swap, the script runs the release's
+own `scripts/install-hook-scripts.sh --dir ~/.purplemux`. It renders `status-hook.sh`,
+`statusline.sh`, `codex-hook.sh` and `grok-hook.sh` from the release's templates and replaces each
+in one rename. Those scripts POST exactly as before, so the old server keeps answering them until it
+stops. When no server answers, they write the event to `~/.purplemux/hook-spool/`, and the new
+server replays the spool, in time order, at boot and on every poll (ADR-0020).
+
+- A forward deploy of a release without the installer refuses before the lease: `HOOK-INSTALL-MISSING`, exit 2.
+- A failed pre-install refuses before the swap: `HOOK-PREINSTALL-FAILED`, exit 1.
+- `--dry-run` runs the installer into a scratch directory and reports it in `HOOKS=`; `~/.purplemux` is untouched. A render failure refuses (`HOOK-RENDER-FAILED`).
+- `--rollback` runs the target's installer when it has one; otherwise `HOOKS=skipped (…)`, and the target's server writes its own scripts when it starts.
+- `DEPLOY_HOOK_INSTALL` overrides the installer path (tests).
+
+Check the spool after a deploy: `ls ~/.purplemux/hook-spool/` is empty once the new server has
+polled; `hook-spool/bad/` holds any file that could not be replayed, and the `hook-spool` log group
+names each one.
+
 ## Health gate
 
 Within 90 s after the restart, all of these must hold:
@@ -132,4 +154,4 @@ Each successful deploy keeps `current` and `previous` and removes other release 
 
 ## Testing
 
-`tests/unit/scripts/deploy-live.test.ts` runs the script against fake `systemctl`, `pnpm`, `curl`, `tmux`, `purplemux` and `journalctl` binaries (`DEPLOY_*` overrides), a temporary `HOME` and a real git repository. It never reaches the live service.
+`tests/unit/scripts/deploy-live.test.ts` runs the script against fake `systemctl`, `pnpm`, `curl`, `tmux`, `purplemux`, `journalctl`, acceptance and hook-installer binaries (`DEPLOY_*` overrides), a temporary `HOME` and a real git repository. It never reaches the live service.

@@ -14,7 +14,8 @@
 # leases → with --announce N, tell every enabled orchestrator and tab-bound lease
 # holder through the inbox and wait until each notice is delivered or held (at
 # most N minutes; story 13) → wait until no agent tab is mid-turn (the tab in PMUX_TAB_ID and every
-# --ignore-tab are excluded) → back up ~/.purplemux state → point `current` at
+# --ignore-tab are excluded) → back up ~/.purplemux state → pre-install the release's hook scripts
+# (they spool the events that fire while no server answers; ADR-0020) → point `current` at
 # the release, `previous` at the old one → restart → health gate → rollback on
 # failure. The script never types into a tab.
 #
@@ -39,6 +40,7 @@
 # DEPLOY_ANNOUNCE_WAIT_S (the --announce minutes in seconds).
 # Acceptance: DEPLOY_ACCEPTANCE (default <release>/scripts/acceptance/run.sh),
 # DEPLOY_BASH_GUARD (a bash-guard.py the gate also exercises; optional).
+# Hook scripts: DEPLOY_HOOK_INSTALL (default <release>/scripts/install-hook-scripts.sh).
 
 set -u
 set -o pipefail
@@ -122,6 +124,7 @@ S_LEASE="-"
 S_BACKUP="-"
 S_ACCEPTANCE="-"
 S_ANNOUNCED="-"
+S_HOOKS="-"
 
 purplemux_cli() {
   if [[ -n "${DEPLOY_PURPLEMUX:-}" ]]; then
@@ -195,6 +198,7 @@ finish() {
   echo "BACKUP=$S_BACKUP"
   echo "ACCEPTANCE=$S_ACCEPTANCE"
   echo "ANNOUNCED=$S_ANNOUNCED"
+  echo "HOOKS=$S_HOOKS"
   ((INTERRUPTED)) && echo "INTERRUPTED=deferred until the swap window closed"
   echo "VERDICT=$verdict"
   rm -rf "$WORK"
@@ -379,6 +383,33 @@ else
   S_ACCEPTANCE="skipped (rollback)"
 fi
 
+# ---- hook scripts (ADR-0020): the release renders its own, checked before the live service is touched ----
+# A forward deploy needs the installer: without it the restart gap drops hook events again. A
+# rollback target older than ADR-0020 has none, and a rollback never depends on a feature of the
+# release it escapes; its server writes its own scripts when it starts.
+
+if ((ROLLBACK)); then
+  HOOK_INSTALL="${DEPLOY_HOOK_INSTALL:-$prev/scripts/install-hook-scripts.sh}"
+  [[ -x "$HOOK_INSTALL" ]] || { HOOK_INSTALL=""; S_HOOKS="skipped (rollback target has no scripts/install-hook-scripts.sh)"; }
+else
+  HOOK_INSTALL="${DEPLOY_HOOK_INSTALL:-$RELEASE_DIR/scripts/install-hook-scripts.sh}"
+  [[ -x "$HOOK_INSTALL" ]] || refuse 2 HOOK-INSTALL-MISSING "no executable $HOOK_INSTALL" \
+    "the release's scripts/install-hook-scripts.sh (ADR-0020); the live service is untouched"
+fi
+
+# install_hooks DIR: the release's installer writes its scripts into DIR; HOOKS_RESULT says what it did.
+install_hooks() {
+  local dir="$1" wrote same
+  # 9>&- and the saved stdout closed, as for the acceptance gate: the installer holds neither.
+  if ! "$HOOK_INSTALL" --dir "$dir" >"$WORK/hooks.out" 2>&1 9>&- {SUMMARY_FD}>&-; then
+    HOOKS_ERROR="$HOOK_INSTALL --dir $dir failed: $(tail -n 5 "$WORK/hooks.out" | tr '\n' ' ')"
+    return 1
+  fi
+  wrote="$(grep -c '^WROTE ' "$WORK/hooks.out")"
+  same="$(grep -c '^SAME ' "$WORK/hooks.out")"
+  HOOKS_RESULT="$((wrote + same)) scripts ($wrote changed)"
+}
+
 # ---- lease ----
 
 # The lease outlives the announce wait and the quiet wait together (capped at the deploy kind's 2 h).
@@ -509,6 +540,13 @@ if ((DRY_RUN)); then
     S_QUIET="unknown ($LIST_ERROR)"
   fi
   S_BACKUP="skipped (dry run)"
+  # The step a deploy runs before the restart, rendered into a scratch directory instead.
+  if install_hooks "$WORK/hooks-preview"; then
+    S_HOOKS="dry run: the release rendered $HOOKS_RESULT into a scratch directory; $PMUX_HOME untouched"
+  else
+    S_HOOKS="dry run: render failed"
+    refuse 2 HOOK-RENDER-FAILED "$HOOKS_ERROR" "the release renders its hook scripts; the live service is untouched"
+  fi
   finish 0 "dry-run"
 fi
 
@@ -569,6 +607,24 @@ backup_state() {
 
 backup_state "${SHORT:-rollback}" || refuse 1 BACKUP-FAILED "backup into $BACKUPS failed" \
   "a copy of $PMUX_HOME/*.json and mission-control.sqlite before the restart"
+
+# ---- pre-install the release's hook scripts (ADR-0020) ----
+# From the stop to the new server's start no server answers a hook. The release's scripts spool
+# such an event into $PMUX_HOME/hook-spool/ and its server replays the spool at boot. Until the
+# restart the old server keeps answering them exactly as before: the POST is unchanged, and it
+# never reads the spool. Each script is replaced in one rename.
+
+if [[ -n "$HOOK_INSTALL" ]]; then
+  if install_hooks "$PMUX_HOME"; then
+    S_HOOKS="pre-installed $HOOKS_RESULT from $HOOK_INSTALL"
+  elif ((ROLLBACK)); then
+    S_HOOKS="failed ($HOOKS_ERROR); rollback proceeds"
+  else
+    S_HOOKS="failed ($HOOKS_ERROR)"
+    refuse 1 HOOK-PREINSTALL-FAILED "$HOOKS_ERROR" \
+      "the release's hook scripts in $PMUX_HOME before the restart, so the restart drops no hook event"
+  fi
+fi
 
 # ---- swap, restart, health gate ----
 

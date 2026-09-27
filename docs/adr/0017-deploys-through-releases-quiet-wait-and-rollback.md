@@ -45,3 +45,10 @@ worker tab, so a defect found on a throwaway instance costs nothing that a defec
 - `deploy-live.sh --announce N` announces after the deploy lease and before the quiet wait, waits until each notice is settled (delivered, held, dropped or pruned) or N minutes pass, and prints `ANNOUNCED=<delivered>/<recipients>`. A server that predates the command does not block the deploy; any other announce failure refuses with exit 1 before the restart. New CLI code: `deploy-invalid` (exit 2).
 - Review round 1: the announce holds the announcements lock across read, enqueue and write, so a malformed store refuses before any notice goes out, and a failed enqueue or write takes back the notices already queued. `deploy withdraw ID` (announcer authority) takes back the notices still waiting; `deploy-live.sh` calls it whatever its verdict, and leaves every `--ignore-tab` out of the announce.
 - Final confirmation: an interrupt or a client failure during the announce call can leave the server's notices with no withdraw. `deploy-live.sh` now closes the announcement from the id in `announce.json` when the call never returned, and prints its summary to the stdout saved at start (a trap inside the redirected call wrote it into `announce.json`). The server-side backstop: every deploy notice carries `staleAt = restartAt + 30 min`, and the inbox drops a queued or held item past its `staleAt` (`stale`) instead of typing it.
+
+## Amendment (ADR-0020, 2026-09-27): hook scripts before the restart
+After the backup (step 5) and before the swap (step 6), the script runs the release's own
+`scripts/install-hook-scripts.sh --dir ~/.purplemux`, so the hooks that fire while no server
+answers spool their events for the new server to replay. A forward deploy without the installer
+refuses with exit 2 before the lease; a failed pre-install refuses with exit 1 before the swap; a
+dry run renders into a scratch directory and reports `HOOKS=`.

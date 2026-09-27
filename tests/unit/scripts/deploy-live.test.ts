@@ -28,6 +28,7 @@ if [[ " $* " == *" restart "* ]]; then
   [[ -e "$FAKE_STATE/term-on-restart.$n" ]] && kill -TERM "$PPID"
   [[ -e "$FAKE_STATE/restart-fail.$n" ]] && exit 1
   [[ -e "$FAKE_STATE/restart-noop.$n" ]] && exit 0
+  echo "restart $n" >> "$FAKE_STATE/order.log"
   pid=$((1000 + n))
   echo "$pid" > "$FAKE_STATE/mainpid"
   wd=$(sed -n 's/^WorkingDirectory=//p' "$HOME/.config/systemd/user/purplemux.service.d/50-mission-control.conf" | tail -n 1)
@@ -124,6 +125,21 @@ if [[ -e "$FAKE_STATE/acceptance-fail" ]]; then
 fi
 printf 'ACCEPTANCE=PASS checks=20 passed=20 failed=0 skipped=0\n' > "$log"
 exit 0
+`,
+  // The release's scripts/install-hook-scripts.sh: writes four scripts into --dir and prints a
+  // WROTE line for each, or fails when asked to (ADR-0020).
+  'hook-install': `#!/usr/bin/env bash
+dir=""
+while (($#)); do case "$1" in --dir) dir="$2"; shift 2 ;; *) shift ;; esac; done
+fd9=closed; [[ -e /proc/$$/fd/9 ]] && fd9=open
+echo "hook-install $dir" >> "$FAKE_STATE/order.log"
+echo "$dir | restarts=$(cat "$FAKE_STATE/restarts" 2>/dev/null || echo 0) fd9=$fd9" >> "$FAKE_STATE/hook-install.log"
+[[ -e "$FAKE_STATE/hook-install-fail" ]] && { echo "render exploded" >&2; exit 1; }
+mkdir -p "$dir"
+for name in status-hook.sh statusline.sh codex-hook.sh grok-hook.sh; do
+  echo "# release $name" > "$dir/$name"
+  echo "WROTE $dir/$name"
+done
 `,
 };
 
@@ -241,6 +257,7 @@ const makeHarness = (options: { homeViaSymlink?: boolean } = {}): IHarness => {
       DEPLOY_PURPLEMUX: path.join(bin, 'purplemux'),
       DEPLOY_JOURNALCTL: path.join(bin, 'journalctl'),
       DEPLOY_ACCEPTANCE: path.join(bin, 'acceptance'),
+      DEPLOY_HOOK_INSTALL: path.join(bin, 'hook-install'),
       DEPLOY_SQLITE_MODULE: SQLITE_MODULE,
       DEPLOY_PROC_ROOT: proc,
       DEPLOY_POLL_S: '0.05',
@@ -995,6 +1012,72 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     const { status, out } = h.run([h.sha(), '--dry-run']);
     expect(status, out).toBe(2);
     expect(field(out, 'VERDICT')).toBe('refused (ACCEPTANCE-FAILED)');
+  });
+
+  describe('hook script pre-install (ADR-0020)', () => {
+    const pmux = () => path.join(h.home, '.purplemux');
+
+    it('writes the release\'s hook scripts into ~/.purplemux after the quiet wait and before the restart', () => {
+      const { status, out } = h.run([h.sha()]);
+      expect(status, out).toBe(0);
+      const order = h.log('order').split('\n').filter(Boolean);
+      const install = order.indexOf(`hook-install ${pmux()}`);
+      const lastQuietPoll = order.map((line, i) => (line.endsWith('/api/cli/tabs') ? i : -1)).filter((i) => i >= 0 && i < install).pop();
+      expect(install, order.join('\n')).toBeGreaterThan(-1);
+      expect(lastQuietPoll).toBeDefined();
+      expect(order.indexOf('restart 1')).toBeGreaterThan(install);
+      expect(h.log('hook-install')).toBe(`${pmux()} | restarts=0 fd9=closed\n`);
+      expect(fs.readFileSync(path.join(pmux(), 'status-hook.sh'), 'utf-8')).toBe('# release status-hook.sh\n');
+      expect(field(out, 'HOOKS')).toBe(`pre-installed 4 scripts (4 changed) from ${h.env.DEPLOY_HOOK_INSTALL}`);
+    });
+
+    it('a failed pre-install refuses with exit 1 before the swap or any restart, and releases the lease', () => {
+      h.flag('hook-install-fail');
+      const { status, out } = h.run([h.sha()]);
+      expect(status, out).toBe(1);
+      expect(out).toContain('REFUSED HOOK-PREINSTALL-FAILED');
+      expect(out).toContain('render exploded');
+      expect(field(out, 'VERDICT')).toBe('refused (HOOK-PREINSTALL-FAILED)');
+      expect(field(out, 'LEASE')).toBe('acquired, released');
+      expect(restarts(h)).toBe(0);
+      expect(link(path.join(h.releases, 'current'))).toBeNull();
+    });
+
+    it('refuses a release without scripts/install-hook-scripts.sh before the lease or the quiet wait', () => {
+      const { status, out } = h.run([h.sha()], { DEPLOY_HOOK_INSTALL: undefined });
+      expect(status, out).toBe(2);
+      expect(out).toContain('REFUSED HOOK-INSTALL-MISSING');
+      expect(out).toContain('/scripts/install-hook-scripts.sh');
+      expect(h.log('purplemux')).not.toContain('lease acquire');
+      expect(h.log('curl')).not.toContain('api/cli/tabs');
+      expect(restarts(h)).toBe(0);
+    });
+
+    it('--dry-run renders the scripts into a scratch directory, reports it, and leaves ~/.purplemux alone', () => {
+      const { status, out } = h.run([h.sha(), '--dry-run']);
+      expect(status, out).toBe(0);
+      expect(field(out, 'VERDICT')).toBe('dry-run');
+      expect(field(out, 'HOOKS')).toBe(`dry run: the release rendered 4 scripts (4 changed) into a scratch directory; ${pmux()} untouched`);
+      expect(h.log('hook-install')).not.toContain(`${pmux()} |`);
+      expect(fs.existsSync(path.join(pmux(), 'status-hook.sh'))).toBe(false);
+      expect(restarts(h)).toBe(0);
+    });
+
+    it('a dry run whose render fails is refused', () => {
+      h.flag('hook-install-fail');
+      const { status, out } = h.run([h.sha(), '--dry-run']);
+      expect(status, out).toBe(2);
+      expect(field(out, 'VERDICT')).toBe('refused (HOOK-RENDER-FAILED)');
+    });
+
+    it('--rollback to a release without the installer skips the step and still rolls back', () => {
+      expect(h.run([h.sha()]).status).toBe(0);
+      expect(h.run([h.commit('second')]).status).toBe(0);
+      const { status, out } = h.run(['--rollback'], { DEPLOY_HOOK_INSTALL: undefined });
+      expect(status, out).toBe(0);
+      expect(field(out, 'VERDICT')).toBe('rolled-back');
+      expect(field(out, 'HOOKS')).toBe('skipped (rollback target has no scripts/install-hook-scripts.sh)');
+    });
   });
 
   it('prints usage and exits 2 on unknown options', () => {

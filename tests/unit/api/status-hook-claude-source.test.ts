@@ -31,11 +31,11 @@ describe('POST /api/status/hook (Claude): SessionStart source (L30)', () => {
 
   it('passes a known source through to the status manager', async () => {
     await post({ event: 'session-start', session: 'pt-ws-1-pane-a-tab-w', source: 'compact' });
-    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('claude', 'pt-ws-1-pane-a-tab-w', { kind: 'session-start', source: 'compact' });
+    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('claude', 'pt-ws-1-pane-a-tab-w', { kind: 'session-start', source: 'compact' }, undefined);
   });
 
   it('drops an unknown source and keeps the event', async () => {
     await post({ event: 'session-start', session: 'pt-ws-1-pane-a-tab-w', source: 'weird' });
-    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('claude', 'pt-ws-1-pane-a-tab-w', { kind: 'session-start' });
+    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('claude', 'pt-ws-1-pane-a-tab-w', { kind: 'session-start' }, undefined);
   });
 });

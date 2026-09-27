@@ -33,6 +33,9 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
+├── hook-spool/              # hook events no server answered (0700; ADR-0020)
+│   ├── {epochMs}-{pid}-{rand}.json
+│   └── bad/                 # spool files that could not be replayed
 ├── pmux.lock                # single-instance lock {pid, port, startedAt}
 ├── logs/                    # pino-roll log files
 │   └── purplemux.YYYY-MM-DD.N.log
@@ -110,11 +113,13 @@ See [STATUS.md](./STATUS.md) for the full status-detection flow.
 
 ### `status-hook.sh`, `codex-hook.sh`, `grok-hook.sh`, `statusline.sh`
 
-Auto-generated from `HOOK_SCRIPT_CONTENT`, `CODEX_HOOK_SCRIPT_CONTENT` and `GROK_HOOK_SCRIPT_CONTENT` (`hook-settings.ts`) and `STATUSLINE_SCRIPT_CONTENT` (`statusline-script.ts`). All of them:
+Auto-generated from `HOOK_SCRIPT_CONTENT`, `CODEX_HOOK_SCRIPT_CONTENT` and `GROK_HOOK_SCRIPT_CONTENT` (`hook-scripts.ts`) and `STATUSLINE_SCRIPT_CONTENT` (`statusline-script.ts`), each replaced in one rename. All of them:
 
 1. Read `port` and `cli-token` from `~/.purplemux/`
 2. `POST` to the local server with `x-pmux-token` header
-3. Fail silently if the server is down
+3. Exit 0 whatever the answer
+
+When no server answers (no port or token file, a refused or never-finished connect, or a 5xx), the three hook scripts write the event to `hook-spool/` instead of dropping it; `statusline.sh` does not. The next server replays the spool in time order at boot and on every poll. Contract: [ADR-0020](adr/0020-hook-spool-across-restarts.md). `scripts/install-hook-scripts.sh` renders the four scripts from a checkout's own templates (`deploy-live.sh` runs it before a restart).
 
 `grok-hook.sh` reads Grok Build's payload from **stdin** (grok pipes the event JSON to the hook process; the keys are camelCase and the `hookEventName` VALUE is snake_case), forwards it verbatim, and also passes `GROK_HOOK_EVENT` — which grok injects into every hook process — as a query parameter so an empty stdin still reports. It time-boxes the request with `curl --max-time 2`, backgrounds it, and always exits 0: `Stop` runs on the turn's critical path and a non-zero exit there would block grok from finishing.
 

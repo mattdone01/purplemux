@@ -220,11 +220,12 @@ The hook script parses `notification_type` from the stdin JSON and includes it i
 
 ### Hook Script
 
-`~/.purplemux/status-hook.sh` is generated from `HOOK_SCRIPT_CONTENT` in `hook-settings.ts`. Core behavior:
+`~/.purplemux/status-hook.sh` is generated from `HOOK_SCRIPT_CONTENT` in `hook-scripts.ts`. Core behavior:
 
 - Looks up the session name with `tmux display-message` (so the server knows which tab)
 - If `event === 'notification'`, parses `notification_type` from stdin JSON and includes it in the payload
 - POSTs `{ event, session, notificationType?, source? }` to `/api/status/hook` via `curl` (`source` is SessionStart's, a plain word only)
+- When no server answers, writes the event to `~/.purplemux/hook-spool/` with the time the hook fired (see "Hook Spool" below)
 
 ### Synthetic Interrupt Event
 
@@ -343,6 +344,28 @@ user selection
 notification  → lastEvent{name:'notification', seq:3}  → needs-input (same cliState, seq++)
 stop          → lastEvent{name:'stop', seq:4}          → ready-for-review
 ```
+
+### Hook Spool (ADR-0020)
+
+The route's handler is `dispatchHook` (`src/lib/hook-dispatch.ts`). A live POST calls it without
+`replayedAt`; `drainHookSpool` (`src/lib/hook-spool.ts`) calls it with each spooled event's time.
+`StatusManager` drains the spool at boot (after `scanAll`, before `startPolling`), at the start of
+every `poll()`, and once after the server writes its port file. Files apply oldest first and are
+deleted when applied; unreadable ones move to `hook-spool/bad/`.
+
+`replayedAt` threads through `handleProviderEvent`, `updateTabFromHook` and `applyAgentHookMeta`:
+
+- `hookAppliedAt` holds each tab's latest applied hook event time (live: receipt time; replayed:
+  `at`; a restored watchdog stop: its `at`).
+- A replayed event older than it, or older than `HOOK_REPLAY_WINDOW_MS` (1 h; `hookAppliedAt` is
+  not persisted, so an older file cannot be ordered against events an earlier server received), is
+  recorded in `getHookHistory(tabId)` with `stale: true` and changes nothing: no `lastEvent`, no
+  `cliState`, no metadata, no broadcast.
+- Otherwise it applies like a live event, dated at `at`: `lastEvent.at`, `lastResumeOrStartedAt`,
+  `compactingSince`, and a stop's `turnEnd.at`, so the turn end is classified and nudged as it
+  would have been and the idle clock counts from the real stop.
+- Tool activity replays into the signal engine whatever the tab's latest event (it is history, not
+  state), unless it is past the replay window.
 
 ---
 
@@ -609,6 +632,9 @@ With `hooks=debug` you see, for example:
 | `src/lib/status-server.ts` | `/api/status` WebSocket handler, per-connection heartbeat |
 | `src/lib/status-keepalive.ts` | Keepalive profiles for `/api/status` (`?keepalive=long`) |
 | `src/lib/hook-settings.ts` | Hook settings file generation, script management |
+| `src/lib/hook-scripts.ts` | Hook script templates, atomic script writes, `installHookScripts` |
+| `src/lib/hook-dispatch.ts` | `dispatchHook`: the hook route's handler, shared by live POSTs and spool replay |
+| `src/lib/hook-spool.ts` | `drainHookSpool`: replays `~/.purplemux/hook-spool/` in time order |
 | `src/pages/api/status/hook.ts` | Hook API endpoint (x-pmux-token required) |
 | `src/lib/session-detection.ts` | `detectActiveSession`, `isClaudeRunning` |
 | `src/pages/api/check-claude.ts` | Claude process detection API |

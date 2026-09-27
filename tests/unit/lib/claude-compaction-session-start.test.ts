@@ -46,7 +46,8 @@ describe('SessionStart source (L30)', () => {
       const script = path.join(dir, 'status-hook.sh');
       fs.writeFileSync(script, HOOK_SCRIPT_CONTENT);
       const captured = path.join(dir, 'payload');
-      fs.writeFileSync(path.join(bin, 'curl'), `#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ "$1" = "-d" ]; then printf '%s' "$2" > '${captured}'; fi; shift; done\n`, { mode: 0o755 });
+      // The hook POSTs its payload on stdin (ADR-0020).
+      fs.writeFileSync(path.join(bin, 'curl'), `#!/bin/sh\ncase "$*" in *api/status/hook*) cat > '${captured}' ;; esac\n`, { mode: 0o755 });
       fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\necho pt-ws-1-pane-a-tab-w\n', { mode: 0o755 });
       const r = spawnSync('sh', [script, event], { input: stdin, env: { ...process.env, HOME: home, PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf-8' });
       expect(r.status).toBe(0);

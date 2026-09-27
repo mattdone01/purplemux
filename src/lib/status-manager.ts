@@ -131,6 +131,24 @@ const JSONL_WATCH_DEBOUNCE_MS = 100;
 // the first poll that sees the agent running (~0.7 s), so a tab whose
 // SessionStart hook never fires is probed without waiting for the interval poll.
 export const LAUNCH_READY_POLL_DELAYS_MS = [700, 1_500, 3_000, 5_000, 8_000, 9_500, 12_000] as const;
+/** Hook events kept per tab in `getHookHistory`. */
+export const HOOK_HISTORY_LIMIT = 32;
+/**
+ * A replayed hook event older than this changes no state (ADR-0020). A restart
+ * gap is seconds to minutes; an older spool file may predate events a server
+ * without the spool received live, and the poll and `resolveUnknown` recover
+ * the state of a long outage from the process and the transcript instead.
+ */
+export const HOOK_REPLAY_WINDOW_MS = 60 * 60 * 1000;
+
+/** One hook event a tab received, live or replayed from the spool (ADR-0020). */
+export interface IHookHistoryItem {
+  event: string;
+  at: number;
+  replayed: boolean;
+  /** Older than the tab's latest applied event or the replay window: recorded here, never applied to its state. */
+  stale: boolean;
+}
 
 const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
@@ -177,6 +195,11 @@ export class StatusManager {
   private processStartCache = new Map<string, { startedAt: number | null; checkedAt: number; stamp: number | null }>();
   private pendingKickoffs = new Map<string, { prompt: string; timer: ReturnType<typeof setTimeout> }>();
   private codexLifecycleEpoch = new Map<string, { generation: string; phase: 'pending' | 'active'; epoch: number }>();
+  /** When each tab's latest applied hook event happened; an older replayed event is history only (ADR-0020). */
+  private hookAppliedAt = new Map<string, number>();
+  private hookHistory = new Map<string, IHookHistoryItem[]>();
+  private hookSpoolDrain: (() => Promise<unknown>) | null = null;
+  private hookSpoolDraining: Promise<void> | null = null;
 
   constructor(
     automatedPrompts = new AutomatedPromptDispatcher(),
@@ -204,6 +227,8 @@ export class StatusManager {
     }).catch(() => {});
 
     await this.scanAll();
+    // Events hooks spooled while no server answered, before the first poll (ADR-0020).
+    await this.drainHookSpool();
     this.startPolling();
 
     this.rateLimitsWatcher = createRateLimitsWatcher((data) => {
@@ -430,7 +455,61 @@ export class StatusManager {
     }
   }
 
+  /** The replay of the hook spool, set by the server before `init` (ADR-0020). */
+  setHookSpoolDrain(drain: (() => Promise<unknown>) | null): void {
+    this.hookSpoolDrain = drain;
+  }
+
+  /** Replay the hook spool; one drain at a time, a caller during one waits for it. */
+  drainHookSpool(): Promise<void> {
+    if (!this.hookSpoolDrain) return Promise.resolve();
+    if (!this.hookSpoolDraining) {
+      this.hookSpoolDraining = this.hookSpoolDrain()
+        .then(() => {}, (err) => {
+          hookLog.error({ err }, 'hook spool drain failed');
+        })
+        .finally(() => {
+          this.hookSpoolDraining = null;
+        });
+    }
+    return this.hookSpoolDraining;
+  }
+
+  getHookHistory(tabId: string): IHookHistoryItem[] {
+    return [...(this.hookHistory.get(tabId) ?? [])];
+  }
+
+  private isStaleReplay(tabId: string, replayedAt: number | undefined): boolean {
+    if (replayedAt === undefined) return false;
+    if (Date.now() - replayedAt > HOOK_REPLAY_WINDOW_MS) return true;
+    const latest = this.hookAppliedAt.get(tabId);
+    return latest !== undefined && replayedAt < latest;
+  }
+
+  /**
+   * Record a hook event in the tab's history. Returns the event's time when it
+   * may change the tab's state, null when it may not: a live event always may,
+   * a replayed one only when it is not older than the latest event applied.
+   */
+  private admitHookEvent(tabId: string, event: string, replayedAt: number | undefined): number | null {
+    const at = replayedAt ?? Date.now();
+    const stale = this.isStaleReplay(tabId, replayedAt);
+    const history = this.hookHistory.get(tabId) ?? [];
+    let index = history.length;
+    while (index > 0 && history[index - 1].at > at) index -= 1;
+    history.splice(index, 0, { event, at, replayed: replayedAt !== undefined, stale });
+    if (history.length > HOOK_HISTORY_LIMIT) history.splice(0, history.length - HOOK_HISTORY_LIMIT);
+    this.hookHistory.set(tabId, history);
+    if (stale) {
+      hookLog.info({ tabId, event, at, latest: this.hookAppliedAt.get(tabId) }, 'replayed hook event older than the tab\'s latest or the replay window: history only');
+      return null;
+    }
+    if (at > (this.hookAppliedAt.get(tabId) ?? -Infinity)) this.hookAppliedAt.set(tabId, at);
+    return at;
+  }
+
   async poll(): Promise<void> {
+    if (this.hookSpoolDrain) await this.drainHookSpool();
     const { workspaces } = await getWorkspaces();
     const panesInfo = await getAllPanesInfo();
     const knownTabIds = new Set<string>();
@@ -1148,7 +1227,10 @@ export class StatusManager {
    * light and must never await the layout on the hot path — scope and cwd come
    * from a short-lived cache instead.
    */
-  handleToolActivity(providerId: string, tmuxSession: string, activity: IToolActivity): void {
+  handleToolActivity(providerId: string, tmuxSession: string, activity: IToolActivity, replayedAt?: number): void {
+    // Tool activity is signal history, so a replay feeds it whatever the tab's
+    // latest event; only one past the replay window could fire a stale signal.
+    if (replayedAt !== undefined && Date.now() - replayedAt > HOOK_REPLAY_WINDOW_MS) return;
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) return;
     const entry = this.tabs.get(tabId);
@@ -1688,6 +1770,7 @@ export class StatusManager {
     entry.turnEnd = { ...record };
     entry.lastEvent = { name: 'stop', at: record.at, seq };
     entry.eventSeq = seq;
+    this.hookAppliedAt.set(tab.id, record.at);
   }
 
   /**
@@ -1930,7 +2013,7 @@ export class StatusManager {
    * Otherwise today's ready-for-review. Any read failure falls back to the
    * plain transition so a broken transcript never hides a real finish.
    */
-  private async applyStopTurnEnd(tabId: string, entry: ITabStatusEntry, tmuxSession: string): Promise<void> {
+  private async applyStopTurnEnd(tabId: string, entry: ITabStatusEntry, tmuxSession: string, replayedAt?: number): Promise<void> {
     const stopSeq = entry.lastEvent?.seq;
     // A stop on a tab already ready-for-review makes no transition, so its end
     // line is sent here, unless it repeats the line the tab already reported
@@ -1986,7 +2069,8 @@ export class StatusManager {
       liveRegisteredJobs,
       armedWatches,
     });
-    const at = Date.now();
+    // A replayed stop ended its turn when it happened, so the idle clocks start there.
+    const at = replayedAt ?? Date.now();
     if (turnEnd.kind === 'waiting') {
       entry.turnEnd = {
         kind: 'waiting', at, seq: stopSeq,
@@ -2029,7 +2113,8 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource): void {
+  /** `replayedAt`: the time a spooled event happened, for a replay (ADR-0020); a live event has none. */
+  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource, replayedAt?: number): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ tmuxSession, event, notificationType }, 'no tabId for session');
@@ -2040,10 +2125,12 @@ export class StatusManager {
       hookLog.debug({ tabId, event, notificationType }, 'no entry for tab');
       return;
     }
+    const now = this.admitHookEvent(tabId, event, replayedAt);
+    if (now === null) return;
 
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');
-      this.setCompacting(tabId, entry, event === 'pre-compact' ? Date.now() : null);
+      this.setCompacting(tabId, entry, event === 'pre-compact' ? now : null);
       return;
     }
 
@@ -2054,7 +2141,7 @@ export class StatusManager {
     // installed the script that sends it.
     if (event === 'session-start' && source === 'compact') {
       // No state change, no nudge, no relaunch stamp: the turn goes on.
-      entry.turnEnd = { kind: 'compacting', at: Date.now(), seq: entry.lastEvent?.seq };
+      entry.turnEnd = { kind: 'compacting', at: now, seq: entry.lastEvent?.seq };
       hookLog.debug({ tabId, source, cliState: entry.cliState }, 'compaction session-start: turn continues');
       this.setCompacting(tabId, entry, null);
       this.broadcastUpdate(tabId, entry);
@@ -2072,7 +2159,6 @@ export class StatusManager {
       return;
     }
 
-    const now = Date.now();
     const seq = (entry.eventSeq ?? 0) + 1;
     entry.eventSeq = seq;
     entry.lastEvent = { name: eventName, at: now, seq };
@@ -2094,7 +2180,7 @@ export class StatusManager {
     if (newState === 'ready-for-review' && eventName === 'stop') {
       // A stop while already ready-for-review is classified too (review r1
       // finding 1): its record re-arms the idle nudge from THIS stop.
-      void this.applyStopTurnEnd(tabId, entry, tmuxSession);
+      void this.applyStopTurnEnd(tabId, entry, tmuxSession, replayedAt);
     } else if (prevState !== newState) {
       this.applyCliState(tabId, entry, newState);
       this.persistToLayout(entry);
@@ -2135,7 +2221,7 @@ export class StatusManager {
     }
   }
 
-  handleProviderEvent(providerId: string, tmuxSession: string, event: TAgentWorkStateEvent): boolean {
+  handleProviderEvent(providerId: string, tmuxSession: string, event: TAgentWorkStateEvent, replayedAt?: number): boolean {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ providerId, tmuxSession, event: event.kind }, 'no tabId for provider event');
@@ -2154,15 +2240,17 @@ export class StatusManager {
       );
       return false;
     }
-    this.handleTabWorkStateEvent(tabId, event);
+    this.handleTabWorkStateEvent(tabId, event, replayedAt);
     return true;
   }
 
+  /** A replayed patch older than the tab's latest event changes nothing and says `stale` (ADR-0020). */
   applyAgentHookMeta(
     providerId: string,
     tmuxSession: string,
     meta: IAgentHookMetaPatch,
-  ): { tabId: string; cliState: TCliState } | null {
+    replayedAt?: number,
+  ): { tabId: string; cliState: TCliState; stale?: boolean } | null {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) return null;
     const entry = this.tabs.get(tabId);
@@ -2175,6 +2263,7 @@ export class StatusManager {
       );
       return null;
     }
+    if (this.isStaleReplay(tabId, replayedAt)) return { tabId, cliState: entry.cliState, stale: true };
 
     let changed = false;
 
@@ -2283,6 +2372,8 @@ export class StatusManager {
     this.tabs.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
     this.processStartCache.delete(tabId);
+    this.hookAppliedAt.delete(tabId);
+    this.hookHistory.delete(tabId);
     this.broadcastRemove(tabId);
   }
 
@@ -2292,30 +2383,32 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  private handleTabWorkStateEvent(tabId: string, event: TAgentWorkStateEvent): void {
+  private handleTabWorkStateEvent(tabId: string, event: TAgentWorkStateEvent, replayedAt?: number): void {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
     switch (event.kind) {
       case 'session-start':
-        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source);
+        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source, replayedAt);
         break;
       case 'prompt-submit':
       case 'stop':
       case 'interrupt':
       case 'pre-compact':
       case 'post-compact':
-        this.updateTabFromHook(entry.tmuxSession, event.kind);
+        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt);
         break;
       case 'notification':
-        this.updateTabFromHook(entry.tmuxSession, 'notification', event.notificationType);
+        this.updateTabFromHook(entry.tmuxSession, 'notification', event.notificationType, undefined, replayedAt);
         break;
       case 'summary-update':
+        if (this.admitHookEvent(tabId, event.kind, replayedAt) === null) break;
         if (entry.agentSummary !== event.summary) {
           entry.agentSummary = event.summary;
           this.broadcastUpdate(tabId, entry);
         }
         break;
       case 'last-user-message':
+        if (this.admitHookEvent(tabId, event.kind, replayedAt) === null) break;
         if (entry.lastUserMessage !== event.message) {
           entry.lastUserMessage = event.message;
           this.broadcastUpdate(tabId, entry);

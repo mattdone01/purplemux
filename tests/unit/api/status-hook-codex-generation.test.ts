@@ -58,7 +58,7 @@ describe('Codex hook generation gate', () => {
     );
     expect(status.applyAgentHookMeta).toHaveBeenCalled();
     expect(status.handleProviderEvent).toHaveBeenCalledWith(
-      'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'session-start' },
+      'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'session-start' }, undefined,
     );
   });
 

@@ -85,7 +85,7 @@ describe('POST /api/status/hook?provider=grok', () => {
       tool: 'search_replace',
       paths: ['/repo/src/app.ts'],
       failed: false,
-    }));
+    }), undefined);
   });
 
   it('also accepts the PascalCase event spelling the hook file registers under', async () => {
@@ -105,14 +105,14 @@ describe('POST /api/status/hook?provider=grok', () => {
     expect(statusManager.handleToolActivity).toHaveBeenCalledWith('grok', TMUX_SESSION, expect.objectContaining({
       tool: 'run_terminal_command',
       failed: true,
-    }));
+    }), undefined);
   });
 
   it('does not raise tool activity for a work-state event', async () => {
     await post({ hookEventName: 'stop', sessionId: SESSION_ID });
 
     expect(statusManager.handleToolActivity).not.toHaveBeenCalled();
-    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('grok', TMUX_SESSION, { kind: 'stop' });
+    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('grok', TMUX_SESSION, { kind: 'stop' }, undefined);
   });
 
   it('refuses a hook that names no tmux session', async () => {
@@ -144,7 +144,7 @@ describe('POST /api/status/hook?provider=grok', () => {
 
     expect(state.statusCode).toBe(204);
     expect(statusManager.handleToolActivity).toHaveBeenCalledTimes(1);
-    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('grok', TMUX_SESSION, { kind: 'prompt-submit' });
+    expect(statusManager.handleProviderEvent).toHaveBeenCalledWith('grok', TMUX_SESSION, { kind: 'prompt-submit' }, undefined);
   });
 
   it('does not synthesise a prompt-submit while the tab is already busy', async () => {

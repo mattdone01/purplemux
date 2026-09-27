@@ -20,6 +20,8 @@ import { startGrants, stopGrants } from './src/lib/grant-service';
 import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
+import { dispatchHook } from './src/lib/hook-dispatch';
+import { drainHookSpool } from './src/lib/hook-spool';
 import { enqueueSystemToast } from './src/lib/sync-server';
 import { getCliToken } from './src/lib/cli-token';
 import { acquireLock, releaseLock, registerLockCleanup } from './src/lib/lock';
@@ -389,6 +391,9 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await initTabTokens();
   startCredentialForkSync();
   await autoResumeOnStartup();
+  // Hooks spool what they cannot deliver while no server answers; the status
+  // manager replays it through the route's own dispatcher (ADR-0020).
+  getStatusManager().setHookSpoolDrain(() => drainHookSpool(dispatchHook));
   await getStatusManager().init();
   await initLeases();
   // After the tab tokens: grants reconcile against the live tabs themselves (ADR-0010 boot-sweep note).
@@ -414,6 +419,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   process.env.PORT = String(result.port);
 
   const hookResult = await ensureHookSettings(result.port);
+  // Hooks spooled until the port file existed; the next poll may be 30 s away.
+  await getStatusManager().drainHookSpool();
   if (hookResult.codexHookInstallFailed) {
     enqueueSystemToast({
       type: 'system-toast',
