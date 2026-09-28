@@ -4,9 +4,10 @@ import { HOOK_SCRIPT_FILES, writeScriptAtomic } from '@/lib/hook-scripts';
 
 /**
  * Write every hook script into one directory, for `scripts/install-hook-scripts.ts`
- * (ADR-0020). No Next route may import this module: Turbopack cannot scope
- * `path.join(dir, name)` to a folder, so it would trace the whole project into
- * `.next/standalone`. That trace put a copy of `server.ts` beside the standalone
+ * (ADR-0020). No Next route may import this module: Turbopack could not scope
+ * this installer's `path.join(dir, name)`, so it traced the whole project into
+ * `.next/standalone` (measured at 8cf238e2; `scripts/post-build.js` is the guard
+ * for any other path that does the same). That trace put a copy of `server.ts` beside the standalone
  * `server.js`, and tsx then loaded the copy in place of the Next server.
  */
 

@@ -643,7 +643,8 @@ With `hooks=debug` you see, for example:
 | `src/lib/status-server.ts` | `/api/status` WebSocket handler, per-connection heartbeat |
 | `src/lib/status-keepalive.ts` | Keepalive profiles for `/api/status` (`?keepalive=long`) |
 | `src/lib/hook-settings.ts` | Hook settings file generation, script management |
-| `src/lib/hook-scripts.ts` | Hook script templates, atomic script writes, `installHookScripts` |
+| `src/lib/hook-scripts.ts` | Hook script templates, atomic script writes |
+| `src/lib/hook-scripts-install.ts` | `installHookScripts` (the directory installer; no Next route imports it, ADR-0020) |
 | `src/lib/hook-dispatch.ts` | `dispatchHook`: the hook route's handler, shared by live POSTs and spool replay |
 | `src/lib/hook-spool.ts` | `drainHookSpool`: replays `~/.purplemux/hook-spool/` in time order |
 | `src/pages/api/status/hook.ts` | Hook API endpoint (x-pmux-token required) |

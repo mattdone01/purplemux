@@ -7,9 +7,12 @@ import { STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
  * scripts before that release's server starts (ADR-0020).
  *
  * Next routes import this module, so Turbopack traces every file operation in
- * it. Keep each path here a constant: a path built from a function argument
- * (`path.join(dir, name)`) makes the trace take the whole project into
- * `.next/standalone`. The directory installer is in `hook-scripts-install.ts`.
+ * it. The directory installer (`path.join(dir, name)` over the script list)
+ * was a path the trace could not scope, and it took the whole project into
+ * `.next/standalone`; it lives in `hook-scripts-install.ts`. Not every
+ * argument-built path does this (hook-spool.ts and hook-floors.ts build some and
+ * trace cleanly): the guard is `scripts/post-build.js`, which refuses a
+ * whole-project standalone tree whatever caused it.
  */
 
 export const HOOK_SPOOL_DIRNAME = 'hook-spool';
