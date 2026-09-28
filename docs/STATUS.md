@@ -354,11 +354,14 @@ rescan rebuilds them (the files wait). `server.ts` calls `startBootHookSpoolDrai
 server listens and has written its port file, never awaited: one drain at once, one 5 s later.
 Both wait for a scan in flight (a rescan) instead of skipping it.
 `bootHookSpoolDrained()` settles when the first one has finished; the inbox skips its ticks until
-then, at most 10 s (`startInbox({ firstTickAfter })`). Every `poll()` drains first too; one drain
-runs at a time and yields every 50 files. Files apply oldest first and are
-deleted when applied; unreadable ones and replays that throw move to `hook-spool/bad/` once.
+then, at most 10 s (`startInbox({ firstTickAfter })`). Every `poll()` starts a drain too and never
+awaits it; one drain runs at a time and yields every 50 files. Files apply oldest first and are
+deleted when applied; unreadable ones, replays that throw, and replays not finished within
+`HOOK_REPLAY_EVENT_TIMEOUT_MS` (5 s) move to `hook-spool/bad/` once. A drain that found files logs
+one `hook spool drain:` line (applied, stale, timed out, bad, duration).
 Files past `HOOK_REPLAY_WINDOW_MS` (1 h) and metadata-only files (body over 256 KiB) are deleted
-without dispatch. A replayed Codex hook never holds its generation (`holdOnFailedProof: false`).
+without dispatch. A replayed Codex hook passes `withReplayedCodexHookGeneration`: the recorded
+active generation only, with no process proof and no target lock, and it never holds the generation.
 
 `replayedAt` threads through `handleProviderEvent`, `updateTabFromHook`, `applyAgentHookMeta` and
 `handleToolActivity`:

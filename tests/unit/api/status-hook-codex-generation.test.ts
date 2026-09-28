@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const lifecycle = vi.hoisted(() => ({
+  withReplayedCodexHookGeneration: vi.fn(),
   withValidatedCodexHookGeneration: vi.fn(),
   withValidatedLegacyCodexHook: vi.fn(),
 }));
@@ -45,6 +46,9 @@ describe('Codex hook generation gate', () => {
     lifecycle.withValidatedCodexHookGeneration.mockImplementation(
       async (_session: string, _generation: string, work: () => unknown) => ({ ok: true, value: await work() }),
     );
+    lifecycle.withReplayedCodexHookGeneration.mockImplementation(
+      async (_session: string, _generation: string, work: () => unknown) => ({ ok: true, value: work() }),
+    );
     lifecycle.withValidatedLegacyCodexHook.mockImplementation(
       async (_session: string, _meta: unknown, work: () => unknown) => ({ ok: true, value: await work() }),
     );
@@ -54,11 +58,25 @@ describe('Codex hook generation gate', () => {
     const { default: handler } = await import('@/pages/api/status/hook');
     await handler(request(), response());
     expect(lifecycle.withValidatedCodexHookGeneration).toHaveBeenCalledWith(
-      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function), { holdOnFailedProof: true },
+      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function),
     );
+    expect(lifecycle.withReplayedCodexHookGeneration).not.toHaveBeenCalled();
     expect(status.applyAgentHookMeta).toHaveBeenCalled();
     expect(status.handleProviderEvent).toHaveBeenCalledWith(
       'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'session-start' }, undefined,
+    );
+  });
+
+  it('a replayed hook goes through the attribution-only gate, never the live process proof (ADR-0020)', async () => {
+    const { dispatchHook } = await import('@/lib/hook-dispatch');
+    const { query, body } = request();
+    await dispatchHook({ query, body, replayedAt: 1_790_576_100_560 });
+    expect(lifecycle.withReplayedCodexHookGeneration).toHaveBeenCalledWith(
+      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function),
+    );
+    expect(lifecycle.withValidatedCodexHookGeneration).not.toHaveBeenCalled();
+    expect(status.handleProviderEvent).toHaveBeenCalledWith(
+      'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'session-start' }, 1_790_576_100_560,
     );
   });
 

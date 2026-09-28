@@ -685,15 +685,13 @@ export interface IValidatedCodexHookGeneration {
 }
 
 /**
- * `holdOnFailedProof: false` for a replayed hook (ADR-0020): an event spooled
- * during a restart says nothing about the process running now, so its failed
- * proof skips the event and never holds the generation.
+ * The gate of a live Codex hook: the generation is the tab's active one and
+ * the process tree running now proves it; a failed proof holds the generation.
  */
 export const withValidatedCodexHookGeneration = async <T>(
   sessionName: string,
   generation: string | null | undefined,
   work: (identity: IValidatedCodexHookGeneration) => Promise<T> | T,
-  options: { holdOnFailedProof?: boolean } = {},
 ): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
   if (!generation) return { ok: false, reason: 'generation-required' };
   const parsed = (await import('@/lib/layout-store')).parseSessionName(sessionName);
@@ -707,14 +705,45 @@ export const withValidatedCodexHookGeneration = async <T>(
     }
     const proof = await verifyCodexActiveRuntime(found.tab);
     if (!proof.ok) {
-      if (options.holdOnFailedProof !== false) {
-        await holdCodexActiveGeneration(parsed.wsId, parsed.tabId, generation, proof.reason);
-      }
+      await holdCodexActiveGeneration(parsed.wsId, parsed.tabId, generation, proof.reason);
       return { ok: false, reason: proof.reason };
     }
     const value = await work({ workspaceId: parsed.wsId, tabId: parsed.tabId, generation });
     return { ok: true, value };
   });
+};
+
+/**
+ * The gate of a REPLAYED Codex hook (ADR-0020): attribution only. The event
+ * applies when its generation is the tab's recorded active one, and is skipped
+ * otherwise; it never holds the generation.
+ *
+ * It runs no process proof and takes no target lock, because both are live
+ * conditions. The proof checks the process tree running now, which says
+ * nothing about an event spooled during a restart. It spawns one `pgrep` per
+ * node for the pane's tree and again for the agent's: on 28 Sep (2 590
+ * processes, load 75) one walk of a Codex pane's 30 descendants took 4.8 s. The
+ * lock queues the replay behind every live hook of the same busy tab, each
+ * running that proof: the drain spent 10 s to 130 s per Codex event, and the
+ * poll waited for the drain. The check
+ * and `work` run in one turn of the event loop after the layout read, so no
+ * lifecycle change interleaves between them.
+ */
+export const withReplayedCodexHookGeneration = async <T>(
+  sessionName: string,
+  generation: string | null | undefined,
+  work: (identity: IValidatedCodexHookGeneration) => T,
+): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
+  if (!generation) return { ok: false, reason: 'generation-required' };
+  const parsed = (await import('@/lib/layout-store')).parseSessionName(sessionName);
+  if (!parsed) return { ok: false, reason: 'invalid-session-name' };
+  const found = await findTab(parsed.wsId, parsed.tabId);
+  const active = found?.tab.codexLaunchRuntime?.active;
+  if (!found || !active || active.generation !== generation || active.phase !== 'active'
+    || found.tab.codexLaunchRuntime?.pending || active.sessionName !== sessionName) {
+    return { ok: false, reason: 'generation-not-active' };
+  }
+  return { ok: true, value: work({ workspaceId: parsed.wsId, tabId: parsed.tabId, generation }) };
 };
 
 export const validateCodexHookGeneration = async (

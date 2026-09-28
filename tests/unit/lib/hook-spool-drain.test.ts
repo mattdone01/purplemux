@@ -4,6 +4,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '@/lib/automated-prompt-dispatcher';
 import type { IHookDelivery } from '@/lib/hook-dispatch';
+import type { IHookSpoolDrainResult } from '@/lib/hook-spool';
 import type { StatusManager } from '@/lib/status-manager';
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
@@ -22,8 +23,15 @@ const layoutWrites = vi.hoisted(() => ({
 const sync = vi.hoisted(() => ({ broadcastSync: vi.fn((_message: { type: string }) => {}) }));
 const WS = { id: 'ws-1', name: 'w', directories: ['/tmp'], orchestration: { enabled: true, orchestratorTabId: 'root' } };
 
+const logs = vi.hoisted(() => ({ lines: [] as { level: string; fields: unknown; msg: string }[] }));
 vi.mock('@/lib/logger', () => {
-  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
+  const record = (level: string) => (fields: unknown, msg?: string) => {
+    logs.lines.push({ level, fields, msg: msg ?? (typeof fields === 'string' ? fields : '') });
+  };
+  const logger = {
+    trace: () => {}, debug: () => {}, info: record('info'), warn: record('warn'), error: record('error'), fatal: () => {},
+    child: () => logger,
+  };
   return { createLogger: () => logger };
 });
 vi.mock('os', async (importOriginal) => {
@@ -46,11 +54,13 @@ vi.mock('@/lib/sync-server', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/sync-server')>()),
   broadcastSync: sync.broadcastSync,
 }));
-// The generation proof is the launch lifecycle's own test; here a Codex hook of the active generation applies.
+// The generation gates are the launch lifecycle's own test; here a Codex hook of the active generation applies.
 vi.mock('@/lib/providers/codex/launch-lifecycle', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/providers/codex/launch-lifecycle')>()),
   withValidatedCodexHookGeneration: vi.fn(async (_session: string, generation: string, work: (identity: unknown) => unknown) =>
     ({ ok: true, value: await work({ workspaceId: 'ws-1', tabId: 'c', generation }) })),
+  withReplayedCodexHookGeneration: vi.fn(async (_session: string, generation: string, work: (identity: unknown) => unknown) =>
+    ({ ok: true, value: work({ workspaceId: 'ws-1', tabId: 'c', generation }) })),
 }));
 vi.mock('@/lib/liveness-manager', () => ({
   getLivenessManager: () => ({
@@ -135,6 +145,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   state.home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-hook-spool-drain-'));
   state.tabs = [];
+  logs.lines = [];
 });
 
 afterEach(async () => {
@@ -302,10 +313,61 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     state.tabs = [tab('w')];
     await spoolEvent(Date.now() - 5_000, claudePrompt());
     await manager.poll();
-    expect(applied).toHaveLength(1);
+    await waitFor(() => expect(applied).toHaveLength(1));
     await spoolEvent(Date.now() - 1_000, claudeStop());
     await manager.poll();
-    expect(applied).toHaveLength(2);
+    await waitFor(() => expect(applied).toHaveLength(2));
+  });
+
+  it('a poll never waits for a drain: with a drain that hangs the poll completes, and a later poll starts no second drain', async () => {
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    manager.registerTab('w', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code' });
+    state.tabs = [tab('w')];
+    // 28 Sep: a drain stuck on its replays held every poll for 7 minutes.
+    let releaseDrain!: () => void;
+    const drain = vi.fn(() => new Promise<IHookSpoolDrainResult>((resolve) => {
+      releaseDrain = () => resolve({ applied: 0, bad: 0, timedOut: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 });
+    }));
+    manager.setHookSpoolDrain(drain);
+    const readLayout = vi.mocked((await import('@/lib/layout-store')).readLayoutFile);
+    const layoutReadsBefore = readLayout.mock.calls.length;
+
+    const first = await Promise.race([
+      manager.poll().then(() => 'polled'),
+      new Promise((resolve) => setTimeout(() => resolve('held by the drain'), 2_000)),
+    ]);
+    expect(first).toBe('polled');
+    // The poll went on to read the layouts, the step the liveness reconcile and the nudges follow.
+    expect(readLayout.mock.calls.length).toBeGreaterThan(layoutReadsBefore);
+    await manager.poll();
+    expect(drain).toHaveBeenCalledTimes(1);
+
+    releaseDrain();
+    await manager.drainHookSpool();
+    await manager.poll();
+    expect(drain).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs one line per drain that found files: applied, stale, timed out, bad, and the duration', async () => {
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    manager.registerTab('w', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code' });
+    state.tabs = [tab('w')];
+    // A live event sets the floor; a replayed event older than it is stale.
+    manager.updateTabFromHook('tmux-w', 'prompt-submit');
+    const now = Date.now();
+    await spoolEvent(now - 60_000, claudeStop());
+    await spoolEvent(now + 1_000, claudeStop());
+    await manager.drainHookSpool();
+    const summary = logs.lines.filter((line) => line.msg.startsWith('hook spool drain:'));
+    expect(summary).toHaveLength(1);
+    expect(summary[0]).toMatchObject({ level: 'info', fields: { applied: 2, stale: 1, timedOut: 0, bad: 0 } });
+    expect((summary[0].fields as { durationMs: number }).durationMs).toBeGreaterThanOrEqual(0);
+
+    // An empty spool logs nothing.
+    await manager.drainHookSpool();
+    expect(logs.lines.filter((line) => line.msg.startsWith('hook spool drain:'))).toHaveLength(1);
   });
 
   it('an event older than the tab\'s floor updates history only, never the newer state', async () => {
@@ -573,7 +635,10 @@ describe('HookFloorStore (ADR-0020)', () => {
 });
 
 describe('drainHookSpool (ADR-0020)', () => {
-  const drain = async (apply: (d: IHookDelivery) => Promise<unknown>, options: { now?: number; maxFiles?: number; maxAgeMs?: number } = {}) => {
+  const drain = async (
+    apply: (d: IHookDelivery) => Promise<unknown>,
+    options: { now?: number; maxFiles?: number; maxAgeMs?: number; eventTimeoutMs?: number } = {},
+  ) => {
     const { drainHookSpool } = await import('@/lib/hook-spool');
     return drainHookSpool(apply, { dir: spoolDir(), ...options });
   };
@@ -608,6 +673,46 @@ describe('drainHookSpool (ADR-0020)', () => {
     expect(seen.map((d) => d.replayedAt)).toEqual([now - 2_000, now - 1_000]);
     expect((await fs.readdir(path.join(spoolDir(), 'bad'))).sort()).toEqual([`${now - 1_500}-1-aa.json`, 'stray.txt']);
     expect((await fs.readdir(spoolDir())).filter((n) => n !== 'bad')).toEqual([]);
+  });
+
+  it('bounds each replay: N replays that never settle finish within N x the bound, each moves to bad/ once, and the rest still apply', async () => {
+    const now = Date.now();
+    const hung = [
+      await spoolEvent(now - 4_000, claudePrompt()),
+      await spoolEvent(now - 3_000, claudeStop()),
+      await spoolEvent(now - 2_000, claudePrompt()),
+    ];
+    await spoolEvent(now - 1_000, claudeStop());
+    const seen: number[] = [];
+    // A dispatch that never settles, as a replay queued behind a busy tab's lock.
+    const apply = vi.fn((d: IHookDelivery) => {
+      seen.push(d.replayedAt!);
+      return d.replayedAt === now - 1_000 ? Promise.resolve() : new Promise<never>(() => {});
+    });
+    const bound = 100;
+    const started = Date.now();
+    const result = await drain(apply, { now, eventTimeoutMs: bound });
+    const elapsed = Date.now() - started;
+    expect(result).toMatchObject({ applied: 1, timedOut: 3, bad: 3 });
+    expect(elapsed).toBeGreaterThanOrEqual(hung.length * bound - 5);
+    expect(elapsed).toBeLessThan(hung.length * bound + 1_000);
+    expect(seen).toEqual([now - 4_000, now - 3_000, now - 2_000, now - 1_000]);
+    expect((await fs.readdir(path.join(spoolDir(), 'bad'))).sort()).toEqual([...hung].sort());
+    expect(await fs.readdir(spoolDir())).toEqual(['bad']);
+    expect(logs.lines.filter((line) => line.msg.includes('did not finish within 100 ms'))).toHaveLength(3);
+
+    // Never retried.
+    expect(await drain(apply, { now, eventTimeoutMs: bound })).toMatchObject({ applied: 0, timedOut: 0, bad: 0 });
+    expect(apply).toHaveBeenCalledTimes(4);
+  });
+
+  it('a replay that settles within the bound is applied, and the default bound is 5 s', async () => {
+    const { HOOK_REPLAY_EVENT_TIMEOUT_MS } = await import('@/lib/hook-spool');
+    expect(HOOK_REPLAY_EVENT_TIMEOUT_MS).toBe(5_000);
+    const now = Date.now();
+    await spoolEvent(now - 1_000, claudeStop());
+    const apply = vi.fn(() => new Promise<void>((resolve) => { setTimeout(resolve, 20); }));
+    expect(await drain(apply, { now, eventTimeoutMs: 1_000 })).toMatchObject({ applied: 1, timedOut: 0, bad: 0 });
   });
 
   it('moves a file whose replay throws (a 5xx event) to bad/ once, and never retries it', async () => {
@@ -674,7 +779,7 @@ describe('drainHookSpool (ADR-0020)', () => {
     const floors = path.join(spoolDir(), '.floors.json');
     await fs.writeFile(floors, '{"w":1}\n');
     await age(floors, 30 * 24 * 60 * MIN);
-    expect(await drain(apply)).toEqual({ applied: 0, bad: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 });
+    expect(await drain(apply)).toEqual({ applied: 0, bad: 0, timedOut: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 });
     expect(seen).toEqual([]);
     expect(await fs.readdir(spoolDir())).toEqual(['.floors.json']);
   });
@@ -711,7 +816,7 @@ describe('drainHookSpool (ADR-0020)', () => {
 
   it('an absent spool directory is an empty spool', async () => {
     const { seen, apply } = collect();
-    expect(await drain(apply)).toEqual({ applied: 0, bad: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 });
+    expect(await drain(apply)).toEqual({ applied: 0, bad: 0, timedOut: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 });
     expect(seen).toEqual([]);
   });
 });

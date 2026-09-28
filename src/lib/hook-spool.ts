@@ -22,6 +22,13 @@ export const HOOK_REPLAY_WINDOW_MS = 60 * 60 * 1000;
 export const HOOK_SPOOL_BAD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 /** A hook's temporary file this old belongs to a hook that died before its rename. */
 export const HOOK_SPOOL_TMP_MAX_AGE_MS = 10 * 60 * 1000;
+/**
+ * The longest one replayed event may take (ADR-0020). A replay is in-memory
+ * work plus a layout read, milliseconds; one that has not finished by then
+ * moves to `bad/` and the drain goes on, so N events that hang cost at most
+ * N times this.
+ */
+export const HOOK_REPLAY_EVENT_TIMEOUT_MS = 5_000;
 /** Files replayed between two yields to the event loop. */
 const DRAIN_BATCH = 50;
 
@@ -39,6 +46,8 @@ export interface ISpooledHook {
 export interface IHookSpoolDrainResult {
   applied: number;
   bad: number;
+  /** Dispatched, but not finished within the per-event bound: moved to `bad/`, and counted in `bad` too. */
+  timedOut: number;
   /** Past the replay window or over the file bound: deleted, never dispatched. */
   dropped: number;
   /** Written without its body (too large): deleted, never dispatched. */
@@ -52,6 +61,7 @@ export interface IHookSpoolDrainOptions {
   now?: number;
   maxFiles?: number;
   maxAgeMs?: number;
+  eventTimeoutMs?: number;
 }
 
 const SPOOL_FILE = /^(\d{1,16})-[^/]*\.json$/;
@@ -157,12 +167,43 @@ const pruneBad = async (dir: string, now: number): Promise<number> => {
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+type TReplayOutcome = { kind: 'applied' } | { kind: 'threw'; err: unknown } | { kind: 'timed-out' };
+
+/**
+ * Run one replay, bounded. A replay that has not settled within `timeoutMs` is
+ * abandoned, never cancelled: if it settles later its error is logged, and
+ * its state change, if any, is ordered against the tab's floor like any replay.
+ */
+const replayBounded = async (run: () => Promise<unknown>, timeoutMs: number, file: string): Promise<TReplayOutcome> => {
+  let timer: NodeJS.Timeout | undefined;
+  const replay = Promise.resolve().then(run);
+  const timeout = new Promise<TReplayOutcome>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: 'timed-out' }), timeoutMs);
+  });
+  try {
+    const outcome = await Promise.race([
+      replay.then((): TReplayOutcome => ({ kind: 'applied' }), (err: unknown): TReplayOutcome => ({ kind: 'threw', err })),
+      timeout,
+    ]);
+    if (outcome.kind === 'timed-out') {
+      replay.catch((err: unknown) => {
+        log.warn({ file, err }, 'a replay abandoned after its time bound failed later');
+      });
+    }
+    return outcome;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
 /**
  * Replay the events hook scripts spooled while no server answered (ADR-0020).
  *
  * Oldest first, each through `apply` — the hook route's own dispatcher — with
  * its original time, and deleted once applied. A file that does not parse, or
- * whose replay throws, moves to `bad/` once and is never retried. Files past
+ * whose replay throws, moves to `bad/` once and is never retried; so does one
+ * whose replay has not finished within `eventTimeoutMs` (5 s), and the drain
+ * goes on with the next file. Files past
  * the replay window, then the oldest beyond `maxFiles`, are deleted without
  * dispatch, with one log line; so is a file whose body the hook dropped for
  * size. `bad/` entries older than 7 days and orphaned temporaries older than
@@ -177,7 +218,10 @@ export const drainHookSpool = async (
   const now = options.now ?? Date.now();
   const maxFiles = options.maxFiles ?? HOOK_SPOOL_MAX_FILES;
   const maxAgeMs = options.maxAgeMs ?? HOOK_REPLAY_WINDOW_MS;
-  const result: IHookSpoolDrainResult = { applied: 0, bad: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0 };
+  const eventTimeoutMs = options.eventTimeoutMs ?? HOOK_REPLAY_EVENT_TIMEOUT_MS;
+  const result: IHookSpoolDrainResult = {
+    applied: 0, bad: 0, timedOut: 0, dropped: 0, metadataOnly: 0, prunedBad: 0, prunedTmp: 0,
+  };
 
   const { entries, unnamed, temporaries } = await listSpool(dir);
   result.prunedTmp = await pruneOlderThan(dir, temporaries, now, HOOK_SPOOL_TMP_MAX_AGE_MS);
@@ -228,12 +272,19 @@ export const drainHookSpool = async (
       droppedBodyLength += spooled.bodyLength ?? 0;
       continue;
     }
-    try {
-      // A hook clock ahead of the server's must not date an event in the future.
-      await apply({ query: spooledHookQuery(spooled.query), body: spooled.body, replayedAt: Math.min(spooled.at, now) });
-    } catch (err) {
+    // A hook clock ahead of the server's must not date an event in the future.
+    const delivery = { query: spooledHookQuery(spooled.query), body: spooled.body, replayedAt: Math.min(spooled.at, now) };
+    const outcome = await replayBounded(() => apply(delivery), eventTimeoutMs, entry.name);
+    if (outcome.kind === 'threw') {
+      const { err } = outcome;
       await quarantine(dir, entry.name, `replay threw: ${err instanceof Error ? err.message : String(err)}`);
       result.bad += 1;
+      continue;
+    }
+    if (outcome.kind === 'timed-out') {
+      await quarantine(dir, entry.name, `replay did not finish within ${eventTimeoutMs} ms`);
+      result.bad += 1;
+      result.timedOut += 1;
       continue;
     }
     await fs.rm(file, { force: true });

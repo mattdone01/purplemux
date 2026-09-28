@@ -8,6 +8,7 @@ import { processGrokHookPayload, shouldEmitGrokHookEvent } from '@/lib/providers
 import { grokHookEvent, parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
 import {
+  withReplayedCodexHookGeneration,
   withValidatedCodexHookGeneration,
   withValidatedLegacyCodexHook,
 } from '@/lib/providers/codex/launch-lifecycle';
@@ -100,8 +101,12 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
     }
     return { applied };
   };
+  // A replay is checked against the recorded generation only: the live process
+  // proof and the tab's lock are live conditions (ADR-0020).
   const guarded = generation
-    ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook, { holdOnFailedProof: replayedAt === undefined })
+    ? replayedAt === undefined
+      ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook)
+      : await withReplayedCodexHookGeneration(tmuxSession, generation, applyHook)
     : await withValidatedLegacyCodexHook(tmuxSession, {
         sessionId: translation.meta?.sessionId ?? null,
         jsonlPath: translation.meta?.jsonlPath,

@@ -1,7 +1,7 @@
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
-import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR } from '@/lib/hook-spool';
+import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR, type IHookSpoolDrainResult } from '@/lib/hook-spool';
 import { HookFloorStore } from '@/lib/hook-floors';
 import { onTabClosed, onTabClosing } from '@/lib/tab-lifecycle';
 import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
@@ -208,8 +208,14 @@ export class StatusManager {
     this.settleBootHookSpoolDrain = resolve;
   });
   private hookHistory = new Map<string, IHookHistoryItem[]>();
-  private hookSpoolDrain: (() => Promise<unknown>) | null = null;
+  private hookSpoolDrain: (() => Promise<IHookSpoolDrainResult>) | null = null;
   private hookSpoolDraining: Promise<void> | null = null;
+  /**
+   * Replayed STATE events that changed no state (older than the tab's floor or
+   * the replay window), counted in `admitHookEvent`; a drain logs its delta.
+   * A stale metadata patch is not counted: its state event, if any, is.
+   */
+  private staleReplays = 0;
 
   constructor(
     automatedPrompts = new AutomatedPromptDispatcher(),
@@ -488,7 +494,7 @@ export class StatusManager {
   }
 
   /** The replay of the hook spool, set by the server before `init` (ADR-0020). */
-  setHookSpoolDrain(drain: (() => Promise<unknown>) | null): void {
+  setHookSpoolDrain(drain: (() => Promise<IHookSpoolDrainResult>) | null): void {
     this.hookSpoolDrain = drain;
   }
 
@@ -496,20 +502,35 @@ export class StatusManager {
    * Replay the hook spool; one drain at a time, a caller during one waits for it.
    * A no-op until `init()`'s scan has built the tabs, and while a rescan
    * rebuilds them: an event for a tab not yet built would be deleted unapplied.
-   * The files wait for the next drain.
+   * The files wait for the next drain. A drain that found files logs one line:
+   * applied, the replayed state events among them that were stale
+   * (history only), timed out, bad, and its duration.
    */
   drainHookSpool(): Promise<void> {
     if (!this.hookSpoolDrain || !this.hookScanReady || this.scansInFlight > 0) return Promise.resolve();
     if (!this.hookSpoolDraining) {
+      const startedAt = Date.now();
+      const staleBefore = this.staleReplays;
       this.hookSpoolDraining = this.hookSpoolDrain()
-        .then(() => {}, (err) => {
-          hookLog.error({ err }, 'hook spool drain failed');
+        .then((result) => {
+          this.logHookSpoolDrain(result, this.staleReplays - staleBefore, Date.now() - startedAt);
+        }, (err) => {
+          hookLog.error({ err, durationMs: Date.now() - startedAt }, 'hook spool drain failed');
         })
         .finally(() => {
           this.hookSpoolDraining = null;
         });
     }
     return this.hookSpoolDraining;
+  }
+
+  private logHookSpoolDrain(result: IHookSpoolDrainResult, stale: number, durationMs: number): void {
+    const { applied, timedOut, bad, dropped, metadataOnly } = result;
+    if (applied + bad + dropped + metadataOnly === 0) return;
+    const fields = { applied, stale, timedOut, bad, dropped, metadataOnly, durationMs };
+    const line = `hook spool drain: ${applied} applied (${stale} stale), ${timedOut} timed out, ${bad} bad, in ${durationMs} ms`;
+    if (timedOut > 0 || bad > 0) hookLog.warn(fields, line);
+    else hookLog.info(fields, line);
   }
 
   /**
@@ -557,6 +578,7 @@ export class StatusManager {
     if (history.length > HOOK_HISTORY_LIMIT) history.splice(0, history.length - HOOK_HISTORY_LIMIT);
     this.hookHistory.set(tabId, history);
     if (stale) {
+      this.staleReplays += 1;
       hookLog.info({ tabId, event, at, floor: this.hookFloors.get(tabId) }, 'replayed hook event older than the tab\'s floor or the replay window: history only');
       return null;
     }
@@ -565,7 +587,11 @@ export class StatusManager {
   }
 
   async poll(): Promise<void> {
-    if (this.hookSpoolDrain) await this.drainHookSpool();
+    // Started, never awaited (ADR-0020): the liveness reconcile, the stuck
+    // checks and the idle nudges must not wait for a slow replay. The drain is
+    // one shared promise, so a poll during a drain starts no second one. On
+    // 28 Sep a drain of 11 files held every poll for 7 minutes.
+    if (this.hookSpoolDrain) void this.drainHookSpool();
     const { workspaces } = await getWorkspaces();
     const panesInfo = await getAllPanesInfo();
     const knownTabIds = new Set<string>();
