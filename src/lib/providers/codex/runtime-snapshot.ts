@@ -128,6 +128,16 @@ const codexTurnError = (payload: Record<string, unknown>): ITurnError | null => 
   };
 };
 
+// The text of a response_item message: its output_text parts, joined.
+const assistantText = (content: unknown): string =>
+  Array.isArray(content)
+    ? content
+        .map((part) => (typeof part === 'object' && part !== null && typeof (part as { text?: unknown }).text === 'string'
+          ? (part as { text: string }).text
+          : ''))
+        .join('')
+    : '';
+
 const isInterruptEvent = (type: string): boolean =>
   type === 'turn_aborted' || type === 'TurnAborted';
 
@@ -182,7 +192,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
         state.staleMs = 0;
         continue;
       }
-      if (eventType === 'task_started' && !state.completionSeen) {
+      if ((eventType === 'task_started' || eventType === 'TurnStarted') && !state.completionSeen) {
         state.turnStartedSeen = true;
       }
       if (isInterruptEvent(eventType)) {
@@ -244,6 +254,27 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
         if (callId && completedCalls.has(callId)) continue;
         if (!state.reset && !state.terminalIdle && name && !state.currentAction) {
           state.currentAction = functionCallAction(name, payload.arguments ?? payload.input);
+        }
+        continue;
+      }
+      // Codex 0.157: the turn's final answer is an assistant message with phase `final_answer`, written
+      // BEFORE the Stop hook runs; task_complete (with last_agent_message) is written ~2.5 s after it
+      // (measured on tab-qVoUnB), which the stop path's single 500 ms re-read can miss. The newest final
+      // answer of the current turn (no newer user message, task_started or completion) is the tail.
+      if (
+        responseType === 'message'
+        && safeString(payload.role) === 'assistant'
+        && safeString(payload.phase) === 'final_answer'
+        && !state.userSeen
+        && !state.turnStartedSeen
+        && !state.completionSeen
+      ) {
+        const finalAnswer = assistantText(payload.content);
+        if (finalAnswer) {
+          if (!state.lastAssistantSnippet) state.lastAssistantSnippet = compact(finalAnswer);
+          if (!state.reset && !state.lastAssistantTail) {
+            state.lastAssistantTail = finalAnswer.trimEnd().slice(-TURN_TAIL_CHARS);
+          }
         }
         continue;
       }

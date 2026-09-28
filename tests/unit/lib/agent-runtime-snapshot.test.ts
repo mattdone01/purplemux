@@ -222,12 +222,37 @@ describe('Codex and Grok turn tails', () => {
     expect(extractTurnMarker(snapshot.lastAssistantTail)).toEqual([final]);
   });
 
+  it('reads a Codex 0.157 final answer before task_complete is written (the Stop hook runs first)', async () => {
+    // Measured on tab-qVoUnB: task_complete lands ~2.5 s after the final answer; the stop path re-reads once at 500 ms.
+    const final = 'Queue is empty.\n\nDONE: codex-eng-review idle, queue empty.';
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-28T12:23:07.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't1' } },
+      { timestamp: '2026-09-28T12:23:15.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking the queue.' }], phase: 'commentary' } },
+      { timestamp: '2026-09-28T12:23:21.882Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: final }], phase: 'final_answer' } },
+    ]);
+    const snapshot = await readCodexRuntimeSnapshot(jsonlPath);
+    expect(extractTurnMarker(snapshot.lastAssistantTail)).toEqual(['DONE: codex-eng-review idle, queue empty.']);
+  });
+
+  it('takes no Codex 0.157 tail from a completed turn once a user message follows it', async () => {
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-28T12:23:24.367Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: 'DONE: old' } },
+      { timestamp: '2026-09-28T12:30:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'next' } },
+    ]);
+    expect((await readCodexRuntimeSnapshot(jsonlPath)).lastAssistantTail ?? null).toBeNull();
+  });
+
   it('takes no Codex 0.157 tail from an older turn once a newer turn has started', async () => {
     const jsonlPath = await writeJsonl([
       { timestamp: '2026-09-28T12:23:24.367Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: 'DONE: old' } },
       { timestamp: '2026-09-28T12:30:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't2' } },
     ]);
     expect((await readCodexRuntimeSnapshot(jsonlPath)).lastAssistantTail ?? null).toBeNull();
+    const pascal = await writeJsonl([
+      { timestamp: '2026-09-28T12:23:21.882Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'DONE: old' }], phase: 'final_answer' } },
+      { timestamp: '2026-09-28T12:30:00.000Z', type: 'event_msg', payload: { type: 'TurnStarted', turn_id: 't2' } },
+    ]);
+    expect((await readCodexRuntimeSnapshot(pascal)).lastAssistantTail ?? null).toBeNull();
   });
 
   it('has no Codex tail when the last event is a new user message', async () => {
