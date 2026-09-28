@@ -12,6 +12,28 @@ import { findTab } from '@/lib/cli-utils';
 import { checkTerminalProcess, sendKeys } from '@/lib/tmux';
 import { getStatusManager } from '@/lib/status-manager';
 
+/**
+ * A new tab's pane reads `tmux` (or nothing) until its shell has started; under host load that takes seconds
+ * (28 Sep: load 70-150, a heavy .bashrc) and every managed Codex launch was held `terminal-not-ready:tmux`.
+ * The submit waits for a STARTING pane to become a shell, bounded; any other program is judged at once.
+ */
+export const CODEX_SHELL_START_WAIT_MS = 15_000;
+const CODEX_SHELL_START_POLL_MS = 200;
+const STARTING_PANE = new Set(['tmux', 'unknown']);
+
+const waitForStartingShell = async (
+  sessionName: string,
+  waitMs: number,
+): Promise<{ isSafe: boolean; processName: string }> => {
+  const deadline = Date.now() + waitMs;
+  let terminal = await checkTerminalProcess(sessionName);
+  while (!terminal.isSafe && STARTING_PANE.has(terminal.processName) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, CODEX_SHELL_START_POLL_MS));
+    terminal = await checkTerminalProcess(sessionName);
+  }
+  return terminal;
+};
+
 export interface IPreparedCodexLaunch extends ICodexLaunchIntent {
   command: string;
 }
@@ -56,6 +78,7 @@ export const submitCodexManagedLaunch = async (
   workspaceId: string,
   tabId: string,
   generation: string,
+  shellStartWaitMs: number = CODEX_SHELL_START_WAIT_MS,
 ): Promise<TSubmitCodexLaunchResult> =>
   withCodexTargetLock(workspaceId, tabId, async () => {
     const found = await findTab(workspaceId, tabId);
@@ -67,7 +90,7 @@ export const submitCodexManagedLaunch = async (
     if (!intent) {
       return { ok: false, generation, phase: 'held', reason: 'launch-generation-not-current' };
     }
-    const terminal = await checkTerminalProcess(sessionName);
+    const terminal = await waitForStartingShell(sessionName, shellStartWaitMs);
     if (!terminal.isSafe) {
       await holdCodexLaunchLocked(workspaceId, tabId, generation, `terminal-not-ready:${terminal.processName}`);
       return {

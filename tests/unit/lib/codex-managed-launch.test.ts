@@ -67,6 +67,36 @@ describe('managed Codex launch callers', () => {
     expect(result).toMatchObject({ ok: false, phase: 'held' });
   });
 
+  it('waits for a starting pane (tmux) to become a shell, then submits', async () => {
+    tmux.checkTerminalProcess
+      .mockResolvedValueOnce({ isSafe: false, processName: 'tmux' })
+      .mockResolvedValueOnce({ isSafe: false, processName: 'tmux' })
+      .mockResolvedValue({ isSafe: true, processName: 'bash' });
+    const { submitCodexManagedLaunch } = await import('@/lib/providers/codex/managed-launch');
+    const result = await submitCodexManagedLaunch('ws-pins', 'tab-pins', intent.generation, 2_000);
+    expect(tmux.checkTerminalProcess).toHaveBeenCalledTimes(3);
+    expect(tmux.sendKeys).toHaveBeenCalledWith(intent.sessionName, 'managed-command');
+    expect(result).toEqual({ ok: true, generation: intent.generation, phase: 'submitted' });
+  });
+
+  it('holds a pane that never leaves tmux once the bounded wait ends', async () => {
+    tmux.checkTerminalProcess.mockResolvedValue({ isSafe: false, processName: 'tmux' });
+    const { submitCodexManagedLaunch } = await import('@/lib/providers/codex/managed-launch');
+    const result = await submitCodexManagedLaunch('ws-pins', 'tab-pins', intent.generation, 300);
+    expect(lifecycle.holdCodexLaunchLocked).toHaveBeenCalledWith(
+      'ws-pins', 'tab-pins', intent.generation, 'terminal-not-ready:tmux',
+    );
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, phase: 'held' });
+  });
+
+  it('judges another program at once, without waiting', async () => {
+    tmux.checkTerminalProcess.mockResolvedValue({ isSafe: false, processName: 'codex' });
+    const { submitCodexManagedLaunch } = await import('@/lib/providers/codex/managed-launch');
+    await submitCodexManagedLaunch('ws-pins', 'tab-pins', intent.generation, 5_000);
+    expect(tmux.checkTerminalProcess).toHaveBeenCalledTimes(1);
+  });
+
   it('marks submitted only after terminal submission succeeds', async () => {
     const { submitCodexManagedLaunch } = await import('@/lib/providers/codex/managed-launch');
     const result = await submitCodexManagedLaunch('ws-pins', 'tab-pins', intent.generation);
