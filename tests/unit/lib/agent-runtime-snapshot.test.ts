@@ -234,6 +234,17 @@ describe('Codex and Grok turn tails', () => {
     expect(extractTurnMarker(snapshot.lastAssistantTail)).toEqual(['DONE: codex-eng-review idle, queue empty.']);
   });
 
+  it('never takes a running Codex 0.157 turn\'s commentary for its end line (the final_answer phase check)', async () => {
+    // Review r3 nit 1: without the phase check, the newest commentary of a RUNNING turn became the snippet and tail.
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-28T12:23:07.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't1' } },
+      { timestamp: '2026-09-28T12:23:15.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'DONE: not yet' }], phase: 'commentary' } },
+    ]);
+    const snapshot = await readCodexRuntimeSnapshot(jsonlPath);
+    expect(snapshot.lastAssistantTail ?? null).toBeNull();
+    expect(snapshot.lastAssistantSnippet ?? null).toBeNull();
+  });
+
   it('takes no Codex 0.157 tail from a completed turn once a user message follows it', async () => {
     const jsonlPath = await writeJsonl([
       { timestamp: '2026-09-28T12:23:24.367Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: 'DONE: old' } },
