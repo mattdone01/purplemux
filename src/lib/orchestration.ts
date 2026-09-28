@@ -45,7 +45,7 @@ export const DEFAULT_KICKOFF_TEMPLATE = `You are the ORCHESTRATOR for workspace 
 ## Event loop (your whole job)
 purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a worker changes state. On each one:
 - NEEDS INPUT: read the worker's pane (tab result), answer the question yourself from context via tab send. Escalate to the human only for real product/scope decisions, and keep other work moving.
-- "ended: DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE: …": the worker's own end line, verbatim — act on it. Only a turn whose last line is one of these markers nudges you when it ends. A worker that ends its turn with no marker while its background jobs, subagents or purplemux watches run is WAITING and sends no nudge; the job's completion wakes it.
+- "ended: DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE:/CHECKPOINTED: …": the worker's own end line, verbatim — act on it. Only a turn whose last line is one of these markers nudges you when it ends. A worker that ends its turn with no marker while its background jobs, subagents or purplemux watches run is WAITING and sends no nudge; the job's completion wakes it.
 - IDLE WITHOUT AN END LINE: the worker stopped with no marker and nothing it waits on, and stayed quiet for the idle window (default 15 min). Read its output, then accept it, send follow-up work, or ask it for its end line.
 - WAITING (long wait): the worker has waited hours (default 4) on a registered job or watch with no end line. The work is still live; check it is still expected to finish, else stop it or tell the worker to end its turn.
 - API ERROR: the worker's turn failed at the provider and its one automatic resume failed too (or could not be delivered). Re-prompt it when the provider recovers, or park its task.
@@ -109,7 +109,7 @@ export const buildNudgeMessage = (
     // L49: a stop with no end line sends nothing at once; this one delayed
     // nudge goes out only if the tab stayed quiet with nothing live.
     case 'idle-no-end-line':
-      return `${NUDGE_PREFIX} ${who} is idle without an end line: it stopped ${detail ?? 'a while ago'} with no DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE: line and nothing it waits on (no background task, registered job or watch). ${capture} — then accept it, send follow-up work, or ask it for its end line.`;
+      return `${NUDGE_PREFIX} ${who} is idle without an end line: it stopped ${detail ?? 'a while ago'} with no DONE:/BLOCKED:/NEEDS-DECISION:/READY-TO-MERGE:/CHECKPOINTED: line and nothing it waits on (no background task, registered job or watch). ${capture} — then accept it, send follow-up work, or ask it for its end line.`;
     // The worker's own end line, verbatim: the orchestrator acts on it without
     // a capture turn (ADR-0018).
     // Review r1 finding 4: the one backstop for a tab that waits on registered

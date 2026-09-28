@@ -53,8 +53,8 @@ purplemux watch lease NAME --until free                # wait for a lease withou
 At turn start, run \`purplemux note list --open --to-me\` and ack each note you applied (\`purplemux note ack ID --comment ...\`).
 To wait for GitHub state or a lease, use \`purplemux watch\`, not a shell poller: it survives your turn, ends with your tab, and tells you once.
 
-The watchdog reads the LAST line of your turn: \`DONE:\`, \`BLOCKED:\`, \`NEEDS-DECISION:\` or
-\`READY-TO-MERGE:\` reaches your orchestrator verbatim. A turn that ends with no such line while
+The watchdog reads the LAST line of your turn: \`DONE:\`, \`BLOCKED:\`, \`NEEDS-DECISION:\`,
+\`READY-TO-MERGE:\` or \`CHECKPOINTED:\` reaches your orchestrator verbatim. A turn that ends with no such line while
 your background shells, agents or registered jobs still run is WAITING: no nudge until they finish.
 
 Exit codes: 4 means the target tab is gone (\`tab-not-found\`, \`session-not-running\`,

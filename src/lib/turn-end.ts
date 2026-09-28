@@ -4,7 +4,8 @@
 import type { IOpenBackgroundTaskKinds } from '@/lib/providers/types';
 
 export const TURN_TAIL_CHARS = 600;
-export const TURN_MARKERS = ['DONE:', 'BLOCKED:', 'NEEDS-DECISION:', 'READY-TO-MERGE:'] as const;
+// CHECKPOINTED: a worker's reply to a planned host maintenance (L71): its handoff path, an end line like the others.
+export const TURN_MARKERS = ['DONE:', 'BLOCKED:', 'NEEDS-DECISION:', 'READY-TO-MERGE:', 'CHECKPOINTED:'] as const;
 const READY_TO_MERGE = 'READY-TO-MERGE:';
 const MAX_MARKER_LINE_CHARS = 300;
 const MAX_READY_TO_MERGE_LINES = 5;

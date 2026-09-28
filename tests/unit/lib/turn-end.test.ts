@@ -19,7 +19,7 @@ const input = (tail: string | null | undefined, open = 0, jobs = 0, transcript =
 });
 
 describe('extractTurnMarker', () => {
-  it.each(['DONE: shipped', 'BLOCKED: gate red — needs X', 'NEEDS-DECISION: a or b — options a/b', 'READY-TO-MERGE: repo#1 @ abc'])(
+  it.each(['DONE: shipped', 'BLOCKED: gate red — needs X', 'NEEDS-DECISION: a or b — options a/b', 'READY-TO-MERGE: repo#1 @ abc', 'CHECKPOINTED: /home/u/_output/x/HANDOFF.md'])(
     'returns the last line when it starts with a marker: %s',
     (line) => {
       expect(extractTurnMarker(`Report.\n\n${line}\n`)).toEqual([line]);

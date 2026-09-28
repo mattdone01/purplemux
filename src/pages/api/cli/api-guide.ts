@@ -451,8 +451,8 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   orchestration off when the epic is finished — this stops watchdog nudges and idle
   heartbeats for the workspace. A tab's live reportsTo overrides this target for that tab.
 
-  Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:
-  or READY-TO-MERGE: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
+  Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:,
+  READY-TO-MERGE: or CHECKPOINTED: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
   — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
   No marker and open background work (the agent's own tasks, a live tab bg job, or an armed
   purplemux watch the tab owns) → WAITING, no nudge. Otherwise no nudge at once: if the tab stays
