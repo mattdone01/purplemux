@@ -212,8 +212,9 @@ export class StatusManager {
   private hookSpoolDraining: Promise<void> | null = null;
   /**
    * Replayed STATE events that changed no state (older than the tab's floor or
-   * the replay window), counted in `admitHookEvent`; a drain logs its delta.
-   * A stale metadata patch is not counted: its state event, if any, is.
+   * the replay window), counted in `admitHookEvent`, and replayed hooks their
+   * gate refused (`recordSkippedReplay`); a drain logs its delta. A stale
+   * metadata patch is not counted: its state event, if any, is.
    */
   private staleReplays = 0;
 
@@ -571,12 +572,7 @@ export class StatusManager {
   private admitHookEvent(tabId: string, event: string, replayedAt: number | undefined): number | null {
     const at = replayedAt ?? Date.now();
     const stale = this.isStaleReplay(tabId, replayedAt);
-    const history = this.hookHistory.get(tabId) ?? [];
-    let index = history.length;
-    while (index > 0 && history[index - 1].at > at) index -= 1;
-    history.splice(index, 0, { event, at, replayed: replayedAt !== undefined, stale });
-    if (history.length > HOOK_HISTORY_LIMIT) history.splice(0, history.length - HOOK_HISTORY_LIMIT);
-    this.hookHistory.set(tabId, history);
+    this.recordHookHistory(tabId, { event, at, replayed: replayedAt !== undefined, stale });
     if (stale) {
       this.staleReplays += 1;
       hookLog.info({ tabId, event, at, floor: this.hookFloors.get(tabId) }, 'replayed hook event older than the tab\'s floor or the replay window: history only');
@@ -584,6 +580,34 @@ export class StatusManager {
     }
     this.hookFloors.raise(tabId, at);
     return at;
+  }
+
+  /** Insert one event in the tab's hook history, in time order, keeping the last `HOOK_HISTORY_LIMIT`. */
+  private recordHookHistory(tabId: string, item: IHookHistoryItem): void {
+    const history = this.hookHistory.get(tabId) ?? [];
+    let index = history.length;
+    while (index > 0 && history[index - 1].at > item.at) index -= 1;
+    history.splice(index, 0, item);
+    if (history.length > HOOK_HISTORY_LIMIT) history.splice(0, history.length - HOOK_HISTORY_LIMIT);
+    this.hookHistory.set(tabId, history);
+  }
+
+  /** The Codex launch this server tracks for the tab in memory; null when it tracks none (e.g. since a restart). */
+  codexLaunchLifecycle(tabId: string): { generation: string; phase: 'pending' | 'active' } | null {
+    const tracked = this.codexLifecycleEpoch.get(tabId);
+    return tracked ? { generation: tracked.generation, phase: tracked.phase } : null;
+  }
+
+  /**
+   * A replayed hook its gate refused (ADR-0020): it changes no state, like a
+   * stale replay, and is recorded the same way — in the tab's history as
+   * stale, in the drain's stale count, and in one log line with the reason.
+   */
+  recordSkippedReplay(tmuxSession: string, event: string, replayedAt: number, reason: string): void {
+    const tabId = this.findTabIdBySession(tmuxSession);
+    if (tabId) this.recordHookHistory(tabId, { event, at: replayedAt, replayed: true, stale: true });
+    this.staleReplays += 1;
+    hookLog.info({ tabId, tmuxSession, event, at: replayedAt, reason }, `replayed hook event skipped (${reason}): history only`);
   }
 
   async poll(): Promise<void> {

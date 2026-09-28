@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { ITab } from '@/types/terminal';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
@@ -85,6 +85,9 @@ const makeTab = (): ITab => ({
   lastUserMessage: 'old prompt',
   agentLaunchConfig: { model: 'gpt-6-astra', effort: 'high' },
 });
+
+/** A server that tracks no launch in memory for the tab (e.g. since its restart). */
+const untracked = () => null;
 
 const installValidProcessTree = (generation: string, resume = true): void => {
   mocks.panePid.mockResolvedValue(10);
@@ -501,7 +504,7 @@ describe('Codex managed launch lifecycle', () => {
     const live = withCodexTargetLock('ws-test', 'tab-t', () => liveHeld);
 
     const work = vi.fn(() => 'applied');
-    const replay = await withReplayedCodexHookGeneration(mocks.tab!.sessionName, prepared.intent.generation, work);
+    const replay = await withReplayedCodexHookGeneration(mocks.tab!.sessionName, prepared.intent.generation, work, untracked);
     expect(replay).toEqual({ ok: true, value: 'applied' });
     expect(work).toHaveBeenCalledWith({ workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation });
     // No live condition: no tmux query, no process-tree walk, no process check.
@@ -510,11 +513,11 @@ describe('Codex managed launch lifecycle', () => {
     expect(mocks.running).not.toHaveBeenCalled();
 
     // Attribution still decides: another generation, a malformed session, no generation.
-    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, 'stale-generation', work))
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, 'stale-generation', work, untracked))
       .toEqual({ ok: false, reason: 'generation-not-active' });
-    expect(await withReplayedCodexHookGeneration('pt-ws-test-pane-p-tab-other', prepared.intent.generation, work))
+    expect(await withReplayedCodexHookGeneration('pt-ws-test-pane-p-tab-other', prepared.intent.generation, work, untracked))
       .toEqual({ ok: false, reason: 'generation-not-active' });
-    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, null, work))
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, null, work, untracked))
       .toEqual({ ok: false, reason: 'generation-required' });
     expect(work).toHaveBeenCalledTimes(1);
     expect(mocks.tab!.codexLaunchRuntime!.active!.phase).toBe('active');
@@ -528,9 +531,53 @@ describe('Codex managed launch lifecycle', () => {
     expect(mocks.tab!.codexLaunchRuntime!.active!.phase).toBe('held');
 
     // A held generation applies no replay either.
-    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, prepared.intent.generation, work))
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, prepared.intent.generation, work, untracked))
       .toEqual({ ok: false, reason: 'generation-not-active' });
     expect(work).toHaveBeenCalledTimes(1);
+  });
+
+  it('a replay racing a relaunch applies nothing: the layout read still shows the old generation active, but the tracked launch is pending or newer (ADR-0020)', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test',
+      tabId: 'tab-t',
+      generation: prepared.intent.generation,
+      launcherPid: 20,
+      childPid: 30,
+    });
+    const old = prepared.intent.generation;
+    // The layout read returns the tab as it was just before the relaunch wrote `pending`.
+    expect(mocks.tab!.codexLaunchRuntime!.active!.generation).toBe(old);
+    const work = vi.fn(() => 'applied');
+
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, old, work,
+      () => ({ generation: 'codex-relaunch', phase: 'pending' as const })))
+      .toEqual({ ok: false, reason: 'launch-changed' });
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, old, work,
+      () => ({ generation: old, phase: 'pending' as const })))
+      .toEqual({ ok: false, reason: 'launch-changed' });
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, old, work,
+      () => ({ generation: 'codex-relaunch', phase: 'active' as const })))
+      .toEqual({ ok: false, reason: 'launch-changed' });
+    expect(work).not.toHaveBeenCalled();
+
+    // The tracked launch agrees, or none is tracked: the replay applies.
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, old, work,
+      (tabId) => (tabId === 'tab-t' ? { generation: old, phase: 'active' as const } : null)))
+      .toEqual({ ok: true, value: 'applied' });
+    expect(await withReplayedCodexHookGeneration(mocks.tab!.sessionName, old, work, untracked))
+      .toEqual({ ok: true, value: 'applied' });
+    expect(work).toHaveBeenCalledTimes(2);
+  });
+
+  it('a replay\'s work is synchronous by type: an async work does not type-check (ADR-0020)', () => {
+    type TReplayWork = Parameters<typeof withReplayedCodexHookGeneration>[2];
+    expectTypeOf<() => { applied: null }>().toExtend<TReplayWork>();
+    expectTypeOf<() => string>().toExtend<TReplayWork>();
+    expectTypeOf<() => Promise<{ applied: null }>>().not.toExtend<TReplayWork>();
+    expectTypeOf<() => PromiseLike<string>>().not.toExtend<TReplayWork>();
   });
 
   it('does not claim when PATCH changed desired pins after launch', async () => {

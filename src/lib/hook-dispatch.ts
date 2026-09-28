@@ -86,8 +86,8 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
     `codex ${payload.hook_event_name ?? 'unknown'}`,
   );
   const { result, translation } = processCodexHookPayload(payload);
+  const statusManager = getStatusManager();
   const applyHook = () => {
-    const statusManager = getStatusManager();
     const applied = translation.meta
       ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta, replayedAt)
       : null;
@@ -101,12 +101,20 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
     }
     return { applied };
   };
-  // A replay is checked against the recorded generation only: the live process
-  // proof and the tab's lock are live conditions (ADR-0020).
+  if (replayedAt !== undefined) {
+    // A replay is checked for attribution only: the live process proof, the
+    // tab's lock and the legacy model check are live conditions (ADR-0020).
+    // A legacy hook carries no generation to attribute it by, so it is skipped.
+    const eventName = typeof payload.hook_event_name === 'string' ? payload.hook_event_name : 'codex-hook';
+    const replayed = generation
+      ? await withReplayedCodexHookGeneration(tmuxSession, generation, applyHook,
+        (tabId) => statusManager.codexLaunchLifecycle(tabId))
+      : { ok: false as const, reason: 'legacy-unattributable' };
+    if (!replayed.ok) statusManager.recordSkippedReplay(tmuxSession, eventName, replayedAt, replayed.reason);
+    return NO_CONTENT;
+  }
   const guarded = generation
-    ? replayedAt === undefined
-      ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook)
-      : await withReplayedCodexHookGeneration(tmuxSession, generation, applyHook)
+    ? await withValidatedCodexHookGeneration(tmuxSession, generation, applyHook)
     : await withValidatedLegacyCodexHook(tmuxSession, {
         sessionId: translation.meta?.sessionId ?? null,
         jsonlPath: translation.meta?.jsonlPath,

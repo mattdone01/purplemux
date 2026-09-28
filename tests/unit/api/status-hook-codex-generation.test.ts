@@ -9,6 +9,8 @@ const lifecycle = vi.hoisted(() => ({
 const status = vi.hoisted(() => ({
   applyAgentHookMeta: vi.fn(),
   handleProviderEvent: vi.fn(),
+  codexLaunchLifecycle: vi.fn(() => null),
+  recordSkippedReplay: vi.fn(),
 }));
 vi.mock('@/lib/providers/codex/launch-lifecycle', () => lifecycle);
 vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => status }));
@@ -47,7 +49,7 @@ describe('Codex hook generation gate', () => {
       async (_session: string, _generation: string, work: () => unknown) => ({ ok: true, value: await work() }),
     );
     lifecycle.withReplayedCodexHookGeneration.mockImplementation(
-      async (_session: string, _generation: string, work: () => unknown) => ({ ok: true, value: work() }),
+      async (_session: string, _generation: string, work: () => unknown, _tracked: unknown) => ({ ok: true, value: work() }),
     );
     lifecycle.withValidatedLegacyCodexHook.mockImplementation(
       async (_session: string, _meta: unknown, work: () => unknown) => ({ ok: true, value: await work() }),
@@ -72,11 +74,42 @@ describe('Codex hook generation gate', () => {
     const { query, body } = request();
     await dispatchHook({ query, body, replayedAt: 1_790_576_100_560 });
     expect(lifecycle.withReplayedCodexHookGeneration).toHaveBeenCalledWith(
-      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function),
+      'pt-ws-pins-pane-one-tab-pins', 'codex-generation', expect.any(Function), expect.any(Function),
     );
     expect(lifecycle.withValidatedCodexHookGeneration).not.toHaveBeenCalled();
     expect(status.handleProviderEvent).toHaveBeenCalledWith(
       'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'session-start' }, 1_790_576_100_560,
+    );
+    // The gate reads the launch the status manager tracks in memory for the tab.
+    const tracked = lifecycle.withReplayedCodexHookGeneration.mock.calls[0][3] as (tabId: string) => unknown;
+    status.codexLaunchLifecycle.mockReturnValueOnce({ generation: 'codex-relaunch', phase: 'pending' } as never);
+    expect(tracked('tab-pins')).toEqual({ generation: 'codex-relaunch', phase: 'pending' });
+    expect(status.codexLaunchLifecycle).toHaveBeenCalledWith('tab-pins');
+    expect(status.recordSkippedReplay).not.toHaveBeenCalled();
+  });
+
+  it('a replay its gate refuses (a relaunch raced it) applies nothing and is recorded as a skipped replay with the reason', async () => {
+    lifecycle.withReplayedCodexHookGeneration.mockResolvedValue({ ok: false, reason: 'launch-changed' });
+    const { dispatchHook } = await import('@/lib/hook-dispatch');
+    const { query, body } = request();
+    expect(await dispatchHook({ query, body, replayedAt: 1_790_576_100_560 })).toEqual({ status: 204 });
+    expect(status.applyAgentHookMeta).not.toHaveBeenCalled();
+    expect(status.handleProviderEvent).not.toHaveBeenCalled();
+    expect(status.recordSkippedReplay).toHaveBeenCalledWith(
+      'pt-ws-pins-pane-one-tab-pins', 'SessionStart', 1_790_576_100_560, 'launch-changed',
+    );
+  });
+
+  it('a replayed legacy hook (no generation) is skipped as unattributable: never the tab lock or the model check (ADR-0020)', async () => {
+    const { dispatchHook } = await import('@/lib/hook-dispatch');
+    const { query, body } = request('');
+    expect(await dispatchHook({ query, body, replayedAt: 1_790_576_100_560 })).toEqual({ status: 204 });
+    expect(lifecycle.withValidatedLegacyCodexHook).not.toHaveBeenCalled();
+    expect(lifecycle.withReplayedCodexHookGeneration).not.toHaveBeenCalled();
+    expect(status.applyAgentHookMeta).not.toHaveBeenCalled();
+    expect(status.handleProviderEvent).not.toHaveBeenCalled();
+    expect(status.recordSkippedReplay).toHaveBeenCalledWith(
+      'pt-ws-pins-pane-one-tab-pins', 'SessionStart', 1_790_576_100_560, 'legacy-unattributable',
     );
   });
 

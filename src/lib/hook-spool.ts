@@ -171,11 +171,14 @@ type TReplayOutcome = { kind: 'applied' } | { kind: 'threw'; err: unknown } | { 
 
 /**
  * Run one replay, bounded. A replay that has not settled within `timeoutMs` is
- * abandoned, never cancelled: if it settles later its error is logged, and
- * its state change, if any, is ordered against the tab's floor like any replay.
+ * abandoned, never cancelled. Its file is in `bad/` by then, so when it settles
+ * later one log line says how, and when, with the file's name: an operator
+ * who re-injects a `bad/` file must know whether it already applied. A late
+ * state change is ordered against the tab's floor like any replay.
  */
 const replayBounded = async (run: () => Promise<unknown>, timeoutMs: number, file: string): Promise<TReplayOutcome> => {
   let timer: NodeJS.Timeout | undefined;
+  const startedAt = Date.now();
   const replay = Promise.resolve().then(run);
   const timeout = new Promise<TReplayOutcome>((resolve) => {
     timer = setTimeout(() => resolve({ kind: 'timed-out' }), timeoutMs);
@@ -186,8 +189,12 @@ const replayBounded = async (run: () => Promise<unknown>, timeoutMs: number, fil
       timeout,
     ]);
     if (outcome.kind === 'timed-out') {
-      replay.catch((err: unknown) => {
-        log.warn({ file, err }, 'a replay abandoned after its time bound failed later');
+      replay.then(() => {
+        const afterMs = Date.now() - startedAt;
+        log.warn({ file, afterMs }, `abandoned replay of ${file} applied at +${afterMs} ms; its file is in ${HOOK_SPOOL_BAD_DIRNAME}/`);
+      }, (err: unknown) => {
+        const afterMs = Date.now() - startedAt;
+        log.warn({ file, afterMs, err }, `abandoned replay of ${file} failed at +${afterMs} ms`);
       });
     }
     return outcome;

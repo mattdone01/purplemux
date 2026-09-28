@@ -361,7 +361,9 @@ deleted when applied; unreadable ones, replays that throw, and replays not finis
 one `hook spool drain:` line (applied, stale, timed out, bad, duration).
 Files past `HOOK_REPLAY_WINDOW_MS` (1 h) and metadata-only files (body over 256 KiB) are deleted
 without dispatch. A replayed Codex hook passes `withReplayedCodexHookGeneration`: the recorded
-active generation only, with no process proof and no target lock, and it never holds the generation.
+active generation and the launch the status manager tracks (`codexLaunchLifecycle`), with no process
+proof and no target lock, and it never holds the generation. A replayed legacy Codex hook (no
+generation) is skipped; a skipped replay is recorded by `recordSkippedReplay` as a stale one.
 
 `replayedAt` threads through `handleProviderEvent`, `updateTabFromHook`, `applyAgentHookMeta` and
 `handleToolActivity`:

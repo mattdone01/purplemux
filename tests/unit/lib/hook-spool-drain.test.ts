@@ -59,8 +59,9 @@ vi.mock('@/lib/providers/codex/launch-lifecycle', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/providers/codex/launch-lifecycle')>()),
   withValidatedCodexHookGeneration: vi.fn(async (_session: string, generation: string, work: (identity: unknown) => unknown) =>
     ({ ok: true, value: await work({ workspaceId: 'ws-1', tabId: 'c', generation }) })),
-  withReplayedCodexHookGeneration: vi.fn(async (_session: string, generation: string, work: (identity: unknown) => unknown) =>
+  withReplayedCodexHookGeneration: vi.fn(async (_session: string, generation: string, work: (identity: unknown) => unknown, _tracked: unknown) =>
     ({ ok: true, value: work({ workspaceId: 'ws-1', tabId: 'c', generation }) })),
+  withValidatedLegacyCodexHook: vi.fn(async () => ({ ok: false, reason: 'legacy-model-unverified' })),
 }));
 vi.mock('@/lib/liveness-manager', () => ({
   getLivenessManager: () => ({
@@ -347,6 +348,45 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     await manager.drainHookSpool();
     await manager.poll();
     expect(drain).toHaveBeenCalledTimes(2);
+  });
+
+  it('a spooled legacy Codex hook and a replay racing a relaunch apply nothing: each is history only, counted stale, and its file is deleted', async () => {
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    const entry: ITabStatusEntry = {
+      cliState: 'idle', workspaceId: 'ws-1', tabName: 'c', tmuxSession: 'tmux-c', panelType: 'codex-cli',
+      agentProviderId: 'codex', agentSessionId: 'sess-c', jsonlPath: '/tmp/c.jsonl', lastEvent: null, eventSeq: 0,
+    };
+    manager.registerTab('c', entry);
+    // A relaunch began: the status manager tracks generation g2 as pending.
+    manager.markCodexLaunchPending('c', 'g2');
+    expect(manager.codexLaunchLifecycle('c')).toEqual({ generation: 'g2', phase: 'pending' });
+    const lifecycle = await import('@/lib/providers/codex/launch-lifecycle');
+    vi.mocked(lifecycle.withReplayedCodexHookGeneration).mockImplementationOnce(async (_session, generation, _work, tracked) => {
+      const launch = tracked('c');
+      return launch && (launch.phase !== 'active' || launch.generation !== generation)
+        ? { ok: false, reason: 'launch-changed' }
+        : { ok: true, value: _work({ workspaceId: 'ws-1', tabId: 'c', generation: generation! }) };
+    });
+    const now = Date.now();
+    const prompt = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-c', prompt: 'go' };
+    await spoolEvent(now - 2_000, prompt, 'provider=codex&tmuxSession=tmux-c&generation=g1', 'tmux-c');
+    await spoolEvent(now - 1_000, prompt, 'provider=codex&tmuxSession=tmux-c', 'tmux-c');
+
+    await manager.drainHookSpool();
+
+    expect(entry.cliState).toBe('idle');
+    expect(entry.lastEvent).toBeNull();
+    expect(lifecycle.withValidatedLegacyCodexHook).not.toHaveBeenCalled();
+    expect(manager.getHookHistory('c')).toEqual([
+      { event: 'UserPromptSubmit', at: now - 2_000, replayed: true, stale: true },
+      { event: 'UserPromptSubmit', at: now - 1_000, replayed: true, stale: true },
+    ]);
+    expect(logs.lines.filter((line) => line.msg.startsWith('replayed hook event skipped (launch-changed)'))).toHaveLength(1);
+    expect(logs.lines.filter((line) => line.msg.startsWith('replayed hook event skipped (legacy-unattributable)'))).toHaveLength(1);
+    expect(logs.lines.find((line) => line.msg.startsWith('hook spool drain:')))
+      .toMatchObject({ fields: { applied: 2, stale: 2, timedOut: 0, bad: 0 } });
+    expect(await fs.readdir(spoolDir())).toEqual([]);
   });
 
   it('logs one line per drain that found files: applied, stale, timed out, bad, and the duration', async () => {
@@ -704,6 +744,23 @@ describe('drainHookSpool (ADR-0020)', () => {
     // Never retried.
     expect(await drain(apply, { now, eventTimeoutMs: bound })).toMatchObject({ applied: 0, timedOut: 0, bad: 0 });
     expect(apply).toHaveBeenCalledTimes(4);
+  });
+
+  it('an abandoned replay that settles later logs how and when, with its file name', async () => {
+    const now = Date.now();
+    const late = await spoolEvent(now - 2_000, claudePrompt());
+    const failing = await spoolEvent(now - 1_000, claudeStop());
+    const apply = vi.fn((d: IHookDelivery) => new Promise<void>((resolve, reject) => {
+      setTimeout(() => (d.replayedAt === now - 2_000 ? resolve() : reject(new Error('late 5xx'))), 150);
+    }));
+    expect(await drain(apply, { now, eventTimeoutMs: 30 })).toMatchObject({ applied: 0, timedOut: 2, bad: 2 });
+    await waitFor(() => {
+      const applied = logs.lines.find((line) => line.msg.startsWith(`abandoned replay of ${late} applied at +`));
+      expect(applied).toMatchObject({ level: 'warn', fields: { file: late } });
+      expect((applied!.fields as { afterMs: number }).afterMs).toBeGreaterThanOrEqual(140);
+      expect(logs.lines.find((line) => line.msg.startsWith(`abandoned replay of ${failing} failed at +`)))
+        .toMatchObject({ level: 'warn', fields: { file: failing } });
+    });
   });
 
   it('a replay that settles within the bound is applied, and the default bound is 5 s', async () => {

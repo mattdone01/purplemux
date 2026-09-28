@@ -713,6 +713,13 @@ export const withValidatedCodexHookGeneration = async <T>(
   });
 };
 
+/** What a replayed hook's work may return: anything but a promise, so check and work share one event-loop turn. */
+export type TSyncReplayValue = string | number | boolean | bigint | symbol | null | undefined
+  | { readonly [key: string]: unknown; then?: never };
+
+/** The Codex launch the status manager tracks in memory for a tab, when it tracks one. */
+export type TTrackedCodexLaunch = (tabId: string) => { generation: string; phase: 'pending' | 'active' } | null;
+
 /**
  * The gate of a REPLAYED Codex hook (ADR-0020): attribution only. The event
  * applies when its generation is the tab's recorded active one, and is skipped
@@ -725,14 +732,20 @@ export const withValidatedCodexHookGeneration = async <T>(
  * processes, load 75) one walk of a Codex pane's 30 descendants took 4.8 s. The
  * lock queues the replay behind every live hook of the same busy tab, each
  * running that proof: the drain spent 10 s to 130 s per Codex event, and the
- * poll waited for the drain. The check
- * and `work` run in one turn of the event loop after the layout read, so no
- * lifecycle change interleaves between them.
+ * poll waited for the drain.
+ *
+ * Without the lock, the layout read can return the tab as it was just before
+ * a relaunch wrote its `pending` launch. So the launch the status manager
+ * tracks in memory (`tracked`) decides too: a `pending` launch or another
+ * generation skips the event. After the layout read, the checks and `work` run
+ * in one turn of the event loop, so `work` must be synchronous: its type
+ * refuses a promise.
  */
-export const withReplayedCodexHookGeneration = async <T>(
+export const withReplayedCodexHookGeneration = async <T extends TSyncReplayValue>(
   sessionName: string,
   generation: string | null | undefined,
   work: (identity: IValidatedCodexHookGeneration) => T,
+  tracked: TTrackedCodexLaunch,
 ): Promise<{ ok: true; value: T } | { ok: false; reason: string }> => {
   if (!generation) return { ok: false, reason: 'generation-required' };
   const parsed = (await import('@/lib/layout-store')).parseSessionName(sessionName);
@@ -742,6 +755,10 @@ export const withReplayedCodexHookGeneration = async <T>(
   if (!found || !active || active.generation !== generation || active.phase !== 'active'
     || found.tab.codexLaunchRuntime?.pending || active.sessionName !== sessionName) {
     return { ok: false, reason: 'generation-not-active' };
+  }
+  const launch = tracked(parsed.tabId);
+  if (launch && (launch.phase !== 'active' || launch.generation !== generation)) {
+    return { ok: false, reason: 'launch-changed' };
   }
   return { ok: true, value: work({ workspaceId: parsed.wsId, tabId: parsed.tabId, generation }) };
 };
