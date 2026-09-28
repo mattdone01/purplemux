@@ -4,6 +4,7 @@ import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { readClaudeRuntimeSnapshot } from '@/lib/providers/claude/runtime-snapshot';
 import { readCodexRuntimeSnapshot } from '@/lib/providers/codex/runtime-snapshot';
+import { extractTurnMarker } from '@/lib/turn-end';
 import { summarizeGrokEntries } from '@/lib/providers/grok/runtime-snapshot';
 
 const writeJsonl = async (lines: unknown[]): Promise<string> => {
@@ -203,6 +204,30 @@ describe('Codex and Grok turn tails', () => {
     ]);
     const snapshot = await readCodexRuntimeSnapshot(jsonlPath);
     expect(snapshot.lastAssistantTail?.split('\n').at(-1)).toBe('BLOCKED: gate red — needs X');
+  });
+
+  it('reads a Codex 0.157 turn end from task_complete.last_agent_message (no agent_message event exists)', async () => {
+    // The shape of tab-qVoUnB's session (Codex 0.157.1, 28 Sep 12:23Z), ids trimmed: the answer is an
+    // item_completed AgentMessage, a response_item assistant message, and task_complete.last_agent_message.
+    const final = 'DONE: codex-eng-review idle, queue empty.';
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-28T12:23:07.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't1' } },
+      { timestamp: '2026-09-28T12:23:10.835Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'End this turn with exactly: DONE: …' }] } },
+      { timestamp: '2026-09-28T12:23:21.880Z', type: 'event_msg', payload: { type: 'item_completed', turn_id: 't1', item: { type: 'AgentMessage', content: [{ type: 'str', text: final }], phase: 'final_answer' } } },
+      { timestamp: '2026-09-28T12:23:21.882Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: final }], phase: 'final_answer' } },
+      { timestamp: '2026-09-28T12:23:24.367Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: final } },
+    ]);
+    const snapshot = await readCodexRuntimeSnapshot(jsonlPath);
+    expect(snapshot.lastAssistantTail).toBe(final);
+    expect(extractTurnMarker(snapshot.lastAssistantTail)).toEqual([final]);
+  });
+
+  it('takes no Codex 0.157 tail from an older turn once a newer turn has started', async () => {
+    const jsonlPath = await writeJsonl([
+      { timestamp: '2026-09-28T12:23:24.367Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: 'DONE: old' } },
+      { timestamp: '2026-09-28T12:30:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't2' } },
+    ]);
+    expect((await readCodexRuntimeSnapshot(jsonlPath)).lastAssistantTail ?? null).toBeNull();
   });
 
   it('has no Codex tail when the last event is a new user message', async () => {

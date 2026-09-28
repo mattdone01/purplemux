@@ -23,6 +23,8 @@ interface ICodexScanState {
   completionSeen: boolean;
   /** Walking backwards, a user message was passed: any completion before it belongs to an older turn. */
   userSeen: boolean;
+  /** Walking backwards, a `task_started` was passed: a newer turn has begun (Codex 0.157 has no user_message event). */
+  turnStartedSeen: boolean;
   reset: boolean;
   lastEntryTs: number | null;
   interrupted: boolean;
@@ -137,6 +139,7 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
     lastTurnError: null,
     completionSeen: false,
     userSeen: false,
+    turnStartedSeen: false,
     reset: false,
     lastEntryTs: null,
     interrupted: false,
@@ -161,11 +164,26 @@ const scanCodexLines = (lines: string[], elapsed: number): IAgentRuntimeSnapshot
       if (isCompletionEvent(eventType)) {
         // Walking backwards, the first completion is the current turn's end.
         if (!state.completionSeen && !state.userSeen) state.lastTurnError = codexTurnError(payload);
+        // Codex 0.157 writes no `agent_message` event: the turn's final answer is `last_agent_message` on its
+        // `task_complete` (measured 28 Sep on tab-qVoUnB: 0 agent_message events in 2446 lines, so every turn
+        // read as "idle without an end line"). Only the current turn's completion supplies the tail.
+        if (!state.completionSeen && !state.userSeen && !state.turnStartedSeen) {
+          const finalMessage = safeString(payload.last_agent_message);
+          if (finalMessage) {
+            if (!state.lastAssistantSnippet) state.lastAssistantSnippet = compact(finalMessage);
+            if (!state.reset && !state.lastAssistantTail) {
+              state.lastAssistantTail = finalMessage.trimEnd().slice(-TURN_TAIL_CHARS);
+            }
+          }
+        }
         state.completionSeen = true;
         state.terminalIdle = true;
         state.needsStaleRecheck = false;
         state.staleMs = 0;
         continue;
+      }
+      if (eventType === 'task_started' && !state.completionSeen) {
+        state.turnStartedSeen = true;
       }
       if (isInterruptEvent(eventType)) {
         state.terminalIdle = true;
