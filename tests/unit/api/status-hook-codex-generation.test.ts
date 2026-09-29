@@ -15,6 +15,9 @@ const status = vi.hoisted(() => ({
   codexLaunchLifecycle: vi.fn(() => null),
   recordSkippedReplay: vi.fn(),
   agentSessionIdForTmuxSession: vi.fn((): string | null => null),
+  raiseSubagentPermission: vi.fn(),
+  resolveSubagentPrompt: vi.fn(),
+  clearSubagentPrompt: vi.fn(),
 }));
 vi.mock('@/lib/providers/codex/launch-lifecycle', () => lifecycle);
 vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => status }));
@@ -200,9 +203,25 @@ describe('Codex hook generation gate', () => {
       const meta = status.applyAgentHookMeta.mock.calls[0][2] as Record<string, unknown>;
       expect(Object.keys(meta)).toEqual(['permissionRequest']);
       expect(meta.permissionRequest).toBeTruthy();
-      expect(status.handleProviderEvent).toHaveBeenCalledWith(
-        'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'notification', notificationType: 'permission_prompt' }, undefined,
-      );
+      expect(status.raiseSubagentPermission).toHaveBeenCalledWith('pt-ws-pins-pane-one-tab-pins');
+      expect(status.handleProviderEvent).not.toHaveBeenCalled();
+    });
+
+    it("a subagent's later hook tells the tab its prompt was answered; a replayed prompt is dropped", async () => {
+      const { dispatchHook } = await import('@/lib/hook-dispatch');
+      const { query } = request();
+      await dispatchHook({ query, body: { hook_event_name: 'PostToolUse', session_id: ROOT, transcript_path: childTranscript() } });
+      expect(status.resolveSubagentPrompt).toHaveBeenCalledWith('pt-ws-pins-pane-one-tab-pins');
+
+      vi.clearAllMocks();
+      await dispatchHook({
+        query,
+        body: { hook_event_name: 'PermissionRequest', session_id: ROOT, transcript_path: childTranscript() },
+        replayedAt: 1_790_648_000_000,
+      });
+      expect(status.raiseSubagentPermission).not.toHaveBeenCalled();
+      expect(status.applyAgentHookMeta).not.toHaveBeenCalled();
+      expect(status.resolveSubagentPrompt).not.toHaveBeenCalled();
     });
 
     it("the root's own Stop still applies", async () => {
@@ -217,6 +236,7 @@ describe('Codex hook generation gate', () => {
 
       expect(status.applyAgentHookMeta).toHaveBeenCalled();
       expect(status.handleProviderEvent).toHaveBeenCalledWith('codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'stop' }, undefined);
+      expect(status.clearSubagentPrompt).toHaveBeenCalledWith('pt-ws-pins-pane-one-tab-pins');
     });
   });
 });

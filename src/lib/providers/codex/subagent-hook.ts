@@ -34,6 +34,11 @@ export const transcriptIsSubagent = async (transcriptPath: string): Promise<bool
   if (cached !== undefined) return cached;
   const firstLine = await readTranscriptFirstLine(transcriptPath);
   if (firstLine === null) return false; // not written yet, or unreadable: never cached
+  try {
+    JSON.parse(firstLine);
+  } catch {
+    return false; // caught mid-write (a last line without its newline): not cached
+  }
   const subagent = isSubagentSessionMeta(firstLine);
   if (subagentByTranscript.size >= MAX_CACHED_TRANSCRIPTS) {
     const oldest = subagentByTranscript.keys().next().value;
