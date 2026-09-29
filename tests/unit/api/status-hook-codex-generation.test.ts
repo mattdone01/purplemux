@@ -1,4 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const lifecycle = vi.hoisted(() => ({
@@ -135,5 +138,65 @@ describe('Codex hook generation gate', () => {
       },
       expect.any(Function),
     );
+  });
+
+  describe('a native subagent hook (tab-QizeO4, 2026-09-29)', () => {
+    const ROOT = '01a0eacc-66cd-7700-a4ae-72adbd13aa58';
+    const CHILD = '01a0eae0-a62b-79e1-b096-5c959155263e';
+    const writeTranscript = (session: string, meta: unknown) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-subagent-route-'));
+      const file = path.join(dir, `rollout-2026-09-29T01-56-26-${session}.jsonl`);
+      fs.writeFileSync(file, `${JSON.stringify(meta)}\n`);
+      return file;
+    };
+    const childTranscript = () => writeTranscript(CHILD, {
+      type: 'session_meta',
+      payload: { id: CHILD, source: { subagent: { thread_spawn: { parent_thread_id: ROOT, depth: 1 } } }, thread_source: 'subagent' },
+    });
+
+    it.each(['PreToolUse', 'PostToolUse', 'Stop'])(
+      'a subagent %s applies nothing to the parent tab: no transcript re-key, no work-state event',
+      async (event) => {
+        const { default: handler } = await import('@/pages/api/status/hook');
+        const req = request();
+        (req as unknown as { body: Record<string, unknown> }).body = {
+          hook_event_name: event, session_id: ROOT, transcript_path: childTranscript(),
+        };
+        const res = response();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(204);
+        expect(status.applyAgentHookMeta).not.toHaveBeenCalled();
+        expect(status.handleProviderEvent).not.toHaveBeenCalled();
+        expect(lifecycle.withValidatedCodexHookGeneration).not.toHaveBeenCalled();
+      },
+    );
+
+    it("a replayed subagent hook is skipped the same way", async () => {
+      const { dispatchHook } = await import('@/lib/hook-dispatch');
+      const { query } = request();
+      await dispatchHook({
+        query,
+        body: { hook_event_name: 'PostToolUse', session_id: ROOT, transcript_path: childTranscript() },
+        replayedAt: 1_790_648_000_000,
+      });
+      expect(status.applyAgentHookMeta).not.toHaveBeenCalled();
+      expect(lifecycle.withReplayedCodexHookGeneration).not.toHaveBeenCalled();
+    });
+
+    it("the root's own Stop still applies", async () => {
+      const { default: handler } = await import('@/pages/api/status/hook');
+      const req = request();
+      (req as unknown as { body: Record<string, unknown> }).body = {
+        hook_event_name: 'Stop', session_id: ROOT,
+        transcript_path: writeTranscript(ROOT, { type: 'session_meta', payload: { id: ROOT, source: 'cli' } }),
+      };
+
+      await handler(req, response());
+
+      expect(status.applyAgentHookMeta).toHaveBeenCalled();
+      expect(status.handleProviderEvent).toHaveBeenCalledWith('codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'stop' }, undefined);
+    });
   });
 });
