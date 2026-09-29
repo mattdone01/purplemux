@@ -91,8 +91,9 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
   // parent tab's session or transcript, nor move its work state (tab-QizeO4, 2026-09-29). Its
   // PermissionRequest is dropped too (architect ruling 2026-09-29, option C): every way of showing
   // it on the tab could leave the tab stuck; the fleet runs approval_policy "never", an attended
-  // session shows the prompt in the pane, and an automated send refuses a pane showing an option
-  // list (composer-readiness). Surfacing it is its own story.
+  // session shows the prompt in the pane, and every automated sender reads the pane and refuses an
+  // option list (the inbox dispatcher, `tab send`, the watchdog-nudge dispatcher). Surfacing it is
+  // its own story.
   if (await isCodexSubagentHook(payload, statusManager.agentSessionIdForTmuxSession(tmuxSession))) {
     log.debug(
       { tmuxSession, event: payload.hook_event_name, sessionId: payload.session_id, replayedAt },

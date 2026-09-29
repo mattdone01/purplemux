@@ -6,6 +6,8 @@ import type { TCliState } from '@/types/timeline';
 const tmux = vi.hoisted(() => ({
   hasSession: vi.fn(async () => true),
   isContentPendingInComposer: vi.fn(async () => false),
+  /** The pane the send route reads before it pastes: an empty composer unless a test says otherwise. */
+  capturePaneContent: vi.fn(async (): Promise<string | null> => '› \n'),
 }));
 
 const delivery = vi.hoisted(() => ({
@@ -118,9 +120,36 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     live.waiting = new Set();
     tmux.hasSession.mockResolvedValue(true);
     tmux.isContentPendingInComposer.mockResolvedValue(false);
+    tmux.capturePaneContent.mockResolvedValue('› \n');
     cliUtils.authorizeWorkspaceInput.mockResolvedValue({ type: 'workspace', workspaceId: WORKSPACE_ID });
     cliUtils.findTab.mockResolvedValue(locate(tabWith('idle')));
     ({ default: handler } = await import('@/pages/api/cli/tabs/[tabId]/send'));
+  });
+
+  // ppc-48 (architect ruling, option C): a Codex native subagent's approval dialog reaches no tab
+  // state, so the tab can read ready-for-review while its pane waits on "Press enter to confirm". The
+  // route reads the pane and never pastes + Enter into an option list (real Codex 0.158 capture).
+  it('refuses to paste into an approval dialog the tab does not know about (ppc-48)', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const dialog = fs.readFileSync(path.join(__dirname, '../../fixtures/panes/codex-0158-approval-80x24.txt'), 'utf-8');
+    tmux.capturePaneContent.mockResolvedValueOnce(dialog);
+    cliUtils.findTab.mockResolvedValue(locate(tabWith('ready-for-review', 'codex-cli')));
+
+    const response = await call({ content: 'next task' });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toMatchObject({ code: 'interactive-prompt-active' });
+    expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+  });
+
+  it('never reads the pane of a terminal tab (it stays ungated)', async () => {
+    cliUtils.findTab.mockResolvedValue(locate(tabWith(undefined, 'terminal')));
+
+    const response = await call({ content: 'ls' });
+
+    expect(response.statusCode).toBe(200);
+    expect(tmux.capturePaneContent).not.toHaveBeenCalled();
   });
 
   it('pastes into a ready agent and reports it submitted', async () => {

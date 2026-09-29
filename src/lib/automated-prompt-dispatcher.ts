@@ -1,6 +1,8 @@
 import { withAgentDispatchLock, type IAgentDispatchPolicyOptions } from '@/lib/agent-dispatch-policy';
 import { findTab } from '@/lib/cli-utils';
-import { hasSession, isLinePendingInComposer, pressEnter } from '@/lib/tmux';
+import { capturePaneContent, hasSession, isLinePendingInComposer, pressEnter } from '@/lib/tmux';
+import { paneShowsInteractivePrompt } from '@/lib/composer-readiness';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { createLogger } from '@/lib/logger';
 import type { ITab } from '@/types/terminal';
@@ -21,7 +23,7 @@ export interface IAutomatedPromptRequest {
 export type TAutomatedPromptResult =
   /** `resubmitted`: the text was still in the composer after the Enter, so Enter was pressed once more (L37). */
   | { delivered: true; resubmitted?: true; stillPending?: true }
-  | { delivered: false; reason: 'target-not-found' | 'session-not-found' | 'model-policy' | 'policy-error' | 'delivery-error'; error?: unknown; policy?: IPolicyResult };
+  | { delivered: false; reason: 'target-not-found' | 'session-not-found' | 'model-policy' | 'policy-error' | 'delivery-error' | 'interactive-prompt-active'; error?: unknown; policy?: IPolicyResult };
 
 export interface IAutomatedPromptDispatcherDeps {
   findTarget: (workspaceId: string, tabId: string) => Promise<ITab | null>;
@@ -41,6 +43,11 @@ export interface IAutomatedPromptDispatcherDeps {
   pressEnter?: (sessionName: string) => Promise<void>;
   /** The settle wait before the check, so the TUI has drawn the submit (review r1 finding 5). */
   settle?: (ms: number) => Promise<void>;
+  /**
+   * The pane, read before the paste: a paste + Enter into an option list chooses its highlighted
+   * option (a Codex subagent's approval dialog reaches no tab state; ppc-48, option C).
+   */
+  readPane?: (sessionName: string) => Promise<string | null>;
 }
 
 /** How long the TUI gets to clear its composer after the Enter before the check reads it. */
@@ -55,6 +62,7 @@ const defaultDeps: IAutomatedPromptDispatcherDeps = {
   isPending: (sessionName, message) => isLinePendingInComposer(sessionName, message),
   pressEnter: (sessionName) => pressEnter(sessionName),
   settle: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+  readPane: (sessionName) => capturePaneContent(sessionName, { escapes: true }),
 };
 
 export class AutomatedPromptDispatcher {
@@ -120,6 +128,13 @@ export class AutomatedPromptDispatcher {
       return { delivered: false, reason: 'policy-error', error };
     }
     if (!policy.ok) return { delivered: false, reason: 'model-policy', policy };
+
+    if (this.deps.readPane && isAgentPanelType(target.panelType)) {
+      const pane = await this.deps.readPane(target.sessionName).catch(() => null);
+      if (pane && paneShowsInteractivePrompt(target.panelType, pane)) {
+        return { delivered: false, reason: 'interactive-prompt-active' };
+      }
+    }
 
     try {
       await this.deps.paste(target.sessionName, message);
