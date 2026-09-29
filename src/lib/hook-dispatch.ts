@@ -90,9 +90,12 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
   // A native subagent's hook shares its parent's pane and generation: it must never re-key the
   // parent tab's session or transcript, nor move its work state (tab-QizeO4, 2026-09-29). Its
   // PermissionRequest is dropped too (architect ruling 2026-09-29, option C): every way of showing
-  // it on the tab could leave the tab stuck; the fleet runs approval_policy "never", an attended
-  // session shows the prompt in the pane, and an automated send refuses a pane showing an option
-  // list (composer-readiness). Surfacing it is its own story.
+  // it on the tab could leave the tab stuck. What that leaves, stated exactly (ruling A of the
+  // send-guard consult): only the inbox dispatcher reads the pane before a paste; `tab send` and the
+  // watchdog nudges do not, as before this change. The orchestrator keeper's heartbeat used to stay
+  // quiet while a subagent's prompt held the tab in needs-input and no longer does. None of this can
+  // happen while Codex tabs launch with --yolo (dangerouslySkipPermissions, true on this host; the
+  // Codex orchestrators record approval_policy "never"). A dialog-aware send guard is its own story.
   if (await isCodexSubagentHook(payload, statusManager.agentSessionIdForTmuxSession(tmuxSession))) {
     log.debug(
       { tmuxSession, event: payload.hook_event_name, sessionId: payload.session_id, replayedAt },
