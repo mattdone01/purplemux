@@ -55,10 +55,16 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
   const spoolFiles = () => (fs.existsSync(spool) ? fs.readdirSync(spool).sort() : []);
+  /** The hook writes a dot-named temporary, then renames it: wait for the renamed file, not the temporary. */
+  const spoolLanded = () => spoolFiles().some((name) => name.endsWith('.json') && !name.startsWith('.'));
 
-  /** Detached POSTs finish after the script exits; wait for their file or their curl call. */
+  /**
+   * Detached POSTs finish after the script exits; wait for their file or their curl call. It
+   * returns as soon as they land; the deadline only has to outlast a loaded host (3 s flaked at
+   * load ~137 on 2026-09-29).
+   */
   const settle = (until: () => boolean) => {
-    const deadline = Date.now() + 3_000;
+    const deadline = Date.now() + 10_000;
     while (!until() && Date.now() < deadline) spawnSync('sleep', ['0.05']);
   };
 
@@ -136,6 +142,25 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     expect(spoolFiles()).toEqual([]);
   });
 
+  // The server may already have applied an event whose POST timed out after the connect (curl
+  // 28 with a non-zero time_connect) or whose connection the server cut while it exited (52:
+  // empty reply, 56: receive failure). A replay or a retry would apply it twice. Codex Astra
+  // consult 2026-09-29 (note n-TkRGbP0Fsp): the --max-time bound must keep this.
+  it.each([
+    ['28 after the connect', { out: '000 0.000180', exit: 28 }],
+    ['52 (empty reply: the server cut the connection)', { out: '000 0.000150', exit: 52 }],
+    ['56 (receive failure)', { out: '000 0.000150', exit: 56 }],
+  ])('curl %s: one POST, never retried, never spooled (claude and codex hooks)', (_label, curl: ICurlBehaviour) => {
+    const curlCalls = () => (fs.existsSync(path.join(dir, 'curl-args'))
+      ? fs.readFileSync(path.join(dir, 'curl-args'), 'utf-8').trim().split('\n').length
+      : 0);
+    run(HOOK_SCRIPT_CONTENT, ['stop'], '{}', curl);
+    expect(curlCalls()).toBe(1);
+    run(CODEX_HOOK_SCRIPT_CONTENT, [], '{"hook_event_name":"Stop"}', curl, {}, 'bash');
+    expect(curlCalls()).toBe(2);
+    expect(spoolFiles()).toEqual([]);
+  });
+
   it('spools when no server is running at all (the port file is gone), without calling curl', () => {
     fs.rmSync(path.join(home, '.purplemux', 'port'));
     run(HOOK_SCRIPT_CONTENT, ['session-start'], '{"source":"resume"}', DELIVERED);
@@ -146,7 +171,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
   it('spools a detached post-tool event with its kind and the raw tool JSON, quotes and newlines intact', () => {
     const tool = { tool_name: 'Bash', tool_input: { command: 'echo "a\\b"\nls' }, tool_response: { exit_code: 1 } };
     run(HOOK_SCRIPT_CONTENT, ['post-tool'], JSON.stringify(tool), REFUSED);
-    settle(() => spoolFiles().length > 0);
+    settle(spoolLanded);
     const spooled = readOnly();
     expect(spooled.query).toBe(`kind=tool&session=${SESSION}`);
     expect(spooled.body).toEqual(tool);
@@ -190,7 +215,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
   it('spools a post-tool body over 256 KiB as metadata only: kind, session, time and size, no body', () => {
     const body = JSON.stringify({ tool_name: 'Write', tool_input: { file_path: '/tmp/big.txt', content: 'x'.repeat(300 * 1024) } });
     run(HOOK_SCRIPT_CONTENT, ['post-tool'], body, REFUSED);
-    settle(() => spoolFiles().length > 0);
+    settle(spoolLanded);
     const spooled = readOnly();
     expect(spooled.query).toBe(`kind=tool&session=${SESSION}`);
     expect(spooled.session).toBe(SESSION);
@@ -201,7 +226,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
 
   it('the detached grok hook spools its stdin body with the provider query', () => {
     run(GROK_HOOK_SCRIPT_CONTENT, [], '{"hookEventName":"stop"}', REFUSED);
-    settle(() => spoolFiles().length > 0);
+    settle(spoolLanded);
     const spooled = readOnly();
     expect(spooled.query).toBe(`provider=grok&tmuxSession=${SESSION}`);
     expect(spooled.body).toEqual({ hookEventName: 'stop' });

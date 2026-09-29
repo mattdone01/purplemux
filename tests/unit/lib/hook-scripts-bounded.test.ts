@@ -30,8 +30,12 @@ const SESSION = 'pt-ws-1-pane-a-tab-w';
  * under KILL_MS, so it only has to tell a bounded hook from an unbounded one.
  */
 const BOUNDED_MS = 8_000;
-/** A detached hook (post-tool, grok) must hand its pipes back at once, not after its POST. */
-const DETACHED_MS = 1_000;
+/**
+ * A detached hook (post-tool, grok) must hand its pipes back at once, not after its POST. A hook
+ * that holds them costs at least the 2 s POST bound, so 1.5 s still tells the two apart on a
+ * loaded host.
+ */
+const DETACHED_MS = 1_500;
 /** Kill a hook still running here: the unbounded case, reported as a failure, not a hang. */
 const KILL_MS = 15_000;
 
@@ -184,9 +188,10 @@ describe('the bounds', () => {
   });
 
   it("the POST bound and a start-up margin fit inside Claude's hook timeout", () => {
-    // Against a stalled server the hook must end on its own (exit 0), not by Claude's kill.
-    // (A wedged tmux AND a stalled server together can still reach Claude's kill; tmux is
-    // bounded separately, at HOOK_TMUX_TIMEOUT_SECONDS.)
+    // Against a stalled server one POST must end on its own (exit 0), not by Claude's kill.
+    // Two paths can still reach Claude's kill, and lose nothing but that event's delivery: a
+    // wedged tmux together with a stalled server, and a session-start on a tab without
+    // PMUX_TAB_ID, which also asks the server for its identity (a second bounded request).
     const startUpMarginSeconds = 0.5;
     expect(HOOK_MAX_TIME_SECONDS + startUpMarginSeconds).toBeLessThan(CLAUDE_HOOK_TIMEOUT_SECONDS);
     expect(HOOK_TMUX_TIMEOUT_SECONDS).toBeLessThanOrEqual(1);

@@ -30,7 +30,12 @@ export const HOOK_SPOOL_MAX_BODY = 256 * 1024;
 export const HOOK_MAX_TIME_SECONDS = 2;
 /** The `timeout` hook-settings.ts gives Claude's hooks (post-tool: 2). */
 export const CLAUDE_HOOK_TIMEOUT_SECONDS = 3;
-/** Bound on a `tmux display-message` in a hook: a wedged tmux server must not stall the agent either. */
+/**
+ * Bound on a `tmux display-message` in a hook: a wedged tmux server must not stall the agent
+ * either. When it fires, SESSION is empty and the event is lost (the route needs a session), so
+ * it sits far above a slow answer: measured 2026-09-29 at load 137, median 8 ms, p90 29 ms, max
+ * 107 ms over 40 calls. It cannot grow much: tmux plus the POST must fit Claude's 3 s timeout.
+ */
 export const HOOK_TMUX_TIMEOUT_SECONDS = 1;
 
 /**
@@ -44,7 +49,10 @@ export const HOOK_TMUX_TIMEOUT_SECONDS = 1;
  * replay would repeat it on a tab whose floor that server never persisted.
  * Only purplemux sessions (`pt-*`) spool, because the Codex hook is global and
  * also fires outside purplemux. `SPOOL_SKIP_EVENT` names a hook event never
- * spooled (Codex PreToolUse: one per tool call, and it changes no state). A
+ * spooled: Codex PreToolUse, one per tool call. It is not stateless (the receiver maps it to
+ * prompt-submit and applies its session metadata, hook-payload.ts), but the PostToolUse that
+ * follows each one carries the same transition and metadata and IS spooled, so a replay of the
+ * PreToolUse adds nothing. A
  * body over `HOOK_SPOOL_MAX_BODY` is spooled as metadata only (`body: null`,
  * `bodyDropped`, `bodyLength`). Nothing retries: the hook stays one round trip,
  * bounded by `HOOK_MAX_TIME_SECONDS`.
