@@ -155,7 +155,8 @@ describe('the generated grok-hook.sh', () => {
     const { GROK_HOOK_SCRIPT_CONTENT } = await import('@/lib/hook-settings');
 
     expect(GROK_HOOK_SCRIPT_CONTENT).toContain('--max-time 2');
-    expect(GROK_HOOK_SCRIPT_CONTENT).toMatch(/>\/dev\/null 2>&1 &\n/);
+    // Detached with the caller's stdin/stdout/stderr dropped, so grok is not held by the POST.
+    expect(GROK_HOOK_SCRIPT_CONTENT).toMatch(/\( exec <\/dev\/null >\/dev\/null 2>&1; post_hook [^\n]*\) &\n/);
     expect(GROK_HOOK_SCRIPT_CONTENT.trimEnd().endsWith('exit 0')).toBe(true);
   });
 

@@ -20,13 +20,18 @@ export const HOOK_SPOOL_DIRNAME = 'hook-spool';
 export const HOOK_SPOOL_MAX_BODY = 256 * 1024;
 /**
  * The most one hook POST may take, connect included. A hook runs on the agent's critical
- * path (Codex waits for it on every tool call, Claude on Stop and Notification), so a slow
- * server must never stall the agent: measured 2026-09-29, an unbounded POST held every Codex
- * tool call for minutes. The POST stays synchronous because the server applies live events
- * in arrival order; a detached PostToolUse could land after the Stop and mark a finished
- * turn busy again. A caller may pass a lower `--max-time` (curl keeps the last one).
+ * path: Codex waits for it on every tool call, with no timeout of its own, and Claude kills
+ * a hook at `CLAUDE_HOOK_TIMEOUT_SECONDS`. Measured 2026-09-29, an unbounded POST held every
+ * Codex tool call for minutes. The bound stays under Claude's timeout with room for the
+ * script's own start-up, so a stalled server ends in curl's timeout, not Claude's kill. The
+ * POST stays synchronous because the server applies live events in arrival order; a detached
+ * PostToolUse could land after the Stop and mark a finished turn busy again.
  */
-export const HOOK_MAX_TIME_SECONDS = 3;
+export const HOOK_MAX_TIME_SECONDS = 2;
+/** The `timeout` hook-settings.ts gives Claude's hooks (post-tool: 2). */
+export const CLAUDE_HOOK_TIMEOUT_SECONDS = 3;
+/** Bound on a `tmux display-message` in a hook: a wedged tmux server must not stall the agent either. */
+export const HOOK_TMUX_TIMEOUT_SECONDS = 1;
 
 /**
  * Shared shell functions. `post_hook TARGET BODY [curl options]` POSTs one
@@ -114,7 +119,10 @@ TOKEN=""
 SPOOL_SKIP_EVENT=""
 [ -f "$PORT_FILE" ] && PORT=$(cat "$PORT_FILE")
 [ -f "$TOKEN_FILE" ] && TOKEN=$(cat "$TOKEN_FILE")
-SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""`;
+# \`timeout\` bounds tmux where coreutils has it (Linux); elsewhere tmux runs unbounded, as before.
+HOOK_TIMEOUT=""
+command -v timeout >/dev/null 2>&1 && HOOK_TIMEOUT="timeout ${HOOK_TMUX_TIMEOUT_SECONDS}"
+SESSION=$($HOOK_TIMEOUT tmux display-message -p '#{session_name}' 2>/dev/null) || SESSION=""`;
 
 export const HOOK_SCRIPT_CONTENT = `#!/bin/sh
 EVENT="\${1:-poll}"
@@ -129,7 +137,9 @@ ${SPOOL_FUNCTIONS}
 if [ "$EVENT" = "post-tool" ]; then
   BODY=$(cat)
   [ -n "$BODY" ] || exit 0
-  post_hook "/api/status/hook?kind=tool&session=\${SESSION}" "$BODY" --max-time 2 >/dev/null 2>&1 &
+  # The background job drops the caller's stdin/stdout/stderr for good: a job that still held
+  # them kept Claude waiting for its whole POST (measured 2 s against a stalled server).
+  ( exec </dev/null >/dev/null 2>&1; post_hook "/api/status/hook?kind=tool&session=\${SESSION}" "$BODY" ) &
   exit 0
 fi
 
@@ -162,7 +172,7 @@ post_hook "/api/status/hook" "$PAYLOAD"
 # token and the exact pane's session, and write it there. Never verified.
 if [ "$EVENT" = "session-start" ] && [ -n "$PORT" ] && [ -z "\${PMUX_TAB_ID:-}" ] && [ -n "\${PMUX_TOKEN:-}" ] \\
   && [ -n "\${CLAUDE_ENV_FILE:-}" ] && [ -n "\${TMUX_PANE:-}" ]; then
-  PANE_SESSION=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || PANE_SESSION=""
+  PANE_SESSION=$($HOOK_TIMEOUT tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || PANE_SESSION=""
   if [ -n "$PANE_SESSION" ]; then
     IDENT=$(curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H "x-pmux-token: \${PMUX_TOKEN}" \\
       -d "{\\"session\\":\\"\${PANE_SESSION}\\"}" "http://localhost:\${PORT}/api/cli/tab-identity" 2>/dev/null)
@@ -211,7 +221,7 @@ ${SPOOL_FUNCTIONS}
 BODY=$(cat)
 [ -z "$BODY" ] && BODY='{}'
 
-post_hook "/api/status/hook?provider=grok&tmuxSession=\${SESSION}" "$BODY" --max-time 2 >/dev/null 2>&1 &
+( exec </dev/null >/dev/null 2>&1; post_hook "/api/status/hook?provider=grok&tmuxSession=\${SESSION}" "$BODY" ) &
 exit 0
 `;
 

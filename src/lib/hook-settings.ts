@@ -4,6 +4,7 @@ import os from 'os';
 import { createLogger } from '@/lib/logger';
 import { STATUSLINE_SCRIPT_PATH, STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
 import {
+  CLAUDE_HOOK_TIMEOUT_SECONDS,
   CODEX_HOOK_SCRIPT_CONTENT,
   GROK_HOOK_SCRIPT_CONTENT,
   HOOK_SCRIPT_CONTENT,
@@ -27,7 +28,7 @@ export const CODEX_HOOK_SCRIPT_PATH = CODEX_HOOK_SCRIPT;
 export const GROK_HOOK_SCRIPT_PATH = GROK_HOOK_SCRIPT;
 export { HOOK_SCRIPT_CONTENT, GROK_HOOK_SCRIPT_CONTENT };
 
-const hookEntry = (event: string, timeout = 3, matcher = '') => [
+const hookEntry = (event: string, timeout = CLAUDE_HOOK_TIMEOUT_SECONDS, matcher = '') => [
   {
     matcher,
     hooks: [
