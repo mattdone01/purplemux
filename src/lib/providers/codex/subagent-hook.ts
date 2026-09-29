@@ -1,6 +1,8 @@
-import fs from 'fs/promises';
 import { codexProvider } from '@/lib/providers/codex';
 import type { ICodexHookPayload } from '@/lib/providers/codex/hook-payload';
+import { isSubagentSessionMeta, readTranscriptFirstLine } from '@/lib/providers/codex/session-meta-line';
+
+export { isSubagentSessionMeta } from '@/lib/providers/codex/session-meta-line';
 
 /**
  * A Codex native subagent (a `spawn_agent` thread) runs inside its parent's process and pane, so
@@ -11,55 +13,26 @@ import type { ICodexHookPayload } from '@/lib/providers/codex/hook-payload';
  * and every send to the tab waited.
  *
  * A hook is the subagent's when either:
- * - its transcript names another session than its own `session_id` (the case measured: the tab
- *   kept the root's id and took the subagent's transcript); or
- * - its transcript's first line, the `session_meta` record, says the session is a subagent
- *   (`source.subagent` or `thread_source: "subagent"`), which covers a subagent that reports its
- *   own id.
+ * 1. its transcript names another session than its own `session_id` (the case measured: the tab
+ *    kept the root's id and took the subagent's transcript); or
+ * 2. its transcript's `session_meta` says the session is a subagent, and the hook's session is
+ *    not the one the tab is bound to (a subagent that reports its own id). A `SessionStart` with
+ *    source `resume` is never dropped by this rule: a resume is a top-level launch.
+ *
+ * A subagent's hook describes its own session, never the tab's, so none of its session metadata
+ * or work-state events apply. One exception: its PermissionRequest blocks the SHARED pane on the
+ * user, so the tab still shows that it needs input (as Claude's worker_permission_prompt does).
  */
 
-/** A transcript's first line is its session_meta; it is small, but never read past this. */
-const FIRST_LINE_MAX_BYTES = 64 * 1024;
-/** Transcripts are immutable in their first line; remember the answer per path (bounded). */
+/** A transcript's first line never changes: remember the answer per path (bounded). */
 const MAX_CACHED_TRANSCRIPTS = 512;
 const subagentByTranscript = new Map<string, boolean>();
-
-export const isSubagentSessionMeta = (line: string): boolean => {
-  let record: unknown;
-  try {
-    record = JSON.parse(line);
-  } catch {
-    return false;
-  }
-  if (!record || typeof record !== 'object') return false;
-  const { type, payload } = record as { type?: unknown; payload?: unknown };
-  if (type !== 'session_meta' || !payload || typeof payload !== 'object') return false;
-  const meta = payload as { source?: unknown; thread_source?: unknown };
-  if (meta.thread_source === 'subagent') return true;
-  return !!meta.source && typeof meta.source === 'object' && 'subagent' in (meta.source as object);
-};
-
-const readFirstLine = async (file: string): Promise<string | null> => {
-  let handle: fs.FileHandle | null = null;
-  try {
-    handle = await fs.open(file, 'r');
-    const buffer = Buffer.alloc(FIRST_LINE_MAX_BYTES);
-    const { bytesRead } = await handle.read(buffer, 0, FIRST_LINE_MAX_BYTES, 0);
-    const text = buffer.subarray(0, bytesRead).toString('utf-8');
-    const end = text.indexOf('\n');
-    return end >= 0 ? text.slice(0, end) : null;
-  } catch {
-    return null;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
-};
 
 /** True when the transcript's session_meta marks a subagent; false when it marks a root or cannot be read. */
 export const transcriptIsSubagent = async (transcriptPath: string): Promise<boolean> => {
   const cached = subagentByTranscript.get(transcriptPath);
   if (cached !== undefined) return cached;
-  const firstLine = await readFirstLine(transcriptPath);
+  const firstLine = await readTranscriptFirstLine(transcriptPath);
   if (firstLine === null) return false; // not written yet, or unreadable: never cached
   const subagent = isSubagentSessionMeta(firstLine);
   if (subagentByTranscript.size >= MAX_CACHED_TRANSCRIPTS) {
@@ -70,12 +43,24 @@ export const transcriptIsSubagent = async (transcriptPath: string): Promise<bool
   return subagent;
 };
 
-export const isCodexSubagentHook = async (payload: ICodexHookPayload): Promise<boolean> => {
+/** `root`: apply as usual. `subagent`: apply nothing. `subagent-permission`: apply only the pane's approval request. */
+export type TCodexHookSource = 'root' | 'subagent' | 'subagent-permission';
+
+export const classifyCodexHook = async (
+  payload: ICodexHookPayload,
+  tabSessionId: string | null,
+): Promise<TCodexHookSource> => {
   const transcript = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
-  if (!transcript) return false;
+  if (!transcript) return 'root';
   const transcriptSession = codexProvider.sessionIdFromJsonlPath(transcript);
-  if (transcriptSession && payload.session_id && transcriptSession !== payload.session_id) return true;
-  return transcriptIsSubagent(transcript);
+  let subagent = !!transcriptSession && !!payload.session_id && transcriptSession !== payload.session_id;
+  if (!subagent) {
+    const isResume = payload.hook_event_name === 'SessionStart' && payload.source === 'resume';
+    const ownSession = payload.session_id ?? transcriptSession;
+    subagent = !isResume && ownSession !== tabSessionId && await transcriptIsSubagent(transcript);
+  }
+  if (!subagent) return 'root';
+  return payload.hook_event_name === 'PermissionRequest' ? 'subagent-permission' : 'subagent';
 };
 
 /** Test seam: forget cached answers. */

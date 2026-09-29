@@ -4,7 +4,7 @@ import { translateClaudeHookEvent } from '@/lib/providers/claude/hook-handler';
 import { parseClaudeToolActivity } from '@/lib/providers/claude/tool-activity';
 import { processCodexHookPayload, shouldEmitCodexHookEvent } from '@/lib/providers/codex/hook-handler';
 import { codexHookEvents } from '@/lib/providers/codex/hook-events';
-import { isCodexSubagentHook } from '@/lib/providers/codex/subagent-hook';
+import { classifyCodexHook } from '@/lib/providers/codex/subagent-hook';
 import { processGrokHookPayload, shouldEmitGrokHookEvent } from '@/lib/providers/grok/hook-handler';
 import { grokHookEvent, parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
@@ -86,9 +86,12 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
     { tmuxSession, event: payload.hook_event_name, source: payload.source, replayedAt },
     `codex ${payload.hook_event_name ?? 'unknown'}`,
   );
+  const statusManager = getStatusManager();
   // A native subagent's hook shares its parent's pane and generation: it must never re-key the
-  // parent tab's session or transcript, nor move its work state (tab-QizeO4, 2026-09-29).
-  if (await isCodexSubagentHook(payload)) {
+  // parent tab's session or transcript, nor move its work state (tab-QizeO4, 2026-09-29). Its
+  // permission prompt still blocks the shared pane, so that alone reaches the tab.
+  const source = await classifyCodexHook(payload, statusManager.agentSessionIdForTmuxSession(tmuxSession));
+  if (source === 'subagent') {
     log.debug(
       { tmuxSession, event: payload.hook_event_name, sessionId: payload.session_id, replayedAt },
       'codex subagent hook ignored: it does not describe the tab',
@@ -96,7 +99,11 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
     return NO_CONTENT;
   }
   const { result, translation } = processCodexHookPayload(payload);
-  const statusManager = getStatusManager();
+  if (source === 'subagent-permission') {
+    translation.meta = { permissionRequest: translation.meta?.permissionRequest ?? null };
+    translation.sessionInfo = null;
+    translation.clearSession = false;
+  }
   const applyHook = () => {
     const applied = translation.meta
       ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta, replayedAt)

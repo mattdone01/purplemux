@@ -1,8 +1,7 @@
 import fs from 'fs/promises';
-import { createReadStream } from 'fs';
 import path from 'path';
 import os from 'os';
-import readline from 'readline';
+import { isSubagentSessionMeta, readTranscriptFirstLine } from '@/lib/providers/codex/session-meta-line';
 import type { ISessionInfo } from '@/types/timeline';
 import type { IAgentSessionDetectionOptions, IAgentSessionWatchOptions, ISessionWatcher } from '@/lib/providers/types';
 import { codexHookEvents } from '@/lib/providers/codex/hook-events';
@@ -40,6 +39,8 @@ const matchesCodexArgs = (args: string): boolean => args.includes('codex');
 interface ICodexSessionMeta {
   sessionId: string;
   jsonlPath: string;
+  /** A native subagent's rollout (its session_meta says so): never a tab's own session. */
+  subagent?: boolean;
   cwd: string | null;
   startedAt: number | null;
   mtimeMs: number | null;
@@ -63,22 +64,8 @@ const dayDirPath = (sessionsRoot: string, date: Date): string =>
     String(date.getDate()).padStart(2, '0'),
   );
 
-const readFirstLine = async (jsonlPath: string): Promise<string | null> => {
-  const stream = createReadStream(jsonlPath, { encoding: 'utf-8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  try {
-    for await (const line of rl) {
-      return line;
-    }
-    return null;
-  } finally {
-    rl.close();
-    stream.destroy();
-  }
-};
-
 const readCodexSessionMeta = async (jsonlPath: string): Promise<ICodexSessionMeta | null> => {
-  const firstLine = await readFirstLine(jsonlPath);
+  const firstLine = await readTranscriptFirstLine(jsonlPath);
   if (!firstLine) return null;
 
   try {
@@ -98,6 +85,7 @@ const readCodexSessionMeta = async (jsonlPath: string): Promise<ICodexSessionMet
     return {
       sessionId: parsed.payload.id,
       jsonlPath,
+      subagent: isSubagentSessionMeta(firstLine),
       cwd: parsed.payload.cwd ?? null,
       startedAt: startedAt !== null && Number.isFinite(startedAt) ? startedAt : null,
       mtimeMs: null,
@@ -153,7 +141,8 @@ export const findLatestCodexSessionForCwd = async (
 
   for (const candidate of candidates) {
     const meta = await readCodexSessionMeta(candidate.jsonlPath);
-    if (meta?.cwd === cwd) return { ...meta, mtimeMs: candidate.mtimeMs };
+    // A native subagent shares its root's cwd and writes more recently: never the tab's session.
+    if (meta?.cwd === cwd && !meta.subagent) return { ...meta, mtimeMs: candidate.mtimeMs };
   }
 
   return null;

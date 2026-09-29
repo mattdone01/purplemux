@@ -14,6 +14,7 @@ const status = vi.hoisted(() => ({
   handleProviderEvent: vi.fn(),
   codexLaunchLifecycle: vi.fn(() => null),
   recordSkippedReplay: vi.fn(),
+  agentSessionIdForTmuxSession: vi.fn((): string | null => null),
 }));
 vi.mock('@/lib/providers/codex/launch-lifecycle', () => lifecycle);
 vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => status }));
@@ -183,6 +184,25 @@ describe('Codex hook generation gate', () => {
       });
       expect(status.applyAgentHookMeta).not.toHaveBeenCalled();
       expect(lifecycle.withReplayedCodexHookGeneration).not.toHaveBeenCalled();
+    });
+
+    it("a subagent's PermissionRequest reaches the tab as a permission prompt only: no session metadata", async () => {
+      const { default: handler } = await import('@/pages/api/status/hook');
+      const req = request();
+      (req as unknown as { body: Record<string, unknown> }).body = {
+        hook_event_name: 'PermissionRequest', session_id: ROOT, transcript_path: childTranscript(),
+        request_type: 'exec', exec_command: { command: 'rm -rf build', call_id: 'c1' },
+      };
+
+      await handler(req, response());
+
+      expect(status.applyAgentHookMeta).toHaveBeenCalledTimes(1);
+      const meta = status.applyAgentHookMeta.mock.calls[0][2] as Record<string, unknown>;
+      expect(Object.keys(meta)).toEqual(['permissionRequest']);
+      expect(meta.permissionRequest).toBeTruthy();
+      expect(status.handleProviderEvent).toHaveBeenCalledWith(
+        'codex', 'pt-ws-pins-pane-one-tab-pins', { kind: 'notification', notificationType: 'permission_prompt' }, undefined,
+      );
     });
 
     it("the root's own Stop still applies", async () => {

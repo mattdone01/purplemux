@@ -2109,6 +2109,12 @@ export class StatusManager {
     return undefined;
   }
 
+  /** The agent session a tab's pane is bound to, or null when none is bound (or no tab owns the pane). */
+  agentSessionIdForTmuxSession(tmuxSession: string): string | null {
+    const tabId = this.findTabIdBySession(tmuxSession);
+    return tabId ? this.tabs.get(tabId)?.agentSessionId ?? null : null;
+  }
+
   /**
    * Classify a `stop` before announcing it (ADR-0018). A marker line
    * (`DONE:` …) becomes a `turn-marker` nudge carrying it. No marker and open

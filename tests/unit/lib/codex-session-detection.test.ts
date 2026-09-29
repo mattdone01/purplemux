@@ -93,6 +93,39 @@ describe('findLatestCodexSessionForCwd', () => {
     expect(session?.startedAt).toBe(new Date('2026-05-02T02:00:00.000Z').getTime());
   });
 
+  it("skips a native subagent's rollout: it shares the root's cwd and writes more recently (tab-QizeO4, 2026-09-29)", async () => {
+    const sessionsRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'purplemux-codex-subagent-'));
+    const dayDir = path.join(sessionsRoot, '2026', '09', '29');
+    await fs.mkdir(dayDir, { recursive: true });
+    const projectCwd = '/tmp/ci-spot-runners';
+    const rootPath = path.join(dayDir, 'rollout-2026-09-29T01-34-19-01a0eacc-66cd-7700-a4ae-72adbd13aa58.jsonl');
+    const childPath = path.join(dayDir, 'rollout-2026-09-29T01-56-26-01a0eae0-a62b-79e1-b096-5c959155263e.jsonl');
+    await fs.writeFile(rootPath, JSON.stringify({
+      type: 'session_meta',
+      payload: { id: '01a0eacc-66cd-7700-a4ae-72adbd13aa58', cwd: projectCwd, source: 'cli', thread_source: 'user' },
+    }) + '\n');
+    await fs.writeFile(childPath, JSON.stringify({
+      type: 'session_meta',
+      payload: {
+        id: '01a0eae0-a62b-79e1-b096-5c959155263e',
+        cwd: projectCwd,
+        source: { subagent: { thread_spawn: { parent_thread_id: '01a0eacc-66cd-7700-a4ae-72adbd13aa58', depth: 1 } } },
+        thread_source: 'subagent',
+      },
+    }) + '\n');
+    await fs.utimes(rootPath, new Date('2026-09-29T02:04:23.000Z'), new Date('2026-09-29T02:04:23.000Z'));
+    await fs.utimes(childPath, new Date('2026-09-29T02:09:40.000Z'), new Date('2026-09-29T02:09:40.000Z'));
+
+    const session = await findLatestCodexSessionForCwd(projectCwd, {
+      sessionsRoot,
+      daysBack: 1,
+      now: new Date('2026-09-29T12:00:00.000Z'),
+    });
+
+    expect(session?.sessionId).toBe('01a0eacc-66cd-7700-a4ae-72adbd13aa58');
+    expect(session?.jsonlPath).toBe(rootPath);
+  });
+
   it('resolves a Codex session by id without using cwd recency', async () => {
     const sessionsRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'purplemux-codex-session-id-'));
     const dayDir = path.join(sessionsRoot, '2026', '05', '02');
