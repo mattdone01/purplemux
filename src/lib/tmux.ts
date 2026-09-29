@@ -13,7 +13,7 @@ import { getWorkspaceToken } from '@/lib/workspace-token';
 import { ensureTabToken, type ITabIdentity } from '@/lib/tab-token';
 import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
-import { getProcessArgs } from '@/lib/process-utils';
+import { getProcessArgs, readProcChildren } from '@/lib/process-utils';
 import { PASTE_END, PASTE_START, TYPED_CHUNK_GAP_MS, planTypedInput } from '@/lib/typed-input';
 import { defaultReaperDeps, reapTabForClose, type IReapResult } from '@/lib/tab-reaper';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
@@ -769,21 +769,8 @@ export const capturePaneContentWithHistory = async (
 
 const getChildPidsOf = async (parentPids: number[]): Promise<number[]> => {
   if (isLinux) {
-    const results: number[] = [];
-    await Promise.all(
-      parentPids.map(async (pid) => {
-        try {
-          const raw = await fs.readFile(`/proc/${pid}/task/${pid}/children`, 'utf-8');
-          for (const s of raw.trim().split(/\s+/)) {
-            const n = parseInt(s, 10);
-            if (!Number.isNaN(n)) results.push(n);
-          }
-        } catch {
-          // process gone
-        }
-      }),
-    );
-    return results;
+    const lists = await Promise.all(parentPids.map((pid) => readProcChildren(pid)));
+    if (lists.every((list) => list !== null)) return lists.flat() as number[];
   }
   try {
     const { stdout } = await execFile('pgrep', ['-P', parentPids.join(',')], { timeout: CMD_TIMEOUT });

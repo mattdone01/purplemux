@@ -12,7 +12,53 @@ export const isProcessRunning = (pid: number): Promise<boolean> =>
     });
   });
 
+/**
+ * A process's children from the kernel, without spawning a process: each thread's
+ * `/proc/<pid>/task/<tid>/children`, unioned, because a child belongs to the thread that forked
+ * it (a Codex or node parent forks from worker threads). Ascending, like `pgrep -P`. `[]` for a
+ * process that is gone; `null` when the kernel exposes no children lists (CONFIG_PROC_CHILDREN
+ * off), so the caller falls back to `pgrep`.
+ *
+ * Measured 2026-09-29 (load ~140): a walk of a 437-node tree took 68 ms this way and 80.6 s with
+ * one `pgrep -P` per node, and the Codex hook's process proof runs such a walk under its tab lock.
+ */
+export const readProcChildren = async (pid: number): Promise<number[] | null> => {
+  let tasks: string[];
+  try {
+    tasks = await fs.readdir(`/proc/${pid}/task`);
+  } catch {
+    return [];
+  }
+  const found = new Set<number>();
+  let readable = false;
+  await Promise.all(tasks.map(async (tid) => {
+    try {
+      const raw = await fs.readFile(`/proc/${pid}/task/${tid}/children`, 'utf-8');
+      readable = true;
+      for (const part of raw.trim().split(/\s+/)) {
+        const child = parseInt(part, 10);
+        if (!Number.isNaN(child)) found.add(child);
+      }
+    } catch {
+      // the thread exited, or the kernel has no children lists
+    }
+  }));
+  if (!readable) {
+    try {
+      await fs.access(`/proc/${pid}`);
+    } catch {
+      return [];
+    }
+    return null;
+  }
+  return [...found].sort((a, b) => a - b);
+};
+
 export const getChildPids = async (parentPid: number): Promise<number[]> => {
+  if (isLinux) {
+    const children = await readProcChildren(parentPid);
+    if (children) return children;
+  }
   try {
     const { stdout } = await execFile('pgrep', ['-P', String(parentPid)]);
     return stdout.trim().split('\n').map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n));
