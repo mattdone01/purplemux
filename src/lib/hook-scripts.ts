@@ -18,6 +18,15 @@ import { STATUSLINE_SCRIPT_CONTENT } from '@/lib/statusline-script';
 export const HOOK_SPOOL_DIRNAME = 'hook-spool';
 /** A body longer than this (a Write's content, a long Bash output) is spooled as metadata only. */
 export const HOOK_SPOOL_MAX_BODY = 256 * 1024;
+/**
+ * The most one hook POST may take, connect included. A hook runs on the agent's critical
+ * path (Codex waits for it on every tool call, Claude on Stop and Notification), so a slow
+ * server must never stall the agent: measured 2026-09-29, an unbounded POST held every Codex
+ * tool call for minutes. The POST stays synchronous because the server applies live events
+ * in arrival order; a detached PostToolUse could land after the Stop and mark a finished
+ * turn busy again. A caller may pass a lower `--max-time` (curl keeps the last one).
+ */
+export const HOOK_MAX_TIME_SECONDS = 3;
 
 /**
  * Shared shell functions. `post_hook TARGET BODY [curl options]` POSTs one
@@ -32,7 +41,8 @@ export const HOOK_SPOOL_MAX_BODY = 256 * 1024;
  * also fires outside purplemux. `SPOOL_SKIP_EVENT` names a hook event never
  * spooled (Codex PreToolUse: one per tool call, and it changes no state). A
  * body over `HOOK_SPOOL_MAX_BODY` is spooled as metadata only (`body: null`,
- * `bodyDropped`, `bodyLength`). Nothing retries: the hook stays one round trip.
+ * `bodyDropped`, `bodyLength`). Nothing retries: the hook stays one round trip,
+ * bounded by `HOOK_MAX_TIME_SECONDS`.
  */
 const SPOOL_FUNCTIONS = `json_escape() {
   printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
@@ -76,7 +86,7 @@ post_hook() {
     return 0
   fi
   HOOK_RESULT=$(printf '%s' "$HOOK_BODY" | curl -s -X POST -o /dev/null -w '%{http_code} %{time_connect}' \\
-    --connect-timeout 1 "$@" -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
+    --connect-timeout 1 --max-time ${HOOK_MAX_TIME_SECONDS} "$@" -H 'Content-Type: application/json' -H "x-pmux-token: \${TOKEN}" \\
     --data-binary @- "http://localhost:\${PORT}\${HOOK_TARGET}" 2>/dev/null)
   HOOK_RC=$?
   HOOK_HTTP="\${HOOK_RESULT%% *}"
