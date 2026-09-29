@@ -49,15 +49,6 @@ export const paneShowsEmptyComposer = (panelType: TPanelType | undefined, conten
   return hasEmptyAgentComposer(panelType, plain);
 };
 
-/**
- * True when the pane shows an interactive option list (an approval dialog, a trust prompt, a
- * picker). A paste and Enter into it would choose the highlighted option: for a Codex approval
- * dialog, `› 1. Yes, proceed`. A native subagent's permission prompt reaches no tab state (ppc-48,
- * option C), so a sender reads the pane itself.
- */
-export const paneShowsInteractivePrompt = (panelType: TPanelType | undefined, content: string): boolean =>
-  parsePermissionOptions(tail(withoutSuggestions(panelType, content))).options.length > 0;
-
 export type TComposerReadiness = { ok: true } | { ok: false; reason: string };
 
 export interface IComposerReadinessInput {

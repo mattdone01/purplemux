@@ -7,9 +7,7 @@ import {
   resolveSendWaitMs,
   resolveTabCliState,
 } from '@/lib/tab-send';
-import { capturePaneContent, hasSession, isContentPendingInComposer } from '@/lib/tmux';
-import { paneShowsInteractivePrompt } from '@/lib/composer-readiness';
-import { isAgentPanelType } from '@/lib/agent-panel-types';
+import { hasSession, isContentPendingInComposer } from '@/lib/tmux';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
 import { TAB_NOT_FOUND_BODY, targetChangedBody } from '@/lib/cli-error';
@@ -102,18 +100,6 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const policy = await checkPolicy({ consumeBootstrapForTarget: true });
     if (!policy.ok) {
       res.status(409).json(policy);
-      return false;
-    }
-    // The tab's state says nothing about a native subagent's approval dialog (ppc-48, option C):
-    // read the pane, and never paste + Enter into an option list.
-    // Agent tabs only: a terminal, browser or diff tab stays ungated, as the readiness gate leaves it.
-    const pane = isAgentPanelType(latest.tab.panelType)
-      ? await capturePaneContent(latest.tab.sessionName, { escapes: true }).catch(() => null)
-      : null;
-    if (pane && paneShowsInteractivePrompt(latest.tab.panelType, pane)) {
-      res.status(409).json({
-        error: 'agent-not-ready', code: 'interactive-prompt-active', tabId, detail: 'interactive-prompt-active',
-      });
       return false;
     }
     await deliverPrompt(latest.tab.sessionName, content);
