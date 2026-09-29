@@ -19,9 +19,9 @@ export { isSubagentSessionMeta } from '@/lib/providers/codex/session-meta-line';
  *    not the one the tab is bound to (a subagent that reports its own id). A `SessionStart` with
  *    source `resume` is never dropped by this rule: a resume is a top-level launch.
  *
- * A subagent's hook describes its own session, never the tab's, so none of its session metadata
- * or work-state events apply. One exception: its PermissionRequest blocks the SHARED pane on the
- * user, so the tab still shows that it needs input (as Claude's worker_permission_prompt does).
+ * A subagent's hook describes its own session, never the tab's, so none of it applies: not its
+ * session metadata, not its work-state events, and not its PermissionRequest (architect ruling
+ * 2026-09-29, option C; see hook-dispatch.ts).
  */
 
 /** A transcript's first line never changes: remember the answer per path (bounded). */
@@ -48,15 +48,13 @@ export const transcriptIsSubagent = async (transcriptPath: string): Promise<bool
   return subagent;
 };
 
-/** `root`: apply as usual. `subagent`: apply nothing. `subagent-permission`: apply only the pane's approval request. */
-export type TCodexHookSource = 'root' | 'subagent' | 'subagent-permission';
-
-export const classifyCodexHook = async (
+/** True when the hook is a native subagent's, which the dispatcher drops (rules above). */
+export const isCodexSubagentHook = async (
   payload: ICodexHookPayload,
   tabSessionId: string | null,
-): Promise<TCodexHookSource> => {
+): Promise<boolean> => {
   const transcript = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
-  if (!transcript) return 'root';
+  if (!transcript) return false;
   const transcriptSession = codexProvider.sessionIdFromJsonlPath(transcript);
   let subagent = !!transcriptSession && !!payload.session_id && transcriptSession !== payload.session_id;
   if (!subagent) {
@@ -64,8 +62,7 @@ export const classifyCodexHook = async (
     const ownSession = payload.session_id ?? transcriptSession;
     subagent = !isResume && ownSession !== tabSessionId && await transcriptIsSubagent(transcript);
   }
-  if (!subagent) return 'root';
-  return payload.hook_event_name === 'PermissionRequest' ? 'subagent-permission' : 'subagent';
+  return subagent;
 };
 
 /** Test seam: forget cached answers. */

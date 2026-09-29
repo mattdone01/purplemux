@@ -4,7 +4,7 @@ import { translateClaudeHookEvent } from '@/lib/providers/claude/hook-handler';
 import { parseClaudeToolActivity } from '@/lib/providers/claude/tool-activity';
 import { processCodexHookPayload, shouldEmitCodexHookEvent } from '@/lib/providers/codex/hook-handler';
 import { codexHookEvents } from '@/lib/providers/codex/hook-events';
-import { classifyCodexHook } from '@/lib/providers/codex/subagent-hook';
+import { isCodexSubagentHook } from '@/lib/providers/codex/subagent-hook';
 import { processGrokHookPayload, shouldEmitGrokHookEvent } from '@/lib/providers/grok/hook-handler';
 import { grokHookEvent, parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
@@ -89,24 +89,18 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
   const statusManager = getStatusManager();
   // A native subagent's hook shares its parent's pane and generation: it must never re-key the
   // parent tab's session or transcript, nor move its work state (tab-QizeO4, 2026-09-29). Its
-  // permission prompt still blocks the shared pane, so that alone reaches the tab.
-  const source = await classifyCodexHook(payload, statusManager.agentSessionIdForTmuxSession(tmuxSession));
-  if (source === 'subagent' || (source === 'subagent-permission' && replayedAt !== undefined)) {
+  // PermissionRequest is dropped too (architect ruling 2026-09-29, option C): every way of showing
+  // it on the tab could leave the tab stuck; the fleet runs approval_policy "never", an attended
+  // session shows the prompt in the pane, and an automated send refuses a pane showing an option
+  // list (composer-readiness). Surfacing it is its own story.
+  if (await isCodexSubagentHook(payload, statusManager.agentSessionIdForTmuxSession(tmuxSession))) {
     log.debug(
       { tmuxSession, event: payload.hook_event_name, sessionId: payload.session_id, replayedAt },
       'codex subagent hook ignored: it does not describe the tab',
     );
-    // A live subagent hook after its permission prompt means the prompt was answered in the pane.
-    // A replayed prompt is history: its answer is already past.
-    if (source === 'subagent' && replayedAt === undefined) statusManager.resolveSubagentPrompt(tmuxSession);
     return NO_CONTENT;
   }
   const { result, translation } = processCodexHookPayload(payload);
-  if (source === 'subagent-permission') {
-    translation.meta = { permissionRequest: translation.meta?.permissionRequest ?? null };
-    translation.sessionInfo = null;
-    translation.clearSession = false;
-  }
   const applyHook = () => {
     const applied = translation.meta
       ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta, replayedAt)
@@ -116,10 +110,7 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
       codexHookEvents.emit('session-info', tmuxSession, translation.sessionInfo);
       if (translation.clearSession) codexHookEvents.emit('session-clear', tmuxSession);
     }
-    if (source === 'subagent-permission') {
-      statusManager.raiseSubagentPermission(tmuxSession);
-    } else if (translation.event && shouldEmitCodexHookEvent(payload, applied.cliState)) {
-      statusManager.clearSubagentPrompt(tmuxSession);
+    if (translation.event && shouldEmitCodexHookEvent(payload, applied.cliState)) {
       statusManager.handleProviderEvent('codex', tmuxSession, translation.event, replayedAt);
     }
     return { applied };

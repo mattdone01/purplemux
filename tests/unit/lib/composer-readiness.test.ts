@@ -89,3 +89,21 @@ describe('suggestion-aware readiness (story 17, L7)', () => {
     expect(paneShowsEmptyComposer('terminal', pane('claude-empty-composer.ansi'))).toBe(false);
   });
 });
+
+// ppc-48 (architect ruling, option C): a Codex native subagent's PermissionRequest is dropped, so the
+// tab may read ready-for-review with no permission request while its pane shows the approval dialog.
+// An automated send must still refuse to type into it. Real Codex 0.158 captures (on-request,
+// read-only sandbox, 2026-09-29), at 80 columns and wrapped at 50.
+describe("a Codex approval dialog the tab does not know about (ppc-48, option C)", () => {
+  it.each(['codex-0158-approval-80x24.txt', 'codex-0158-approval-50x24.txt'])('%s refuses the send', async (name) => {
+    const pane = fs.readFileSync(path.join(__dirname, '../../fixtures/panes', name), 'utf-8');
+
+    const result = await checkComposerReady({
+      panelType: 'codex-cli',
+      status: { cliState: 'ready-for-review', permissionRequest: null },
+      capture: async () => pane,
+    });
+
+    expect(result).toEqual({ ok: false, reason: 'interactive-prompt-active' });
+  });
+});

@@ -151,12 +151,6 @@ const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
 export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
-  /**
-   * The work state a tab was in when a Codex native subagent's permission prompt moved it to
-   * needs-input (ppc-48). The subagent's other hooks never reach the tab, so nothing else would
-   * move it back: the ack, or the subagent's next hook, restores this state instead of busy.
-   */
-  private subagentPromptReturn = new Map<string, TCliState>();
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
   private currentInterval = 0;
   private clients = new Set<WebSocket>();
@@ -1985,52 +1979,10 @@ export class StatusManager {
     if (entry.cliState !== 'needs-input') return;
     if (entry.lastEvent?.name !== 'notification' || entry.lastEvent.seq !== seq) return;
 
-    // A subagent's prompt returns the tab to where it was: its root may have stopped long ago,
-    // and no root hook would follow to leave busy (the tab-QizeO4 deadlock).
-    const back = this.subagentPromptReturn.get(tabId);
-    this.subagentPromptReturn.delete(tabId);
-    const next = back ?? 'busy';
-    hookLog.debug({ tabId, seq, next }, `ack: needs-input→${next}`);
-    if (back) entry.permissionRequest = null;
-    this.applyCliState(tabId, entry, next, back ? { silent: true } : {});
+    hookLog.debug({ tabId, seq }, 'ack: needs-input→busy');
+    this.applyCliState(tabId, entry, 'busy');
     this.persistToLayout(entry);
     this.broadcastUpdate(tabId, entry);
-  }
-
-  /**
-   * A Codex native subagent asks the user for a permission in the SHARED pane: the tab shows it
-   * needs input, and remembers the state to return to (ppc-48).
-   */
-  raiseSubagentPermission(tmuxSession: string): void {
-    const tabId = this.findTabIdBySession(tmuxSession);
-    const entry = tabId ? this.tabs.get(tabId) : undefined;
-    if (!tabId || !entry) return;
-    if (entry.cliState !== 'needs-input' && !this.subagentPromptReturn.has(tabId)) {
-      this.subagentPromptReturn.set(tabId, entry.cliState);
-    }
-    this.handleProviderEvent('codex', tmuxSession, { kind: 'notification', notificationType: 'permission_prompt' });
-  }
-
-  /** A subagent's later hook: its prompt was answered in the pane. Return the tab to where it was. */
-  resolveSubagentPrompt(tmuxSession: string): void {
-    const tabId = this.findTabIdBySession(tmuxSession);
-    const entry = tabId ? this.tabs.get(tabId) : undefined;
-    if (!tabId || !entry) return;
-    const back = this.subagentPromptReturn.get(tabId);
-    if (!back) return;
-    this.subagentPromptReturn.delete(tabId);
-    if (entry.cliState !== 'needs-input') return;
-    hookLog.debug({ tabId, next: back }, 'subagent prompt answered: needs-input→' + back);
-    entry.permissionRequest = null;
-    this.applyCliState(tabId, entry, back, { silent: true });
-    this.persistToLayout(entry);
-    this.broadcastUpdate(tabId, entry);
-  }
-
-  /** A root hook supersedes a pending subagent prompt's return state. */
-  clearSubagentPrompt(tmuxSession: string): void {
-    const tabId = this.findTabIdBySession(tmuxSession);
-    if (tabId) this.subagentPromptReturn.delete(tabId);
   }
 
   // Codex의 SessionStart hook은 첫 사용자 메시지 후에야 발사된다(turn.rs:299).
