@@ -102,3 +102,45 @@ describe.skipIf(!isLinux)('getDescendantPids (tmux) uses the same per-thread uni
     expect(await getDescendantPids(parent.pid!)).toContain(sleeper);
   }, 30_000);
 });
+
+describe.skipIf(!isLinux)('the pgrep fallback when the kernel exposes no children lists', () => {
+  // CONFIG_PROC_CHILDREN off: every /proc/<pid>/task/<tid>/children read fails while the process
+  // exists. readProcChildren must answer null (not []), and both walks must fall back to pgrep:
+  // an empty list here would silently hide every child, the bug the old tmux reader had.
+  const mockNoChildrenFiles = (pgrepOut: string) => {
+    const execFile = vi.fn((...args: unknown[]) => {
+      const callback = args[args.length - 1];
+      // promisify() of a plain function resolves with this one value; the code reads `.stdout`.
+      if (typeof callback === 'function') callback(null, { stdout: pgrepOut, stderr: '' });
+    });
+    vi.doMock('child_process', async (original) => ({ ...(await original<typeof import('child_process')>()), execFile }));
+    vi.doMock('fs/promises', async (original) => {
+      const real = await original<typeof import('fs/promises')>();
+      const readFile = (async (file: Parameters<typeof real.readFile>[0], ...rest: unknown[]) => {
+        if (String(file).endsWith('/children')) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        return (real.readFile as (...a: unknown[]) => unknown)(file, ...rest);
+      }) as typeof real.readFile;
+      return { ...real, default: { ...real, readFile }, readFile };
+    });
+    vi.resetModules();
+    return execFile;
+  };
+
+  it('readProcChildren answers null and getChildPids uses pgrep', async () => {
+    const execFile = mockNoChildrenFiles('41\n42\n');
+    const { getChildPids, readProcChildren } = await import('@/lib/process-utils');
+
+    expect(await readProcChildren(process.pid)).toBeNull();
+    expect(await getChildPids(process.pid)).toEqual([41, 42]);
+    expect(execFile).toHaveBeenCalledWith('pgrep', ['-P', String(process.pid)], expect.any(Function));
+  });
+
+  it('getDescendantPids (tmux) uses pgrep for the frontier', async () => {
+    const execFile = mockNoChildrenFiles('');
+    const { getDescendantPids } = await import('@/lib/tmux');
+
+    await getDescendantPids(process.pid);
+
+    expect(execFile.mock.calls.some(([cmd, args]) => cmd === 'pgrep' && (args as string[])[0] === '-P')).toBe(true);
+  });
+});

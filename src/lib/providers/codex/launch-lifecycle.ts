@@ -26,6 +26,17 @@ import type {
 
 const PROCESS_PROOF_ATTEMPTS = 5;
 const PROCESS_PROOF_RETRY_MS = 40;
+/**
+ * Proof failures a single process-tree read can produce transiently. The Linux walk reads each
+ * thread's /proc children list; a thread exiting mid-read moves its children to another thread,
+ * so one call can miss a live child. The proof reads the tree once more before a live hook holds
+ * the generation on one of these; a definitive failure (an identity replaced) is never retried.
+ */
+const TREE_READ_REASONS: ReadonlySet<string> = new Set([
+  'process-lineage-mismatch',
+  'agent-not-launcher-child',
+  'competing-agent-process',
+]);
 const MAX_PROCESS_TREE_NODES = 128;
 export const CODEX_LAUNCH_PREPARED_TIMEOUT_MS = 60_000;
 export const CODEX_LAUNCH_SUBMITTED_TIMEOUT_MS = 15_000;
@@ -428,9 +439,14 @@ const verifyProcessProof = async (
   childPid: number,
 ): Promise<TCodexRuntimeVerification> => {
   let result: TCodexRuntimeVerification = { ok: false, reason: 'process-identity-unavailable' };
+  let treeReread = false;
   for (let attempt = 0; attempt < PROCESS_PROOF_ATTEMPTS; attempt += 1) {
     result = await verifyProcessProofOnce(tab, pending, launcherPid, childPid);
     if (result.ok) return result;
+    if (TREE_READ_REASONS.has(result.reason) && !treeReread) {
+      treeReread = true;
+      continue;
+    }
     if (result.reason !== 'process-identity-unavailable') return result;
     if (attempt + 1 < PROCESS_PROOF_ATTEMPTS) {
       await new Promise<void>((resolve) => setTimeout(resolve, PROCESS_PROOF_RETRY_MS));

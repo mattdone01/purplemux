@@ -397,6 +397,48 @@ describe('Codex managed launch lifecycle', () => {
     expect(active.phase).toBe('held');
   });
 
+  it('reads the tree once more when one read misses a live child, and still holds a persistent miss', async () => {
+    const prepared = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!prepared.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(prepared.intent.generation, false);
+    // The first read of the pane misses the launcher (a /proc children read racing a thread exit).
+    let paneReads = 0;
+    mocks.children.mockImplementation(async (pid: number) => {
+      if (pid === 10) {
+        paneReads += 1;
+        return paneReads === 1 ? [] : [20];
+      }
+      return pid === 20 ? [30] : [];
+    });
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', prepared.intent.generation);
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: prepared.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toMatchObject({ ok: true, state: 'confirmed' });
+    expect(paneReads).toBe(2);
+
+    // A miss on every read is still a hold, after exactly one extra read.
+    const again = await beginCodexLaunch('ws-test', 'tab-t');
+    if (!again.ok) throw new Error('expected prepared launch');
+    installValidProcessTree(again.intent.generation, false);
+    paneReads = 0;
+    mocks.children.mockImplementation(async (pid: number) => {
+      if (pid === 10) {
+        paneReads += 1;
+        return [];
+      }
+      return pid === 20 ? [30] : [];
+    });
+    await markCodexLaunchSubmitted('ws-test', 'tab-t', again.intent.generation);
+
+    expect(await confirmCodexLaunchReceipt({
+      workspaceId: 'ws-test', tabId: 'tab-t', generation: again.intent.generation,
+      launcherPid: 20, childPid: 30,
+    })).toEqual({ ok: false, state: 'held', reason: 'process-lineage-mismatch' });
+    expect(paneReads).toBe(2);
+  });
+
   it('holds wrapper-only or ambiguous process proof and never binds the resume session', async () => {
     const originalSession = mocks.tab!.agentState!.sessionId;
     const prepared = await beginCodexLaunch('ws-test', 'tab-t', { resumeSessionId: SESSION_ID });
