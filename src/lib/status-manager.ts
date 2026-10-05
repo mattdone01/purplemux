@@ -53,6 +53,7 @@ import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { enqueueNotice, onInboxHeld, withdrawNotice } from '@/lib/inbox-store';
 import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
+import { readLivenessEvidence } from '@/lib/liveness-store';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
 import { listLeases } from '@/lib/lease-store';
 import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
@@ -1097,13 +1098,13 @@ export class StatusManager {
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
   // idle로 잠들면 아무것도 깨우지 못한다 — 그 유일한 사각을 keeper가 메운다.
   private async runOrchestratorKeeper(): Promise<void> {
+    await this.runOrchestratorPresence().catch((err) => {
+      log.warn(`orchestrator presence refresh failed: ${err instanceof Error ? err.message : err}`);
+    });
     const workspaceData = await getWorkspacesCached();
-    // An unreadable workspace registry is unknown, not an empty fleet. Keep
-    // the last coverage snapshot and episode guards until a reliable read.
     if (!workspaceData) return;
     const workspaces = workspaceData.workspaces;
     const now = Date.now();
-    await this.runOrchestratorPresence(workspaces, now);
     for (const ws of workspaces) {
       const orch = ws.orchestration;
       if (!orch?.enabled || !orch.orchestratorTabId) { this.orchKeeper.delete(ws.id); continue; }
@@ -1184,64 +1185,72 @@ export class StatusManager {
     }
   }
 
-  private async runOrchestratorPresence(workspaces: IWorkspace[], now: number): Promise<void> {
-    let epicLeases: Awaited<ReturnType<typeof listLeases>> | null;
-    try {
-      epicLeases = await listLeases('epic:', now);
-    } catch {
-      epicLeases = null;
-    }
-    const statuses = this.getAllForClient();
-    const liveness = getLivenessManager();
-    const facts = await Promise.all(workspaces.map(async (workspace): Promise<IOrchestratorPresenceFacts> => {
-      const [layout, standup] = await Promise.all([
-        readLayoutFile(resolveLayoutFile(workspace.id)),
-        readLatestStandupEvidence(workspace.id),
-      ]);
-      const layoutTabs = layout ? collectAllTabs(layout.root) : null;
-      const tabs = layoutTabs?.map((tab) => ({
-        tabId: tab.id,
-        tabName: tab.name,
-        isAgent: isAgentPanelType(tab.panelType),
-        cliState: statuses[tab.id]?.workspaceId === workspace.id ? statuses[tab.id].cliState : null,
-      })) ?? null;
-
-      let liveBackgroundTabIds: string[] | null = layoutTabs ? [] : null;
-      if (layoutTabs) {
-        const readings = await Promise.allSettled(layoutTabs.map(async (tab) => ({
-          tabId: tab.id,
-          status: await liveness.statusForTab(tab.id),
-        })));
-        if (readings.some((reading) => reading.status === 'rejected')) {
-          liveBackgroundTabIds = null;
-        } else {
-          liveBackgroundTabIds = readings.flatMap((reading) => {
-            if (reading.status !== 'fulfilled') return [];
-            return reading.value.status.backgroundJobs.some((job) => job.alive) ? [reading.value.tabId] : [];
-          });
-        }
+  private async runOrchestratorPresence(): Promise<void> {
+    const monitor = getOrchestratorPresenceMonitor();
+    let workspaceById = new Map<string, IWorkspace>();
+    await monitor.refresh(async () => {
+      const workspaceData = await getWorkspacesCached();
+      if (!workspaceData) throw new Error('workspace registry unreadable');
+      const workspaces = workspaceData.workspaces;
+      workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+      const observedAt = Date.now();
+      let epicLeases: Awaited<ReturnType<typeof listLeases>> | null;
+      try {
+        epicLeases = await listLeases('epic:', observedAt);
+      } catch {
+        epicLeases = null;
       }
+      const statuses = this.getAllForClient();
+      const liveness = getLivenessManager();
+      const facts = await Promise.all(workspaces.map(async (workspace): Promise<IOrchestratorPresenceFacts> => {
+        const [layout, standup, livenessEvidence] = await Promise.all([
+          readLayoutFile(resolveLayoutFile(workspace.id)),
+          readLatestStandupEvidence(workspace.id),
+          readLivenessEvidence(workspace.id),
+        ]);
+        const layoutTabs = layout ? collectAllTabs(layout.root) : null;
+        const tabs = layoutTabs?.map((tab) => ({
+          tabId: tab.id,
+          tabName: tab.name,
+          isAgent: isAgentPanelType(tab.panelType),
+          cliState: statuses[tab.id]?.workspaceId === workspace.id ? statuses[tab.id].cliState : null,
+        })) ?? null;
 
-      return {
-        workspaceId: workspace.id,
-        workspaceName: workspace.name,
-        orchestration: workspace.orchestration
-          ? { enabled: workspace.orchestration.enabled, orchestratorTabId: workspace.orchestration.orchestratorTabId }
-          : null,
-        epicLeases: epicLeases === null
-          ? null
-          : epicLeases.filter((lease) => lease.holder.workspaceId === workspace.id).map((lease) => lease.name),
-        standupState: standup.known ? standup.standup?.state ?? null : undefined,
-        tabs,
-        liveBackgroundTabIds,
-      };
-    }));
+        let liveBackgroundTabIds: string[] | null = layoutTabs && livenessEvidence.known ? [] : null;
+        if (layoutTabs && livenessEvidence.known) {
+          const readings = await Promise.allSettled(layoutTabs.map(async (tab) => ({
+            tabId: tab.id,
+            status: await liveness.statusForTab(tab.id),
+          })));
+          if (readings.some((reading) => reading.status === 'rejected')) {
+            liveBackgroundTabIds = null;
+          } else {
+            liveBackgroundTabIds = readings.flatMap((reading) => {
+              if (reading.status !== 'fulfilled') return [];
+              return reading.value.status.backgroundJobs.some((job) => job.alive) ? [reading.value.tabId] : [];
+            });
+          }
+        }
 
-    const alerts = getOrchestratorPresenceMonitor().reconcile(facts, now);
-    for (const issue of alerts) {
+        return {
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          orchestration: workspace.orchestration
+            ? { enabled: workspace.orchestration.enabled, orchestratorTabId: workspace.orchestration.orchestratorTabId }
+            : null,
+          epicLeases: epicLeases === null
+            ? null
+            : epicLeases.filter((lease) => lease.holder.workspaceId === workspace.id).map((lease) => lease.name),
+          standupState: standup.known ? standup.standup?.state ?? null : undefined,
+          tabs,
+          liveBackgroundTabIds,
+        };
+      }));
+      return { facts, observedAt };
+    }, async (issue) => {
       const tabId = issue.designatedTabId ?? '';
       const entry = tabId ? this.tabs.get(tabId) : undefined;
-      const workspace = workspaces.find((candidate) => candidate.id === issue.workspaceId);
+      const workspace = workspaceById.get(issue.workspaceId);
       await this.dispatchAlert({
         kind: 'orchestrator-missing',
         tabId,
@@ -1252,7 +1261,7 @@ export class StatusManager {
         agentSessionId: entry?.agentSessionId,
         detail: issue.reason,
       });
-    }
+    });
   }
 
   private async dispatchStallAlert(ws: IWorkspace, entry: ITabStatusEntry, tabId: string, idleMinutes: number): Promise<void> {

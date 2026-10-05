@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   evaluateOrchestratorPresence,
   getOrchestratorPresenceMonitor,
+  type IOrchestratorPresencePersistence,
   OrchestratorPresenceMonitor,
 } from '@/lib/orchestrator-presence';
-import type { IOrchestratorPresenceFacts } from '@/types/coordination';
+import type { IOrchestratorPresenceFacts, IOrchestratorPresenceIssue } from '@/types/coordination';
 
 const NOW = 1_800_000_000_000;
 
@@ -18,6 +19,32 @@ const facts = (overrides: Partial<IOrchestratorPresenceFacts> = {}): IOrchestrat
   liveBackgroundTabIds: [],
   ...overrides,
 });
+
+const persistence = (initial: string[] = []): IOrchestratorPresencePersistence & { value: Set<string> } => {
+  const store = {
+    value: new Set(initial),
+    read: async () => new Set(store.value),
+    replace: async (expected: ReadonlySet<string>, next: ReadonlySet<string>) => {
+      if (store.value.size !== expected.size || [...store.value].some((id) => !expected.has(id))) return false;
+      store.value = new Set(next);
+      return true;
+    },
+  };
+  return store;
+};
+
+const refresh = async (
+  monitor: OrchestratorPresenceMonitor,
+  workspaceFacts: IOrchestratorPresenceFacts[],
+  observedAt: number,
+): Promise<IOrchestratorPresenceIssue[]> => {
+  const notifications: IOrchestratorPresenceIssue[] = [];
+  await monitor.refresh(
+    async () => ({ facts: workspaceFacts, observedAt }),
+    async (issue) => { notifications.push(issue); },
+  );
+  return notifications;
+};
 
 describe('orchestrator presence', () => {
   it('reports remaining work with an absent designation', () => {
@@ -76,6 +103,18 @@ describe('orchestrator presence', () => {
     expect(unknownIncumbent).toMatchObject({ state: 'uncertain', workState: 'remaining', orchestratorState: 'unknown', designatedTabId: 'orch' });
   });
 
+  it('keeps mixed unreadable evidence uncertain beside known work and a live coordinator', () => {
+    const issue = evaluateOrchestratorPresence(facts({
+      epicLeases: null,
+      standupState: 'on-track',
+      tabs: [{ tabId: 'orch', tabName: 'orchestrator', isAgent: true, cliState: 'busy' }],
+    }), NOW);
+
+    expect(issue).toMatchObject({ state: 'uncertain', workState: 'remaining', orchestratorState: 'usable' });
+    expect(issue?.evidence).toContain('epic leases unreadable');
+    expect(issue?.reason).toBe('Work evidence is incomplete. Coverage remains uncertain.');
+  });
+
   it('preserves a live coordinator that is awaiting a human answer or merely idle', () => {
     expect(evaluateOrchestratorPresence(facts({
       standupState: 'awaiting-human',
@@ -103,18 +142,41 @@ describe('orchestrator presence', () => {
     }), NOW)).toBeNull();
   });
 
-  it('deduplicates one missing-owner episode and rearms only after confirmed recovery', () => {
-    const monitor = new OrchestratorPresenceMonitor();
+  it('deduplicates across monitor reconstruction and rearms only after confirmed recovery', async () => {
+    const store = persistence();
+    let monitor = new OrchestratorPresenceMonitor(store);
     const missing = facts({ orchestration: { enabled: true, orchestratorTabId: null } });
     const uncertain = facts({ tabs: null, liveBackgroundTabIds: null });
     const recovered = facts();
 
-    expect(monitor.reconcile([missing], NOW)).toHaveLength(1);
-    expect(monitor.reconcile([missing], NOW + 1)).toHaveLength(0);
-    expect(monitor.reconcile([uncertain], NOW + 2)).toHaveLength(0);
-    expect(monitor.reconcile([missing], NOW + 3)).toHaveLength(0);
-    expect(monitor.reconcile([recovered], NOW + 4)).toHaveLength(0);
-    expect(monitor.reconcile([missing], NOW + 5)).toHaveLength(1);
+    expect(await refresh(monitor, [missing], NOW)).toHaveLength(1);
+    monitor = new OrchestratorPresenceMonitor(store);
+    expect(await refresh(monitor, [missing], NOW + 1)).toHaveLength(0);
+    expect(await refresh(monitor, [uncertain], NOW + 2)).toHaveLength(0);
+    expect(await refresh(monitor, [], NOW + 3)).toHaveLength(0);
+    expect(await refresh(monitor, [missing], NOW + 4)).toHaveLength(0);
+    expect(await refresh(monitor, [recovered], NOW + 5)).toHaveLength(0);
+    expect(await refresh(monitor, [missing], NOW + 6)).toHaveLength(1);
+  });
+
+  it('coalesces an overlapping refresh before either collector can apply stale facts', async () => {
+    const monitor = new OrchestratorPresenceMonitor(persistence());
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const notifications: IOrchestratorPresenceIssue[] = [];
+    const first = monitor.refresh(async () => {
+      await blocked;
+      return { facts: [facts({ orchestration: { enabled: true, orchestratorTabId: null } })], observedAt: NOW };
+    }, async (issue) => { notifications.push(issue); });
+    const secondCollector = vi.fn(async () => ({ facts: [facts()], observedAt: NOW + 1 }));
+    const second = monitor.refresh(secondCollector, async (issue) => { notifications.push(issue); });
+
+    release();
+    await Promise.all([first, second]);
+
+    expect(secondCollector).not.toHaveBeenCalled();
+    expect(notifications).toHaveLength(1);
+    expect(monitor.snapshot()).toMatchObject({ state: 'ready', checkedAt: NOW });
   });
 
   it('shares its singleton across server and route module graphs through globalThis', () => {

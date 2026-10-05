@@ -737,13 +737,21 @@ closed, or inactive designation beside confirmed remaining work creates a red
 and dispatches one `orchestrator-missing` alert for that episode. The monitor
 does not select a worker, change orchestration settings, or release leases.
 Confirmed recovery (or confirmed completion) rearms the alert; repeated polls
-and uncertain reads do not.
+and uncertain reads do not. Episode latches are atomically persisted in
+`~/.purplemux/orchestrator-presence.json`, so an unchanged missing condition does
+not alert again after a server restart. Presence refreshes are single-flight
+from evidence collection through dispatch, preventing an older overlapping
+scan from applying after a newer one.
 
-Unreadable leases, standups, layouts, background-job state, or unknown incumbent
-liveness produce an amber `uncertain` row instead of a green result. A live
+Unreadable or structurally invalid leases, standups, layouts, background-job
+state, or unknown incumbent liveness produce an amber `uncertain` row instead
+of a green result, even when another source proves remaining work and the
+incumbent is live. A live
 coordinator waiting for a human answer remains the incumbent. The monitor is a
 `globalThis.__ptOrchestratorPresenceMonitor` singleton so the custom server and
-Next.js coordination route see the same snapshot and episode guards.
+Next.js coordination route see the same snapshot and refresh guard. A corrupt
+episode-latch file appears as an unavailable Coordination section and is never
+silently replaced.
 
 ## Notification System
 

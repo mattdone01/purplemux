@@ -2,7 +2,8 @@ import type { ICaller } from '@/lib/caller';
 import type { ICoordinationSnapshot, INoteRow, TSection } from '@/types/coordination';
 
 // The coordination panel's read (story 20): leases, open notes, watches, active
-// grants, held inbox deliveries and host pressure, each section independent.
+// grants, held inbox deliveries, orchestrator coverage and host pressure, each
+// section independent.
 
 const section = async <T>(read: () => Promise<T[]>): Promise<TSection<T>> => {
   try {
@@ -46,6 +47,8 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
   ]);
   const orchestrators = orchestratorSnapshot.state === 'ready'
     ? { ok: true as const, items: orchestratorSnapshot.issues }
-    : { ok: false as const, error: 'Orchestrator coverage has not been evaluated yet' };
+    : { ok: false as const, error: orchestratorSnapshot.state === 'error'
+      ? orchestratorSnapshot.error
+      : 'Orchestrator coverage has not been evaluated yet' };
   return { at: now, leases, notes: openNotes, watches, grants, inboxHeld, orchestrators, host, signals: hostSignalsView(now) };
 };

@@ -11,6 +11,7 @@ vi.mock('@/lib/layout-store', () => ({
 
 import {
   readLiveness,
+  readLivenessEvidence,
   upsertProbe,
   removeProbes,
   upsertJob,
@@ -74,5 +75,16 @@ describe('liveness-store', () => {
 
   it('reads an empty file shape for an unknown workspace', async () => {
     expect(await readLiveness('ws-none')).toEqual({ probes: [], jobs: [] });
+    expect(await readLivenessEvidence('ws-none')).toEqual({
+      known: true,
+      data: { probes: [], jobs: [] },
+    });
+  });
+
+  it('keeps malformed registrations unknown for strict presence evidence', async () => {
+    await fs.mkdir(path.join(baseDir, 'ws-corrupt'), { recursive: true });
+    await fs.writeFile(path.join(baseDir, 'ws-corrupt', 'liveness.json'), JSON.stringify({ probes: [], jobs: [{}] }));
+
+    expect(await readLivenessEvidence('ws-corrupt')).toEqual({ known: false });
   });
 });

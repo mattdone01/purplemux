@@ -4,21 +4,47 @@ import type {
   TOrchestratorPresenceState,
   TWorkspaceWorkState,
 } from '@/types/coordination';
+import {
+  readOrchestratorPresenceState,
+  replaceOrchestratorPresenceState,
+} from '@/lib/orchestrator-presence-store';
 
 export type TOrchestratorPresenceSnapshot =
   | { state: 'pending' }
+  | { state: 'error'; checkedAt: number; error: string }
   | { state: 'ready'; checkedAt: number; issues: IOrchestratorPresenceIssue[] };
+
+export interface IOrchestratorPresenceObservation {
+  facts: IOrchestratorPresenceFacts[];
+  observedAt: number;
+}
+
+export interface IOrchestratorPresencePersistence {
+  read: () => Promise<ReadonlySet<string>>;
+  replace: (expected: ReadonlySet<string>, next: ReadonlySet<string>) => Promise<boolean>;
+}
+
+const durablePersistence: IOrchestratorPresencePersistence = {
+  read: async () => new Set((await readOrchestratorPresenceState()).missingWorkspaceIds),
+  replace: replaceOrchestratorPresenceState,
+};
 
 const ACTIVE_WORK_STATES = new Set(['busy', 'needs-input', 'ready-for-review']);
 const USABLE_ORCHESTRATOR_STATES = new Set(['busy', 'idle', 'needs-input', 'ready-for-review']);
 
-const workStateOf = (facts: IOrchestratorPresenceFacts): { state: TWorkspaceWorkState; evidence: string[] } => {
+const workStateOf = (facts: IOrchestratorPresenceFacts): {
+  state: TWorkspaceWorkState;
+  evidence: string[];
+  incomplete: boolean;
+} => {
   const evidence: string[] = [];
   let remaining = false;
   let unknown = false;
+  let incomplete = false;
 
   if (facts.epicLeases === null) {
     unknown = true;
+    incomplete = true;
     evidence.push('epic leases unreadable');
   } else if (facts.epicLeases.length > 0) {
     remaining = true;
@@ -27,6 +53,7 @@ const workStateOf = (facts: IOrchestratorPresenceFacts): { state: TWorkspaceWork
 
   if (facts.standupState === undefined) {
     unknown = true;
+    incomplete = true;
     evidence.push('latest standup unreadable');
   } else if (facts.standupState !== null && facts.standupState !== 'done') {
     remaining = true;
@@ -35,6 +62,7 @@ const workStateOf = (facts: IOrchestratorPresenceFacts): { state: TWorkspaceWork
 
   if (facts.tabs === null) {
     unknown = true;
+    incomplete = true;
     evidence.push('workspace tabs unreadable');
   } else {
     const active = facts.tabs.filter((tab) => tab.isAgent && tab.cliState !== null && ACTIVE_WORK_STATES.has(tab.cliState));
@@ -44,6 +72,7 @@ const workStateOf = (facts: IOrchestratorPresenceFacts): { state: TWorkspaceWork
     }
     if (facts.tabs.some((tab) => tab.isAgent && (tab.cliState === null || tab.cliState === 'unknown'))) {
       unknown = true;
+      incomplete = true;
       evidence.push('agent work state unknown');
     }
     // An idle agent is not proof of completion. A final done standup is the
@@ -56,15 +85,16 @@ const workStateOf = (facts: IOrchestratorPresenceFacts): { state: TWorkspaceWork
 
   if (facts.liveBackgroundTabIds === null) {
     unknown = true;
+    incomplete = true;
     evidence.push('registered background work unreadable');
   } else if (facts.liveBackgroundTabIds.length > 0) {
     remaining = true;
     evidence.push(`live registered background work: ${facts.liveBackgroundTabIds.join(', ')}`);
   }
 
-  if (remaining) return { state: 'remaining', evidence };
-  if (unknown) return { state: 'unknown', evidence };
-  return { state: 'complete', evidence };
+  if (remaining) return { state: 'remaining', evidence, incomplete };
+  if (unknown) return { state: 'unknown', evidence, incomplete: true };
+  return { state: 'complete', evidence, incomplete: false };
 };
 
 const orchestratorStateOf = (facts: IOrchestratorPresenceFacts): TOrchestratorPresenceState => {
@@ -93,8 +123,8 @@ const uncertainReason = (
   orchestratorState: TOrchestratorPresenceState,
 ): string => {
   if (orchestratorState === 'unknown') return missingReason(orchestratorState);
+  if (orchestratorState === 'usable') return 'Work evidence is incomplete. Coverage remains uncertain.';
   if (workState === 'unknown') {
-    if (orchestratorState === 'usable') return 'Work completion evidence is incomplete. Coverage remains uncertain.';
     return `Work completion evidence is incomplete and ${orchestratorState === 'disabled'
       ? 'orchestration is disabled'
       : orchestratorState === 'missing'
@@ -110,7 +140,7 @@ export const evaluateOrchestratorPresence = (
 ): IOrchestratorPresenceIssue | null => {
   const work = workStateOf(facts);
   const orchestratorState = orchestratorStateOf(facts);
-  if (work.state === 'complete' || (work.state === 'remaining' && orchestratorState === 'usable')) return null;
+  if (work.state === 'complete' || (work.state === 'remaining' && orchestratorState === 'usable' && !work.incomplete)) return null;
 
   const confirmedMissing = work.state === 'remaining'
     && (orchestratorState === 'missing' || orchestratorState === 'disabled' || orchestratorState === 'dead');
@@ -133,37 +163,67 @@ export const evaluateOrchestratorPresence = (
 
 export class OrchestratorPresenceMonitor {
   private snapshotValue: TOrchestratorPresenceSnapshot = { state: 'pending' };
-  private missingEpisodes = new Set<string>();
+  private refreshInFlight: Promise<void> | null = null;
 
-  reconcile(facts: IOrchestratorPresenceFacts[], observedAt = Date.now()): IOrchestratorPresenceIssue[] {
-    const issues = facts
-      .map((workspace) => evaluateOrchestratorPresence(workspace, observedAt))
-      .filter((issue): issue is IOrchestratorPresenceIssue => issue !== null);
-    const issueByWorkspace = new Map(issues.map((issue) => [issue.workspaceId, issue]));
-    const observedWorkspaces = new Set(facts.map((workspace) => workspace.workspaceId));
-    const notify: IOrchestratorPresenceIssue[] = [];
+  constructor(private readonly persistence: IOrchestratorPresencePersistence = durablePersistence) {}
 
-    for (const issue of issues) {
-      if (issue.state !== 'missing' || this.missingEpisodes.has(issue.workspaceId)) continue;
-      this.missingEpisodes.add(issue.workspaceId);
-      notify.push(issue);
-    }
-    for (const workspace of facts) {
-      const issue = issueByWorkspace.get(workspace.workspaceId);
-      // Only confirmed recovery or completion rearms the episode. An uncertain
-      // read cannot turn the dashboard green or cause a second alert on return.
-      if (!issue) this.missingEpisodes.delete(workspace.workspaceId);
-    }
-    for (const workspaceId of [...this.missingEpisodes]) {
-      if (!observedWorkspaces.has(workspaceId)) this.missingEpisodes.delete(workspaceId);
-    }
+  refresh(
+    collect: () => Promise<IOrchestratorPresenceObservation | null>,
+    notify: (issue: IOrchestratorPresenceIssue) => Promise<void>,
+  ): Promise<void> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    const refresh = this.performRefresh(collect, notify);
+    const tracked = refresh.finally(() => {
+      if (this.refreshInFlight === tracked) this.refreshInFlight = null;
+    });
+    this.refreshInFlight = tracked;
+    return tracked;
+  }
 
-    this.snapshotValue = { state: 'ready', checkedAt: observedAt, issues };
-    return notify;
+  private async performRefresh(
+    collect: () => Promise<IOrchestratorPresenceObservation | null>,
+    notify: (issue: IOrchestratorPresenceIssue) => Promise<void>,
+  ): Promise<void> {
+    const checkedAt = Date.now();
+    try {
+      const missingEpisodes = new Set(await this.persistence.read());
+      const observation = await collect();
+      if (!observation) return;
+      const { facts, observedAt } = observation;
+      const issues = facts
+        .map((workspace) => evaluateOrchestratorPresence(workspace, observedAt))
+        .filter((issue): issue is IOrchestratorPresenceIssue => issue !== null);
+      const issueByWorkspace = new Map(issues.map((issue) => [issue.workspaceId, issue]));
+      const notifications: IOrchestratorPresenceIssue[] = [];
+      const nextEpisodes = new Set(missingEpisodes);
+
+      for (const issue of issues) {
+        if (issue.state !== 'missing' || missingEpisodes.has(issue.workspaceId)) continue;
+        nextEpisodes.add(issue.workspaceId);
+        notifications.push(issue);
+      }
+      for (const workspace of facts) {
+        const issue = issueByWorkspace.get(workspace.workspaceId);
+        if (!issue) nextEpisodes.delete(workspace.workspaceId);
+      }
+
+      if (!(await this.persistence.replace(missingEpisodes, nextEpisodes))) {
+        throw new Error('orchestrator presence state changed during refresh');
+      }
+      this.snapshotValue = { state: 'ready', checkedAt: observedAt, issues };
+      for (const issue of notifications) await notify(issue);
+    } catch (error) {
+      this.snapshotValue = {
+        state: 'error',
+        checkedAt,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    }
   }
 
   snapshot(): TOrchestratorPresenceSnapshot {
-    if (this.snapshotValue.state === 'pending') return this.snapshotValue;
+    if (this.snapshotValue.state !== 'ready') return { ...this.snapshotValue };
     return {
       state: 'ready',
       checkedAt: this.snapshotValue.checkedAt,
