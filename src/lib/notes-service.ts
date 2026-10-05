@@ -43,7 +43,6 @@ import type { INote, INoteAdmission, INoteReceipt, INotesState, INoteView, TNote
 // across workspaces (ADR-0013). Only the inbox's fixed line is typed; the body is pulled.
 
 const log = createLogger('notes');
-const NOTE_PREFLIGHT_SETTLE_MS = 5_000;
 
 export interface INotesDeps {
   now: () => number;
@@ -56,6 +55,8 @@ export interface INotesDeps {
   holdsEpic: (caller: ICaller, slug: string) => Promise<boolean>;
   /** The workspace's orchestrator tab while orchestration is on (liveness is checked by the caller); else null. */
   orchestratorOf: (workspaceId: string) => Promise<string | null>;
+  /** Holds the target workspace's orchestration mapping stable through a terminal note mutation. */
+  withMappingRead: <T>(workspaceId: string, work: () => Promise<T>) => Promise<T>;
   workspaceExists: (workspaceId: string) => Promise<boolean>;
   /** Every live tab, and the workspaces whose layout could not be read (their tabs are unknown, not closed). */
   liveTabs: () => Promise<ILiveTabs>;
@@ -117,7 +118,36 @@ const isToMe = (n: INote, caller: ICaller): boolean => {
 };
 
 export class NotesService {
+  private operationTail: Promise<void> = Promise.resolve();
+
   constructor(private readonly deps: INotesDeps) {}
+
+  /**
+   * Note mutations and a successful paste preflight share one lifecycle lock. A preflight keeps the
+   * lock until the inbox has durably recorded the paste outcome, so ACK/expiry cannot overtake it.
+   */
+  private async acquireOperation(): Promise<() => void> {
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    const previous = this.operationTail;
+    this.operationTail = next;
+    await previous;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      release();
+    };
+  }
+
+  private async withOperation<T>(work: () => Promise<T>): Promise<T> {
+    const release = await this.acquireOperation();
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
 
   // ─── routing ────────────────────────────────────────────────────────────
 
@@ -212,7 +242,7 @@ export class NotesService {
         heldReason: item.heldReason,
         deliveredAt: item.deliveredAt,
       } : null,
-      composerDeliveredAt: note.deliveredAt,
+      composerDeliveredAt: note.deliveredAt ?? item?.deliveredAt ?? null,
     };
   }
 
@@ -222,51 +252,57 @@ export class NotesService {
   }
 
   /** The inbox calls this under its dispatch lock immediately before a note line is pasted. */
-  async preflight(item: IInboxItem): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const match = /^note:(n-[A-Za-z0-9_-]{4,32}):(delivered|reminder|unacked|expired):/.exec(item.dedupeKey);
-    if (!match) return { ok: false, reason: 'note-notice-key-invalid' };
-    const [, id, event] = match;
-    const note = (await this.deps.read()).notes.find((candidate) => candidate.id === id);
-    const storeMayBeSettling = this.deps.now() - item.createdAt < NOTE_PREFLIGHT_SETTLE_MS;
-    if (!note) {
-      if (storeMayBeSettling) throw new Error('note-store-not-settled');
-      return { ok: false, reason: 'note-not-found' };
-    }
-    if (event === 'unacked' || event === 'expired') {
-      const valid = event === 'expired'
-        ? note.state === 'expired' || (OPEN_STATES.has(note.state) && this.deps.now() - note.createdAt >= NOTE_EXPIRE_MS)
-        : note.state === 'delivered';
-      if (!valid) return { ok: false, reason: `note-terminal:${note.state}` };
-      if (item.targetWorkspaceId !== note.from.workspaceId || item.targetTabId !== note.from.tabId) {
-        return { ok: false, reason: 'note-sender-changed' };
+  async preflight(item: IInboxItem): Promise<
+    | { ok: true; settle: () => void }
+    | { ok: false; reason: string }
+  > {
+    const release = await this.acquireOperation();
+    const reject = (reason: string) => {
+      release();
+      return { ok: false as const, reason };
+    };
+    try {
+      const match = /^note:(n-[A-Za-z0-9_-]{4,32}):(delivered|reminder|unacked|expired):/.exec(item.dedupeKey);
+      if (!match) return reject('note-notice-key-invalid');
+      const [, id, event] = match;
+      const note = (await this.deps.read()).notes.find((candidate) => candidate.id === id);
+      if (!note) return reject('note-not-found');
+      if (event === 'unacked' || event === 'expired') {
+        const valid = event === 'expired'
+          ? note.state === 'expired' || (OPEN_STATES.has(note.state) && this.deps.now() - note.createdAt >= NOTE_EXPIRE_MS)
+          : note.state === 'delivered';
+        if (!valid) return reject(`note-terminal:${note.state}`);
+        if (item.targetWorkspaceId !== note.from.workspaceId || item.targetTabId !== note.from.tabId) {
+          return reject('note-sender-changed');
+        }
+        return { ok: true, settle: release };
       }
-      return { ok: true };
-    }
-    if (note.state !== 'delivered') return { ok: false, reason: `note-terminal:${note.state}` };
-    const expectedItemId = event === 'reminder' ? note.reminderItemId : note.inboxItemId;
-    if (expectedItemId !== item.id) {
-      if (storeMayBeSettling) throw new Error('note-store-not-settled');
-      return { ok: false, reason: 'note-notice-superseded' };
-    }
-    const decision = await this.recipientOf(note, this.reads());
-    if (decision.status !== 'routed') {
-      if (decision.status === 'policyblocked' && note.deliveredAt === null) {
-        await this.deps.mutate((state) => {
-          const current = state.notes.find((candidate) => candidate.id === note.id);
-          if (!current || current.state !== 'delivered') return { state, value: undefined };
-          return { state: replaceNote(state, policyBlocked(current, this.deps.now(), decision.reason)), value: undefined };
-        });
+      if (note.state !== 'delivered') return reject(`note-terminal:${note.state}`);
+      const expectedItemId = event === 'reminder' ? note.reminderItemId : note.inboxItemId;
+      if (expectedItemId !== item.id) return reject('note-notice-superseded');
+      const decision = await this.recipientOf(note, this.reads());
+      if (decision.status !== 'routed') {
+        if (decision.status === 'policyblocked' && note.deliveredAt === null) {
+          await this.deps.mutate((state) => {
+            const current = state.notes.find((candidate) => candidate.id === note.id);
+            if (!current || current.state !== 'delivered') return { state, value: undefined };
+            return { state: replaceNote(state, policyBlocked(current, this.deps.now(), decision.reason)), value: undefined };
+          });
+        }
+        return reject(`note-${decision.status}:${decision.reason}`);
       }
-      return { ok: false, reason: `note-${decision.status}:${decision.reason}` };
+      const { recipient } = decision;
+      if (item.targetWorkspaceId !== recipient.workspaceId || item.targetTabId !== recipient.tabId) {
+        return reject('note-recipient-changed');
+      }
+      if (!note.deliveredTo || note.deliveredTo.workspaceId !== recipient.workspaceId || note.deliveredTo.tabId !== recipient.tabId) {
+        return reject('note-route-superseded');
+      }
+      return { ok: true, settle: release };
+    } catch (err) {
+      release();
+      throw err;
     }
-    const { recipient } = decision;
-    if (item.targetWorkspaceId !== recipient.workspaceId || item.targetTabId !== recipient.tabId) {
-      return { ok: false, reason: 'note-recipient-changed' };
-    }
-    if (!note.deliveredTo || note.deliveredTo.workspaceId !== recipient.workspaceId || note.deliveredTo.tabId !== recipient.tabId) {
-      return { ok: false, reason: 'note-route-superseded' };
-    }
-    return { ok: true };
   }
 
   /** Route a queued or undeliverable note: enqueue its line for the live recipient, or mark it undeliverable. */
@@ -310,12 +346,17 @@ export class NotesService {
    */
   private async advance(note: INote, now: number, r: IReads): Promise<INote> {
     if (OPEN_STATES.has(note.state) && now - note.createdAt >= NOTE_EXPIRE_MS) {
+      let expiring = note;
+      const item = note.inboxItemId ? await r.inboxItem(note.inboxItemId) : null;
+      if (item?.state === 'delivered' && expiring.deliveredAt === null) {
+        expiring = reachedComposer(expiring, item.deliveredAt ?? now);
+      }
       // The one expiry notice waits while the sender's liveness is unknown, for at most a day.
-      const settled = await this.noticeSender(note, 'expired', r);
-      if (!settled && now - note.createdAt < NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS) return note;
-      if (note.inboxItemId) await this.deps.withdraw(note.inboxItemId, 'note-terminal:expired');
-      if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-terminal:expired');
-      return expired(note, now);
+      const settled = await this.noticeSender(expiring, 'expired', r);
+      if (!settled && now - expiring.createdAt < NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS) return expiring;
+      if (expiring.inboxItemId) await this.deps.withdraw(expiring.inboxItemId, 'note-terminal:expired');
+      if (expiring.reminderItemId) await this.deps.withdraw(expiring.reminderItemId, 'note-terminal:expired');
+      return expired(expiring, now);
     }
     if (note.state === 'queued' || (note.state === 'undeliverable' && note.routingStatus !== 'policyblocked')) {
       return this.route(note, now, r);
@@ -327,11 +368,19 @@ export class NotesService {
     // or an item gone before it was delivered. The inbox prunes a DELIVERED item after 7 days;
     // that is not a drop, and re-routing it would deliver the note again.
     if (item?.state === 'dropped' || (!item && note.deliveredAt === null)) return this.route(requeued(note, now), now, r);
-    const decision = await this.recipientOf(note, r);
+    let next = note;
+    if (item?.state === 'delivered' && next.deliveredAt === null) next = reachedComposer(next, item.deliveredAt ?? now);
+    const decision = await this.recipientOf(next, r);
     if (decision.status === 'policyblocked') {
+      // A legacy line already delivered to a composer cannot be recalled. Keep its routed record so
+      // the current coordinator can ACK it, while preflight still rejects every pending legacy line.
+      if (!next.admission && next.deliveredAt !== null) {
+        if (next.reminderItemId) await this.deps.withdraw(next.reminderItemId, 'note-policyblocked');
+        return next;
+      }
       if (item && (item.state === 'queued' || item.state === 'held')) await this.deps.withdraw(item.id, 'note-policyblocked');
-      if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-policyblocked');
-      return policyBlocked(note, now, decision.reason);
+      if (next.reminderItemId) await this.deps.withdraw(next.reminderItemId, 'note-policyblocked');
+      return policyBlocked(next, now, decision.reason);
     }
     // A line that reached a tab which is now closed, or an epic that changed hands, goes to the
     // current owner: `--to-me` is the routed tab, so nobody else would see it (review round 2).
@@ -346,8 +395,6 @@ export class NotesService {
         ? undeliverable(waiting, now, decision.reason)
         : this.route(waiting, now, r);
     }
-    let next = note;
-    if (item?.state === 'delivered' && next.deliveredAt === null) next = reachedComposer(next, item.deliveredAt ?? now);
     // The recipient's reminder counts from the line reaching its composer: a busy recipient is not
     // reminded of a line it has not seen. recipientGone() above leaves only a live or unknown tab;
     // an unknown one is tried again next pass, never marked as reminded.
@@ -444,7 +491,7 @@ export class NotesService {
   private async tickOnce(onlyEpic?: string): Promise<void> {
     const now = this.deps.now();
     const r = this.reads();
-    await this.deps.mutate(async (state) => {
+    await this.withOperation(() => this.deps.mutate(async (state) => {
       let next = state;
       for (const note of state.notes) {
         if (onlyEpic !== undefined && note.to.epic !== onlyEpic) continue;
@@ -459,7 +506,12 @@ export class NotesService {
       }
       next = prune(next, now);
       return { state: next, value: undefined };
-    });
+    }));
+  }
+
+  /** One finite boot pass. Runtime periodic/coalesced ticks are armed only after this resolves. */
+  async reconcileInitial(): Promise<void> {
+    await this.tickOnce();
   }
 
   // ─── the CLI operations ─────────────────────────────────────────────────
@@ -498,7 +550,7 @@ export class NotesService {
       now,
       this.deps.newId(),
     );
-    const sent = await this.deps.mutate(async (state) => {
+    const sent = await this.withOperation(() => this.deps.mutate(async (state) => {
       const mine = state.notes.filter((n) => OPEN_STATES.has(n.state)
         && n.from.workspaceId === note.from.workspaceId && n.from.tabId === note.from.tabId).length;
       if (mine >= NOTE_OPEN_PER_SENDER) {
@@ -506,7 +558,7 @@ export class NotesService {
       }
       const routedNote = await this.route(note, now, reads);
       return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
-    });
+    }));
     return (await this.views([sent]))[0];
   }
 
@@ -518,16 +570,33 @@ export class NotesService {
 
   async ack(caller: ICaller, id: unknown, comment: unknown): Promise<INoteView> {
     const clean = cleanComment(comment);
-    const done = await this.deps.mutate(async (state) => {
+    const snapshot = await this.find(id);
+    if (!canAck(snapshot, caller)) throw new NoteError('forbidden', `only the recipient workspace acks note ${snapshot.id}`);
+    const targetWorkspaceId = snapshot.deliveredTo!.workspaceId;
+    const done = await this.deps.withMappingRead(targetWorkspaceId, () => this.withOperation(() => this.deps.mutate(async (state) => {
       const note = state.notes.find((n) => n.id === id);
-      if (!isNoteId(id) || !note) throw new NoteError('note-not-found', `no note ${String(id)}`);
+      if (!note) throw new NoteError('note-not-found', `no note ${String(id)}`);
       if (!canAck(note, caller)) throw new NoteError('forbidden', `only the recipient workspace acks note ${note.id}`);
-      const crossWorkspace = note.from.workspaceId !== null && note.deliveredTo !== null
-        && note.from.workspaceId !== note.deliveredTo.workspaceId;
-      if (crossWorkspace) {
-        const decision = await this.recipientOf(note, this.reads());
-        if (decision.status !== 'routed' || !caller.verified || caller.workspaceId !== decision.recipient.workspaceId
-          || caller.tabId !== decision.recipient.tabId || caller.tabId !== note.deliveredTo!.tabId) {
+      if (note.deliveredTo!.workspaceId !== targetWorkspaceId) {
+        throw new NoteError('forbidden', `note ${note.id} changed recipient while ACK was starting; retry`);
+      }
+      const item = note.inboxItemId
+        ? (await this.deps.inboxItems()).find((candidate) => candidate.id === note.inboxItemId) ?? null
+        : null;
+      const requiresCoordinator = note.deliveredTo !== null
+        && (note.from.workspaceId === null || note.from.workspaceId !== note.deliveredTo.workspaceId);
+      if (requiresCoordinator) {
+        const legacyDelivered = !note.admission && (note.deliveredAt !== null || item?.state === 'delivered');
+        const reads = this.reads();
+        const decision = await this.recipientOf(note, reads);
+        const currentCoordinator = await reads.orchestratorOf(targetWorkspaceId);
+        const routeMatches = legacyDelivered
+          ? currentCoordinator === note.deliveredTo!.tabId
+          : decision.status === 'routed'
+            && decision.recipient.workspaceId === targetWorkspaceId
+            && decision.recipient.tabId === note.deliveredTo!.tabId;
+        if ((!note.admission && !legacyDelivered) || !routeMatches || !caller.verified
+          || caller.workspaceId !== targetWorkspaceId || caller.tabId !== currentCoordinator) {
           throw new NoteError('forbidden', `only the currently routed coordinator acks cross-workspace note ${note.id}`);
         }
       }
@@ -535,9 +604,12 @@ export class NotesService {
       if (note.state !== 'delivered') throw new NoteError('forbidden', `note ${note.id} is ${note.state}, not delivered`);
       if (note.inboxItemId) await this.deps.withdraw(note.inboxItemId, 'note-terminal:acked');
       if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-terminal:acked');
-      const acknowledged = acked(note, { workspaceId: caller.workspaceId!, tabId: caller.tabId }, clean, this.deps.now());
+      const received = item?.state === 'delivered' && note.deliveredAt === null
+        ? reachedComposer(note, item.deliveredAt ?? this.deps.now())
+        : note;
+      const acknowledged = acked(received, { workspaceId: caller.workspaceId!, tabId: caller.tabId }, clean, this.deps.now());
       return { state: replaceNote(state, acknowledged), value: acknowledged };
-    });
+    })));
     return (await this.views([done]))[0];
   }
 
@@ -565,12 +637,13 @@ export class NotesService {
 export const NOTES_TICK_MS = 15_000;
 
 const defaultDeps = async (): Promise<INotesDeps> => {
-  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore] = await Promise.all([
+  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock] = await Promise.all([
     import('@/lib/lease-store'),
     import('@/lib/lease-http'),
     import('@/lib/workspace-store'),
     import('@/lib/tab-lifecycle'),
     import('@/lib/inbox-store'),
+    import('@/lib/orchestration-mapping-lock'),
   ]);
   const epicLease = async (slug: string) => {
     const now = Date.now();
@@ -596,6 +669,7 @@ const defaultDeps = async (): Promise<INotesDeps> => {
       const orchestration = (await workspaceStore.getWorkspaceById(workspaceId))?.orchestration;
       return (orchestration?.enabled ? orchestration.orchestratorTabId : null) ?? null;
     },
+    withMappingRead: mappingLock.withOrchestrationMappingRead,
     workspaceExists: async (workspaceId) => !!(await workspaceStore.getWorkspaceById(workspaceId)),
     liveTabs: tabLifecycle.readLiveTabs,
     enqueue: inboxStore.enqueueNotice,
@@ -634,6 +708,8 @@ export const startNotes = async (): Promise<void> => {
   const tick = (onlyEpic?: string) => {
     service.tick(onlyEpic).catch((err) => log.warn(`notes tick failed: ${err instanceof Error ? err.message : err}`));
   };
+  await service.reconcileInitial().catch((err) => log.warn(`initial notes tick failed: ${err instanceof Error ? err.message : err}`));
+  if (g.__ptNotesRuntime !== runtime) return;
   // Claiming an epic routes the notes that waited for its owner now, not on the next tick.
   runtime.unsubscribeLease = onLeaseAcquired((lease, outcome) => {
     if (lease.kind === 'epic' && outcome === 'acquired') tick(lease.resource);
@@ -641,7 +717,6 @@ export const startNotes = async (): Promise<void> => {
   const timer = setInterval(() => tick(), NOTES_TICK_MS);
   timer.unref?.();
   runtime.timer = timer;
-  tick();
 };
 
 export const stopNotes = async (): Promise<void> => {

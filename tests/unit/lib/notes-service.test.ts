@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ICaller } from '@/lib/caller';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import { renderInboxLine } from '@/lib/inbox-templates';
 import { NoteError, NOTE_EXPIRE_MS, NOTE_EXPIRE_NOTICE_GRACE_MS, NOTE_PRUNE_MS, NOTE_REMIND_MS, NOTE_SENDER_NOTICE_MS } from '@/lib/notes-store';
-import { NotesService, type INotesDeps } from '@/lib/notes-service';
+import { NotesService, NOTES_TICK_MS, startNotes, stopNotes, type INotesDeps } from '@/lib/notes-service';
+import { withOrchestrationMappingRead, withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
 import type { IInboxItem } from '@/types/inbox';
 import type { INotesState } from '@/types/note';
 
@@ -59,6 +60,7 @@ class Fakes {
         return !!h && h.workspaceId === c.workspaceId && h.tabId === c.tabId;
       },
       orchestratorOf: async (ws) => this.orchestrators.get(ws) ?? null,
+      withMappingRead: async (_workspaceId, work) => work(),
       workspaceExists: async (ws) => ['ws-1', 'ws-2', 'ws-3', 'ws-9'].includes(ws),
       liveTabs: async () => {
         this.reads.liveTabs += 1;
@@ -68,6 +70,10 @@ class Fakes {
         };
       },
       enqueue: async (req) => {
+        const existing = [...this.inbox.values()].find((item) => item.state === 'queued'
+          && item.dedupeKey === req.dedupeKey
+          && item.targetWorkspaceId === req.targetWorkspaceId && item.targetTabId === req.targetTabId);
+        if (existing) return { item: existing };
         const id = `i-item${this.sent.length + 1}`;
         const line = renderInboxLine('note', req.fields).line;
         this.sent.push({ ...req, line, id });
@@ -160,7 +166,9 @@ describe('notes (ADR-0013)', () => {
     const sent = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
     f.orchestrators.set('ws-2', 'tab-worker');
     const item = f.inbox.get(f.note(sent.id).inboxItemId!)!;
-    await expect(svc.preflight(item)).resolves.toEqual({ ok: true });
+    const verdict = await svc.preflight(item);
+    expect(verdict).toMatchObject({ ok: true });
+    if (verdict.ok) verdict.settle();
   });
 
   it('rejects an old recipient at paste time, then withdraws and re-routes on coordinator replacement or disable', async () => {
@@ -213,13 +221,71 @@ describe('notes (ADR-0013)', () => {
     await expect(svc.preflight(firstItem)).resolves.toEqual({ ok: false, reason: 'note-terminal:acked' });
   });
 
-  it('retries a just-enqueued notice while the note write settles, then fails a missing note closed', async () => {
+  it('fails a missing note notice closed', async () => {
     const sent = await svc.send(B, { toEpic: 'ddh', subject: 'settling', body: 'b' });
     const item = f.inbox.get(f.note(sent.id).inboxItemId!)!;
     f.state = { notes: [] };
-    await expect(svc.preflight(item)).rejects.toThrow('note-store-not-settled');
-    f.now += 5_000;
     await expect(svc.preflight(item)).resolves.toEqual({ ok: false, reason: 'note-not-found' });
+  });
+
+  it('serializes ACK and expiry behind a successful paste preflight and preserves the composer receipt', async () => {
+    const ackedNote = await svc.send(B, { toEpic: 'ddh', subject: 'ack race', body: 'b' });
+    const ackItem = f.inbox.get(f.note(ackedNote.id).inboxItemId!)!;
+    const ackPreflight = await svc.preflight(ackItem);
+    expect(ackPreflight.ok).toBe(true);
+    let ackFinished = false;
+    const ackPromise = svc.ack(A, ackedNote.id, 'done').then((value) => {
+      ackFinished = true;
+      return value;
+    });
+    await Promise.resolve();
+    expect(ackFinished).toBe(false);
+    f.deliverInbox(ackItem.id, T0 + 123);
+    if (ackPreflight.ok) ackPreflight.settle();
+    const acknowledged = await ackPromise;
+    expect(acknowledged).toMatchObject({
+      state: 'acked',
+      deliveredAt: T0 + 123,
+      receipt: { composerDeliveredAt: T0 + 123, notice: { state: 'delivered', deliveredAt: T0 + 123 } },
+    });
+
+    const expiringNote = await svc.send(B, { toEpic: 'ddh', subject: 'expiry race', body: 'b' });
+    const expiryItem = f.inbox.get(f.note(expiringNote.id).inboxItemId!)!;
+    const expiryPreflight = await svc.preflight(expiryItem);
+    f.now = T0 + NOTE_EXPIRE_MS;
+    let expiryFinished = false;
+    const expiryPromise = svc.tick().then(() => { expiryFinished = true; });
+    await Promise.resolve();
+    expect(expiryFinished).toBe(false);
+    f.deliverInbox(expiryItem.id, f.now);
+    if (expiryPreflight.ok) expiryPreflight.settle();
+    await expiryPromise;
+    expect(f.note(expiringNote.id)).toMatchObject({ state: 'expired', deliveredAt: f.now });
+    expect(f.inbox.get(expiryItem.id)).toMatchObject({ state: 'delivered', deliveredAt: f.now });
+  });
+
+  it('reconciles an orphan queued reminder before its paste preflight after restart', async () => {
+    const sent = await svc.send(B, { toEpic: 'ddh', subject: 'restart', body: 'b' });
+    const main = f.note(sent.id).inboxItemId!;
+    f.deliverInbox(main);
+    await svc.tick();
+    f.now += NOTE_REMIND_MS + MIN;
+    const orphan = (await f.deps().enqueue({
+      kind: 'note',
+      targetWorkspaceId: 'ws-1',
+      targetTabId: 'tab-a',
+      dedupeKey: `note:${sent.id}:reminder:tab-a`,
+      fields: { noteId: sent.id, fromWorkspaceId: 'ws-2', fromTabId: 'tab-b', sentAt: T0, event: 'reminder' },
+    })).item;
+    expect(f.note(sent.id).reminderItemId).toBeNull();
+
+    const bootReconcile = svc.tick();
+    const preflight = svc.preflight(orphan);
+    await bootReconcile;
+    const verdict = await preflight;
+    expect(f.note(sent.id)).toMatchObject({ reminderItemId: orphan.id, remindedAt: f.now });
+    expect(verdict).toMatchObject({ ok: true });
+    if (verdict.ok) verdict.settle();
   });
 
   it('routes a note to the live epic owner with exactly the one fixed line, and the owner reads the body', async () => {
@@ -577,6 +643,65 @@ describe('notes (ADR-0013)', () => {
     await expectCode(svc.ack(A, 'n-nosuchnote', null), 'note-not-found');
   });
 
+  it('lets a local recipient worker ACK, but requires the current coordinator for a delivered legacy unknown-source note', async () => {
+    f.epics.set('local', { workspaceId: 'ws-2', tabId: 'tab-b' });
+    const local = await svc.send(W, { toEpic: 'local', subject: 'local', body: 'b' });
+    await expect(svc.ack(caller('ws-2', 'tab-worker', false), local.id, 'local done')).resolves.toMatchObject({ state: 'acked' });
+
+    const legacy = await svc.send(B, { toEpic: 'ddh', subject: 'legacy admin', body: 'b' });
+    const legacyItem = f.note(legacy.id).inboxItemId!;
+    f.deliverInbox(legacyItem);
+    const persisted = f.note(legacy.id);
+    f.state = { notes: [{ ...persisted, from: { ...persisted.from, workspaceId: null, tabId: null }, admission: undefined }] };
+    await svc.reconcileInitial();
+    expect(f.note(legacy.id)).toMatchObject({ state: 'delivered', deliveredAt: T0 });
+    await expectCode(svc.ack(caller('ws-1', 'tab-a2'), legacy.id, 'worker'), 'forbidden');
+    await expectCode(svc.ack({ ...A, verified: false } as ICaller, legacy.id, 'unverified'), 'forbidden');
+    await expect(svc.ack(A, legacy.id, 'coordinator')).resolves.toMatchObject({
+      state: 'acked', ackedBy: { workspaceId: 'ws-1', tabId: 'tab-a' }, deliveredAt: T0,
+    });
+  });
+
+  it('holds one authoritative coordinator mapping through ACK and reads that mapping once', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 'mapping race', body: 'b' });
+    const itemId = f.note(id).inboxItemId!;
+    f.deliverInbox(itemId);
+    await svc.tick();
+
+    let entered!: () => void;
+    const readEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const readGate = new Promise<void>((resolve) => { release = resolve; });
+    let coordinatorReads = 0;
+    const deps = f.deps();
+    const locked = new NotesService({
+      ...deps,
+      withMappingRead: withOrchestrationMappingRead,
+      orchestratorOf: async (workspaceId) => {
+        if (workspaceId === 'ws-1') {
+          coordinatorReads += 1;
+          entered();
+          await readGate;
+        }
+        return f.orchestrators.get(workspaceId) ?? null;
+      },
+    });
+    const ack = locked.ack(A, id, 'before handover');
+    await readEntered;
+    let handoverFinished = false;
+    const handover = withOrchestrationMappingWrite('ws-1', async () => {
+      f.orchestrators.set('ws-1', 'tab-a2');
+      handoverFinished = true;
+    });
+    await Promise.resolve();
+    expect(handoverFinished).toBe(false);
+    release();
+    await expect(ack).resolves.toMatchObject({ state: 'acked', ackedBy: { tabId: 'tab-a' } });
+    await handover;
+    expect(coordinatorReads).toBe(1);
+    expect(handoverFinished).toBe(true);
+  });
+
   it('denies the old coordinator after a target mapping change and allows the newly routed coordinator', async () => {
     const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
     f.orchestrators.set('ws-1', 'tab-a2');
@@ -659,5 +784,45 @@ describe('notes (ADR-0013)', () => {
     expect((await svc.list(B, { toMe: true })).map((n) => n.subject)).toEqual([]);
     expect((await svc.list(ADMIN, {})).map((n) => n.subject)).toEqual(['to ddh', 'to ws-9']);
     expect((await svc.list(ADMIN, { epic: 'ddh' })).map((n) => n.subject)).toEqual(['to ddh']);
+  });
+});
+
+describe('notes runtime startup', () => {
+  it('finishes one boot reconciliation before arming the periodic tick', async () => {
+    vi.useFakeTimers();
+    const runtimeGlobal = globalThis as unknown as {
+      __ptNotesRuntime?: unknown;
+      __ptNotesService?: NotesService;
+    };
+    const previousRuntime = runtimeGlobal.__ptNotesRuntime;
+    const previousService = runtimeGlobal.__ptNotesService;
+    let release = () => {};
+    const bootGate = new Promise<void>((resolve) => { release = resolve; });
+    const reconcileInitial = vi.fn(async () => bootGate);
+    const tick = vi.fn(async () => {});
+    runtimeGlobal.__ptNotesRuntime = undefined;
+    runtimeGlobal.__ptNotesService = {
+      reconcileInitial,
+      tick,
+      preflight: async () => ({ ok: false as const, reason: 'test' }),
+    } as unknown as NotesService;
+
+    try {
+      const starting = startNotes();
+      await vi.waitFor(() => expect(reconcileInitial).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(4 * NOTES_TICK_MS);
+      expect(tick).not.toHaveBeenCalled();
+
+      release();
+      await starting;
+      await vi.advanceTimersByTimeAsync(NOTES_TICK_MS);
+      expect(tick).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      await stopNotes();
+      runtimeGlobal.__ptNotesRuntime = previousRuntime;
+      runtimeGlobal.__ptNotesService = previousService;
+      vi.useRealTimers();
+    }
   });
 });

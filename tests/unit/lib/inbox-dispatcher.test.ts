@@ -354,6 +354,22 @@ describe('per-kind paste-time preflight (story 12, consult ruling A′)', () => 
     expect(calls.slice(calls.indexOf('lock:enter'))).toEqual(['lock:enter', 'findTab', 'policy', 'capture', 'preflight:i-m1', 'deliver', 'lock:exit']);
   });
 
+  it('settles a claimed preflight only after the paste outcome is recorded', async () => {
+    const { dispatcher, add, item } = withMission();
+    let stateAtSettle: string | null = null;
+    const unregister = registerInboxPreflight('mission', async () => ({
+      ok: true,
+      settle: () => { stateAtSettle = item('i-m1').state; },
+    }));
+    try {
+      add('m1');
+      await dispatcher.tick();
+    } finally {
+      unregister();
+    }
+    expect(stateAtSettle).toBe('delivered');
+  });
+
   it('drops only the refused item, with the owner\'s reason, and delivers the next one', async () => {
     const { dispatcher, deliver, add, item } = withMission();
     const unregister = registerInboxPreflight('mission', async (candidate) =>

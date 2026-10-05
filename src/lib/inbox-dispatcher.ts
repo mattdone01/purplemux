@@ -30,7 +30,10 @@ export const INBOX_FIRST_TICK_MAX_WAIT_MS = 10_000;
  * for this paste, so the delivery that follows is the only one it allows. In memory only: a callback
  * cannot be persisted, and the owner registers it again when its runtime starts.
  */
-export type TInboxPreflight = (item: IInboxItem) => Promise<{ ok: true } | { ok: false; reason: string }>;
+export type TInboxPreflight = (item: IInboxItem) => Promise<
+  | { ok: true; settle?: () => void | Promise<void> }
+  | { ok: false; reason: string }
+>;
 
 /** Kinds whose items may not be typed without their owner's preflight. */
 const PREFLIGHT_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['mission', 'note']);
@@ -69,13 +72,14 @@ export interface IInboxDispatcherDeps {
   isPending: (sessionName: string, line: string) => Promise<boolean>;
 }
 
-type TAttempt =
+type TAttempt = (
   | { outcome: 'delivered' }
   | { outcome: 'refused'; reason: string }
   | { outcome: 'held'; reason: string }
   | { outcome: 'dropped'; reason: string }
   | { outcome: 'rejected'; reason: string }
-  | { outcome: 'withdrawn' };
+  | { outcome: 'withdrawn' }
+) & { settle?: () => void | Promise<void> };
 
 const STATE_REFUSAL = 'composer-not-ready:';
 
@@ -146,17 +150,23 @@ export class InboxDispatcher {
       attempt = { outcome: 'refused', reason: `dispatch-error:${err instanceof Error ? err.message : String(err)}` };
     }
     const now = this.deps.now();
-    await this.deps.mutate((state) => {
-      switch (attempt.outcome) {
-        case 'delivered': return { state: deliverInState(state, item.id, now), value: null };
-        case 'held': return { state: holdInState(state, item.id, attempt.reason, now), value: null };
-        case 'dropped': return { state: dropForTabInState(state, item.targetWorkspaceId, item.targetTabId, attempt.reason, now).state, value: null };
-        case 'refused': return { state: refuseInState(state, item.id, attempt.reason, now), value: null };
-        // This item only: its owner refused it at paste time.
-        case 'rejected': return { state: withdrawInState(state, item.id, attempt.reason, now), value: null };
-        case 'withdrawn': return { state, value: null };
-      }
-    });
+    try {
+      await this.deps.mutate((state) => {
+        switch (attempt.outcome) {
+          case 'delivered': return { state: deliverInState(state, item.id, now), value: null };
+          case 'held': return { state: holdInState(state, item.id, attempt.reason, now), value: null };
+          case 'dropped': return { state: dropForTabInState(state, item.targetWorkspaceId, item.targetTabId, attempt.reason, now).state, value: null };
+          case 'refused': return { state: refuseInState(state, item.id, attempt.reason, now), value: null };
+          // This item only: its owner refused it at paste time.
+          case 'rejected': return { state: withdrawInState(state, item.id, attempt.reason, now), value: null };
+          case 'withdrawn': return { state, value: null };
+        }
+      });
+    } finally {
+      // A successful owner preflight may hold its lifecycle lock until the inbox outcome is durable.
+      // This makes terminal owner transitions serialize with both the paste and its receipt.
+      await attempt.settle?.();
+    }
     if (attempt.outcome === 'delivered') log.info({ id: item.id, kind: item.kind, tabId: item.targetTabId }, 'inbox delivered');
     else if (attempt.outcome !== 'refused' && attempt.outcome !== 'withdrawn') log.info({ id: item.id, tabId: item.targetTabId, ...attempt }, `inbox ${attempt.outcome}`);
   }
@@ -174,47 +184,55 @@ export class InboxDispatcher {
     if (!isAgentPanelType(found.panelType)) return { outcome: 'held', reason: 'target-not-agent' };
     if (!(await this.deps.hasSession(found.sessionName))) return { outcome: 'refused', reason: 'session-not-running' };
 
-    return this.deps.withDispatchLock(item.targetWorkspaceId, found, async (checkPolicy) => {
-      const current = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
-      if (!current) return this.missing(item);
-      if (current.sessionName !== found.sessionName) return { outcome: 'refused', reason: 'target-changed' };
-      const policy = await checkPolicy();
-      if (!policy.ok) return { outcome: 'refused', reason: `policy:${policy.error ?? 'refused'}` };
-      if (this.deps.halted(item.targetTabId)) return { outcome: 'refused', reason: 'usage-limit-halt' };
-      const readiness = await checkComposerReady({
-        panelType: current.panelType,
-        status: this.deps.status(item.targetTabId),
-        waitingAtPrompt: this.deps.waitingAtPrompt(item.targetTabId),
-        capture: () => this.deps.capture(current.sessionName),
-      });
-      if (!readiness.ok) return { outcome: 'refused', reason: readiness.reason };
-      // Its owner may have withdrawn it since this tick picked it (a closed episode).
-      const stillQueued = await this.deps.mutate((state) => ({
-        state,
-        value: state.items.find((i) => i.id === item.id)?.state === 'queued',
-      }));
-      if (!stillQueued) return { outcome: 'withdrawn' };
-      if (PREFLIGHT_KINDS.has(item.kind)) {
-        const preflight = preflights().get(item.kind);
-        // No owner listening yet (a boot before its runtime started): wait, within the bound.
-        if (!preflight) return { outcome: 'refused', reason: 'preflight-unregistered' };
-        let verdict: { ok: true } | { ok: false; reason: string };
-        try {
-          verdict = await preflight(item);
-        } catch (err) {
-          return { outcome: 'refused', reason: `preflight-error:${err instanceof Error ? err.message : String(err)}` };
+    let settle: (() => void | Promise<void>) | undefined;
+    let result: TAttempt;
+    try {
+      result = await this.deps.withDispatchLock<TAttempt>(item.targetWorkspaceId, found, async (checkPolicy) => {
+        const current = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
+        if (!current) return this.missing(item);
+        if (current.sessionName !== found.sessionName) return { outcome: 'refused', reason: 'target-changed' };
+        const policy = await checkPolicy();
+        if (!policy.ok) return { outcome: 'refused', reason: `policy:${policy.error ?? 'refused'}` };
+        if (this.deps.halted(item.targetTabId)) return { outcome: 'refused', reason: 'usage-limit-halt' };
+        const readiness = await checkComposerReady({
+          panelType: current.panelType,
+          status: this.deps.status(item.targetTabId),
+          waitingAtPrompt: this.deps.waitingAtPrompt(item.targetTabId),
+          capture: () => this.deps.capture(current.sessionName),
+        });
+        if (!readiness.ok) return { outcome: 'refused', reason: readiness.reason };
+        // Its owner may have withdrawn it since this tick picked it (a closed episode).
+        const stillQueued = await this.deps.mutate((state) => ({
+          state,
+          value: state.items.find((i) => i.id === item.id)?.state === 'queued',
+        }));
+        if (!stillQueued) return { outcome: 'withdrawn' };
+        if (PREFLIGHT_KINDS.has(item.kind)) {
+          const preflight = preflights().get(item.kind);
+          // No owner listening yet (a boot before its runtime started): wait, within the bound.
+          if (!preflight) return { outcome: 'refused', reason: 'preflight-unregistered' };
+          let verdict: Awaited<ReturnType<TInboxPreflight>>;
+          try {
+            verdict = await preflight(item);
+          } catch (err) {
+            return { outcome: 'refused', reason: `preflight-error:${err instanceof Error ? err.message : String(err)}` };
+          }
+          if (!verdict.ok) return { outcome: 'rejected', reason: `preflight:${verdict.reason}` };
+          settle = verdict.settle;
         }
-        if (!verdict.ok) return { outcome: 'rejected', reason: `preflight:${verdict.reason}` };
-      }
-      try {
-        await this.deps.deliver(current.sessionName, item.line);
-      } catch (err) {
-        return { outcome: 'held', reason: `transport-uncertain:${err instanceof Error ? err.message : String(err)}` };
-      }
-      // No caller reads `submitted` here, so a stranded paste is held, never retried blind.
-      const pending = await this.deps.isPending(current.sessionName, item.line).catch(() => false);
-      return pending ? { outcome: 'held', reason: 'stranded-in-composer' } : { outcome: 'delivered' };
-    });
+        try {
+          await this.deps.deliver(current.sessionName, item.line);
+        } catch (err) {
+          return { outcome: 'held', reason: `transport-uncertain:${err instanceof Error ? err.message : String(err)}` };
+        }
+        // No caller reads `submitted` here, so a stranded paste is held, never retried blind.
+        const pending = await this.deps.isPending(current.sessionName, item.line).catch(() => false);
+        return pending ? { outcome: 'held', reason: 'stranded-in-composer' } : { outcome: 'delivered' };
+      });
+    } catch (err) {
+      result = { outcome: 'refused', reason: `dispatch-error:${err instanceof Error ? err.message : String(err)}` };
+    }
+    return settle ? { ...result, settle } : result;
   }
 
   /** `tab-closed`: the tab's queued and held notices are dropped; their owners re-route them. */

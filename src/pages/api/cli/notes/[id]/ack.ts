@@ -3,7 +3,7 @@ import { bodyOf, requireCaller, requireMethod } from '@/lib/lease-http';
 import { sendNoteError } from '@/lib/notes-http';
 import { getNotesService } from '@/lib/notes-service';
 
-/** Acknowledge a delivered note: the recipient workspace only (ADR-0013). */
+/** ACK a local note from its workspace, or a cross-workspace note from its current routed coordinator. */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!requireMethod(req, res, 'POST')) return;
   const caller = await requireCaller(req, res);

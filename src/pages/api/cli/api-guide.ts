@@ -361,8 +361,10 @@ GET /api/cli/notes/<id>
   404 note-not-found (exit 7); 403 forbidden (exit 3).
 
 POST /api/cli/notes/<id>/ack
-  The recipient workspace only. Body: { "comment"? (≤ 500) }. Response: { "note" } in state "acked".
-  404 note-not-found (exit 7); 403 forbidden (exit 3), also for a note that is not delivered.
+  Same-workspace notes: the recipient workspace. Cross-workspace and legacy unknown-source notes:
+  the verified currently routed recipient coordinator. Body: { "comment"? (≤ 500) }.
+  Response: { "note" } in state "acked". 404 note-not-found (exit 7); 403 forbidden (exit 3),
+  also for a note that is not delivered.
 
 ## Harness watches (ADR-0015)
 
