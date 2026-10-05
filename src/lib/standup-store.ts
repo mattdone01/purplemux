@@ -70,6 +70,24 @@ const writeFile = async (filePath: string, data: IStandupFile): Promise<void> =>
 export const readStandups = async (wsId: string): Promise<IWorkspaceStandup[]> =>
   readFile(resolveStandupPath(wsId));
 
+/**
+ * Presence checks must distinguish an empty history from an unreadable one:
+ * treating a damaged standup file as "done" could hide unfinished work.
+ */
+export const readLatestStandupEvidence = async (
+  wsId: string,
+): Promise<{ known: true; standup: IWorkspaceStandup | null } | { known: false }> => {
+  try {
+    const raw = await fs.readFile(resolveStandupPath(wsId), 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<IStandupFile> | null;
+    if (!Array.isArray(parsed?.standups)) return { known: false };
+    return { known: true, standup: parsed.standups[0] ?? null };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { known: true, standup: null };
+    return { known: false };
+  }
+};
+
 export const addStandup = async (standup: IWorkspaceStandup): Promise<void> =>
   withLock(standup.workspaceId, async () => {
     const filePath = resolveStandupPath(standup.workspaceId);

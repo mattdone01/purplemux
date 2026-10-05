@@ -101,6 +101,7 @@ const titleFor = (kind: TAlertKind): string => {
     case 'review': return 'Task Complete';
     case 'standup-needs-human': return 'Standup Needs You';
     case 'orchestrator-stalled': return 'Orchestrator Stalled';
+    case 'orchestrator-missing': return 'Orchestrator Missing';
     case 'work-stalled': return 'Work Stalled';
     case 'bg-job-died': return 'Background Job Died';
     case 'bg-job-unknown': return 'Background Job Status Unknown';
@@ -116,6 +117,8 @@ const bodyFor = (source: IAlertSource): string => {
       return source.headline || source.tabName || source.tabId;
     case 'orchestrator-stalled':
       return source.detail || STALL_BODY;
+    case 'orchestrator-missing':
+      return source.detail?.slice(0, MAX_BODY) || 'Unfinished work has no usable orchestrator.';
     case 'work-stalled':
     case 'bg-job-died':
     case 'bg-job-unknown':

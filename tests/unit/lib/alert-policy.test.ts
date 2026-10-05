@@ -140,6 +140,12 @@ describe('alertFor', () => {
   it('describes a stall without a detail', () => {
     expect(alertFor({ ...base, kind: 'orchestrator-stalled' }).body.length).toBeGreaterThan(0);
   });
+
+  it('builds a bounded missing-orchestrator alert from its reason', () => {
+    const alert = alertFor({ ...base, kind: 'orchestrator-missing', detail: 'x'.repeat(200) });
+    expect(alert.title).toBe('Orchestrator Missing');
+    expect(alert.body).toHaveLength(100);
+  });
 });
 
 describe('standupAlertTabId', () => {

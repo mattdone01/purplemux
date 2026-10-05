@@ -721,6 +721,30 @@ todo`, `note?`), `blockers[]` (`what`, `needs` — the exact input that clears i
 `needsHuman`, `next[]`. The sidebar chip shows the state dot, done-count, and headline;
 ticks older than `STANDUP_STALE_MS` (20 min) render as stale.
 
+## Orchestrator Coverage
+
+Every status poll checks whether a workspace with remaining work has a usable
+designated orchestrator. Remaining-work evidence comes from active `epic:`
+leases, a latest standup whose state is not `done`, active agent tabs, and live
+registered background jobs. An idle agent is not completion evidence. An empty
+workspace, or a `done` standup with no conflicting work evidence, needs no
+orchestrator.
+
+The designation is usable when orchestration is enabled and its agent tab has a
+known live work state, including `idle` and `needs-input`. A missing, disabled,
+closed, or inactive designation beside confirmed remaining work creates a red
+`Orchestrator coverage` row in Mission Control's existing Coordination panel
+and dispatches one `orchestrator-missing` alert for that episode. The monitor
+does not select a worker, change orchestration settings, or release leases.
+Confirmed recovery (or confirmed completion) rearms the alert; repeated polls
+and uncertain reads do not.
+
+Unreadable leases, standups, layouts, background-job state, or unknown incumbent
+liveness produce an amber `uncertain` row instead of a green result. A live
+coordinator waiting for a human answer remains the incumbent. The monitor is a
+`globalThis.__ptOrchestratorPresenceMonitor` singleton so the custom server and
+Next.js coordination route see the same snapshot and episode guards.
+
 ## Notification System
 
 ### Notification Sheet (`NotificationSheet`)
@@ -762,6 +786,7 @@ shouldAlert({ id: tabId }, workspace, config)
 | `review` | Task Complete | `applyCliState` → `ready-for-review` |
 | `standup-needs-human` | Standup Needs You | `reportStandup` when `needsHuman` (or state `blocked`/`awaiting-human`); addressed to the orchestrator tab, body is the headline |
 | `orchestrator-stalled` | Orchestrator Stalled | `runOrchestratorKeeper` on the `ORCH_MAX_HEARTBEATS` beat, once per stall episode |
+| `orchestrator-missing` | Orchestrator Missing | the coverage monitor finds confirmed remaining work with a missing, disabled, closed, or inactive designation; once per episode |
 
 The idempotent guard at the top of `applyCliState` (`prevState === newState`) blocks duplicate calls, so callers don't have to track state.
 

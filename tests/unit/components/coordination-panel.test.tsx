@@ -11,7 +11,7 @@ const AT = Date.parse('2026-09-26T15:00:00Z');
 const empty = (): ICoordinationSnapshot => ({
   at: AT,
   leases: { ok: true, items: [] }, notes: { ok: true, items: [] }, watches: { ok: true, items: [] },
-  grants: { ok: true, items: [] }, inboxHeld: { ok: true, items: [] },
+  grants: { ok: true, items: [] }, inboxHeld: { ok: true, items: [] }, orchestrators: { ok: true, items: [] },
   host: { available: true, disks: [{ path: '/', usedPct: 40, freeBytes: 500 * 1024 ** 3, inodesUsedPct: 10 }], tmpInodesUsedPct: 20, loadAverage: [1, 2, 3], memAvailableBytes: 8 * 1024 ** 3 },
   signals: { state: 'not-configured' },
 });
@@ -20,12 +20,13 @@ const render = (snapshot: ICoordinationSnapshot | null, error: string | null = n
 const sectionHtml = (html: string, title: string) => html.slice(html.indexOf(`data-section="${title}"`), html.indexOf('</div>', html.indexOf(`data-section="${title}"`)));
 
 describe('coordination panel', () => {
-  it.each(['Leases', 'Open notes', 'Watches', 'Grants', 'Held deliveries'])('%s: empty state', (title) => {
+  it.each(['Leases', 'Open notes', 'Watches', 'Grants', 'Held deliveries', 'Orchestrator coverage'])('%s: empty state', (title) => {
     expect(sectionHtml(render(empty()), title)).toContain('data-state="empty"');
   });
 
   it.each([
     ['Leases', 'leases'], ['Open notes', 'notes'], ['Watches', 'watches'], ['Grants', 'grants'], ['Held deliveries', 'inboxHeld'],
+    ['Orchestrator coverage', 'orchestrators'],
   ] as const)('%s: error state shows the served error', (title, key) => {
     const snap = { ...empty(), [key]: { ok: false, error: `${key} store unreadable` } } as ICoordinationSnapshot;
     const html = sectionHtml(render(snap), title);
@@ -54,6 +55,28 @@ describe('coordination panel', () => {
     expect(render(snap)).not.toContain('data-warn="true"');
     if (snap.host.available) snap.host.disks[0].usedPct = 99;
     expect(render(snap)).toMatch(/data-disk="\/" data-warn="true".*?<span class="text-ui-amber">disk 99%/);
+  });
+
+  it('shows reasoned missing and uncertain orchestrator coverage', () => {
+    const snap = empty();
+    snap.orchestrators = { ok: true, items: [
+      {
+        workspaceId: 'ws-missing', workspaceName: 'Payments', state: 'missing', workState: 'remaining',
+        orchestratorState: 'missing', designatedTabId: null, evidence: ['active epic lease: epic:payments'],
+        reason: 'Work remains but no orchestrator is designated.', observedAt: AT,
+      },
+      {
+        workspaceId: 'ws-unknown', workspaceName: 'Treasury', state: 'uncertain', workState: 'remaining',
+        orchestratorState: 'unknown', designatedTabId: 'tab-owner', evidence: ['latest standup is awaiting-human'],
+        reason: 'The designated orchestrator liveness is unknown.', observedAt: AT,
+      },
+    ] };
+    const html = render(snap);
+    expect(html).toContain('data-orchestrator-coverage="ws-missing"');
+    expect(html).toContain('data-state="missing"');
+    expect(html).toContain('active epic lease: epic:payments');
+    expect(html).toContain('data-orchestrator-coverage="ws-unknown"');
+    expect(html).toContain('The designated orchestrator liveness is unknown.');
   });
 
   it('host signals: not configured, validation error, values with stamp, stale', () => {
