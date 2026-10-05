@@ -55,7 +55,7 @@ describe('portfolio grants dialog content', () => {
   it('lists an active grant with its workspaces, expiry and a Revoke button; revoked and expired ones are gone', () => {
     const html = panel({ grants: [active, { ...active, id: 'g-rev1', revokedAt: NOW - 1 }, { ...active, id: 'g-exp1', expiresAt: NOW }] });
     expect(html).toContain('data-grant="g-live1"');
-    expect(html).toContain('drives Billing, Treasury');
+    expect(html).toContain('reads Billing, Treasury');
     expect(html).toContain('Revoke');
     expect(html).not.toContain('g-rev1');
     expect(html).not.toContain('g-exp1');
@@ -110,15 +110,15 @@ describe('portfolio grants dialog content', () => {
 });
 
 describe('grant badge', () => {
-  it('shows "drives N" with the workspaces and the expiry in its label', () => {
+  it('shows "reads N" with the workspaces and the expiry in its label', () => {
     const html = renderToStaticMarkup(
       <NextIntlClientProvider locale="en" timeZone="UTC" messages={{ grants }}>
         <GrantBadgeView badge={{ count: 2, workspaces: ['ws-2', 'ws-3'], expiresAt: NOW + 3_600_000 }} workspaceNames={names} />
       </NextIntlClientProvider>,
     );
-    expect(html).toContain('drives 2 workspaces');
+    expect(html).toContain('reads 2 workspaces');
     expect(html).toContain('data-grant-badge="2"');
-    expect(html).toMatch(/aria-label="Drives Billing, Treasury until [^"]+"/);
+    expect(html).toMatch(/aria-label="Reads Billing, Treasury until [^"]+"/);
     expect(html).not.toContain('data-stale');
   });
 
@@ -128,7 +128,7 @@ describe('grant badge', () => {
         <GrantBadgeView badge={{ count: 1, workspaces: ['ws-2'], expiresAt: NOW + 3_600_000 }} workspaceNames={names} staleReason="Authentication required" />
       </NextIntlClientProvider>,
     );
-    expect(html).toContain('drives 1 workspace<');
+    expect(html).toContain('reads 1 workspace<');
     expect(html).toContain('data-stale="true"');
     expect(html).toContain('not refreshed: Authentication required');
   });

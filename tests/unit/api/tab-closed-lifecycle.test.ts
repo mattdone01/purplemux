@@ -1,3 +1,4 @@
+vi.mock('@/lib/human-mutation', () => ({ authorizeHumanMutation: vi.fn(async () => true) }));
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';

@@ -8,7 +8,7 @@ export const GRANT_DEFAULT_EXPIRY_HOURS = 24;
 export const isGrantActive = (grant: IGrant, now: number): boolean => grant.revokedAt === null && grant.expiresAt > now;
 
 export interface IGrantBadge {
-  /** Distinct workspaces this tab may drive now. */
+  /** Distinct workspaces this tab may read now. */
   count: number;
   workspaces: string[];
   /** The latest expiry among its active grants (the badge lasts until then). */

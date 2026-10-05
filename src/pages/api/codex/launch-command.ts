@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { codexProvider } from '@/lib/providers/codex';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
@@ -32,7 +33,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const hasCliToken = typeof req.headers?.['x-pmux-token'] === 'string';
   if (hasCliToken) {
     if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
-  }
+  } else if (!(await authorizeHumanMutation(req, res))) return;
 
   try {
     const availability = await checkAgentAvailabilityForPanelType(codexProvider.panelType);

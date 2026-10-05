@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspaceInput } from '@/lib/cli-utils';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
@@ -32,7 +33,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (hasCliToken) {
     if (!workspaceId) return res.status(400).json({ error: 'workspaceId is required' });
     if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
-  }
+  } else if (!(await authorizeHumanMutation(req, res))) return;
 
   try {
     const availability = await checkAgentAvailabilityForPanelType(claudeProvider.panelType);

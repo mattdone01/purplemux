@@ -14,6 +14,7 @@ const stores = vi.hoisted(() => ({
 
 vi.mock('@/lib/workspace-token', () => scope);
 vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: stores.getWorkspaceById }));
+vi.mock('@/lib/workspace-layout-read', () => ({ readWorkspaceLayout: stores.getLayout }));
 vi.mock('@/lib/layout-store', () => ({ getLayout: stores.getLayout }));
 vi.mock('@/lib/layout-tree', () => ({
   collectPanes: (root: { tabs: unknown[]; id: string }) => [root],
@@ -74,7 +75,7 @@ describe('authorization refusals carry code forbidden (exit 3)', () => {
 
     expect(await authorizeWorkspace(request(), response.res, 'ws-1')).toBeNull();
     expect(response.statusCode).toBe(403);
-    expect(response.body).toMatchObject({ code: 'forbidden', error: expect.stringContaining('allowedPeers') });
+    expect(response.body).toMatchObject({ code: 'forbidden', error: expect.stringContaining('coordinator notes') });
   });
 
   it('authorizeWorkspaceInput refuses an unknown token', async () => {
@@ -92,7 +93,7 @@ describe('authorization refusals carry code forbidden (exit 3)', () => {
 
     expect(await authorizeWorkspaceInput(request(), response.res, 'ws-1')).toBeNull();
     expect(response.statusCode).toBe(403);
-    expect(response.body).toMatchObject({ code: 'forbidden', error: expect.stringContaining('PMUX_TOKEN') });
+    expect(response.body).toMatchObject({ code: 'forbidden', error: expect.stringContaining('coordinator notes') });
   });
 
   it('withBrowserTab answers a missing tab with tab-not-found', async () => {

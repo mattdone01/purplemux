@@ -1,5 +1,7 @@
 # ADR-0014: Portfolio scope — a human-granted, verified-tab drive grant
 
+> Superseded for mutation authority by ADR-0021. Existing `drive` records now provide read access only; they never authorize foreign agent mutations. No migration or token rotation is required.
+
 - **Status**: Accepted (story 11, 2026-09-26)
 - **Context source**: `_output/purplemux-portfolio-coordination/architecture.md` (nomupay workspace), learning L13
 

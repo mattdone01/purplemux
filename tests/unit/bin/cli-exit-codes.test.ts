@@ -188,7 +188,7 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     requests.length = 0;
     const listed = await cli(['grant', 'list']);
     expect(listed.code).toBe(0);
-    expect(listed.stdout).toMatch(/^g-aaaa1 {2}ws-1\/tab-a drives ws-2 {2}active until .+ {2}"portfolio"$/m);
+    expect(listed.stdout).toMatch(/^g-aaaa1 {2}ws-1\/tab-a reads ws-2 {2}active until .+ {2}"portfolio"$/m);
     expect(listed.stdout).toMatch(/^g-bbbb2 .* ended \(grantee-tab-closed\)/m);
     expect(requests.map((r) => `${r.method} ${r.url}`)).toEqual(['GET /api/cli/grants']);
     expect(JSON.parse((await cli(['grant', 'list', '--json'])).stdout).grants).toHaveLength(2);

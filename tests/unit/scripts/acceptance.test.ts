@@ -17,6 +17,25 @@ const checks = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptanc
 // Next types NODE_ENV as required on ProcessEnv; a child's environment here is deliberately minimal.
 const asEnv = (env: Record<string, string | undefined>) => env as NodeJS.ProcessEnv;
 
+describe('isolated CLI fixture authority', () => {
+  it('scopes workspace commands without overwriting tab identities or global read commands', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'accept-cli-scope-'));
+    try {
+      fs.mkdirSync(path.join(root, '.purplemux'));
+      fs.writeFileSync(path.join(root, '.purplemux/workspace-tokens.json'), JSON.stringify({ 'ws-a': 'scratch-a' }));
+      fs.mkdirSync(path.join(root, 'bin'));
+      fs.writeFileSync(path.join(root, 'bin/purplemux.js'), 'process.stdout.write(process.env.PMUX_TOKEN || "global")');
+      const inst = new checks.Instance({ candidate: root, home: root, node: process.execPath, tmuxTmpdir: root, workspaces: { a: 'ws-a' } });
+      expect((await inst.cli(['tab', 'create', '-w', 'ws-a'])).out).toBe('scratch-a');
+      expect((await inst.cli(['workspaces'])).out).toBe('global');
+      expect((await inst.cli(['tab', 'send', '-w', 'ws-a'], { env: { ...inst.env, PMUX_TOKEN: 'tab-own' } })).out).toBe('tab-own');
+      expect(() => inst.cli(['tab', 'create', '-w', 'foreign'])).toThrow('Unknown isolated fixture workspace');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('checks.cjs judgements', () => {
   it('judgeNoteDelivery: only a stamped delivery whose notice line reached the composer, body absent, passes', () => {
     const note = { id: 'n-abcd1234', state: 'delivered', deliveredAt: 1790000000000 };
@@ -300,8 +319,9 @@ exec sleep 600
 const fakeCurl = (dir: string) => `#!/bin/bash
 url="\${@: -1}"
 case "$url" in
+  */api/auth/setup|*/api/auth/login) echo '{}' ;;
   */api/health) echo '{"app":"purplemux","version":"0"}' ;;
-  */api/workspace) [[ -e "${dir}/ws-fail" ]] && exit 7; echo "{\\"id\\":\\"ws-$RANDOM\\"}" ;;
+  */api/workspace) [[ " $* " == *" -b "* && " $* " == *"Origin: "* ]] || exit 22; [[ -e "${dir}/ws-fail" ]] && exit 7; echo "{\\"id\\":\\"ws-$RANDOM\\"}" ;;
   *) exit 7 ;;
 esac
 `;

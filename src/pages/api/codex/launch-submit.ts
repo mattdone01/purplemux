@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspaceInput } from '@/lib/cli-utils';
 import {
@@ -20,7 +21,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(400).json({ error: 'workspaceId, tabId, and generation are required' });
   }
   const hasCliToken = typeof req.headers?.['x-pmux-token'] === 'string';
-  if (hasCliToken && !(await authorizeWorkspaceInput(req, res, workspaceId))) return;
+  if (hasCliToken) {
+    if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
+  } else if (!(await authorizeHumanMutation(req, res))) return;
 
   const submitted = await submitCodexManagedLaunch(workspaceId, tabId, generation);
   if (!submitted.ok) {

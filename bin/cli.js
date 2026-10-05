@@ -848,7 +848,7 @@ const cmdGrant = async (args) => {
   }
   for (const g of grants) {
     const state = g.revokedAt !== null ? `ended (${g.revokeReason})` : g.expiresAt <= now ? 'expired' : `active until ${new Date(g.expiresAt).toISOString()}`;
-    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} drives ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
+    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} reads ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
   }
 };
 
@@ -1408,10 +1408,8 @@ Commands:
                                            new tabs and keys the agent chat store, and must be unique across
                                            workspaces. Later DIRs are navigation shortcuts and may overlap.
                                            Paths are resolved against your cwd; existing tabs keep their old cwd
-  workspace peers show -w WS               Show which workspaces may reach into WS
-  workspace peers set -w WS [PEER...]      Replace that list (global token only — an agent cannot
-                                           widen its own scope). Grants are one-directional; pass
-                                           no PEER to revoke all
+  workspace peers show -w WS               Show which workspaces may read WS
+  workspace peers set -w WS [PEER...]      Removed: manage read grants through authenticated human controls
   tab list [-w WS]                         List tabs (only those your token may act on)
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
@@ -1519,7 +1517,7 @@ Commands:
                                            A stale --expect-version exits 3 config-version-conflict
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
-  grant list [--json]                      Portfolio drive grants you hold or are driven under (read-only; a human
+  grant list [--json]                      Portfolio read grants held by or targeting your workspace (read-only; a human
                                            creates and revokes them in the web UI with the purplemux password)
   deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json]
                                            Tell every enabled orchestrator and tab-bound lease holder that purplemux

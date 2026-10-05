@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { removeTabFromPane, restartTabSession, patchTab } from '@/lib/layout-store';
 import { getActiveWorkspaceId } from '@/lib/workspace-store';
@@ -8,6 +9,7 @@ import type { ITab } from '@/types/terminal';
 const log = createLogger('layout');
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
   const wsId = (req.query.workspace as string) || await getActiveWorkspaceId();
   if (!wsId) {
     return res.status(400).json({ error: 'No workspace found' });

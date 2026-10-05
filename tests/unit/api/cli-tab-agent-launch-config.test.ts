@@ -13,6 +13,7 @@ const managed = vi.hoisted(() => ({
   waitForCodexManagedLaunch: vi.fn(),
 }));
 
+vi.mock('@/lib/workspace-layout-read', () => ({ readWorkspaceLayout: layout.getLayout }));
 vi.mock('@/lib/layout-store', () => ({
   addTabToPane: layout.addTabToPane,
   getLayout: layout.getLayout,

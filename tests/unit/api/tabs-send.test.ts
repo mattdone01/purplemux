@@ -28,9 +28,10 @@ vi.mock('@/lib/cli-token', () => ({
 }));
 vi.mock('@/lib/auth', () => ({
   SESSION_COOKIE: 'session-token',
+  extractCookie: (cookie: string) => cookie.split('=')[1],
   MAX_AGE: 7 * 86400,
   verifySessionToken: async (token: string) =>
-    (token === VALID_COOKIE ? { exp: Math.floor(Date.now() / 1000) + 7 * 86400 } : null),
+    (token === VALID_COOKIE ? { sub: 'human', exp: Math.floor(Date.now() / 1000) + 7 * 86400 } : null),
   signSessionToken: async () => 'fresh-jwt',
   buildCookieHeader: (token: string) => `session-token=${token}`,
 }));
@@ -102,7 +103,7 @@ describe('POST /api/tabs/[tabId]/send', () => {
     method = 'POST',
   ): Promise<IFakeResponse> => {
     const response = fakeResponse();
-    await handler({ method, query, body } as unknown as NextApiRequest, response.res);
+    await handler({ method, query, body, headers: { cookie: `session-token=${VALID_COOKIE}`, host: 'localhost:8022', origin: 'http://localhost:8022' } } as unknown as NextApiRequest, response.res);
     return response;
   };
 
@@ -348,11 +349,11 @@ describe('auth surface of /api/tabs/[tabId]/send', () => {
     expect(response.headers.get('x-middleware-next')).toBe('1');
   });
 
-  it('lets the global CLI token short-circuit', async () => {
+  it('refuses the global CLI token on UI mutations', async () => {
     const response = await runProxy({ 'x-pmux-token': GLOBAL_TOKEN });
 
-    expect(response.status).toBe(200);
-    expect(response.headers.get('x-middleware-next')).toBe('1');
+    expect(response.status).toBe(401);
+    expect(response.headers.get('x-middleware-next')).toBeNull();
   });
 
   it('401s a workspace-scoped token — this route implements no /api/cli scope rules', async () => {

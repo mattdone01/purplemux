@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import os from 'os';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getWorkspaces, createWorkspace } from '@/lib/workspace-store';
@@ -14,6 +15,7 @@ const log = createLogger('workspace-api');
 const SHELL_READY_DELAY_MS = 500;
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
   if (req.method === 'GET') {
     const data = await getWorkspaces();
     return res.status(200).json(data);

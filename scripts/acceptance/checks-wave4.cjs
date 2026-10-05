@@ -5,8 +5,8 @@
 //     `tab status` serves the classification (`turnEnd`);
 //   * story 36 — `tab list` reports each tab's identity; the hook-time identity route is mint-only
 //     (a tab with a launch identity is refused), Claude-only, and never answers the admin token;
-//   * story 11 — a human-granted, launch-verified tab drives another workspace; nobody else in its
-//     workspace does; the password step-up, the revoke and the audit lines;
+//   * ADR-0021 — a human grant permits foreign reads only; input remains denied before and after
+//     creation/revocation, and denied input never records successful grant use;
 //   * story 28 — the grants read needs the session only (no Origin) and names each grantee's identity;
 //   * story 20 — the coordination route answers the human session only, and the built Mission Control
 //     page ships the panel;
@@ -213,7 +213,7 @@ const checks = async (inst, helpers, results) => {
   const password = `acc-pw-${crypto.createHash('sha256').update(inst.state.scratch).digest('hex').slice(0, 16)}`;
   const session = await humanSession(ctx.port, password);
   if (!session.cookie) {
-    for (const id of ['grant-step-up', 'grant-drives-other-workspace', 'grant-only-grantee', 'grant-revoke', 'grant-audit', 'grants-read-session-only', 'coordination-route', 'coordination-panel-built', 'mission-bootstrap-inbox']) {
+    for (const id of ['grant-step-up', 'grant-reads-without-driving', 'grant-only-grantee', 'grant-revoke', 'grant-audit', 'grants-read-session-only', 'coordination-route', 'coordination-panel-built', 'mission-bootstrap-inbox']) {
       fail(id, 'needs the scratch human session', session.why, 'setup 200, login 200 with a session-token cookie');
     }
     return;
@@ -411,12 +411,16 @@ const grants = async (inst, { check, nonce, sleep, tab, brief, port, cookie, pas
     'wrong 403 grant-password-invalid; no Origin 403 naming the Origin; right 201 with a grant id',
   );
   const byGrantee = grantId ? await drive(grantee, `ACC4-GRANTED-${nonce}`) : { rc: -1, out: '', err: 'no grant' };
+  const readable = grantId ? await inst.inTab(wsA, grantee.tabId, inst.tabCli(['tab', 'list', '-w', wsB])) : { rc: -1 };
+  const targetView = await inst.cli(['tab', 'result', '-w', wsB, target.tabId]);
+  const untouched = targetView.rc === 0 && !(parseJson(targetView.out)?.content ?? '').includes(`ACC4-GRANTED-${nonce}`);
   check(
-    'grant-drives-other-workspace',
-    'the granted, launch-verified tab drives a tab of the granted workspace (refused before the grant)',
-    refusedForbidden(before) && byGrantee.rc === 0,
-    `before ${brief(before)}; with the grant ${brief(byGrantee)}`,
-    'before exit 3 forbidden; with the grant exit 0',
+    'grant-reads-without-driving',
+    'the granted, launch-verified tab can read the foreign workspace but input remains forbidden',
+    refusedForbidden(before) && refusedForbidden(byGrantee) && readable.rc === 0
+      && (parseJson(readable.out)?.tabs ?? []).some((t) => t.tabId === target.tabId) && untouched,
+    `before ${brief(before)}; with grant ${brief(byGrantee)}; read exit ${readable.rc}; target untouched ${untouched}`,
+    'input exit 3 forbidden before and after grant; read exit 0 with target listed; target receives no marker',
   );
   const byOther = grantId ? await drive(other, `ACC4-OTHER-${nonce}`) : { rc: -1, out: '', err: 'no grant' };
   check(
@@ -451,10 +455,10 @@ const grants = async (inst, { check, nonce, sleep, tab, brief, port, cookie, pas
   const kinds = new Set(events.map((e) => e.event));
   check(
     'grant-audit',
-    'the audit file records the refused password, the creation, each use and the revoke',
-    ['grant-password-invalid', 'grant-created', 'grant-used', 'grant-revoked'].every((k) => kinds.has(k)),
+    'the audit records password refusal, creation and revoke, but no successful use for denied input',
+    ['grant-password-invalid', 'grant-created', 'grant-revoked'].every((k) => kinds.has(k)) && !kinds.has('grant-used'),
     `events: ${[...kinds].join(', ') || 'none'}`,
-    'grant-password-invalid, grant-created, grant-used, grant-revoked',
+    'grant-password-invalid, grant-created, grant-revoked; no grant-used',
   );
   for (const [ws, t] of [[wsA, grantee], [wsA, other], [wsB, target]]) if (t?.tabId) await inst.cli(['tab', 'close', '-w', ws, t.tabId]);
 };
