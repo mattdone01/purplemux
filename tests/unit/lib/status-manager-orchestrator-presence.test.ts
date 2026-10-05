@@ -188,6 +188,51 @@ describe('status manager orchestrator presence collector', () => {
     expect(mocks.dispatch).not.toHaveBeenCalled();
   });
 
+  it('retains confirmed live work beside rejected and missing-PID liveness evidence', async () => {
+    mocks.getWorkspacesCached.mockResolvedValue({ workspaces: [workspace(null)] });
+    mocks.readLeaseEvidence.mockResolvedValue({ known: true, leases: [] });
+    mocks.readLatestStandupEvidence.mockResolvedValue({ known: true, standup: {
+      workspaceId: 'ws-1', at: 1, state: 'done', headline: 'Done', items: [], blockers: [], needsHuman: false, next: [],
+    } });
+    mocks.collectAllTabs.mockReturnValue([]);
+    mocks.readLivenessEvidence.mockResolvedValue({
+      known: true,
+      data: {
+        probes: [],
+        jobs: [
+          { workspaceId: 'ws-1', tabId: 'live-worker', pid: 1001, registeredAt: 1 },
+          { workspaceId: 'ws-1', tabId: 'rejected-worker', pid: 1002, registeredAt: 1 },
+          { workspaceId: 'ws-1', tabId: 'missing-pid-worker', pid: 1003, registeredAt: 1 },
+        ],
+      },
+    });
+    mocks.statusForTab.mockImplementation(async (tabId: string) => {
+      if (tabId === 'rejected-worker') throw new Error('liveness unavailable');
+      return {
+        probes: [],
+        backgroundJobs: tabId === 'live-worker'
+          ? [{ pid: 1001, alive: true, registeredAt: 1, ageS: 10 }]
+          : [],
+      };
+    });
+    const manager = new StatusManager();
+
+    await runPresence(manager);
+
+    expect(getOrchestratorPresenceMonitor().snapshot()).toMatchObject({
+      state: 'ready',
+      issues: [{
+        state: 'missing',
+        workState: 'remaining',
+        evidence: expect.arrayContaining([
+          'live registered background work: live-worker',
+          'registered background work unreadable',
+        ]),
+      }],
+    });
+    expect(mocks.dispatch).toHaveBeenCalledTimes(1);
+  });
+
   it('persists dedup across monitor reconstruction and rearms after confirmed recovery', async () => {
     mocks.getWorkspacesCached.mockResolvedValue({ workspaces: [workspace(null)] });
     mocks.collectAllTabs.mockReturnValue([{ id: 'worker', name: 'worker', panelType: 'codex-cli' }]);

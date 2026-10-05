@@ -1212,6 +1212,7 @@ export class StatusManager {
         })) ?? null;
 
         let liveBackgroundTabIds: string[] | null = livenessEvidence.known ? [] : null;
+        let backgroundWorkIncomplete = !livenessEvidence.known;
         if (livenessEvidence.known) {
           const pidsByTab = new Map<string, Set<number>>();
           for (const job of livenessEvidence.data.jobs) {
@@ -1224,17 +1225,18 @@ export class StatusManager {
             registeredPids,
             status: await liveness.statusForTab(tabId),
           })));
-          if (readings.some((reading) => reading.status === 'rejected'
-            || [...reading.value.registeredPids].some((pid) => !reading.value.status.backgroundJobs.some((job) => job.pid === pid)))) {
-            liveBackgroundTabIds = null;
-          } else {
-            liveBackgroundTabIds = readings.flatMap((reading) => {
-              if (reading.status !== 'fulfilled') return [];
-              return reading.value.status.backgroundJobs.some((job) => (
-                reading.value.registeredPids.has(job.pid) && job.alive
-              )) ? [reading.value.tabId] : [];
-            });
-          }
+          liveBackgroundTabIds = readings.flatMap((reading) => {
+            if (reading.status !== 'fulfilled') {
+              backgroundWorkIncomplete = true;
+              return [];
+            }
+            if ([...reading.value.registeredPids].some((pid) => (
+              !reading.value.status.backgroundJobs.some((job) => job.pid === pid)
+            ))) backgroundWorkIncomplete = true;
+            return reading.value.status.backgroundJobs.some((job) => (
+              reading.value.registeredPids.has(job.pid) && job.alive
+            )) ? [reading.value.tabId] : [];
+          });
         }
 
         return {
@@ -1251,6 +1253,7 @@ export class StatusManager {
           standupState: standup.known ? standup.standup?.state ?? null : undefined,
           tabs,
           liveBackgroundTabIds,
+          backgroundWorkIncomplete,
         };
       }));
       return { facts, observedAt };

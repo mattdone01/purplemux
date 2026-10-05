@@ -83,13 +83,14 @@ const workStateOf = (facts: IOrchestratorPresenceFacts): {
     }
   }
 
-  if (facts.liveBackgroundTabIds === null) {
+  if (facts.liveBackgroundTabIds !== null && facts.liveBackgroundTabIds.length > 0) {
+    remaining = true;
+    evidence.push(`live registered background work: ${facts.liveBackgroundTabIds.join(', ')}`);
+  }
+  if (facts.liveBackgroundTabIds === null || facts.backgroundWorkIncomplete) {
     unknown = true;
     incomplete = true;
     evidence.push('registered background work unreadable');
-  } else if (facts.liveBackgroundTabIds.length > 0) {
-    remaining = true;
-    evidence.push(`live registered background work: ${facts.liveBackgroundTabIds.join(', ')}`);
   }
 
   if (remaining) return { state: 'remaining', evidence, incomplete };
@@ -204,7 +205,7 @@ export class OrchestratorPresenceMonitor {
       }
       for (const workspace of facts) {
         const issue = issueByWorkspace.get(workspace.workspaceId);
-        if (!issue) nextEpisodes.delete(workspace.workspaceId);
+        if (!issue || issue.orchestratorState === 'usable') nextEpisodes.delete(workspace.workspaceId);
       }
 
       if (!(await this.persistence.replace(missingEpisodes, nextEpisodes))) {

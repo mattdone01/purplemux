@@ -728,7 +728,10 @@ designated orchestrator. Remaining-work evidence comes from active `epic:`
 leases, a latest standup whose state is not `done`, active agent tabs, and live
 registered background jobs. Registered job owners are checked even when their
 tabs are no longer in the current layout; their liveness still goes through the
-existing PID-aware manager. An idle agent is not completion evidence. An empty
+existing PID-aware manager. Confirmed-live owner IDs are retained when a
+different job lookup is rejected or cannot account for its registered PID; the
+same result also carries incomplete evidence, so known work stays red while the
+partial read remains visible. An idle agent is not completion evidence. An empty
 workspace, or a `done` standup with no conflicting work evidence, needs no
 orchestrator.
 
@@ -739,7 +742,9 @@ closed, or inactive designation beside confirmed remaining work creates a red
 and dispatches one `orchestrator-missing` alert for that episode. The monitor
 does not select a worker, change orchestration settings, or release leases.
 Confirmed recovery (or confirmed completion) rearms the alert; repeated polls
-and uncertain reads do not. Episode latches are atomically persisted in
+and uncertain owner reads do not. A positively usable designated owner rearms
+the missing-owner episode even when work evidence remains amber. Episode
+latches are atomically persisted in
 `~/.purplemux/orchestrator-presence.json`, so an unchanged missing condition does
 not alert again after a server restart. Presence refreshes are single-flight
 from evidence collection through dispatch, preventing an older overlapping

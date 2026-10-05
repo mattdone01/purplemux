@@ -17,6 +17,7 @@ const facts = (overrides: Partial<IOrchestratorPresenceFacts> = {}): IOrchestrat
   standupState: 'on-track',
   tabs: [{ tabId: 'orch', tabName: 'orchestrator', isAgent: true, cliState: 'busy' }],
   liveBackgroundTabIds: [],
+  backgroundWorkIncomplete: false,
   ...overrides,
 });
 
@@ -157,6 +158,26 @@ describe('orchestrator presence', () => {
     expect(await refresh(monitor, [missing], NOW + 4)).toHaveLength(0);
     expect(await refresh(monitor, [recovered], NOW + 5)).toHaveLength(0);
     expect(await refresh(monitor, [missing], NOW + 6)).toHaveLength(1);
+  });
+
+  it('rearms on a positively usable owner with amber work evidence but not an unknown owner', async () => {
+    const store = persistence();
+    const monitor = new OrchestratorPresenceMonitor(store);
+    const missing = facts({ orchestration: { enabled: true, orchestratorTabId: null } });
+    const usableWithUnknownWork = facts({
+      epicLeases: null,
+      standupState: undefined,
+      tabs: [{ tabId: 'orch', tabName: 'orchestrator', isAgent: true, cliState: 'busy' }],
+      liveBackgroundTabIds: null,
+      backgroundWorkIncomplete: true,
+    });
+    const unknownOwner = facts({ tabs: null, liveBackgroundTabIds: null, backgroundWorkIncomplete: true });
+
+    expect(await refresh(monitor, [missing], NOW)).toHaveLength(1);
+    expect(await refresh(monitor, [usableWithUnknownWork], NOW + 1)).toHaveLength(0);
+    expect(await refresh(monitor, [missing], NOW + 2)).toHaveLength(1);
+    expect(await refresh(monitor, [unknownOwner], NOW + 3)).toHaveLength(0);
+    expect(await refresh(monitor, [missing], NOW + 4)).toHaveLength(0);
   });
 
   it('coalesces an overlapping refresh before either collector can apply stale facts', async () => {

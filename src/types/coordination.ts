@@ -72,6 +72,8 @@ export interface IOrchestratorPresenceFacts {
   tabs: IOrchestratorPresenceTab[] | null;
   /** null means registered background liveness could not be read. */
   liveBackgroundTabIds: string[] | null;
+  /** Some registered jobs could not be assessed even when other live jobs are known. */
+  backgroundWorkIncomplete: boolean;
 }
 
 export interface IOrchestratorPresenceIssue {
