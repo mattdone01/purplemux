@@ -13,7 +13,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'PATCH') {
     if (!(await authorizeHumanMutation(req, res))) return;
   } else {
-    const scope = resolveCliScope(req);
+    const scope = resolveCliScope(req, { response: res });
     if (scope?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
   }
 

@@ -25,7 +25,7 @@ const BASE = `http://localhost:${PORT}`;
 /**
  * The token to present for a request against `requestPath`.
  *
- * `send` and `steer` accept ONLY a token scoped to the target workspace, so
+ * Workspace mutations accept ONLY a token scoped to the target workspace, so
  * that a tab cannot type into another epic's worker. That rule would also
  * catch a human shell, which holds the global token and belongs to no
  * workspace — so when nothing scoped us, resolve the token of the workspace
@@ -48,11 +48,15 @@ const workspaceTokenFor = (workspaceId) => {
   }
 };
 
-const tokenFor = (requestPath) => {
+const tokenFor = (requestPath, body, method) => {
   if (TAB_TOKEN) return TAB_TOKEN;
   if (ENV_TOKEN) return ENV_TOKEN;
   const match = /[?&]workspaceId=([^&]+)/.exec(requestPath || '');
-  const workspaceId = match ? decodeURIComponent(match[1]) : null;
+  const pathMatch = !['GET', 'HEAD', 'OPTIONS'].includes(method)
+    ? /^\/api\/cli\/workspaces\/([^/?]+)(?:\/|$)/.exec(requestPath || '') : null;
+  const workspaceId = match ? decodeURIComponent(match[1])
+    : pathMatch ? decodeURIComponent(pathMatch[1])
+      : typeof body?.workspaceId === 'string' ? body.workspaceId : null;
   return workspaceTokenFor(workspaceId) || ADMIN_TOKEN;
 };
 
@@ -78,8 +82,8 @@ const ownSessionName = () => {
  * (tabs created before tab tokens existed). The server trusts it only inside
  * the token's own workspace, and a tab token makes it redundant.
  */
-const headersFor = (requestPath, extra) => {
-  const headers = { 'X-Pmux-Token': tokenFor(requestPath), ...(extra || {}) };
+const headersFor = (requestPath, extra, body, method) => {
+  const headers = { 'X-Pmux-Token': tokenFor(requestPath, body, method), ...(extra || {}) };
   const session = TAB_TOKEN ? null : ownSessionName();
   if (session) headers['X-Pmux-Session'] = session;
   return headers;
@@ -290,7 +294,7 @@ const failIfRouteAbsent = (resp, requestPath) => {
 const api = async (method, path, data) => {
   const opts = {
     method,
-    headers: headersFor(path, { 'Content-Type': 'application/json' }),
+    headers: headersFor(path, { 'Content-Type': 'application/json' }, data, method),
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
   const resp = await request(method, path, opts);
@@ -305,7 +309,7 @@ const api = async (method, path, data) => {
 };
 
 const apiRaw = async (method, path) => {
-  const resp = await request(method, path, { headers: headersFor(path) });
+  const resp = await request(method, path, { headers: headersFor(path, undefined, undefined, method) });
   failIfRouteAbsent(resp, path);
   if (!resp.ok) failFromResponse(resp, isJson(resp) ? await readBody(method, path, resp, 'json') : null);
   return resp;

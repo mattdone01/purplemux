@@ -592,7 +592,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
   // Any valid CLI scope: the guide is documentation, and the agents that most
   // need it hold a workspace token, not the global one.
-  if (!resolveCliScope(req)) {
+  if (!resolveCliScope(req, { response: res })) {
     return res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
   }
   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');

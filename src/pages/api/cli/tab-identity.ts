@@ -19,7 +19,7 @@ const SESSION = /^[A-Za-z0-9_.:-]{1,200}$/;
  */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!requireMethod(req, res, 'POST')) return;
-  const scope = resolveCliScope(req);
+  const scope = resolveCliScope(req, { response: res });
   // The workspace token only: the admin token is not tied to a workspace (a wrong session
   // would hand the agent another workspace's tab), and a tab token already names its tab.
   if (!scope || scope.type !== 'workspace' || scope.tabId) {

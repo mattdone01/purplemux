@@ -46,7 +46,7 @@ export const authorizeWorkspaceMutation = async (
   res: NextApiResponse,
   workspaceId: string,
 ): Promise<TCliScope | null> => {
-  const scope = resolveCliScope(req, { recordPresentation: false });
+  const scope = resolveCliScope(req, { response: res });
   if (!scope) {
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
@@ -58,8 +58,6 @@ export const authorizeWorkspaceMutation = async (
     });
     return null;
   }
-  // A denied hook-token request must not persist first-presentation metadata.
-  resolveCliScope(req);
   return scope;
 };
 
@@ -73,7 +71,7 @@ export const authorizeWorkspace = async (
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET')) {
     return authorizeWorkspaceMutation(req, res, workspaceId);
   }
-  const scope = resolveCliScope(req, { recordPresentation: false });
+  const scope = resolveCliScope(req, { response: res });
   if (!scope) {
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;
@@ -82,8 +80,6 @@ export const authorizeWorkspace = async (
     res.status(403).json({ error: 'Workspace read access is out of scope. Use coordinator notes or local human controls.', code: 'forbidden' });
     return null;
   }
-  // A denied hook-token request must not persist first-presentation metadata.
-  resolveCliScope(req);
   return scope;
 };
 

@@ -30,7 +30,7 @@ const log = createLogger('api:cli:tabs');
 const VALID_PANEL_TYPES: TPanelType[] = ['terminal', 'claude-code', 'codex-cli', 'grok-cli', 'agent-sessions', 'web-browser', 'diff'];
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
-  const cliScope = resolveCliScope(req, { recordPresentation: false });
+  const cliScope = resolveCliScope(req, { response: res });
   if (!cliScope) {
     return res.status(403).json({ error: 'Forbidden' });
   }
@@ -94,7 +94,6 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         }
       }
     }
-    resolveCliScope(req);
     return res.status(200).json({ tabs });
   }
 

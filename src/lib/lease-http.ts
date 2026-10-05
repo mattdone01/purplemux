@@ -62,7 +62,7 @@ export const viewOf = async (lease: ILease): Promise<ILeaseView> => (await views
 
 /** Any valid CLI scope, or a 403 with a machine code; null means the response is written. */
 export const requireCaller = async (req: NextApiRequest, res: NextApiResponse): Promise<ICaller | null> => {
-  const caller = await resolveCaller(req);
+  const caller = await resolveCaller(req, res);
   if (!caller) {
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
     return null;

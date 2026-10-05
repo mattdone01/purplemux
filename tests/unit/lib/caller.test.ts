@@ -1,7 +1,8 @@
 import fs from 'fs/promises';
+import { EventEmitter } from 'node:events';
 import os from 'os';
 import path from 'path';
-import type { NextApiRequest } from 'next';
+import type { NextApiRequest, NextApiResponse } from 'next';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ILayoutData, ITab } from '@/types/terminal';
 
@@ -145,12 +146,17 @@ describe('resolveCaller', () => {
       expect(await resolveCaller(req({ 'x-pmux-token': launch }))).toMatchObject({ verified: true, identity: 'launch' });
     });
 
-    it('tab list shows hook only once the token was presented (minting proves only that someone asked)', async () => {
+    it('tab list shows hook only after its request completes successfully', async () => {
       const { mintHookTabToken, tabIdentityOf } = await import('@/lib/tab-token');
       const { resolveCaller } = await import('@/lib/caller');
       const hook = await mintHookTabToken({ workspaceId: 'ws-a', tabId: 'tab-a2' }, 'pt-ws-a-pane-1-tab-a2');
       expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('none');
       await resolveCaller(req({ 'x-pmux-token': hook.ok ? hook.token : '' }));
+      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('none');
+      const response = Object.assign(new EventEmitter(), { statusCode: 200 }) as unknown as NextApiResponse;
+      await resolveCaller(req({ 'x-pmux-token': hook.ok ? hook.token : '' }), response);
+      expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('none');
+      response.emit('finish');
       expect(tabIdentityOf('ws-a', 'tab-a2')).toBe('hook');
     });
 

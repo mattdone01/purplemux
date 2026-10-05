@@ -108,15 +108,8 @@ class Instance {
     this.env = { PATH: `${path.dirname(state.node)}:/usr/bin:/bin`, HOME: state.home, TMUX_TMPDIR: state.tmuxTmpdir };
   }
 
-  /** Isolated fixture driver: explicitly scope workspace commands; tab commands retain their own identity. */
+  /** Run the actual unscoped shell CLI; its production token selection supplies workspace scope. */
   cli(args, { env = this.env, timeoutMs = 30000 } = {}) {
-    const workspaceFlag = args.findIndex((arg) => arg === '-w' || arg === '--workspace');
-    if (env === this.env && workspaceFlag >= 0) {
-      const ws = args[workspaceFlag + 1];
-      const tokens = JSON.parse(fs.readFileSync(path.join(this.state.home, '.purplemux', 'workspace-tokens.json'), 'utf8'));
-      if (!Object.values(this.state.workspaces).includes(ws) || !tokens[ws]) throw new Error('Unknown isolated fixture workspace');
-      env = { ...env, PMUX_TOKEN: tokens[ws] };
-    }
     return run(this.state.node, [this.cliPath, ...args], { env, timeoutMs });
   }
 
@@ -881,7 +874,7 @@ const main = async (argv) => {
   return pass ? 0 : 1;
 };
 
-module.exports = { Instance, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs };
+module.exports = { judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs };
 
 if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
