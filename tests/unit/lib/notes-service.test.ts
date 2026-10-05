@@ -20,13 +20,19 @@ const ADMIN = { scope: { type: 'admin' }, workspaceId: null, tabId: null, tabNam
 const A = caller('ws-1', 'tab-a'); // holds epic:ddh
 const B = caller('ws-2', 'tab-b'); // a sender in another workspace
 const C = caller('ws-3', 'tab-c'); // neither sender nor recipient
+const W = caller('ws-2', 'tab-worker');
 
 class Fakes {
   now = T0;
   state: INotesState = { notes: [] };
   epics = new Map<string, { workspaceId: string; tabId: string }>();
-  live = new Set(['ws-1/tab-a', 'ws-1/tab-a2', 'ws-2/tab-b', 'ws-3/tab-c', 'ws-9/tab-orch']);
-  orchestrators = new Map<string, string>([['ws-9', 'tab-orch']]);
+  live = new Set(['ws-1/tab-a', 'ws-1/tab-a2', 'ws-2/tab-b', 'ws-2/tab-worker', 'ws-3/tab-c', 'ws-9/tab-orch']);
+  orchestrators = new Map<string, string>([
+    ['ws-1', 'tab-a'],
+    ['ws-2', 'tab-b'],
+    ['ws-3', 'tab-c'],
+    ['ws-9', 'tab-orch'],
+  ]);
   /** Workspaces whose layout could not be read: their tabs are neither live nor closed. */
   uncertain = new Set<string>();
   reads = { liveTabs: 0, inboxItems: 0 };
@@ -65,7 +71,18 @@ class Fakes {
         const id = `i-item${this.sent.length + 1}`;
         const line = renderInboxLine('note', req.fields).line;
         this.sent.push({ ...req, line, id });
-        const item = { id, state: 'queued', targetWorkspaceId: req.targetWorkspaceId, targetTabId: req.targetTabId, deliveredAt: null } as unknown as IInboxItem;
+        const item = {
+          id,
+          kind: 'note',
+          dedupeKey: req.dedupeKey,
+          state: 'queued',
+          targetWorkspaceId: req.targetWorkspaceId,
+          targetTabId: req.targetTabId,
+          createdAt: this.now,
+          deliveredAt: null,
+          lastRefusal: null,
+          heldReason: null,
+        } as unknown as IInboxItem;
         this.inbox.set(id, item);
         return { item };
       },
@@ -111,13 +128,98 @@ describe('notes (ADR-0013)', () => {
     svc = new NotesService(f.deps());
   });
 
-  it('records how the sender was named beside verified (story 36): launch, hook, or none for the admin token', async () => {
-    const launch = await svc.send({ ...B, identity: 'launch' } as ICaller, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
-    const hook = await svc.send({ ...C, verified: false, identity: 'hook' } as ICaller, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
-    const admin = await svc.send({ ...ADMIN, identity: 'none' } as ICaller, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+  it('records how local senders were named, while the anonymous admin token cannot cross workspaces', async () => {
+    const launch = await svc.send({ ...B, identity: 'launch' } as ICaller, { toWorkspace: 'ws-2', subject: 's', body: 'b' });
+    const hook = await svc.send({ ...C, verified: false, identity: 'hook' } as ICaller, { toWorkspace: 'ws-3', subject: 's', body: 'b' });
     expect(launch.from).toMatchObject({ verified: true, identity: 'launch' });
     expect(hook.from).toMatchObject({ verified: false, identity: 'hook' });
-    expect(admin.from).toMatchObject({ workspaceId: null, verified: false, identity: 'none' });
+    await expectCode(svc.send(ADMIN, { toWorkspace: 'ws-9', subject: 's', body: 'b' }), 'forbidden');
+  });
+
+  it('allows local worker messaging, but only the verified designated source coordinator may cross or retain an unresolved epic', async () => {
+    f.epics.set('local', { workspaceId: 'ws-2', tabId: 'tab-b' });
+    await expect(svc.send(W, { toEpic: 'local', subject: 'local', body: 'b' })).resolves.toMatchObject({
+      admission: { mode: 'local' }, deliveredTo: { workspaceId: 'ws-2', tabId: 'tab-b' },
+    });
+    await expectCode(svc.send(W, { toEpic: 'ddh', subject: 'cross', body: 'b' }), 'forbidden');
+    await expectCode(svc.send(W, { toEpic: 'unknown', subject: 'unknown', body: 'b' }), 'forbidden');
+    await expectCode(svc.send({ ...B, verified: false } as ICaller, { toEpic: 'ddh', subject: 'unverified', body: 'b' }), 'forbidden');
+  });
+
+  it('routes a cross-workspace epic note to the target coordinator rather than its worker holder', async () => {
+    f.epics.set('worker-owned', { workspaceId: 'ws-1', tabId: 'tab-a2' });
+    const sent = await svc.send(B, { toEpic: 'worker-owned', subject: 's', body: 'b' });
+    expect(sent).toMatchObject({
+      admission: { mode: 'coordinator', sender: { workspaceId: 'ws-2', tabId: 'tab-b' } },
+      deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a' },
+      receipt: { routingStatus: 'routed', composerDeliveredAt: null, notice: { state: 'queued' } },
+    });
+  });
+
+  it('keeps persisted coordinator admission after the source coordinator changes', async () => {
+    const sent = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.orchestrators.set('ws-2', 'tab-worker');
+    const item = f.inbox.get(f.note(sent.id).inboxItemId!)!;
+    await expect(svc.preflight(item)).resolves.toEqual({ ok: true });
+  });
+
+  it('rejects an old recipient at paste time, then withdraws and re-routes on coordinator replacement or disable', async () => {
+    const replaced = await svc.send(B, { toEpic: 'ddh', subject: 'replace', body: 'b' });
+    const oldItem = f.inbox.get(f.note(replaced.id).inboxItemId!)!;
+    f.orchestrators.set('ws-1', 'tab-a2');
+    await expect(svc.preflight(oldItem)).resolves.toEqual({ ok: false, reason: 'note-recipient-changed' });
+    await svc.tick();
+    expect(f.inbox.get(oldItem.id)).toMatchObject({ state: 'dropped', droppedReason: 'note-rerouted' });
+    expect(f.note(replaced.id).deliveredTo).toEqual({ workspaceId: 'ws-1', tabId: 'tab-a2' });
+
+    const disabledItem = f.inbox.get(f.note(replaced.id).inboxItemId!)!;
+    f.orchestrators.delete('ws-1');
+    await expect(svc.preflight(disabledItem)).resolves.toEqual({
+      ok: false, reason: 'note-undeliverable:target-coordinator-unavailable',
+    });
+    await svc.tick();
+    expect(f.inbox.get(disabledItem.id)).toMatchObject({ state: 'dropped', droppedReason: 'note-rerouted' });
+    expect(f.note(replaced.id)).toMatchObject({ state: 'undeliverable', routingReason: 'target-coordinator-unavailable' });
+  });
+
+  it('fails a legacy pending cross-workspace worker notice closed and exposes policyblocked for coordinator resubmission', async () => {
+    const sent = await svc.send(B, { toEpic: 'ddh', subject: 'legacy', body: 'b' });
+    const current = f.note(sent.id);
+    f.state = { notes: [{ ...current, admission: undefined, routingStatus: undefined, routingReason: undefined }] };
+    const item = f.inbox.get(current.inboxItemId!)!;
+    await expect(svc.preflight(item)).resolves.toEqual({
+      ok: false, reason: 'note-policyblocked:legacy-admission-missing',
+    });
+    expect((await svc.show(B, sent.id)).note).toMatchObject({
+      state: 'undeliverable',
+      receipt: { routingStatus: 'policyblocked', routingReason: 'legacy-admission-missing' },
+    });
+    await expect(svc.send(B, { toEpic: 'ddh', subject: 'resubmitted', body: 'b' })).resolves.toMatchObject({
+      receipt: { routingStatus: 'routed' },
+    });
+  });
+
+  it('returns only each note\'s own receipt and rejects terminal stale notices before paste', async () => {
+    const first = await svc.send(B, { toEpic: 'ddh', subject: 'first', body: 'b' });
+    const second = await svc.send(B, { toEpic: 'ddh', subject: 'second', body: 'b' });
+    const firstItem = f.inbox.get(f.note(first.id).inboxItemId!)!;
+    const listed = await svc.list(B, { fromMe: true });
+    expect(listed.map((note) => note.receipt?.notice?.id)).toEqual([
+      f.note(first.id).inboxItemId,
+      f.note(second.id).inboxItemId,
+    ]);
+    expect(listed[0].receipt?.notice).not.toHaveProperty('line');
+    await svc.ack(A, first.id, 'done');
+    await expect(svc.preflight(firstItem)).resolves.toEqual({ ok: false, reason: 'note-terminal:acked' });
+  });
+
+  it('retries a just-enqueued notice while the note write settles, then fails a missing note closed', async () => {
+    const sent = await svc.send(B, { toEpic: 'ddh', subject: 'settling', body: 'b' });
+    const item = f.inbox.get(f.note(sent.id).inboxItemId!)!;
+    f.state = { notes: [] };
+    await expect(svc.preflight(item)).rejects.toThrow('note-store-not-settled');
+    f.now += 5_000;
+    await expect(svc.preflight(item)).resolves.toEqual({ ok: false, reason: 'note-not-found' });
   });
 
   it('routes a note to the live epic owner with exactly the one fixed line, and the owner reads the body', async () => {
@@ -155,8 +257,10 @@ describe('notes (ADR-0013)', () => {
   it('routes --to-workspace to the enabled orchestrator, and holds it undeliverable while there is none', async () => {
     const { id } = await svc.send(B, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
     expect(f.note(id).deliveredTo).toEqual({ workspaceId: 'ws-9', tabId: 'tab-orch' });
+    f.orchestrators.delete('ws-3');
     const none = await svc.send(B, { toWorkspace: 'ws-3', subject: 's', body: 'b' });
     expect(none.state).toBe('undeliverable');
+    expect(none.receipt).toMatchObject({ routingStatus: 'undeliverable', routingReason: 'target-coordinator-unavailable' });
     f.orchestrators.set('ws-3', 'tab-c');
     await svc.tick();
     expect(f.note(none.id).deliveredTo).toEqual({ workspaceId: 'ws-3', tabId: 'tab-c' });
@@ -230,6 +334,7 @@ describe('notes (ADR-0013)', () => {
     await svc.tick();
     expect(f.note(id)).toMatchObject({ state: 'undeliverable', deliveredTo: null });
     f.epics.set('ddh', { workspaceId: 'ws-1', tabId: 'tab-a2' });
+    f.orchestrators.set('ws-1', 'tab-a2');
     await svc.tick('ddh'); // the lease-acquire hook
     expect(f.note(id)).toMatchObject({ state: 'delivered', deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a2' } });
     expect((await svc.list(caller('ws-1', 'tab-a2'), { open: true, toMe: true })).map((n) => n.id)).toEqual([id]);
@@ -331,6 +436,7 @@ describe('notes (ADR-0013)', () => {
     expect(f.note(id)).toMatchObject({ state: 'delivered', deliveredTo: { tabId: 'tab-a' }, remindedAt: null });
     f.uncertain.delete('ws-1');
     f.live.add('ws-1/tab-a');
+    f.epics.set('ddh', { workspaceId: 'ws-1', tabId: 'tab-a' });
     await svc.tick();
     expect(f.sent.filter((s) => s.fields.event === 'reminder').map((s) => s.targetTabId)).toEqual(['tab-a']);
   });
@@ -443,7 +549,7 @@ describe('notes (ADR-0013)', () => {
 
   it('--to-me is the tab: another tab of the recipient workspace does not see the note as its own', async () => {
     await svc.send(B, { toEpic: 'ddh', subject: 'for tab-a', body: 'b' });
-    await svc.send(B, { toEpic: 'unowned', subject: 'waiting for an owner', body: 'b' });
+    await svc.send(A, { toEpic: 'unowned', subject: 'waiting for an owner', body: 'b' });
     expect((await svc.list(A, { toMe: true })).map((n) => n.subject)).toEqual(['for tab-a']);
     expect(await svc.list(caller('ws-1', 'tab-a2'), { toMe: true })).toEqual([]);
     f.epics.set('unowned', { workspaceId: 'ws-1', tabId: 'tab-a2' });
@@ -457,16 +563,27 @@ describe('notes (ADR-0013)', () => {
     const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
     await expectCode(svc.ack(B, id, 'mine'), 'forbidden');
     await expectCode(svc.ack(C, id, 'x'), 'forbidden');
-    const done = await svc.ack(caller('ws-1', 'tab-a2', false), id, 'adopted in story 03');
-    expect(done).toMatchObject({ state: 'acked', ackComment: 'adopted in story 03', ackedBy: { workspaceId: 'ws-1', tabId: 'tab-a2' } });
+    await expectCode(svc.ack(caller('ws-1', 'tab-a2'), id, 'not the coordinator'), 'forbidden');
+    await expectCode(svc.ack({ ...A, verified: false } as ICaller, id, 'unverified'), 'forbidden');
+    const done = await svc.ack(A, id, 'adopted in story 03');
+    expect(done).toMatchObject({ state: 'acked', ackComment: 'adopted in story 03', ackedBy: { workspaceId: 'ws-1', tabId: 'tab-a' } });
+    expect(f.inbox.get(f.note(id).inboxItemId!)).toMatchObject({ state: 'dropped', droppedReason: 'note-terminal:acked' });
     expect(await svc.list(B, { open: true })).toEqual([]);
     expect(await svc.list(B, {})).toHaveLength(1);
     // No reminders after an ack.
-    f.deliverInbox(f.note(id).inboxItemId!);
     f.now += 2 * NOTE_SENDER_NOTICE_MS;
     await svc.tick();
     expect(f.sent).toHaveLength(1);
     await expectCode(svc.ack(A, 'n-nosuchnote', null), 'note-not-found');
+  });
+
+  it('denies the old coordinator after a target mapping change and allows the newly routed coordinator', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.orchestrators.set('ws-1', 'tab-a2');
+    await expectCode(svc.ack(A, id, 'stale coordinator'), 'forbidden');
+    await svc.tick();
+    const done = await svc.ack(caller('ws-1', 'tab-a2'), id, 'current coordinator');
+    expect(done).toMatchObject({ state: 'acked', ackedBy: { workspaceId: 'ws-1', tabId: 'tab-a2' } });
   });
 
   it('refuses a body over 16 KiB naming the limit, and a note without exactly one target', async () => {
@@ -496,10 +613,12 @@ describe('notes (ADR-0013)', () => {
 
   it('expires a note unacked for 14 days with one notice to a live sender, then prunes it 14 days later', async () => {
     const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    const stale = f.note(id).inboxItemId!;
     const undeliverable = await svc.send(B, { toEpic: 'gone', subject: 's', body: 'b' });
     f.now = T0 + NOTE_EXPIRE_MS;
     await svc.tick();
     expect(f.note(id).state).toBe('expired');
+    expect(f.inbox.get(stale)).toMatchObject({ state: 'dropped', droppedReason: 'note-terminal:expired' });
     expect(f.note(undeliverable.id).state).toBe('expired');
     const expiredNotices = f.sent.filter((s) => s.fields.event === 'expired');
     expect(expiredNotices.map((s) => s.targetTabId)).toEqual(['tab-b', 'tab-b']);

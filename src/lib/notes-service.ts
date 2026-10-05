@@ -23,6 +23,7 @@ import {
   isNoteId,
   mutateNotes,
   newNoteId,
+  policyBlocked,
   prune,
   reachedComposer,
   readNotesState,
@@ -36,13 +37,13 @@ import {
   viewOf,
 } from '@/lib/notes-store';
 import type { IInboxItem } from '@/types/inbox';
-import type { INote, INotesState, INoteView } from '@/types/note';
+import type { INote, INoteAdmission, INoteReceipt, INotesState, INoteView, TNoteRoutingStatus } from '@/types/note';
 
-// Notes routed to the epic's owner (ADR-0013). The recipient is resolved at
-// delivery time: the live holder of `epic:<slug>`, or a workspace's enabled
-// orchestrator. Only the inbox's fixed line is typed; the body is pulled.
+// Notes route directly inside one workspace and coordinator-to-coordinator
+// across workspaces (ADR-0013). Only the inbox's fixed line is typed; the body is pulled.
 
 const log = createLogger('notes');
+const NOTE_PREFLIGHT_SETTLE_MS = 5_000;
 
 export interface INotesDeps {
   now: () => number;
@@ -84,6 +85,11 @@ interface IReads {
   inboxItem: (id: string) => Promise<IInboxItem | null>;
 }
 
+type TRecipientDecision =
+  | { status: 'routed'; recipient: { workspaceId: string; tabId: string } }
+  | { status: 'undeliverable'; reason: string }
+  | { status: 'policyblocked'; reason: string };
+
 export interface ISendInput {
   toEpic?: unknown;
   toWorkspace?: unknown;
@@ -115,13 +121,42 @@ export class NotesService {
 
   // ─── routing ────────────────────────────────────────────────────────────
 
-  private async recipientOf(note: INote, r: IReads): Promise<{ workspaceId: string; tabId: string } | null> {
-    if (note.to.epic) return r.epicHolder(note.to.epic);
-    if (note.to.workspaceId) {
-      const tabId = await r.orchestratorOf(note.to.workspaceId);
-      return tabId ? { workspaceId: note.to.workspaceId, tabId } : null;
+  private async recipientOf(note: INote, r: IReads): Promise<TRecipientDecision> {
+    if (!note.admission && note.deliveredAt === null) {
+      return { status: 'policyblocked', reason: 'legacy-admission-missing' };
     }
-    return null;
+    let targetWorkspaceId: string;
+    let localRecipient: { workspaceId: string; tabId: string } | null = null;
+    if (note.to.epic) {
+      const holder = await r.epicHolder(note.to.epic);
+      if (!holder) {
+        return { status: 'undeliverable', reason: 'target-epic-unowned' };
+      }
+      targetWorkspaceId = holder.workspaceId;
+      localRecipient = holder;
+    } else if (note.to.workspaceId) {
+      targetWorkspaceId = note.to.workspaceId;
+    } else {
+      return { status: 'policyblocked', reason: 'target-missing' };
+    }
+
+    if (note.from.workspaceId === targetWorkspaceId) {
+      if (localRecipient) return { status: 'routed', recipient: localRecipient };
+      const tabId = await r.orchestratorOf(targetWorkspaceId);
+      return tabId
+        ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
+        : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
+    }
+    if (note.admission?.mode !== 'coordinator') {
+      return {
+        status: 'policyblocked',
+        reason: note.admission ? 'cross-workspace-admission-required' : 'legacy-cross-workspace-admission-missing',
+      };
+    }
+    const tabId = await r.orchestratorOf(targetWorkspaceId);
+    return tabId
+      ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
+      : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
   }
 
   private notice(note: INote, to: { workspaceId: string; tabId: string }, event: TNoteEvent): IEnqueueRequest<'note'> {
@@ -134,12 +169,113 @@ export class NotesService {
     };
   }
 
+  private async admissionFor(caller: ICaller, to: { epic: string | null; workspaceId: string | null }, now: number, r: IReads): Promise<INoteAdmission> {
+    const targetWorkspaceId = to.workspaceId ?? (to.epic ? (await r.epicHolder(to.epic))?.workspaceId ?? null : null);
+    const sourceCoordinator = caller.workspaceId ? await r.orchestratorOf(caller.workspaceId) : null;
+    if (caller.verified && caller.workspaceId && caller.tabId && sourceCoordinator === caller.tabId) {
+      return {
+        mode: 'coordinator',
+        sender: { workspaceId: caller.workspaceId, tabId: caller.tabId },
+        authorizedAt: now,
+      };
+    }
+    if (caller.workspaceId && targetWorkspaceId === caller.workspaceId) {
+      return { mode: 'local', sender: { workspaceId: caller.workspaceId, tabId: caller.tabId }, authorizedAt: now };
+    }
+    throw new NoteError(
+      'forbidden',
+      targetWorkspaceId
+        ? 'cross-workspace notes require the verified, currently designated source coordinator'
+        : 'an unresolved epic may be retained only by the verified, currently designated source coordinator',
+    );
+  }
+
+  private routingStatus(note: INote): TNoteRoutingStatus {
+    if (note.routingStatus) return note.routingStatus;
+    if (note.state === 'delivered' || note.state === 'acked') return 'routed';
+    if (note.state === 'undeliverable') return 'undeliverable';
+    return 'pending';
+  }
+
+  private receipt(note: INote, items: ReadonlyMap<string, IInboxItem>): INoteReceipt {
+    const item = note.inboxItemId ? items.get(note.inboxItemId) ?? null : null;
+    const routingStatus = this.routingStatus(note);
+    return {
+      routingStatus,
+      routingReason: note.routingReason ?? null,
+      authorizedSender: note.admission?.sender ?? null,
+      authorizedRecipient: routingStatus === 'routed' ? note.deliveredTo : null,
+      notice: item ? {
+        id: item.id,
+        state: item.state,
+        lastRefusal: item.lastRefusal,
+        heldReason: item.heldReason,
+        deliveredAt: item.deliveredAt,
+      } : null,
+      composerDeliveredAt: note.deliveredAt,
+    };
+  }
+
+  private async views(notes: readonly INote[]): Promise<INoteView[]> {
+    const items = new Map((await this.deps.inboxItems()).map((item) => [item.id, item]));
+    return notes.map((note) => ({ ...viewOf(note), receipt: this.receipt(note, items) }));
+  }
+
+  /** The inbox calls this under its dispatch lock immediately before a note line is pasted. */
+  async preflight(item: IInboxItem): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const match = /^note:(n-[A-Za-z0-9_-]{4,32}):(delivered|reminder|unacked|expired):/.exec(item.dedupeKey);
+    if (!match) return { ok: false, reason: 'note-notice-key-invalid' };
+    const [, id, event] = match;
+    const note = (await this.deps.read()).notes.find((candidate) => candidate.id === id);
+    const storeMayBeSettling = this.deps.now() - item.createdAt < NOTE_PREFLIGHT_SETTLE_MS;
+    if (!note) {
+      if (storeMayBeSettling) throw new Error('note-store-not-settled');
+      return { ok: false, reason: 'note-not-found' };
+    }
+    if (event === 'unacked' || event === 'expired') {
+      const valid = event === 'expired'
+        ? note.state === 'expired' || (OPEN_STATES.has(note.state) && this.deps.now() - note.createdAt >= NOTE_EXPIRE_MS)
+        : note.state === 'delivered';
+      if (!valid) return { ok: false, reason: `note-terminal:${note.state}` };
+      if (item.targetWorkspaceId !== note.from.workspaceId || item.targetTabId !== note.from.tabId) {
+        return { ok: false, reason: 'note-sender-changed' };
+      }
+      return { ok: true };
+    }
+    if (note.state !== 'delivered') return { ok: false, reason: `note-terminal:${note.state}` };
+    const expectedItemId = event === 'reminder' ? note.reminderItemId : note.inboxItemId;
+    if (expectedItemId !== item.id) {
+      if (storeMayBeSettling) throw new Error('note-store-not-settled');
+      return { ok: false, reason: 'note-notice-superseded' };
+    }
+    const decision = await this.recipientOf(note, this.reads());
+    if (decision.status !== 'routed') {
+      if (decision.status === 'policyblocked' && note.deliveredAt === null) {
+        await this.deps.mutate((state) => {
+          const current = state.notes.find((candidate) => candidate.id === note.id);
+          if (!current || current.state !== 'delivered') return { state, value: undefined };
+          return { state: replaceNote(state, policyBlocked(current, this.deps.now(), decision.reason)), value: undefined };
+        });
+      }
+      return { ok: false, reason: `note-${decision.status}:${decision.reason}` };
+    }
+    const { recipient } = decision;
+    if (item.targetWorkspaceId !== recipient.workspaceId || item.targetTabId !== recipient.tabId) {
+      return { ok: false, reason: 'note-recipient-changed' };
+    }
+    if (!note.deliveredTo || note.deliveredTo.workspaceId !== recipient.workspaceId || note.deliveredTo.tabId !== recipient.tabId) {
+      return { ok: false, reason: 'note-route-superseded' };
+    }
+    return { ok: true };
+  }
+
   /** Route a queued or undeliverable note: enqueue its line for the live recipient, or mark it undeliverable. */
   private async route(note: INote, now: number, r: IReads): Promise<INote> {
-    const to = await this.recipientOf(note, r);
-    if (!to) return undeliverable(note, now);
-    const { item } = await this.deps.enqueue(this.notice(note, to, 'delivered'));
-    return routed(note, to, item.id, now);
+    const decision = await this.recipientOf(note, r);
+    if (decision.status === 'policyblocked') return policyBlocked(note, now, decision.reason);
+    if (decision.status === 'undeliverable') return undeliverable(note, now, decision.reason);
+    const { item } = await this.deps.enqueue(this.notice(note, decision.recipient, 'delivered'));
+    return routed(note, decision.recipient, item.id, now);
   }
 
   /**
@@ -156,15 +292,16 @@ export class NotesService {
 
   /**
    * The routed tab can no longer act on the note: it is confirmed closed (an epic lease dies with
-   * its tab), or the recipient role moved to another live tab — a different holder of the epic, or
-   * a different orchestrator of the workspace (review round 3). Unknown liveness is not gone.
+   * its tab), or the recipient role moved to another live tab. Unknown liveness is not gone.
    */
-  private async recipientGone(note: INote, r: IReads): Promise<boolean> {
+  private async recipientGone(note: INote, decision: TRecipientDecision, r: IReads): Promise<boolean> {
     const to = note.deliveredTo;
     if (!to) return false;
-    if ((await r.tabState(to.workspaceId, to.tabId)) === 'closed') return true;
-    const now = await this.recipientOf(note, r);
-    return !!now && (now.workspaceId !== to.workspaceId || now.tabId !== to.tabId);
+    const state = await r.tabState(to.workspaceId, to.tabId);
+    if (state === 'closed') return true;
+    if (state === 'unknown') return false;
+    if (decision.status !== 'routed') return true;
+    return decision.recipient.workspaceId !== to.workspaceId || decision.recipient.tabId !== to.tabId;
   }
 
   /**
@@ -176,9 +313,13 @@ export class NotesService {
       // The one expiry notice waits while the sender's liveness is unknown, for at most a day.
       const settled = await this.noticeSender(note, 'expired', r);
       if (!settled && now - note.createdAt < NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS) return note;
+      if (note.inboxItemId) await this.deps.withdraw(note.inboxItemId, 'note-terminal:expired');
+      if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-terminal:expired');
       return expired(note, now);
     }
-    if (note.state === 'queued' || note.state === 'undeliverable') return this.route(note, now, r);
+    if (note.state === 'queued' || (note.state === 'undeliverable' && note.routingStatus !== 'policyblocked')) {
+      return this.route(note, now, r);
+    }
     if (note.state !== 'delivered') return note;
 
     const item = note.inboxItemId ? await r.inboxItem(note.inboxItemId) : null;
@@ -186,15 +327,24 @@ export class NotesService {
     // or an item gone before it was delivered. The inbox prunes a DELIVERED item after 7 days;
     // that is not a drop, and re-routing it would deliver the note again.
     if (item?.state === 'dropped' || (!item && note.deliveredAt === null)) return this.route(requeued(note, now), now, r);
+    const decision = await this.recipientOf(note, r);
+    if (decision.status === 'policyblocked') {
+      if (item && (item.state === 'queued' || item.state === 'held')) await this.deps.withdraw(item.id, 'note-policyblocked');
+      if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-policyblocked');
+      return policyBlocked(note, now, decision.reason);
+    }
     // A line that reached a tab which is now closed, or an epic that changed hands, goes to the
     // current owner: `--to-me` is the routed tab, so nobody else would see it (review round 2).
-    if (await this.recipientGone(note, r)) {
+    if (await this.recipientGone(note, decision, r)) {
       // The old tab may still be open with the line waiting: take the line back first, so it is not
       // typed there after the note has moved (review round 3). A failed withdrawal defers the move.
       // The same holds for its reminder (final confirmation): the withdrawal leaves a delivered one alone.
       if (item && (item.state === 'queued' || item.state === 'held')) await this.deps.withdraw(item.id, 'note-rerouted');
       if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-rerouted');
-      return this.route(requeued(note, now), now, r);
+      const waiting = requeued(note, now);
+      return decision.status === 'undeliverable'
+        ? undeliverable(waiting, now, decision.reason)
+        : this.route(waiting, now, r);
     }
     let next = note;
     if (item?.state === 'delivered' && next.deliveredAt === null) next = reachedComposer(next, item.deliveredAt ?? now);
@@ -329,6 +479,8 @@ export class NotesService {
       throw new NoteError('note-target-missing', `no workspace ${to.workspaceId}`);
     }
     const now = this.deps.now();
+    const reads = this.reads();
+    const admission = await this.admissionFor(caller, to, now, reads);
     const note = createNote(
       {
         from: {
@@ -341,50 +493,64 @@ export class NotesService {
         to,
         subject,
         body,
+        admission,
       },
       now,
       this.deps.newId(),
     );
-    return this.deps.mutate(async (state) => {
+    const sent = await this.deps.mutate(async (state) => {
       const mine = state.notes.filter((n) => OPEN_STATES.has(n.state)
         && n.from.workspaceId === note.from.workspaceId && n.from.tabId === note.from.tabId).length;
       if (mine >= NOTE_OPEN_PER_SENDER) {
         throw new NoteError('note-cap', `this sender already has ${mine} open notes (the limit is ${NOTE_OPEN_PER_SENDER}); wait for acks or expiry`);
       }
-      const sent = await this.route(note, now, this.reads());
-      return { state: { notes: [...state.notes, sent] }, value: viewOf(sent) };
+      const routedNote = await this.route(note, now, reads);
+      return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
     });
+    return (await this.views([sent]))[0];
   }
 
   async show(caller: ICaller, id: unknown): Promise<{ note: INoteView; body: string }> {
     const note = await this.find(id);
     if (!canShow(note, caller)) throw new NoteError('forbidden', `note ${note.id} belongs to other workspaces`);
-    return { note: viewOf(note), body: note.body };
+    return { note: (await this.views([note]))[0], body: note.body };
   }
 
   async ack(caller: ICaller, id: unknown, comment: unknown): Promise<INoteView> {
     const clean = cleanComment(comment);
-    return this.deps.mutate((state) => {
+    const done = await this.deps.mutate(async (state) => {
       const note = state.notes.find((n) => n.id === id);
       if (!isNoteId(id) || !note) throw new NoteError('note-not-found', `no note ${String(id)}`);
       if (!canAck(note, caller)) throw new NoteError('forbidden', `only the recipient workspace acks note ${note.id}`);
-      if (note.state === 'acked') return { state, value: viewOf(note) };
+      const crossWorkspace = note.from.workspaceId !== null && note.deliveredTo !== null
+        && note.from.workspaceId !== note.deliveredTo.workspaceId;
+      if (crossWorkspace) {
+        const decision = await this.recipientOf(note, this.reads());
+        if (decision.status !== 'routed' || !caller.verified || caller.workspaceId !== decision.recipient.workspaceId
+          || caller.tabId !== decision.recipient.tabId || caller.tabId !== note.deliveredTo!.tabId) {
+          throw new NoteError('forbidden', `only the currently routed coordinator acks cross-workspace note ${note.id}`);
+        }
+      }
+      if (note.state === 'acked') return { state, value: note };
       if (note.state !== 'delivered') throw new NoteError('forbidden', `note ${note.id} is ${note.state}, not delivered`);
-      const done = acked(note, { workspaceId: caller.workspaceId!, tabId: caller.tabId }, clean, this.deps.now());
-      return { state: replaceNote(state, done), value: viewOf(done) };
+      if (note.inboxItemId) await this.deps.withdraw(note.inboxItemId, 'note-terminal:acked');
+      if (note.reminderItemId) await this.deps.withdraw(note.reminderItemId, 'note-terminal:acked');
+      const acknowledged = acked(note, { workspaceId: caller.workspaceId!, tabId: caller.tabId }, clean, this.deps.now());
+      return { state: replaceNote(state, acknowledged), value: acknowledged };
     });
+    return (await this.views([done]))[0];
   }
 
   async list(caller: ICaller, filter: IListFilter): Promise<INoteView[]> {
     const { notes } = await this.deps.read();
-    return notes
+    const visible = notes
       .filter((n) => canShow(n, caller))
       .filter((n) => !filter.open || OPEN_STATES.has(n.state))
       .filter((n) => !filter.fromMe || (!caller.admin && n.from.workspaceId === caller.workspaceId))
       .filter((n) => !filter.toMe || caller.admin || isToMe(n, caller))
       .filter((n) => !filter.epic || n.to.epic === filter.epic || n.from.epic === filter.epic)
-      .sort((a, b) => a.createdAt - b.createdAt)
-      .map(viewOf);
+      .sort((a, b) => a.createdAt - b.createdAt);
+    return this.views(visible);
   }
 
   private async find(id: unknown): Promise<INote> {
@@ -441,7 +607,8 @@ const defaultDeps = async (): Promise<INotesDeps> => {
 interface INotesRuntime {
   service: NotesService | null;
   timer: ReturnType<typeof setInterval> | null;
-  unsubscribe: (() => void) | null;
+  unsubscribeLease: (() => void) | null;
+  unregisterPreflight: (() => void) | null;
 }
 
 const g = globalThis as unknown as { __ptNotesRuntime?: INotesRuntime; __ptNotesService?: NotesService };
@@ -454,17 +621,21 @@ export const getNotesService = async (): Promise<NotesService> => {
 
 export const startNotes = async (): Promise<void> => {
   if (g.__ptNotesRuntime) return;
-  const runtime: INotesRuntime = { service: null, timer: null, unsubscribe: null };
+  const runtime: INotesRuntime = { service: null, timer: null, unsubscribeLease: null, unregisterPreflight: null };
   g.__ptNotesRuntime = runtime;
   const service = await getNotesService();
-  const { onLeaseAcquired } = await import('@/lib/lease-store');
+  const [{ onLeaseAcquired }, { registerInboxPreflight }] = await Promise.all([
+    import('@/lib/lease-store'),
+    import('@/lib/inbox-dispatcher'),
+  ]);
   if (g.__ptNotesRuntime !== runtime) return;
   runtime.service = service;
+  runtime.unregisterPreflight = registerInboxPreflight('note', (item) => service.preflight(item));
   const tick = (onlyEpic?: string) => {
     service.tick(onlyEpic).catch((err) => log.warn(`notes tick failed: ${err instanceof Error ? err.message : err}`));
   };
   // Claiming an epic routes the notes that waited for its owner now, not on the next tick.
-  runtime.unsubscribe = onLeaseAcquired((lease, outcome) => {
+  runtime.unsubscribeLease = onLeaseAcquired((lease, outcome) => {
     if (lease.kind === 'epic' && outcome === 'acquired') tick(lease.resource);
   });
   const timer = setInterval(() => tick(), NOTES_TICK_MS);
@@ -478,5 +649,6 @@ export const stopNotes = async (): Promise<void> => {
   if (!runtime) return;
   g.__ptNotesRuntime = undefined;
   if (runtime.timer) clearInterval(runtime.timer);
-  runtime.unsubscribe?.();
+  runtime.unsubscribeLease?.();
+  runtime.unregisterPreflight?.();
 };

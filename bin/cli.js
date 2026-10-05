@@ -1504,13 +1504,14 @@ Commands:
   inbox retry ID                           Re-queue a held notice once (the target workspace's token or admin).
                                            Exit 3 inbox-not-held, 7 inbox-not-found
   note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]
-                                           A note to an epic's owner (the live epic:SLUG holder) or a workspace's
-                                           orchestrator; body <= 16 KiB (exit 2). Only a fixed notice line is typed
+                                           A local note to the live epic holder, or a cross-workspace note between
+                                           verified current orchestrators; body <= 16 KiB (exit 2). Only a fixed line is typed
                                            into the recipient; it pulls the body. --from-epic needs that epic lease (3)
   note list [--open] [--to-me] [--from-me] [--epic SLUG]
                                            Notes your workspace sent or receives (no bodies). Run --open --to-me at turn start
   note show ID                             The note and its body (recipient or sender workspace, or admin; else exit 3; 7 unknown)
-  note ack ID [--comment TEXT]             Acknowledge a note delivered to your workspace (else exit 3)
+  note ack ID [--comment TEXT]             Acknowledge a local note in your workspace, or a cross-workspace note as
+                                           its verified currently routed coordinator (else exit 3)
   config get KEY                           Print a fleet config value bare (e.g. gate.slots); exit 7 when unset
   config list [--json]                     Every fleet config value with its version, time and setter
   config set KEY VALUE [--expect-version N]

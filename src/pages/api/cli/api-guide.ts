@@ -324,10 +324,12 @@ POST /api/cli/inbox/<id>/retry
 
 ## Notes (ADR-0013)
 
-A note is a body the recipient pulls. It is addressed to an epic (--to-epic SLUG: routed at delivery
-time to the live holder of lease epic:SLUG) or to a workspace (--to-workspace WS: its enabled
-orchestrator tab). With no live recipient the note is "undeliverable" (listed, never dropped) until
-an owner claims the epic or orchestration is turned on; then it is delivered. The recipient's tab
+A note is a body the recipient pulls. A same-workspace --to-epic note routes directly to the live
+epic holder. A cross-workspace note routes to the enabled, live orchestrator of the holder's
+workspace; --to-workspace uses that workspace's orchestrator too. Cross-workspace and unresolved
+epic sends require the verified current source orchestrator. Admission is persisted across source
+orchestrator handover. With no target orchestrator the note is "undeliverable" with a reason and
+never falls back to a worker. The recipient's tab
 receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
 show n-…, then purplemux note ack n-…"; the subject and body are never typed. If that tab closes
 before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
@@ -335,16 +337,24 @@ the line reached its composer, and one notice reaches the sender's tab (if live)
 more. A note unacked or undeliverable for 14 days expires (one notice to a live sender); acked and
 expired notes are pruned 14 days later. At turn start, run \`note list --open --to-me\`.
 
+The compatible note state "delivered" means ROUTED. The notice reached a composer only when
+deliveredAt (also receipt.composerDeliveredAt) is non-null. Each authorized response includes this
+note's receipt: routing status/reason, authorized sender/recipient, and its own notice state,
+last refusal, held reason, and composer delivery time. It never includes the recipient's inbox.
+Queued notices are revalidated immediately before paste; terminal, legacy-policy-blocked, or stale
+recipient notices are dropped.
+
 POST /api/cli/notes
   Any resolved caller. Body: { "toEpic"? , "toWorkspace"? (exactly one), "subject" (≤ 120, control
   characters removed), "body" (≤ 16 KiB UTF-8), "fromEpic"? (only the holder of epic:<slug>) }.
   Response: { "note": INoteView }. 413 note-too-large (exit 2), 400 note-target-missing / note-invalid
-  (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold.
+  (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold or a cross-workspace
+  sender that is not the verified current source orchestrator.
 
 GET /api/cli/notes[?open=1][&toMe=1][&fromMe=1][&epic=SLUG]
   Notes the caller's workspace sent or receives (admin: all), without bodies.
   Response: { "notes": [{ "id", "from", "to", "subject", "state", "deliveredTo", "routedAt",
-    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", ... }] }
+    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", "receipt", ... }] }
 
 GET /api/cli/notes/<id>
   The recipient workspace, the sender workspace, or admin. Response: { "note", "body" }.

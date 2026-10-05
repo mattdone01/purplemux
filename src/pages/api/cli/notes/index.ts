@@ -6,8 +6,8 @@ import { getNotesService } from '@/lib/notes-service';
 const flag = (value: unknown): boolean => value === '1' || value === 'true';
 
 /**
- * POST — send a note (any resolved caller); GET — the notes the caller's
- * workspace sent or receives, without bodies (ADR-0013).
+ * POST — send a local note, or a coordinator-authorized cross-workspace note;
+ * GET — the notes the caller's workspace sent or receives, without bodies (ADR-0013).
  */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'POST' && req.method !== 'GET') {

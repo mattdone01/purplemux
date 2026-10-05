@@ -45,7 +45,7 @@ purplemux lease acquire NAME [--ttl 45m] [--epic S]   # e.g. merge:owner/repo, e
 purplemux lease release NAME                          # release what you hold; lease list shows every holder
 purplemux inbox list -w ${ws.id}                        # server notices queued or held for this workspace's tabs
 purplemux note list --open --to-me                     # notes for you: run at turn start, then note show ID / note ack ID
-purplemux note send --to-epic SLUG --subject T -f FILE # a note to an epic's owner (its epic:SLUG holder); the body is pulled, never typed
+purplemux note send --to-epic SLUG --subject T -f FILE # local to the holder; cross-workspace coordinator-to-coordinator; body pulled, never typed
 purplemux watch pr OWNER/REPO#N --until merged         # one inbox line when it holds (also closed, head-moved, checks-settled)
 purplemux watch lease NAME --until free                # wait for a lease without a polling loop; watch list / watch clear ID
 \`\`\`

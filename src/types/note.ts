@@ -4,6 +4,14 @@ import type { TCallerIdentity } from '@/types/identity';
 // inbox's fixed one-line notice is ever typed into the recipient's tab.
 
 export type TNoteState = 'queued' | 'delivered' | 'acked' | 'undeliverable' | 'expired';
+export type TNoteRoutingStatus = 'pending' | 'routed' | 'undeliverable' | 'policyblocked';
+
+export interface INoteAdmission {
+  /** Local messages stay inside one workspace; coordinator admission may cross workspaces. */
+  mode: 'local' | 'coordinator';
+  sender: { workspaceId: string; tabId: string | null };
+  authorizedAt: number;
+}
 
 export interface INoteParty {
   /** null for an admin-token sender. */
@@ -32,6 +40,11 @@ export interface INote {
   body: string;
   createdAt: number;
   state: TNoteState;
+  /** Send-time authority. Absent on notes persisted before coordinator routing was introduced. */
+  admission?: INoteAdmission;
+  /** Routing is separate from composer receipt; `state: delivered` remains the legacy routed value. */
+  routingStatus?: TNoteRoutingStatus;
+  routingReason?: string | null;
   /** The tab the note was last routed to. */
   deliveredTo: { workspaceId: string; tabId: string } | null;
   /** When the note was FIRST routed (its inbox notice queued): the sender's clock. A re-route keeps it. */
@@ -54,7 +67,23 @@ export interface INotesState {
   notes: INote[];
 }
 
+export interface INoteReceipt {
+  routingStatus: TNoteRoutingStatus;
+  routingReason: string | null;
+  authorizedSender: INoteAdmission['sender'] | null;
+  authorizedRecipient: { workspaceId: string; tabId: string } | null;
+  notice: {
+    id: string;
+    state: 'queued' | 'delivered' | 'held' | 'dropped';
+    lastRefusal: string | null;
+    heldReason: string | null;
+    deliveredAt: number | null;
+  } | null;
+  /** Kept after the inbox prunes its item. Null means routed, but not known to have reached a composer. */
+  composerDeliveredAt: number | null;
+}
+
 /** A note without its body: what `note list` returns. */
-export type INoteView = Omit<INote, 'body'> & { bodyBytes: number };
+export type INoteView = Omit<INote, 'body'> & { bodyBytes: number; receipt?: INoteReceipt };
 
 export type TNoteErrorCode = 'note-not-found' | 'note-too-large' | 'note-target-missing' | 'forbidden' | 'note-invalid' | 'note-cap';

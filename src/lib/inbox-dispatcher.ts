@@ -33,7 +33,7 @@ export const INBOX_FIRST_TICK_MAX_WAIT_MS = 10_000;
 export type TInboxPreflight = (item: IInboxItem) => Promise<{ ok: true } | { ok: false; reason: string }>;
 
 /** Kinds whose items may not be typed without their owner's preflight. */
-const PREFLIGHT_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['mission']);
+const PREFLIGHT_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['mission', 'note']);
 
 const gp = globalThis as unknown as { __ptInboxPreflights?: Map<TInboxKind, TInboxPreflight> };
 const preflights = (): Map<TInboxKind, TInboxPreflight> => (gp.__ptInboxPreflights ??= new Map());

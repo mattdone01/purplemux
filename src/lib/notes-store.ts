@@ -4,7 +4,7 @@ import path from 'path';
 import { nanoid } from 'nanoid';
 import { brandCodedError } from '@/lib/coded-error';
 import { EPIC_SLUG } from '@/lib/lease-policy';
-import type { INote, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode } from '@/types/note';
+import type { INote, INoteAdmission, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode } from '@/types/note';
 
 // Notes with acknowledgement (ADR-0013). Pure state transitions first, then the
 // one file store. Routing and delivery live in notes-service.ts.
@@ -81,7 +81,7 @@ export const checkTarget = (toEpic: unknown, toWorkspace: unknown): INoteTarget 
 export const newNoteId = (): string => `n-${nanoid(10)}`;
 
 export const createNote = (
-  input: { from: INoteParty; to: INoteTarget; subject: string; body: string },
+  input: { from: INoteParty; to: INoteTarget; subject: string; body: string; admission: INoteAdmission },
   now: number,
   id: string,
 ): INote => ({
@@ -92,6 +92,9 @@ export const createNote = (
   body: input.body,
   createdAt: now,
   state: 'queued',
+  admission: input.admission,
+  routingStatus: 'pending',
+  routingReason: null,
   deliveredTo: null,
   routedAt: null,
   deliveredAt: null,
@@ -115,6 +118,8 @@ export const createNote = (
 export const routed = (note: INote, to: { workspaceId: string; tabId: string }, inboxItemId: string, now: number): INote => ({
   ...note,
   state: 'delivered',
+  routingStatus: 'routed',
+  routingReason: null,
   deliveredTo: to,
   routedAt: note.routedAt ?? now,
   deliveredAt: null,
@@ -124,13 +129,22 @@ export const routed = (note: INote, to: { workspaceId: string; tabId: string }, 
   transitionAt: now,
 });
 
-export const undeliverable = (note: INote, now: number): INote =>
-  note.state === 'undeliverable' ? note : { ...note, state: 'undeliverable', transitionAt: now };
+export const undeliverable = (note: INote, now: number, reason: string): INote =>
+  note.state === 'undeliverable' && note.routingStatus === 'undeliverable' && note.routingReason === reason
+    ? note
+    : { ...note, state: 'undeliverable', routingStatus: 'undeliverable', routingReason: reason, transitionAt: now };
+
+export const policyBlocked = (note: INote, now: number, reason: string): INote =>
+  note.state === 'undeliverable' && note.routingStatus === 'policyblocked' && note.routingReason === reason
+    ? note
+    : { ...note, state: 'undeliverable', routingStatus: 'policyblocked', routingReason: reason, transitionAt: now };
 
 /** The recipient is gone (its notice dropped, its tab closed, or the epic changed hands): route again. */
 export const requeued = (note: INote, now: number): INote => ({
   ...note,
   state: 'queued',
+  routingStatus: 'pending',
+  routingReason: null,
   deliveredTo: null,
   inboxItemId: null,
   deliveredAt: null,

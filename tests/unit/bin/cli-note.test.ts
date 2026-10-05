@@ -106,9 +106,9 @@ describe('purplemux note — the installed CLI against the real note and lease r
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-note-srv-'));
     cliHome = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-note-home-'));
     await writeFixture(mockHome.value, [
-      { id: 'ws-a', name: 'ddh', tabs: [{ id: 'tab-a', name: 'ddh orchestrator' }] },
-      { id: 'ws-b', name: 'pft-1162', tabs: [{ id: 'tab-b', name: 'pft worker' }] },
-      { id: 'ws-c', name: 'bystander', tabs: [{ id: 'tab-c', name: 'other' }] },
+      { id: 'ws-a', name: 'ddh', tabs: [{ id: 'tab-a', name: 'ddh orchestrator' }], orchestratorTabId: 'tab-a' },
+      { id: 'ws-b', name: 'pft-1162', tabs: [{ id: 'tab-b', name: 'pft coordinator' }], orchestratorTabId: 'tab-b' },
+      { id: 'ws-c', name: 'bystander', tabs: [{ id: 'tab-c', name: 'other coordinator' }], orchestratorTabId: 'tab-c' },
     ]);
     const { ensureTabToken } = await import('@/lib/tab-token');
     server = await serve();

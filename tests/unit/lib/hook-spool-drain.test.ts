@@ -886,6 +886,7 @@ describe('server boot wiring (ADR-0020)', () => {
     const listen = server.indexOf('? await startDev(port, appDir, bindPlan.host)');
     const portFile = server.indexOf('await ensureHookSettings(result.port);');
     const boot = server.indexOf('  getStatusManager().startBootHookSpoolDrains();');
+    const notes = server.indexOf('  await startNotes();');
     const inbox = server.indexOf('  await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });');
     expect(wire).toBeGreaterThan(0);
     expect(wire).toBeLessThan(init);
@@ -895,6 +896,9 @@ describe('server boot wiring (ADR-0020)', () => {
     // The inbox starts before listen but holds its first tick for the first boot drain.
     expect(inbox).toBeGreaterThan(init);
     expect(inbox).toBeLessThan(listen);
+    // Notes install their paste-time preflight before the inbox can drain persisted notices.
+    expect(notes).toBeGreaterThan(init);
+    expect(notes).toBeLessThan(inbox);
     // The graceful shutdown awaits the status manager, which saves the hook floors.
     expect(server).toContain('  await gracefulStatusShutdown();');
     expect(server).not.toContain('await getStatusManager().drainHookSpool()');

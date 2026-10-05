@@ -13,6 +13,7 @@ const load = () => import('@/lib/notes-store');
 
 const T0 = Date.parse('2026-09-26T09:00:00.000Z');
 const party = { workspaceId: 'ws-2', tabId: 'tab-b', verified: true, epic: null };
+const admission = { mode: 'local' as const, sender: { workspaceId: 'ws-2', tabId: 'tab-b' }, authorizedAt: T0 };
 
 describe('notes store (ADR-0013)', () => {
   beforeEach(async () => {
@@ -53,7 +54,7 @@ describe('notes store (ADR-0013)', () => {
 
   it('show: the recipient workspace, the sender workspace or admin; ack: the routed recipient workspace only', async () => {
     const { createNote, routed, canShow, canAck } = await load();
-    const queued = createNote({ from: party, to: { epic: null, workspaceId: 'ws-9' }, subject: 's', body: 'b' }, T0, 'n-abcdef');
+    const queued = createNote({ from: party, to: { epic: null, workspaceId: 'ws-9' }, subject: 's', body: 'b', admission }, T0, 'n-abcdef');
     expect(canShow(queued, { workspaceId: 'ws-9', admin: false })).toBe(true);
     expect(canAck(queued, { workspaceId: 'ws-9' })).toBe(false);
     const note = routed(queued, { workspaceId: 'ws-1', tabId: 'tab-a' }, 'i-1', T0);
@@ -67,7 +68,7 @@ describe('notes store (ADR-0013)', () => {
 
   it('prunes acked and expired notes 14 days after their transition, never open ones', async () => {
     const { createNote, acked, expired, prune, NOTE_PRUNE_MS } = await load();
-    const base = createNote({ from: party, to: { epic: 'ddh', workspaceId: null }, subject: 's', body: 'b' }, T0, 'n-open01');
+    const base = createNote({ from: party, to: { epic: 'ddh', workspaceId: null }, subject: 's', body: 'b', admission }, T0, 'n-open01');
     const done = acked({ ...base, id: 'n-acked1' }, { workspaceId: 'ws-1', tabId: 'tab-a' }, null, T0);
     const gone = expired({ ...base, id: 'n-expir1' }, T0);
     const state = { notes: [base, done, gone] };
@@ -77,7 +78,7 @@ describe('notes store (ADR-0013)', () => {
 
   it('writes notes.json with mode 0600 and refuses a malformed file rather than reading it as empty', async () => {
     const { mutateNotes, readNotesState, notesFile, createNote } = await load();
-    const note = createNote({ from: party, to: { epic: 'ddh', workspaceId: null }, subject: 's', body: 'b' }, T0, 'n-abcdef');
+    const note = createNote({ from: party, to: { epic: 'ddh', workspaceId: null }, subject: 's', body: 'b', admission }, T0, 'n-abcdef');
     await mutateNotes((state) => ({ state: { notes: [...state.notes, note] }, value: undefined }));
     expect((await fs.stat(notesFile())).mode & 0o777).toBe(0o600);
     expect((await readNotesState()).notes).toHaveLength(1);

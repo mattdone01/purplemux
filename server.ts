@@ -403,8 +403,9 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await getMissionControlRuntime().start();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most
   // 10 s): a tab's state from before the restart gap must not look ready (ADR-0020).
-  await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });
+  // Note paste-time policy must be registered before the inbox can drain legacy notices.
   await startNotes();
+  await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });
   await startWatches();
 
   const envHost = process.env.HOST?.trim();

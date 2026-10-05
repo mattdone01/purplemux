@@ -386,6 +386,26 @@ describe('per-kind paste-time preflight (story 12, consult ruling A′)', () => 
     expect(item('i-m1')).toMatchObject({ state: 'queued', lastRefusal: 'preflight-error:database locked' });
   });
 
+  it('drops a stale note notice when its owner reports that the note is terminal', async () => {
+    const env = setup();
+    const result = enqueueInState(env.world.state, {
+      kind: 'note',
+      targetWorkspaceId: 'ws-1',
+      targetTabId: 'tab-w',
+      dedupeKey: 'note:n-abcd1234:delivered:tab-w',
+      fields: { noteId: 'n-abcd1234', fromWorkspaceId: 'ws-2', fromTabId: 'tab-s', sentAt: T0, event: 'delivered' },
+    }, env.world.clock, () => 'i-note');
+    env.world.state = result.state;
+    const unregister = registerInboxPreflight('note', async () => ({ ok: false, reason: 'note-terminal:acked' }));
+    try {
+      await env.dispatcher.tick();
+    } finally {
+      unregister();
+    }
+    expect(env.deliver).not.toHaveBeenCalled();
+    expect(env.item('i-note')).toMatchObject({ state: 'dropped', droppedReason: 'preflight:note-terminal:acked' });
+  });
+
   it('kinds without a preflight are unaffected, and unregister only removes its own hook', async () => {
     const { dispatcher, deliver, enqueue } = withMission();
     const first = vi.fn(async () => ({ ok: true as const }));
