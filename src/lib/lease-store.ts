@@ -254,6 +254,44 @@ const isLease = (value: unknown): value is ILease => {
     && typeof l.renewedAt === 'string' && !!l.holder && typeof l.holder === 'object';
 };
 
+const isNullableString = (value: unknown): value is string | null => value === null || typeof value === 'string';
+
+const isStrictLease = (value: unknown): value is ILease => {
+  if (!value || typeof value !== 'object') return false;
+  const lease = value as Record<string, unknown>;
+  if (typeof lease.name !== 'string' || typeof lease.kind !== 'string' || typeof lease.resource !== 'string') return false;
+  try {
+    const parsed = parseLeaseName(lease.name);
+    if (parsed.name !== lease.name || parsed.kind !== lease.kind || parsed.resource !== lease.resource) return false;
+  } catch {
+    return false;
+  }
+  if (!lease.holder || typeof lease.holder !== 'object') return false;
+  const holder = lease.holder as Record<string, unknown>;
+  const identity = holder.identity;
+  const validIdentity = identity === undefined || identity === 'launch' || identity === 'hook'
+    || identity === 'session' || identity === 'none';
+  const acquiredAt = typeof lease.acquiredAt === 'string' ? Date.parse(lease.acquiredAt) : Number.NaN;
+  const renewedAt = typeof lease.renewedAt === 'string' ? Date.parse(lease.renewedAt) : Number.NaN;
+  const expiresAt = typeof lease.expiresAt === 'string' ? Date.parse(lease.expiresAt) : Number.NaN;
+  const ttlValid = lease.ttlSeconds === null
+    || (Number.isSafeInteger(lease.ttlSeconds) && (lease.ttlSeconds as number) > 0);
+  return isNullableString(holder.workspaceId)
+    && isNullableString(holder.tabId)
+    && isNullableString(holder.tabName)
+    && typeof holder.verified === 'boolean'
+    && typeof holder.admin === 'boolean'
+    && validIdentity
+    && isNullableString(lease.epic)
+    && isNullableString(lease.note)
+    && Number.isFinite(acquiredAt)
+    && Number.isFinite(renewedAt)
+    && ttlValid
+    && (lease.expiresAt === null || Number.isFinite(expiresAt))
+    && ((lease.ttlSeconds === null) === (lease.expiresAt === null))
+    && typeof lease.survivesTab === 'boolean';
+};
+
 export class LeaseFileError extends Error {
   readonly code = 'lease-store-unreadable' as const;
 }
@@ -514,6 +552,22 @@ export const releaseEpicClaims = async (
 
 const unexpired = (leases: ILease[], now: number): ILease[] =>
   leases.filter((l) => l.expiresAt === null || Date.parse(l.expiresAt) > now);
+
+export type TLeaseEvidence =
+  | { known: true; leases: ILease[] }
+  | { known: false };
+
+/** Strict read-only evidence for diagnostics; normal lease API compatibility is unchanged. */
+export const readLeaseEvidence = async (now: number = Date.now()): Promise<TLeaseEvidence> => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(leasesFile(), 'utf-8')) as { leases?: unknown } | null;
+    if (!Array.isArray(parsed?.leases) || !parsed.leases.every(isStrictLease)) return { known: false };
+    return { known: true, leases: unexpired(parsed.leases, now) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { known: true, leases: [] };
+    return { known: false };
+  }
+};
 
 export const listLeases = async (prefix?: string, now: number = Date.now()): Promise<ILease[]> => {
   const { leases } = await readLeaseState();

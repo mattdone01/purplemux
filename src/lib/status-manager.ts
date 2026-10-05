@@ -55,7 +55,7 @@ import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
 import { readLivenessEvidence } from '@/lib/liveness-store';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
-import { listLeases } from '@/lib/lease-store';
+import { readLeaseEvidence } from '@/lib/lease-store';
 import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
@@ -1194,12 +1194,7 @@ export class StatusManager {
       const workspaces = workspaceData.workspaces;
       workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
       const observedAt = Date.now();
-      let epicLeases: Awaited<ReturnType<typeof listLeases>> | null;
-      try {
-        epicLeases = await listLeases('epic:', observedAt);
-      } catch {
-        epicLeases = null;
-      }
+      const leaseEvidence = await readLeaseEvidence(observedAt);
       const statuses = this.getAllForClient();
       const liveness = getLivenessManager();
       const facts = await Promise.all(workspaces.map(async (workspace): Promise<IOrchestratorPresenceFacts> => {
@@ -1216,18 +1211,28 @@ export class StatusManager {
           cliState: statuses[tab.id]?.workspaceId === workspace.id ? statuses[tab.id].cliState : null,
         })) ?? null;
 
-        let liveBackgroundTabIds: string[] | null = layoutTabs && livenessEvidence.known ? [] : null;
-        if (layoutTabs && livenessEvidence.known) {
-          const readings = await Promise.allSettled(layoutTabs.map(async (tab) => ({
-            tabId: tab.id,
-            status: await liveness.statusForTab(tab.id),
+        let liveBackgroundTabIds: string[] | null = livenessEvidence.known ? [] : null;
+        if (livenessEvidence.known) {
+          const pidsByTab = new Map<string, Set<number>>();
+          for (const job of livenessEvidence.data.jobs) {
+            const pids = pidsByTab.get(job.tabId) ?? new Set<number>();
+            pids.add(job.pid);
+            pidsByTab.set(job.tabId, pids);
+          }
+          const readings = await Promise.allSettled([...pidsByTab].map(async ([tabId, registeredPids]) => ({
+            tabId,
+            registeredPids,
+            status: await liveness.statusForTab(tabId),
           })));
-          if (readings.some((reading) => reading.status === 'rejected')) {
+          if (readings.some((reading) => reading.status === 'rejected'
+            || [...reading.value.registeredPids].some((pid) => !reading.value.status.backgroundJobs.some((job) => job.pid === pid)))) {
             liveBackgroundTabIds = null;
           } else {
             liveBackgroundTabIds = readings.flatMap((reading) => {
               if (reading.status !== 'fulfilled') return [];
-              return reading.value.status.backgroundJobs.some((job) => job.alive) ? [reading.value.tabId] : [];
+              return reading.value.status.backgroundJobs.some((job) => (
+                reading.value.registeredPids.has(job.pid) && job.alive
+              )) ? [reading.value.tabId] : [];
             });
           }
         }
@@ -1238,9 +1243,11 @@ export class StatusManager {
           orchestration: workspace.orchestration
             ? { enabled: workspace.orchestration.enabled, orchestratorTabId: workspace.orchestration.orchestratorTabId }
             : null,
-          epicLeases: epicLeases === null
+          epicLeases: !leaseEvidence.known
             ? null
-            : epicLeases.filter((lease) => lease.holder.workspaceId === workspace.id).map((lease) => lease.name),
+            : leaseEvidence.leases
+              .filter((lease) => lease.name.startsWith('epic:') && lease.holder.workspaceId === workspace.id)
+              .map((lease) => lease.name),
           standupState: standup.known ? standup.standup?.state ?? null : undefined,
           tabs,
           liveBackgroundTabIds,

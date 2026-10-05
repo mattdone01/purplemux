@@ -10,8 +10,25 @@ import { showNotificationAlert } from '@/hooks/use-agent-status';
 describe('status socket alerts', () => {
   beforeEach(() => warning.mockReset());
 
-  it('presents a foreground orchestrator-missing alert through the client toast path', () => {
-    const message: INotificationAlertMessage = {
+  it('ignores completion alerts owned by the configured subscriber and presents only missing coverage', () => {
+    const completion: INotificationAlertMessage = {
+      type: 'notification:alert',
+      alert: {
+        id: 'alert-complete',
+        seq: 1,
+        kind: 'review',
+        tabId: 'worker',
+        workspaceId: 'ws-1',
+        workspaceName: 'Payments',
+        tabName: 'worker',
+        providerId: 'codex',
+        isOrchestrator: false,
+        title: 'Task Complete',
+        body: 'Review the result',
+        at: 41,
+      },
+    };
+    const missing: INotificationAlertMessage = {
       type: 'notification:alert',
       alert: {
         id: 'alert-1',
@@ -29,8 +46,10 @@ describe('status socket alerts', () => {
       },
     };
 
-    showNotificationAlert(message);
+    showNotificationAlert(completion);
+    showNotificationAlert(missing);
 
+    expect(warning).toHaveBeenCalledTimes(1);
     expect(warning).toHaveBeenCalledWith('Orchestrator Missing', {
       id: 'alert-1',
       description: 'Work remains but no orchestrator is designated.',

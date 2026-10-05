@@ -5,7 +5,7 @@ import type { IWorkspace } from '@/types/terminal';
 
 const mocks = vi.hoisted(() => ({
   getWorkspacesCached: vi.fn(),
-  listLeases: vi.fn(),
+  readLeaseEvidence: vi.fn(),
   readLayoutFile: vi.fn(),
   collectAllTabs: vi.fn(),
   readLatestStandupEvidence: vi.fn(),
@@ -20,7 +20,7 @@ vi.mock('@/lib/workspace-store', () => ({
   getWorkspaceByIdCached: vi.fn(),
 }));
 
-vi.mock('@/lib/lease-store', () => ({ listLeases: mocks.listLeases }));
+vi.mock('@/lib/lease-store', () => ({ readLeaseEvidence: mocks.readLeaseEvidence }));
 vi.mock('@/lib/standup-store', () => ({
   addStandup: vi.fn(),
   readAllLatestStandups: vi.fn(async () => ({})),
@@ -79,7 +79,10 @@ beforeEach(async () => {
   resetMonitor();
   await fs.rm(orchestratorPresenceStateFile(), { force: true });
   mocks.getWorkspacesCached.mockResolvedValue({ workspaces: [workspace('orch')] });
-  mocks.listLeases.mockResolvedValue([{ name: 'epic:payments', holder: { workspaceId: 'ws-1' } }]);
+  mocks.readLeaseEvidence.mockResolvedValue({
+    known: true,
+    leases: [{ name: 'epic:payments', holder: { workspaceId: 'ws-1' } }],
+  });
   mocks.readLayoutFile.mockResolvedValue({ root: {} });
   mocks.collectAllTabs.mockReturnValue([{ id: 'orch', name: 'orchestrator', panelType: 'codex-cli' }]);
   mocks.readLatestStandupEvidence.mockResolvedValue({ known: true, standup: null });
@@ -117,6 +120,70 @@ describe('status manager orchestrator presence collector', () => {
         orchestratorState: 'usable',
         evidence: expect.arrayContaining(['latest standup unreadable', 'registered background work unreadable']),
       }],
+    });
+    expect(mocks.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('keeps malformed lease evidence uncertain instead of treating it as no active epic', async () => {
+    mocks.readLeaseEvidence.mockResolvedValue({ known: false });
+    mocks.readLatestStandupEvidence.mockResolvedValue({ known: true, standup: {
+      workspaceId: 'ws-1', at: 1, state: 'done', headline: 'Done', items: [], blockers: [], needsHuman: false, next: [],
+    } });
+    const manager = new StatusManager();
+    manager.registerTab('orch', entry());
+
+    await runPresence(manager);
+
+    expect(getOrchestratorPresenceMonitor().snapshot()).toMatchObject({
+      state: 'ready',
+      issues: [{ state: 'uncertain', evidence: expect.arrayContaining(['epic leases unreadable']) }],
+    });
+    expect(mocks.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('checks registered job owners absent from the layout through liveness PID assessment', async () => {
+    mocks.getWorkspacesCached.mockResolvedValue({ workspaces: [workspace(null)] });
+    mocks.readLeaseEvidence.mockResolvedValue({ known: true, leases: [] });
+    mocks.readLatestStandupEvidence.mockResolvedValue({ known: true, standup: {
+      workspaceId: 'ws-1', at: 1, state: 'done', headline: 'Done', items: [], blockers: [], needsHuman: false, next: [],
+    } });
+    mocks.collectAllTabs.mockReturnValue([]);
+    mocks.readLivenessEvidence.mockResolvedValue({
+      known: true,
+      data: { probes: [], jobs: [{ workspaceId: 'ws-1', tabId: 'closed-worker', pid: 4242, registeredAt: 1 }] },
+    });
+    mocks.statusForTab.mockResolvedValue({
+      probes: [],
+      backgroundJobs: [{ pid: 4242, alive: true, registeredAt: 1, ageS: 10 }],
+    });
+    const manager = new StatusManager();
+
+    await runPresence(manager);
+
+    expect(mocks.statusForTab).toHaveBeenCalledWith('closed-worker');
+    expect(getOrchestratorPresenceMonitor().snapshot()).toMatchObject({
+      state: 'ready',
+      issues: [{ state: 'missing', evidence: ['live registered background work: closed-worker'] }],
+    });
+    expect(mocks.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps registered job evidence unknown when PID assessment cannot account for it', async () => {
+    mocks.getWorkspacesCached.mockResolvedValue({ workspaces: [workspace(null)] });
+    mocks.readLeaseEvidence.mockResolvedValue({ known: true, leases: [] });
+    mocks.collectAllTabs.mockReturnValue([]);
+    mocks.readLivenessEvidence.mockResolvedValue({
+      known: true,
+      data: { probes: [], jobs: [{ workspaceId: 'ws-1', tabId: 'closed-worker', pid: 4242, registeredAt: 1 }] },
+    });
+    mocks.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [] });
+    const manager = new StatusManager();
+
+    await runPresence(manager);
+
+    expect(getOrchestratorPresenceMonitor().snapshot()).toMatchObject({
+      state: 'ready',
+      issues: [{ state: 'uncertain', evidence: expect.arrayContaining(['registered background work unreadable']) }],
     });
     expect(mocks.dispatch).not.toHaveBeenCalled();
   });

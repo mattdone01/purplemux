@@ -726,7 +726,9 @@ ticks older than `STANDUP_STALE_MS` (20 min) render as stale.
 Every status poll checks whether a workspace with remaining work has a usable
 designated orchestrator. Remaining-work evidence comes from active `epic:`
 leases, a latest standup whose state is not `done`, active agent tabs, and live
-registered background jobs. An idle agent is not completion evidence. An empty
+registered background jobs. Registered job owners are checked even when their
+tabs are no longer in the current layout; their liveness still goes through the
+existing PID-aware manager. An idle agent is not completion evidence. An empty
 workspace, or a `done` standup with no conflicting work evidence, needs no
 orchestrator.
 
@@ -785,6 +787,12 @@ shouldAlert({ id: tabId }, workspace, config)
 | `false` | not orchestrated | every agent tab alerts (the pre-dispatcher rule) |
 
 `alertsOrchestratorOnly` is a `config.json` key (`ALERTS_ORCHESTRATOR_ONLY_DEFAULT`), toggled in Settings → Notifications.
+
+The status-socket `notification:alert` consumer is intentionally limited to
+`orchestrator-missing`, which has no tab-state transition to drive an existing
+subscriber. Completion toasts remain owned by `use-toast-notification.ts`, so
+their enable flag, focused-tab suppression, duration, action, and deduplication
+remain unchanged and no second warning toast is created.
 
 ### Alert Kinds
 

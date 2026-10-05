@@ -37,6 +37,7 @@ export const ackNotificationInput = (tabId: string, seq: number) => {
 };
 
 export const showNotificationAlert = ({ alert }: INotificationAlertMessage): void => {
+  if (alert.kind !== 'orchestrator-missing') return;
   toast.warning(alert.title, { id: alert.id, description: alert.body });
 };
 

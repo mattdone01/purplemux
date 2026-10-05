@@ -219,6 +219,8 @@ and server restarts at-most-once per episode. An uncertain read, an omitted
 workspace, or a restart does not clear a latch; only confirmed recovery or
 confirmed completion does. The file is strict-read and atomically replaced, so
 damage pauses notification transitions instead of becoming an empty state.
+Lease and liveness files are also read through strict diagnostic views for this
+monitor; their normal mutation/API compatibility paths are unchanged.
 
 ### FCM service account (outside `~/.purplemux`)
 
