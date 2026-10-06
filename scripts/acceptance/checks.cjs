@@ -593,6 +593,10 @@ const story15 = async (inst, { nonce, wsB, fail, check }) => {
     `bg add ${registered.rc}, stop posted ${w2Stopped}, after w3's nudge: cliState ${w2State}, nudges ${w2Early.map((n) => n.kind).join(',') || 'none'}; after the job ended: ${woke ? `idle nudge at +${woke.at - endedAt} ms` : 'no idle nudge'}`,
     'bg add 0, stop posted, cliState busy, no nudge; then an idle nudge stamped after the job ended',
   );
+  // Wave 2 runs commands as the designated coordinator. Return this fixture from its foreground
+  // composer to the shell while retaining the same tab/session identity and designation.
+  await inst.keys(orchTab.sessionName, 'C-c');
+  await sleep(500);
 };
 
 /** The wave-2 checks (story 22). Each pushes one result; a failed prerequisite fails what depends on it. */

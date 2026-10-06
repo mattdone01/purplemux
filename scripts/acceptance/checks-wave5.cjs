@@ -128,7 +128,7 @@ const wave5 = async (inst, helpers) => {
   const pass = (id, what) => results.push({ status: 'pass', id, what });
   const fail = (id, what, measured, expected) => results.push({ status: 'fail', id, what, measured, expected });
   const check = (id, what, ok, measured, expected) => ok ? pass(id, what) : fail(id, what, measured, expected);
-  const { within, sleep, brief, readIf } = helpers;
+  const { parseJson, within, sleep, brief, readIf } = helpers;
   const ws = inst.state.workspaces.a;
   const created = [];
   const sockets = [];
@@ -137,7 +137,9 @@ const wave5 = async (inst, helpers) => {
     const cookie = await humanCookie(inst);
     const humanHeaders = { cookie, origin: `http://localhost:${inst.state.port}` };
     const create = async (name) => {
-      const made = JSON.parse((await inst.cli(['tab', 'create', '-w', ws, '-n', name, '-t', 'claude-code', '--no-launch'])).out);
+      const result = await inst.cli(['tab', 'create', '-w', ws, '-n', name, '-t', 'claude-code', '--no-launch']);
+      const made = parseJson(result.out);
+      if (result.rc !== 0 || !made?.tabId || !made?.sessionName) throw new Error(`fixture tab ${name} was not created: ${brief(result)}`);
       created.push(made);
       return made;
     };
