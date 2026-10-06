@@ -229,15 +229,15 @@ const checks = async (inst, helpers, results) => {
 // ─── story 37: open work a subagent owns ─────────────────────────────────────────────────────────
 const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, status, brief, retainDesignatedFixture }) => {
   const { b: wsB } = inst.state.workspaces;
-  const ids = ['subagent-shell-waiting', 'subagent-woken-waiting', 'turn-end-served'];
+  const ids = ['subagent-shell-waiting', 'subagent-woken-waiting', 'turn-end-served', 'subagent-designated-housekeeping'];
   const orch = await tab(wsB, `acc4-orch-${nonce}`, 'claude-code', ['--no-launch']);
-  await inst.startLiveFixtureAgent(wsB, orch);
+  const coordinator = await inst.startLiveFixtureAgent(wsB, orch);
   await sleep(1000);
   const on = orch?.tabId ? await inst.designate(wsB, orch.tabId) : { rc: -1, out: '', err: 'no tab' };
   // A stop with no end line nudges only after the idle window (L49); 3 s instead of the 15 min default.
   await inst.cli(['config', 'set', 'watchdog.idle-nudge-minutes', '0.05']);
-  if (!orch?.tabId || on.rc !== 0) {
-    for (const id of ids) fail(id, 'story 37 needs an orchestrated workspace B', `orchestration on: ${brief(on)}`, 'exit 0');
+  if (!orch?.tabId || coordinator.rc !== 0 || on.rc !== 0) {
+    for (const id of ids) fail(id, 'story 37 needs a live orchestrated workspace B', `stand-in: ${brief(coordinator)}; orchestration on: ${brief(on)}`, 'stand-in and orchestration exit 0');
     return;
   }
   const worker = async (name, transcript, subagents) => {
@@ -517,6 +517,23 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
   const standIn = orch
     ? await inst.startLiveFixtureAgent(wsA, orch, { inputFile })
     : { rc: -1 };
+  if (!orch?.tabId || standIn.rc !== 0) {
+    check(
+      'mission-bootstrap-inbox',
+      'a reconcile bootstrap reaches the idle orchestrator as ONE inbox notice, typed once into its empty composer as a single line',
+      false,
+      `stand-in ${brief(standIn)}`,
+      'a bound live stand-in before bootstrap',
+    );
+    check(
+      'mission-designated-housekeeping',
+      'mission cleanup retains the actual designated coordinator live with unchanged mapping',
+      false,
+      `stand-in ${brief(standIn)}`,
+      'a captured live fixture identity',
+    );
+    return;
+  }
   const on = orch?.tabId ? await inst.designate(wsA, orch.tabId) : { rc: -1 };
   const idle = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
   // The orchestrator's live binding: the server finds the stand-in's session from its `--resume`

@@ -53,6 +53,8 @@ const IDLE_WINDOW_MIN = '0.05';
 const IDLE_WINDOW_MS = 3000;
 /** The window plus two status polls of the largest interval. */
 const IDLE_WAIT_MS = 130000;
+const FIXTURE_PROCESS_WAIT_MS = 10000;
+const FIXTURE_BIND_WAIT_MS = 150000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -108,6 +110,19 @@ class Instance {
     this.cliPath = path.join(state.candidate, 'bin', 'purplemux.js');
     this.env = { PATH: `${path.dirname(state.node)}:/usr/bin:/bin`, HOME: state.home, TMUX_TMPDIR: state.tmuxTmpdir };
     this.fixtureAgents = new Map();
+    this.shellOperations = new Map();
+    this.fixtureEvidenceDir = state.evidenceDir || path.join(state.scratch, 'evidence');
+    fs.mkdirSync(this.fixtureEvidenceDir, { recursive: true });
+  }
+
+  persistFixtureObservation(kind, details) {
+    const observedAt = Date.now();
+    const record = { observedAt, kind, ...details };
+    const name = `${String(observedAt)}-${kind.replace(/[^a-zA-Z0-9_-]/g, '-')}-${crypto.randomBytes(3).toString('hex')}.json`;
+    const file = path.join(this.fixtureEvidenceDir, name);
+    fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+    fs.appendFileSync(path.join(this.fixtureEvidenceDir, 'observations.jsonl'), `${JSON.stringify({ ...record, file })}\n`);
+    return file;
   }
 
   /** Run the actual unscoped shell CLI; its production token selection supplies workspace scope. */
@@ -153,54 +168,137 @@ class Instance {
     return assessFixtureAgent({ result, status, panePid, pane, record, process, expected, descendant });
   }
 
-  async startLiveFixtureAgent(ws, tab, { inputFile = null } = {}) {
+  async startLiveFixtureAgent(ws, tab, { inputFile = null, phase = 'launch' } = {}) {
     if (!tab) return { rc: -1, out: '', err: 'missing fixture agent' };
     const launchedAfter = Date.now();
     const started = await this.startStandIn(tab.sessionName, 'Ready.', {
       workspaceDir: ws === this.state.workspaces.a ? 'a' : 'b', inputFile,
-      standInPath: liveStandIn(this.state.scratch),
+      standInPath: liveStandIn(this.state.scratch), verifiedShell: true,
     });
     if (started.rc !== 0) return started;
     const sessionId = path.basename(started.transcriptPath, '.jsonl');
-    const processReady = await pollObservation(10000, async () => {
-      const observed = await this.observeFixtureAgent(ws, tab, { sessionId, launchedAfter });
-      return {
-        ...observed,
-        ok: observed.status?.alive === true && observed.status.command === 'claude'
-          && observed.facts.freshRecord && observed.facts.sameIdentity
-          && observed.facts.descendant && observed.facts.foreground
-          && observed.facts.process?.state !== 'Z' && observed.facts.process?.argv0 === 'claude',
-      };
+    const processReady = await pollObservation(FIXTURE_PROCESS_WAIT_MS, async () => fixturePhysicalObservation(
+      await this.observeFixtureAgent(ws, tab, { sessionId, launchedAfter }),
+    ));
+    const processEvidence = this.persistFixtureObservation(`${phase}-physical`, {
+      workspaceId: ws, tabId: tab.tabId, sessionName: tab.sessionName, sessionId, launchedAfter,
+      shellOperation: started.operation ?? null, observation: processReady,
     });
     if (!processReady.ok) {
-      return { ...started, rc: -1, err: `live fixture process was not observed: ${JSON.stringify(processReady.facts)}`, observation: processReady };
+      return { ...started, rc: -1, err: `live fixture process was not observed; evidence ${processEvidence}`, observation: processReady, evidence: [processEvidence] };
     }
+    const pinned = {
+      sessionId,
+      pid: processReady.facts.record.pid,
+      startedAt: processReady.facts.record.startedAt,
+      startTicks: processReady.facts.process.startTicks,
+    };
     await this.hook('session-start', tab.sessionName);
-    const observation = await pollObservation(10000, () => this.observeFixtureAgent(ws, tab, { sessionId, launchedAfter }));
+    const observation = await pollObservation(FIXTURE_BIND_WAIT_MS, () => this.observeFixtureAgent(ws, tab, pinned));
+    const bindingEvidence = this.persistFixtureObservation(`${phase}-binding`, {
+      workspaceId: ws, tabId: tab.tabId, sessionName: tab.sessionName, pinned, observation,
+    });
     if (!observation.ok || !observation.identity) {
-      return { ...started, rc: -1, err: `live fixture was not observed: ${JSON.stringify(observation.facts)}`, observation };
+      return { ...started, rc: -1, err: `live fixture was not bound; evidence ${bindingEvidence}`, observation, evidence: [processEvidence, bindingEvidence] };
     }
     this.fixtureAgents.set(tab.tabId, observation.identity);
-    return { ...started, observation };
+    return { ...started, observation, evidence: [processEvidence, bindingEvidence] };
   }
 
   async restoreLiveFixtureAgent(ws, tab) {
-    const marker = path.join(this.state.scratch, 'io', `shell-control-${tab.tabId}-${crypto.randomBytes(3).toString('hex')}`);
-    const sent = await this.keys(tab.sessionName, `: > ${shellQuote(marker)}`);
-    const shellControl = sent.rc === 0 && await within(3000, async () => fs.existsSync(marker));
-    if (!shellControl) return { rc: -1, out: '', err: `shell control not confirmed after ${brief(sent)}` };
-    return this.startLiveFixtureAgent(ws, tab);
+    return this.startLiveFixtureAgent(ws, tab, { phase: 'restore' });
+  }
+
+  async isolatedShellState(session) {
+    const shown = await this.isolatedTmux(['display-message', '-p', '-t', session, '#{pane_current_command}']);
+    const panePid = await this.isolatedPanePid(session);
+    const process = processIdentity(panePid);
+    return assessShellControl({ result: shown, command: shown.out.trim(), panePid, process });
+  }
+
+  shellReceipt(operation) {
+    const text = readIf(operation.receiptPath);
+    if (text === null || text.trim() === '' || !/^-?\d+$/.test(text.trim())) return null;
+    return Number(text.trim());
+  }
+
+  async captureIsolatedPane(session) {
+    const captured = await this.isolatedTmux(['capture-pane', '-p', '-S', '-200', '-t', session]);
+    return captured.out;
+  }
+
+  async isolatedShellCommand(session, command, { timeoutMs = 30000, waitForCompletion = true, terminalOutput = false } = {}) {
+    const previous = this.shellOperations.get(session) ?? null;
+    if (previous && this.shellReceipt(previous) === null) {
+      await within(3000, async () => this.shellReceipt(previous) !== null);
+      if (this.shellReceipt(previous) === null) {
+        const partial = await this.captureIsolatedPane(session);
+        const evidence = this.persistFixtureObservation('shell-refused-ambiguous', { sessionName: session, previous, partial });
+        return { rc: -1, out: '', err: `previous isolated shell operation has no receipt; not resent; evidence ${evidence}`, operation: previous };
+      }
+    }
+
+    const shell = await this.isolatedShellState(session);
+    const shellEvidence = this.persistFixtureObservation('shell-control', { sessionName: session, observation: shell });
+    if (!shell.ok) return { rc: -1, out: '', err: `foreground shell not proven; evidence ${shellEvidence}`, shell };
+
+    const tag = crypto.randomBytes(4).toString('hex');
+    const base = path.join(this.state.scratch, 'io', `shell-${tag}`);
+    fs.mkdirSync(path.dirname(base), { recursive: true });
+    const operation = {
+      sessionName: session,
+      commandStartPath: `${base}.started`,
+      receiptPath: `${base}.rc`,
+      stdoutPath: `${base}.out`,
+      stderrPath: `${base}.err`,
+    };
+    const invoke = terminalOutput
+      ? `: > ${shellQuote(operation.commandStartPath)}; ${shellQuote(this.fixtureCommandWrapper())} ${shellQuote(operation.receiptPath)} ${shellQuote(command)}`
+      : `: > ${shellQuote(operation.commandStartPath)}; ( ${command} ) > ${shellQuote(operation.stdoutPath)} 2> ${shellQuote(operation.stderrPath)}; rc=$?; printf '%s\\n' "$rc" > ${shellQuote(operation.receiptPath)}`;
+    const sent = await this.keys(session, invoke, { clearPending: true });
+    if (sent.rc !== 0) return { rc: -1, out: '', err: `isolated tmux send exited ${sent.rc}: ${sent.err.trim()}`, operation };
+    this.shellOperations.set(session, operation);
+    const started = await within(3000, async () => fs.existsSync(operation.commandStartPath));
+    if (!started) {
+      const partial = await this.captureIsolatedPane(session);
+      const evidence = this.persistFixtureObservation('shell-start-timeout', { sessionName: session, operation, sent, partial });
+      return { rc: -1, out: readIf(operation.stdoutPath) || '', err: `command-start marker absent; mutation state ambiguous; not resent; evidence ${evidence}`, operation, partial };
+    }
+    if (!waitForCompletion) {
+      const evidence = this.persistFixtureObservation('shell-command-started', { sessionName: session, operation, shell });
+      return { rc: 0, out: '', err: '', operation, evidence };
+    }
+
+    const completed = await within(timeoutMs, async () => {
+      const rc = this.shellReceipt(operation);
+      return rc === null ? null : { rc };
+    });
+    if (!completed) {
+      const partial = await this.captureIsolatedPane(session);
+      const evidence = this.persistFixtureObservation('shell-receipt-timeout', { sessionName: session, operation, partial });
+      return {
+        rc: -1,
+        out: readIf(operation.stdoutPath) || '',
+        err: `${readIf(operation.stderrPath) || ''}no exit receipt within ${timeoutMs} ms; mutation state ambiguous; not resent; evidence ${evidence}`,
+        operation,
+        partial,
+      };
+    }
+    const result = { rc: completed.rc, out: readIf(operation.stdoutPath) || '', err: readIf(operation.stderrPath) || '', operation };
+    result.evidence = this.persistFixtureObservation('shell-command-complete', { sessionName: session, operation, result: { rc: result.rc, out: result.out, err: result.err } });
+    return result;
   }
 
   /** Type `command` into a terminal tab; wait for the exit code it writes. */
   async inTab(ws, tab, command, { timeoutMs = 30000, session = null } = {}) {
+    if (session) return this.isolatedShellCommand(session, command, { timeoutMs });
     const tag = crypto.randomBytes(4).toString('hex');
     const base = path.join(this.state.scratch, 'io', `${tab}-${tag}`);
     fs.mkdirSync(path.dirname(base), { recursive: true });
     const line = `( ${command} ) > ${base}.out 2> ${base}.err; echo $? > ${base}.rc`;
     // A stopped agent stand-in leaves a shell that agent-readiness intentionally refuses.
     // Only isolated fixture panes use keys(); their original injected identity is unchanged.
-    const sent = session ? await this.keys(session, line) : await this.cli(['tab', 'send', '-w', ws, tab, line]);
+    const sent = await this.cli(['tab', 'send', '-w', ws, tab, line]);
     if (sent.rc !== 0) return { rc: -1, out: '', err: `tab send exited ${sent.rc}: ${sent.err.trim()}` };
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -239,7 +337,10 @@ class Instance {
    * `<transcript>/subagents/` as Claude writes them (story 37). The result carries `transcriptPath`
    * so a check can append to the transcript later. `standInPath` runs another stand-in script.
    */
-  async startStandIn(session, transcript, { workspaceDir = 'b', composer = false, inputFile = null, subagents = null, standInPath = null, background = false } = {}) {
+  async startStandIn(session, transcript, {
+    workspaceDir = 'b', composer = false, inputFile = null, subagents = null,
+    standInPath = null, background = false, verifiedShell = false,
+  } = {}) {
     const tmuxDir = this.state.tmuxTmpdir;
     if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
     const uuid = crypto.randomUUID();
@@ -264,7 +365,10 @@ class Instance {
     const env = { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir };
     const standIn = standInPath ?? (composer ? this.composerStandIn() : path.join(this.state.scratch, 'bin', 'claude'));
     const input = inputFile ? `ACC_INPUT=${shellQuote(inputFile)} ` : '';
-    const started = await run('tmux', ['-L', 'purple', 'send-keys', '-t', session, `${input}${standIn} --resume ${uuid}${background ? " </dev/null >/dev/null 2>&1 &" : ""}`, 'Enter'], { env, timeoutMs: 10000 });
+    const command = `${input}${standIn} --resume ${uuid}${background ? " </dev/null >/dev/null 2>&1 &" : ""}`;
+    const started = verifiedShell
+      ? await this.isolatedShellCommand(session, command, { timeoutMs: 10000, waitForCompletion: background, terminalOutput: !background })
+      : await run('tmux', ['-L', 'purple', 'send-keys', '-t', session, command, 'Enter'], { env, timeoutMs: 10000 });
     return { ...started, transcriptPath };
   }
 
@@ -292,11 +396,39 @@ class Instance {
     return file;
   }
 
+  /** Keep a receipt-writing parent in the foreground process group when Ctrl-C ends a live stand-in. */
+  fixtureCommandWrapper() {
+    const file = path.join(this.state.scratch, 'bin', 'fixture-command-wrapper');
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, [
+        '#!/bin/bash',
+        'receipt="$1"; command="$2"',
+        'finish() { rc="$1"; printf \'%s\\n\' "$rc" > "$receipt"; trap - INT TERM; exit "$rc"; }',
+        'trap \'finish 130\' INT',
+        'trap \'finish 143\' TERM',
+        '/bin/bash -c "$command"',
+        'finish "$?"',
+        '',
+      ].join('\n'));
+      fs.chmodSync(file, 0o755);
+    }
+    return file;
+  }
+
   /** Type keys into a pane over the ISOLATED tmux socket (for a pane whose shell `tab send` refuses). */
-  keys(session, line) {
+  keys(session, line, { clearPending = false } = {}) {
     const tmuxDir = this.state.tmuxTmpdir;
     if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
-    return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, line, 'Enter'], { env: { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir }, timeoutMs: 10000 });
+    const keys = clearPending ? ['C-u', line, 'Enter'] : [line, 'Enter'];
+    return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, ...keys], { env: { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir }, timeoutMs: 10000 });
+  }
+
+  /** Put literal text on an isolated shell's pending Readline buffer without executing it. */
+  preloadPendingInput(session, text) {
+    const tmuxDir = this.state.tmuxTmpdir;
+    if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
+    return run('tmux', ['-L', 'purple', 'send-keys', '-l', '-t', session, text], { env: { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir }, timeoutMs: 10000 });
   }
 
   /** Exact probes and lifecycle operations against only this fixture's isolated tmux server. */
@@ -402,9 +534,21 @@ const assessFixtureAgent = ({ result, status, panePid, pane, record, process, ex
     && (!expected?.startTicks || process.startTicks === expected.startTicks));
   const foreground = Boolean(pane && process && pane.tpgid > 0 && process.pgrp === pane.tpgid);
   const bound = status?.agentSessionId === expected?.sessionId;
-  const ok = result.rc === 0 && status?.alive === true && status.command === 'claude'
-    && status.agentProviderId === 'claude' && bound && freshRecord && sameIdentity
-    && process?.state !== 'Z' && process?.argv0 === 'claude' && descendant && foreground;
+  const predicates = {
+    statusRead: result.rc === 0,
+    alive: status?.alive === true,
+    command: status?.command === 'claude',
+    provider: status?.agentProviderId === 'claude',
+    bound,
+    freshRecord,
+    sameIdentity,
+    nonZombie: Boolean(process && process.state !== 'Z'),
+    argv0: process?.argv0 === 'claude',
+    descendant,
+    foreground,
+  };
+  const failedPredicates = Object.entries(predicates).filter(([, value]) => !value).map(([name]) => name);
+  const ok = failedPredicates.length === 0;
   return {
     ok,
     result,
@@ -418,6 +562,8 @@ const assessFixtureAgent = ({ result, status, panePid, pane, record, process, ex
       descendant,
       foreground,
       bound,
+      predicates,
+      failedPredicates,
     },
     identity: ok ? {
       sessionId: record.sessionId,
@@ -425,6 +571,35 @@ const assessFixtureAgent = ({ result, status, panePid, pane, record, process, ex
       startedAt: record.startedAt,
       startTicks: process.startTicks,
     } : null,
+  };
+};
+
+const fixturePhysicalObservation = (observation) => {
+  const required = ['freshRecord', 'sameIdentity', 'nonZombie', 'argv0', 'descendant', 'foreground'];
+  const failedPredicates = required.filter((name) => !observation.facts?.predicates?.[name]);
+  return {
+    ...observation,
+    ok: failedPredicates.length === 0,
+    facts: { ...observation.facts, physicalFailedPredicates: failedPredicates },
+  };
+};
+
+const assessShellControl = ({ result, command, panePid, process }) => {
+  const predicates = {
+    statusRead: result.rc === 0,
+    shellCommand: ['bash', 'sh', 'zsh', 'fish'].includes(command),
+    processReadable: Boolean(process),
+    nonZombie: Boolean(process && process.state !== 'Z'),
+    foreground: Boolean(process && process.tpgid > 0 && process.pgrp === process.tpgid),
+  };
+  return {
+    ok: Object.values(predicates).every(Boolean),
+    result,
+    command,
+    panePid,
+    process,
+    predicates,
+    failedPredicates: Object.entries(predicates).filter(([, value]) => !value).map(([name]) => name),
   };
 };
 
@@ -1124,6 +1299,177 @@ const suggestions = async (inst, { nonce, wsA, check, created }) => {
   if (t) await inst.cli(['tab', 'close', '-w', wsA, t.tabId]);
 };
 
+/** Architect-bounded real-fixture proof for retained coordinator identity and safe shell submission. */
+const targetedFixtureProof = async (inst) => {
+  const results = [];
+  const nonce = crypto.randomBytes(4).toString('hex');
+  const { a: wsA, b: wsB } = inst.state.workspaces;
+  const pass = (id, what) => results.push({ status: 'pass', id, what });
+  const fail = (id, what, measured, expected) => results.push({ status: 'fail', id, what, measured, expected });
+  const check = (id, what, ok, measured, expected) => (ok ? pass(id, what) : fail(id, what, measured, expected));
+  const create = async (ws, name, type = 'claude-code') => {
+    const args = ['tab', 'create', '-w', ws, '-n', name, '-t', type];
+    if (type !== 'terminal') args.push('--no-launch');
+    const result = await inst.cli(args);
+    return result.rc === 0 ? parseJson(result.out) : null;
+  };
+  const mapping = async (ws) => parseJson((await inst.cli(['orchestration', 'status', '-w', ws])).out)?.orchestration ?? null;
+  const allNotes = async () => parseJson((await inst.cli(['note', 'list'])).out)?.notes ?? [];
+
+  const recipient = await create(wsA, `target-recipient-${nonce}`);
+  const sender = await create(wsB, `target-sender-${nonce}`);
+  const worker = await create(wsB, `target-worker-${nonce}`);
+  const inputFile = path.join(inst.state.scratch, 'io', `target-note-${nonce}.txt`);
+  const bodyFile = path.join(inst.state.scratch, 'io', `target-body-${nonce}.txt`);
+  fs.mkdirSync(path.dirname(inputFile), { recursive: true });
+  fs.writeFileSync(inputFile, '');
+  fs.writeFileSync(bodyFile, `TARGET-BODY-${nonce}\n`);
+
+  const fresh = recipient
+    ? await inst.startLiveFixtureAgent(wsA, recipient, { inputFile, phase: 'target-fresh' })
+    : { rc: -1, err: 'recipient not created' };
+  const senderStarted = sender ? await inst.startFixtureAgent(wsB, sender, { background: true }) : { rc: -1, err: 'sender not created' };
+  const workerStarted = worker ? await inst.startFixtureAgent(wsB, worker, { background: true }) : { rc: -1, err: 'worker not created' };
+  const designatedA = recipient ? await inst.designate(wsA, recipient.tabId) : { rc: -1 };
+  const designatedB = sender ? await inst.designate(wsB, sender.tabId) : { rc: -1 };
+  const initialIdentity = recipient ? inst.fixtureAgents.get(recipient.tabId) : null;
+  check(
+    'target-fresh-bind',
+    'a fresh live stand-in binds only after its physical UUID/PID/start identity is pinned',
+    fresh.rc === 0 && Boolean(initialIdentity) && fresh.observation?.facts?.failedPredicates?.length === 0,
+    `fresh ${brief(fresh)} identity ${JSON.stringify(initialIdentity ?? null)} evidence ${JSON.stringify(fresh.evidence ?? [])}`,
+    'launch exit 0, a pinned identity, and no failed binding predicate',
+  );
+
+  const noteBefore = (await allNotes()).length;
+  const noteCommand = inst.tabCli(['note', 'send', '--to-workspace', wsA, '--subject', `target ${nonce}`, '-f', bodyFile]);
+  const workerDenied = worker ? await inst.inTab(wsB, worker.tabId, noteCommand, { session: worker.sessionName }) : { rc: -1 };
+  const preloaded = sender ? await inst.preloadPendingInput(sender.sessionName, '[orchestrator-watchdog] sender is INACTIVE ') : { rc: -1 };
+  const sent = sender && fresh.rc === 0 && senderStarted.rc === 0 && workerStarted.rc === 0 && designatedA.rc === 0 && designatedB.rc === 0
+    ? await inst.inTab(wsB, sender.tabId, noteCommand, { session: sender.sessionName, timeoutMs: 30000 })
+    : { rc: -1, out: '', err: 'note prerequisites failed' };
+  const note = parseJson(sent.out)?.note ?? null;
+  const delivered = note ? await within(180000, async () => (await allNotes()).find((entry) => entry.id === note.id && typeof entry.deliveredAt === 'number')) : null;
+  const sourceAck = note && sender
+    ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'ack', note.id]), { session: sender.sessionName })
+    : { rc: -1 };
+  const noteAfter = await allNotes();
+  const input = readIf(inputFile) ?? '';
+  const noticeCount = note?.id ? input.split(`[purplemux note ${note.id}]`).length - 1 : 0;
+  const receipt = sent.operation ? inst.shellReceipt(sent.operation) : null;
+  check(
+    'target-watchdog-note-once',
+    'pending watchdog text is cleared before one note command whose receipt proves routing and denials',
+    workerDenied.rc === 3 && preloaded.rc === 0 && sent.rc === 0 && receipt === 0 && noteAfter.length === noteBefore + 1
+      && delivered?.deliveredTo?.tabId === recipient?.tabId && noticeCount === 1 && sourceAck.rc === 3,
+    `worker ${brief(workerDenied)} preload ${brief(preloaded)} send ${brief(sent)} receipt ${receipt} notes ${noteBefore}->${noteAfter.length} recipient ${delivered?.deliveredTo?.tabId ?? 'none'} notices ${noticeCount} source ACK ${brief(sourceAck)}`,
+    'worker send denied; one received CLI command with receipt 0; one note routed once to the coordinator; source ACK denied',
+  );
+
+  const beforeLiveIdentity = recipient ? inst.fixtureAgents.get(recipient.tabId) : null;
+  const beforeLiveMapping = await mapping(wsA);
+  const liveOther = await create(wsA, `target-live-other-${nonce}`, 'terminal');
+  const retainedLive = await retainDesignatedFixture(inst, wsA, [recipient, liveOther]);
+  const afterLiveIdentity = recipient ? inst.fixtureAgents.get(recipient.tabId) : null;
+  check(
+    'target-live-retain',
+    'an already-live designated fixture is retained without restart while only the other tab closes',
+    retainedLive.ok && JSON.stringify(beforeLiveIdentity) === JSON.stringify(afterLiveIdentity),
+    `${retainedLive.measured}; identity ${JSON.stringify(beforeLiveIdentity)} -> ${JSON.stringify(afterLiveIdentity)}`,
+    'retention passes and the pinned identity is byte-identical',
+  );
+
+  const stopped = recipient ? await inst.keys(recipient.sessionName, 'C-c') : { rc: -1 };
+  const launchReceipt = recipient && inst.shellOperations.get(recipient.sessionName)
+    ? await within(5000, async () => inst.shellReceipt(inst.shellOperations.get(recipient.sessionName)) !== null)
+    : false;
+  const shellControl = recipient ? await inst.isolatedShellState(recipient.sessionName) : { ok: false };
+  const shellNegative = recipient && beforeLiveIdentity ? await inst.observeFixtureAgent(wsA, recipient, beforeLiveIdentity) : { ok: true, facts: {} };
+  check(
+    'target-shell-control-rejected',
+    'a foreground shell after the stand-in stops is never accepted as the pinned coordinator process',
+    stopped.rc === 0 && launchReceipt && shellControl.ok && !shellNegative.ok
+      && shellNegative.facts.failedPredicates.includes('command'),
+    `stop ${brief(stopped)} receipt ${launchReceipt} shell ${JSON.stringify(shellControl)} observation ${JSON.stringify(shellNegative)}`,
+    'the launch receipt is terminal, foreground shell is proven, and the agent observation rejects command',
+  );
+
+  const reviveOther = await create(wsA, `target-revive-other-${nonce}`, 'terminal');
+  const revived = await retainDesignatedFixture(inst, wsA, [recipient, reviveOther], {
+    restore: (tab) => inst.restoreLiveFixtureAgent(wsA, tab),
+  });
+  const revivedIdentity = recipient ? inst.fixtureAgents.get(recipient.tabId) : null;
+  const afterReviveMapping = await mapping(wsA);
+  check(
+    'target-stopped-revive',
+    'a stopped coordinator revives in the same tab and tmux session with unchanged designation and revision',
+    revived.ok && Boolean(revivedIdentity) && revivedIdentity.sessionId !== beforeLiveIdentity?.sessionId
+      && revivedIdentity.pid !== beforeLiveIdentity?.pid && recipient?.sessionName
+      && beforeLiveMapping?.orchestratorTabId === recipient?.tabId
+      && JSON.stringify(beforeLiveMapping) === JSON.stringify(afterReviveMapping),
+    `${revived.measured}; session ${recipient?.sessionName ?? 'none'}; identity ${JSON.stringify(beforeLiveIdentity)} -> ${JSON.stringify(revivedIdentity)}; mapping ${JSON.stringify(beforeLiveMapping)} -> ${JSON.stringify(afterReviveMapping)}`,
+    'new UUID/PID in the same tab/session and byte-identical orchestration mapping',
+  );
+
+  const stale = recipient && revivedIdentity
+    ? await inst.observeFixtureAgent(wsA, recipient, { ...revivedIdentity, startTicks: revivedIdentity.startTicks + 1 })
+    : { ok: true, facts: {} };
+  check(
+    'target-stale-identity-rejected',
+    'a stale process-start identity is rejected even when the tab is otherwise live and bound',
+    !stale.ok && stale.facts.failedPredicates.includes('sameIdentity'),
+    JSON.stringify(stale),
+    'sameIdentity is the failed predicate',
+  );
+
+  const backgroundTab = await create(wsA, `target-background-${nonce}`);
+  let background = { rc: -1, observation: null };
+  if (backgroundTab) {
+    const backgroundId = crypto.randomUUID();
+    const script = path.join(inst.state.scratch, 'bin', `background-claude-${nonce}`);
+    fs.writeFileSync(script, [
+      '#!/bin/bash',
+      'd="$HOME/.claude/sessions"; mkdir -p "$d"',
+      'printf \'{"pid":%d,"sessionId":"%s","cwd":"%s","startedAt":%s}\\n\' "$$" "$1" "$PWD" "$(( $(date +%s%N) / 1000000 ))" > "$d/$$.json"',
+      'exec -a claude sleep 300',
+      '',
+    ].join('\n'));
+    fs.chmodSync(script, 0o755);
+    const launchedAfter = Date.now();
+    const command = `${shellQuote(script)} ${shellQuote(backgroundId)} </dev/null >/dev/null 2>&1 &`;
+    const launched = await inst.isolatedShellCommand(backgroundTab.sessionName, command);
+    const observation = launched.rc === 0
+      ? await pollObservation(FIXTURE_PROCESS_WAIT_MS, async () => {
+        const observed = await inst.observeFixtureAgent(wsA, backgroundTab, { sessionId: backgroundId, launchedAfter });
+        return { ...observed, ok: Boolean(observed.facts.record && observed.facts.process) };
+      })
+      : null;
+    background = { ...launched, observation };
+  }
+  check(
+    'target-background-rejected',
+    'a real background Claude-shaped process with a fresh session record is not accepted as foreground coordinator work',
+    background.rc === 0 && background.observation?.facts?.record && background.observation?.facts?.process
+      && background.observation.facts.foreground === false && background.observation.facts.failedPredicates.includes('foreground'),
+    JSON.stringify(background),
+    'the process and record exist, but foreground is false and rejected',
+  );
+  if (backgroundTab) await inst.cli(['tab', 'close', '-w', wsA, backgroundTab.tabId]);
+
+  const subsequent = await create(wsA, `target-subsequent-${nonce}`);
+  check(
+    'target-subsequent-create',
+    'after other fixture tabs are cleaned up, a legitimate agent tab can still be created',
+    Boolean(subsequent?.tabId),
+    JSON.stringify(subsequent ?? null),
+    'a new agent tab id',
+  );
+  if (subsequent) await inst.cli(['tab', 'close', '-w', wsA, subsequent.tabId]);
+
+  inst.persistFixtureObservation('targeted-summary', { results, fixtureAgents: Object.fromEntries(inst.fixtureAgents) });
+  return results;
+};
+
 const freePort = () =>
   new Promise((resolve) => {
     const server = http.createServer();
@@ -1134,16 +1480,19 @@ const freePort = () =>
   });
 
 const parseArgs = (argv) => {
-  const opts = { state: null, bashGuard: null, requireBashGuard: false, onlyWave: null };
+  const opts = { state: null, bashGuard: null, requireBashGuard: false, onlyWave: null, targetedFixture: false, evidenceDir: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--state') opts.state = argv[++i];
     // Debugging one wave against a kept instance; run.sh and the deploy gate never pass it.
     else if (argv[i] === '--only-wave') opts.onlyWave = Number(argv[++i]);
+    else if (argv[i] === '--targeted-fixture') opts.targetedFixture = true;
+    else if (argv[i] === '--evidence-dir') opts.evidenceDir = argv[++i];
     else if (argv[i] === '--bash-guard') opts.bashGuard = argv[++i];
     else if (argv[i] === '--require-bash-guard') opts.requireBashGuard = true;
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
-  if (!opts.state) throw new Error('usage: checks.cjs --state <state.json> [--bash-guard <path>] [--require-bash-guard]');
+  if (!opts.state) throw new Error('usage: checks.cjs --state <state.json> [--targeted-fixture] [--evidence-dir <path>] [--bash-guard <path>] [--require-bash-guard]');
+  if (opts.onlyWave !== null && opts.targetedFixture) throw new Error('--only-wave and --targeted-fixture are mutually exclusive');
   return opts;
 };
 
@@ -1164,12 +1513,15 @@ const main = async (argv) => {
     process.stderr.write(`REFUSED BASH-GUARD — ${opts.bashGuard} does not exist\n`);
     return 2;
   }
+  if (opts.evidenceDir) state.evidenceDir = path.resolve(opts.evidenceDir);
   const inst = new Instance(state);
   const helpers = { parseJson, within, sleep, brief, shellQuote, readIf, retainDesignatedFixture };
-  const waves = [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers)];
+  const waves = opts.targetedFixture
+    ? [() => targetedFixtureProof(inst)]
+    : [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers)];
   const results = [];
   for (const [i, wave] of waves.entries()) {
-    if (opts.onlyWave === null || opts.onlyWave === i + 1) results.push(...(await wave()));
+    if (opts.targetedFixture || opts.onlyWave === null || opts.onlyWave === i + 1) results.push(...(await wave()));
   }
   const { lines, pass } = summarize(results, opts);
   process.stdout.write(`${lines.join('\n')}\n`);
@@ -1178,7 +1530,8 @@ const main = async (argv) => {
 
 module.exports = {
   Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs,
-  retainDesignatedFixture, assessFixtureAgent, pollObservation, processIdentity, processDescendsFrom,
+  retainDesignatedFixture, assessFixtureAgent, assessShellControl, fixturePhysicalObservation,
+  pollObservation, processIdentity, processDescendsFrom, targetedFixtureProof,
 };
 
 if (require.main === module) {

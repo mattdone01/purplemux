@@ -143,6 +143,67 @@ describe('checks.cjs judgements', () => {
     expect(checks.assessFixtureAgent({ ...base, descendant: false }).ok).toBe(false);
   });
 
+  it('separates physical identity from the later status binding without weakening the final predicate', () => {
+    const observed = checks.assessFixtureAgent({
+      result: { rc: 0, out: '{}', err: '' },
+      status: { alive: true, command: 'bash', agentProviderId: null, agentSessionId: null },
+      panePid: 20,
+      pane: { pid: 20, state: 'S', ppid: 1, pgrp: 20, tpgid: 42, startTicks: 500, argv0: 'bash' },
+      record: { pid: 42, sessionId: 'session-live', startedAt: 1000 },
+      process: { pid: 42, state: 'S', ppid: 20, pgrp: 42, tpgid: 42, startTicks: 700, argv0: 'claude' },
+      expected: { sessionId: 'session-live', launchedAfter: 1000 },
+      descendant: true,
+    });
+    expect(observed.ok).toBe(false);
+    expect(observed.facts.failedPredicates).toEqual(expect.arrayContaining(['command', 'provider', 'bound']));
+    expect(checks.fixturePhysicalObservation(observed)).toMatchObject({
+      ok: true,
+      facts: { physicalFailedPredicates: [] },
+    });
+  });
+
+  it('requires a readable foreground shell before an isolated helper may submit input', () => {
+    const base = {
+      result: { rc: 0, out: 'bash\n', err: '' },
+      command: 'bash',
+      panePid: 20,
+      process: { pid: 20, state: 'S', ppid: 1, pgrp: 20, tpgid: 20, startTicks: 500, argv0: 'bash' },
+    };
+    expect(checks.assessShellControl(base)).toMatchObject({ ok: true, failedPredicates: [] });
+    expect(checks.assessShellControl({ ...base, command: 'claude' })).toMatchObject({ ok: false, failedPredicates: ['shellCommand'] });
+    expect(checks.assessShellControl({ ...base, process: { ...base.process, tpgid: 42 } })).toMatchObject({ ok: false, failedPredicates: ['foreground'] });
+  });
+
+  it('writes a terminal receipt when Ctrl-C ends the foreground fixture command', async () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-receipt-'));
+    const receipt = path.join(scratch, 'command.rc');
+    const inst = new checks.Instance({
+      scratch,
+      home: path.join(scratch, 'home'),
+      tmuxTmpdir: path.join(scratch, 'tmux'),
+      candidate: ROOT,
+      node: process.execPath,
+      workspaces: { a: 'ws-a', b: 'ws-b' },
+    });
+    const child = spawn(inst.fixtureCommandWrapper(), [receipt, 'sleep 300'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      process.kill(-child.pid!, 'SIGINT');
+      await new Promise((resolve) => child.once('exit', resolve));
+      expect(fs.readFileSync(receipt, 'utf8')).toBe('130\n');
+    } finally {
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it('returns the last observed facts when a bounded observation times out', async () => {
     const observations = [{ ok: false, seq: 1 }, { ok: false, seq: 2 }];
     const last = await checks.pollObservation(150, async () => observations.shift());
@@ -191,9 +252,16 @@ describe('checks.cjs judgements', () => {
       bashGuard: 'g.py',
       requireBashGuard: true,
       onlyWave: null,
+      targetedFixture: false,
+      evidenceDir: null,
     });
     // Debugging one wave against a kept instance (story 39); run.sh never passes it.
     expect(checks.parseArgs(['--state', 's.json', '--only-wave', '4']).onlyWave).toBe(4);
+    expect(checks.parseArgs(['--state', 's.json', '--targeted-fixture', '--evidence-dir', '/tmp/evidence'])).toMatchObject({
+      targetedFixture: true,
+      evidenceDir: '/tmp/evidence',
+    });
+    expect(() => checks.parseArgs(['--state', 's.json', '--only-wave', '4', '--targeted-fixture'])).toThrow(/mutually exclusive/);
     expect(() => checks.parseArgs([])).toThrow(/usage/);
     expect(() => checks.parseArgs(['--state', 's', '--nope'])).toThrow(/unknown argument/);
   });
