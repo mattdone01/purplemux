@@ -204,6 +204,35 @@ describe('checks.cjs judgements', () => {
     }
   });
 
+  it('reports incomplete prerequisite results as failures without throwing or converting them to success', () => {
+    expect(checks.completeResult({ rc: -1 }, 'prerequisite missing')).toEqual({
+      rc: -1,
+      out: '',
+      err: 'prerequisite missing',
+    });
+    expect(checks.brief({ rc: -1 })).toBe('exit -1, stderr: incomplete operation result');
+    const results = [{ status: 'fail', id: 'first' }];
+    checks.appendTargetedPrerequisiteFailures(results, ['second', 'third'], 'fresh binding failed');
+    expect(results).toEqual([
+      { status: 'fail', id: 'first' },
+      {
+        status: 'fail',
+        id: 'second',
+        what: 'targeted fixture prerequisite is complete before dependent operations run',
+        measured: 'fresh binding failed',
+        expected: 'all prior targeted fixture prerequisites pass',
+      },
+      {
+        status: 'fail',
+        id: 'third',
+        what: 'targeted fixture prerequisite is complete before dependent operations run',
+        measured: 'fresh binding failed',
+        expected: 'all prior targeted fixture prerequisites pass',
+      },
+    ]);
+    expect(results.every((result) => result.status === 'fail')).toBe(true);
+  });
+
   it('returns the last observed facts when a bounded observation times out', async () => {
     const observations = [{ ok: false, seq: 1 }, { ok: false, seq: 2 }];
     const last = await checks.pollObservation(150, async () => observations.shift());

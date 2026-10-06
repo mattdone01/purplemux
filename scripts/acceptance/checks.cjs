@@ -253,7 +253,7 @@ class Instance {
       stderrPath: `${base}.err`,
     };
     const invoke = terminalOutput
-      ? `: > ${shellQuote(operation.commandStartPath)}; ${shellQuote(this.fixtureCommandWrapper())} ${shellQuote(operation.receiptPath)} ${shellQuote(command)}`
+      ? `: > ${shellQuote(operation.commandStartPath)}; /bin/bash -c ${shellQuote(`exec -a claude /bin/bash ${shellQuote(this.fixtureCommandWrapper())} ${shellQuote(operation.receiptPath)} ${shellQuote(command)}`)}`
       : `: > ${shellQuote(operation.commandStartPath)}; ( ${command} ) > ${shellQuote(operation.stdoutPath)} 2> ${shellQuote(operation.stderrPath)}; rc=$?; printf '%s\\n' "$rc" > ${shellQuote(operation.receiptPath)}`;
     const sent = await this.keys(session, invoke, { clearPending: true });
     if (sent.rc !== 0) return { rc: -1, out: '', err: `isolated tmux send exited ${sent.rc}: ${sent.err.trim()}`, operation };
@@ -631,7 +631,17 @@ const parseJson = (text) => {
   }
 };
 
-const brief = (r) => `exit ${r.rc}${r.err.trim() ? `, stderr: ${r.err.trim().split('\n')[0].slice(0, 160)}` : ''}`;
+const completeResult = (result, fallback = 'incomplete operation result') => ({
+  ...(result && typeof result === 'object' ? result : {}),
+  rc: Number.isInteger(result?.rc) ? result.rc : -1,
+  out: typeof result?.out === 'string' ? result.out : '',
+  err: typeof result?.err === 'string' ? result.err : fallback,
+});
+
+const brief = (result) => {
+  const r = completeResult(result);
+  return `exit ${r.rc}${r.err.trim() ? `, stderr: ${r.err.trim().split('\n')[0].slice(0, 160)}` : ''}`;
+};
 
 /** Preserve the actual designated scratch coordinator while removing only the other fixture tabs. */
 const retainDesignatedFixture = async (inst, ws, candidates, { restore = null } = {}) => {
@@ -1299,6 +1309,28 @@ const suggestions = async (inst, { nonce, wsA, check, created }) => {
   if (t) await inst.cli(['tab', 'close', '-w', wsA, t.tabId]);
 };
 
+const TARGETED_FIXTURE_IDS = [
+  'target-fresh-bind',
+  'target-watchdog-note-once',
+  'target-live-retain',
+  'target-shell-control-rejected',
+  'target-stopped-revive',
+  'target-stale-identity-rejected',
+  'target-background-rejected',
+  'target-subsequent-create',
+];
+
+const appendTargetedPrerequisiteFailures = (results, ids, reason) => {
+  for (const id of ids) results.push({
+    status: 'fail',
+    id,
+    what: 'targeted fixture prerequisite is complete before dependent operations run',
+    measured: reason,
+    expected: 'all prior targeted fixture prerequisites pass',
+  });
+  return results;
+};
+
 /** Architect-bounded real-fixture proof for retained coordinator identity and safe shell submission. */
 const targetedFixtureProof = async (inst) => {
   const results = [];
@@ -1327,11 +1359,20 @@ const targetedFixtureProof = async (inst) => {
 
   const fresh = recipient
     ? await inst.startLiveFixtureAgent(wsA, recipient, { inputFile, phase: 'target-fresh' })
-    : { rc: -1, err: 'recipient not created' };
-  const senderStarted = sender ? await inst.startFixtureAgent(wsB, sender, { background: true }) : { rc: -1, err: 'sender not created' };
-  const workerStarted = worker ? await inst.startFixtureAgent(wsB, worker, { background: true }) : { rc: -1, err: 'worker not created' };
-  const designatedA = recipient ? await inst.designate(wsA, recipient.tabId) : { rc: -1 };
-  const designatedB = sender ? await inst.designate(wsB, sender.tabId) : { rc: -1 };
+    : completeResult(null, 'recipient not created');
+  const senderStarted = sender
+    ? await inst.startFixtureAgent(wsB, sender, { background: true })
+    : completeResult(null, 'sender not created');
+  const workerStarted = worker
+    ? await inst.startFixtureAgent(wsB, worker, { background: true })
+    : completeResult(null, 'worker not created');
+  const startsReady = fresh.rc === 0 && senderStarted.rc === 0 && workerStarted.rc === 0;
+  const designatedA = recipient && startsReady
+    ? await inst.designate(wsA, recipient.tabId)
+    : completeResult(null, 'fixture starts did not all pass');
+  const designatedB = sender && startsReady
+    ? await inst.designate(wsB, sender.tabId)
+    : completeResult(null, 'fixture starts did not all pass');
   const initialIdentity = recipient ? inst.fixtureAgents.get(recipient.tabId) : null;
   check(
     'target-fresh-bind',
@@ -1340,19 +1381,30 @@ const targetedFixtureProof = async (inst) => {
     `fresh ${brief(fresh)} identity ${JSON.stringify(initialIdentity ?? null)} evidence ${JSON.stringify(fresh.evidence ?? [])}`,
     'launch exit 0, a pinned identity, and no failed binding predicate',
   );
+  const prerequisitesReady = startsReady && designatedA.rc === 0 && designatedB.rc === 0 && Boolean(initialIdentity);
+  if (!prerequisitesReady) {
+    const reason = `fresh ${brief(fresh)}; sender ${brief(senderStarted)}; worker ${brief(workerStarted)}; designate A ${brief(designatedA)}; designate B ${brief(designatedB)}; identity ${JSON.stringify(initialIdentity ?? null)}`;
+    appendTargetedPrerequisiteFailures(results, TARGETED_FIXTURE_IDS.slice(1), reason);
+    inst.persistFixtureObservation('targeted-summary', { results, fixtureAgents: Object.fromEntries(inst.fixtureAgents), prerequisiteFailure: reason });
+    return results;
+  }
 
   const noteBefore = (await allNotes()).length;
   const noteCommand = inst.tabCli(['note', 'send', '--to-workspace', wsA, '--subject', `target ${nonce}`, '-f', bodyFile]);
-  const workerDenied = worker ? await inst.inTab(wsB, worker.tabId, noteCommand, { session: worker.sessionName }) : { rc: -1 };
-  const preloaded = sender ? await inst.preloadPendingInput(sender.sessionName, '[orchestrator-watchdog] sender is INACTIVE ') : { rc: -1 };
-  const sent = sender && fresh.rc === 0 && senderStarted.rc === 0 && workerStarted.rc === 0 && designatedA.rc === 0 && designatedB.rc === 0
+  const workerDenied = worker
+    ? await inst.inTab(wsB, worker.tabId, noteCommand, { session: worker.sessionName })
+    : completeResult(null, 'worker fixture missing');
+  const preloaded = sender
+    ? await inst.preloadPendingInput(sender.sessionName, '[orchestrator-watchdog] sender is INACTIVE ')
+    : completeResult(null, 'sender fixture missing');
+  const sent = sender
     ? await inst.inTab(wsB, sender.tabId, noteCommand, { session: sender.sessionName, timeoutMs: 30000 })
-    : { rc: -1, out: '', err: 'note prerequisites failed' };
+    : completeResult(null, 'sender fixture missing');
   const note = parseJson(sent.out)?.note ?? null;
   const delivered = note ? await within(180000, async () => (await allNotes()).find((entry) => entry.id === note.id && typeof entry.deliveredAt === 'number')) : null;
   const sourceAck = note && sender
     ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'ack', note.id]), { session: sender.sessionName })
-    : { rc: -1 };
+    : completeResult(null, 'note send did not return a note');
   const noteAfter = await allNotes();
   const input = readIf(inputFile) ?? '';
   const noticeCount = note?.id ? input.split(`[purplemux note ${note.id}]`).length - 1 : 0;
@@ -1470,6 +1522,37 @@ const targetedFixtureProof = async (inst) => {
   return results;
 };
 
+const notesOnly = async (inst) => {
+  const results = [];
+  const nonce = crypto.randomBytes(3).toString('hex');
+  const { a: wsA, b: wsB } = inst.state.workspaces;
+  const check = (id, what, ok, measured, expected) => results.push(ok
+    ? { status: 'pass', id, what }
+    : { status: 'fail', id, what, measured, expected });
+  const created = async (ws, name, type, extra = []) => parseJson((await inst.cli([
+    'tab', 'create', '-w', ws, '-n', name, '-t', type, ...extra,
+  ])).out);
+  await notes(inst, { nonce, wsA, wsB, check, created });
+  return results;
+};
+
+const targetedFixtureWithNotes = async (inst) => {
+  const targeted = await targetedFixtureProof(inst);
+  if (targeted.some((result) => result.status === 'fail')) {
+    return [
+      ...targeted,
+      {
+        status: 'fail',
+        id: 'notes-only-prerequisite',
+        what: 'notes-only proof starts only after all targeted fixture checks pass',
+        measured: 'one or more targeted fixture checks failed',
+        expected: 'all eight targeted fixture checks pass',
+      },
+    ];
+  }
+  return [...targeted, ...(await notesOnly(inst))];
+};
+
 const freePort = () =>
   new Promise((resolve) => {
     const server = http.createServer();
@@ -1517,7 +1600,7 @@ const main = async (argv) => {
   const inst = new Instance(state);
   const helpers = { parseJson, within, sleep, brief, shellQuote, readIf, retainDesignatedFixture };
   const waves = opts.targetedFixture
-    ? [() => targetedFixtureProof(inst)]
+    ? [() => targetedFixtureWithNotes(inst)]
     : [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers)];
   const results = [];
   for (const [i, wave] of waves.entries()) {
@@ -1531,7 +1614,8 @@ const main = async (argv) => {
 module.exports = {
   Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs,
   retainDesignatedFixture, assessFixtureAgent, assessShellControl, fixturePhysicalObservation,
-  pollObservation, processIdentity, processDescendsFrom, targetedFixtureProof,
+  pollObservation, processIdentity, processDescendsFrom, completeResult, brief,
+  appendTargetedPrerequisiteFailures, targetedFixtureProof, notesOnly, targetedFixtureWithNotes,
 };
 
 if (require.main === module) {
