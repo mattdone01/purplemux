@@ -43,6 +43,7 @@ describe.each(callerPaths)('%s managed Codex launches', (callerPath) => {
     const marker = between(source, 'const markAgentLaunch', 'const handleNewCodexSession');
     expect(marker).toContain('return fetch(');
     expect(marker).toContain('response.ok');
+    expect(marker).toContain("panelType: options?.panelType ?? 'claude-code'");
     const grok = between(source, 'const handleNewGrokSession', 'const handleNewClaudeFromSessionList');
     expect(grok.indexOf('await markAgentLaunch')).toBeLessThan(grok.indexOf('sendStdin('));
     expect(grok).toContain('connectedSessionRef.current !== sessionName');

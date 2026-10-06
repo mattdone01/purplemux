@@ -33,10 +33,14 @@ export const readOrchestrationWorkState = async (workspace: IWorkspace): Promise
     if (observed.state === 'present') liveBackgroundTabIds!.push(job.tabId);
     if (observed.state === 'unknown') backgroundWorkIncomplete = true;
   }
-  return workStateOf({ workspaceId: workspace.id, workspaceName: workspace.name,
+  const result = workStateOf({ workspaceId: workspace.id, workspaceName: workspace.name,
     orchestration: workspace.orchestration ?? null,
     epicLeases: leases.known ? leases.leases.filter((lease) => lease.name.startsWith('epic:') && lease.holder.workspaceId === workspace.id).map((lease) => lease.name) : null,
     standupState: standup.known ? standup.standup?.state ?? null : undefined,
     tabs, liveBackgroundTabIds, backgroundWorkIncomplete,
   });
+  if (layout && collectAllTabs(layout.root).some((tab) => tab.orchestrationActivity?.turn?.rawInput)) {
+    result.evidence.push('Unresolved terminal input: even arrows or Escape retain ownership until a matching accepted turn completes or a confirmed close/reap abandons it');
+  }
+  return result;
 };

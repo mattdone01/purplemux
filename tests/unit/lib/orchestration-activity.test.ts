@@ -1,23 +1,27 @@
 import fs from 'fs/promises';
+import { EventEmitter } from 'events';
+import type { IncomingMessage } from 'http';
+import type { WebSocket } from 'ws';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import type { ITab } from '@/types/terminal';
 
-const fixture = vi.hoisted(() => ({ home: '', now: 1000, send: vi.fn(), type: vi.fn(), submit: vi.fn(), reap: vi.fn(), session: vi.fn(), process: vi.fn() }));
+const fixture = vi.hoisted(() => ({ home: '', now: 1000, send: vi.fn(), type: vi.fn(), submit: vi.fn(), reap: vi.fn(), session: vi.fn(), process: vi.fn(), write: vi.fn() }));
 vi.mock('os', async (original) => {
   const actual = await original<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => fixture.home }, homedir: () => fixture.home };
 });
+vi.mock('node-pty', () => ({ spawn: () => ({ pid: 42, write: fixture.write, resize: vi.fn(), destroy: vi.fn(), onData: () => ({ dispose: vi.fn() }), onExit: () => ({ dispose: vi.fn() }) }) }));
 vi.mock('@/lib/tmux', async (original) => ({
   ...await original<typeof import('@/lib/tmux')>(),
-  hasSession: vi.fn(async () => true), isContentPendingInComposer: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'),
+  exitCopyMode: vi.fn(async () => undefined), hasSession: vi.fn(async () => true), isContentPendingInComposer: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'),
   sendKeys: fixture.send, sendTypedText: fixture.type, sendBracketedPasteText: fixture.type, submitComposer: fixture.submit,
   killSession: fixture.reap, observeSessionStrict: fixture.session,
 }));
 vi.mock('@/lib/process-utils', async (original) => ({ ...await original<typeof import('@/lib/process-utils')>(), observeProviderProcess: fixture.process }));
-vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ isOrchestrationLaunchPending: () => false, isWaitingAtPrompt: () => true, getAllForClient: () => ({ 'tab-old': { workspaceId: 'ws-a', cliState: 'idle' } }) }) }));
+vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ isOrchestrationLaunchPending: () => false, isWaitingAtPrompt: () => true, markAgentLaunch: vi.fn(), getAllForClient: () => ({ 'tab-old': { workspaceId: 'ws-a', cliState: 'idle' } }) }) }));
 vi.mock('@/lib/lease-store', () => ({ readLeaseEvidence: vi.fn(async () => ({ known: true, leases: [] })) }));
 vi.mock('@/lib/standup-store', () => ({ readLatestStandupEvidence: vi.fn(async () => ({ known: true, standup: { state: 'done' } })) }));
 vi.mock('@/lib/liveness-store', () => ({ readLivenessEvidence: vi.fn(async () => ({ known: true, data: { jobs: [] } })) }));
@@ -48,9 +52,10 @@ beforeEach(async () => {
   fixture.process.mockResolvedValue({ state: 'present', identity: 'provider:123:456' });
   layout = await import('@/lib/layout-store'); activity = await import('@/lib/orchestration-activity');
   recovery = await import('@/lib/orchestration-recovery');
+  vi.spyOn(await import('@/lib/human-mutation'), 'authorizeHumanMutation').mockResolvedValue(true);
   vi.spyOn(await import('@/lib/cli-utils'), 'authorizeWorkspaceInput').mockResolvedValue({ type: 'workspace', workspaceId: 'ws-a' });
 });
-afterEach(async () => { vi.restoreAllMocks(); await fs.rm(fixture.home, { recursive: true, force: true }); });
+afterEach(async () => { for (const socket of sockets.splice(0)) socket.emit('close'); vi.unstubAllGlobals(); vi.restoreAllMocks(); await fs.rm(fixture.home, { recursive: true, force: true }); });
 
 describe('persisted pending lifecycle evidence through real layout and recovery services', () => {
   it('queues restart only after durable launch intent; shell absence cannot permit recovery after module reload', async () => {
@@ -81,11 +86,11 @@ describe('persisted pending lifecycle evidence through real layout and recovery 
     release.resolve(); await delivery; await denied;
     expect(response.status).toHaveBeenCalledWith(200);
   });
-  it('distinguishes input never submitted from uncertain terminal submission', async () => {
+  it('persists before any prompt bytes and retains uncertain text or Enter delivery', async () => {
     const { deliverPrompt } = await import('@/lib/agent-prompt-delivery');
     fixture.type.mockRejectedValueOnce(new Error('text failed'));
     await expect(deliverPrompt(SESSION, 'work')).rejects.toThrow('text failed');
-    expect((await readTab()).orchestrationActivity).toBeUndefined(); expect(fixture.submit).not.toHaveBeenCalled();
+    expect((await readTab()).orchestrationActivity?.turn).toBeDefined(); expect(fixture.submit).not.toHaveBeenCalled();
     fixture.submit.mockRejectedValueOnce(new Error('transport failed after write'));
     await expect(deliverPrompt(SESSION, 'work')).rejects.toThrow('transport failed after write');
     expect((await readTab()).orchestrationActivity?.turn).toBeDefined();
@@ -175,5 +180,135 @@ describe('persisted pending lifecycle evidence through real layout and recovery 
     const restart = layout.restartTabSession('ws-a', 'pane-a', 'tab-old', 'claude');
     release.resolve(); expect(await closing).toMatchObject({ ok: true }); expect(await restart).toBe(false);
     expect(fixture.send).not.toHaveBeenCalled();
+  });
+});
+
+const sockets: EventEmitter[] = [];
+const connectRaw = async () => {
+  const socket = Object.assign(new EventEmitter(), { readyState: 1, bufferedAmount: 0, send: vi.fn(), close: vi.fn() });
+  sockets.push(socket);
+  const { handleConnection } = await import('@/lib/terminal-server');
+  await handleConnection(socket as unknown as WebSocket, { url: '/api/terminal' } as IncomingMessage, SESSION);
+  return socket;
+};
+const emitRaw = (socket: EventEmitter, data: string, type = 0) => socket.emit('message', Buffer.concat([Buffer.from([type]), Buffer.from(data)]));
+const response = () => ({ status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis(), end: vi.fn().mockReturnThis(), setHeader: vi.fn() });
+
+describe('real non-Codex browser launch preparation', () => {
+  it.each(['terminal', 'agent-sessions'] as const)('atomically prepares Claude while the optimistic %s PATCH has not reached the server', async (panelType) => {
+    await layout.patchTab('ws-a', 'pane-a', 'tab-old', { panelType });
+    const { claudeProvider } = await import('@/lib/providers/claude');
+    vi.spyOn(claudeProvider, 'buildLaunchCommand').mockResolvedValue('claude');
+    vi.spyOn(await import('@/lib/agent-availability'), 'checkAgentAvailabilityForPanelType').mockResolvedValue({ ok: true, provider: null });
+    const { default: launch } = await import('@/pages/api/claude/launch-command');
+    const res = response();
+    await launch({ method: 'POST', headers: {}, body: { workspaceId: 'ws-a', tabId: 'tab-old' } } as NextApiRequest, res as unknown as NextApiResponse);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(await readTab()).toMatchObject({ panelType: 'claude-code', orchestrationActivity: { launch: { at: 1000 } } });
+    vi.resetModules(); // No in-memory status marker survives this restart.
+    expect(await (await import('@/lib/orchestration-runtime')).observeOrchestrationRuntime(await readTab())).toMatchObject({ state: 'unknown' });
+    await expect(recovery.changeOrchestration('ws-a', { enabled: false }, options)).rejects.toMatchObject({ code: 'orchestration-work-remains' });
+  });
+  it('Grok launch preparation survives an actual failed optimistic PATCH and refuses a failed atomic launch write', async () => {
+    await layout.patchTab('ws-a', 'pane-a', 'tab-old', { panelType: 'agent-sessions' });
+    const { default: patch } = await import('@/pages/api/layout/pane/[paneId]/tabs/[tabId]');
+    const write = vi.spyOn(fs, 'writeFile').mockRejectedValueOnce(new Error('PATCH failed'));
+    await expect(patch({ method: 'PATCH', query: { workspace: 'ws-a', paneId: 'pane-a', tabId: 'tab-old' }, body: { panelType: 'grok-cli' } } as unknown as NextApiRequest, response() as unknown as NextApiResponse)).rejects.toThrow('PATCH failed');
+    write.mockRestore();
+    const { default: launch } = await import('@/pages/api/status/agent-launch');
+    const req = { method: 'POST', body: { tabId: 'tab-old', panelType: 'grok-cli' } } as NextApiRequest;
+    const res = response();
+    await launch(req, res as unknown as NextApiResponse);
+    expect(res.status).toHaveBeenCalledWith(204);
+    expect(await readTab()).toMatchObject({ panelType: 'grok-cli', orchestrationActivity: { launch: { at: 1000 } } });
+    vi.spyOn(fs, 'writeFile').mockRejectedValueOnce(new Error('launch write failed'));
+    const refused = response();
+    await expect(launch(req, refused as unknown as NextApiResponse)).rejects.toThrow('launch write failed');
+    expect(refused.status).not.toHaveBeenCalledWith(204);
+  });
+});
+
+describe('actual authenticated app send and raw WebSocket paths', () => {
+  it.each(['prompt', 'attachment-only'] as const)('app %s persists before bytes/Enter and blocks a queued off writer', async (kind) => {
+    const { default: send } = await import('@/pages/api/tabs/[tabId]/send');
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      const parsed = new URL(url, 'http://localhost');
+      const res = response();
+      await send({ method: 'POST', query: { workspaceId: parsed.searchParams.get('workspaceId'), tabId: 'tab-old' }, body: JSON.parse(init.body as string) } as unknown as NextApiRequest, res as unknown as NextApiResponse);
+      return { ok: res.status.mock.calls.at(-1)?.[0] === 200, status: res.status.mock.calls.at(-1)?.[0] };
+    }));
+    const { sendWebPrompt } = await import('@/lib/web-prompt-client');
+    const target = { workspaceId: 'ws-a', tabId: 'tab-old', sessionName: SESSION };
+    if (kind === 'attachment-only') {
+      await sendWebPrompt(target, '/tmp/image.png', { submit: false, literalPaste: true });
+      expect((await readTab()).orchestrationActivity?.turn?.rawInput).toBe(true);
+    }
+    const entered = deferred(); const release = deferred();
+    fixture.type.mockImplementation(async () => { expect((await readTab()).orchestrationActivity?.turn).toBeDefined(); });
+    fixture.submit.mockImplementation(async () => { entered.resolve(); await release.promise; });
+    const sending = sendWebPrompt(target, kind === 'prompt' ? 'new work' : '');
+    await Promise.race([entered.promise, sending.then(() => { throw new Error('app send did not reach submission'); })]);
+    const off = expect(recovery.changeOrchestration('ws-a', { enabled: false }, options)).rejects.toMatchObject({ code: 'orchestration-work-remains' });
+    release.resolve(); await sending; await off;
+  });
+  it('raw frames retain order, coalesce durable writes, and prevent queued off against stale done', async () => {
+    const socket = await connectRaw();
+    const entered = deferred(); const release = deferred();
+    const original = fs.writeFile.bind(fs);
+    const writes = vi.spyOn(fs, 'writeFile').mockImplementationOnce(async (...args) => { entered.resolve(); await release.promise; return original(...args); });
+    const forwarded: string[] = [];
+    const all = deferred(); fixture.write.mockImplementation((data: string) => { forwarded.push(data); if (forwarded.length === 3) all.resolve(); });
+    emitRaw(socket, 'a'); await entered.promise;
+    const off = expect(recovery.changeOrchestration('ws-a', { enabled: false }, options)).rejects.toMatchObject({ code: 'orchestration-work-remains' });
+    emitRaw(socket, '\x1b[A', 5); emitRaw(socket, '\r');
+    expect(forwarded).toEqual([]); release.resolve(); await all.promise; await off;
+    expect(forwarded).toEqual(['a', '\x1b[A', '\r']);
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect((await readTab()).orchestrationActivity?.turn).toMatchObject({ rawInput: true });
+  });
+  it('a previous in-flight stop cannot clear later raw input; only its own accepted chain can', async () => {
+    fixture.session.mockResolvedValue({ state: 'present', panePid: 42, identity: 'session:42' });
+    await activity.recordOrchestrationSubmission(SESSION);
+    await activity.acknowledgeOrchestrationActivity('ws-a', 'tab-old', SESSION, 'prompt-submit', 1001);
+    const socket = await connectRaw(); const forwarded = deferred(); fixture.write.mockImplementation(() => forwarded.resolve());
+    fixture.now = 2000; emitRaw(socket, '\x1b'); await forwarded.promise;
+    await activity.acknowledgeOrchestrationActivity('ws-a', 'tab-old', SESSION, 'stop', 2001);
+    expect((await readTab()).orchestrationActivity?.turn).toMatchObject({ rawInput: true });
+    await activity.acknowledgeOrchestrationActivity('ws-a', 'tab-old', SESSION, 'prompt-submit', 2002);
+    await activity.acknowledgeOrchestrationActivity('ws-a', 'tab-old', SESSION, 'interrupt', 2003);
+    expect((await readTab()).orchestrationActivity?.turn).toBeUndefined();
+  });
+  it('new raw input during delayed prompt acknowledgment cannot coalesce into the old accepted turn', async () => {
+    fixture.session.mockResolvedValue({ state: 'present', panePid: 42, identity: 'session:42' });
+    const socket = await connectRaw();
+    let forwarded = deferred(); fixture.write.mockImplementation(() => forwarded.resolve());
+    emitRaw(socket, 'first'); await forwarded.promise;
+    const old = (await readTab()).orchestrationActivity!.turn!.generation;
+    const entered = deferred(); const release = deferred();
+    fixture.process.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return { state: 'present', identity: 'provider:123:456' }; });
+    const accepted = activity.acknowledgeOrchestrationActivity('ws-a', 'tab-old', SESSION, 'prompt-submit', 1001);
+    await entered.promise;
+    fixture.now = 2000; forwarded = deferred(); emitRaw(socket, 'new input'); await forwarded.promise;
+    expect((await readTab()).orchestrationActivity!.turn!.generation).not.toBe(old);
+    release.resolve(); await accepted;
+    await activity.acknowledgeOrchestrationActivity('ws-a', 'tab-old', SESSION, 'stop', 2001);
+    expect((await readTab()).orchestrationActivity?.turn).toMatchObject({ rawInput: true, at: 2000 });
+  });
+  it('raw persistence refusal sends a visible protocol error and forwards no bytes', async () => {
+    const socket = await connectRaw(); const error = deferred(); socket.send.mockImplementation(() => error.resolve());
+    vi.spyOn(fs, 'writeFile').mockRejectedValueOnce(new Error('disk full'));
+    emitRaw(socket, 'work\r'); await error.promise;
+    expect(fixture.write).not.toHaveBeenCalled();
+    expect(socket.send.mock.calls[0][0][0]).toBe(6);
+    expect(new TextDecoder().decode(socket.send.mock.calls[0][0].slice(1))).toContain('not confirmed');
+  });
+  it('ordinary nonagent terminal bytes are unchanged; resize and heartbeat do not record activity', async () => {
+    await layout.patchTab('ws-a', 'pane-a', 'tab-old', { panelType: 'terminal' });
+    const socket = await connectRaw(); const forwarded = deferred(); fixture.write.mockImplementation(() => forwarded.resolve());
+    const writes = vi.spyOn(fs, 'writeFile');
+    socket.emit('message', Buffer.from([2, 0, 80, 0, 24])); socket.emit('message', Buffer.from([3]));
+    emitRaw(socket, '\x1b[Aecho hi\r'); await forwarded.promise;
+    expect(fixture.write).toHaveBeenCalledWith('\x1b[Aecho hi\r');
+    expect(writes).not.toHaveBeenCalled(); expect((await readTab()).orchestrationActivity).toBeUndefined();
   });
 });

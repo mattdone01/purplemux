@@ -1,3 +1,4 @@
+import { sendWebPrompt } from '@/lib/web-prompt-client';
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import { toast } from 'sonner';
 import { t } from '@/lib/i18n';
@@ -44,7 +45,7 @@ interface IUseWebInputReturn {
   setValue: (v: string) => void;
   mode: TWebInputMode;
   canSend: boolean;
-  send: () => void;
+  send: () => Promise<void>;
   interrupt: () => void;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   focusInput: () => void;
@@ -55,7 +56,8 @@ interface IUseWebInputOptions {
   onRestartSession?: () => void;
   onMessageSent?: (message: string) => void;
   disabledMessage?: string;
-  submitDelayMs?: number;
+  workspaceId?: string;
+  sessionName?: string;
 }
 
 const useWebInput = (
@@ -75,7 +77,9 @@ const useWebInput = (
 
   const onRestartSession = options?.onRestartSession;
   const onMessageSent = options?.onMessageSent;
-  const submitDelayMs = options?.submitDelayMs ?? 250;
+  const workspaceId = options?.workspaceId;
+  const sessionName = options?.sessionName;
+  const submitting = useRef(false);
 
   const draftTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
   useEffect(() => {
@@ -87,7 +91,8 @@ const useWebInput = (
     };
   }, [tabId, value]);
 
-  const send = useCallback(() => {
+  const send = useCallback(async () => {
+    if (submitting.current) return;
     if (mode === 'disabled') {
       toast.error(options?.disabledMessage ?? t('terminal', 'inputDisabledPlaceholder'));
       return;
@@ -107,20 +112,18 @@ const useWebInput = (
       return;
     }
 
-    if (value.includes('\n')) {
-      sendStdin(`\x1b[200~${value}\x1b[201~`);
-    } else {
-      sendStdin(value);
+    submitting.current = true;
+    try {
+      await sendWebPrompt({ workspaceId, tabId, sessionName }, value);
+      if (!value.trim().startsWith('/')) onMessageSent?.(value.trim());
+      setValue('');
+      if (tabId) clearDraft(tabId);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Prompt delivery failed');
+    } finally {
+      submitting.current = false;
     }
-    setTimeout(() => sendStdin('\r'), submitDelayMs);
-
-    if (!value.trim().startsWith('/')) {
-      onMessageSent?.(value.trim());
-    }
-
-    setValue('');
-    if (tabId) clearDraft(tabId);
-  }, [mode, value, sendStdin, terminalWsConnected, onRestartSession, onMessageSent, tabId, options?.disabledMessage, submitDelayMs]);
+  }, [mode, value, terminalWsConnected, onRestartSession, onMessageSent, tabId, workspaceId, sessionName, options?.disabledMessage]);
 
   const interrupt = useCallback(() => {
     if (!terminalWsConnected) {

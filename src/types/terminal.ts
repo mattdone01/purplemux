@@ -87,7 +87,7 @@ export interface IOrchestrationActivity {
   sessionName: string;
   runtimeGeneration: string;
   launch?: { at: number; priorIdentity?: string; priorUnknown?: boolean };
-  turn?: { generation: string; runtimeGeneration: string; at: number; runningAt?: number; runningIdentity?: string };
+  turn?: { generation: string; runtimeGeneration: string; at: number; rawInput?: boolean; rawEpoch?: number; runningAt?: number; runningIdentity?: string };
 }
 
 export interface ITab {

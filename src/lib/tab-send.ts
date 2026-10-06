@@ -65,6 +65,9 @@ export interface ITabSendRequest {
   tabId: string;
   content: string;
   submit: boolean;
+  submitOnly?: boolean;
+  literalPaste?: boolean;
+  expectedSessionName?: string;
 }
 
 export type TTabSendParseResult =
@@ -83,13 +86,19 @@ export const parseSendRequest = (
   if (!tabId || !workspaceId) return { ok: false, error: 'bad-request' };
 
   if (typeof body !== 'object' || body === null) return { ok: false, error: 'bad-request' };
-  const { content, submit } = body as { content?: unknown; submit?: unknown };
+  const { content, submit, submitOnly, literalPaste, expectedSessionName } = body as { content?: unknown; submit?: unknown; submitOnly?: unknown; literalPaste?: unknown; expectedSessionName?: unknown };
 
-  if (typeof content !== 'string' || content.trim() === '') return { ok: false, error: 'bad-request' };
+  if (typeof content !== 'string' || content.trim() === '' && submitOnly !== true) return { ok: false, error: 'bad-request' };
   if (Buffer.byteLength(content, 'utf-8') > MAX_SEND_CONTENT_BYTES) return { ok: false, error: 'bad-request' };
   if (submit !== undefined && typeof submit !== 'boolean') return { ok: false, error: 'bad-request' };
 
-  return { ok: true, request: { workspaceId, tabId, content, submit: submit ?? true } };
+  if (submitOnly !== undefined && typeof submitOnly !== 'boolean' || literalPaste !== undefined && typeof literalPaste !== 'boolean') return { ok: false, error: 'bad-request' };
+  if (submitOnly && (content !== '' || submit === false) || literalPaste && submit !== false) return { ok: false, error: 'bad-request' };
+  if (expectedSessionName !== undefined && (typeof expectedSessionName !== 'string' || !expectedSessionName)) return { ok: false, error: 'bad-request' };
+  return { ok: true, request: { workspaceId, tabId, content, submit: submit ?? true,
+    ...(submitOnly ? { submitOnly: true } : {}), ...(literalPaste ? { literalPaste: true } : {}),
+    ...(typeof expectedSessionName === 'string' ? { expectedSessionName } : {}),
+  } };
 };
 
 export interface ITabSendTarget {

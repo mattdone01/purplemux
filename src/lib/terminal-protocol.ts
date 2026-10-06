@@ -4,9 +4,15 @@ export const MSG_RESIZE = 0x02;
 export const MSG_HEARTBEAT = 0x03;
 export const MSG_KILL_SESSION = 0x04;
 export const MSG_WEB_STDIN = 0x05;
+export const MSG_INPUT_ERROR = 0x06;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+export const encodeInputError = (message: string): Uint8Array => {
+  const payload = encoder.encode(message);
+  return new Uint8Array([MSG_INPUT_ERROR, ...payload]);
+};
 
 export const encodeStdout = (data: string): Uint8Array => {
   const payload = encoder.encode(data);

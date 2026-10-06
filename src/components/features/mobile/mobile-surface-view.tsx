@@ -531,11 +531,11 @@ const MobileSurfaceView = ({
     await submitCodexBrowserLaunch(intent);
   }, [agentProcess, sendStdin]);
 
-  const markAgentLaunch = useCallback(async (tabId: string, options?: { resetAgentSession?: boolean }) => {
+  const markAgentLaunch = useCallback(async (tabId: string, options?: { resetAgentSession?: boolean; panelType?: 'claude-code' | 'grok-cli' }) => {
     return fetch('/api/status/agent-launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tabId, resetAgentSession: options?.resetAgentSession === true }),
+      body: JSON.stringify({ tabId, resetAgentSession: options?.resetAgentSession === true, panelType: options?.panelType ?? 'claude-code' }),
     }).then((response) => response.ok).catch(() => false);
   }, []);
 
@@ -561,7 +561,7 @@ const MobileSurfaceView = ({
       return;
     }
     const sessionName = connectedSessionRef.current;
-    if (!await markAgentLaunch(activeTabId, { resetAgentSession: true })) return;
+    if (!await markAgentLaunch(activeTabId, { resetAgentSession: true, panelType: 'grok-cli' })) return;
     if (activeTabIdRef.current !== activeTabId || connectedSessionRef.current !== sessionName) return;
     useTabStore.getState().setSessionView(activeTabId, 'timeline');
     sendStdin(`${command}\r`);

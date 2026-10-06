@@ -65,7 +65,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             lastUserMessage: null,
           });
         }
-        await recordOrchestrationLaunch(launchPolicy.workspaceId, launchPolicy.tabId, launchPolicy.sessionName);
+        await recordOrchestrationLaunch(launchPolicy.workspaceId, launchPolicy.tabId, launchPolicy.sessionName, 'claude-code');
         getStatusManager().markAgentLaunch(launchPolicy.tabId, { resumeSessionId: resumeSessionId ?? undefined });
       });
     }

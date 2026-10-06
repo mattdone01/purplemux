@@ -1,3 +1,4 @@
+import { withRecordedTerminalInput } from '@/lib/terminal-input';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { hasSession, sendRawKeys } from '@/lib/tmux';
@@ -24,7 +25,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   try {
-    await sendRawKeys(session, input);
+    await withRecordedTerminalInput(session, input, () => sendRawKeys(session, input));
     return res.status(200).json({ ok: true });
   } catch (err) {
     log.error(`send-input failed: ${err instanceof Error ? err.message : err}`);

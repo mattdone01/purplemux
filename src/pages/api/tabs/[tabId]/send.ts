@@ -1,10 +1,12 @@
+import { withCodexTargetLock } from '@/lib/providers/codex/launch-lifecycle';
 import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { findTab } from '@/lib/cli-utils';
 import { getStatusManager } from '@/lib/status-manager';
 import { parseSendRequest, performTabSend, resolveTabCliState } from '@/lib/tab-send';
-import { hasSession, isContentPendingInComposer } from '@/lib/tmux';
+import { recordOrchestrationSubmission } from '@/lib/orchestration-activity';
+import { hasSession, isContentPendingInComposer, sendBracketedPasteText } from '@/lib/tmux';
 import { deliverPrompt, deliverPromptText } from '@/lib/agent-prompt-delivery';
 
 /**
@@ -29,11 +31,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const parsed = parseSendRequest(req.query, req.body);
   if (!parsed.ok) return res.status(400).json({ error: parsed.error });
 
-  const result = await withOrchestrationMappingRead(parsed.request.workspaceId, () => performTabSend(
+  const result = await withOrchestrationMappingRead(parsed.request.workspaceId, () => withCodexTargetLock(parsed.request.workspaceId, parsed.request.tabId, () => performTabSend(
     {
       findTarget: async (workspaceId, tabId) => {
         const found = await findTab(workspaceId, tabId);
-        if (!found) return null;
+        if (!found || parsed.request.expectedSessionName && found.tab.sessionName !== parsed.request.expectedSessionName) return null;
         return {
           sessionName: found.tab.sessionName,
           panelType: found.tab.panelType,
@@ -42,11 +44,15 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       },
       hasSession,
       paste: deliverPrompt,
-      pasteWithoutSubmit: deliverPromptText,
+      pasteWithoutSubmit: async (sessionName, content) => {
+        await recordOrchestrationSubmission(sessionName, true);
+        if (parsed.request.literalPaste) await sendBracketedPasteText(sessionName, content);
+        else await deliverPromptText(sessionName, content);
+      },
       isContentPendingInComposer,
     },
     parsed.request,
-  ));
+  )));
 
   return res.status(result.status).json(result.body);
 };

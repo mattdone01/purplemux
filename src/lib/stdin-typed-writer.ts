@@ -15,7 +15,7 @@ const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTim
  * arrives while the replay runs queues behind it, so the Enter a client sends
  * 100 ms after its paste cannot overtake the text it submits.
  */
-export const createStdinTypedWriter = (deps: IStdinTypedWriterDeps): ((data: string) => void) => {
+export const createStdinTypedWriter = (deps: IStdinTypedWriterDeps): ((data: string) => Promise<void>) => {
   const sleep = deps.sleep ?? realSleep;
   let tail: Promise<void> = Promise.resolve();
   let queued = 0;
@@ -34,17 +34,14 @@ export const createStdinTypedWriter = (deps: IStdinTypedWriterDeps): ((data: str
     if (paste.after) await replay(paste.after);
   };
 
-  return (data: string): void => {
+  return (data: string): Promise<void> => {
     if (queued === 0 && !splitBracketedPaste(data)) {
       deps.write(data);
-      return;
+      return Promise.resolve();
     }
     queued += 1;
-    tail = tail
-      .then(() => replay(data))
-      .catch(() => {})
-      .finally(() => {
-        queued -= 1;
-      });
+    const next = tail.then(() => replay(data));
+    tail = next.catch(() => {}).finally(() => { queued -= 1; });
+    return next;
   };
 };

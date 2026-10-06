@@ -12,18 +12,21 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { tabId, resetAgentSession } = req.body as { tabId?: string; resetAgentSession?: boolean };
+  const { tabId, resetAgentSession, panelType } = req.body as { tabId?: string; resetAgentSession?: boolean; panelType?: string };
   if (!tabId) {
     return res.status(400).json({ error: 'tabId is required' });
   }
 
+  if (panelType !== 'claude-code' && panelType !== 'grok-cli') {
+    return res.status(400).json({ error: 'An explicit non-Codex agent type is required' });
+  }
   const manager = getStatusManager();
   const workspaceId = manager.getAllForClient()[tabId]?.workspaceId;
   if (!workspaceId) return res.status(404).json({ error: 'Tab not found' });
   await withOrchestrationMappingRead(workspaceId, async () => {
     const found = await findTab(workspaceId, tabId);
     if (!found) throw new Error('Launch target disappeared');
-    await recordOrchestrationLaunch(workspaceId, tabId, found.tab.sessionName);
+    await recordOrchestrationLaunch(workspaceId, tabId, found.tab.sessionName, panelType);
     manager.markAgentLaunch(tabId, { resetAgentSession: resetAgentSession === true });
   });
   return res.status(204).end();

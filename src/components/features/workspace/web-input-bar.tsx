@@ -1,3 +1,4 @@
+import { sendWebPrompt } from '@/lib/web-prompt-client';
 import { useCallback, useEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent } from 'react';
 import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
@@ -86,7 +87,7 @@ const WebInputBar = ({
   const inactiveMessage = provider === 'codex'
     ? t('codexInactiveMessage')
     : provider === 'grok' ? t('grokInactiveMessage') : t('inputDisabledPlaceholder');
-  const submitDelayMs = 250;
+
   const handleMessageSent = useCallback(
     (message: string) => {
       addHistory(message);
@@ -103,7 +104,8 @@ const WebInputBar = ({
       onRestartSession,
       onMessageSent: handleMessageSent,
       disabledMessage: inactiveMessage,
-      submitDelayMs,
+      workspaceId: wsId,
+      sessionName,
     },
   );
 
@@ -175,7 +177,7 @@ const WebInputBar = ({
     if (!hasAttach) {
       onSend?.();
       if (agentSessionId) registerPushTarget(agentSessionId);
-      send();
+      await send();
       return;
     }
 
@@ -221,7 +223,7 @@ const WebInputBar = ({
 
       let allConfirmed = true;
       for (const att of sentAttachments) {
-        sendStdin(`\x1b[200~${escapePathForPrompt(att.path)}\x1b[201~`);
+        await sendWebPrompt({ workspaceId: wsId, tabId, sessionName }, escapePathForPrompt(att.path), { submit: false, literalPaste: true });
         if (!shouldConfirmImageRefs) {
           await new Promise((r) => setTimeout(r, 400));
           continue;
@@ -246,20 +248,14 @@ const WebInputBar = ({
         return;
       }
 
-      if (hasText) {
-        const payload = ` ${text}`;
-        sendStdin(`\x1b[200~${payload}\x1b[201~`);
-        setTimeout(() => sendStdin('\r'), submitDelayMs);
-      } else {
-        sendStdin('\r');
-      }
+      await sendWebPrompt({ workspaceId: wsId, tabId, sessionName }, hasText ? ` ${text}` : '');
     } catch (err) {
       if (pendingId) onRemovePendingMessage?.(pendingId);
-      throw err;
+      toast.error(err instanceof Error ? err.message : 'Prompt delivery failed');
     } finally {
       setIsDispatching(false);
     }
-  }, [canSend, isDispatching, value, attachments, send, sendStdin, setValue, onSend, agentSessionId, sessionName, tabId, addHistory, onAddPendingMessage, onRemovePendingMessage, t, submitDelayMs, isTuiAgent]);
+  }, [canSend, isDispatching, value, attachments, send, setValue, onSend, agentSessionId, sessionName, tabId, wsId, addHistory, onAddPendingMessage, onRemovePendingMessage, t, isTuiAgent]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;

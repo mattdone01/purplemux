@@ -10,7 +10,8 @@ import {
 } from './tmux';
 import { buildShellEnv } from '@/lib/shell-env';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
-import { encodeStdout } from '@/lib/terminal-protocol';
+import { withRecordedTerminalInput } from '@/lib/terminal-input';
+import { encodeStdout, encodeInputError } from '@/lib/terminal-protocol';
 import { reconcileTabCwd } from '@/lib/layout-store';
 import { createLogger } from '@/lib/logger';
 import { sessionUsesTypedDelivery } from '@/lib/agent-prompt-delivery';
@@ -253,7 +254,7 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
   let conn: IActiveConnection | null = null;
   let lastHeartbeat = Date.now();
   let sessionName = '';
-  let webStdinQueue = Promise.resolve();
+  let inputQueue = Promise.resolve();
   const writeStdin = createStdinTypedWriter({
     write: (data) => { ptyProcess?.write(data); },
     usesTyped: () => sessionUsesTypedDelivery(sessionName),
@@ -282,16 +283,19 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
     }
 
     switch (msg.type) {
-      case MSG_STDIN: {
-        writeStdin(textDecoder.decode(msg.payload));
-        break;
-      }
+      case MSG_STDIN:
       case MSG_WEB_STDIN: {
         const data = textDecoder.decode(msg.payload);
-        webStdinQueue = webStdinQueue
-          .then(() => exitCopyMode(sessionName))
-          .catch(() => {})
-          .then(() => { writeStdin(data); });
+        if (!data) break;
+        const prior = inputQueue;
+        inputQueue = withRecordedTerminalInput(sessionName, data, async () => {
+          if (conn?.cleaned || ws.readyState !== WebSocket.OPEN) return;
+          if (msg.type === MSG_WEB_STDIN) await exitCopyMode(sessionName);
+          await writeStdin(data);
+        }, prior).catch((err) => {
+          log.warn({ err, sessionName }, 'terminal input refused or delivery uncertain');
+          if (ws.readyState === WebSocket.OPEN) ws.send(encodeInputError('Terminal input was not confirmed. Pending activity is retained; check the terminal before retrying.'));
+        });
         break;
       }
       case MSG_RESIZE: {

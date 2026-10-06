@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import { nanoid } from 'nanoid';
 import type { TConnectionStatus, TDisconnectReason } from '@/types/terminal';
 import {
   MSG_STDOUT,
+  MSG_INPUT_ERROR,
   MSG_HEARTBEAT,
   encodeStdin,
   encodeWebStdin,
@@ -113,6 +115,9 @@ const useTerminalWebSocket = ({
         switch (type) {
           case MSG_STDOUT:
             callbacksRef.current.onData?.(payload);
+            break;
+          case MSG_INPUT_ERROR:
+            toast.error(new TextDecoder().decode(payload));
             break;
           case MSG_HEARTBEAT:
             break;

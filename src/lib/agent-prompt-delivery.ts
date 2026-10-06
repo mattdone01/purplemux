@@ -51,7 +51,7 @@ export const deliverPrompt = async (
   content: string,
   deps: IPromptDeliveryDeps = defaultDeps,
 ): Promise<void> => {
-  await deliverPromptText(sessionName, content, deps);
   await deps.beforeSubmit?.(sessionName);
+  await deliverPromptText(sessionName, content, deps);
   await deps.submit(sessionName);
 };
