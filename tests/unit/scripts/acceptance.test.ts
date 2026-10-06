@@ -207,6 +207,34 @@ describe('checks-wave4.cjs fixtures (story 39)', () => {
   });
 });
 
+describe('checks-wave5.cjs fixtures (ADR-0021)', () => {
+  const wave5 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave5.cjs'));
+
+  it('findTab traverses panes and splits without accepting a different tab', () => {
+    const wanted = { id: 'tab-wanted', sessionName: 'pt-ws-p-tab-wanted' };
+    const root = { type: 'split', children: [
+      { type: 'pane', tabs: [{ id: 'other' }] },
+      { type: 'split', children: [{ type: 'pane', tabs: [wanted] }] },
+    ] };
+    expect(wave5.findTab(root, 'tab-wanted')).toBe(wanted);
+    expect(wave5.findTab(root, 'tab-missing')).toBeNull();
+  });
+
+  it('the recovery daemon records provider identity and stays a Claude-named live process', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-w5-'));
+    try {
+      const script = wave5.daemonStandIn(dir);
+      const text = fs.readFileSync(script, 'utf8');
+      expect(text).toContain('.claude/sessions');
+      expect(text).toContain('"sessionId":"%s"');
+      expect(text).toContain('exec -a claude sleep 3600');
+      expect(fs.statSync(script).mode & 0o111).not.toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('checks-wave3.cjs judgements (story 23)', () => {
   const wave3 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave3.cjs'));
   let dir: string;
@@ -655,10 +683,14 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=30 passed=29 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=43 passed=42 failed=0 skipped=1$/m);
     // The wave-2 checks (story 22) ran, each by id.
     for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
       'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {
+      expect(body).toMatch(new RegExp(`^PASS ${id} — `, 'm'));
+    }
+    for (const id of ['recovery-live-refusal', 'recovery-stale-cas', 'recovery-own-workspace-success',
+      'recovery-authenticated-app-input', 'recovery-raw-order-coalescing', 'recovery-raw-persistence-refusal']) {
       expect(body).toMatch(new RegExp(`^PASS ${id} — `, 'm'));
     }
     expect(body.match(/^SKIP .*/gm)).toEqual(['SKIP bash-guard — no --bash-guard path given']);

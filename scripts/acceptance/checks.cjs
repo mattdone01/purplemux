@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Wave-1 to wave-4 acceptance checks against an ISOLATED purplemux instance (stories 07, 22, 23 and
-// 39; ADR-0017 amendment). The wave-3 checks (deploy announce, harness watches, self-notified
+// Wave-1 to wave-5 acceptance checks against an ISOLATED purplemux instance (stories 07, 22, 23 and
+// 39; ADR-0017 and ADR-0021 amendments). The wave-3 checks (deploy announce, harness watches, self-notified
 // failures, refusal codes) live in checks-wave3.cjs and run after wave 2; the wave-4 checks (subagent
 // background work, hook-time identity, drive grants, the grants read, the coordination panel, Mission
 // Control delivery through the inbox) live in checks-wave4.cjs and run last.
@@ -45,6 +45,7 @@ const http = require('http');
 const path = require('path');
 const { wave3 } = require('./checks-wave3.cjs');
 const { wave4, request, humanSession } = require('./checks-wave4.cjs');
+const { wave5 } = require('./checks-wave5.cjs');
 
 const POLL_MS = 200;
 /** The idle window the run sets (fleet config, minutes): 3 s. */
@@ -934,7 +935,7 @@ const main = async (argv) => {
   }
   const inst = new Instance(state);
   const helpers = { parseJson, within, sleep, brief, shellQuote, readIf };
-  const waves = [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers)];
+  const waves = [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers)];
   const results = [];
   for (const [i, wave] of waves.entries()) {
     if (opts.onlyWave === null || opts.onlyWave === i + 1) results.push(...(await wave()));
