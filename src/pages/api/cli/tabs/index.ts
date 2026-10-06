@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { getLayout, addTabToPane, isAgentPanelType } from '@/lib/layout-store';
+import { addTabToPane, isAgentPanelType } from '@/lib/layout-store';
+import { readWorkspaceLayout } from '@/lib/workspace-layout-read';
 import { collectPanes } from '@/lib/layout-tree';
 import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
 import { authorizeWorkspace, canAccessWorkspace, resolveFirstPaneId } from '@/lib/cli-utils';
@@ -29,7 +30,7 @@ const log = createLogger('api:cli:tabs');
 const VALID_PANEL_TYPES: TPanelType[] = ['terminal', 'claude-code', 'codex-cli', 'grok-cli', 'agent-sessions', 'web-browser', 'diff'];
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
-  const cliScope = resolveCliScope(req);
+  const cliScope = resolveCliScope(req, { response: res });
   if (!cliScope) {
     return res.status(403).json({ error: 'Forbidden' });
   }
@@ -70,7 +71,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     for (const id of workspaceIds) {
       const ws = await getWorkspaceById(id);
       if (!ws) continue;
-      const layout = await getLayout(id);
+      const layout = await readWorkspaceLayout(id);
+      if (!layout) continue;
       for (const pane of collectPanes(layout.root)) {
         for (const tab of pane.tabs) {
           const provider = getProviderByPanelType(tab.panelType);

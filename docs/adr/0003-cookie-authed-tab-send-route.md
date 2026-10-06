@@ -1,5 +1,8 @@
 # ADR-0003: Phone authenticates with the purplemux password only; server gains a cookie-authed prompt-send route; the CLI token never leaves the box
 
+> Authentication update: ADR-0021 removes the global-token HTTP mutation bypass. This route now verifies a human session cookie and same-origin request at the handler.
+
+
 _Epic decision id: ADR-004 (see `_output/purplemux-mobile/architecture.md`)._
 
 ## Status

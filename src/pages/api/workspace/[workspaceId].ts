@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import {
   deleteWorkspace,
@@ -28,6 +29,7 @@ const parseOrchestrationPatch = (raw: unknown): Partial<IWorkspaceOrchestration>
 };
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
   const workspaceId = req.query.workspaceId as string;
 
   if (req.method === 'DELETE') {

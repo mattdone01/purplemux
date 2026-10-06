@@ -1,4 +1,4 @@
-import type { NextApiRequest } from 'next';
+import type { NextApiRequest, NextApiResponse } from 'next';
 import { collectAllTabs, findTabBySessionName, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
 import type { ITab } from '@/types/terminal';
 import { resolveCliScope, type TCliScope } from '@/lib/workspace-token';
@@ -38,8 +38,8 @@ const sessionHeader = (req: NextApiRequest): string | null => {
  * tab tokens existed. A session of another workspace is ignored, not trusted.
  * A hook-time tab token (story 36) names its tab as well, still unverified.
  */
-export const resolveCaller = async (req: NextApiRequest): Promise<ICaller | null> => {
-  const scope = resolveCliScope(req);
+export const resolveCaller = async (req: NextApiRequest, response?: NextApiResponse): Promise<ICaller | null> => {
+  const scope = resolveCliScope(req, { response });
   if (!scope) return null;
   if (scope.type === 'admin') {
     return { scope, workspaceId: null, tabId: null, tabName: null, verified: false, identity: 'none', admin: true };

@@ -184,7 +184,7 @@ describe('grant routes', () => {
     await create();
     scopeHolder.scope = { type: 'workspace', workspaceId: 'ws-1', tabId: 'tab-a', tabVerified: true, tabIdentity: 'launch' };
     const { canDriveWorkspace } = await import('@/lib/cli-utils');
-    expect(canDriveWorkspace(scopeHolder.scope, 'ws-2')).toBe(true);
+    expect(canDriveWorkspace(scopeHolder.scope, 'ws-2')).toBe(false);
     const r = await call('@/pages/api/cli/mission-control/events', 'POST', { query: { workspaceId: 'ws-2' }, body: { events: [] } });
     expect(r.status).toBe(403);
   });

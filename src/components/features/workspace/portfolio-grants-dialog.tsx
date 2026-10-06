@@ -15,7 +15,7 @@ interface IPortfolioGrantsDialogProps {
 
 /**
  * Portfolio grants (story 28; ADR-0014): pick a verified grantee tab, the
- * workspaces it may drive, an expiry, a reason and the purplemux password;
+ * workspaces it may read, an expiry, a reason and the purplemux password;
  * list the active grants with Revoke. A refusal shows the served reason. The
  * sidebar mounts this only while open, so each open starts from a clean form.
  */

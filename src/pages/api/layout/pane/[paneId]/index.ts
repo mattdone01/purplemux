@@ -1,8 +1,10 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { deletePane, patchPane, closePaneInLayout } from '@/lib/layout-store';
 import { getActiveWorkspaceId } from '@/lib/workspace-store';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
   const wsId = (req.query.workspace as string) || await getActiveWorkspaceId();
   const paneId = req.query.paneId as string;
 

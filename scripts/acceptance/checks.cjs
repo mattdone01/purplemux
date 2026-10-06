@@ -108,18 +108,20 @@ class Instance {
     this.env = { PATH: `${path.dirname(state.node)}:/usr/bin:/bin`, HOME: state.home, TMUX_TMPDIR: state.tmuxTmpdir };
   }
 
-  /** Run the candidate CLI as the admin token (no tab), with a clean environment. */
+  /** Run the actual unscoped shell CLI; its production token selection supplies workspace scope. */
   cli(args, { env = this.env, timeoutMs = 30000 } = {}) {
     return run(this.state.node, [this.cliPath, ...args], { env, timeoutMs });
   }
 
   /** Type `command` into a terminal tab; wait for the exit code it writes. */
-  async inTab(ws, tab, command, { timeoutMs = 30000 } = {}) {
+  async inTab(ws, tab, command, { timeoutMs = 30000, session = null } = {}) {
     const tag = crypto.randomBytes(4).toString('hex');
     const base = path.join(this.state.scratch, 'io', `${tab}-${tag}`);
     fs.mkdirSync(path.dirname(base), { recursive: true });
     const line = `( ${command} ) > ${base}.out 2> ${base}.err; echo $? > ${base}.rc`;
-    const sent = await this.cli(['tab', 'send', '-w', ws, tab, line]);
+    // A stopped agent stand-in leaves a shell that agent-readiness intentionally refuses.
+    // Only isolated fixture panes use keys(); their original injected identity is unchanged.
+    const sent = session ? await this.keys(session, line) : await this.cli(['tab', 'send', '-w', ws, tab, line]);
     if (sent.rc !== 0) return { rc: -1, out: '', err: `tab send exited ${sent.rc}: ${sent.err.trim()}` };
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -664,56 +666,98 @@ const tabCloseReap = async (inst, { wsA, check, created }) => {
   }
 };
 
-/** Story 10 (ADR-0013): a note reaches an idle, empty composer as a fixed line, is shown and acked. */
+/** Cross-workspace notes require real designated coordinators; local workers retain local authority. */
 const notes = async (inst, { nonce, wsA, wsB, check, created }) => {
+  const previous = {};
+  for (const ws of [wsA, wsB]) previous[ws] = parseJson((await inst.cli(['orchestration', 'status', '-w', ws])).out)?.orchestration;
   const orch = await created(wsA, 'acc2-orch-a', 'claude-code', ['--no-launch']);
   const sender = await created(wsB, 'acc2-sender', 'terminal');
-  await sleep(1000);
-  const on = orch ? await inst.cli(['orchestration', 'on', '-w', wsA, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
-  const inputFile = path.join(inst.state.scratch, 'io', `composer-input-${nonce}.txt`);
-  fs.mkdirSync(path.dirname(inputFile), { recursive: true });
-  fs.writeFileSync(inputFile, '');
-  const standIn = orch && on.rc === 0 ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', composer: true, inputFile }) : { rc: -1 };
-  await sleep(1500);
-  if (orch) await inst.hook('session-start', orch.sessionName);
-  const ready = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
+  const reader = await created(wsA, 'acc2-reader', 'terminal');
+  const worker = await created(wsB, 'acc2-worker', 'terminal');
+  const missing = { rc: -1, out: '', err: 'missing fixture prerequisite' };
+  const epic = `acc-notes-${nonce}`;
   const bodyMarker = `ACC-NOTE-BODY-${nonce}`;
   const bodyFile = path.join(inst.state.scratch, 'io', `note-${nonce}.txt`);
+  const inputFile = path.join(inst.state.scratch, 'io', `composer-input-${nonce}.txt`);
   fs.mkdirSync(path.dirname(bodyFile), { recursive: true });
   fs.writeFileSync(bodyFile, `${bodyMarker}\nthe body is pulled, never typed\n`);
-  const sent = sender && ready
-    ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'send', '--to-workspace', wsA, '--subject', `acc note ${nonce}`, '-f', bodyFile]))
-    : { rc: -1, out: '', err: `orchestration on ${on.rc}, stand-in ${standIn.rc}, idle ${ready}` };
-  const note = parseJson(sent.out)?.note ?? null;
-  // `state: delivered` is set when the notice is QUEUED; `deliveredAt` only once the inbox typed it
-  // (review r1). 180 s covers two readiness refusals (10 s, 30 s backoff) plus the 15 s notes tick.
-  const delivered = note ? await within(180000, async () => {
-    const all = parseJson((await inst.cli(['note', 'list'])).out)?.notes ?? [];
-    return all.find((n) => n.id === note.id && typeof n.deliveredAt === 'number');
-  }) : null;
-  const judged = judgeNoteDelivery(delivered ?? note, readIf(inputFile) ?? '', bodyMarker);
-  check(
-    'note-delivered',
-    'a note to another workspace is typed into its orchestrator\'s idle, empty composer as the fixed notice line naming it; the body never is',
-    sent.rc === 0 && judged.ok,
-    `send ${brief(sent)}, note ${note?.id ?? 'none'}; ${judged.measured}`,
-    'send exit 0; deliveredAt stamped within 180 s; the composer received "[purplemux note <id>]" and not the body',
-  );
-  const shown = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'show', note.id])) : { rc: -1, out: '', err: 'no note' };
-  const bySender = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'ack', note.id])) : { rc: -1, out: '', err: 'no note' };
-  const reader = await created(wsA, 'acc2-reader', 'terminal');
-  await sleep(1000);
-  const byRecipient = note && reader ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['note', 'ack', note.id, '--comment', 'seen'])) : { rc: -1, out: '', err: 'not delivered' };
-  const acked = parseJson(byRecipient.out)?.note?.state ?? null;
-  check(
-    'note-ack',
-    'the sender may show its note but not ack it (exit 3); a tab of the recipient workspace acks it',
-    shown.rc === 0 && (parseJson(shown.out)?.body ?? '').includes(bodyMarker) && bySender.rc === 3 && byRecipient.rc === 0 && acked === 'acked',
-    `show ${brief(shown)}; sender ack ${brief(bySender)}; recipient ack ${brief(byRecipient)}, state ${acked}`,
-    'show exit 0 with the body; sender ack exit 3; recipient ack exit 0, state acked',
-  );
-  for (const t of [orch, sender, reader]) if (t) await inst.cli(['tab', 'close', '-w', t === sender ? wsB : wsA, t.tabId]);
-  await inst.cli(['orchestration', 'off', '-w', wsA]);
+  fs.writeFileSync(inputFile, '');
+  const send = (target) => inst.tabCli(['note', 'send', ...target, '--subject', `acc note ${nonce}`, '-f', bodyFile]);
+  const allNotes = async () => parseJson((await inst.cli(['note', 'list'])).out)?.notes ?? [];
+  const waitDelivery = async (note) => note ? within(180000, async () => (await allNotes()).find((n) => n.id === note.id && typeof n.deliveredAt === 'number')) : null;
+  try {
+    await sleep(1000);
+    const onA = orch ? await inst.cli(['orchestration', 'on', '-w', wsA, orch.tabId]) : missing;
+    const onB = sender ? await inst.cli(['orchestration', 'on', '-w', wsB, sender.tabId]) : missing;
+    const before = (await allNotes()).length;
+    const byWorker = worker ? await inst.inTab(wsB, worker.tabId, send(['--to-workspace', wsA])) : missing;
+    const changedB = worker ? await inst.cli(['orchestration', 'on', '-w', wsB, worker.tabId]) : missing;
+    const byStaleSender = sender && changedB.rc === 0 ? await inst.inTab(wsB, sender.tabId, send(['--to-workspace', wsA])) : missing;
+    const restoredB = sender ? await inst.cli(['orchestration', 'on', '-w', wsB, sender.tabId]) : missing;
+    check('note-source-authority', 'foreign workers and replaced source coordinators cannot create notes',
+      onB.rc === 0 && byWorker.rc === 3 && byStaleSender.rc === 3 && restoredB.rc === 0 && (await allNotes()).length === before,
+      `worker ${brief(byWorker)}; stale coordinator ${brief(byStaleSender)}; restore ${brief(restoredB)}`, 'both denied with exit 3 and no new note');
+
+    const standIn = orch && onA.rc === 0 ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', composer: true, inputFile }) : missing;
+    await sleep(1500);
+    if (orch) await inst.hook('session-start', orch.sessionName);
+    const ready = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
+    const directMarker = `ACC-FOREIGN-DIRECT-${nonce}`;
+    const direct = [];
+    for (const action of ['send', 'steer']) direct.push(sender && orch ? await inst.inTab(wsB, sender.tabId,
+      inst.tabCli(['tab', action, '-w', wsA, orch.tabId, directMarker])) : missing);
+    check('note-no-direct-drive', 'a foreign coordinator cannot send or steer even the designated target coordinator',
+      direct.every((r) => r.rc === 3) && !(readIf(inputFile) ?? '').includes(directMarker),
+      direct.map(brief).join('; '), 'both denied with exit 3 and no direct input');
+
+    const sent = sender && ready && standIn.rc === 0 && restoredB.rc === 0
+      ? await inst.inTab(wsB, sender.tabId, send(['--to-workspace', wsA])) : missing;
+    const note = parseJson(sent.out)?.note ?? null;
+    const delivered = await waitDelivery(note);
+    const judged = judgeNoteDelivery(delivered ?? note, readIf(inputFile) ?? '', bodyMarker);
+    check('note-delivered', 'a designated coordinator sends a fixed notice to the foreign coordinator; the body is never typed',
+      sent.rc === 0 && judged.ok && delivered?.deliveredTo?.tabId === orch?.tabId,
+      `send ${brief(sent)}; ${judged.measured}`, 'send exit 0, coordinator delivery stamped, notice received without body');
+
+    // An epic held by a worker still routes foreign notes to that workspace's coordinator.
+    const held = reader ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['lease', 'acquire', `epic:${epic}`, '--ttl', '5m'])) : missing;
+    const epicSent = sender && held.rc === 0 ? await inst.inTab(wsB, sender.tabId, send(['--to-epic', epic])) : missing;
+    const epicNote = parseJson(epicSent.out)?.note ?? null;
+    const epicDelivered = await waitDelivery(epicNote);
+    check('note-epic-coordinator', 'a foreign note addressed to a worker-held epic is delivered to its current coordinator',
+      epicSent.rc === 0 && epicDelivered?.deliveredTo?.tabId === orch?.tabId && judgeNoteDelivery(epicDelivered, readIf(inputFile) ?? '', bodyMarker).ok,
+      `epic lease ${brief(held)}; send ${brief(epicSent)}; recipient ${epicDelivered?.deliveredTo?.tabId}`, 'epic holder is the worker; delivered recipient is the coordinator');
+
+    const shown = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'show', note.id])) : missing;
+    const bySender = note && sender ? await inst.inTab(wsB, sender.tabId, inst.tabCli(['note', 'ack', note.id])) : missing;
+    const byReader = note && reader ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['note', 'ack', note.id])) : missing;
+    // End only the scratch stand-in; the shell still carries the same launch-bound coordinator token.
+    const stopped = orch ? await inst.keys(orch.sessionName, 'C-c') : missing;
+    const byRecipient = note && orch && stopped.rc === 0 ? await inst.inTab(wsA, orch.tabId,
+      inst.tabCli(['note', 'ack', note.id, '--comment', 'seen']), { session: orch.sessionName }) : missing;
+    check('note-ack', 'the source coordinator and recipient worker cannot ACK; the current recipient coordinator can',
+      shown.rc === 0 && (parseJson(shown.out)?.body ?? '').includes(bodyMarker) && bySender.rc === 3 && byReader.rc === 3
+        && byRecipient.rc === 0 && parseJson(byRecipient.out)?.note?.state === 'acked',
+      `show ${brief(shown)}; sender ${brief(bySender)}; worker ${brief(byReader)}; coordinator ${brief(byRecipient)}`, 'show 0, sender/worker ACK 3, current coordinator ACK 0');
+
+    const replaced = reader ? await inst.cli(['orchestration', 'on', '-w', wsA, reader.tabId]) : missing;
+    const staleAck = epicNote && orch && replaced.rc === 0 ? await inst.inTab(wsA, orch.tabId,
+      inst.tabCli(['note', 'ack', epicNote.id]), { session: orch.sessionName }) : missing;
+    const rerouted = epicNote && reader ? await within(30000, async () => (await allNotes())
+      .find((n) => n.id === epicNote.id && n.deliveredTo?.tabId === reader.tabId)) : null;
+    const currentAck = rerouted && reader ? await inst.inTab(wsA, reader.tabId, inst.tabCli(['note', 'ack', epicNote.id])) : missing;
+    check('note-stale-recipient', 'a replaced recipient cannot ACK; the newly designated coordinator can',
+      staleAck.rc === 3 && currentAck.rc === 0 && parseJson(currentAck.out)?.note?.state === 'acked',
+      `stale ${brief(staleAck)}; current ${brief(currentAck)}`, 'stale ACK 3; current coordinator ACK 0');
+  } finally {
+    if (reader) await inst.inTab(wsA, reader.tabId, inst.tabCli(['lease', 'release', `epic:${epic}`]));
+    for (const ws of [wsA, wsB]) {
+      const old = previous[ws];
+      await inst.cli(old?.enabled && old.orchestratorTabId
+        ? ['orchestration', 'on', '-w', ws, old.orchestratorTabId] : ['orchestration', 'off', '-w', ws]);
+    }
+    for (const [ws, tab] of [[wsA, orch], [wsA, reader], [wsB, sender], [wsB, worker]]) if (tab) await inst.cli(['tab', 'close', '-w', ws, tab.tabId]);
+  }
 };
 
 // Story 26 transcripts: the real Claude 2.1.283 server-error entry, and the usage WARNING (a normal
@@ -874,7 +918,7 @@ const main = async (argv) => {
   return pass ? 0 : 1;
 };
 
-module.exports = { judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs };
+module.exports = { notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs };
 
 if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));

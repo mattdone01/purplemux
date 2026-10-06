@@ -8,14 +8,11 @@ else \`PMUX_TOKEN\`.
 
 ## Workspace scope
 
-Every agent tab launches with a token scoped to ITS OWN workspace (\`PMUX_TOKEN\` in
-the pane environment). Naming a different workspace returns 403 — you cannot list,
-read, drive, or create tabs anywhere but your own workspace, and an unscoped
-\`GET /api/cli/tabs\` returns only tabs you may already act on.
-
-Cross-workspace access is deliberate and rare: the TARGET workspace must name your
-workspace id in its \`allowedPeers\`. Grants are one-directional. Ask the human to
-add one rather than working around a 403.
+Agent tokens may mutate tabs and workspace configuration only in their own workspace. Peer
+entries and legacy drive grants allow authorized reads only. The global CLI token
+is not human identity and cannot mutate these surfaces. Foreign requests go through
+coordinator notes; use authenticated local human controls for human actions.
+An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
 
 ## Caller identity
 
@@ -140,12 +137,9 @@ PATCH /api/cli/workspaces/<workspaceId>/directories
 ## Tabs
 
 GET /api/cli/grants
-  Portfolio drive grants (ADR-0014), read-only: the admin token sees all; a workspace or tab token sees
-  the grants its workspace holds or is driven under. A grant lets ONE launch-verified tab drive (send,
-  steer, …) the named workspaces until it expires, is revoked, or the tab closes; every such use is
-  audited. Grants are created and revoked only by a human in the web UI with the purplemux password
-  (POST /api/grants, DELETE /api/grants/<id>); no CLI token can. A grantee calling without its launch
-  identity gets 403 grant-tab-unverified: recreate the tab.
+  Legacy portfolio grants retain read access for their verified grantee tab until expiry or revocation.
+  They never authorize foreign input, tab creation/closure, browser evaluation, or settings changes.
+  Grant administration remains in the authenticated human UI. No CLI token proves human identity.
 
 POST /api/cli/tab-identity  { session }
   Story 36: the Claude SessionStart hook of a tab created before tab tokens asks for a hook-time
@@ -610,7 +604,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
   // Any valid CLI scope: the guide is documentation, and the agents that most
   // need it hold a workspace token, not the global one.
-  if (!resolveCliScope(req)) {
+  if (!resolveCliScope(req, { response: res })) {
     return res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
   }
   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');

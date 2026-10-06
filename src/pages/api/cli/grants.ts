@@ -12,7 +12,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     res.setHeader('Allow', 'GET');
     return res.status(405).json({ error: 'Method not allowed' });
   }
-  const scope = resolveCliScope(req);
+  const scope = resolveCliScope(req, { response: res });
   if (!scope) return res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
   const refusal = grantsRefusal();
   if (refusal) return res.status(500).json({ error: refusal, code: 'grant-store-unreadable' });

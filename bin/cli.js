@@ -25,7 +25,7 @@ const BASE = `http://localhost:${PORT}`;
 /**
  * The token to present for a request against `requestPath`.
  *
- * `send` and `steer` accept ONLY a token scoped to the target workspace, so
+ * Workspace mutations accept ONLY a token scoped to the target workspace, so
  * that a tab cannot type into another epic's worker. That rule would also
  * catch a human shell, which holds the global token and belongs to no
  * workspace — so when nothing scoped us, resolve the token of the workspace
@@ -48,11 +48,15 @@ const workspaceTokenFor = (workspaceId) => {
   }
 };
 
-const tokenFor = (requestPath) => {
+const tokenFor = (requestPath, body, method) => {
   if (TAB_TOKEN) return TAB_TOKEN;
   if (ENV_TOKEN) return ENV_TOKEN;
   const match = /[?&]workspaceId=([^&]+)/.exec(requestPath || '');
-  const workspaceId = match ? decodeURIComponent(match[1]) : null;
+  const pathMatch = !['GET', 'HEAD', 'OPTIONS'].includes(method)
+    ? /^\/api\/cli\/workspaces\/([^/?]+)(?:\/|$)/.exec(requestPath || '') : null;
+  const workspaceId = match ? decodeURIComponent(match[1])
+    : pathMatch ? decodeURIComponent(pathMatch[1])
+      : typeof body?.workspaceId === 'string' ? body.workspaceId : null;
   return workspaceTokenFor(workspaceId) || ADMIN_TOKEN;
 };
 
@@ -78,8 +82,8 @@ const ownSessionName = () => {
  * (tabs created before tab tokens existed). The server trusts it only inside
  * the token's own workspace, and a tab token makes it redundant.
  */
-const headersFor = (requestPath, extra) => {
-  const headers = { 'X-Pmux-Token': tokenFor(requestPath), ...(extra || {}) };
+const headersFor = (requestPath, extra, body, method) => {
+  const headers = { 'X-Pmux-Token': tokenFor(requestPath, body, method), ...(extra || {}) };
   const session = TAB_TOKEN ? null : ownSessionName();
   if (session) headers['X-Pmux-Session'] = session;
   return headers;
@@ -290,7 +294,7 @@ const failIfRouteAbsent = (resp, requestPath) => {
 const api = async (method, path, data) => {
   const opts = {
     method,
-    headers: headersFor(path, { 'Content-Type': 'application/json' }),
+    headers: headersFor(path, { 'Content-Type': 'application/json' }, data, method),
   };
   if (data !== undefined) opts.body = JSON.stringify(data);
   const resp = await request(method, path, opts);
@@ -305,7 +309,7 @@ const api = async (method, path, data) => {
 };
 
 const apiRaw = async (method, path) => {
-  const resp = await request(method, path, { headers: headersFor(path) });
+  const resp = await request(method, path, { headers: headersFor(path, undefined, undefined, method) });
   failIfRouteAbsent(resp, path);
   if (!resp.ok) failFromResponse(resp, isJson(resp) ? await readBody(method, path, resp, 'json') : null);
   return resp;
@@ -848,7 +852,7 @@ const cmdGrant = async (args) => {
   }
   for (const g of grants) {
     const state = g.revokedAt !== null ? `ended (${g.revokeReason})` : g.expiresAt <= now ? 'expired' : `active until ${new Date(g.expiresAt).toISOString()}`;
-    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} drives ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
+    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} reads ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
   }
 };
 
@@ -1408,10 +1412,8 @@ Commands:
                                            new tabs and keys the agent chat store, and must be unique across
                                            workspaces. Later DIRs are navigation shortcuts and may overlap.
                                            Paths are resolved against your cwd; existing tabs keep their old cwd
-  workspace peers show -w WS               Show which workspaces may reach into WS
-  workspace peers set -w WS [PEER...]      Replace that list (global token only — an agent cannot
-                                           widen its own scope). Grants are one-directional; pass
-                                           no PEER to revoke all
+  workspace peers show -w WS               Show which workspaces may read WS
+  workspace peers set -w WS [PEER...]      Removed: manage read grants through authenticated human controls
   tab list [-w WS]                         List tabs (only those your token may act on)
   tab create -w WS [-n NAME] [-t TYPE] [--scope GLOBS]
                                            Create a tab in workspace (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
@@ -1520,7 +1522,7 @@ Commands:
                                            A stale --expect-version exits 3 config-version-conflict
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
-  grant list [--json]                      Portfolio drive grants you hold or are driven under (read-only; a human
+  grant list [--json]                      Portfolio read grants held by or targeting your workspace (read-only; a human
                                            creates and revokes them in the web UI with the purplemux password)
   deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json]
                                            Tell every enabled orchestrator and tab-bound lease holder that purplemux

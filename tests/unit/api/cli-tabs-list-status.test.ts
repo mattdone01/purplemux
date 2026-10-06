@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const statuses = vi.hoisted(() => ({ value: {} as Record<string, unknown> }));
 
+vi.mock('@/lib/workspace-layout-read', () => ({ readWorkspaceLayout: vi.fn(async () => ({ root: {} })) }));
 vi.mock('@/lib/layout-store', () => ({
   addTabToPane: vi.fn(),
   getLayout: vi.fn(async () => ({ root: {} })),
@@ -61,6 +62,21 @@ const listTabs = async () => {
 };
 
 describe('GET /api/cli/tabs status fields', () => {
+  it('does not initialize a missing layout during listing', async () => {
+    const { readWorkspaceLayout } = await import('@/lib/workspace-layout-read');
+    const { getLayout } = await import('@/lib/layout-store');
+    vi.mocked(readWorkspaceLayout).mockResolvedValueOnce(null);
+    expect((await listTabs()).body.tabs).toEqual([]);
+    expect(getLayout).not.toHaveBeenCalled();
+  });
+  it('propagates unavailable layouts without initialization', async () => {
+    const { readWorkspaceLayout } = await import('@/lib/workspace-layout-read');
+    const { getLayout } = await import('@/lib/layout-store');
+    vi.mocked(readWorkspaceLayout).mockRejectedValueOnce(new Error('unavailable'));
+    await expect(listTabs()).rejects.toThrow('unavailable');
+    expect(getLayout).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     statuses.value = {
       'tab-busy': { cliState: 'busy', lastEvent: { name: 'stop', at: 5, seq: 9 }, busySince: 3 },

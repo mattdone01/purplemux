@@ -122,7 +122,7 @@ export const createGrant = async (deps: IGrantDeps, subject: string, body: ICrea
     throw invalid('workspaces must name at least one workspace');
   }
   const workspaces = [...new Set(body.workspaces as string[])];
-  if (workspaces.includes(ws)) throw invalid('a tab drives its own workspace already; name only other workspaces');
+  if (workspaces.includes(ws)) throw invalid('a tab can read its own workspace already; name only other workspaces');
   const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
   if (!reason || reason.length > GRANT_REASON_MAX) throw invalid(`reason is required, at most ${GRANT_REASON_MAX} characters`);
   const hours = body.expiresInHours === undefined || body.expiresInHours === null ? GRANT_DEFAULT_HOURS : body.expiresInHours;

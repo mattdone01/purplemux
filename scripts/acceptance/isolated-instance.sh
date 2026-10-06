@@ -212,11 +212,16 @@ up() {
     fi
   done
 
-  local token ws_a ws_b
-  token="$(head -n 1 "$home/.purplemux/cli-token" 2>/dev/null || true)"
-  [[ -n "$token" ]] || { say_refusal NO-TOKEN "no $home/.purplemux/cli-token" "the candidate's admin token"; exit 2; }
+  local password ws_a ws_b
+  password="$("$NODE" -e 'process.stdout.write("acc-pw-"+require("crypto").createHash("sha256").update(process.argv[1]).digest("hex").slice(0,16))' "$scratch")"
+  "$CURL" -fsS -m 20 -H 'Content-Type: application/json' \
+    -d "{\"authPassword\":\"$password\"}" "http://127.0.0.1:$actual/api/auth/setup" >/dev/null \
+    || { say_refusal HUMAN-SETUP "scratch setup failed" "an isolated human session"; exit 2; }
+  "$CURL" -fsS -m 20 -c "$scratch/human-cookies" -H 'Content-Type: application/json' \
+    -d "{\"password\":\"$password\"}" "http://127.0.0.1:$actual/api/auth/login" >/dev/null \
+    || { say_refusal HUMAN-LOGIN "scratch login failed" "an isolated human session"; exit 2; }
   create_ws() {
-    "$CURL" -s -m 20 -X POST -H "X-Pmux-Token: $token" -H 'Content-Type: application/json' \
+    "$CURL" -s -m 20 -X POST -b "$scratch/human-cookies" -H "Origin: http://127.0.0.1:$actual" -H 'Content-Type: application/json' \
       -d "{\"directory\":\"$scratch/work/$1\",\"name\":\"acc-$1\"}" "http://127.0.0.1:$actual/api/workspace" 2>/dev/null \
       | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).id||"")}catch{}})'
   }

@@ -121,14 +121,14 @@ describe('coordination panel', () => {
     expect(html).not.toContain('mystery-state');
   });
 
-  it('grants: populated rows show the grantee, the workspaces it drives and the expiry', () => {
+  it('grants: populated rows show the grantee, the workspaces it reads and the expiry', () => {
     const snap = empty();
     snap.grants = { ok: true, items: [
       { id: 'g-1', grantee: { workspaceId: 'ws-orch', tabId: 'tab-o' }, workspaces: ['ws-a', 'ws-b'], expiresAt: AT + 3_600_000 },
     ] } as unknown as ICoordinationSnapshot['grants'];
     const html = sectionHtml(render(snap), 'Grants');
     expect(html).toContain('data-state="populated"');
-    expect(html).toMatch(/data-grant="g-1".*?ws-orch\/tab-o drives ws-a, ws-b.*?until [^<]+</);
+    expect(html).toMatch(/data-grant="g-1".*?ws-orch\/tab-o reads ws-a, ws-b.*?until [^<]+</);
     expect(html).toContain(new Date(AT + 3_600_000).toLocaleString());
   });
 

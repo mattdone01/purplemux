@@ -21,7 +21,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : '';
     if (!workspaceId) throw new MissionControlError(400, 'invalid-request', 'workspaceId is required');
-    const scope = resolveCliScope(req);
+    const scope = resolveCliScope(req, { response: res });
     if (!scope) throw new MissionControlError(401, 'unauthorized', 'CLI token required');
     // Own workspace only: a portfolio grant never lets a tab write another workspace's MC events (ADR-0014).
     if (!isOwnWorkspace(scope, workspaceId)) {

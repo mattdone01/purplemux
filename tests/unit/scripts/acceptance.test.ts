@@ -300,8 +300,9 @@ exec sleep 600
 const fakeCurl = (dir: string) => `#!/bin/bash
 url="\${@: -1}"
 case "$url" in
+  */api/auth/setup|*/api/auth/login) echo '{}' ;;
   */api/health) echo '{"app":"purplemux","version":"0"}' ;;
-  */api/workspace) [[ -e "${dir}/ws-fail" ]] && exit 7; echo "{\\"id\\":\\"ws-$RANDOM\\"}" ;;
+  */api/workspace) [[ " $* " == *" -b "* && " $* " == *"Origin: "* ]] || exit 22; [[ -e "${dir}/ws-fail" ]] && exit 7; echo "{\\"id\\":\\"ws-$RANDOM\\"}" ;;
   *) exit 7 ;;
 esac
 `;

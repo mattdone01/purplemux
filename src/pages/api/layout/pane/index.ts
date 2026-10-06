@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { createPane, splitPaneInLayout } from '@/lib/layout-store';
 import { getActiveWorkspaceId } from '@/lib/workspace-store';
@@ -6,6 +7,7 @@ import { createLogger } from '@/lib/logger';
 const log = createLogger('layout');
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method not allowed' });

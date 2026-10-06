@@ -1,7 +1,9 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { renameGroup, ungroupGroup, setGroupCollapsed } from '@/lib/workspace-store';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
+  if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
   const groupId = req.query.groupId as string;
 
   if (req.method === 'DELETE') {

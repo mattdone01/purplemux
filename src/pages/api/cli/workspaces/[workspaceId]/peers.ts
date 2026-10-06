@@ -1,3 +1,4 @@
+import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveCliScope } from '@/lib/workspace-token';
 import { getWorkspaceById, updateWorkspaceAllowedPeers } from '@/lib/workspace-store';
@@ -9,15 +10,11 @@ const parsePeers = (raw: unknown): string[] | null => {
 };
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
-  // Deliberately admin-only, not authorizeWorkspace: a workspace-scoped agent
-  // that could edit allowedPeers could grant itself the access this exists to
-  // withhold. Granting a peer is a human decision.
-  const scope = resolveCliScope(req);
-  if (!scope) return res.status(403).json({ error: 'Forbidden' });
-  if (scope.type !== 'admin') {
-    return res.status(403).json({
-      error: 'Editing allowedPeers requires the global token — an agent cannot widen its own scope. Ask the human.',
-    });
+  if (req.method === 'PATCH') {
+    if (!(await authorizeHumanMutation(req, res))) return;
+  } else {
+    const scope = resolveCliScope(req, { response: res });
+    if (scope?.type !== 'admin') return res.status(403).json({ error: 'Forbidden' });
   }
 
   const workspaceId = req.query.workspaceId as string;

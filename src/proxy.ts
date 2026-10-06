@@ -10,7 +10,10 @@ import { verifyTokenValue } from '@/lib/cli-token';
 
 export const proxy = async (request: NextRequest) => {
   const cliToken = request.headers.get('x-pmux-token');
-  if (cliToken && verifyTokenValue(cliToken)) {
+  const machineLaunch = /^\/api\/(?:codex\/launch-(?:command|args|submit|confirm)|claude\/launch-command)$/.test(request.nextUrl.pathname);
+  const uiMutation = !['GET', 'HEAD', 'OPTIONS'].includes(request.method)
+    && /^\/api\/(?:layout(?:\/|$)|workspace(?:\/|$)|tabs\/[^/]+\/send$|tmux\/(?:send-input|reset|recover-unknown)$|status\/agent-launch$)/.test(request.nextUrl.pathname);
+  if (cliToken && (machineLaunch || (!uiMutation && verifyTokenValue(cliToken)))) {
     return NextResponse.next();
   }
 

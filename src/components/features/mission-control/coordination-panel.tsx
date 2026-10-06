@@ -162,7 +162,7 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
         )} />
         <Section title="Grants" section={snapshot.grants} empty="No active grants" render={(g) => (
           <li key={g.id} className="flex min-w-0 justify-between gap-2" data-grant={g.id}>
-            <span className="truncate">{g.grantee.workspaceId}/{g.grantee.tabId} drives {g.workspaces.join(', ')}</span>
+            <span className="truncate">{g.grantee.workspaceId}/{g.grantee.tabId} reads {g.workspaces.join(', ')}</span>
             <span className="shrink-0 text-muted-foreground">until {new Date(g.expiresAt).toLocaleString()}</span>
           </li>
         )} />

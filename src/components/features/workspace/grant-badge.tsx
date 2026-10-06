@@ -6,7 +6,7 @@ import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { describeGrantFailure, grantBadgeOf, type IGrantBadge } from '@/lib/grant-view';
 import { cn } from '@/lib/utils';
 
-// "drives N workspaces" on a grantee tab (story 28; ADR-0014), with the
+// "reads N workspaces" on a grantee tab (story 28; ADR-0014), with the
 // workspaces and the expiry in its tooltip. A failed refresh keeps the badge
 // from the last good read and marks it "not refreshed" (review r1).
 
