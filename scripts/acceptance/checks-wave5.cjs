@@ -414,7 +414,10 @@ const wave5 = async (inst, helpers) => {
     check('recovery-restart-close-durability', 'restart retains unresolved input, while a later managed close confirms reap and removes the tab',
       restarted.status === 200 && pendingBeforeRestart?.generation === pendingAfterRestart?.generation
         && closed.rc === 0 && !layoutTab(inst, ws, io.tabId)
-        && targetProbe.rc === 1 && targetProbe.err.trim() === `can't find session: ${io.sessionName}`
+        && targetProbe.rc === 1 && [
+          `can't find session: ${io.sessionName}`,
+          `can't find window: ${io.sessionName}`,
+        ].includes(targetProbe.err.trim())
         && controlProbe.rc === 0 && Array.isArray(closePayload?.survivors) && closePayload.survivors.length === 0,
       `restart ${restarted.status}; generations ${pendingBeforeRestart?.generation}/${pendingAfterRestart?.generation}; close ${brief(closed)} payload ${JSON.stringify(closePayload)}; remains ${Boolean(layoutTab(inst, ws, io.tabId))}; target probe ${brief(targetProbe)}; control probe ${brief(controlProbe)}; audit ${JSON.stringify(audit)}; socket ${JSON.stringify(terminalEvidence(ioSocket))}`,
       'restart 200 with same turn generation; close 0; exact target absent while control is present; no reap survivors; tab absent');

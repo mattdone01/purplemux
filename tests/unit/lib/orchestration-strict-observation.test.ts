@@ -8,10 +8,12 @@ import { observeProviderProcess } from '@/lib/process-utils';
 import { observeSessionStrict } from '@/lib/tmux';
 beforeEach(() => { fixture.output = ''; fixture.failure = null; fixture.read.mockReset(); });
 describe('strict low-level runtime proof', () => {
-  it('only accepts an exact explicit missing-session response as absent', async () => {
-    fixture.failure = { code: 1, stderr: "can't find session: target" };
-    expect(await observeSessionStrict('target')).toMatchObject({ state: 'absent' });
-    for (const error of [{ code: 1, stderr: 'no server running' }, { code: 1, stderr: "can't find session: other" }, { code: 1, stderr: "can't find session: target", killed: true }, { code: 'EACCES' }]) {
+  it('only accepts exact explicit missing-target responses as absent', async () => {
+    for (const stderr of ["can't find session: target", "can't find window: target"]) {
+      fixture.failure = { code: 1, stderr };
+      expect(await observeSessionStrict('target')).toMatchObject({ state: 'absent' });
+    }
+    for (const error of [{ code: 1, stderr: 'no server running' }, { code: 1, stderr: "can't find session: other" }, { code: 1, stderr: "can't find window: other" }, { code: 1, stderr: "can't find window: target", killed: true }, { code: 'EACCES' }]) {
       fixture.failure = error; expect(await observeSessionStrict('target')).toMatchObject({ state: 'unknown' });
     }
   });

@@ -857,7 +857,7 @@ export const getLastCommand = async (sessionName: string): Promise<string | null
   }
 };
 
-/** Exact target lookup; only tmux's explicit missing-session result is positive absence. */
+/** Exact target lookup; only tmux's explicit exact-target absence is positive absence. */
 export const observeSessionStrict = async (sessionName: string): Promise<
   | { state: 'present'; panePid: number; identity: string }
   | { state: 'absent' | 'unknown'; reason: string }
@@ -870,8 +870,10 @@ export const observeSessionStrict = async (sessionName: string): Promise<
     return { state: 'present', panePid: Number(pid), identity: `${name}:${pane}:${pid}` };
   } catch (error) {
     const failure = error as { code?: unknown; stderr?: string; killed?: boolean; signal?: unknown };
-    if (failure.code === 1 && !failure.killed && !failure.signal && failure.stderr?.trim() === `can't find session: ${sessionName}`) {
-      return { state: 'absent', reason: 'tmux positively reported the exact session absent' };
+    const diagnostic = failure.stderr?.trim();
+    if (failure.code === 1 && !failure.killed && !failure.signal
+      && (diagnostic === `can't find session: ${sessionName}` || diagnostic === `can't find window: ${sessionName}`)) {
+      return { state: 'absent', reason: 'tmux positively reported the exact target absent' };
     }
     return { state: 'unknown', reason: 'tmux unavailable, timed out, or did not prove session absence' };
   }
