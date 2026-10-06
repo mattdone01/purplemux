@@ -66,12 +66,11 @@ for the wake-up path = nothing to stall.
 ## Kickoff (step by step)
 
 ```bash
-# Inside a purplemux tab, PMUX_TAB_TOKEN and PMUX_TOKEN are already set and
-# PMUX_TAB_TOKEN wins over PMUX_TOKEN; the exports below are for a plain shell.
-export PMUX_PORT=$(cat ~/.purplemux/port)
-export PMUX_TOKEN=$(cat ~/.purplemux/cli-token)
+# In a plain shell, the CLI reads the port and the selected workspace token
+# from ~/.purplemux. Do not export the global cli-token as PMUX_TOKEN.
+# Inside a tab, keep its injected credentials and operate in its own workspace.
 
-# 1. Pick/create the workspace (one per epic; add per-story worktree dirs as you go)
+# 1. Pick the workspace (create it in the UI if needed; one per epic)
 purplemux workspaces
 
 # 2. Create the orchestrator tab (Fable — your Claude Code default)
@@ -79,11 +78,17 @@ purplemux tab create -w WS_ID -n orchestrator -t claude-code
 # note the tabId it prints, e.g. tab-Abc123
 
 # 3. Start the watchdog in a plain terminal (same box; a purplemux terminal tab is fine)
-~/code/ai-server/orchestration/pmux-watch.sh -w WS_ID -o ORCH_TAB_ID
+./orchestration/pmux-watch.sh -w WS_ID -o ORCH_TAB_ID
 
 # 4. Send the orchestrator its kickoff prompt (template below)
 purplemux tab send -w WS_ID ORCH_TAB_ID "$(cat kickoff-prompt.md)"
 ```
+
+The watchdog uses the same credential precedence as the CLI: injected tab token,
+injected workspace token, then the selected workspace token on disk for an
+unscoped shell. A missing credential or failed request stops the watchdog with
+an error. A failed nudge is not recorded as delivered; resolve the reported
+failure before restarting it.
 
 Watch progress any time:
 
@@ -103,8 +108,9 @@ You are the ORCHESTRATOR for epic EPIC_NAME. You delegate all implementation
 to worker agents in purplemux tabs; you never implement stories yourself.
 
 ## Environment
-export PMUX_PORT=$(cat ~/.purplemux/port); export PMUX_TOKEN=$(cat ~/.purplemux/cli-token)
-(Inside a purplemux tab, PMUX_TAB_TOKEN is set and takes precedence over PMUX_TOKEN.)
+Keep the injected PMUX_TAB_TOKEN and PMUX_TOKEN unchanged. The tab token takes
+precedence and confines commands to this workspace. The CLI reads the local port.
+Do not export the global cli-token; it cannot authorize workspace mutations.
 Workspace: WS_ID. Your own tab: ORCH_TAB_ID (never send to yourself).
 
 purplemux commands you use:
