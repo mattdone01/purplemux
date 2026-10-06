@@ -44,7 +44,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { wave3 } = require('./checks-wave3.cjs');
-const { wave4, request, humanSession } = require('./checks-wave4.cjs');
+const { wave4, request, humanSession, liveStandIn, standInRecord } = require('./checks-wave4.cjs');
 const { wave5 } = require('./checks-wave5.cjs');
 
 const POLL_MS = 200;
@@ -107,6 +107,7 @@ class Instance {
     this.state = state;
     this.cliPath = path.join(state.candidate, 'bin', 'purplemux.js');
     this.env = { PATH: `${path.dirname(state.node)}:/usr/bin:/bin`, HOME: state.home, TMUX_TMPDIR: state.tmuxTmpdir };
+    this.fixtureAgents = new Map();
   }
 
   /** Run the actual unscoped shell CLI; its production token selection supplies workspace scope. */
@@ -139,6 +140,56 @@ class Instance {
     await sleep(1000);
     await this.hook('session-start', tab.sessionName);
     return started;
+  }
+
+  async observeFixtureAgent(ws, tab, expected) {
+    const result = await this.cli(['tab', 'status', '-w', ws, tab.tabId]);
+    const status = parseJson(result.out);
+    const panePid = await this.isolatedPanePid(tab.sessionName);
+    const pane = processIdentity(panePid);
+    const record = standInRecord(this.state.home, expected?.sessionId);
+    const process = processIdentity(record?.pid);
+    const descendant = Boolean(panePid && process && processDescendsFrom(process.pid, panePid));
+    return assessFixtureAgent({ result, status, panePid, pane, record, process, expected, descendant });
+  }
+
+  async startLiveFixtureAgent(ws, tab, { inputFile = null } = {}) {
+    if (!tab) return { rc: -1, out: '', err: 'missing fixture agent' };
+    const launchedAfter = Date.now();
+    const started = await this.startStandIn(tab.sessionName, 'Ready.', {
+      workspaceDir: ws === this.state.workspaces.a ? 'a' : 'b', inputFile,
+      standInPath: liveStandIn(this.state.scratch),
+    });
+    if (started.rc !== 0) return started;
+    const sessionId = path.basename(started.transcriptPath, '.jsonl');
+    const processReady = await pollObservation(10000, async () => {
+      const observed = await this.observeFixtureAgent(ws, tab, { sessionId, launchedAfter });
+      return {
+        ...observed,
+        ok: observed.status?.alive === true && observed.status.command === 'claude'
+          && observed.facts.freshRecord && observed.facts.sameIdentity
+          && observed.facts.descendant && observed.facts.foreground
+          && observed.facts.process?.state !== 'Z' && observed.facts.process?.argv0 === 'claude',
+      };
+    });
+    if (!processReady.ok) {
+      return { ...started, rc: -1, err: `live fixture process was not observed: ${JSON.stringify(processReady.facts)}`, observation: processReady };
+    }
+    await this.hook('session-start', tab.sessionName);
+    const observation = await pollObservation(10000, () => this.observeFixtureAgent(ws, tab, { sessionId, launchedAfter }));
+    if (!observation.ok || !observation.identity) {
+      return { ...started, rc: -1, err: `live fixture was not observed: ${JSON.stringify(observation.facts)}`, observation };
+    }
+    this.fixtureAgents.set(tab.tabId, observation.identity);
+    return { ...started, observation };
+  }
+
+  async restoreLiveFixtureAgent(ws, tab) {
+    const marker = path.join(this.state.scratch, 'io', `shell-control-${tab.tabId}-${crypto.randomBytes(3).toString('hex')}`);
+    const sent = await this.keys(tab.sessionName, `: > ${shellQuote(marker)}`);
+    const shellControl = sent.rc === 0 && await within(3000, async () => fs.existsSync(marker));
+    if (!shellControl) return { rc: -1, out: '', err: `shell control not confirmed after ${brief(sent)}` };
+    return this.startLiveFixtureAgent(ws, tab);
   }
 
   /** Type `command` into a terminal tab; wait for the exit code it writes. */
@@ -286,15 +337,12 @@ class Instance {
     return parseJson((await this.cli(['tab', 'status', '-w', ws, tabId])).out)?.cliState ?? null;
   }
 
-  async fixtureAgentState(ws, tabId) {
-    const result = await this.cli(['tab', 'status', '-w', ws, tabId]);
-    const status = parseJson(result.out);
-    return {
-      ok: result.rc === 0 && status?.alive === true && status.command === 'claude'
-        && typeof status.agentSessionId === 'string' && status.agentSessionId.length > 0,
-      result,
-      status,
-    };
+  async fixtureAgentState(ws, tab) {
+    const expected = this.fixtureAgents.get(tab.tabId);
+    if (!expected) {
+      return { ok: false, result: { rc: -1, out: '', err: 'no captured live fixture identity' }, status: null, facts: null };
+    }
+    return this.observeFixtureAgent(ws, tab, expected);
   }
 
   /** The candidate CLI as a one-line shell command, for use inside a tab (whose PATH has no node). */
@@ -309,6 +357,75 @@ const readIf = (file) => {
   } catch {
     return null;
   }
+};
+
+const processIdentity = (pid) => {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/);
+    const argv0 = path.basename((fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0] || ''));
+    const identity = {
+      pid,
+      state: fields[0],
+      ppid: Number(fields[1]),
+      pgrp: Number(fields[2]),
+      tpgid: Number(fields[5]),
+      startTicks: Number(fields[19]),
+      argv0,
+    };
+    return Number.isSafeInteger(identity.ppid) && Number.isSafeInteger(identity.pgrp)
+      && Number.isSafeInteger(identity.tpgid) && Number.isSafeInteger(identity.startTicks) ? identity : null;
+  } catch {
+    return null;
+  }
+};
+
+const processDescendsFrom = (pid, ancestorPid) => {
+  if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ancestorPid)) return false;
+  const seen = new Set();
+  let current = pid;
+  while (current > 1 && !seen.has(current)) {
+    if (current === ancestorPid) return true;
+    seen.add(current);
+    current = processIdentity(current)?.ppid ?? 0;
+  }
+  return false;
+};
+
+const assessFixtureAgent = ({ result, status, panePid, pane, record, process, expected, descendant }) => {
+  const freshRecord = Boolean(record && Number.isFinite(record.startedAt)
+    && (!expected?.launchedAfter || record.startedAt >= expected.launchedAfter - 1000));
+  const sameIdentity = Boolean(record && process
+    && (!expected?.pid || record.pid === expected.pid)
+    && (!expected?.startedAt || record.startedAt === expected.startedAt)
+    && (!expected?.startTicks || process.startTicks === expected.startTicks));
+  const foreground = Boolean(pane && process && pane.tpgid > 0 && process.pgrp === pane.tpgid);
+  const bound = status?.agentSessionId === expected?.sessionId;
+  const ok = result.rc === 0 && status?.alive === true && status.command === 'claude'
+    && status.agentProviderId === 'claude' && bound && freshRecord && sameIdentity
+    && process?.state !== 'Z' && process?.argv0 === 'claude' && descendant && foreground;
+  return {
+    ok,
+    result,
+    status,
+    facts: {
+      panePid,
+      record: record ? { pid: record.pid, sessionId: record.sessionId, startedAt: record.startedAt } : null,
+      process,
+      freshRecord,
+      sameIdentity,
+      descendant,
+      foreground,
+      bound,
+    },
+    identity: ok ? {
+      sessionId: record.sessionId,
+      pid: record.pid,
+      startedAt: record.startedAt,
+      startTicks: process.startTicks,
+    } : null,
+  };
 };
 
 const shellQuote = (s) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(s) ? s : `'${String(s).replace(/'/g, `'\\''`)}'`);
@@ -357,19 +474,16 @@ const retainDesignatedFixture = async (inst, ws, candidates, { restore = null } 
     };
   }
 
-  let live = await inst.fixtureAgentState(ws, retained.tabId);
+  let live = await inst.fixtureAgentState(ws, retained);
   let restored = null;
   if (!live.ok && restore) {
     restored = await restore(retained);
-    if (restored?.rc === 0) live = await within(10000, async () => {
-      const observed = await inst.fixtureAgentState(ws, retained.tabId);
-      return observed.ok ? observed : null;
-    }) || live;
+    if (restored?.rc === 0) live = await pollObservation(10000, () => inst.fixtureAgentState(ws, retained));
   }
   if (!live.ok) {
     return {
       ok: false,
-      measured: `designated ${retained.tabId} not live: ${brief(live.result)} ${JSON.stringify(live.status ?? null)}; restore ${restored ? brief(restored) : 'not attempted'}`,
+      measured: `designated ${retained.tabId} not live: ${brief(live.result)} status ${JSON.stringify(live.status ?? null)} facts ${JSON.stringify(live.facts ?? null)}; restore ${restored ? brief(restored) : 'not attempted'}`,
       retained: retained.tabId,
       closed: [],
     };
@@ -383,13 +497,13 @@ const retainDesignatedFixture = async (inst, ws, candidates, { restore = null } 
   }
   const afterResult = await inst.cli(['orchestration', 'status', '-w', ws]);
   const after = parseJson(afterResult.out)?.orchestration;
-  const finalLive = await inst.fixtureAgentState(ws, retained.tabId);
+  const finalLive = await pollObservation(5000, () => inst.fixtureAgentState(ws, retained));
   const mappingUnchanged = afterResult.rc === 0 && before.enabled === after?.enabled
     && before.orchestratorTabId === after?.orchestratorTabId && before.revision === after?.revision;
   const ok = closed.every((entry) => entry.ok) && mappingUnchanged && finalLive.ok;
   return {
     ok,
-    measured: `retained ${retained.tabId} live ${finalLive.ok}; restored ${restored ? brief(restored) : 'not needed'}; closes ${closed.map((entry) => `${entry.tabId}:${brief(entry.result)}:${JSON.stringify(entry.result.out.trim().split('\n')[0] ?? '')}`).join(',') || 'none'}; mapping ${JSON.stringify(before)} -> ${JSON.stringify(after ?? null)}`,
+    measured: `retained ${retained.tabId} live ${finalLive.ok} facts ${JSON.stringify(finalLive.facts ?? null)}; restored ${restored ? brief(restored) : 'not needed'}; closes ${closed.map((entry) => `${entry.tabId}:${brief(entry.result)}:${JSON.stringify(entry.result.out.trim().split('\n')[0] ?? '')}`).join(',') || 'none'}; mapping ${JSON.stringify(before)} -> ${JSON.stringify(after ?? null)}`,
     retained: retained.tabId,
     closed,
   };
@@ -597,6 +711,17 @@ const within = async (ms, probe) => {
     if (value || Date.now() >= deadline) return value;
     await sleep(POLL_MS);
   }
+};
+
+/** Poll observed facts, returning the last observation rather than a stale pre-poll snapshot. */
+const pollObservation = async (ms, probe) => {
+  const deadline = Date.now() + ms;
+  let last;
+  do {
+    last = await probe();
+    if (last?.ok || Date.now() >= deadline) return last;
+    await sleep(POLL_MS);
+  } while (true);
 };
 
 /** Story 15 (ADR-0018): turn-end markers, WAITING, and the idle nudge of a stop with no end line (L49), in workspace B. */
@@ -878,10 +1003,10 @@ const notes = async (inst, { nonce, wsA, wsB, check, created }) => {
   } finally {
     const released = reader ? await inShell(wsA, reader, inst.tabCli(['lease', 'release', `epic:${epic}`])) : missing;
     const retainA = await retainDesignatedFixture(inst, wsA, [orch, reader], {
-      restore: (tab) => inst.startFixtureAgent(wsA, tab, { composer: true }),
+      restore: (tab) => inst.restoreLiveFixtureAgent(wsA, tab),
     });
     const retainB = await retainDesignatedFixture(inst, wsB, [sender, worker], {
-      restore: (tab) => inst.startFixtureAgent(wsB, tab, { composer: true }),
+      restore: (tab) => inst.restoreLiveFixtureAgent(wsB, tab),
     });
     check(
       'note-designated-housekeeping',
@@ -1051,7 +1176,10 @@ const main = async (argv) => {
   return pass ? 0 : 1;
 };
 
-module.exports = { Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs, retainDesignatedFixture };
+module.exports = {
+  Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs,
+  retainDesignatedFixture, assessFixtureAgent, pollObservation, processIdentity, processDescendsFrom,
+};
 
 if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));

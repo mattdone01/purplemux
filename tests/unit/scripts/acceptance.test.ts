@@ -123,6 +123,32 @@ describe('checks.cjs judgements', () => {
     expect(unknownLive.cli).toHaveBeenCalledTimes(1);
   });
 
+  it('requires a fresh bound non-zombie foreground Claude descendant, rejecting shell-only and stale identities', () => {
+    const expected = { sessionId: 'session-live', pid: 42, startedAt: 1000, startTicks: 700 };
+    const base = {
+      result: { rc: 0, out: '{}', err: '' },
+      status: { alive: true, command: 'claude', agentProviderId: 'claude', agentSessionId: 'session-live' },
+      panePid: 20,
+      pane: { pid: 20, state: 'S', ppid: 1, pgrp: 20, tpgid: 42, startTicks: 500, argv0: 'bash' },
+      record: { pid: 42, sessionId: 'session-live', startedAt: 1000 },
+      process: { pid: 42, state: 'S', ppid: 20, pgrp: 42, tpgid: 42, startTicks: 700, argv0: 'claude' },
+      expected,
+      descendant: true,
+    };
+    expect(checks.assessFixtureAgent(base)).toMatchObject({ ok: true, identity: expected });
+    expect(checks.assessFixtureAgent({ ...base, status: { ...base.status, command: 'bash' } }).ok).toBe(false);
+    expect(checks.assessFixtureAgent({ ...base, process: { ...base.process, startTicks: 701 } }).ok).toBe(false);
+    expect(checks.assessFixtureAgent({ ...base, process: { ...base.process, state: 'Z' } }).ok).toBe(false);
+    expect(checks.assessFixtureAgent({ ...base, status: { ...base.status, agentSessionId: 'stale-session' } }).ok).toBe(false);
+    expect(checks.assessFixtureAgent({ ...base, descendant: false }).ok).toBe(false);
+  });
+
+  it('returns the last observed facts when a bounded observation times out', async () => {
+    const observations = [{ ok: false, seq: 1 }, { ok: false, seq: 2 }];
+    const last = await checks.pollObservation(150, async () => observations.shift());
+    expect(last).toEqual({ ok: false, seq: 2 });
+  });
+
   it('revives only the same designated fixture before cleanup and rejects a changed mapping or failed close', async () => {
     let mapping = { enabled: true, orchestratorTabId: 'reader', revision: 3 };
     let observations = 0;
@@ -252,6 +278,9 @@ describe('checks-wave4.cjs fixtures (story 39)', () => {
         for (let i = 0; i < 40 && !fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').startsWith('claude'); i++) await new Promise((r) => setTimeout(r, 50));
         expect(fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').split('\0')[0]).toBe('claude');
         expect(fs.readFileSync(`/proc/${child.pid}/environ`, 'utf8').split('\0')).toContain(`HOME=${home}`);
+        expect(wave4.standInRecord(home, uuid)).toMatchObject({ pid: child.pid, sessionId: uuid, startedAt });
+        expect(checks.processIdentity(child.pid)).toMatchObject({ pid: child.pid, state: expect.not.stringMatching(/^Z$/), argv0: 'claude' });
+        expect(checks.processDescendsFrom(child.pid, process.pid)).toBe(true);
       }
       child.stdin!.write('typed line\n');
       child.stdin!.end();

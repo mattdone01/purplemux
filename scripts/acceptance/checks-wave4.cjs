@@ -139,18 +139,19 @@ const liveStandIn = (scratch) => {
 };
 
 /** The process start the live stand-in recorded for session `uuid` (its pid file), or null before it did. */
-const standInStart = (home, uuid) => {
+const standInRecord = (home, uuid) => {
   const dir = path.join(home, '.claude', 'sessions');
   for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
     try {
       const data = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-      if (data.sessionId === uuid && Number.isFinite(data.startedAt)) return data.startedAt;
+      if (data.sessionId === uuid && Number.isSafeInteger(data.pid) && Number.isFinite(data.startedAt)) return data;
     } catch {
       // a pid file being written
     }
   }
   return null;
 };
+const standInStart = (home, uuid) => standInRecord(home, uuid)?.startedAt ?? null;
 
 /** Bracketed-paste markers a pane may carry around a pasted line. */
 const unpaste = (text) => text.replace(/\u001b\[20[01]~/g, '');
@@ -230,7 +231,7 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
   const { b: wsB } = inst.state.workspaces;
   const ids = ['subagent-shell-waiting', 'subagent-woken-waiting', 'turn-end-served'];
   const orch = await tab(wsB, `acc4-orch-${nonce}`, 'claude-code', ['--no-launch']);
-  await inst.startFixtureAgent(wsB, orch, { composer: true });
+  await inst.startLiveFixtureAgent(wsB, orch);
   await sleep(1000);
   const on = orch?.tabId ? await inst.designate(wsB, orch.tabId) : { rc: -1, out: '', err: 'no tab' };
   // A stop with no end line nudges only after the idle window (L49); 3 s instead of the 15 min default.
@@ -514,10 +515,8 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
   fs.mkdirSync(path.dirname(inputFile), { recursive: true });
   fs.writeFileSync(inputFile, '');
   const standIn = orch
-    ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', inputFile, standInPath: liveStandIn(inst.state.scratch) })
+    ? await inst.startLiveFixtureAgent(wsA, orch, { inputFile })
     : { rc: -1 };
-  await sleep(1500);
-  if (orch) await inst.hook('session-start', orch.sessionName);
   const on = orch?.tabId ? await inst.designate(wsA, orch.tabId) : { rc: -1 };
   const idle = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
   // The orchestrator's live binding: the server finds the stand-in's session from its `--resume`
@@ -560,6 +559,6 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
 };
 
 module.exports = {
-  wave4, request, humanSession, liveStandIn, standInStart, judgeMissionTyped, judgeSubagentWait,
+  wave4, request, humanSession, liveStandIn, standInRecord, standInStart, judgeMissionTyped, judgeSubagentWait,
   userLine, assistantEnd, queuedCompletion, subagentMovedShell, subagentDelivery, asyncAgentLaunch,
 };
