@@ -344,9 +344,27 @@ if ((!ROLLBACK)); then
   if [[ -e "$RELEASE_DIR" ]]; then
     [[ "$("$GIT" -C "$RELEASE_DIR" rev-parse HEAD 2>/dev/null)" == "$SHA" ]] \
       || refuse 2 RELEASE-DIR-CONFLICT "$RELEASE_DIR exists and is not a worktree at $SHA" "an absent or matching release directory"
+    if ! release_status="$("$GIT" -C "$RELEASE_DIR" status --porcelain=v1 --untracked-files=normal 2>/dev/null)"; then
+      refuse 2 RELEASE-DIR-CONFLICT "$RELEASE_DIR cannot be inspected as a worktree at $SHA" \
+        "an absent or matching release directory"
+    fi
+    if [[ -n "$release_status" ]]; then
+      release_status_summary="$(sed -n '1,5p' <<<"$release_status" | tr '\n' ' ')"
+      refuse 2 RELEASE-DIR-INCOMPLETE "$RELEASE_DIR is not a clean initialized checkout: $release_status_summary" \
+        "a clean initialized release worktree; inspect it and remove it through git worktree remove before retrying"
+    fi
     reused=1
   elif ! "$GIT" -C "$REPO" worktree add --detach "$RELEASE_DIR" "$SHA" >>"$BUILD_LOG" 2>&1; then
     refuse 2 BUILD-FAILED "git worktree add failed (see $BUILD_LOG)" "a release worktree at $RELEASE_DIR"
+  fi
+  expected_tsconfig="$("$GIT" -C "$REPO" rev-parse "$SHA:tsconfig.json" 2>/dev/null || true)"
+  actual_tsconfig=""
+  [[ -f "$RELEASE_DIR/tsconfig.json" ]] \
+    && actual_tsconfig="$("$GIT" -C "$RELEASE_DIR" hash-object tsconfig.json 2>/dev/null || true)"
+  if [[ -z "$expected_tsconfig" || "$actual_tsconfig" != "$expected_tsconfig" ]]; then
+    ((reused)) || "$GIT" -C "$REPO" worktree remove --force "$RELEASE_DIR" >>"$BUILD_LOG" 2>&1
+    refuse 2 RELEASE-DIR-INCOMPLETE "$RELEASE_DIR does not contain the tracked tsconfig.json from $SHA" \
+      "the commit's tracked TypeScript configuration in a clean initialized release worktree"
   fi
   if ! (cd "$RELEASE_DIR" && env -u NODE_ENV "$PNPM" install --frozen-lockfile && env -u NODE_ENV "$PNPM" build) >>"$BUILD_LOG" 2>&1; then
     tail -n 40 "$BUILD_LOG" >&2

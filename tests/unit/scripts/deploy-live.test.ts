@@ -232,6 +232,8 @@ const makeHarness = (options: { homeViaSymlink?: boolean } = {}): IHarness => {
     git(repo, 'commit', '-q', '-m', message);
     return git(repo, 'rev-parse', 'HEAD');
   };
+  fs.writeFileSync(path.join(repo, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}\n');
+  git(repo, 'add', 'tsconfig.json');
   commit('first');
 
   const setHttp = (route: string, code: number, body: unknown, phase?: number) => {
@@ -909,6 +911,21 @@ describe('scripts/deploy-live.sh', { timeout: 60_000 }, () => {
     const { status, out } = h.run([h.sha()]);
     expect(status, out).toBe(2);
     expect(out).toContain('REFUSED RELEASE-DIR-CONFLICT');
+  });
+
+  it('refuses a matching release worktree whose checkout was never initialized', () => {
+    const sha = h.sha();
+    const release = path.join(h.releases, sha.slice(0, 12));
+    fs.mkdirSync(h.releases, { recursive: true });
+    git(h.repo, 'worktree', 'add', '--detach', '--no-checkout', release, sha);
+
+    const { status, out } = h.run([sha]);
+
+    expect(status, out).toBe(2);
+    expect(out).toContain('REFUSED RELEASE-DIR-INCOMPLETE');
+    expect(out).toContain('tsconfig.json');
+    expect(h.log('pnpm')).toBe('');
+    expect(restarts(h)).toBe(0);
   });
 
   it('refuses while another deploy holds the lock', () => {
