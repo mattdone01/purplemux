@@ -26,12 +26,16 @@ const settled = async () => { await roots().__ptTabTokenLock; };
 let state: INotesState;
 let inbox: Map<string, IInboxItem>;
 let roles: Map<string, string>;
+let revisions: Map<string, number>;
 let tabs: Map<string, { workspaceId: string; tabId: string; sessionName: string }>;
+let fixtureAgents: Map<string, { workspaceId: string; sessionName: string; sessionId: string; pid: number; startTicks: number; active: boolean }>;
+let closedTabs: Set<string>;
 let epics: Map<string, { workspaceId: string; tabId: string }>;
 let records: Record<string, unknown>;
 let service: NotesService;
 let inputFile: string;
 let sequence: number;
+let agentSequence: number;
 const created = async (workspaceId: string, name: string, _type: string, _extra: string[] = []) => {
   const tabId = name.replace('acc2-', 'tab-');
   const tab = { workspaceId, tabId, sessionName: `session-${tabId}` };
@@ -76,7 +80,8 @@ beforeEach(async () => {
   vi.resetModules(); reset();
   fixture.home = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-combined-'));
   fs.mkdirSync(path.join(fixture.home, '.purplemux'));
-  state = { notes: [] }; inbox = new Map(); roles = new Map(); tabs = new Map(); epics = new Map(); records = {}; sequence = 0; inputFile = '';
+  state = { notes: [] }; inbox = new Map(); roles = new Map(); revisions = new Map(); tabs = new Map(); fixtureAgents = new Map(); closedTabs = new Set();
+  epics = new Map(); records = {}; sequence = 0; agentSequence = 0; inputFile = '';
   const deps: INotesDeps = {
     now: () => Date.now(), newId: () => `n-combined${++sequence}`,
     mutate: async (fn) => { const result = await fn(state); state = result.state; return result.value; },
@@ -104,6 +109,35 @@ afterEach(async () => { await settled(); reset(); fs.rmSync(fixture.home, { recu
 describe('combined routing, caller authentication and mutation confinement', () => {
   it('runs the actual acceptance note fixture through real note/send/steer routes and routing service', async () => {
     const ok = { rc: 0, out: '{}', err: '' };
+    const mapping = (workspaceId: string) => ({
+      enabled: roles.has(workspaceId),
+      orchestratorTabId: roles.get(workspaceId) ?? null,
+      revision: revisions.get(workspaceId) ?? 0,
+    });
+    const designate = async (workspaceId: string, tabId: string) => {
+      const tab = tabs.get(tabId);
+      if (!tab || tab.workspaceId !== workspaceId) return { rc: 1, out: '', err: 'tab not found in workspace' };
+      roles.set(workspaceId, tabId);
+      revisions.set(workspaceId, (revisions.get(workspaceId) ?? 0) + 1);
+      return { ...ok, out: JSON.stringify({ orchestration: mapping(workspaceId) }) };
+    };
+    const startFixtureAgent = async (workspaceId: string, tab: { workspaceId: string; tabId: string; sessionName: string }, opts: { inputFile?: string } = {}) => {
+      const actual = tabs.get(tab.tabId);
+      if (!actual || actual.workspaceId !== workspaceId || actual.sessionName !== tab.sessionName) {
+        return { rc: -1, out: '', err: 'fixture tab is absent or mismatched' };
+      }
+      if (opts.inputFile) inputFile = opts.inputFile;
+      agentSequence += 1;
+      fixtureAgents.set(tab.tabId, {
+        workspaceId,
+        sessionName: tab.sessionName,
+        sessionId: `fixture-${tab.tabId}-${agentSequence}`,
+        pid: 10000 + agentSequence,
+        startTicks: 20000 + agentSequence,
+        active: true,
+      });
+      return ok;
+    };
     const inst = {
       state: { scratch: fixture.home },
       tabCli: (args: string[]) => JSON.stringify(args),
@@ -119,11 +153,23 @@ describe('combined routing, caller authentication and mutation confinement', () 
       cli: async (args: string[]) => {
         if (args[0] === 'orchestration') {
           const ws = args[3];
-          if (args[1] === 'on') roles.set(ws, args[4]);
-          if (args[1] === 'off') roles.delete(ws);
-          return { ...ok, out: JSON.stringify({ orchestration: { enabled: roles.has(ws), orchestratorTabId: roles.get(ws) ?? null } }) };
+          if (args[1] === 'on') return designate(ws, args[4]);
+          if (args[1] === 'off') {
+            roles.delete(ws);
+            revisions.set(ws, (revisions.get(ws) ?? 0) + 1);
+          }
+          return { ...ok, out: JSON.stringify({ orchestration: mapping(ws) }) };
         }
-        if (args[0] === 'tab') return ok;
+        if (args[0] === 'tab' && args[1] === 'close') {
+          const ws = args[3];
+          const tabId = args[4];
+          const tab = tabs.get(tabId);
+          if (!tab || tab.workspaceId !== ws) return { rc: 4, out: '', err: 'target tab is absent' };
+          tabs.delete(tabId);
+          fixtureAgents.delete(tabId);
+          closedTabs.add(tabId);
+          return { rc: 0, out: 'ok\n', err: '' };
+        }
         await service.tick();
         for (const item of inbox.values()) if (item.state === 'queued') {
           const permit = await service.preflight(item);
@@ -137,9 +183,46 @@ describe('combined routing, caller authentication and mutation confinement', () 
         await service.tick();
         return { ...ok, out: JSON.stringify({ notes: state.notes }) };
       },
-      designate: async (ws: string, tabId: string) => { roles.set(ws, tabId); return ok; },
-      startFixtureAgent: async (_ws: string, _tab: unknown, opts: { inputFile?: string } = {}) => { if (opts.inputFile) inputFile = opts.inputFile; return ok; },
-      hook: async () => 204, cliState: async () => 'idle', keys: async () => ok,
+      designate,
+      startFixtureAgent,
+      restoreLiveFixtureAgent: startFixtureAgent,
+      fixtureAgentState: async (workspaceId: string, tab: { workspaceId: string; tabId: string; sessionName: string }) => {
+        const actual = tabs.get(tab.tabId);
+        const agent = fixtureAgents.get(tab.tabId);
+        const present = actual?.workspaceId === workspaceId && actual.sessionName === tab.sessionName;
+        const identityMatches = agent?.workspaceId === workspaceId && agent.sessionName === tab.sessionName;
+        const live = present && identityMatches && agent?.active === true;
+        const status = present ? {
+          alive: true,
+          command: live ? 'claude' : 'bash',
+          agentSessionId: live ? agent.sessionId : null,
+        } : null;
+        const result = present ? { rc: 0, out: JSON.stringify(status), err: '' } : { rc: 4, out: '', err: 'target tab is absent' };
+        return {
+          ok: live,
+          result,
+          status,
+          facts: {
+            tabPresent: present,
+            identityMatches,
+            active: agent?.active ?? false,
+            sessionId: agent?.sessionId ?? null,
+            pid: agent?.pid ?? null,
+            startTicks: agent?.startTicks ?? null,
+          },
+        };
+      },
+      hook: async () => 204,
+      cliState: async () => 'idle',
+      keys: async (sessionName: string, keys: string) => {
+        const tab = [...tabs.values()].find((candidate) => candidate.sessionName === sessionName);
+        if (!tab) return { rc: 4, out: '', err: 'target tab is absent' };
+        if (keys === 'C-c') {
+          const agent = fixtureAgents.get(tab.tabId);
+          if (agent) fixtureAgents.set(tab.tabId, { ...agent, active: false });
+        }
+        return ok;
+      },
     };
     const outcomes: { id: string; passed: boolean; measured: string }[] = [];
     await checks.notes(inst, { nonce: 'combined', wsA: 'ws-a', wsB: 'ws-b', created,
@@ -149,7 +232,12 @@ describe('combined routing, caller authentication and mutation confinement', () 
     expect(outcomes.filter((r) => !r.passed)).toEqual([]);
     expect(state.notes).toHaveLength(2);
     expect(state.notes.every((n) => n.state === 'acked')).toBe(true);
-    expect(roles.size).toBe(2);
+    expect(Object.fromEntries(roles)).toEqual({ 'ws-a': 'tab-reader', 'ws-b': 'tab-sender' });
+    expect(Object.fromEntries(revisions)).toEqual({ 'ws-a': 2, 'ws-b': 3 });
+    expect([...tabs.keys()].sort()).toEqual(['tab-reader', 'tab-sender']);
+    expect([...closedTabs].sort()).toEqual(['tab-orch-a', 'tab-worker']);
+    expect([...fixtureAgents.entries()].map(([tabId, agent]) => ({ tabId, active: agent.active })).sort((a, b) => a.tabId.localeCompare(b.tabId)))
+      .toEqual([{ tabId: 'tab-reader', active: true }, { tabId: 'tab-sender', active: true }]);
   }, 15000);
 
   it('routing denies a hook coordinator without presentation writes while preserving its local note authority', async () => {
