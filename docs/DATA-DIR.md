@@ -31,6 +31,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── sidebar-items.json       # custom sidebar items + disabled builtins
 ├── vapid-keys.json          # Web Push VAPID keypair (generated)
 ├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
+├── orchestrator-presence.json # durable missing-owner notification episode latches
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
 ├── hook-spool/              # hook events no server answered (0700; ADR-0020)
@@ -209,6 +210,17 @@ The same file holds both channels' registrations, told apart by a `kind` discrim
 ```
 
 A Web Push row carries **no** `kind` — rows written before FCM existed round-trip unchanged, and `getSubscriptionRecords()` / `getFcmSubscriptionRecords()` each read only their own kind. `DELETE` takes `{endpoint}` for a Web Push row, `{token}` for one FCM registration, or `{deviceId}` for every FCM registration of one device. `GET` returns `devices` (endpoints) and `fcmDevices`; the FCM listing carries the device binding but never the token, which is a send credential.
+
+### `orchestrator-presence.json`
+
+The coverage monitor persists only the workspace IDs whose current missing-owner
+episode has already claimed its notification. This keeps repeat watchdog ticks
+and server restarts at-most-once per episode. An uncertain read, an omitted
+workspace, or a restart does not clear a latch; only confirmed recovery or
+confirmed completion does. The file is strict-read and atomically replaced, so
+damage pauses notification transitions instead of becoming an empty state.
+Lease and liveness files are also read through strict diagnostic views for this
+monitor; their normal mutation/API compatibility paths are unchanged.
 
 ### FCM service account (outside `~/.purplemux`)
 

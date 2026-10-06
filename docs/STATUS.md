@@ -721,6 +721,45 @@ todo`, `note?`), `blockers[]` (`what`, `needs` — the exact input that clears i
 `needsHuman`, `next[]`. The sidebar chip shows the state dot, done-count, and headline;
 ticks older than `STANDUP_STALE_MS` (20 min) render as stale.
 
+## Orchestrator Coverage
+
+Every status poll checks whether a workspace with remaining work has a usable
+designated orchestrator. Remaining-work evidence comes from active `epic:`
+leases, a latest standup whose state is not `done`, active agent tabs, and live
+registered background jobs. Registered job owners are checked even when their
+tabs are no longer in the current layout; their liveness still goes through the
+existing PID-aware manager. Confirmed-live owner IDs are retained when a
+different job lookup is rejected or cannot account for its registered PID; the
+same result also carries incomplete evidence, so known work stays red while the
+partial read remains visible. An idle agent is not completion evidence. An empty
+workspace, or a `done` standup with no conflicting work evidence, needs no
+orchestrator.
+
+The designation is usable when orchestration is enabled and its agent tab has a
+known live work state, including `idle` and `needs-input`. A missing, disabled,
+closed, or inactive designation beside confirmed remaining work creates a red
+`Orchestrator coverage` row in Mission Control's existing Coordination panel
+and dispatches one `orchestrator-missing` alert for that episode. The monitor
+does not select a worker, change orchestration settings, or release leases.
+Confirmed recovery (or confirmed completion) rearms the alert; repeated polls
+and uncertain owner reads do not. A positively usable designated owner rearms
+the missing-owner episode even when work evidence remains amber. Episode
+latches are atomically persisted in
+`~/.purplemux/orchestrator-presence.json`, so an unchanged missing condition does
+not alert again after a server restart. Presence refreshes are single-flight
+from evidence collection through dispatch, preventing an older overlapping
+scan from applying after a newer one.
+
+Unreadable or structurally invalid leases, standups, layouts, background-job
+state, or unknown incumbent liveness produce an amber `uncertain` row instead
+of a green result, even when another source proves remaining work and the
+incumbent is live. A live
+coordinator waiting for a human answer remains the incumbent. The monitor is a
+`globalThis.__ptOrchestratorPresenceMonitor` singleton so the custom server and
+Next.js coordination route see the same snapshot and refresh guard. A corrupt
+episode-latch file appears as an unavailable Coordination section and is never
+silently replaced.
+
 ## Notification System
 
 ### Notification Sheet (`NotificationSheet`)
@@ -754,6 +793,12 @@ shouldAlert({ id: tabId }, workspace, config)
 
 `alertsOrchestratorOnly` is a `config.json` key (`ALERTS_ORCHESTRATOR_ONLY_DEFAULT`), toggled in Settings → Notifications.
 
+The status-socket `notification:alert` consumer is intentionally limited to
+`orchestrator-missing`, which has no tab-state transition to drive an existing
+subscriber. Completion toasts remain owned by `use-toast-notification.ts`, so
+their enable flag, focused-tab suppression, duration, action, and deduplication
+remain unchanged and no second warning toast is created.
+
 ### Alert Kinds
 
 | Kind | Title | Fired from |
@@ -762,6 +807,7 @@ shouldAlert({ id: tabId }, workspace, config)
 | `review` | Task Complete | `applyCliState` → `ready-for-review` |
 | `standup-needs-human` | Standup Needs You | `reportStandup` when `needsHuman` (or state `blocked`/`awaiting-human`); addressed to the orchestrator tab, body is the headline |
 | `orchestrator-stalled` | Orchestrator Stalled | `runOrchestratorKeeper` on the `ORCH_MAX_HEARTBEATS` beat, once per stall episode |
+| `orchestrator-missing` | Orchestrator Missing | the coverage monitor finds confirmed remaining work with a missing, disabled, closed, or inactive designation; once per episode |
 
 The idempotent guard at the top of `applyCliState` (`prevState === newState`) blocks duplicate calls, so callers don't have to track state.
 

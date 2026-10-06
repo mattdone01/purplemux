@@ -2,7 +2,8 @@ import type { ICaller } from '@/lib/caller';
 import type { ICoordinationSnapshot, INoteRow, TSection } from '@/types/coordination';
 
 // The coordination panel's read (story 20): leases, open notes, watches, active
-// grants, held inbox deliveries and host pressure, each section independent.
+// grants, held inbox deliveries, orchestrator coverage and host pressure, each
+// section independent.
 
 const section = async <T>(read: () => Promise<T[]>): Promise<TSection<T>> => {
   try {
@@ -18,7 +19,7 @@ const PANEL_CALLER = {
 } as ICaller;
 
 export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoordinationSnapshot> => {
-  const [{ listLeases }, { viewsOf }, notes, { getWatchManager }, grantStore, { readInboxState }, { readHostMetrics }, { hostSignalsView }] = await Promise.all([
+  const [{ listLeases }, { viewsOf }, notes, { getWatchManager }, grantStore, { readInboxState }, { readHostMetrics }, { hostSignalsView }, { getOrchestratorPresenceMonitor }] = await Promise.all([
     import('@/lib/lease-store'),
     import('@/lib/lease-http'),
     import('@/lib/notes-store'),
@@ -27,7 +28,9 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
     import('@/lib/inbox-store'),
     import('@/lib/host-metrics'),
     import('@/lib/host-signals'),
+    import('@/lib/orchestrator-presence'),
   ]);
+  const orchestratorSnapshot = getOrchestratorPresenceMonitor().snapshot();
   const [leases, openNotes, watches, grants, inboxHeld, host] = await Promise.all([
     section(async () => viewsOf(await listLeases(undefined, now))),
     section(async (): Promise<INoteRow[]> => (await notes.readNotesState()).notes
@@ -42,5 +45,10 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
     section(async () => (await readInboxState()).items.filter((i) => i.state === 'held')),
     readHostMetrics().catch((err) => ({ available: false as const, reason: err instanceof Error ? err.message : String(err) })),
   ]);
-  return { at: now, leases, notes: openNotes, watches, grants, inboxHeld, host, signals: hostSignalsView(now) };
+  const orchestrators = orchestratorSnapshot.state === 'ready'
+    ? { ok: true as const, items: orchestratorSnapshot.issues }
+    : { ok: false as const, error: orchestratorSnapshot.state === 'error'
+      ? orchestratorSnapshot.error
+      : 'Orchestrator coverage has not been evaluated yet' };
+  return { at: now, leases, notes: openNotes, watches, grants, inboxHeld, orchestrators, host, signals: hostSignalsView(now) };
 };

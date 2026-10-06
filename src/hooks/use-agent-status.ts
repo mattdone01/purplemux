@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { toast } from 'sonner';
 import useTabStore from '@/hooks/use-tab-store';
 import useTabMetadataStore from '@/hooks/use-tab-metadata-store';
 import useRateLimitsStore from '@/hooks/use-rate-limits-store';
@@ -9,7 +10,7 @@ import useGitStatusStore from '@/hooks/use-git-status-store';
 import { useLayoutStore } from '@/hooks/use-layout';
 import { formatTabTitle } from '@/lib/tab-title';
 import { collectAllTabs } from '@/lib/layout-tree';
-import type { ILastEvent, TStatusServerMessage } from '@/types/status';
+import type { ILastEvent, INotificationAlertMessage, TStatusServerMessage } from '@/types/status';
 
 const RECONNECT_BASE = 1_000;
 const RECONNECT_MAX = 30_000;
@@ -33,6 +34,11 @@ export const ackNotificationInput = (tabId: string, seq: number) => {
   if (sharedWs?.readyState === WebSocket.OPEN) {
     sharedWs.send(JSON.stringify({ type: 'status:ack-notification', tabId, seq }));
   }
+};
+
+export const showNotificationAlert = ({ alert }: INotificationAlertMessage): void => {
+  if (alert.kind !== 'orchestrator-missing') return;
+  toast.warning(alert.title, { id: alert.id, description: alert.body });
 };
 
 const refreshGitStatusAfterStop = (tabId: string, event: ILastEvent) => {
@@ -143,6 +149,10 @@ const useAgentStatus = () => {
 
             case 'standup:update':
               useStandupStore.getState().setStandup(msg.standup);
+              break;
+
+            case 'notification:alert':
+              showNotificationAlert(msg);
               break;
           }
         } catch {

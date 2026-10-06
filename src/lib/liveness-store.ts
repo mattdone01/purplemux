@@ -14,6 +14,10 @@ export interface ILivenessFile {
   jobs: IBackgroundJob[];
 }
 
+export type TLivenessEvidence =
+  | { known: true; data: ILivenessFile }
+  | { known: false };
+
 const g = globalThis as unknown as {
   __ptLivenessLocks?: Map<string, Promise<void>>;
 };
@@ -39,6 +43,53 @@ const withLock = async <T>(wsId: string, fn: () => Promise<T>): Promise<T> => {
 
 const resolveLivenessPath = (wsId: string): string =>
   path.join(resolveLayoutDir(wsId), 'liveness.json');
+
+const isFiniteNonnegative = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+const isProbe = (value: unknown): value is ILivenessProbe => {
+  if (!value || typeof value !== 'object') return false;
+  const probe = value as Record<string, unknown>;
+  return typeof probe.workspaceId === 'string'
+    && typeof probe.tabId === 'string'
+    && typeof probe.label === 'string'
+    && typeof probe.command === 'string'
+    && isFiniteNonnegative(probe.stalenessThresholdS)
+    && isFiniteNonnegative(probe.intervalS)
+    && isFiniteNonnegative(probe.registeredAt);
+};
+
+const isJob = (value: unknown): value is IBackgroundJob => {
+  if (!value || typeof value !== 'object') return false;
+  const job = value as Record<string, unknown>;
+  return typeof job.workspaceId === 'string'
+    && typeof job.tabId === 'string'
+    && Number.isSafeInteger(job.pid)
+    && (job.pid as number) > 0
+    && isFiniteNonnegative(job.registeredAt)
+    && (job.label === undefined || typeof job.label === 'string')
+    && (job.stderrFile === undefined || typeof job.stderrFile === 'string')
+    && (job.exitCodeFile === undefined || typeof job.exitCodeFile === 'string')
+    && (job.notify === undefined || job.notify === 'self' || job.notify === 'orchestrator');
+};
+
+export const readLivenessEvidence = async (wsId: string): Promise<TLivenessEvidence> => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(resolveLivenessPath(wsId), 'utf-8')) as Partial<ILivenessFile> | null;
+    if (!Array.isArray(parsed?.probes)
+      || !parsed.probes.every(isProbe)
+      || !Array.isArray(parsed.jobs)
+      || !parsed.jobs.every(isJob)
+      || parsed.probes.some((probe) => probe.workspaceId !== wsId)
+      || parsed.jobs.some((job) => job.workspaceId !== wsId)) return { known: false };
+    return { known: true, data: { probes: parsed.probes, jobs: parsed.jobs } };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { known: true, data: { probes: [], jobs: [] } };
+    }
+    return { known: false };
+  }
+};
 
 const readFileAt = async (filePath: string): Promise<ILivenessFile> => {
   try {

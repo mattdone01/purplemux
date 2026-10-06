@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { resolveLayoutDir } from '@/lib/layout-store';
-import { MAX_STANDUP_HISTORY } from '@/lib/standup';
+import { MAX_STANDUP_HISTORY, parseStandupReport } from '@/lib/standup';
 import { createLogger } from '@/lib/logger';
 import type { IWorkspaceStandup } from '@/types/status';
 
@@ -69,6 +69,30 @@ const writeFile = async (filePath: string, data: IStandupFile): Promise<void> =>
 /** Newest first. */
 export const readStandups = async (wsId: string): Promise<IWorkspaceStandup[]> =>
   readFile(resolveStandupPath(wsId));
+
+/**
+ * Presence checks must distinguish an empty history from an unreadable one:
+ * treating a damaged standup file as "done" could hide unfinished work.
+ */
+export const readLatestStandupEvidence = async (
+  wsId: string,
+): Promise<{ known: true; standup: IWorkspaceStandup | null } | { known: false }> => {
+  try {
+    const raw = await fs.readFile(resolveStandupPath(wsId), 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<IStandupFile> | null;
+    if (!Array.isArray(parsed?.standups)) return { known: false };
+    const latest = parsed.standups[0];
+    if (latest === undefined) return { known: true, standup: null };
+    if (!latest || typeof latest !== 'object'
+      || latest.workspaceId !== wsId
+      || !Number.isFinite(latest.at)) return { known: false };
+    const standup = parseStandupReport(latest, wsId, latest.at);
+    return standup ? { known: true, standup } : { known: false };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { known: true, standup: null };
+    return { known: false };
+  }
+};
 
 export const addStandup = async (standup: IWorkspaceStandup): Promise<void> =>
   withLock(standup.workspaceId, async () => {

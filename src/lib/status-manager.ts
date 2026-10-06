@@ -31,7 +31,7 @@ import type { IPaneInfo } from '@/lib/tmux';
 import type { ITab, IWorkspace, TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ITurnErrorEpisode, ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
-import { addStandup, readAllLatestStandups } from '@/lib/standup-store';
+import { addStandup, readAllLatestStandups, readLatestStandupEvidence } from '@/lib/standup-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import {
@@ -53,7 +53,9 @@ import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { enqueueNotice, onInboxHeld, withdrawNotice } from '@/lib/inbox-store';
 import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
+import { readLivenessEvidence } from '@/lib/liveness-store';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
+import { readLeaseEvidence } from '@/lib/lease-store';
 import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
@@ -66,6 +68,8 @@ import { registerFcmChannel } from '@/lib/fcm-channel';
 import { getConfig } from '@/lib/config-store';
 import { nanoid } from 'nanoid';
 import { reconcileCodexLaunchTimeout } from '@/lib/providers/codex/launch-lifecycle';
+import { getOrchestratorPresenceMonitor } from '@/lib/orchestrator-presence';
+import type { IOrchestratorPresenceFacts } from '@/types/coordination';
 import fs from 'fs/promises';
 import { watch, type FSWatcher } from 'fs';
 
@@ -1094,7 +1098,12 @@ export class StatusManager {
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
   // idle로 잠들면 아무것도 깨우지 못한다 — 그 유일한 사각을 keeper가 메운다.
   private async runOrchestratorKeeper(): Promise<void> {
-    const workspaces = (await getWorkspacesCached())?.workspaces ?? [];
+    await this.runOrchestratorPresence().catch((err) => {
+      log.warn(`orchestrator presence refresh failed: ${err instanceof Error ? err.message : err}`);
+    });
+    const workspaceData = await getWorkspacesCached();
+    if (!workspaceData) return;
+    const workspaces = workspaceData.workspaces;
     const now = Date.now();
     for (const ws of workspaces) {
       const orch = ws.orchestration;
@@ -1174,6 +1183,95 @@ export class StatusManager {
       this.broadcast({ type: 'orchestration:nudge', nudge });
       log.info({ workspaceId: ws.id, beats, delivered }, 'orchestrator heartbeat');
     }
+  }
+
+  private async runOrchestratorPresence(): Promise<void> {
+    const monitor = getOrchestratorPresenceMonitor();
+    let workspaceById = new Map<string, IWorkspace>();
+    await monitor.refresh(async () => {
+      const workspaceData = await getWorkspacesCached();
+      if (!workspaceData) throw new Error('workspace registry unreadable');
+      const workspaces = workspaceData.workspaces;
+      workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+      const observedAt = Date.now();
+      const leaseEvidence = await readLeaseEvidence(observedAt);
+      const statuses = this.getAllForClient();
+      const liveness = getLivenessManager();
+      const facts = await Promise.all(workspaces.map(async (workspace): Promise<IOrchestratorPresenceFacts> => {
+        const [layout, standup, livenessEvidence] = await Promise.all([
+          readLayoutFile(resolveLayoutFile(workspace.id)),
+          readLatestStandupEvidence(workspace.id),
+          readLivenessEvidence(workspace.id),
+        ]);
+        const layoutTabs = layout ? collectAllTabs(layout.root) : null;
+        const tabs = layoutTabs?.map((tab) => ({
+          tabId: tab.id,
+          tabName: tab.name,
+          isAgent: isAgentPanelType(tab.panelType),
+          cliState: statuses[tab.id]?.workspaceId === workspace.id ? statuses[tab.id].cliState : null,
+        })) ?? null;
+
+        let liveBackgroundTabIds: string[] | null = livenessEvidence.known ? [] : null;
+        let backgroundWorkIncomplete = !livenessEvidence.known;
+        if (livenessEvidence.known) {
+          const pidsByTab = new Map<string, Set<number>>();
+          for (const job of livenessEvidence.data.jobs) {
+            const pids = pidsByTab.get(job.tabId) ?? new Set<number>();
+            pids.add(job.pid);
+            pidsByTab.set(job.tabId, pids);
+          }
+          const readings = await Promise.allSettled([...pidsByTab].map(async ([tabId, registeredPids]) => ({
+            tabId,
+            registeredPids,
+            status: await liveness.statusForTab(tabId),
+          })));
+          liveBackgroundTabIds = readings.flatMap((reading) => {
+            if (reading.status !== 'fulfilled') {
+              backgroundWorkIncomplete = true;
+              return [];
+            }
+            if ([...reading.value.registeredPids].some((pid) => (
+              !reading.value.status.backgroundJobs.some((job) => job.pid === pid)
+            ))) backgroundWorkIncomplete = true;
+            return reading.value.status.backgroundJobs.some((job) => (
+              reading.value.registeredPids.has(job.pid) && job.alive
+            )) ? [reading.value.tabId] : [];
+          });
+        }
+
+        return {
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          orchestration: workspace.orchestration
+            ? { enabled: workspace.orchestration.enabled, orchestratorTabId: workspace.orchestration.orchestratorTabId }
+            : null,
+          epicLeases: !leaseEvidence.known
+            ? null
+            : leaseEvidence.leases
+              .filter((lease) => lease.name.startsWith('epic:') && lease.holder.workspaceId === workspace.id)
+              .map((lease) => lease.name),
+          standupState: standup.known ? standup.standup?.state ?? null : undefined,
+          tabs,
+          liveBackgroundTabIds,
+          backgroundWorkIncomplete,
+        };
+      }));
+      return { facts, observedAt };
+    }, async (issue) => {
+      const tabId = issue.designatedTabId ?? '';
+      const entry = tabId ? this.tabs.get(tabId) : undefined;
+      const workspace = workspaceById.get(issue.workspaceId);
+      await this.dispatchAlert({
+        kind: 'orchestrator-missing',
+        tabId,
+        workspace,
+        workspaceId: issue.workspaceId,
+        tabName: entry?.tabName ?? '',
+        providerId: toAlertProvider(entry?.agentProviderId),
+        agentSessionId: entry?.agentSessionId,
+        detail: issue.reason,
+      });
+    });
   }
 
   private async dispatchStallAlert(ws: IWorkspace, entry: ITabStatusEntry, tabId: string, idleMinutes: number): Promise<void> {

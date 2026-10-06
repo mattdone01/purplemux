@@ -118,6 +118,23 @@ describe('lease store', () => {
     }
   });
 
+  it('keeps shallowly filtered malformed rows unknown to strict diagnostic readers', async () => {
+    const { leasesFile, listLeases, readLeaseEvidence } = await store();
+    await fs.mkdir(path.dirname(leasesFile()), { recursive: true });
+    await fs.writeFile(leasesFile(), JSON.stringify({
+      leases: [{
+        name: 'epic:damaged',
+        kind: 'epic',
+        acquiredAt: new Date(now).toISOString(),
+        renewedAt: new Date(now).toISOString(),
+        holder: { workspaceId: 'ws1' },
+      }],
+    }));
+
+    expect(await listLeases('epic:', now)).toEqual([]);
+    expect(await readLeaseEvidence(now)).toEqual({ known: false });
+  });
+
   it('releases only for the holder', async () => {
     const { acquireLease, releaseLease, findLease } = await store();
     await acquireLease({ name: 'merge:x/y' }, tabA, authority);

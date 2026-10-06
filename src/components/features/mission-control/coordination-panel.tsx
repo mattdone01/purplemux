@@ -172,6 +172,20 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
             <span className={cn('shrink-0', WARN)}>{heldReasonLabel(i.heldReason)}</span>
           </li>
         )} />
+        <Section title="Orchestrator coverage" section={snapshot.orchestrators} empty="Every unfinished workspace has a usable orchestrator" render={(issue) => (
+          <li
+            key={issue.workspaceId}
+            className="min-w-0 text-xs"
+            data-orchestrator-coverage={issue.workspaceId}
+            data-state={issue.state}
+          >
+            <span className={cn('font-medium', issue.state === 'missing' ? 'text-ui-red' : WARN)}>{issue.workspaceName}</span>
+            <span className="text-muted-foreground"> · {issue.reason}</span>
+            {issue.evidence.length > 0 && (
+              <span className="block break-words text-muted-foreground">Evidence: {issue.evidence.join('; ')}</span>
+            )}
+          </li>
+        )} />
         <div className="min-w-0 space-y-1.5" data-section="Host">
           <h3 className="text-xs font-semibold">Host</h3>
           {!host.available ? (

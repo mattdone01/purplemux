@@ -227,7 +227,7 @@ export interface IOrchestrationNudgeMessage {
   nudge: IOrchestrationNudge;
 }
 
-export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'work-stalled' | 'bg-job-died' | 'bg-job-unknown';
+export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'orchestrator-missing' | 'work-stalled' | 'bg-job-died' | 'bg-job-unknown';
 
 export type TAlertProviderId = 'claude' | 'codex' | 'grok';
 

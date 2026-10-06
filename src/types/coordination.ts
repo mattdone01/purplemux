@@ -3,6 +3,7 @@ import type { IInboxItem } from '@/types/inbox';
 import type { ILeaseView } from '@/types/lease';
 import type { INoteView } from '@/types/note';
 import type { IWatchView } from '@/types/watch';
+import type { TCliState } from '@/types/timeline';
 
 // The Mission Control coordination panel (story 20): each section is its own
 // result, so one unreadable store shows its error and never blanks the others.
@@ -46,6 +47,47 @@ export type THostSignals =
   | { state: 'ok'; value: IHostSignalsValue; ranAt: number; stale: boolean }
   | { state: 'error'; error: string; ranAt: number; stale: boolean };
 
+export type TOrchestratorCoverageState = 'missing' | 'uncertain';
+
+export type TOrchestratorPresenceState = 'usable' | 'missing' | 'disabled' | 'dead' | 'unknown';
+
+export type TWorkspaceWorkState = 'remaining' | 'complete' | 'unknown';
+
+export interface IOrchestratorPresenceTab {
+  tabId: string;
+  tabName: string;
+  isAgent: boolean;
+  cliState: TCliState | null;
+}
+
+export interface IOrchestratorPresenceFacts {
+  workspaceId: string;
+  workspaceName: string;
+  orchestration: { enabled: boolean; orchestratorTabId: string | null } | null;
+  /** null means the lease store could not be read. */
+  epicLeases: string[] | null;
+  /** undefined means the standup store could not be read; null means no standup exists. */
+  standupState: 'on-track' | 'at-risk' | 'blocked' | 'awaiting-human' | 'done' | null | undefined;
+  /** null means the workspace layout or tab state could not be read. */
+  tabs: IOrchestratorPresenceTab[] | null;
+  /** null means registered background liveness could not be read. */
+  liveBackgroundTabIds: string[] | null;
+  /** Some registered jobs could not be assessed even when other live jobs are known. */
+  backgroundWorkIncomplete: boolean;
+}
+
+export interface IOrchestratorPresenceIssue {
+  workspaceId: string;
+  workspaceName: string;
+  state: TOrchestratorCoverageState;
+  workState: TWorkspaceWorkState;
+  orchestratorState: TOrchestratorPresenceState;
+  designatedTabId: string | null;
+  evidence: string[];
+  reason: string;
+  observedAt: number;
+}
+
 export interface ICoordinationSnapshot {
   at: number;
   leases: TSection<ILeaseView>;
@@ -53,6 +95,7 @@ export interface ICoordinationSnapshot {
   watches: TSection<IWatchView>;
   grants: TSection<IGrant>;
   inboxHeld: TSection<IInboxItem>;
+  orchestrators: TSection<IOrchestratorPresenceIssue>;
   host: THostMetrics;
   signals: THostSignals;
 }
