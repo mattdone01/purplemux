@@ -233,6 +233,34 @@ describe('checks-wave5.cjs fixtures (ADR-0021)', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('requires plaintext close success plus a fresh matching reap with no survivors', () => {
+    const freshAudit = {
+      event: 'tab-reap', tabId: 'tab-test', session: 'session-test', keepProcesses: false,
+      killed: [{ pid: 42, comm: 'sleep', args: 'sleep 300' }], survivors: [],
+    };
+    const base = {
+      closed: { rc: 0, out: 'ok\nkilled 42 sleep sleep 300\n', err: '' },
+      tabPresent: false,
+      targetProbe: { rc: 1, out: '', err: "can't find window: session-test" },
+      controlProbe: { rc: 0, out: 'control\t%1\t40\n', err: '' },
+      entries: [{ event: 'earlier' }, freshAudit],
+      auditOffset: 1,
+      tabId: 'tab-test',
+      sessionName: 'session-test',
+    };
+    expect(wave5.closeDurabilityEvidence(base)).toEqual({ ok: true, audit: freshAudit });
+    for (const rejected of [
+      { entries: [], auditOffset: 0 },
+      { entries: [freshAudit], auditOffset: 1 },
+      { entries: [{ ...freshAudit, session: 'other' }], auditOffset: 0 },
+      { entries: [{ ...freshAudit, survivors: [{ pid: 43 }] }], auditOffset: 0 },
+      { closed: { rc: 1, out: '', err: 'close-not-confirmed' } },
+      { controlProbe: { rc: 1, out: '', err: 'no server running' } },
+    ]) {
+      expect(wave5.closeDurabilityEvidence({ ...base, ...rejected }).ok).toBe(false);
+    }
+  });
 });
 
 describe('checks-wave3.cjs judgements (story 23)', () => {

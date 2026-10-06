@@ -146,6 +146,31 @@ const hookAt = async (inst, session, event, occurredAt) => {
   });
 };
 
+const auditEntries = (raw) => raw.split('\n').filter(Boolean).flatMap((line) => {
+  try { return [JSON.parse(line)]; } catch { return []; }
+});
+
+const closeDurabilityEvidence = ({
+  closed, tabPresent, targetProbe, controlProbe, entries, auditOffset, tabId, sessionName,
+}) => {
+  const audit = entries.slice(auditOffset)
+    .filter((entry) => entry.event === 'tab-reap' && entry.tabId === tabId && entry.session === sessionName)
+    .at(-1) ?? null;
+  const firstLine = closed.out.split(/\r?\n/, 1)[0];
+  const targetAbsent = targetProbe.rc === 1 && [
+    `can't find session: ${sessionName}`,
+    `can't find window: ${sessionName}`,
+  ].includes(targetProbe.err.trim());
+  const auditConfirmed = audit?.keepProcesses === false
+    && Array.isArray(audit.killed) && audit.killed.length >= 1
+    && Array.isArray(audit.survivors) && audit.survivors.length === 0;
+  return {
+    ok: closed.rc === 0 && firstLine === 'ok' && !tabPresent && targetAbsent
+      && controlProbe.rc === 0 && auditConfirmed,
+    audit,
+  };
+};
+
 const orchestration = async (inst, ws) => {
   const result = await inst.cli(['orchestration', 'status', '-w', ws]);
   try { return JSON.parse(result.out).orchestration; } catch { return null; }
@@ -404,23 +429,26 @@ const wave5 = async (inst, helpers) => {
         && (await orchestration(inst, ws))?.orchestratorTabId === io.tabId,
       `designate ${brief(restartDesignated)}; remove ${brief(removedSession)}; absent ${absentBeforeRestart}; restart ${restarted.status}; panes ${paneBeforeRestart}/${paneAfterRestart}; control ${controlAlive}; recover ${brief(unknownRefusal)}; owner ${(await orchestration(inst, ws))?.orchestratorTabId}`,
       `session removed, restart 200 with new pane, control live, recover exit 3 state unknown, owner ${io.tabId}`);
+    const auditPath = path.join(inst.state.home, '.purplemux', 'audit', 'coordination.jsonl');
+    const auditOffset = auditEntries(readIf(auditPath) ?? '').length;
     const closed = await inst.cli(['tab', 'close', '-w', ws, io.tabId]);
-    const closePayload = parseJson(closed.out);
     const targetProbe = await inst.strictSessionProbe(io.sessionName);
     const controlProbe = await inst.strictSessionProbe(candidate.sessionName);
-    const audit = (readIf(path.join(inst.state.home, '.purplemux', 'audit', 'coordination.jsonl')) ?? '')
-      .trim().split('\n').filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } })
-      .filter((entry) => entry.event === 'tab-reap' && entry.tabId === io.tabId).at(-1) ?? null;
+    const closeEvidence = closeDurabilityEvidence({
+      closed,
+      tabPresent: Boolean(layoutTab(inst, ws, io.tabId)),
+      targetProbe,
+      controlProbe,
+      entries: auditEntries(readIf(auditPath) ?? ''),
+      auditOffset,
+      tabId: io.tabId,
+      sessionName: io.sessionName,
+    });
     check('recovery-restart-close-durability', 'restart retains unresolved input, while a later managed close confirms reap and removes the tab',
       restarted.status === 200 && pendingBeforeRestart?.generation === pendingAfterRestart?.generation
-        && closed.rc === 0 && !layoutTab(inst, ws, io.tabId)
-        && targetProbe.rc === 1 && [
-          `can't find session: ${io.sessionName}`,
-          `can't find window: ${io.sessionName}`,
-        ].includes(targetProbe.err.trim())
-        && controlProbe.rc === 0 && Array.isArray(closePayload?.survivors) && closePayload.survivors.length === 0,
-      `restart ${restarted.status}; generations ${pendingBeforeRestart?.generation}/${pendingAfterRestart?.generation}; close ${brief(closed)} payload ${JSON.stringify(closePayload)}; remains ${Boolean(layoutTab(inst, ws, io.tabId))}; target probe ${brief(targetProbe)}; control probe ${brief(controlProbe)}; audit ${JSON.stringify(audit)}; socket ${JSON.stringify(terminalEvidence(ioSocket))}`,
-      'restart 200 with same turn generation; close 0; exact target absent while control is present; no reap survivors; tab absent');
+        && closeEvidence.ok,
+      `restart ${restarted.status}; generations ${pendingBeforeRestart?.generation}/${pendingAfterRestart?.generation}; close ${brief(closed)}; remains ${Boolean(layoutTab(inst, ws, io.tabId))}; target probe ${brief(targetProbe)}; control probe ${brief(controlProbe)}; audit offset ${auditOffset}, selected ${JSON.stringify(closeEvidence.audit)}; socket ${JSON.stringify(terminalEvidence(ioSocket))}`,
+      'restart 200 with same turn generation; close exit 0 with first line ok; exact target absent while control is present; a new matching reap killed the live fixture with no survivors; tab absent');
   } catch (error) {
     fail('wave5-error', 'the recovery and raw-input acceptance checks ran to the end', error instanceof Error ? error.stack : String(error), 'no exception');
   } finally {
@@ -440,4 +468,4 @@ const wave5 = async (inst, helpers) => {
   return results;
 };
 
-module.exports = { wave5, daemonStandIn, findTab };
+module.exports = { wave5, daemonStandIn, findTab, closeDurabilityEvidence };
