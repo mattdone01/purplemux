@@ -683,7 +683,7 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=43 passed=42 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=76 passed=75 failed=0 skipped=1$/m);
     // The wave-2 checks (story 22) ran, each by id.
     for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
       'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {
