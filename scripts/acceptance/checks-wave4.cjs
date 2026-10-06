@@ -226,7 +226,7 @@ const checks = async (inst, helpers, results) => {
 };
 
 // ─── story 37: open work a subagent owns ─────────────────────────────────────────────────────────
-const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, status, brief }) => {
+const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, status, brief, retainDesignatedFixture }) => {
   const { b: wsB } = inst.state.workspaces;
   const ids = ['subagent-shell-waiting', 'subagent-woken-waiting', 'turn-end-served'];
   const orch = await tab(wsB, `acc4-orch-${nonce}`, 'claude-code', ['--no-launch']);
@@ -348,7 +348,14 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
     wokenJudged.measured,
     'control READY first; busy, no nudge, turnEnd waiting with 1 open task (the woken agent); then a ready nudge stamped after its completion',
   );
-  for (const w of [shell, woken, plain, orch]) if (w?.tabId) await inst.cli(['tab', 'close', '-w', wsB, w.tabId]);
+  const retained = await retainDesignatedFixture(inst, wsB, [shell, woken, plain, orch]);
+  check(
+    'subagent-designated-housekeeping',
+    'subagent cleanup retains the actual designated coordinator live with unchanged mapping and checks every other temporary tab close',
+    retained.ok,
+    retained.measured,
+    'the actual designated tab remains live; every other close exits 0 with ok; the mapping is unchanged',
+  );
 };
 
 // ─── story 36: identity is reported; the hook-time route is mint-only ───────────────────────────
@@ -499,7 +506,7 @@ const coordination = async (inst, { check, port, cookie }) => {
 };
 
 // ─── story 12: a reconcile bootstrap reaches the orchestrator through the inbox ─────────────────
-const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: tabStatus, brief, port, cookie, readIf, parseJson }) => {
+const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: tabStatus, brief, port, cookie, readIf, parseJson, retainDesignatedFixture }) => {
   const { a: wsA } = inst.state.workspaces;
   const orch = await tab(wsA, `acc4-mc-orch-${nonce}`, 'claude-code', ['--no-launch']);
   await sleep(1000);
@@ -542,7 +549,14 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
     `orchestration ${on.rc}, stand-in ${standIn.rc}, idle ${idle}, session bound ${Boolean(bound)}; standup ${brief(standup)}; bootstrap ${bootstrap.status} with ${entries.length} entries; mission items ${mission.map((i) => i.state).join(',') || 'none'}; composer input: ${judged.measured}`,
     'standup 0; bootstrap 200 with an entry; one delivered mission item; the composer received exactly one line, the fixed bootstrap notice for this workspace',
   );
-  if (orch?.tabId) await inst.cli(['tab', 'close', '-w', wsA, orch.tabId]);
+  const retained = await retainDesignatedFixture(inst, wsA, [orch]);
+  check(
+    'mission-designated-housekeeping',
+    'mission cleanup retains the actual designated coordinator live with unchanged mapping',
+    retained.ok,
+    retained.measured,
+    'the actual designated tab remains live and the mapping is unchanged',
+  );
 };
 
 module.exports = {

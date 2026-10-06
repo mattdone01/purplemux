@@ -72,6 +72,93 @@ describe('checks.cjs judgements', () => {
     expect(checks.shellQuote('a b')).toBe(`'a b'`);
   });
 
+  it('retains the actual live designated fixture, checks other closes, preserves its mapping, and permits a later agent create', async () => {
+    const mapping = { enabled: true, orchestratorTabId: 'reader', revision: 9 };
+    const closed: string[] = [];
+    const inst = {
+      cli: vi.fn(async (args: string[]) => {
+        if (args[0] === 'orchestration') return { rc: 0, out: JSON.stringify({ orchestration: mapping }), err: '' };
+        if (args[0] === 'tab' && args[1] === 'close') {
+          closed.push(args[4]);
+          return { rc: 0, out: 'ok\n', err: '' };
+        }
+        if (args[0] === 'tab' && args[1] === 'create') return { rc: 0, out: JSON.stringify({ tabId: 'next-agent' }), err: '' };
+        throw new Error(`unexpected command ${args.join(' ')}`);
+      }),
+      fixtureAgentState: vi.fn(async () => ({
+        ok: true,
+        result: { rc: 0, out: '{}', err: '' },
+        status: { alive: true, command: 'claude', agentSessionId: 'session-reader' },
+      })),
+    };
+    const kept = await checks.retainDesignatedFixture(inst, 'ws-a', [
+      { tabId: 'old-orch' }, { tabId: 'reader' }, { tabId: 'worker' },
+    ]);
+    const created = await inst.cli(['tab', 'create', '-w', 'ws-a', '-n', 'next', '-t', 'claude-code']);
+    expect(kept.ok).toBe(true);
+    expect(kept.retained).toBe('reader');
+    expect(closed).toEqual(['old-orch', 'worker']);
+    expect(inst.fixtureAgentState).toHaveBeenCalledTimes(2);
+    expect(created).toMatchObject({ rc: 0, out: expect.stringContaining('next-agent') });
+    expect(mapping).toEqual({ enabled: true, orchestratorTabId: 'reader', revision: 9 });
+  });
+
+  it('does not close anything when designated fixture mapping or liveness is unknown', async () => {
+    const close = vi.fn();
+    const unknownMapping = {
+      cli: vi.fn(async (args: string[]) => {
+        if (args[0] === 'tab' && args[1] === 'close') close();
+        return { rc: 0, out: JSON.stringify({ orchestration: { enabled: true, orchestratorTabId: 'outside', revision: 1 } }), err: '' };
+      }),
+      fixtureAgentState: vi.fn(),
+    };
+    expect((await checks.retainDesignatedFixture(unknownMapping, 'ws-a', [{ tabId: 'fixture' }])).ok).toBe(false);
+    expect(close).not.toHaveBeenCalled();
+
+    const unknownLive = {
+      cli: vi.fn(async () => ({ rc: 0, out: JSON.stringify({ orchestration: { enabled: true, orchestratorTabId: 'fixture', revision: 1 } }), err: '' })),
+      fixtureAgentState: vi.fn(async () => ({ ok: false, result: { rc: 1, out: '', err: 'unknown' }, status: null })),
+    };
+    expect((await checks.retainDesignatedFixture(unknownLive, 'ws-a', [{ tabId: 'fixture' }])).ok).toBe(false);
+    expect(unknownLive.cli).toHaveBeenCalledTimes(1);
+  });
+
+  it('revives only the same designated fixture before cleanup and rejects a changed mapping or failed close', async () => {
+    let mapping = { enabled: true, orchestratorTabId: 'reader', revision: 3 };
+    let observations = 0;
+    const inst = {
+      cli: vi.fn(async (args: string[]) => {
+        if (args[0] === 'orchestration') return { rc: 0, out: JSON.stringify({ orchestration: mapping }), err: '' };
+        if (args[0] === 'tab' && args[1] === 'close') return { rc: 1, out: 'close-not-confirmed\n', err: '' };
+        throw new Error(`unexpected command ${args.join(' ')}`);
+      }),
+      fixtureAgentState: vi.fn(async () => {
+        observations += 1;
+        const ok = observations > 1;
+        return { ok, result: { rc: 0, out: '{}', err: '' }, status: { alive: true, command: ok ? 'claude' : 'bash', agentSessionId: 'session-reader' } };
+      }),
+    };
+    const restore = vi.fn(async (tab: { tabId: string }) => {
+      expect(tab.tabId).toBe('reader');
+      return { rc: 0, out: '', err: '' };
+    });
+    const failedClose = await checks.retainDesignatedFixture(inst, 'ws-a', [{ tabId: 'reader' }, { tabId: 'other' }], { restore });
+    expect(restore).toHaveBeenCalledOnce();
+    expect(failedClose.ok).toBe(false);
+
+    observations = 2;
+    inst.cli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'orchestration') {
+        const result = { rc: 0, out: JSON.stringify({ orchestration: mapping }), err: '' };
+        mapping = { ...mapping, revision: mapping.revision + 1 };
+        return result;
+      }
+      if (args[0] === 'tab' && args[1] === 'close') return { rc: 0, out: 'ok\n', err: '' };
+      throw new Error(`unexpected command ${args.join(' ')}`);
+    });
+    expect((await checks.retainDesignatedFixture(inst, 'ws-a', [{ tabId: 'reader' }, { tabId: 'other' }])).ok).toBe(false);
+  });
+
   it('parseArgs requires a state file and rejects unknown flags', () => {
     expect(checks.parseArgs(['--state', 's.json', '--bash-guard', 'g.py', '--require-bash-guard'])).toEqual({
       state: 's.json',
@@ -711,7 +798,7 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=78 passed=77 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=81 passed=80 failed=0 skipped=1$/m);
     // The wave-2 checks (story 22) ran, each by id.
     for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
       'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {

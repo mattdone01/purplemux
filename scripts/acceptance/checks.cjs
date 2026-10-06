@@ -286,6 +286,17 @@ class Instance {
     return parseJson((await this.cli(['tab', 'status', '-w', ws, tabId])).out)?.cliState ?? null;
   }
 
+  async fixtureAgentState(ws, tabId) {
+    const result = await this.cli(['tab', 'status', '-w', ws, tabId]);
+    const status = parseJson(result.out);
+    return {
+      ok: result.rc === 0 && status?.alive === true && status.command === 'claude'
+        && typeof status.agentSessionId === 'string' && status.agentSessionId.length > 0,
+      result,
+      status,
+    };
+  }
+
   /** The candidate CLI as a one-line shell command, for use inside a tab (whose PATH has no node). */
   tabCli(args) {
     return [this.state.node, this.cliPath, ...args].map(shellQuote).join(' ');
@@ -329,6 +340,60 @@ const parseJson = (text) => {
 };
 
 const brief = (r) => `exit ${r.rc}${r.err.trim() ? `, stderr: ${r.err.trim().split('\n')[0].slice(0, 160)}` : ''}`;
+
+/** Preserve the actual designated scratch coordinator while removing only the other fixture tabs. */
+const retainDesignatedFixture = async (inst, ws, candidates, { restore = null } = {}) => {
+  const tabs = candidates.filter((tab) => tab?.tabId);
+  const beforeResult = await inst.cli(['orchestration', 'status', '-w', ws]);
+  const before = parseJson(beforeResult.out)?.orchestration;
+  const retained = tabs.find((tab) => tab.tabId === before?.orchestratorTabId) ?? null;
+  if (beforeResult.rc !== 0 || before?.enabled !== true || typeof before.orchestratorTabId !== 'string'
+    || !Number.isSafeInteger(before.revision) || before.revision < 0 || !retained) {
+    return {
+      ok: false,
+      measured: `mapping ${brief(beforeResult)} ${JSON.stringify(before ?? null)}; candidates ${tabs.map((tab) => tab.tabId).join(',') || 'none'}`,
+      retained: null,
+      closed: [],
+    };
+  }
+
+  let live = await inst.fixtureAgentState(ws, retained.tabId);
+  let restored = null;
+  if (!live.ok && restore) {
+    restored = await restore(retained);
+    if (restored?.rc === 0) live = await within(10000, async () => {
+      const observed = await inst.fixtureAgentState(ws, retained.tabId);
+      return observed.ok ? observed : null;
+    }) || live;
+  }
+  if (!live.ok) {
+    return {
+      ok: false,
+      measured: `designated ${retained.tabId} not live: ${brief(live.result)} ${JSON.stringify(live.status ?? null)}; restore ${restored ? brief(restored) : 'not attempted'}`,
+      retained: retained.tabId,
+      closed: [],
+    };
+  }
+
+  const closed = [];
+  for (const tab of tabs) {
+    if (tab.tabId === retained.tabId) continue;
+    const result = await inst.cli(['tab', 'close', '-w', ws, tab.tabId]);
+    closed.push({ tabId: tab.tabId, result, ok: result.rc === 0 && result.out.trim().split('\n')[0] === 'ok' });
+  }
+  const afterResult = await inst.cli(['orchestration', 'status', '-w', ws]);
+  const after = parseJson(afterResult.out)?.orchestration;
+  const finalLive = await inst.fixtureAgentState(ws, retained.tabId);
+  const mappingUnchanged = afterResult.rc === 0 && before.enabled === after?.enabled
+    && before.orchestratorTabId === after?.orchestratorTabId && before.revision === after?.revision;
+  const ok = closed.every((entry) => entry.ok) && mappingUnchanged && finalLive.ok;
+  return {
+    ok,
+    measured: `retained ${retained.tabId} live ${finalLive.ok}; restored ${restored ? brief(restored) : 'not needed'}; closes ${closed.map((entry) => `${entry.tabId}:${brief(entry.result)}:${JSON.stringify(entry.result.out.trim().split('\n')[0] ?? '')}`).join(',') || 'none'}; mapping ${JSON.stringify(before)} -> ${JSON.stringify(after ?? null)}`,
+    retained: retained.tabId,
+    closed,
+  };
+};
 
 /** The wave-1 checks. Each pushes one result; a failed prerequisite fails what depends on it. */
 const wave1 = async (inst, { bashGuard }) => {
@@ -811,8 +876,20 @@ const notes = async (inst, { nonce, wsA, wsB, check, created }) => {
       staleAck.rc === 3 && currentAck.rc === 0 && parseJson(currentAck.out)?.note?.state === 'acked',
       `stale ${brief(staleAck)}; current ${brief(currentAck)}`, 'stale ACK 3; current coordinator ACK 0');
   } finally {
-    if (reader) await inShell(wsA, reader, inst.tabCli(['lease', 'release', `epic:${epic}`]));
-    for (const [ws, tab] of [[wsA, orch], [wsA, reader], [wsB, sender], [wsB, worker]]) if (tab) await inst.cli(['tab', 'close', '-w', ws, tab.tabId]);
+    const released = reader ? await inShell(wsA, reader, inst.tabCli(['lease', 'release', `epic:${epic}`])) : missing;
+    const retainA = await retainDesignatedFixture(inst, wsA, [orch, reader], {
+      restore: (tab) => inst.startFixtureAgent(wsA, tab, { composer: true }),
+    });
+    const retainB = await retainDesignatedFixture(inst, wsB, [sender, worker], {
+      restore: (tab) => inst.startFixtureAgent(wsB, tab, { composer: true }),
+    });
+    check(
+      'note-designated-housekeeping',
+      'note cleanup releases its fixture lease, retains each actual designated coordinator live with unchanged mapping, and closes only the other temporary tabs',
+      released.rc === 0 && retainA.ok && retainB.ok,
+      `lease ${brief(released)}; A ${retainA.measured}; B ${retainB.measured}`,
+      'lease release exit 0; actual designated tabs retained live; every other close exits 0 with ok; mappings unchanged',
+    );
   }
 };
 
@@ -963,7 +1040,7 @@ const main = async (argv) => {
     return 2;
   }
   const inst = new Instance(state);
-  const helpers = { parseJson, within, sleep, brief, shellQuote, readIf };
+  const helpers = { parseJson, within, sleep, brief, shellQuote, readIf, retainDesignatedFixture };
   const waves = [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers)];
   const results = [];
   for (const [i, wave] of waves.entries()) {
@@ -974,7 +1051,7 @@ const main = async (argv) => {
   return pass ? 0 : 1;
 };
 
-module.exports = { Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs };
+module.exports = { Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs, retainDesignatedFixture };
 
 if (require.main === module) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
