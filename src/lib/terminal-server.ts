@@ -36,6 +36,13 @@ const THROTTLE_FLUSH_INTERVAL_MS = 250;
 const TMUX_SOCKET = 'purple';
 const textDecoder = new TextDecoder();
 
+// The server selects its tmux socket at process start. Keep that server-owned value for the PTY
+// attach client without broadening the shell allowlist or accepting a socket from the browser.
+const terminalAttachEnv = (): NodeJS.ProcessEnv => ({
+  ...buildShellEnv(),
+  ...(PRISTINE_ENV.TMUX_TMPDIR ? { TMUX_TMPDIR: PRISTINE_ENV.TMUX_TMPDIR } : {}),
+});
+
 interface IActiveConnection {
   ws: WebSocket;
   pty: pty.IPty;
@@ -71,7 +78,7 @@ const attachToSession = (sessionName: string, cols: number, rows: number): pty.I
     cols,
     rows,
     cwd: PRISTINE_ENV.HOME || '/',
-    env: buildShellEnv(),
+    env: terminalAttachEnv(),
   });
 
 const cleanup = (conn: IActiveConnection, sessionExited = false) => {
@@ -278,6 +285,11 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
       if (msg.type === MSG_RESIZE && msg.payload.length >= 4) {
         const view = new DataView(msg.payload.buffer, msg.payload.byteOffset, msg.payload.byteLength);
         pending.resize = { cols: view.getUint16(0), rows: view.getUint16(2) };
+      } else if ((msg.type === MSG_STDIN || msg.type === MSG_WEB_STDIN) && msg.payload.length > 0) {
+        log.warn({ sessionName }, 'terminal input refused before tmux attachment completed');
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(encodeInputError('Terminal is still attaching. Input was not sent; retry after terminal output appears.'));
+        }
       }
       return;
     }

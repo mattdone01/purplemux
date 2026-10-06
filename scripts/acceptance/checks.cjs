@@ -248,6 +248,31 @@ class Instance {
     return run('tmux', ['-L', 'purple', 'send-keys', '-t', session, line, 'Enter'], { env: { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir }, timeoutMs: 10000 });
   }
 
+  /** Exact probes and lifecycle operations against only this fixture's isolated tmux server. */
+  isolatedTmux(args) {
+    const tmuxDir = this.state.tmuxTmpdir;
+    if (!tmuxDir.startsWith(`${this.state.scratch}/`)) throw new Error(`tmux dir ${tmuxDir} is not under the scratch directory`);
+    return run('tmux', ['-L', 'purple', ...args], { env: { PATH: '/usr/bin:/bin', TMUX_TMPDIR: tmuxDir }, timeoutMs: 10000 });
+  }
+
+  removeIsolatedSession(session) {
+    return this.isolatedTmux(['kill-session', '-t', session]);
+  }
+
+  async isolatedSessionExists(session) {
+    return (await this.isolatedTmux(['has-session', '-t', session])).rc === 0;
+  }
+
+  async isolatedPanePid(session) {
+    const result = await this.isolatedTmux(['display-message', '-p', '-t', session, '#{pane_pid}']);
+    const pid = Number(result.out.trim());
+    return result.rc === 0 && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  }
+
+  strictSessionProbe(session) {
+    return this.isolatedTmux(['list-panes', '-t', `=${session}`, '-F', '#{session_name}\t#{pane_id}\t#{pane_pid}']);
+  }
+
   async inbox(ws) {
     return parseJson((await this.cli(['inbox', 'list', '-w', ws, '--all'])).out)?.items ?? [];
   }

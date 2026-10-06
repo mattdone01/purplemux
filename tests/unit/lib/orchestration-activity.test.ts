@@ -8,12 +8,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import type { ITab } from '@/types/terminal';
 
-const fixture = vi.hoisted(() => ({ home: '', now: 1000, send: vi.fn(), type: vi.fn(), submit: vi.fn(), reap: vi.fn(), session: vi.fn(), process: vi.fn(), write: vi.fn() }));
+const fixture = vi.hoisted(() => ({ home: '', now: 1000, send: vi.fn(), type: vi.fn(), submit: vi.fn(), reap: vi.fn(), session: vi.fn(), process: vi.fn(), write: vi.fn(), spawn: vi.fn() }));
 vi.mock('os', async (original) => {
   const actual = await original<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => fixture.home }, homedir: () => fixture.home };
 });
-vi.mock('node-pty', () => ({ spawn: () => ({ pid: 42, write: fixture.write, resize: vi.fn(), destroy: vi.fn(), onData: () => ({ dispose: vi.fn() }), onExit: () => ({ dispose: vi.fn() }) }) }));
+vi.mock('node-pty', () => ({ spawn: (...args: unknown[]) => fixture.spawn(...args) }));
 vi.mock('@/lib/tmux', async (original) => ({
   ...await original<typeof import('@/lib/tmux')>(),
   exitCopyMode: vi.fn(async () => undefined), hasSession: vi.fn(async () => true), isContentPendingInComposer: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'),
@@ -47,6 +47,7 @@ beforeEach(async () => {
   await fs.writeFile(path.join(fixture.home, '.purplemux/workspaces.json'), JSON.stringify({ workspaces: [{ id: 'ws-a', name: 'A', directories: [], orchestration: { enabled: true, orchestratorTabId: 'tab-old', revision: 0 } }], groups: [] }));
   for (const key of ['__purplemuxWorkspacesContentCache', '__ptWorkspacesMemo']) delete (globalThis as Record<string, unknown>)[key];
   fixture.send.mockResolvedValue(undefined); fixture.type.mockResolvedValue(undefined); fixture.submit.mockResolvedValue(undefined);
+  fixture.spawn.mockImplementation(() => ({ pid: 42, write: fixture.write, resize: vi.fn(), destroy: vi.fn(), onData: () => ({ dispose: vi.fn() }), onExit: () => ({ dispose: vi.fn() }) }));
   fixture.reap.mockResolvedValue({ reaper: 'linux', envMarker: 'present', killed: [], survivors: [] });
   fixture.session.mockResolvedValue({ state: 'absent', reason: 'exact session absent' });
   fixture.process.mockResolvedValue({ state: 'present', identity: 'provider:123:456' });
@@ -229,6 +230,35 @@ describe('real non-Codex browser launch preparation', () => {
 });
 
 describe('actual authenticated app send and raw WebSocket paths', () => {
+  it('attaches the PTY through the server-owned tmux socket without restoring tab identity', async () => {
+    await connectRaw();
+    const options = fixture.spawn.mock.calls.at(-1)?.[2] as { env?: NodeJS.ProcessEnv } | undefined;
+    expect(options?.env?.TMUX_TMPDIR).toBe(process.env.TMUX_TMPDIR);
+    expect(options?.env?.PMUX_TAB_ID).toBeUndefined();
+    expect(options?.env?.PMUX_TAB_TOKEN).toBeUndefined();
+    expect(options?.env?.PMUX_WORKSPACE_ID).toBeUndefined();
+  });
+  it('visibly refuses input received before tmux attachment and never replays it', async () => {
+    const attach = deferred();
+    vi.mocked((await import('@/lib/tmux')).hasSession).mockImplementationOnce(async () => { await attach.promise; return true; });
+    const socket = Object.assign(new EventEmitter(), { readyState: 1, bufferedAmount: 0, send: vi.fn(), close: vi.fn() });
+    sockets.push(socket);
+    const { handleConnection } = await import('@/lib/terminal-server');
+    const connecting = handleConnection(socket as unknown as WebSocket, { url: '/api/terminal' } as IncomingMessage, SESSION);
+    emitRaw(socket, 'too early');
+    expect(fixture.write).not.toHaveBeenCalled();
+    expect(socket.send).toHaveBeenCalledOnce();
+    const refusal = socket.send.mock.calls[0][0] as Uint8Array;
+    expect(refusal[0]).toBe(6);
+    expect(new TextDecoder().decode(refusal.slice(1))).toContain('not sent');
+    expect((await readTab()).orchestrationActivity).toBeUndefined();
+    attach.resolve();
+    await connecting;
+    expect(fixture.write).not.toHaveBeenCalled();
+    emitRaw(socket, 'after attach');
+    await vi.waitFor(() => expect(fixture.write).toHaveBeenCalledWith('after attach'));
+    expect(fixture.write).not.toHaveBeenCalledWith('too early');
+  });
   it.each(['prompt', 'attachment-only'] as const)('app %s persists before bytes/Enter and blocks a queued off writer', async (kind) => {
     const { default: send } = await import('@/pages/api/tabs/[tabId]/send');
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {

@@ -61,14 +61,62 @@ const alive = (pid) => {
   }
 };
 
+const terminalStates = new WeakMap();
 const openTerminal = (inst, sessionName, cookie) => new Promise((resolve, reject) => {
   const ws = new WebSocket(`ws://127.0.0.1:${inst.state.port}/api/terminal?session=${encodeURIComponent(sessionName)}&clientId=acc5-${crypto.randomUUID()}`, {
     headers: { Cookie: cookie, Origin: `http://localhost:${inst.state.port}` },
   });
-  const timer = setTimeout(() => { ws.terminate(); reject(new Error('terminal WebSocket open timed out')); }, 15000);
-  ws.once('open', () => { clearTimeout(timer); resolve(ws); });
-  ws.once('error', (error) => { clearTimeout(timer); reject(error); });
+  const state = { opened: false, ready: false, stdoutBytes: 0, close: null, errors: [], heartbeat: null };
+  terminalStates.set(ws, state);
+  let settled = false;
+  let timer = null;
+  const fail = (error) => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    if (state.heartbeat) clearInterval(state.heartbeat);
+    reject(error);
+  };
+  timer = setTimeout(() => {
+    ws.terminate();
+    fail(new Error(`terminal output timed out: ${JSON.stringify({ opened: state.opened, close: state.close, errors: state.errors })}`));
+  }, 15000);
+  ws.on('open', () => {
+    state.opened = true;
+    state.heartbeat = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(Buffer.from([3]));
+    }, 5000);
+  });
+  ws.on('message', (data) => {
+    const bytes = Buffer.from(data);
+    if (bytes[0] !== 1) return;
+    state.stdoutBytes += Math.max(0, bytes.length - 1);
+    if (state.ready) return;
+    state.ready = true;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    resolve(ws);
+  });
+  ws.on('close', (code, reason) => {
+    state.close = { code, reason: Buffer.from(reason).toString('utf8') };
+    if (state.heartbeat) clearInterval(state.heartbeat);
+    if (!state.ready) fail(new Error(`terminal closed before output: ${JSON.stringify(state.close)}`));
+  });
+  ws.on('error', (error) => {
+    state.errors.push(error instanceof Error ? error.message : String(error));
+    if (!state.ready) fail(error);
+  });
 });
+
+const terminalEvidence = (ws) => {
+  const state = terminalStates.get(ws);
+  return state ? { opened: state.opened, ready: state.ready, stdoutBytes: state.stdoutBytes, close: state.close, errors: [...state.errors] } : null;
+};
+const closeTerminal = (ws) => {
+  const state = terminalStates.get(ws);
+  if (state?.heartbeat) clearInterval(state.heartbeat);
+  try { ws.close(); } catch {}
+};
 
 const sendFrame = (ws, text, type = 0) => ws.send(Buffer.concat([Buffer.from([type]), Buffer.from(text)]));
 
@@ -186,6 +234,10 @@ const wave5 = async (inst, helpers) => {
     await inst.hook('session-start', io.sessionName);
     const ioSocket = await openTerminal(inst, io.sessionName, cookie);
     sockets.push(ioSocket);
+    const ioTerminal = terminalEvidence(ioSocket);
+    check('recovery-terminal-ready', 'the authenticated terminal waits for initial output from the isolated tmux attachment',
+      ioTerminal?.opened === true && ioTerminal?.ready === true && ioTerminal.stdoutBytes > 0 && ioTerminal.errors.length === 0,
+      JSON.stringify(ioTerminal), 'opened, initial stdout received, no WebSocket error');
     hold = installTmuxHold(inst, candidate.sessionName);
     const replacing = inst.designate(ws, candidate.tabId);
     const writerEntered = await within(10000, async () => fs.existsSync(hold.entered));
@@ -214,34 +266,36 @@ const wave5 = async (inst, helpers) => {
       `HTTP ${stale.status}; before ${JSON.stringify(beforeStale)}; after ${JSON.stringify(afterStale)}`,
       'HTTP 409 and identical owner/revision');
 
-    // Restore the incumbent, then one raw Escape is enough to make its state unknown. Idle keys are
-    // deliberately not interpreted as completion.
+    // Restore the incumbent. Raw Escape is durable activity, not completion or process liveness.
     await inst.designate(ws, incumbent.tabId);
     const incumbentSocket = await openTerminal(inst, incumbent.sessionName, cookie);
     sockets.push(incumbentSocket);
     sendFrame(incumbentSocket, '\x1b');
     const rawPending = await within(10000, async () => layoutTab(inst, ws, incumbent.tabId)?.orchestrationActivity?.turn?.rawInput === true);
-    const unknownRefusal = await inst.inTab(ws, candidate.tabId,
-      inst.tabCli(['orchestration', 'recover', '-w', ws, candidate.tabId]), { session: candidate.sessionName });
-    check('recovery-unknown-refusal', 'a retained raw Escape makes the incumbent unknown and cannot authorize recovery',
-      rawPending && unknownRefusal.rc === 3 && (await orchestration(inst, ws))?.orchestratorTabId === incumbent.tabId,
-      `raw pending ${rawPending}; recover ${brief(unknownRefusal)}; owner ${(await orchestration(inst, ws))?.orchestratorTabId}`,
-      `pending true, recover exit 3, owner ${incumbent.tabId}`);
 
     const turnAt = layoutTab(inst, ws, incumbent.tabId)?.orchestrationActivity?.turn?.at ?? Date.now();
+    await inst.hook('prompt-submit', incumbent.sessionName);
+    await inst.hook('stop', incumbent.sessionName);
+    await sleep(300);
+    const retainedAfterUnattributable = Boolean(layoutTab(inst, ws, incumbent.tabId)?.orchestrationActivity?.turn);
+    check('recovery-unattributable-hooks-retain', 'hooks without occurrence time cannot retire conservative raw input',
+      rawPending && retainedAfterUnattributable,
+      `raw pending ${rawPending}; retained after unattributable hooks ${retainedAfterUnattributable}`,
+      'raw Escape persisted and unattributable prompt/stop retained it');
     await hookAt(inst, incumbent.sessionName, 'prompt-submit', Math.max(1, turnAt - 2));
     await hookAt(inst, incumbent.sessionName, 'stop', Math.max(1, turnAt - 1));
     await sleep(300);
     const retainedAfterOld = Boolean(layoutTab(inst, ws, incumbent.tabId)?.orchestrationActivity?.turn);
-    await sleep(5);
-    await inst.hook('prompt-submit', incumbent.sessionName);
-    await sleep(5);
-    await inst.hook('stop', incumbent.sessionName);
+    const promptAt = Date.now();
+    await hookAt(inst, incumbent.sessionName, 'prompt-submit', promptAt);
+    const runningAt = await within(10000, async () => layoutTab(inst, ws, incumbent.tabId)?.orchestrationActivity?.turn?.runningAt ?? null);
+    while (Date.now() <= (runningAt ?? promptAt)) await sleep(2);
+    await hookAt(inst, incumbent.sessionName, 'stop', Date.now());
     const clearedByCurrent = await within(10000, async () => !layoutTab(inst, ws, incumbent.tabId)?.orchestrationActivity?.turn);
     check('recovery-hook-ordering', 'old occurrence-time hooks cannot clear pending input; a current attributed submit then stop can',
-      retainedAfterOld && clearedByCurrent,
-      `retained after old ${retainedAfterOld}; cleared after current ${clearedByCurrent}`,
-      'old prompt/stop retained; current prompt/stop cleared');
+      retainedAfterOld && Boolean(runningAt) && clearedByCurrent,
+      `retained after old ${retainedAfterOld}; runningAt ${runningAt}; cleared after current ${clearedByCurrent}`,
+      'old prompt/stop retained; current prompt persisted runningAt; later current stop cleared');
 
     process.kill(oldRuntime.pid, 'SIGTERM');
     const oldGone = await within(10000, async () => !alive(oldRuntime.pid));
@@ -310,30 +364,60 @@ const wave5 = async (inst, helpers) => {
     sockets.push(refusedSocket);
     const dir = path.dirname(layoutFile(inst, ws));
     const mode = fs.statSync(dir).mode & 0o777;
-    fs.chmodSync(dir, 0o500);
-    const visible = inputError(refusedSocket);
-    sendFrame(refusedSocket, 'MUST-NOT-FORWARD\n');
-    const errorText = await visible;
-    fs.chmodSync(dir, mode);
+    let errorText = null;
+    try {
+      fs.chmodSync(dir, 0o500);
+      const visible = inputError(refusedSocket);
+      sendFrame(refusedSocket, 'MUST-NOT-FORWARD\n');
+      errorText = await visible;
+    } finally {
+      fs.chmodSync(dir, mode);
+    }
     await sleep(300);
     check('recovery-raw-persistence-refusal', 'a raw-input persistence failure is visible to the client and forwards no terminal bytes',
       typeof errorText === 'string' && errorText.includes('not confirmed') && (readIf(refusedFile) ?? '') === '',
       `error ${JSON.stringify(errorText)}; pane bytes ${JSON.stringify(readIf(refusedFile) ?? '')}`,
       'MSG_INPUT_ERROR names unconfirmed input and pane remains empty');
 
-    // The real restart route must retain the exact unresolved turn generation. The normal close
-    // route then reaps its managed session and removes the tab, which is the only abandonment here.
+    // Designate the live fixture, then remove only its isolated tmux session. The layout and pending
+    // turn remain. Restart must create a new pane identity without changing the turn generation;
+    // that pending launch is unknown to local recovery. A second isolated session stays live so an
+    // exact missing-target result cannot be confused with an unavailable tmux server.
+    const restartDesignated = await inst.designate(ws, io.tabId);
     const pendingBeforeRestart = layoutTab(inst, ws, io.tabId)?.orchestrationActivity?.turn;
+    const paneBeforeRestart = await inst.isolatedPanePid(io.sessionName);
+    closeTerminal(ioSocket);
+    const removedSession = await inst.removeIsolatedSession(io.sessionName);
+    const absentBeforeRestart = await within(10000, async () => !(await inst.isolatedSessionExists(io.sessionName)));
     const restarted = await request(inst.state.port, 'POST', `/api/layout/pane/${io.paneId}/tabs/${io.tabId}?workspace=${ws}`, {
       headers: humanHeaders, body: { command: 'sleep 300' },
     });
     const pendingAfterRestart = layoutTab(inst, ws, io.tabId)?.orchestrationActivity?.turn;
+    const paneAfterRestart = await inst.isolatedPanePid(io.sessionName);
+    const controlAlive = await inst.isolatedSessionExists(candidate.sessionName);
+    const unknownRefusal = await inst.inTab(ws, candidate.tabId,
+      inst.tabCli(['orchestration', 'recover', '-w', ws, candidate.tabId]), { session: candidate.sessionName });
+    check('recovery-unknown-refusal', 'a retained turn beside a pending genuine restart cannot authorize local recovery',
+      restartDesignated.rc === 0 && removedSession.rc === 0 && absentBeforeRestart && restarted.status === 200
+        && paneBeforeRestart && paneAfterRestart && paneBeforeRestart !== paneAfterRestart && controlAlive
+        && unknownRefusal.rc === 3 && unknownRefusal.err.includes('orchestrator-state-unknown')
+        && (await orchestration(inst, ws))?.orchestratorTabId === io.tabId,
+      `designate ${brief(restartDesignated)}; remove ${brief(removedSession)}; absent ${absentBeforeRestart}; restart ${restarted.status}; panes ${paneBeforeRestart}/${paneAfterRestart}; control ${controlAlive}; recover ${brief(unknownRefusal)}; owner ${(await orchestration(inst, ws))?.orchestratorTabId}`,
+      `session removed, restart 200 with new pane, control live, recover exit 3 state unknown, owner ${io.tabId}`);
     const closed = await inst.cli(['tab', 'close', '-w', ws, io.tabId]);
+    const closePayload = parseJson(closed.out);
+    const targetProbe = await inst.strictSessionProbe(io.sessionName);
+    const controlProbe = await inst.strictSessionProbe(candidate.sessionName);
+    const audit = (readIf(path.join(inst.state.home, '.purplemux', 'audit', 'coordination.jsonl')) ?? '')
+      .trim().split('\n').filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } })
+      .filter((entry) => entry.event === 'tab-reap' && entry.tabId === io.tabId).at(-1) ?? null;
     check('recovery-restart-close-durability', 'restart retains unresolved input, while a later managed close confirms reap and removes the tab',
       restarted.status === 200 && pendingBeforeRestart?.generation === pendingAfterRestart?.generation
-        && closed.rc === 0 && !layoutTab(inst, ws, io.tabId),
-      `restart ${restarted.status}; generations ${pendingBeforeRestart?.generation}/${pendingAfterRestart?.generation}; close ${brief(closed)}; remains ${Boolean(layoutTab(inst, ws, io.tabId))}`,
-      'restart 200 with same turn generation; close 0 and tab absent');
+        && closed.rc === 0 && !layoutTab(inst, ws, io.tabId)
+        && targetProbe.rc === 1 && targetProbe.err.trim() === `can't find session: ${io.sessionName}`
+        && controlProbe.rc === 0 && Array.isArray(closePayload?.survivors) && closePayload.survivors.length === 0,
+      `restart ${restarted.status}; generations ${pendingBeforeRestart?.generation}/${pendingAfterRestart?.generation}; close ${brief(closed)} payload ${JSON.stringify(closePayload)}; remains ${Boolean(layoutTab(inst, ws, io.tabId))}; target probe ${brief(targetProbe)}; control probe ${brief(controlProbe)}; audit ${JSON.stringify(audit)}; socket ${JSON.stringify(terminalEvidence(ioSocket))}`,
+      'restart 200 with same turn generation; close 0; exact target absent while control is present; no reap survivors; tab absent');
   } catch (error) {
     fail('wave5-error', 'the recovery and raw-input acceptance checks ran to the end', error instanceof Error ? error.stack : String(error), 'no exception');
   } finally {
@@ -344,7 +428,7 @@ const wave5 = async (inst, helpers) => {
       }
     }
     for (const socket of sockets) {
-      try { socket.close(); } catch {}
+      closeTerminal(socket);
     }
     for (const tab of created) {
       if (tab?.tabId) await inst.cli(['tab', 'close', '-w', ws, tab.tabId]);

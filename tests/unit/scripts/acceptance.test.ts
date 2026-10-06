@@ -683,14 +683,15 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=76 passed=75 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=78 passed=77 failed=0 skipped=1$/m);
     // The wave-2 checks (story 22) ran, each by id.
     for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
       'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {
       expect(body).toMatch(new RegExp(`^PASS ${id} — `, 'm'));
     }
     for (const id of ['recovery-live-refusal', 'recovery-stale-cas', 'recovery-own-workspace-success',
-      'recovery-authenticated-app-input', 'recovery-raw-order-coalescing', 'recovery-raw-persistence-refusal']) {
+      'recovery-authenticated-app-input', 'recovery-terminal-ready', 'recovery-unattributable-hooks-retain',
+      'recovery-raw-order-coalescing', 'recovery-raw-persistence-refusal']) {
       expect(body).toMatch(new RegExp(`^PASS ${id} — `, 'm'));
     }
     expect(body.match(/^SKIP .*/gm)).toEqual(['SKIP bash-guard — no --bash-guard path given']);
