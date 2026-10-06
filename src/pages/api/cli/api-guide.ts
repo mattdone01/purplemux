@@ -449,13 +449,23 @@ POST /api/cli/deploy/withdraw   { "id": "d-…" }
 ## Orchestration
 
 GET /api/cli/workspaces/<workspaceId>/orchestration
-  Response: { "orchestration": { "enabled", "orchestratorTabId", "kickoffTemplate"? }, "nudges": [...] }
+  Response: { "orchestration": { "enabled", "orchestratorTabId", "revision", "kickoffTemplate"? }, "nudges": [...] }
 
 PATCH /api/cli/workspaces/<workspaceId>/orchestration
-  Body: { "enabled"?: boolean, "orchestratorTabId"?: string | null, "kickoffTemplate"?: string | null }
-  Orchestrators use this to designate themselves (enabled + own tabId) and to turn
-  orchestration off when the epic is finished — this stops watchdog nudges and idle
-  heartbeats for the workspace. A tab's live reportsTo overrides this target for that tab.
+  Body: { "expectedRevision": number, "mode"?: "update" | "recover" | "handoff",
+          "enabled"?: boolean, "orchestratorTabId"?: string | null, "kickoffTemplate"?: string | null }
+  Read the current revision, then submit one PATCH. Missing precondition: 428; malformed: 400;
+  stale revision: 409 orchestration-conflict with current orchestration. Never retry a conflict
+  automatically. Legacy mappings read as revision 0; each semantic change increments once.
+  An own-workspace caller may explicitly recover a vacant or positively dead incumbent to a
+  live local agent. Live, pending or unknown incumbent state refuses recovery. A missing legacy
+  session binding is unknown. Only the launch-verified incumbent can hand off a live mapping.
+  The human UI can explicitly replace after confirmation; it uses cookie, same origin and CAS,
+  and leaves the former process running. Global tokens, peers and grants confer no mutation right.
+  CLI: orchestration recover -w WS TAB; orchestration handoff -w WS TAB; on aliases recover.
+  Clear/off requires fresh complete work evidence: no active epic lease, agent work or background
+  job, no unfinished standup, and no unknown observations. awaiting-human retains ownership and
+  pauses idle heartbeats. A tab's live reportsTo still overrides the coordinator nudge target.
 
   Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:,
   READY-TO-MERGE: or CHECKPOINTED: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>

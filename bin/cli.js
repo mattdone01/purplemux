@@ -126,6 +126,14 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'note-too-large': EXIT.USAGE,
   'deploy-invalid': EXIT.USAGE,
   'config-invalid': EXIT.USAGE,
+  'orchestration-precondition-required': EXIT.USAGE,
+  'orchestration-invalid': EXIT.USAGE,
+  'orchestration-conflict': EXIT.CONFLICT,
+  'orchestrator-state-unknown': EXIT.CONFLICT,
+  'orchestrator-live': EXIT.CONFLICT,
+  'orchestrator-candidate-invalid': EXIT.CONFLICT,
+  'orchestration-work-remains': EXIT.CONFLICT,
+  'orchestration-recovery-required': EXIT.CONFLICT,
   'note-target-missing': EXIT.USAGE,
   'note-invalid': EXIT.USAGE,
   'lease-held': EXIT.CONFLICT,
@@ -392,18 +400,19 @@ const cmdOrchestration = async (args) => {
     const { body } = await api('GET', `/api/cli/workspaces/${wsId}/orchestration`);
     return out(body);
   }
-  if (sub === 'off') {
-    const { body } = await api('PATCH', `/api/cli/workspaces/${wsId}/orchestration`, { enabled: false });
-    return out(body);
-  }
-  if (sub === 'on') {
+  if (['on', 'off', 'recover', 'handoff'].includes(sub)) {
     const positional = stripFlags(rest, ['--workspace', '-w']);
     const tabId = positional[0] || deriveOwnTabId();
-    if (!tabId) die('TAB_ID required (or run inside a purplemux tab to self-designate)');
-    const { body } = await api('PATCH', `/api/cli/workspaces/${wsId}/orchestration`, { enabled: true, orchestratorTabId: tabId });
+    if (sub !== 'off' && !tabId) die('TAB_ID required (or run inside a purplemux tab)');
+    const endpoint = `/api/cli/workspaces/${wsId}/orchestration`;
+    const current = (await api('GET', endpoint)).body.orchestration;
+    if (!Number.isSafeInteger(current?.revision) || current.revision < 0) die('Server did not return a valid orchestration revision');
+    const patch = sub === 'off' ? { enabled: false } : { enabled: true, orchestratorTabId: tabId };
+    const { body } = await api('PATCH', endpoint, { ...patch, expectedRevision: current.revision,
+      mode: sub === 'handoff' ? 'handoff' : sub === 'recover' || sub === 'on' ? 'recover' : 'update' });
     return out(body);
   }
-  die("usage: orchestration status|on|off -w WS [TAB_ID]");
+  die('usage: orchestration status|on|off|recover|handoff -w WS [TAB_ID]');
 };
 
 const cmdStandup = async (args) => {
@@ -1473,7 +1482,9 @@ Commands:
   tab browser eval -w WS TAB_ID EXPR       Evaluate JS expression inside the tab; returns serialized value
   orchestration status -w WS               Orchestration config + recent watchdog nudges for a workspace
   orchestration on -w WS [TAB_ID]          Enable orchestration; TAB_ID omitted = self-designate the calling tab
-  orchestration off -w WS                  Disable orchestration (stops watchdog nudges + idle heartbeats)
+  orchestration recover -w WS TAB_ID       Recover to a live local agent only when the incumbent is positively absent
+  orchestration handoff -w WS TAB_ID       Verified incumbent explicitly transfers ownership to a local agent
+  orchestration off -w WS                  Disable only after fresh work evidence proves completion (all writes use revision CAS)
   standup report -w WS --json '{...}'      Post a standup tick (or pipe JSON on stdin). Shown in the sidebar so
                                            the human can read progress at a glance. Shape:
                                            {"state":"on-track|at-risk|blocked|awaiting-human|done","headline":"...",

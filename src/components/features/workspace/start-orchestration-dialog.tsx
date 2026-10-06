@@ -35,6 +35,8 @@ const StartOrchestrationDialog = ({
   const workspace = useWorkspaceStore((s) => s.workspaces.find((w) => w.id === workspaceId));
   const savedTemplate = workspace?.orchestration?.kickoffTemplate ?? null;
 
+  const [displayed, setDisplayed] = useState({ revision: workspace?.orchestration?.revision ?? 0, incumbent: workspace?.orchestration?.orchestratorTabId ?? null });
+  const [confirmReplace, setConfirmReplace] = useState(false);
   const [task, setTask] = useState('');
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
@@ -46,6 +48,8 @@ const StartOrchestrationDialog = ({
   if (prevOpen !== open) {
     setPrevOpen(open);
     if (open) {
+      setDisplayed({ revision: workspace?.orchestration?.revision ?? 0, incumbent: workspace?.orchestration?.orchestratorTabId ?? null });
+      setConfirmReplace(false);
       setTask('');
       setModel('');
       setEffort('');
@@ -62,6 +66,7 @@ const StartOrchestrationDialog = ({
   const canSubmit = task.trim().length > 0
     && (!trimmedModel || isValidModelName(trimmedModel))
     && (!trimmedEffort || isValidClaudeEffort(trimmedEffort))
+    && (!displayed.incumbent || confirmReplace)
     && !isSubmitting;
 
   const handleSubmit = useCallback(async () => {
@@ -73,20 +78,25 @@ const StartOrchestrationDialog = ({
       workspaceName: workspace.name,
       task: task.trim(),
     });
-    const tab = await startOrchestration(workspaceId, {
-      paneId,
-      prompt,
-      ...(trimmedModel ? { model: trimmedModel } : {}),
-      ...(trimmedEffort ? { effort: trimmedEffort } : {}),
-      ...(template !== null && template !== savedTemplate ? { template } : {}),
-    });
-    setIsSubmitting(false);
-    if (tab) {
-      onOpenChange(false);
-    } else {
-      setError(t('startFailed'));
-    }
-  }, [canSubmit, workspace, effectiveTemplate, workspaceId, task, paneId, trimmedModel, trimmedEffort, template, savedTemplate, onOpenChange, t]);
+    try {
+      const tab = await startOrchestration(workspaceId, {
+        paneId,
+        prompt,
+        expectedRevision: displayed.revision,
+        mode: displayed.incumbent ? 'replace' : 'update',
+        ...(trimmedModel ? { model: trimmedModel } : {}),
+        ...(trimmedEffort ? { effort: trimmedEffort } : {}),
+        ...(template !== null && template !== savedTemplate ? { template } : {}),
+      });
+      setIsSubmitting(false);
+      if (tab) {
+        onOpenChange(false);
+      } else {
+        setError(t('startFailed'));
+      }
+    } catch (error) { setError(error instanceof Error ? error.message : t('startFailed')); }
+    finally { setIsSubmitting(false); }
+  }, [canSubmit, displayed, workspace, effectiveTemplate, workspaceId, task, paneId, trimmedModel, trimmedEffort, template, savedTemplate, onOpenChange, t]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -96,6 +106,10 @@ const StartOrchestrationDialog = ({
         </DialogHeader>
 
         <div className="flex flex-col gap-4">
+          {displayed.incumbent && <label className="flex items-start gap-2 text-sm">
+            <input type="checkbox" checked={confirmReplace} onChange={(event) => setConfirmReplace(event.target.checked)} />
+            Replace coordinator {displayed.incumbent}. Its process remains running; its current runtime may be uncertain.
+          </label>}
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="orchestration-task">{t('taskLabel')}</Label>
             <Textarea

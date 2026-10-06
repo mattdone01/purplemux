@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { withOrchestrationMappingRead, withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
+import { withOrchestrationMappingRead, withOrchestrationMappingWrite, withOrchestrationReset } from '@/lib/orchestration-mapping-lock';
 
 const deferred = () => {
   let resolve!: () => void;
@@ -92,4 +92,23 @@ describe('orchestration mapping leases', () => {
     await Promise.all([writer, reader]);
     expect(concurrent).toBe(true);
   });
+});
+
+it('global reset waits for an admitted writer and completes without recursive workspace locks', async () => {
+  const entered = deferred(); const release = deferred(); const resetting = deferred(); const finishReset = deferred();
+  const events: string[] = [];
+  const first = withOrchestrationMappingWrite('ws-reset-existing', async () => { events.push('first'); entered.resolve(); await release.promise; });
+  await entered.promise;
+  const reset = withOrchestrationReset(async () => { events.push('reset'); resetting.resolve(); await finishReset.promise; });
+  const next = withOrchestrationMappingWrite('ws-reset-new', async () => { events.push('next'); });
+  const reader = withOrchestrationMappingRead('ws-reset-new', async () => { events.push('reader'); });
+  await flush(); expect(events).toEqual(['first']);
+  release.resolve(); await resetting.promise;
+  expect(events).toEqual(['first', 'reset']);
+  finishReset.resolve(); await Promise.all([first, reset, next, reader]);
+  expect(events).toEqual(['first', 'reset', 'next', 'reader']);
+});
+it('releases the global barrier on reset failure', async () => {
+  await expect(withOrchestrationReset(async () => { throw new Error('reset failed'); })).rejects.toThrow('reset failed');
+  await expect(withOrchestrationMappingWrite('ws-reset-after-error', async () => 7)).resolves.toBe(7);
 });

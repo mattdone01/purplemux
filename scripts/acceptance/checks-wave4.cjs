@@ -229,9 +229,10 @@ const checks = async (inst, helpers, results) => {
 const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, status, brief }) => {
   const { b: wsB } = inst.state.workspaces;
   const ids = ['subagent-shell-waiting', 'subagent-woken-waiting', 'turn-end-served'];
-  const orch = await tab(wsB, `acc4-orch-${nonce}`);
+  const orch = await tab(wsB, `acc4-orch-${nonce}`, 'claude-code', ['--no-launch']);
+  await inst.startFixtureAgent(wsB, orch, { composer: true });
   await sleep(1000);
-  const on = orch?.tabId ? await inst.cli(['orchestration', 'on', '-w', wsB, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
+  const on = orch?.tabId ? await inst.designate(wsB, orch.tabId) : { rc: -1, out: '', err: 'no tab' };
   // A stop with no end line nudges only after the idle window (L49); 3 s instead of the 15 min default.
   await inst.cli(['config', 'set', 'watchdog.idle-nudge-minutes', '0.05']);
   if (!orch?.tabId || on.rc !== 0) {
@@ -348,7 +349,6 @@ const subagentWork = async (inst, { check, fail, nonce, within, sleep, tab, stat
     'control READY first; busy, no nudge, turnEnd waiting with 1 open task (the woken agent); then a ready nudge stamped after its completion',
   );
   for (const w of [shell, woken, plain, orch]) if (w?.tabId) await inst.cli(['tab', 'close', '-w', wsB, w.tabId]);
-  await inst.cli(['orchestration', 'off', '-w', wsB]);
 };
 
 // ─── story 36: identity is reported; the hook-time route is mint-only ───────────────────────────
@@ -503,15 +503,15 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
   const { a: wsA } = inst.state.workspaces;
   const orch = await tab(wsA, `acc4-mc-orch-${nonce}`, 'claude-code', ['--no-launch']);
   await sleep(1000);
-  const on = orch?.tabId ? await inst.cli(['orchestration', 'on', '-w', wsA, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
   const inputFile = path.join(inst.state.scratch, 'io', `mc-composer-${nonce}.txt`);
   fs.mkdirSync(path.dirname(inputFile), { recursive: true });
   fs.writeFileSync(inputFile, '');
-  const standIn = orch && on.rc === 0
+  const standIn = orch
     ? await inst.startStandIn(orch.sessionName, 'Ready.', { workspaceDir: 'a', inputFile, standInPath: liveStandIn(inst.state.scratch) })
     : { rc: -1 };
   await sleep(1500);
   if (orch) await inst.hook('session-start', orch.sessionName);
+  const on = orch?.tabId ? await inst.designate(wsA, orch.tabId) : { rc: -1 };
   const idle = orch ? await within(10000, async () => (await inst.cliState(wsA, orch.tabId)) === 'idle') : false;
   // The orchestrator's live binding: the server finds the stand-in's session from its `--resume`
   // argument on its next poll; a bootstrap before that records "no live orchestrator binding".
@@ -543,7 +543,6 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
     'standup 0; bootstrap 200 with an entry; one delivered mission item; the composer received exactly one line, the fixed bootstrap notice for this workspace',
   );
   if (orch?.tabId) await inst.cli(['tab', 'close', '-w', wsA, orch.tabId]);
-  await inst.cli(['orchestration', 'off', '-w', wsA]);
 };
 
 module.exports = {

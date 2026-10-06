@@ -1,3 +1,5 @@
+import { toast } from 'sonner';
+import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/components/ui/alert-dialog';
 import { useState, useRef, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import { X, Globe, GitCompareArrows, History, Crown } from 'lucide-react';
@@ -64,6 +66,7 @@ const PaneTabItem = ({
   const isOrchestrator = !!orchestration?.enabled && orchestration.orchestratorTabId === tab.id;
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState('');
+  const [replacement, setReplacement] = useState<{ incumbent: string; revision: number } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -88,14 +91,19 @@ const PaneTabItem = ({
   const typeDisplayName = tab.panelType === 'agent-sessions' ? t('sessionList') : '';
   const displayName = tab.name || typeDisplayName || displayTitle || '';
 
-  const handleToggleOrchestrator = () => {
+  const applyDesignation = async (revision: number, replace: boolean) => {
     if (!wsId) return;
-    void patchWorkspaceOrchestration(
-      wsId,
-      isOrchestrator
-        ? { enabled: false, orchestratorTabId: null }
-        : { enabled: true, orchestratorTabId: tab.id },
-    );
+    try {
+      await patchWorkspaceOrchestration(wsId, isOrchestrator && !replace
+        ? { enabled: false, orchestratorTabId: null } : { enabled: true, orchestratorTabId: tab.id },
+      { expectedRevision: revision, mode: replace ? 'replace' : 'update' });
+    } catch (error) { toast.error(error instanceof Error ? error.message : 'Unable to change orchestration'); }
+  };
+  const handleToggleOrchestrator = () => {
+    const revision = orchestration?.revision ?? 0;
+    if (orchestration?.orchestratorTabId && orchestration.orchestratorTabId !== tab.id) {
+      setReplacement({ incumbent: orchestration.orchestratorTabId, revision });
+    } else void applyDesignation(revision, false);
   };
 
   const tabEl = (
@@ -200,6 +208,7 @@ const PaneTabItem = ({
   if (!isAgentTab) return tabEl;
 
   return (
+    <>
     <ContextMenu>
       <ContextMenuTrigger render={tabEl} />
       <ContextMenuContent>
@@ -209,6 +218,19 @@ const PaneTabItem = ({
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
+    <AlertDialog open={replacement !== null} onOpenChange={(open) => { if (!open) setReplacement(null); }}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Replace the coordinator?</AlertDialogTitle>
+          <AlertDialogDescription>Current coordinator: {replacement?.incumbent}. Its runtime may be live or unknown. Replacing it leaves its process running.</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={() => { if (replacement) void applyDesignation(replacement.revision, true); setReplacement(null); }}>Replace coordinator</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    </>
   );
 };
 

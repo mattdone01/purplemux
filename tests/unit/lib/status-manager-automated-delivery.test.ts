@@ -332,3 +332,31 @@ describe('status manager automated prompt call paths', () => {
     expect(paste).toHaveBeenCalledTimes(1);
   });
 });
+
+it('awaiting-human keeps ownership but suppresses idle keeper beats without resuming work', async () => {
+  const { StatusManager } = await import('@/lib/status-manager');
+  const paste = vi.fn(async () => {});
+  const manager = new StatusManager(new AutomatedPromptDispatcher({
+    findTarget: vi.fn(async (_ws, id) => tab(id)), withPolicyLock: policyLock(vi.fn(async () => ({ ok: true as const }))), hasSession: vi.fn(async () => true), paste,
+  }));
+  manager.registerTab('root', entry('root'));
+  workspaceStore.getWorkspacesCached.mockResolvedValue({ workspaces: [{ id: 'ws-1', name: 'workspace', directories: [], orchestration: { enabled: true, orchestratorTabId: 'root', revision: 4 } }] });
+  const internals = manager as unknown as { standups: Map<string, unknown>; orchKeeper: Map<string, unknown>; runOrchestratorKeeper: () => Promise<void> };
+  internals.standups.set('ws-1', { state: 'awaiting-human' });
+  internals.orchKeeper.set('ws-1', { idleSince: 0, beats: 0, lastBeatAt: 0, stallAlerted: false });
+  await internals.runOrchestratorKeeper();
+  expect(paste).not.toHaveBeenCalled(); expect(internals.orchKeeper.has('ws-1')).toBe(false);
+});
+
+it('a replay from before a managed start cannot erase pending-launch uncertainty', async () => {
+  const { StatusManager } = await import('@/lib/status-manager');
+  const manager = new StatusManager();
+  manager.registerTab('pending-root', { ...entry('pending-root'), panelType: 'claude-code', agentProviderId: 'claude' });
+  const started = Date.now();
+  manager.markAgentLaunch('pending-root');
+  expect(manager.isOrchestrationLaunchPending('pending-root')).toBe(true);
+  manager.updateTabFromHook('tmux-pending-root', 'session-start', undefined, undefined, started - 1000);
+  expect(manager.isOrchestrationLaunchPending('pending-root')).toBe(true);
+  manager.updateTabFromHook('tmux-pending-root', 'session-start');
+  expect(manager.isOrchestrationLaunchPending('pending-root')).toBe(false);
+});

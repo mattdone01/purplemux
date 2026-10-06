@@ -1,7 +1,9 @@
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { addTabToPane } from '@/lib/layout-store';
-import { getWorkspaceById, updateWorkspaceOrchestration } from '@/lib/workspace-store';
+import { startOrchestrationTransaction } from '@/lib/orchestration-recovery';
+import { parseOrchestrationPrecondition } from '@/lib/orchestration-contract';
+import { sendOrchestrationError } from '@/lib/orchestration-http';
 import { resolveFirstPaneId } from '@/lib/cli-utils';
 import { getStatusManager } from '@/lib/status-manager';
 import { getProviderByPanelType } from '@/lib/providers';
@@ -20,8 +22,6 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   const workspaceId = req.query.workspaceId as string;
-  const ws = await getWorkspaceById(workspaceId);
-  if (!ws) return res.status(404).json({ error: 'Workspace not found' });
 
   const { paneId, prompt, name, model, effort, template } = req.body ?? {};
   if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -39,53 +39,52 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(availability.status).json(toAgentAvailabilityError(availability));
   }
 
-  const targetPaneId = typeof paneId === 'string' && paneId
-    ? paneId
-    : await resolveFirstPaneId(workspaceId);
-  if (!targetPaneId) return res.status(404).json({ error: 'No pane found' });
-
   try {
-    const flags = await buildClaudeFlags(workspaceId, { model, effort });
-    const command = `claude ${flags}`;
-    const tabName = typeof name === 'string' && name.trim() ? name.trim() : 'orchestrator';
-    const tab = await addTabToPane(
-      workspaceId,
-      targetPaneId,
-      tabName,
-      ws.directories[0],
-      'claude-code',
-      command,
-      { agentLaunchConfig: agentLaunchConfigFromOptions(model, effort) },
-    );
-    if (!tab) return res.status(404).json({ error: 'Pane not found' });
+    const condition = parseOrchestrationPrecondition(req.body);
+    const { tab, workspace } = await startOrchestrationTransaction(workspaceId, { ...condition, actor: { kind: 'human' } }, typeof template === 'string' ? template : undefined, async (ws) => {
+      const targetPaneId = typeof paneId === 'string' && paneId
+        ? paneId
+        : await resolveFirstPaneId(workspaceId);
+      if (!targetPaneId) throw new Error('No pane found');
 
-    const provider = getProviderByPanelType('claude-code');
+      const flags = await buildClaudeFlags(workspaceId, { model, effort });
+      const command = `claude ${flags}`;
+      const tabName = typeof name === 'string' && name.trim() ? name.trim() : 'orchestrator';
+      const tab = await addTabToPane(
+        workspaceId,
+        targetPaneId,
+        tabName,
+        ws.directories[0],
+        'claude-code',
+        command,
+        { agentLaunchConfig: agentLaunchConfigFromOptions(model, effort) },
+      );
+      if (!tab) throw new Error('Pane not found');
+      const provider = getProviderByPanelType('claude-code');
+      const manager = getStatusManager();
+      manager.registerTab(tab.id, {
+        cliState: 'inactive',
+        workspaceId,
+        tabName: tab.name,
+        tmuxSession: tab.sessionName,
+        panelType: tab.panelType,
+        agentProviderId: provider?.id,
+        agentSessionId: provider?.readSessionId(tab) ?? null,
+        lastEvent: null,
+        eventSeq: 0,
+      });
+      manager.markAgentLaunch(tab.id);
+
+      return tab;
+    });
+
     const manager = getStatusManager();
-    manager.registerTab(tab.id, {
-      cliState: 'inactive',
-      workspaceId,
-      tabName: tab.name,
-      tmuxSession: tab.sessionName,
-      panelType: tab.panelType,
-      agentProviderId: provider?.id,
-      agentSessionId: provider?.readSessionId(tab) ?? null,
-      lastEvent: null,
-      eventSeq: 0,
-    });
-    manager.markAgentLaunch(tab.id);
-
-    await updateWorkspaceOrchestration(workspaceId, {
-      enabled: true,
-      orchestratorTabId: tab.id,
-      ...(typeof template === 'string' ? { kickoffTemplate: template } : {}),
-    });
-
     manager.queueKickoffPrompt(tab.id, prompt.trim());
 
-    return res.status(200).json(tab);
+    return res.status(200).json({ ...tab, orchestration: workspace.orchestration });
   } catch (err) {
     log.error(`orchestrate failed: ${err instanceof Error ? err.message : err}`);
-    return res.status(500).json({ error: 'Failed to start orchestration' });
+    return sendOrchestrationError(res, err);
   }
 };
 

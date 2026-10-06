@@ -137,7 +137,8 @@ describe('combined routing, caller authentication and mutation confinement', () 
         await service.tick();
         return { ...ok, out: JSON.stringify({ notes: state.notes }) };
       },
-      startStandIn: async (_session: string, _text: string, opts: { inputFile: string }) => { inputFile = opts.inputFile; return ok; },
+      designate: async (ws: string, tabId: string) => { roles.set(ws, tabId); return ok; },
+      startFixtureAgent: async (_ws: string, _tab: unknown, opts: { inputFile?: string } = {}) => { if (opts.inputFile) inputFile = opts.inputFile; return ok; },
       hook: async () => 204, cliState: async () => 'idle', keys: async () => ok,
     };
     const outcomes: { id: string; passed: boolean; measured: string }[] = [];
@@ -148,7 +149,7 @@ describe('combined routing, caller authentication and mutation confinement', () 
     expect(outcomes.filter((r) => !r.passed)).toEqual([]);
     expect(state.notes).toHaveLength(2);
     expect(state.notes.every((n) => n.state === 'acked')).toBe(true);
-    expect(roles.size).toBe(0);
+    expect(roles.size).toBe(2);
   }, 15000);
 
   it('routing denies a hook coordinator without presentation writes while preserving its local note authority', async () => {

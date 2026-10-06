@@ -856,3 +856,23 @@ export const getLastCommand = async (sessionName: string): Promise<string | null
     return null;
   }
 };
+
+/** Exact target lookup; only tmux's explicit missing-session result is positive absence. */
+export const observeSessionStrict = async (sessionName: string): Promise<
+  | { state: 'present'; panePid: number; identity: string }
+  | { state: 'absent' | 'unknown'; reason: string }
+> => {
+  try {
+    const { stdout } = await execFile('tmux', ['-L', TMUX_SOCKET, 'list-panes', '-t', `=${sessionName}`, '-F', '#{session_name}\t#{pane_id}\t#{pane_pid}'], { timeout: CMD_TIMEOUT });
+    const lines = stdout.trim().split('\n');
+    const [name, pane, pid] = lines[0].split('\t');
+    if (lines.length !== 1 || name !== sessionName || !pane || !/^\d+$/.test(pid) || Number(pid) <= 0) return { state: 'unknown', reason: 'session identity changed or is ambiguous' };
+    return { state: 'present', panePid: Number(pid), identity: `${name}:${pane}:${pid}` };
+  } catch (error) {
+    const failure = error as { code?: unknown; stderr?: string; killed?: boolean; signal?: unknown };
+    if (failure.code === 1 && !failure.killed && !failure.signal && failure.stderr?.trim() === `can't find session: ${sessionName}`) {
+      return { state: 'absent', reason: 'tmux positively reported the exact session absent' };
+    }
+    return { state: 'unknown', reason: 'tmux unavailable, timed out, or did not prove session absence' };
+  }
+};

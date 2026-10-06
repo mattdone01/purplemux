@@ -1,3 +1,4 @@
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspaceInput } from '@/lib/cli-utils';
@@ -53,14 +54,18 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const command = resumeSessionId
       ? await claudeProvider.buildResumeCommand(resumeSessionId, options)
       : await claudeProvider.buildLaunchCommand(options);
-    if (resumeSessionId && launchPolicy) {
-      await updateTabAgentState(launchPolicy.sessionName, claudeProvider, {
-        sessionId: resumeSessionId,
-        jsonlPath: null,
-        summary: null,
-        lastUserMessage: null,
+    if (launchPolicy) {
+      await withOrchestrationMappingRead(launchPolicy.workspaceId, async () => {
+        if (resumeSessionId) {
+          await updateTabAgentState(launchPolicy.sessionName, claudeProvider, {
+            sessionId: resumeSessionId,
+            jsonlPath: null,
+            summary: null,
+            lastUserMessage: null,
+          });
+        }
+        getStatusManager().markAgentLaunch(launchPolicy.tabId, { resumeSessionId: resumeSessionId ?? undefined });
       });
-      getStatusManager().markAgentLaunch(launchPolicy.tabId, { resumeSessionId });
     }
     return res.status(200).json({ command });
   } catch (err) {

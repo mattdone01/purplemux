@@ -1,3 +1,4 @@
+import { withOrchestrationMappingsRead } from '@/lib/orchestration-mapping-lock';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs } from '@/lib/layout-store';
 import { hasSession, createSession, getPaneCurrentCommand, getSessionPanePid, sendKeysSeparated } from '@/lib/tmux';
 import { getWorkspaces } from '@/lib/workspace-store';
@@ -137,8 +138,8 @@ const sendResumeKeys = async (target: IAutoResumeTarget): Promise<boolean> => {
       ...agentLaunchOptionsForTab(target),
     });
     log.debug(`Sending resume: ${target.tmuxSession} → ${target.sessionId}`);
-    await sendKeysSeparated(target.tmuxSession, resumeCmd);
     getStatusManager().markAgentLaunch(target.tabId);
+    await sendKeysSeparated(target.tmuxSession, resumeCmd);
 
     return true;
   } catch (err) {
@@ -147,7 +148,10 @@ const sendResumeKeys = async (target: IAutoResumeTarget): Promise<boolean> => {
   }
 };
 
-export const executeAutoResume = async (targets: IAutoResumeTarget[]): Promise<void> => {
+export const executeAutoResume = async (targets: IAutoResumeTarget[]): Promise<void> =>
+  withOrchestrationMappingsRead(targets.map((target) => target.workspaceId), () => executeAutoResumeLocked(targets));
+
+const executeAutoResumeLocked = async (targets: IAutoResumeTarget[]): Promise<void> => {
   // Phase 1: Sequential session creation — first createSession cold-starts tmux server, so avoid race
   let hasNewSession = false;
   for (const target of targets) {
@@ -167,10 +171,11 @@ export const executeAutoResume = async (targets: IAutoResumeTarget[]): Promise<v
   await Promise.allSettled(targets.map((target) => sendResumeKeys(target)));
 };
 
-export const autoResumeOnStartup = async (): Promise<void> => {
+export const autoResumeOnStartup = async (mappingGuardsHeld = false): Promise<void> => {
   const targets = await findAutoResumeTargets();
   if (targets.length === 0) return;
 
+  if (mappingGuardsHeld) { await executeAutoResumeLocked(targets); return; }
   log.debug(`${targets.length} surface(s) auto-resume started`);
   executeAutoResume(targets).then(() => {
     log.debug('Auto-resume complete');

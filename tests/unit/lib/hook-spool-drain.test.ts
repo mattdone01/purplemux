@@ -115,7 +115,7 @@ const spoolEvent = async (at: number, body: unknown, query = '', session = 'tmux
 const claudeStop = (session = 'tmux-w') => ({ event: 'stop', session });
 const claudePrompt = (session = 'tmux-w') => ({ event: 'prompt-submit', session });
 
-const managerWithPaste = async () => {
+const managerWithPaste = async (afterReplay?: () => Promise<void>) => {
   const paste = vi.fn(async (_session: string, _message: string) => {});
   const dispatcher = new AutomatedPromptDispatcher({
     findTarget: vi.fn(async (_ws, id) => tab(id)),
@@ -133,7 +133,9 @@ const managerWithPaste = async () => {
   const applied: IHookDelivery[] = [];
   manager.setHookSpoolDrain(() => drainHookSpool(async (delivery) => {
     applied.push(delivery);
-    return dispatchHook(delivery);
+    const result = await dispatchHook(delivery);
+    await afterReplay?.();
+    return result;
   }, { dir: spoolDir() }));
   return { manager, paste, applied };
 };
@@ -307,17 +309,41 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     expect(applied).toHaveLength(2);
   });
 
-  it('drains on every poll', async () => {
-    const { manager, applied } = await managerWithPaste();
-    await manager.init();
-    manager.registerTab('w', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code' });
-    state.tabs = [tab('w')];
-    await spoolEvent(Date.now() - 5_000, claudePrompt());
-    await manager.poll();
-    await waitFor(() => expect(applied).toHaveLength(1));
-    await spoolEvent(Date.now() - 1_000, claudeStop());
-    await manager.poll();
-    await waitFor(() => expect(applied).toHaveLength(2));
+  it('drains on each available poll and retains files added during an active drain', async () => {
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstApplied!: () => void;
+    const firstEntered = new Promise<void>((resolve) => { firstApplied = resolve; });
+    let holdFirst = true;
+    const { manager, applied } = await managerWithPaste(async () => {
+      if (!holdFirst) return;
+      holdFirst = false;
+      firstApplied();
+      await firstHeld;
+    });
+    try {
+      await manager.init();
+      manager.registerTab('w', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code' });
+      state.tabs = [tab('w')];
+      await spoolEvent(Date.now() - 5_000, claudePrompt());
+      await manager.poll();
+      await firstEntered;
+      const nextFile = await spoolEvent(Date.now() - 1_000, claudeStop());
+      await manager.poll();
+      expect(applied).toHaveLength(1);
+      expect(await fs.readdir(spoolDir())).toContain(nextFile);
+      // Replay entry precedes drain completion. An overlapping poll shares that drain.
+      releaseFirst();
+      await manager.drainHookSpool();
+      expect(applied).toHaveLength(1);
+      await manager.poll();
+      await manager.drainHookSpool();
+      expect(applied).toHaveLength(2);
+      expect(await fs.readdir(spoolDir())).not.toContain(nextFile);
+    } finally {
+      releaseFirst();
+      await manager.drainHookSpool();
+    }
   });
 
   it('a poll never waits for a drain: with a drain that hangs the poll completes, and a later poll starts no second drain', async () => {

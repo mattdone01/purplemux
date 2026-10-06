@@ -27,9 +27,11 @@ The fork now has orchestration built into the app; no CLI or scripts needed:
    shows per-tab state dots and the crown on the orchestrator.
 
 Settings persist per workspace in `workspaces.json` under `orchestration:
-{ enabled, orchestratorTabId, kickoffTemplate }`. API: `PATCH
+{ enabled, orchestratorTabId, revision, kickoffTemplate }`. API: `PATCH
 /api/workspace/:id` (orchestration object), `POST /api/workspace/:id/orchestrate`,
 `GET /api/workspace/:id/orchestration`.
+
+Mapping writes and Start carry the revision displayed by the UI. A conflict refreshes state and requires a new explicit action. Replacing an incumbent requires human confirmation and leaves its process running. Local agents use `purplemux orchestration recover -w WS TAB` only when the mapping is vacant or its incumbent is positively absent; a launch-verified incumbent can use `handoff`. Unknown or pending runtime refuses recovery. Keep orchestration enabled while waiting for human input and post `state: "awaiting-human"`; idle heartbeats pause. Clear/off is permitted only when fresh evidence confirms all work finished.
 
 Everything below is the original CLI/script flow — still valid as a headless
 fallback (e.g. driving purplemux from outside the app).

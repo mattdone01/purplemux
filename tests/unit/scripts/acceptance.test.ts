@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Story 07: the isolated acceptance harness that gates every forward deploy (scripts/acceptance/).
 // These tests pin its judgements and its safety rules with fakes; the end-to-end run against a real
@@ -663,4 +663,13 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     }
     expect(body.match(/^SKIP .*/gm)).toEqual(['SKIP bash-guard — no --bash-guard path given']);
   });
+});
+
+it('isolated intentional ownership changes send one human CAS replacement with the read revision', async () => {
+  const inst = Object.create(checks.Instance.prototype);
+  inst.cli = vi.fn(async () => ({ rc: 0, out: JSON.stringify({ orchestration: { revision: 7, orchestratorTabId: 'old' } }) }));
+  inst.human = vi.fn(async () => ({ status: 409, body: 'changed' }));
+  expect(await inst.designate('ws-a', 'next')).toMatchObject({ rc: 1 });
+  expect(inst.cli).toHaveBeenCalledOnce(); expect(inst.human).toHaveBeenCalledOnce();
+  expect(inst.human).toHaveBeenCalledWith('PATCH', '/api/workspace/ws-a', { orchestration: { enabled: true, orchestratorTabId: 'next' }, expectedRevision: 7, mode: 'replace' });
 });

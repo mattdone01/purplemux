@@ -1,3 +1,4 @@
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
@@ -368,7 +369,7 @@ export const closeTab = async (
   paneId: string,
   tabId: string,
   opts: { keepProcesses?: boolean } = {},
-): Promise<ICloseTabResult> => {
+): Promise<ICloseTabResult> => withOrchestrationMappingRead(wsId, async () => {
   const tabInfo = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -396,7 +397,7 @@ export const closeTab = async (
     emitTabClosing({ ...closing, phase: 'aborted' });
     throw err;
   }
-};
+});
 
 const removeClosedTab = async (
   wsId: string,
@@ -460,7 +461,7 @@ export const renameTabInPane = async (wsId: string, paneId: string, tabId: strin
   });
 
 export const restartTabSession = async (wsId: string, paneId: string, tabId: string, command?: string): Promise<boolean> =>
-  withLock(async () => {
+  withOrchestrationMappingRead(wsId, () => withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
     if (!layout) return false;
@@ -490,7 +491,7 @@ export const restartTabSession = async (wsId: string, paneId: string, tabId: str
       await writeLayoutFile(layout, filePath);
     }
     return true;
-  });
+  }));
 
 export const reconcileTabCwd = async (sessionName: string): Promise<void> =>
   withLock(async () => {
@@ -821,7 +822,7 @@ export const splitPaneInLayout = async (
   return result;
 };
 
-export const closePaneInLayout = async (wsId: string, paneId: string): Promise<ILayoutData | null> => {
+export const closePaneInLayout = async (wsId: string, paneId: string): Promise<ILayoutData | null> => withOrchestrationMappingRead(wsId, async () => {
   let sessions: Array<{ sessionName: string; tabId: string }> = [];
 
   const result = await withLock(async () => {
@@ -848,7 +849,7 @@ export const closePaneInLayout = async (wsId: string, paneId: string): Promise<I
   await Promise.all(sessions.map((s) => killSession(s.sessionName, { tabId: s.tabId }).catch(() => {})));
 
   return result;
-};
+});
 
 export const reorderTabsInPane = async (
   wsId: string,
@@ -909,7 +910,7 @@ export const patchTab = async (
   paneId: string,
   tabId: string,
   patch: Partial<Pick<ITab, 'name' | 'panelType' | 'title' | 'cwd' | 'lastCommand' | 'webUrl' | 'terminalRatio' | 'terminalCollapsed'>>,
-): Promise<ILayoutData | null> => {
+): Promise<ILayoutData | null> => withOrchestrationMappingRead(wsId, async () => {
   let authoritativeCwd: string | null | undefined;
   let authoritativeTitle: string | null | undefined;
   if (patch.cwd !== undefined || patch.title !== undefined) {
@@ -959,4 +960,4 @@ export const patchTab = async (
     if (patch.terminalCollapsed !== undefined) tab.terminalCollapsed = patch.terminalCollapsed;
     return layout;
   });
-};
+});

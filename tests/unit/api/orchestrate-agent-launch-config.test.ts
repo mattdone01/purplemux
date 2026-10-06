@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const layout = vi.hoisted(() => ({ addTabToPane: vi.fn() }));
 const claude = vi.hoisted(() => ({ buildClaudeFlags: vi.fn() }));
-const workspace = vi.hoisted(() => ({ updateWorkspaceOrchestration: vi.fn() }));
+const recovery = vi.hoisted(() => ({ start: vi.fn() }));
 const manager = vi.hoisted(() => ({
   registerTab: vi.fn(),
   markAgentLaunch: vi.fn(),
@@ -12,10 +12,7 @@ const manager = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/layout-store', () => layout);
-vi.mock('@/lib/workspace-store', () => ({
-  getWorkspaceById: vi.fn(async () => ({ id: 'ws-pins', directories: ['/repo'] })),
-  updateWorkspaceOrchestration: workspace.updateWorkspaceOrchestration,
-}));
+vi.mock('@/lib/orchestration-recovery', () => ({ startOrchestrationTransaction: recovery.start }));
 vi.mock('@/lib/cli-utils', () => ({ resolveFirstPaneId: vi.fn(async () => 'pane-one') }));
 vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => manager }));
 vi.mock('@/lib/providers', () => ({
@@ -44,6 +41,7 @@ const fakeResponse = () => {
 describe('POST /api/workspace/[workspaceId]/orchestrate launch config', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    recovery.start.mockImplementation(async (_id, _options, _template, create) => ({ workspace: { orchestration: { revision: 1 } }, tab: await create({ id: 'ws-pins', directories: ['/repo'] }) }));
     claude.buildClaudeFlags.mockResolvedValue('--model claude-opus-5 --effort high');
     layout.addTabToPane.mockResolvedValue({
       id: 'tab-root',
@@ -63,7 +61,7 @@ describe('POST /api/workspace/[workspaceId]/orchestrate launch config', () => {
       method: 'POST',
       query: { workspaceId: 'ws-pins' },
       body: {
-        prompt: 'Run the epic',
+        prompt: 'Run the epic', expectedRevision: 0,
         model: 'claude-opus-5',
         effort: 'high',
       },
@@ -80,4 +78,21 @@ describe('POST /api/workspace/[workspaceId]/orchestrate launch config', () => {
     );
     expect(state.statusCode).toBe(200);
   });
+});
+
+it.each([undefined, -1, '0'])('human start precondition %s creates nothing and queues no kickoff', async (expectedRevision) => {
+  vi.clearAllMocks();
+  const { default: handler } = await import('@/pages/api/workspace/[workspaceId]/orchestrate');
+  const { state, res } = fakeResponse();
+  await handler({ method: 'POST', query: { workspaceId: 'ws-pins' }, body: { prompt: 'work', expectedRevision } } as unknown as NextApiRequest, res);
+  expect(state.statusCode).toBe(expectedRevision === undefined ? 428 : 400);
+  expect(recovery.start).not.toHaveBeenCalled(); expect(layout.addTabToPane).not.toHaveBeenCalled(); expect(manager.queueKickoffPrompt).not.toHaveBeenCalled();
+});
+it('reports a created undesignated tab on commit failure and queues no kickoff', async () => {
+  vi.clearAllMocks();
+  const { OrchestrationError } = await import('@/lib/orchestration-contract');
+  recovery.start.mockRejectedValueOnce(new OrchestrationError(503, 'orchestration-persist-failed', 'Tab new is undesignated', undefined, 'new'));
+  const { default: handler } = await import('@/pages/api/workspace/[workspaceId]/orchestrate'); const { state, res } = fakeResponse();
+  await handler({ method: 'POST', query: { workspaceId: 'ws-pins' }, body: { prompt: 'work', expectedRevision: 0 } } as unknown as NextApiRequest, res);
+  expect(state).toMatchObject({ statusCode: 503, body: { undesignatedTabId: 'new' } }); expect(manager.queueKickoffPrompt).not.toHaveBeenCalled();
 });

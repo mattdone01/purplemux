@@ -69,4 +69,15 @@ export const withOrchestrationMappingRead = <T>(
 export const withOrchestrationMappingWrite = <T>(
   workspaceId: string,
   work: () => Promise<T>,
-): Promise<T> => withMappingLease(workspaceId, 'write', work);
+): Promise<T> => withMappingLease(workspaceId, 'write', () => withMappingLease('\0server-reset', 'read', work));
+
+/** Outer guard for explicit server-wide lifecycle operations; acquire once in stable order. */
+export const withOrchestrationMappingsRead = <T>(workspaceIds: string[], work: () => Promise<T>): Promise<T> => {
+  const ids = [...new Set(workspaceIds)].sort();
+  const take = (index: number): Promise<T> => index === ids.length ? work() : withOrchestrationMappingRead(ids[index], () => take(index + 1));
+  return take(0);
+};
+
+/** Serialize explicit whole-server reset against mapping commits, including newly created workspaces. */
+export const withOrchestrationReset = <T>(work: () => Promise<T>): Promise<T> =>
+  withMappingLease('\0server-reset', 'write', work);

@@ -18,9 +18,9 @@ beforeAll(async () => {
   server = http.createServer((req, res) => {
     req.resume();
     observed = String(req.headers['x-pmux-token']);
-    const allowed = observed === 'target-token' || (observed === 'global' && req.method === 'GET' && req.url?.endsWith('/peers'));
+    const allowed = observed === 'target-token' || (observed === 'global' && req.method === 'GET' && (req.url?.endsWith('/peers') || req.url?.endsWith('/orchestration')));
     res.writeHead(allowed ? 200 : 403, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(allowed ? {} : { error: 'Own workspace required', code: 'forbidden' }));
+    res.end(JSON.stringify(allowed ? { orchestration: { revision: 0 } } : { error: 'Own workspace required', code: 'forbidden' }));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   port = (server.address() as { port: number }).port;

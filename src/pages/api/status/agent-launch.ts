@@ -1,3 +1,4 @@
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getStatusManager } from '@/lib/status-manager';
@@ -14,7 +15,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(400).json({ error: 'tabId is required' });
   }
 
-  getStatusManager().markAgentLaunch(tabId, { resetAgentSession: resetAgentSession === true });
+  const manager = getStatusManager();
+  const workspaceId = manager.getAllForClient()[tabId]?.workspaceId;
+  if (!workspaceId) return res.status(404).json({ error: 'Tab not found' });
+  await withOrchestrationMappingRead(workspaceId, async () => {
+    manager.markAgentLaunch(tabId, { resetAgentSession: resetAgentSession === true });
+  });
   return res.status(204).end();
 };
 

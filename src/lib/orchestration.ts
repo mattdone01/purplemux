@@ -11,18 +11,19 @@ export const ORCH_IDLE_HEARTBEAT_MS = 10 * 60 * 1000;
 export const ORCH_MAX_HEARTBEATS = 3;
 
 export const buildHeartbeatMessage = (idleMinutes: number, workspaceId: string): string =>
-  `${NUDGE_PREFIX} heartbeat: you have been idle ~${idleMinutes} min with NO active workers and nothing pending that will wake you. Re-read your epic state and act on the next step now (dispatch workers, run the next phase, or report). Then post a standup tick (purplemux standup report -w ${workspaceId} --json '...') so the human can see where things stand without reading any pane. If the epic is finished or genuinely waiting on a human, post a final standup (state "done" or "awaiting-human", blockers naming the exact input you need) and then turn these heartbeats off yourself: purplemux orchestration off -w ${workspaceId}`;
+  `${NUDGE_PREFIX} heartbeat: you have been idle ~${idleMinutes} min with NO active workers and nothing pending that will wake you. Re-read your epic state and act on the next step now (dispatch workers, run the next phase, or report). Then post a standup tick (purplemux standup report -w ${workspaceId} --json '...') so the human can see where things stand without reading any pane. If waiting on a human, post state "awaiting-human" naming the exact input and keep orchestration enabled; idle heartbeats pause without resuming work. Only after all work is confirmed finished, post state "done" and disable with: purplemux orchestration off -w ${workspaceId}`;
 
 export const parseOrchestrationPatch = (raw: unknown): Partial<import('@/types/terminal').IWorkspaceOrchestration> | null => {
-  if (typeof raw !== 'object' || raw === null) return null;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const body = raw as Record<string, unknown>;
+  if (Object.keys(body).some((key) => !['enabled', 'orchestratorTabId', 'kickoffTemplate', 'expectedRevision', 'mode'].includes(key))) return null;
   const patch: Partial<import('@/types/terminal').IWorkspaceOrchestration> = {};
   if (body.enabled !== undefined) {
     if (typeof body.enabled !== 'boolean') return null;
     patch.enabled = body.enabled;
   }
   if (body.orchestratorTabId !== undefined) {
-    if (body.orchestratorTabId !== null && typeof body.orchestratorTabId !== 'string') return null;
+    if (body.orchestratorTabId !== null && (typeof body.orchestratorTabId !== 'string' || !body.orchestratorTabId)) return null;
     patch.orchestratorTabId = body.orchestratorTabId;
   }
   if (body.kickoffTemplate !== undefined) {
@@ -59,7 +60,7 @@ purplemux's built-in watchdog sends you '${NUDGE_PREFIX} ...' messages when a wo
 - INACTIVE/DEAD: respawn the tab and re-issue the task, noting prior progress.
 After handling every nudge, post a standup tick, then end your turn. The tick is the human's dashboard — it must answer "where are things at, are we progressing, any blockers, am I needed" at a glance:
 purplemux standup report -w {{WORKSPACE_ID}} --json '${STANDUP_SCHEMA_HINT}'
-One item per task with its current status; every blocker names the exact input that clears it; set needsHuman only when a human decision is genuinely required. Do not busy-wait; the watchdog will wake you. When the epic is FINISHED (or hard-blocked on a human): post a final standup (state "done", or "awaiting-human" with the blockers filled in), close remaining worker tabs, then run: purplemux orchestration off -w {{WORKSPACE_ID}} — this stops the idle heartbeats so you are not woken all night for nothing.
+One item per task with its current status; every blocker names the exact input that clears it; set needsHuman only when a human decision is genuinely required. Do not busy-wait; the watchdog will wake you. When awaiting a human, post state "awaiting-human" with the blockers filled in and retain the coordinator; heartbeats pause and no work resumes automatically. Only when the epic is FINISHED: post state "done", close completed worker tabs, then run: purplemux orchestration off -w {{WORKSPACE_ID}} — this stops the idle heartbeats so you are not woken all night for nothing.
 
 Mission Control is the durable decision record. At kickoff/resume and on ordinary turns, read outstanding answers and human-inbox policy guidance with purplemux mission answers -w {{WORKSPACE_ID}}. Acknowledge each exact answer ID with the ackCommand that purplemux mission answers prints for it (its generation, revision, and event ID) after applying it, then explicitly resolve the attention item. Workers route blockers to you; ordinary attention events create durable workspace candidates. Use existing instructions, authority, evidence, and delegated handling first. Routine setup, coordination, already-granted permissions, and parked-work choices are not human questions merely because a worker stopped. Only the remaining human-exclusive decision, approval, information, or external action receives an explicit human review from the configured orchestrator. Record workspace handling with a none review or cancel an issue handled elsewhere. Reuse stable item IDs and report transitions, not repeated unchanged issues. Emit stable Mission Control events when the run starts/resumes, meaningful progress changes, an attention item opens/changes, an answer is applied, or the run finishes. Do not turn standup blockers or historical transcript questions into confirmed decisions. Completion requires an explicit run.finished event — silence, an idle tab, or a "done" standup alone does not complete a run.
 

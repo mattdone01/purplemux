@@ -1,3 +1,4 @@
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { IncomingMessage } from 'http';
 import { WebSocket } from 'ws';
 import { watch, type FSWatcher } from 'fs';
@@ -745,22 +746,27 @@ export const handleResumeMessage = async (
       });
       return;
     }
-    const resumeCmd = await conn.provider.buildResumeCommand(sessionId, {
-      workspaceId: launchPolicy?.workspaceId ?? parsed?.wsId,
-      ...launchPolicy?.options,
-    });
-    if (conn.currentJsonlPath) {
-      unsubscribeFromFile(ws, conn.currentJsonlPath);
-      conn.currentJsonlPath = null;
-    }
-    await sendKeys(tmuxSession, resumeCmd);
-    await updateTabAgentState(conn.sessionName, conn.provider, {
-      sessionId,
-      jsonlPath: null,
-      summary: null,
-      lastUserMessage: null,
-    });
-    if (parsed) getStatusManager().markAgentLaunch(parsed.tabId, { resumeSessionId: sessionId });
+    const submitResume = async () => {
+      const resumeCmd = await conn.provider.buildResumeCommand(sessionId, {
+        workspaceId: launchPolicy?.workspaceId ?? parsed?.wsId,
+        ...launchPolicy?.options,
+      });
+      if (conn.currentJsonlPath) {
+        unsubscribeFromFile(ws, conn.currentJsonlPath);
+        conn.currentJsonlPath = null;
+      }
+      if (parsed) getStatusManager().markAgentLaunch(parsed.tabId, { resumeSessionId: sessionId });
+      await sendKeys(tmuxSession, resumeCmd);
+      await updateTabAgentState(conn.sessionName, conn.provider, {
+        sessionId,
+        jsonlPath: null,
+        summary: null,
+        lastUserMessage: null,
+      });
+
+    };
+    if (parsed) await withOrchestrationMappingRead(parsed.wsId, submitResume);
+    else await submitResume();
 
     const jsonlPath = await resolveJsonlPath(tmuxSession, sessionId, conn.provider);
 

@@ -32,7 +32,7 @@ const durablePersistence: IOrchestratorPresencePersistence = {
 const ACTIVE_WORK_STATES = new Set(['busy', 'needs-input', 'ready-for-review']);
 const USABLE_ORCHESTRATOR_STATES = new Set(['busy', 'idle', 'needs-input', 'ready-for-review']);
 
-const workStateOf = (facts: IOrchestratorPresenceFacts): {
+export const workStateOf = (facts: IOrchestratorPresenceFacts): {
   state: TWorkspaceWorkState;
   evidence: string[];
   incomplete: boolean;

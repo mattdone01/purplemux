@@ -30,8 +30,9 @@ import {
 import { removeWorkspaceClaudeHome } from '@/lib/workspace-home';
 import { revokeWorkspaceToken } from '@/lib/workspace-token';
 import { revokeWorkspaceTabTokens } from '@/lib/tab-token';
-import { withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
-import type { IWorkspace, IWorkspaceGroup, IWorkspaceOrchestration, IWorkspacesData, ILayoutData } from '@/types/terminal';
+import { normalizeOrchestration, OrchestrationError, requireOrchestrationRevision, type TOrchestrationPatch } from '@/lib/orchestration-contract';
+import { withOrchestrationMappingWrite, withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
+import type { IWorkspace, IWorkspaceGroup, IWorkspacesData, ILayoutData } from '@/types/terminal';
 
 const log = createLogger('workspace');
 
@@ -116,6 +117,7 @@ const readWorkspacesFile = async (): Promise<IWorkspacesData | null> => {
   try {
     const data = JSON.parse(raw) as IWorkspacesData;
     for (const ws of data.workspaces) {
+      ws.orchestration = normalizeOrchestration(ws.orchestration);
       const legacy = ws as unknown as { directory?: string; order?: number };
       if (!ws.directories && legacy.directory) {
         ws.directories = [legacy.directory];
@@ -134,7 +136,8 @@ const readWorkspacesFile = async (): Promise<IWorkspacesData | null> => {
       }
     }
     return data;
-  } catch {
+  } catch (error) {
+    if (error instanceof OrchestrationError) throw error;
     log.warn('Failed to parse workspaces.json, starting empty');
     try {
       await fs.copyFile(WORKSPACES_FILE, WORKSPACES_FILE.replace(/\.json$/, '.json.bak'));
@@ -149,6 +152,23 @@ const readWorkspacesFile = async (): Promise<IWorkspacesData | null> => {
  * both, which is right for the UI and wrong for a sweep that releases what it
  * cannot see.
  */
+export const readWorkspacesStrict = async (): Promise<IWorkspacesData> => {
+  try {
+    const data = JSON.parse(await fs.readFile(WORKSPACES_FILE, 'utf-8')) as IWorkspacesData;
+    if (!data || !Array.isArray(data.workspaces) || data.workspaces.some((ws) => !ws || typeof ws.id !== 'string')) throw new Error('Invalid workspaces registry');
+    for (const ws of data.workspaces) ws.orchestration = normalizeOrchestration(ws.orchestration);
+    return data;
+  } catch (error) {
+    throw new OrchestrationError(503, 'orchestration-unavailable', `Workspace registry unavailable: ${error instanceof Error ? error.message : error}`);
+  }
+};
+
+export const getWorkspaceStrict = async (workspaceId: string): Promise<IWorkspace> => {
+  const ws = (await readWorkspacesStrict()).workspaces.find((value) => value.id === workspaceId);
+  if (!ws) throw new OrchestrationError(404, 'workspace-not-found', 'Workspace not found');
+  return { ...ws, orchestration: normalizeOrchestration(ws.orchestration) };
+};
+
 export const readWorkspaceIdsStrict = async (): Promise<string[]> => {
   let raw: string;
   try {
@@ -247,7 +267,7 @@ const migrateFromTabs = async (): Promise<IWorkspacesData | null> => {
   }
 };
 
-export const initWorkspaceStore = async (): Promise<void> => {
+export const initWorkspaceStore = async (mappingGuardsHeld = false): Promise<void> => {
   await fs.mkdir(path.join(BASE_DIR, 'workspaces'), { recursive: true });
 
   let data = await readWorkspacesFile();
@@ -278,6 +298,7 @@ export const initWorkspaceStore = async (): Promise<void> => {
   const allTmuxSessions = await listSessions();
 
   for (const ws of data.workspaces) {
+    const reconcile = async () => {
     const layoutFile = resolveLayoutFile(ws.id);
     let layout = await readLayoutFile(layoutFile);
 
@@ -285,7 +306,7 @@ export const initWorkspaceStore = async (): Promise<void> => {
       log.warn(`Workspace '${ws.name}': layout.json corrupted, reset to default pane`);
       layout = await createDefaultLayout(ws.id, ws.directories[0]);
       await writeLayoutFile(layout, layoutFile);
-      continue;
+      return;
     }
 
     const wsTabs = collectAllTabs(layout.root);
@@ -305,6 +326,9 @@ export const initWorkspaceStore = async (): Promise<void> => {
       log.error(`Workspace '${ws.name}': tmux consistency check failed: ${err instanceof Error ? err.message : err}`);
     }
 
+    };
+    if (mappingGuardsHeld) await reconcile();
+    else await withOrchestrationMappingRead(ws.id, reconcile);
   }
 };
 
@@ -443,7 +467,7 @@ export const createWorkspace = async (
   });
 
 export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
-  withLock(async () => {
+  withOrchestrationMappingWrite(workspaceId, () => withLock(async () => {
     const data = (await readWorkspacesFile()) ?? emptyState();
     const idx = data.workspaces.findIndex((w) => w.id === workspaceId);
     if (idx === -1) return false;
@@ -475,7 +499,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
     await revokeWorkspaceTabTokens(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;
-  });
+  }));
 
 export const renameWorkspace = async (workspaceId: string, name: string): Promise<IWorkspace | null> =>
   withLock(async () => {
@@ -546,24 +570,27 @@ export const updateWorkspaceAllowedPeers = async (
     return { ...ws };
   });
 
+/** Internal CAS persistence: caller must hold the mapping write lease and lifecycle guards. */
+export const commitWorkspaceOrchestrationLocked = async (
+  workspaceId: string, patch: TOrchestrationPatch, expectedRevision: number,
+): Promise<IWorkspace> => withLock(async () => {
+  const data = await readWorkspacesStrict();
+  const ws = data.workspaces.find((value) => value.id === workspaceId);
+  if (!ws) throw new OrchestrationError(404, 'workspace-not-found', 'Workspace not found');
+  const current = normalizeOrchestration(ws.orchestration);
+  requireOrchestrationRevision(current, expectedRevision);
+  const next = { ...current, ...patch };
+  if (JSON.stringify(next) === JSON.stringify(current)) return { ...ws, orchestration: current };
+  if (current.revision === Number.MAX_SAFE_INTEGER) throw new OrchestrationError(503, 'orchestration-unavailable', 'Orchestration revision exhausted');
+  ws.orchestration = { ...next, revision: current.revision + 1 };
+  await writeWorkspacesFile(data);
+  return ws;
+});
+
 export const updateWorkspaceOrchestration = async (
-  workspaceId: string,
-  patch: Partial<IWorkspaceOrchestration>,
-): Promise<IWorkspace | null> =>
-  withOrchestrationMappingWrite(workspaceId, () => withLock(async () => {
-    const data = await readWorkspacesFile();
-    if (!data) return null;
-    const ws = data.workspaces.find((w) => w.id === workspaceId);
-    if (!ws) return null;
-    const current: IWorkspaceOrchestration = ws.orchestration ?? { enabled: false, orchestratorTabId: null };
-    ws.orchestration = {
-      enabled: patch.enabled ?? current.enabled,
-      orchestratorTabId: patch.orchestratorTabId !== undefined ? patch.orchestratorTabId : current.orchestratorTabId,
-      kickoffTemplate: patch.kickoffTemplate !== undefined ? patch.kickoffTemplate : current.kickoffTemplate,
-    };
-    await writeWorkspacesFile(data);
-    return ws;
-  }));
+  workspaceId: string, patch: TOrchestrationPatch,
+  options: import('@/lib/orchestration-recovery').IOrchestrationChange,
+): Promise<IWorkspace> => (await import('@/lib/orchestration-recovery')).changeOrchestration(workspaceId, patch, options);
 
 export interface IReorderItem {
   id: string;

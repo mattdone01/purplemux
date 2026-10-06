@@ -32,7 +32,10 @@ vi.mock('@/lib/tmux', () => ({
   listSessions: vi.fn(async () => []),
   killSession: vi.fn(),
 }));
-vi.mock('@/lib/layout-store', () => ({}));
+vi.mock('@/lib/layout-store', () => ({ collectAllTabs: () => [...mocks.tabs.values()], isAgentPanelType: () => true }));
+vi.mock('@/lib/workspace-layout-read', () => ({ readWorkspaceLayout: async () => ({ root: {} }) }));
+vi.mock('@/lib/orchestration-runtime', () => ({ observeOrchestrationRuntime: async (tab: ITab) => tab.id === 'crown-a' ? { state: 'absent', reason: 'dead' } : { state: 'present', identity: tab.sessionName }, candidateModelUsable: async () => true }));
+vi.mock('@/lib/caller', () => ({ resolveCaller: async () => ({ kind: 'workspace', workspaceId: 'ws-map', tabId: null, verified: false }) }));
 vi.mock('@/lib/providers/codex', () => ({ CODEX_LAUNCHER_SCRIPT: '/test/codex-launcher.js', codexProvider: {} }));
 vi.mock('@/lib/providers/codex/session-detection', () => ({ findCodexSessionById: vi.fn() }));
 vi.mock('@/lib/providers/codex/model-observation', () => ({ getCodexModelStatus: mocks.model }));
@@ -67,7 +70,7 @@ const call = async (handler: THandler, body: unknown, method = 'POST') => {
   return response;
 };
 const settings = (enabled: boolean): IWorkspaceOrchestration => ({
-  enabled, orchestratorTabId: enabled ? 'crown-a' : null,
+  enabled, orchestratorTabId: enabled ? 'crown-a' : null, revision: 0,
 });
 const seed = async (enabled: boolean) => {
   const data: IWorkspacesData = {
@@ -131,7 +134,7 @@ describe('actual orchestration PATCH and dispatch share the mapping lease', () =
     await pasted.promise;
     const attempted = attemptedWriter();
     let updated = false;
-    const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b' }, 'PATCH')
+    const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH')
       .then((result) => { updated = true; return result; });
     await attempted;
     const before = await store.getWorkspaceById(WS);
@@ -159,7 +162,7 @@ describe('actual orchestration PATCH and dispatch share the mapping lease', () =
     const delivery = deliver('cli');
     await pasted.promise;
     const attempted = attemptedWriter();
-    const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b' }, 'PATCH');
+    const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH');
     await attempted;
     const changedPeers = await store.updateWorkspaceAllowedPeers(WS, []);
     release.resolve();
@@ -176,7 +179,7 @@ describe('actual orchestration PATCH and dispatch share the mapping lease', () =
     const first = deliver('cli');
     await pasted.promise;
     const writerAttempted = attemptedWriter();
-    const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b' }, 'PATCH');
+    const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH');
     await writerAttempted;
     const readerAttempted = deferred();
     const read = mapping.withOrchestrationMappingRead;
@@ -200,17 +203,16 @@ describe('actual orchestration PATCH and dispatch share the mapping lease', () =
     await seed(false);
     mocks.paste.mockRejectedValueOnce(new Error('paste failed'));
     expect(await deliver('automated')).toMatchObject({ delivered: false, reason: 'delivery-error' });
-    expect(await call(orchestration, { enabled: true, orchestratorTabId: 'crown-b' }, 'PATCH')).toMatchObject({ status: 200 });
+    expect(await call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH')).toMatchObject({ status: 200 });
     expect(await deliver('automated')).toMatchObject({ delivered: false, reason: 'model-policy' });
   });
 
   it('releases mapping and workspace write leases after a failed file write', async () => {
     await seed(false);
     const write = vi.spyOn(fs, 'writeFile').mockRejectedValueOnce(new Error('write unavailable'));
-    await expect(call(orchestration, { enabled: true, orchestratorTabId: 'crown-b' }, 'PATCH'))
-      .rejects.toThrow('write unavailable');
+    expect(await call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH')).toMatchObject({ status: 503 });
     write.mockRestore();
     expect(await deliver('automated')).toEqual({ delivered: true });
-    expect(await call(orchestration, { enabled: true, orchestratorTabId: 'crown-b' }, 'PATCH')).toMatchObject({ status: 200 });
+    expect(await call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH')).toMatchObject({ status: 200 });
   });
 });

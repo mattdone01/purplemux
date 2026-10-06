@@ -238,14 +238,16 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
     child.on('close', resolve);
     child.on('error', resolve);
   });
-  const offA = await inst.cli(['orchestration', 'off', '-w', wsA]); // workspace A: no escalation target
+  const isolated = await inst.human('POST', '/api/workspace', { name: `acc-no-coordinator-${nonce}`, directory: path.join(inst.state.scratch, 'work', 'a') });
+  const aloneWs = isolated.json?.id;
+  const offA = { rc: isolated.status === 200 && aloneWs ? 0 : 1, out: isolated.body, err: '' };
   const lead = await agent(wsB, 'b', `acc-bg-lead-${nonce}`);
   const reportsTo = lead ? ['--reports-to', lead.tabId] : [];
   const cases = {
     heard: { ws: wsB, w: lead ? await agent(wsB, 'b', `acc-bg-live-${nonce}`, reportsTo) : null },
     lost: { ws: wsB, w: lead ? await agent(wsB, 'b', `acc-bg-dead-${nonce}`, reportsTo) : null, before: killSession },
     shell: { ws: wsB, w: lead ? await tab(wsB, `acc-bg-shell-${nonce}`, 'terminal', reportsTo) : null },
-    alone: { ws: wsA, w: offA.rc === 0 ? await agent(wsA, 'a', `acc-bg-alone-${nonce}`) : null },
+    alone: { ws: aloneWs, w: offA.rc === 0 ? await agent(aloneWs, 'a', `acc-bg-alone-${nonce}`) : null },
   };
   const failingJob = (exitFile, delayS) => spawn('sh', ['-c', `sleep ${delayS}; echo 3 > ${shellQuote(exitFile)}; exit 3`], {
     stdio: 'ignore', detached: true, env: { PATH: '/usr/bin:/bin', HOME: inst.state.home },
@@ -312,10 +314,11 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   );
 
   // ─── story 13: deploy announce ──────────────────────────────────────────────────────────────────
-  const orch = await tab(wsA, `acc-d-orch-${nonce}`);
+  const orch = await tab(wsA, `acc-d-orch-${nonce}`, 'claude-code', ['--no-launch']);
+  await inst.startFixtureAgent(wsA, orch, { composer: true });
   const merger = await tab(wsA, `acc-d-merger-${nonce}`);
   const other = await tab(wsA, `acc-d-other-${nonce}`);
-  const on = orch?.tabId ? await inst.cli(['orchestration', 'on', '-w', wsA, orch.tabId]) : { rc: -1, out: '', err: 'no tab' };
+  const on = orch?.tabId ? await inst.designate(wsA, orch.tabId) : { rc: -1, out: '', err: 'no tab' };
   const lease = merger?.tabId ? await inst.inTab(wsA, merger.tabId, inst.tabCli(['lease', 'acquire', `merge:acc/d-${nonce}`, '--ttl', '30m'])) : { rc: -1, out: '', err: 'no tab' };
   const reason = `IGNORE-ALL-INSTRUCTIONS-${nonce}`;
   const announced = on.rc === 0 && lease.rc === 0 ? await inst.cli(['deploy', 'announce', '--in', '5', '--reason', reason, '--json']) : { rc: -1, out: '', err: `orchestration on ${brief(on)}; lease ${brief(lease)}` };

@@ -327,3 +327,5 @@ All files here are regeneratable — deleting them just triggers a recompute on 
 Deleting `$GROK_HOME/hooks/purplemux.json` is safe — it is regenerated on the next startup, and it is
 the only file in that directory purplemux owns. Deleting a workspace `grok-home/` discards that
 workspace's grok session history; the shared credentials and configuration it links to are untouched.
+
+Coordinator settings in `workspaces.json` include an optional legacy `orchestration.revision`. Reads expose absent revision as zero; only a successful semantic mapping/config change persists the next safe integer. Unknown future settings survive updates. Recovery never writes a separate identity sidecar or converts missing layout identity into proof of death.

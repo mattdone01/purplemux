@@ -1,3 +1,4 @@
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { addTabToPane, updateTabAgentSessionId } from '@/lib/layout-store';
@@ -95,9 +96,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (resumeSessionId && provider && !command && provider.id !== CODEX_PROVIDER_ID) {
       setTimeout(async () => {
         try {
-          const resumeCmd = await provider.buildResumeCommand(resumeSessionId, { workspaceId: wsId });
-          await sendKeys(tab.sessionName, resumeCmd);
-          getStatusManager().markAgentLaunch(tab.id);
+          await withOrchestrationMappingRead(wsId, async () => {
+            const resumeCmd = await provider.buildResumeCommand(resumeSessionId, { workspaceId: wsId });
+            getStatusManager().markAgentLaunch(tab.id);
+            await sendKeys(tab.sessionName, resumeCmd);
+          });
         } catch (err) {
           log.warn(`resume sendKeys failed: ${err instanceof Error ? err.message : err}`);
         }

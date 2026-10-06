@@ -18,6 +18,7 @@ interface IRecorded {
   body: string;
 }
 
+let conflict = false;
 let server: http.Server;
 let port: number;
 let recorded: IRecorded[];
@@ -30,8 +31,11 @@ beforeAll(async () => {
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
       recorded.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers, body });
+      if (conflict && req.method === 'PATCH') {
+        res.writeHead(409, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ code: 'orchestration-conflict', error: 'changed', orchestration: { revision: 8 } })); return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{}');
+      res.end(JSON.stringify({ orchestration: { revision: 7 } }));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -44,6 +48,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   recorded = [];
+  conflict = false;
   home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-identity-'));
   fakeBin = path.join(home, 'bin');
   await fs.mkdir(fakeBin);
@@ -66,8 +71,8 @@ const cli = async (args: string[], env: Record<string, string>) => {
       ...env,
     },
   });
-  expect(recorded).toHaveLength(1);
-  return recorded[0];
+  expect(recorded).toHaveLength(args[0] === 'orchestration' ? 2 : 1);
+  return recorded[recorded.length - 1];
 };
 
 describe('purplemux CLI caller identity', () => {
@@ -117,7 +122,7 @@ describe('purplemux CLI caller identity', () => {
       FAKE_TMUX_SESSION: 'pt-ws-a-pane-1-tab-other',
     });
     expect(call.method).toBe('PATCH');
-    expect(JSON.parse(call.body)).toEqual({ enabled: true, orchestratorTabId: 'tab-own' });
+    expect(JSON.parse(call.body)).toEqual({ enabled: true, orchestratorTabId: 'tab-own', expectedRevision: 7, mode: 'recover' });
   });
 
   it('still parses the session name for a tab created before PMUX_TAB_ID existed', async () => {
@@ -126,7 +131,14 @@ describe('purplemux CLI caller identity', () => {
       TMUX: '/tmp/fake,1,0',
       FAKE_TMUX_SESSION: 'pt-ws-a-pane-1-tab-legacy',
     });
-    expect(JSON.parse(call.body)).toEqual({ enabled: true, orchestratorTabId: 'tab-legacy' });
+    expect(JSON.parse(call.body)).toEqual({ enabled: true, orchestratorTabId: 'tab-legacy', expectedRevision: 7, mode: 'recover' });
     expect(call.headers['x-pmux-session']).toBe('pt-ws-a-pane-1-tab-legacy');
   });
+});
+
+it.each(['recover', 'handoff', 'off'])('production CLI %s submits one displayed revision and never retries a conflict', async (mode) => {
+  conflict = true;
+  await expect(cli(['orchestration', mode, '-w', 'ws-a', 'tab-target'], { PMUX_TAB_TOKEN: 'tab-token' })).rejects.toMatchObject({ code: 3 });
+  expect(recorded.map((call) => call.method)).toEqual(['GET', 'PATCH']);
+  expect(JSON.parse(recorded[1].body)).toMatchObject({ expectedRevision: 7, mode: mode === 'off' ? 'update' : mode });
 });

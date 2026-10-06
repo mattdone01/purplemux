@@ -155,6 +155,7 @@ const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
 
 export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
+  private orchestrationPendingLaunches = new Set<string>();
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
   private currentInterval = 0;
   private clients = new Set<WebSocket>();
@@ -862,6 +863,7 @@ export class StatusManager {
       if (!knownTabIds.has(tabId) && this.tabs.has(tabId)) {
         this.stopJsonlWatch(tabId);
         this.tabs.delete(tabId);
+        this.orchestrationPendingLaunches.delete(tabId);
         this.jobEventAt.delete(tabId);
         this.modelWatch.forget(tabId);
         this.codexLifecycleEpoch.delete(tabId);
@@ -1108,6 +1110,7 @@ export class StatusManager {
     for (const ws of workspaces) {
       const orch = ws.orchestration;
       if (!orch?.enabled || !orch.orchestratorTabId) { this.orchKeeper.delete(ws.id); continue; }
+      if (this.standups.get(ws.id)?.state === 'awaiting-human') { this.orchKeeper.delete(ws.id); continue; }
       const entry = this.tabs.get(orch.orchestratorTabId);
       if (!entry) { this.orchKeeper.delete(ws.id); continue; }
 
@@ -2373,7 +2376,10 @@ export class StatusManager {
     entry.eventSeq = seq;
     entry.lastEvent = { name: eventName, at: now, seq };
     if (eventName === 'session-start') {
-      entry.lastResumeOrStartedAt = now;
+      if (now >= (entry.lastResumeOrStartedAt ?? 0)) {
+        this.orchestrationPendingLaunches.delete(tabId);
+        entry.lastResumeOrStartedAt = now;
+      }
       // A new agent session is not the halted one (story 26 review r2).
       if (entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'session-start');
     }
@@ -2581,6 +2587,7 @@ export class StatusManager {
     // A poll that read the layout before the close must not bring the tab back (L38).
     this.retiredTabs.set(tabId, Date.now() + CLOSED_RETIRE_MS);
     this.tabs.delete(tabId);
+    this.orchestrationPendingLaunches.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
     this.processStartCache.delete(tabId);
     this.hookFloors.forget(tabId);
@@ -2628,9 +2635,14 @@ export class StatusManager {
     }
   }
 
+  isOrchestrationLaunchPending(tabId: string): boolean {
+    return this.orchestrationPendingLaunches.has(tabId);
+  }
+
   markAgentLaunch(tabId: string, options?: { resetAgentSession?: boolean; resumeSessionId?: string }): void {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
+    this.orchestrationPendingLaunches.add(tabId);
     entry.lastResumeOrStartedAt = Date.now();
     const provider = getProviderByPanelType(entry.panelType);
     const isCodex = entry.agentProviderId === CODEX_PROVIDER_ID || entry.panelType === 'codex-cli';

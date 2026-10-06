@@ -152,6 +152,8 @@ export interface ILayoutData {
 }
 
 export interface IWorkspaceOrchestration {
+  /** Absent legacy revisions normalize to zero without a migration write. */
+  revision?: number;
   enabled: boolean;
   orchestratorTabId: string | null;
   kickoffTemplate?: string | null;

@@ -1,6 +1,7 @@
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { listSessions, killServer, scanSessions, applyConfig } from '@/lib/tmux';
+import { withOrchestrationReset } from '@/lib/orchestration-mapping-lock';
 import { initWorkspaceStore } from '@/lib/workspace-store';
 import { autoResumeOnStartup } from '@/lib/auto-resume';
 import { getStatusManager } from '@/lib/status-manager';
@@ -16,18 +17,20 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   try {
-    const sessions = await listSessions();
-    log.info(`tmux reset requested — killing ${sessions.length} session(s)`);
-    await killServer();
+    return await withOrchestrationReset(async () => {
+      const sessions = await listSessions();
+      log.info(`tmux reset requested — killing ${sessions.length} session(s)`);
+      await killServer();
 
-    await scanSessions();
-    await applyConfig();
-    await initWorkspaceStore();
-    await autoResumeOnStartup();
-    await getStatusManager().rescan();
+      await scanSessions();
+      await applyConfig();
+      await initWorkspaceStore(true);
+      await autoResumeOnStartup(true);
+      await getStatusManager().rescan();
 
-    log.info('tmux re-initialized after reset');
-    return res.status(200).json({ killed: sessions.length });
+      log.info('tmux re-initialized after reset');
+      return res.status(200).json({ killed: sessions.length });
+    });
   } catch (err) {
     log.error(`tmux reset failed: ${err instanceof Error ? err.message : err}`);
     return res.status(500).json({ error: 'tmux reset failed' });

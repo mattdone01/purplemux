@@ -7,26 +7,9 @@ import {
   updateWorkspaceOrchestration,
 } from '@/lib/workspace-store';
 import { applyDirectoriesPatch } from '@/lib/workspace-patch';
-import type { IWorkspaceOrchestration } from '@/types/terminal';
-
-const parseOrchestrationPatch = (raw: unknown): Partial<IWorkspaceOrchestration> | null => {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const body = raw as Record<string, unknown>;
-  const patch: Partial<IWorkspaceOrchestration> = {};
-  if (body.enabled !== undefined) {
-    if (typeof body.enabled !== 'boolean') return null;
-    patch.enabled = body.enabled;
-  }
-  if (body.orchestratorTabId !== undefined) {
-    if (body.orchestratorTabId !== null && typeof body.orchestratorTabId !== 'string') return null;
-    patch.orchestratorTabId = body.orchestratorTabId;
-  }
-  if (body.kickoffTemplate !== undefined) {
-    if (body.kickoffTemplate !== null && typeof body.kickoffTemplate !== 'string') return null;
-    patch.kickoffTemplate = body.kickoffTemplate;
-  }
-  return patch;
-};
+import { parseOrchestrationPatch } from '@/lib/orchestration';
+import { parseOrchestrationPrecondition } from '@/lib/orchestration-contract';
+import { sendOrchestrationError } from '@/lib/orchestration-http';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
@@ -43,6 +26,19 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'PATCH') {
     const { name, groupId, orchestration, directories } = req.body ?? {};
 
+    if (orchestration !== undefined) {
+      if (name !== undefined || groupId !== undefined || directories !== undefined) return res.status(400).json({ error: 'Change orchestration separately from other workspace fields' });
+      try {
+        const patch = parseOrchestrationPatch(orchestration);
+        if (!patch) {
+          return res.status(400).json({ error: 'Invalid orchestration settings' });
+        }
+        const ws = await updateWorkspaceOrchestration(workspaceId, patch, { ...parseOrchestrationPrecondition(req.body), actor: { kind: 'human' } });
+        if (!ws) return res.status(404).json({ error: 'Workspace not found' });
+        return res.status(200).json(ws);
+      } catch (error) { return sendOrchestrationError(res, error); }
+    }
+
     if (directories !== undefined) {
       const result = await applyDirectoriesPatch(workspaceId, directories);
       if (result.status !== 200) {
@@ -51,16 +47,6 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       if (name === undefined && groupId === undefined && orchestration === undefined) {
         return res.status(200).json(result.workspace);
       }
-    }
-
-    if (orchestration !== undefined) {
-      const patch = parseOrchestrationPatch(orchestration);
-      if (!patch) {
-        return res.status(400).json({ error: 'Invalid orchestration settings' });
-      }
-      const ws = await updateWorkspaceOrchestration(workspaceId, patch);
-      if (!ws) return res.status(404).json({ error: 'Workspace not found' });
-      if (name === undefined && groupId === undefined) return res.status(200).json(ws);
     }
 
     if (groupId !== undefined) {
