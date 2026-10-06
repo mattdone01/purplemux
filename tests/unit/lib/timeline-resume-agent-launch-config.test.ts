@@ -1,3 +1,4 @@
+vi.mock('@/lib/orchestration-activity', () => ({ recordOrchestrationLaunch: vi.fn(async () => {}) }));
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IAgentProvider } from '@/lib/providers/types';
 

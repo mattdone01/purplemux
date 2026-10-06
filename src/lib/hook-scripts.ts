@@ -90,7 +90,7 @@ spool_hook() {
 }
 
 post_hook() {
-  HOOK_TARGET="$1"
+  case "$1" in *\\?*) HOOK_TARGET="$1&occurredAt=$AT" ;; *) HOOK_TARGET="$1?occurredAt=$AT" ;; esac
   HOOK_BODY="$2"
   shift 2
   case "$HOOK_TARGET" in *\\?*) HOOK_QUERY="\${HOOK_TARGET#*\\?}" ;; *) HOOK_QUERY="" ;; esac

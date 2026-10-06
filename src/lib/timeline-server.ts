@@ -1,3 +1,4 @@
+import { recordOrchestrationLaunch } from '@/lib/orchestration-activity';
 import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { IncomingMessage } from 'http';
 import { WebSocket } from 'ws';
@@ -755,7 +756,10 @@ export const handleResumeMessage = async (
         unsubscribeFromFile(ws, conn.currentJsonlPath);
         conn.currentJsonlPath = null;
       }
-      if (parsed) getStatusManager().markAgentLaunch(parsed.tabId, { resumeSessionId: sessionId });
+      if (parsed) {
+        await recordOrchestrationLaunch(parsed.wsId, parsed.tabId, tmuxSession);
+        getStatusManager().markAgentLaunch(parsed.tabId, { resumeSessionId: sessionId });
+      }
       await sendKeys(tmuxSession, resumeCmd);
       await updateTabAgentState(conn.sessionName, conn.provider, {
         sessionId,

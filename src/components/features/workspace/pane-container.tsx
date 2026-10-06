@@ -920,12 +920,12 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
     await submitCodexBrowserLaunch(intent);
   }, [agentProcess, sendStdin]);
 
-  const markAgentLaunch = useCallback((tabId: string, options?: { resetAgentSession?: boolean }) => {
-    fetch('/api/status/agent-launch', {
+  const markAgentLaunch = useCallback(async (tabId: string, options?: { resetAgentSession?: boolean }) => {
+    return fetch('/api/status/agent-launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tabId, resetAgentSession: options?.resetAgentSession === true }),
-    }).catch(() => {});
+    }).then((response) => response.ok).catch(() => false);
   }, []);
 
   const handleNewCodexSession = useCallback(async () => {
@@ -949,7 +949,9 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
       toast.error(t('grokLaunchFailed'));
       return;
     }
-    markAgentLaunch(activeTabId, { resetAgentSession: true });
+    const sessionName = connectedSessionRef.current;
+    if (!await markAgentLaunch(activeTabId, { resetAgentSession: true })) return;
+    if (activeTabIdRef.current !== activeTabId || connectedSessionRef.current !== sessionName) return;
     useTabStore.getState().setSessionView(activeTabId, 'timeline');
     sendStdin(`${command}\r`);
   }, [status, sendStdin, activeTabId, ensureAgentInstalled, markAgentLaunch, t]);
@@ -1093,8 +1095,11 @@ const PaneContainer = memo(({ paneId, paneNumber }: IPaneContainerProps) => {
     const cmd = pendingLegacyRestartRef.current;
     pendingLegacyRestartRef.current = null;
     const tabId = activeTabIdRef.current;
-    if (tabId) markAgentLaunch(tabId);
-    sendStdin(`${cmd}\r`);
+    if (!tabId) return;
+    const sessionName = connectedSessionRef.current;
+    void markAgentLaunch(tabId).then((recorded) => {
+      if (recorded && activeTabIdRef.current === tabId && connectedSessionRef.current === sessionName) sendStdin(`${cmd}\r`);
+    });
   }, [agentProcess, status, sendStdin, markAgentLaunch]);
 
   useEffect(() => {

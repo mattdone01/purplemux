@@ -1,3 +1,4 @@
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { findTab } from '@/lib/cli-utils';
@@ -28,7 +29,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const parsed = parseSendRequest(req.query, req.body);
   if (!parsed.ok) return res.status(400).json({ error: parsed.error });
 
-  const result = await performTabSend(
+  const result = await withOrchestrationMappingRead(parsed.request.workspaceId, () => performTabSend(
     {
       findTarget: async (workspaceId, tabId) => {
         const found = await findTab(workspaceId, tabId);
@@ -45,7 +46,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       isContentPendingInComposer,
     },
     parsed.request,
-  );
+  ));
 
   return res.status(result.status).json(result.body);
 };

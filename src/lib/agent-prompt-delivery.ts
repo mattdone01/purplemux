@@ -1,3 +1,4 @@
+import { recordOrchestrationSubmission } from '@/lib/orchestration-activity';
 import { findTabBySessionName } from '@/lib/layout-store';
 import { sendBracketedPasteText, sendTypedText, submitComposer } from '@/lib/tmux';
 import type { TPanelType } from '@/types/terminal';
@@ -20,6 +21,7 @@ export interface IPromptDeliveryDeps {
   typeText: (sessionName: string, content: string) => Promise<void>;
   pasteText: (sessionName: string, content: string) => Promise<void>;
   submit: (sessionName: string) => Promise<void>;
+  beforeSubmit?: (sessionName: string) => Promise<void>;
 }
 
 const defaultDeps: IPromptDeliveryDeps = {
@@ -27,6 +29,7 @@ const defaultDeps: IPromptDeliveryDeps = {
   typeText: sendTypedText,
   pasteText: sendBracketedPasteText,
   submit: submitComposer,
+  beforeSubmit: recordOrchestrationSubmission,
 };
 
 /** Put a prompt in the agent's composer WITHOUT submitting it. */
@@ -49,5 +52,6 @@ export const deliverPrompt = async (
   deps: IPromptDeliveryDeps = defaultDeps,
 ): Promise<void> => {
   await deliverPromptText(sessionName, content, deps);
+  await deps.beforeSubmit?.(sessionName);
   await deps.submit(sessionName);
 };

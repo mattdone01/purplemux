@@ -1,3 +1,5 @@
+import { findTab } from '@/lib/cli-utils';
+import { recordOrchestrationLaunch } from '@/lib/orchestration-activity';
 import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
@@ -19,6 +21,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const workspaceId = manager.getAllForClient()[tabId]?.workspaceId;
   if (!workspaceId) return res.status(404).json({ error: 'Tab not found' });
   await withOrchestrationMappingRead(workspaceId, async () => {
+    const found = await findTab(workspaceId, tabId);
+    if (!found) throw new Error('Launch target disappeared');
+    await recordOrchestrationLaunch(workspaceId, tabId, found.tab.sessionName);
     manager.markAgentLaunch(tabId, { resetAgentSession: resetAgentSession === true });
   });
   return res.status(204).end();

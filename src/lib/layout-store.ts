@@ -1,4 +1,5 @@
-import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
+import { prepareOrchestrationLaunch } from '@/lib/orchestration-activity';
+import { withOrchestrationMappingRead, withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
@@ -334,9 +335,6 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const sessionName = workspaceSessionName(wsId, paneId, tabId);
     if (!isWebBrowser) {
       await createSession(sessionName, 80, 24, cwd, { workspaceId: wsId, tabId });
-      if (command) {
-        await sendKeys(sessionName, command);
-      }
     }
 
     const nextOrder = pane.tabs.length > 0 ? Math.max(...pane.tabs.map((t) => t.order)) + 1 : 0;
@@ -345,11 +343,13 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
     const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}) };
 
+    if (command && !isWebBrowser) prepareOrchestrationLaunch(tab);
     pane.tabs.push(tab);
     pane.activeTabId = tabId;
     layout.updatedAt = new Date().toISOString();
     await writeLayoutFile(layout, filePath);
     syncWorkspaceDirectories(wsId,layout.root);
+    if (command && !isWebBrowser) await sendKeys(sessionName, command);
 
     return tab;
   });
@@ -369,7 +369,7 @@ export const closeTab = async (
   paneId: string,
   tabId: string,
   opts: { keepProcesses?: boolean } = {},
-): Promise<ICloseTabResult> => withOrchestrationMappingRead(wsId, async () => {
+): Promise<ICloseTabResult> => withOrchestrationMappingWrite(wsId, async () => {
   const tabInfo = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -380,7 +380,7 @@ export const closeTab = async (
 
     const tab = pane.tabs.find((t) => t.id === tabId);
     if (!tab) return null;
-    return { sessionName: tab.sessionName, panelType: tab.panelType };
+    return { sessionName: tab.sessionName, panelType: tab.panelType, pending: !!(tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn) };
   });
 
   if (!tabInfo) return { ok: false, reap: null };
@@ -399,16 +399,25 @@ export const closeTab = async (
   }
 });
 
+const requireAbandonedRuntime = async (sessionName: string, reap: IReapResult | null): Promise<void> => {
+  const { observeSessionStrict } = await import('@/lib/tmux');
+  if (!reap || reap.reaper !== 'linux' || reap.survivors.length || (await observeSessionStrict(sessionName)).state !== 'absent') {
+    throw new Error('Pending work retained: process reap or session absence is unconfirmed');
+  }
+};
+
 const removeClosedTab = async (
   wsId: string,
   paneId: string,
   tabId: string,
-  tabInfo: { sessionName: string; panelType: TPanelType | undefined },
+  tabInfo: { sessionName: string; panelType: TPanelType | undefined; pending: boolean },
   opts: { keepProcesses?: boolean },
 ): Promise<ICloseTabResult> => {
+  if (tabInfo.pending && opts.keepProcesses) throw new Error('Pending work requires a confirmed process reap');
   const reap = tabInfo.panelType !== 'web-browser'
     ? await killSession(tabInfo.sessionName, { tabId, keepProcesses: opts.keepProcesses })
     : null;
+  if (tabInfo.pending) await requireAbandonedRuntime(tabInfo.sessionName, reap);
 
   const ok = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
@@ -480,6 +489,9 @@ export const restartTabSession = async (wsId: string, paneId: string, tabId: str
 
     await createSession(tab.sessionName, 80, 24, effectiveCwd, { workspaceId: wsId, tabId: tab.id });
     if (command && !cwdLost) {
+      prepareOrchestrationLaunch(tab);
+      layout.updatedAt = new Date().toISOString();
+      await writeLayoutFile(layout, filePath);
       await sendKeys(tab.sessionName, command);
     }
 
@@ -822,9 +834,7 @@ export const splitPaneInLayout = async (
   return result;
 };
 
-export const closePaneInLayout = async (wsId: string, paneId: string): Promise<ILayoutData | null> => withOrchestrationMappingRead(wsId, async () => {
-  let sessions: Array<{ sessionName: string; tabId: string }> = [];
-
+export const closePaneInLayout = async (wsId: string, paneId: string): Promise<ILayoutData | null> => withOrchestrationMappingWrite(wsId, async () => {
   const result = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -834,7 +844,10 @@ export const closePaneInLayout = async (wsId: string, paneId: string): Promise<I
     if (!pane) return null;
     if (collectPanes(layout.root).length <= 1) return null;
 
-    sessions = pane.tabs.filter((t) => t.panelType !== 'web-browser').map((t) => ({ sessionName: t.sessionName, tabId: t.id }));
+    for (const tab of pane.tabs.filter((t) => t.panelType !== 'web-browser')) {
+      const reap = await killSession(tab.sessionName, { tabId: tab.id });
+      if (tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn) await requireAbandonedRuntime(tab.sessionName, reap);
+    }
     const wasEqualized = isEqualized(layout.root);
     removePaneWithFocus(layout, paneId);
     if (wasEqualized) {
@@ -845,8 +858,6 @@ export const closePaneInLayout = async (wsId: string, paneId: string): Promise<I
     syncWorkspaceDirectories(wsId, layout.root);
     return layout;
   });
-
-  await Promise.all(sessions.map((s) => killSession(s.sessionName, { tabId: s.tabId }).catch(() => {})));
 
   return result;
 });

@@ -39,6 +39,16 @@ describe.each(callerPaths)('%s managed Codex launches', (callerPath) => {
     expect(body).not.toContain('markAgentLaunch');
   });
 
+  it('awaits non-Codex launch persistence and checks the connected target before terminal input', () => {
+    const marker = between(source, 'const markAgentLaunch', 'const handleNewCodexSession');
+    expect(marker).toContain('return fetch(');
+    expect(marker).toContain('response.ok');
+    const grok = between(source, 'const handleNewGrokSession', 'const handleNewClaudeFromSessionList');
+    expect(grok.indexOf('await markAgentLaunch')).toBeLessThan(grok.indexOf('sendStdin('));
+    expect(grok).toContain('connectedSessionRef.current !== sessionName');
+    expect(source).toContain('if (recorded && activeTabIdRef.current === tabId && connectedSessionRef.current === sessionName) sendStdin');
+  });
+
   it('uses the title event tab and session when releasing a queued replacement', () => {
     const titleHandler = between(source, 'onTitleChange: (title)', 'const tab = tabsRef.current.find');
     const submitter = between(source, 'const submitPendingCodexLaunch = useCallback', 'useEffect(() => {');

@@ -1,3 +1,4 @@
+import { recordOrchestrationLaunch } from '@/lib/orchestration-activity';
 import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
@@ -64,6 +65,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             lastUserMessage: null,
           });
         }
+        await recordOrchestrationLaunch(launchPolicy.workspaceId, launchPolicy.tabId, launchPolicy.sessionName);
         getStatusManager().markAgentLaunch(launchPolicy.tabId, { resumeSessionId: resumeSessionId ?? undefined });
       });
     }

@@ -111,7 +111,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     const spooled = readOnly();
     expect(spooled.body).toEqual({ event: 'stop', session: SESSION });
     expect(spooled.session).toBe(SESSION);
-    expect(spooled.query).toBe('');
+    expect(spooled.query).toBe(`occurredAt=${spooled.at}`);
     expect(spooled.at).toBeGreaterThanOrEqual(before - 1);
     expect(spooled.at).toBeLessThanOrEqual(after);
     // Nothing half-written is left behind.
@@ -123,7 +123,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     expect(spoolFiles()).toEqual([]);
     expect(JSON.parse(fs.readFileSync(path.join(dir, 'curl-body'), 'utf-8')))
       .toEqual({ event: 'notification', session: SESSION, notificationType: 'permission_prompt' });
-    expect(fs.readFileSync(path.join(dir, 'curl-args'), 'utf-8')).toContain('http://localhost:8022/api/status/hook');
+    expect(fs.readFileSync(path.join(dir, 'curl-args'), 'utf-8')).toMatch(/http:\/\/localhost:8022\/api\/status\/hook\?occurredAt=\d{13}/);
   });
 
   it.each([
@@ -173,7 +173,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     run(HOOK_SCRIPT_CONTENT, ['post-tool'], JSON.stringify(tool), REFUSED);
     settle(spoolLanded);
     const spooled = readOnly();
-    expect(spooled.query).toBe(`kind=tool&session=${SESSION}`);
+    expect(spooled.query).toBe(`kind=tool&session=${SESSION}&occurredAt=${spooled.at}`);
     expect(spooled.body).toEqual(tool);
   });
 
@@ -193,7 +193,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     const body = { hook_event_name: 'Stop', session_id: 's-1', last_assistant_message: 'DONE: "x"' };
     run(CODEX_HOOK_SCRIPT_CONTENT, [], JSON.stringify(body), REFUSED, { PURPLEMUX_CODEX_GENERATION: 'gen-1' }, 'bash');
     const spooled = readOnly();
-    expect(spooled.query).toBe(`provider=codex&tmuxSession=${SESSION}&generation=gen-1`);
+    expect(spooled.query).toBe(`provider=codex&tmuxSession=${SESSION}&generation=gen-1&occurredAt=${spooled.at}`);
     expect(spooled.body).toEqual(body);
   });
 
@@ -217,7 +217,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     run(HOOK_SCRIPT_CONTENT, ['post-tool'], body, REFUSED);
     settle(spoolLanded);
     const spooled = readOnly();
-    expect(spooled.query).toBe(`kind=tool&session=${SESSION}`);
+    expect(spooled.query).toBe(`kind=tool&session=${SESSION}&occurredAt=${spooled.at}`);
     expect(spooled.session).toBe(SESSION);
     expect(spooled.body).toBeNull();
     expect(spooled.bodyDropped).toBe(true);
@@ -228,7 +228,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     run(GROK_HOOK_SCRIPT_CONTENT, [], '{"hookEventName":"stop"}', REFUSED);
     settle(spoolLanded);
     const spooled = readOnly();
-    expect(spooled.query).toBe(`provider=grok&tmuxSession=${SESSION}`);
+    expect(spooled.query).toBe(`provider=grok&tmuxSession=${SESSION}&occurredAt=${spooled.at}`);
     expect(spooled.body).toEqual({ hookEventName: 'stop' });
   });
 

@@ -1,3 +1,4 @@
+import { recordOrchestrationLaunch } from '@/lib/orchestration-activity';
 import { withOrchestrationMappingsRead } from '@/lib/orchestration-mapping-lock';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs } from '@/lib/layout-store';
 import { hasSession, createSession, getPaneCurrentCommand, getSessionPanePid, sendKeysSeparated } from '@/lib/tmux';
@@ -138,6 +139,7 @@ const sendResumeKeys = async (target: IAutoResumeTarget): Promise<boolean> => {
       ...agentLaunchOptionsForTab(target),
     });
     log.debug(`Sending resume: ${target.tmuxSession} → ${target.sessionId}`);
+    await recordOrchestrationLaunch(target.workspaceId, target.tabId, target.tmuxSession);
     getStatusManager().markAgentLaunch(target.tabId);
     await sendKeysSeparated(target.tmuxSession, resumeCmd);
 

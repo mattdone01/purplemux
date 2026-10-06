@@ -82,6 +82,14 @@ export interface ICodexLaunchRuntime {
   pending?: ICodexPendingLaunch;
 }
 
+/** Server-owned lifecycle evidence. Pending work has no expiry. */
+export interface IOrchestrationActivity {
+  sessionName: string;
+  runtimeGeneration: string;
+  launch?: { at: number; priorIdentity?: string; priorUnknown?: boolean };
+  turn?: { generation: string; runtimeGeneration: string; at: number; runningAt?: number; runningIdentity?: string };
+}
+
 export interface ITab {
   id: string;
   sessionName: string;
@@ -94,6 +102,7 @@ export interface ITab {
   agentLaunchConfig?: IAgentLaunchConfig;
   /** Server-owned proof of the Codex process generation currently attached to this tab. */
   codexLaunchRuntime?: ICodexLaunchRuntime;
+  orchestrationActivity?: IOrchestrationActivity;
   /** @deprecated use agentState; kept for disk back-compat */
   claudeSessionId?: string | null;
   /** @deprecated use agentState; kept for disk back-compat */

@@ -1,3 +1,4 @@
+import { recordOrchestrationLaunch } from '@/lib/orchestration-activity';
 import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
@@ -98,6 +99,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         try {
           await withOrchestrationMappingRead(wsId, async () => {
             const resumeCmd = await provider.buildResumeCommand(resumeSessionId, { workspaceId: wsId });
+            await recordOrchestrationLaunch(wsId, tab.id, tab.sessionName);
             getStatusManager().markAgentLaunch(tab.id);
             await sendKeys(tab.sessionName, resumeCmd);
           });

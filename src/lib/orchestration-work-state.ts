@@ -18,11 +18,12 @@ export const readOrchestrationWorkState = async (workspace: IWorkspace): Promise
   ]);
   const statuses = getStatusManager().getAllForClient();
   const tabs: IOrchestratorPresenceFacts['tabs'] = layout ? await Promise.all(collectAllTabs(layout.root).map(async (tab) => {
-    const isAgent = isAgentPanelType(tab.panelType);
+    const isAgent = isAgentPanelType(tab.panelType) || !!(tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn);
     const runtime = isAgent ? await observeOrchestrationRuntime(tab) : null;
     const status = statuses[tab.id]?.workspaceId === workspace.id ? statuses[tab.id].cliState : null;
     return { tabId: tab.id, tabName: tab.name, isAgent,
-      cliState: runtime?.state === 'absent' ? 'inactive' as const
+      cliState: tab.orchestrationActivity?.turn ? 'busy' as const
+        : runtime?.state === 'absent' ? 'inactive' as const
         : runtime?.state === 'unknown' || runtime?.state === 'present' && status === 'inactive' ? null : status };
   })) : null;
   const liveBackgroundTabIds: string[] | null = background.known ? [] : null;

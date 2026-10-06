@@ -25,6 +25,7 @@ export interface IHookDelivery {
   query: Partial<Record<string, string | string[]>>;
   body: unknown;
   replayedAt?: number;
+  occurredAt?: number;
 }
 
 export interface IHookOutcome {
@@ -54,14 +55,14 @@ const handleClaudeToolHook = ({ query, body, replayedAt }: IHookDelivery): IHook
   return NO_CONTENT;
 };
 
-const handleClaudeHook = ({ body, replayedAt }: IHookDelivery): IHookOutcome => {
+const handleClaudeHook = ({ body, replayedAt, occurredAt }: IHookDelivery): IHookOutcome => {
   const { event, session, notificationType, source } = bodyRecord(body);
   if (typeof event === 'string' && event !== 'poll' && typeof session === 'string' && session) {
     const type = typeof notificationType === 'string' && notificationType ? notificationType : undefined;
     log.debug({ event, session, notificationType: type, source, replayedAt }, `received ${event}${type ? `(${type})` : ''}${typeof source === 'string' ? `(source=${source})` : ''}`);
     const workEvent = translateClaudeHookEvent(event, type, source);
     if (workEvent) {
-      getStatusManager().handleProviderEvent('claude', session, workEvent, replayedAt);
+      getStatusManager().handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt);
     } else {
       log.debug({ event, session, notificationType: type }, 'unknown claude hook event, ignoring');
     }
@@ -74,7 +75,7 @@ const handleClaudeHook = ({ body, replayedAt }: IHookDelivery): IHookOutcome => 
   return NO_CONTENT;
 };
 
-const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Promise<IHookOutcome> => {
+const handleCodexHook = async ({ query, body, replayedAt, occurredAt }: IHookDelivery): Promise<IHookOutcome> => {
   const payload = bodyRecord(body);
   const tmuxSession = queryString(query, 'tmuxSession');
   if (!tmuxSession) {
@@ -106,7 +107,7 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
   const { result, translation } = processCodexHookPayload(payload);
   const applyHook = () => {
     const applied = translation.meta
-      ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta, replayedAt)
+      ? statusManager.applyAgentHookMeta('codex', tmuxSession, translation.meta, replayedAt ?? occurredAt)
       : null;
     if (!applied) return { applied: null };
     if (translation.sessionInfo && !applied.stale) {
@@ -114,7 +115,7 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
       if (translation.clearSession) codexHookEvents.emit('session-clear', tmuxSession);
     }
     if (translation.event && shouldEmitCodexHookEvent(payload, applied.cliState)) {
-      statusManager.handleProviderEvent('codex', tmuxSession, translation.event, replayedAt);
+      statusManager.handleProviderEvent('codex', tmuxSession, translation.event, replayedAt ?? occurredAt);
     }
     return { applied };
   };
@@ -150,7 +151,7 @@ const handleCodexHook = async ({ query, body, replayedAt }: IHookDelivery): Prom
   return NO_CONTENT;
 };
 
-const handleGrokHook = ({ query, body, replayedAt }: IHookDelivery): IHookOutcome => {
+const handleGrokHook = ({ query, body, replayedAt, occurredAt }: IHookDelivery): IHookOutcome => {
   const payload = bodyRecord(body);
   const tmuxSession = queryString(query, 'tmuxSession');
   if (!tmuxSession) {
@@ -166,7 +167,7 @@ const handleGrokHook = ({ query, body, replayedAt }: IHookDelivery): IHookOutcom
   const statusManager = getStatusManager();
   const { result, translation } = processGrokHookPayload(payload);
   const applied = translation.meta
-    ? statusManager.applyAgentHookMeta('grok', tmuxSession, translation.meta, replayedAt)
+    ? statusManager.applyAgentHookMeta('grok', tmuxSession, translation.meta, replayedAt ?? occurredAt)
     : null;
   if (!applied) {
     log.debug({ tmuxSession, event: payload.hookEventName, reason: 'unknown-session' }, 'grok hook skipped');
@@ -194,7 +195,7 @@ const handleGrokHook = ({ query, body, replayedAt }: IHookDelivery): IHookOutcom
     log.debug({ tmuxSession, event: payload.hookEventName, reason: result.reason }, 'grok hook skipped');
   }
   if (translation.event && shouldEmitGrokHookEvent(payload, applied.cliState)) {
-    statusManager.handleProviderEvent('grok', tmuxSession, translation.event, replayedAt);
+    statusManager.handleProviderEvent('grok', tmuxSession, translation.event, replayedAt ?? occurredAt);
   }
   return NO_CONTENT;
 };
@@ -205,6 +206,10 @@ const handleGrokHook = ({ query, body, replayedAt }: IHookDelivery): IHookOutcom
  * event the same way.
  */
 export const dispatchHook = async (delivery: IHookDelivery): Promise<IHookOutcome> => {
+  const occurredAt = Number(queryString(delivery.query, 'occurredAt'));
+  if (delivery.replayedAt === undefined && Number.isSafeInteger(occurredAt) && occurredAt > 0 && occurredAt <= Date.now()) {
+    delivery = { ...delivery, occurredAt };
+  }
   const provider = queryString(delivery.query, 'provider') ?? 'claude';
   if (provider === 'codex') return handleCodexHook(delivery);
   if (provider === 'grok') return handleGrokHook(delivery);

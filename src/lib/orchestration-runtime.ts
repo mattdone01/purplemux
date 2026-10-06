@@ -6,7 +6,12 @@ import type { ITab } from '@/types/terminal';
 
 /** Must run under mapping and target lifecycle guards. Cached CLI state is not runtime evidence. */
 export const observeOrchestrationRuntime = async (tab: ITab): Promise<TStrictRuntimeObservation> => {
-  if (tab.codexLaunchRuntime?.pending || getStatusManager().isOrchestrationLaunchPending(tab.id)) return { state: 'unknown', reason: 'managed launch is pending' };
+  if (tab.orchestrationActivity?.launch || tab.codexLaunchRuntime?.pending || getStatusManager().isOrchestrationLaunchPending(tab.id)) return { state: 'unknown', reason: 'managed launch is pending' };
+  return observeOrchestrationProcess(tab);
+};
+
+/** Strict process identity, also used to attribute lifecycle acknowledgments. */
+export const observeOrchestrationProcess = async (tab: ITab): Promise<TStrictRuntimeObservation> => {
   const provider = tab.panelType === 'claude-code' ? 'claude' : tab.panelType === 'codex-cli' ? 'codex' : tab.panelType === 'grok-cli' ? 'grok' : null;
   if (!provider) return { state: 'unknown', reason: 'candidate is not an agent tab' };
   const session = await observeSessionStrict(tab.sessionName);

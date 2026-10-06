@@ -1,3 +1,4 @@
+import { acknowledgeOrchestrationActivity } from '@/lib/orchestration-activity';
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
@@ -2366,6 +2367,10 @@ export class StatusManager {
       return;
     }
     const eventName = event as TEventName;
+    if (replayedAt !== undefined) {
+      void acknowledgeOrchestrationActivity(entry.workspaceId, tabId, tmuxSession, eventName, now)
+        .catch((err) => log.warn({ err, tabId }, 'pending orchestration activity retained: hook persistence failed'));
+    }
 
     if (eventName === 'notification' && notificationType && !INPUT_REQUESTING_NOTIFICATION_TYPES.has(notificationType)) {
       hookLog.debug({ tabId, event: eventName, notificationType }, 'non-input notification, skipping state transition');
