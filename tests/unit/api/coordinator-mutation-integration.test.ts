@@ -145,7 +145,7 @@ describe('combined routing, caller authentication and mutation confinement', () 
     await checks.notes(inst, { nonce: 'combined', wsA: 'ws-a', wsB: 'ws-b', created,
       check: (id: string, _what: string, passed: boolean, measured: string) => outcomes.push({ id, passed, measured }),
     });
-    expect(outcomes.map((r) => r.id)).toEqual(['note-source-authority', 'note-no-direct-drive', 'note-delivered', 'note-epic-coordinator', 'note-ack', 'note-stale-recipient']);
+    expect(outcomes.map((r) => r.id)).toEqual(['note-source-authority', 'note-no-direct-drive', 'note-delivered', 'note-epic-coordinator', 'note-ack', 'note-stale-recipient', 'note-designated-housekeeping']);
     expect(outcomes.filter((r) => !r.passed)).toEqual([]);
     expect(state.notes).toHaveLength(2);
     expect(state.notes.every((n) => n.state === 'acked')).toBe(true);
