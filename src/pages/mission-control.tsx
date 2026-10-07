@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import Head from 'next/head';
 import type { GetServerSideProps } from 'next';
 import { AlertCircle } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import PortfolioBoard from '@/components/features/mission-control/portfolio-board';
 import { getPageShellWithTitlebarLayout } from '@/components/layout/page-shell';
 import MissionControlDashboard, {
   MissionControlDashboardSkeleton,
@@ -42,7 +44,8 @@ const isAttentionItem = (value: IMissionError['current']): value is IMissionAtte
   Boolean(value && 'kind' in value && 'options' in value);
 
 const MissionControlPage = () => {
-  useBrowserTitle('Mission Control');
+  useBrowserTitle('Portfolio board');
+  const [legacyOpen, setLegacyOpen] = useState(false);
   const selectWorkspace = useSelectWorkspace();
   const {
     snapshot,
@@ -53,7 +56,7 @@ const MissionControlPage = () => {
     refresh,
     applyAnswer,
     applyBootstrap,
-  } = useMissionControl();
+  } = useMissionControl(legacyOpen);
   const [drafts, setDrafts] = useState<Record<string, IMissionDraft>>({});
   const [bootstrapPending, setBootstrapPending] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
@@ -179,7 +182,9 @@ const MissionControlPage = () => {
   }, [applyBootstrap, bootstrapId, refresh]);
 
   let content;
-  if (loading) {
+  if (!legacyOpen) {
+    content = <PortfolioBoard />;
+  } else if (loading) {
     content = <MissionControlDashboardSkeleton />;
   } else if (!snapshot) {
     content = <MissionControlErrorState unsupported={unsupported} error={error} onRetry={() => void refresh()} />;
@@ -211,8 +216,15 @@ const MissionControlPage = () => {
 
   return (
     <>
-      <Head><title>Mission Control · PurpleMux</title></Head>
-      <main className="min-h-0 flex-1 overflow-y-auto">{content}</main>
+      <Head><title>Portfolio board · PurpleMux</title></Head>
+      <main className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex w-full max-w-[1440px] justify-end px-3 pt-3 sm:px-5 lg:px-8">
+          <Button size="sm" variant="ghost" onClick={() => setLegacyOpen((open) => !open)}>
+            {legacyOpen ? 'Portfolio board' : 'Mission records'}
+          </Button>
+        </div>
+        {content}
+      </main>
     </>
   );
 };

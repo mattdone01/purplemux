@@ -501,6 +501,60 @@ POST /api/cli/workspaces/<workspaceId>/standup
 GET /api/cli/workspaces/<workspaceId>/standup
   Response: { "latest": { ... } | null, "history": [...] }
 
+## Portfolio board
+
+GET /api/cli/portfolio?workspaces=WS1,WS2
+  A launch-verified current managing orchestrator explicitly selects 1..100 workspaces.
+  The response gives coverage for each selected workspace; blocker records and shared
+  dependency aggregates include only the manager's own workspace or workspaces in an
+  active tab-bound read grant. A missing grant/coordinator stays visible as incomplete
+  coverage. Revocation takes effect on the next read. This route never grants access.
+
+POST /api/cli/portfolio/events
+  Only the launch-verified current orchestrator of the report's workspace, with the
+  current Mission Control run binding generation, may report, apply, or resolve.
+  \`purplemux portfolio report -w WS --json '{...}'\` submits one blocker report:
+  {"eventId":"evt-1","schemaVersion":1,"workspaceId":"WS","runId":"RUN","bindingGeneration":1,
+   "sourceKey":"stable-blocker-key","revision":0,"producerAt":1700000000000,
+   "resourceKey":"lease:merge:owner/repo","kind":"lease","watchId":"w-...",
+   "watchHead":null,"outcome":"Ship release","priority":90,"stage":"implemented",
+   "owner":"orchestrator","cause":"Merge lease held","evidence":"reported observation",
+   "nextAction":"Wait for lease release","decisionOwner":"orchestrator",
+   "checkpointAt":1700000300000,"capacity":{"host":"host-a","measuredReason":"lease held",
+   "limit":"1","use":"1","holder":"tab-holder","clearingCondition":"lease free"}}
+  Stable sourceKey preserves the first-blocked age across task renames and coordinator
+  replacement. Revisions begin at 0 and increment by one. Event IDs replay only identical
+  content. A newer revision needs a new watch ID. For PR/ref watches, watchHead must equal
+  the immutable watch baseline SHA; a changed head cannot clear the old blocker. Capacity
+  details are required for worker-limit, build-slots, memory, disk-reservation and lease.
+  Reported stage/evidence are claims, not verified milestones. A matching green CI, merged
+  PR, moved ref or free lease watch clears only its linked dependency. It does not verify
+  deployment or the release. No arbitrary prose resolves a blocker.
+
+  \`purplemux portfolio applied -w WS --json '{...}'\` records that the current owner
+  applied a routed decision (separate from note acknowledgement):
+  {"schemaVersion":1,"workspaceId":"WS","runId":"RUN","bindingGeneration":1,
+   "impactId":"pb-...","noteId":"n-...","eventId":"apply-1","expectedRevision":0}
+
+  \`purplemux portfolio resolved -w WS --json '{...}'\` records capacity clearance only
+  for an unwatched worker-limit, build-slots, memory, or disk-reservation blocker:
+  {"schemaVersion":1,"type":"resolved","workspaceId":"WS","runId":"RUN",
+   "bindingGeneration":1,"impactId":"pb-...","eventId":"resolve-1",
+   "expectedRevision":0,"observedAt":1700000300000,
+   "evidence":{"host":"host-a","measuredReason":"slot available","limit":"4",
+   "use":"3","holder":null,"clearingCondition":"one free slot",
+   "reference":"host-signals:sample-123"}}
+  The coordinator claim is identified as such. It clears only this dependency, never
+  a release milestone; stale revisions and reused event IDs are refused.
+
+The human Mission Control portfolio board uses an authenticated session and same-origin
+checks to select scope, acknowledge a blocker, route decisions through NotesService,
+and confirm merged/deployed/verified release milestones with cited evidence. Human notes carry the
+session subject and human admission, never a manufactured orchestrator identity.
+The target orchestrator receives the ordinary durable note and inbox receipt. A missed
+checkpoint sends one deduplicated local coordinator note; watch proof wakes each affected
+coordinator once through the existing watch notice or a deduplicated note.
+
 ## Mission Control
 
 GET /api/cli/mission-control?workspaceId=WS

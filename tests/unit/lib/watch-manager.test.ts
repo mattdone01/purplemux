@@ -155,6 +155,31 @@ describe('harness watches (ADR-0015)', () => {
     expect(f.sent.map((s) => s.line)).toEqual([expect.stringContaining('o/r#5 checks settled at aaaaaaaa: 3 green, 1 red — watch cleared')]);
   });
 
+  it('does not emit settled-check proof if the PR head changes during check queries', async () => {
+    f.answer('/pulls/51', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A),
+      f.pull(false, 'open', SHA_B), f.pull(false, 'open', SHA_B), f.pull(false, 'open', SHA_B));
+    f.answer('/check-runs', { ok: true, stdout: 'completed\tsuccess\n' });
+    f.answer('/status', { ok: true, stdout: 'success\n' });
+    await m.create(B, { kind: 'pr', target: 'o/r#51', until: 'checks-settled' });
+    await tickAt(2);
+    expect(f.sent).toEqual([]);
+    expect(f.state.watches).toHaveLength(1);
+    await tickAt(2);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0].fields.sha).toBe(SHA_B);
+  });
+
+  it('drops stale settled-check proof when the head changes after evaluation but before enqueue', async () => {
+    f.answer('/pulls/52', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A),
+      f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_B));
+    f.answer('/check-runs', { ok: true, stdout: 'completed\tsuccess\n' });
+    f.answer('/status', { ok: true, stdout: 'success\n' });
+    await m.create(B, { kind: 'pr', target: 'o/r#52', until: 'checks-settled' });
+    await tickAt(2);
+    expect(f.sent).toEqual([]);
+    expect(f.state.watches[0].pendingNotice).toBeUndefined();
+  });
+
   it('ref moved reports both shas', async () => {
     f.answer('/commits/feature%2Fx', { ok: true, stdout: `${SHA_A}\n` }, { ok: true, stdout: `${SHA_B}\n` });
     await m.create(B, { kind: 'ref', target: 'o/r@feature/x', until: 'moved' });

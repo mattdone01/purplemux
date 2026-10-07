@@ -80,7 +80,7 @@ const responseError = async (response: Response): Promise<string> => {
   return response.statusText || `Request failed (${response.status})`;
 };
 
-const useMissionControl = (): IMissionControlState => {
+const useMissionControl = (enabled = true): IMissionControlState => {
   const [snapshot, setSnapshot] = useState<IMissionSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -130,6 +130,7 @@ const useMissionControl = (): IMissionControlState => {
   }, []);
 
   useEffect(() => {
+    if (!enabled) return;
     const scheduler = createMissionPollScheduler({
       refresh,
       isHidden: () => document.hidden,
@@ -144,7 +145,7 @@ const useMissionControl = (): IMissionControlState => {
       scheduler.stop();
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [refresh]);
+  }, [enabled, refresh]);
 
   const applyAnswer = useCallback((response: IMissionAnswerResponse) => {
     setSnapshot((current) => {

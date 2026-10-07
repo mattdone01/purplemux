@@ -18,6 +18,17 @@ export const requireMissionHuman = async (req: NextApiRequest): Promise<string> 
   return payload.sub;
 };
 
+export interface IHumanControlAuthority {
+  kind: 'human-control';
+  actor: string;
+}
+
+export const requireMissionHumanMutation = async (req: NextApiRequest): Promise<IHumanControlAuthority> => {
+  const actor = await requireMissionHuman(req);
+  requireMissionSameOrigin(req);
+  return { kind: 'human-control', actor };
+};
+
 const requestOrigin = (req: NextApiRequest): string => {
   const forwardedProtocol = req.headers['x-forwarded-proto'];
   const encrypted = (req.socket as (typeof req.socket & { encrypted?: boolean }) | undefined)?.encrypted === true;
