@@ -61,11 +61,12 @@ export const PortfolioBoardContent = ({ snapshot, priorityFilter, onPriorityFilt
     .filter((impact) => showResolved || impact.state !== 'resolved');
   const actionable = impacts.filter((impact) => impact.state !== 'resolved');
   const topPriority = (actionable.length ? actionable : impacts).reduce((highest, impact) => Math.max(highest, impact.priority), 0);
-  const visible = snapshot.dependencies.map((dependency) => ({
-    ...dependency,
-    impacts: dependency.impacts.filter((impact) => (showResolved || impact.state !== 'resolved')
-      && (priorityFilter === 'all' || impact.priority === topPriority)),
-  })).filter((dependency) => dependency.impacts.length).sort((a, b) =>
+  const visible = snapshot.dependencies.map((dependency) => {
+    const filtered = dependency.impacts.filter((impact) => (showResolved || impact.state !== 'resolved')
+      && (priorityFilter === 'all' || impact.priority === topPriority));
+    return { ...dependency, impacts: filtered,
+      firstBlockedAt: filtered.reduce((earliest, impact) => Math.min(earliest, impact.firstBlockedAt), Infinity) };
+  }).filter((dependency) => dependency.impacts.length).sort((a, b) =>
     Math.max(...b.impacts.map((impact) => impact.priority)) - Math.max(...a.impacts.map((impact) => impact.priority))
     || a.firstBlockedAt - b.firstBlockedAt);
   const gaps = snapshot.coverage.filter((entry) => entry.access !== 'available');

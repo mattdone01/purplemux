@@ -9,16 +9,22 @@ import { NotesService, type INotesDeps } from '@/lib/notes-service';
 import { PortfolioStore } from '@/lib/portfolio-store';
 import type { IPortfolioSnapshot } from '@/types/portfolio';
 import type { INotesState } from '@/types/note';
-import type { IWatch } from '@/types/watch';
+import type { IWatch, IWatchesState } from '@/types/watch';
+import type { ICaller } from '@/lib/caller';
+import type { IPortfolioReport } from '@/types/portfolio';
 
 const synthetic = vi.hoisted(() => ({
   notes: { notes: [] } as INotesState,
   service: null as NotesService | null,
   watch: { id: 'w-local', workspaceId: 'ws-a', tabId: 'tab-a', kind: 'lease', target: 'merge:o/r',
-    until: 'free', baseline: null, verified: true } as IWatch,
+    until: 'free', baseline: null, expiresAt: Date.now() + 24 * 60 * 60_000, verified: true } as IWatch,
   watchAvailable: true,
   sessionLists: 0,
   hasSessionCalls: 0,
+  watchTail: Promise.resolve() as Promise<void>,
+  watchQueueCount: 0,
+  onWatchQueue: null as ((count: number) => void) | null,
+  watchLockHook: null as (() => Promise<void>) | null,
 }));
 
 vi.mock('@/lib/caller', () => ({ resolveCaller: async () => ({ verified: true, identity: 'launch',
@@ -45,7 +51,23 @@ vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch',
 vi.mock('@/lib/tmux', async (original) => ({ ...await original<typeof import('@/lib/tmux')>(),
   hasSession: async () => { synthetic.hasSessionCalls++; return true; },
   listSessions: async () => { synthetic.sessionLists++; return ['session-ws-root', 'session-ws-a']; } }));
-vi.mock('@/lib/watch-store', () => ({ readWatches: async () => ({ watches: synthetic.watchAvailable ? [synthetic.watch] : [] }) }));
+vi.mock('@/lib/watch-store', () => ({
+  readWatches: async () => ({ watches: synthetic.watchAvailable ? [synthetic.watch] : [] }),
+  mutateWatches: async <T,>(fn: (state: IWatchesState) => Promise<{ state: IWatchesState; value: T }>): Promise<T> => {
+    const previous = synthetic.watchTail;
+    let release!: () => void;
+    synthetic.watchTail = new Promise<void>((resolve) => { release = resolve; });
+    synthetic.onWatchQueue?.(++synthetic.watchQueueCount);
+    await previous;
+    try {
+      if (synthetic.watchLockHook) await synthetic.watchLockHook();
+      const state = { watches: synthetic.watchAvailable ? [synthetic.watch] : [] };
+      const result = await fn(state);
+      synthetic.watchAvailable = result.state.watches.length > 0;
+      return result.value;
+    } finally { release(); }
+  },
+}));
 vi.mock('@/lib/notes-store', async (original) => ({ ...await original<typeof import('@/lib/notes-store')>(),
   readNotesState: async () => synthetic.notes }));
 vi.mock('@/lib/notes-service', async (original) => ({ ...await original<typeof import('@/lib/notes-service')>(),
@@ -72,7 +94,73 @@ describe('interactive synthetic portfolio API and UI journey', () => {
   afterEach(() => { store?.close(); store = null;
     delete (globalThis as { __ptPortfolioStore?: PortfolioStore }).__ptPortfolioStore;
     synthetic.notes = { notes: [] }; synthetic.service = null; synthetic.watchAvailable = true;
-    synthetic.sessionLists = 0; synthetic.hasSessionCalls = 0; });
+    synthetic.sessionLists = 0; synthetic.hasSessionCalls = 0; synthetic.watchTail = Promise.resolve();
+    synthetic.watchQueueCount = 0; synthetic.onWatchQueue = null; synthetic.watchLockHook = null; });
+
+  it('serializes first watch report against firing in both orders and replays a committed event', async () => {
+    const { reportPortfolioBlocker } = await import('@/lib/portfolio-service');
+    const { mutateWatches } = await import('@/lib/watch-store');
+    const caller = { verified: true, identity: 'launch', workspaceId: 'ws-a', tabId: 'tab-a' } as ICaller;
+    const report: IPortfolioReport = { schemaVersion: 1, eventId: 'race-report', workspaceId: 'ws-a', runId: 'run-a',
+      bindingGeneration: 1, sourceKey: 'race-source', revision: 0, producerAt: Date.now(),
+      resourceKey: 'lease:merge:o/r', kind: 'lease', watchId: 'w-local', watchHead: null,
+      outcome: 'Ship after lease release', priority: 90, stage: 'implemented', owner: 'tab-a',
+      cause: 'Merge lease held', evidence: 'fixture', nextAction: 'Wait for free lease',
+      decisionOwner: 'tab-a', checkpointAt: null,
+      capacity: { host: 'local', measuredReason: 'lease held', limit: '1', use: '1', holder: 'tab-holder',
+        clearingCondition: 'lease free' } };
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      return { promise, resolve };
+    };
+    const fire = () => mutateWatches(async () => {
+      const cleared = store!.clearByWatch(synthetic.watch, { notice: 'free' }).length;
+      return { state: { watches: [] }, value: cleared };
+    });
+
+    store = new PortfolioStore(':memory:');
+    (globalThis as { __ptPortfolioStore?: PortfolioStore }).__ptPortfolioStore = store;
+    const entered = deferred(); const proceed = deferred(); const queued = deferred();
+    synthetic.watchLockHook = async () => { synthetic.watchLockHook = null; entered.resolve(); await proceed.promise; };
+    synthetic.onWatchQueue = (count) => { if (count === 2) queued.resolve(); };
+    const reporting = reportPortfolioBlocker(caller, report);
+    await entered.promise;
+    const firing = fire();
+    await queued.promise;
+    proceed.resolve();
+    expect((await reporting).replayed).toBe(false);
+    expect(await firing).toBe(1);
+    expect(store.impact(store.impacts()[0].id)?.state).toBe('resolved');
+    expect((await reportPortfolioBlocker(caller, report)).replayed).toBe(true);
+
+    store.close(); store = new PortfolioStore(':memory:');
+    (globalThis as { __ptPortfolioStore?: PortfolioStore }).__ptPortfolioStore = store;
+    synthetic.watchAvailable = true; synthetic.watchTail = Promise.resolve(); synthetic.watchQueueCount = 0;
+    const fireEntered = deferred(); const fireProceed = deferred(); const reportQueued = deferred();
+    synthetic.onWatchQueue = (count) => { if (count === 2) reportQueued.resolve(); };
+    const firingFirst = mutateWatches(async () => {
+      fireEntered.resolve(); await fireProceed.promise;
+      const cleared = store!.clearByWatch(synthetic.watch, { notice: 'free' }).length;
+      return { state: { watches: [] }, value: cleared };
+    });
+    await fireEntered.promise;
+    const reportingSecond = reportPortfolioBlocker(caller, report);
+    await reportQueued.promise;
+    fireProceed.resolve();
+    expect(await firingFirst).toBe(0);
+    await expect(reportingSecond).rejects.toMatchObject({ status: 400 });
+    expect(store.impacts()).toEqual([]);
+
+    synthetic.watchAvailable = true;
+    const liveWatch = synthetic.watch;
+    synthetic.watch = { ...liveWatch, expiresAt: Date.now() - 1 };
+    try {
+      await expect(reportPortfolioBlocker(caller, { ...report, eventId: 'expired-report',
+        sourceKey: 'expired-source' })).rejects.toThrow('expired watch');
+      expect(store.impacts()).toEqual([]);
+    } finally { synthetic.watch = liveWatch; }
+  });
 
   it('reports by coordinator API, assigns from human board, applies by owner API, clears on proof, and updates the board', async () => {
     process.env.NEXTAUTH_SECRET = 'portfolio-interactive-test-secret-at-least-32-bytes';

@@ -5,7 +5,7 @@ import { getNotesService } from '@/lib/notes-service';
 import { NOTE_BODY_MAX_BYTES, readNotesState } from '@/lib/notes-store';
 import { getPortfolioStore } from '@/lib/portfolio-store';
 import { currentCoordinator } from '@/lib/scrum-master-access';
-import { readWatches } from '@/lib/watch-store';
+import { mutateWatches } from '@/lib/watch-store';
 import { getWorkspaces } from '@/lib/workspace-store';
 import { listSessions } from '@/lib/tmux';
 import type { ICaller } from '@/lib/caller';
@@ -54,17 +54,25 @@ export const reportPortfolioBlocker = async (caller: ICaller, report: IPortfolio
     // An already committed event remains replayable after its one-shot watch has fired.
     // The store still compares the full report hash, so a reused event ID cannot bypass validation.
     if (report.watchId) {
-      if (!store.hasEvent(report.eventId)) {
-        const watch = (await readWatches()).watches.find((entry) => entry.id === report.watchId);
-        if (!watch || report.resourceKey !== `${watch.kind}:${watch.target}`
-          || (report.kind === 'ci' && (watch.kind !== 'pr' || watch.until !== 'checks-settled'))
-          || (report.kind === 'lease' && (watch.kind !== 'lease' || watch.until !== 'free'))
-          || (watch.kind !== 'lease' && report.watchHead !== watch.baseline)
-          || (watch.kind === 'lease' && report.watchHead !== null)
-          || !watch.verified) {
-          throw new MissionControlError(400, 'invalid-request', 'linked watch identity or baseline does not match the dependency');
+      // Watch consumption uses this same lock. Commit before it fires, or reject if it
+      // already fired; an exact event replay remains valid after the watch is gone.
+      return mutateWatches(async (state) => {
+        if (!store.hasEvent(report.eventId)) {
+          const watch = state.watches.find((entry) => entry.id === report.watchId);
+          if (!watch || report.resourceKey !== `${watch.kind}:${watch.target}`
+            || (report.kind === 'ci' && (watch.kind !== 'pr' || watch.until !== 'checks-settled'))
+            || (report.kind === 'lease' && (watch.kind !== 'lease' || watch.until !== 'free'))
+            || (watch.kind !== 'lease' && report.watchHead !== watch.baseline)
+            || (watch.kind === 'lease' && report.watchHead !== null)
+            || !watch.verified) {
+            throw new MissionControlError(400, 'invalid-request', 'linked watch identity or baseline does not match the dependency');
+          }
+          if (Date.now() >= watch.expiresAt) {
+            throw new MissionControlError(400, 'invalid-request', 'new blocker report cannot link an expired watch');
+          }
         }
-      }
+        return { state, value: store.report(report) };
+      });
     } else if (report.watchHead !== null) {
       throw new MissionControlError(400, 'invalid-request', 'watchHead requires a linked watch');
     }
