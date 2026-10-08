@@ -6,6 +6,7 @@ import {
   withCodexTargetLock,
 } from '@/lib/providers/codex/launch-lifecycle';
 import { getCodexModelStatus, type ICodexModelStatus } from '@/lib/providers/codex/model-observation';
+import { observeTabSessionsStrict } from '@/lib/tmux';
 import type { ITab } from '@/types/terminal';
 
 export interface IAgentDispatchPolicyOptions {
@@ -73,8 +74,9 @@ export const checkAgentDispatchPolicyLocked = async (
   const tabs = currentTarget ? [currentTarget] : [];
   if (orchestratorId && orchestratorId !== currentTarget?.id) {
     const found = await findTab(workspaceId, orchestratorId);
-    if (!found) return unverified(orchestratorId);
-    tabs.push(found.tab);
+    if (found) tabs.push(found.tab);
+    // A closed crown has no model left to verify; only a surviving session keeps it unverified.
+    else if ((await observeTabSessionsStrict(workspaceId, orchestratorId)).state !== 'absent') return unverified(orchestratorId);
   }
 
   let targetAwaitingFirstTurn: { tab: ITab; modelStatus: ICodexModelStatus } | null = null;

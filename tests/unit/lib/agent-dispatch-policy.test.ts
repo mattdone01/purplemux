@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   find: vi.fn(),
   model: vi.fn(),
   claim: vi.fn(),
+  sessions: vi.fn(),
   lock: vi.fn(async (_workspaceId: string, _tabId: string, work: () => Promise<unknown>) => work()),
 }));
 vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: mocks.workspace }));
@@ -16,6 +17,7 @@ vi.mock('@/lib/providers/codex/launch-lifecycle', () => ({
   withCodexTargetLock: mocks.lock,
 }));
 vi.mock('@/lib/providers/codex/model-observation', () => ({ getCodexModelStatus: mocks.model }));
+vi.mock('@/lib/tmux', () => ({ observeTabSessionsStrict: mocks.sessions }));
 import {
   checkAgentDispatchPolicy,
   clearAgentDispatchPolicyState,
@@ -64,6 +66,32 @@ describe('automated dispatch model guard', () => {
     }));
     mocks.model.mockResolvedValue(modelStatus('match'));
     mocks.claim.mockResolvedValue({ ok: false, reason: 'not-pre-first-turn' });
+    mocks.sessions.mockResolvedValue({ state: 'present', sessions: ['pt-ws-pane-1-root'] });
+  });
+
+  it('does not let a closed orchestrator hold every dispatch in its workspace', async () => {
+    mocks.find.mockImplementation(async (_workspaceId: string, id: string) =>
+      id === 'root' ? null : { workspaceId: 'ws', paneId: 'pane-1', tab: tab(id) });
+    mocks.sessions.mockResolvedValue({ state: 'absent', reason: 'no tmux session of the tab survives' });
+
+    expect(await checkAgentDispatchPolicy('ws')).toEqual({ ok: true });
+    expect(await checkAgentDispatchPolicy('ws', tab('worker'))).toEqual({ ok: true });
+    expect(mocks.sessions).toHaveBeenCalledWith('ws', 'root');
+  });
+
+  it.each([
+    { state: 'present', sessions: ['pt-ws-pane-1-root'] },
+    { state: 'unknown', reason: 'tmux unavailable' },
+  ])('holds dispatch while a missing orchestrator is not proven closed: %j', async (sessions) => {
+    mocks.find.mockImplementation(async (_workspaceId: string, id: string) =>
+      id === 'root' ? null : { workspaceId: 'ws', paneId: 'pane-1', tab: tab(id) });
+    mocks.sessions.mockResolvedValue(sessions);
+
+    expect(await checkAgentDispatchPolicy('ws', tab('worker'))).toMatchObject({
+      ok: false,
+      error: 'agent-model-unverified',
+      tabId: 'root',
+    });
   });
 
   it('holds new worker creation when the orchestrator model drifted', async () => {

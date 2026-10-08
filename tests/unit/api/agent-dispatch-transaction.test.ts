@@ -6,6 +6,7 @@ import type { ICodexModelStatus } from '@/lib/providers/codex/model-observation'
 const mocks = vi.hoisted(() => ({
   tabs: new Map<string, ITab>(),
   crown: 'm-crown' as string | null,
+  tabSessions: { state: 'unknown', reason: 'tmux did not list sessions' } as { state: string; reason?: string },
   events: [] as string[],
   find: vi.fn(),
   workspace: vi.fn(),
@@ -42,6 +43,7 @@ vi.mock('@/lib/tmux', () => ({
   hasSession: mocks.hasSession,
   sendEscape: mocks.escape,
   isContentPendingInComposer: vi.fn(async () => false),
+  observeTabSessionsStrict: async () => mocks.tabSessions,
 }));
 vi.mock('@/lib/logger', () => ({ createLogger: () => ({ error: vi.fn(), warn: vi.fn() }) }));
 
@@ -93,6 +95,7 @@ const automate = (dispatcher: AutomatedPromptDispatcher, targetTabId = 'a-worker
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.crown = 'm-crown';
+  mocks.tabSessions = { state: 'unknown', reason: 'tmux did not list sessions' };
   mocks.events = [];
   mocks.tabs = new Map(['a-worker', 'm-crown', 'z-worker', 'new-crown'].map((id) => [id, tab(id)]));
   mocks.find.mockImplementation(async (_ws: string, id: string) => {
@@ -260,6 +263,13 @@ describe('real dispatch callers share lifecycle transactions', () => {
     mocks.tabs.delete('m-crown');
     expect(await call(sendHandler)).toMatchObject({ status: 409, body: { tabId: 'm-crown' } });
     expect(mocks.paste).not.toHaveBeenCalled();
+  });
+
+  it('delivers past a crown that was closed: gone from the layout, no session of it survives', async () => {
+    mocks.tabs.delete('m-crown');
+    mocks.tabSessions = { state: 'absent', reason: 'no tmux session of the tab survives' };
+    expect(await call(sendHandler)).toMatchObject({ status: 200 });
+    expect(mocks.paste).toHaveBeenCalled();
   });
 
   it.each([false, true])('steer rechecks policy after interrupt (interrupt failure: %s)', async (interruptFailure) => {

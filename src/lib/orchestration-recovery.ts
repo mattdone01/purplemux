@@ -40,7 +40,13 @@ const checkIncumbent = async (workspace: IWorkspace, tabs: ITab[], options: IOrc
   if (options.actor.kind === 'human' && options.mode === 'replace') return;
   if (options.mode === 'handoff' && options.actor.kind === 'workspace' && options.actor.verified && options.actor.tabId === current.orchestratorTabId) return;
   const incumbent = tabs.find((tab) => tab.id === current.orchestratorTabId);
-  if (!incumbent) throw new OrchestrationError(409, 'orchestrator-state-unknown', 'Incumbent has no authoritative session binding; use explicit human replacement', current);
+  if (!incumbent) {
+    const { observeTabSessionsStrict } = await import('@/lib/tmux');
+    const sessions = await observeTabSessionsStrict(workspace.id, current.orchestratorTabId);
+    if (sessions.state !== 'absent') throw new OrchestrationError(409, 'orchestrator-state-unknown', 'Incumbent has no authoritative session binding; use explicit human replacement', current);
+    if (options.mode !== 'recover' && options.actor.kind !== 'human') throw new OrchestrationError(409, 'orchestration-recovery-required', 'Use explicit local recovery for the closed incumbent', current);
+    return;
+  }
   const observed = await observeOrchestrationRuntime(incumbent);
   if (observed.state === 'unknown') throw new OrchestrationError(409, 'orchestrator-state-unknown', observed.reason, current);
   if (observed.state === 'present') throw new OrchestrationError(409, 'orchestrator-live', 'The incumbent is live; only its verified handoff or explicit human replacement may change ownership', current);

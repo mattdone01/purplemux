@@ -5,7 +5,7 @@ vi.mock('child_process', () => ({ execFile: (_bin: string, _args: string[], _opt
 vi.mock('fs/promises', () => ({ default: { readFile: fixture.read } }));
 vi.mock('@/lib/platform', () => ({ isLinux: true }));
 import { observeProviderProcess } from '@/lib/process-utils';
-import { observeSessionStrict } from '@/lib/tmux';
+import { observeSessionStrict, observeTabSessionsStrict } from '@/lib/tmux';
 beforeEach(() => { fixture.output = ''; fixture.failure = null; fixture.read.mockReset(); });
 describe('strict low-level runtime proof', () => {
   it('only accepts exact explicit missing-target responses as absent', async () => {
@@ -15,6 +15,17 @@ describe('strict low-level runtime proof', () => {
     }
     for (const error of [{ code: 1, stderr: 'no server running' }, { code: 1, stderr: "can't find session: other" }, { code: 1, stderr: "can't find window: other" }, { code: 1, stderr: "can't find window: target", killed: true }, { code: 'EACCES' }]) {
       fixture.failure = error; expect(await observeSessionStrict('target')).toMatchObject({ state: 'unknown' });
+    }
+  });
+  it('proves a closed tab only when no session of it survives on a readable listing', async () => {
+    fixture.output = 'pt-ws-a-pane-1-tab-other\npt-ws-b-pane-1-tab-x\n';
+    expect(await observeTabSessionsStrict('ws-a', 'tab-x')).toMatchObject({ state: 'absent' });
+    fixture.output = 'pt-ws-a-pane-9-tab-x\n';
+    expect(await observeTabSessionsStrict('ws-a', 'tab-x')).toEqual({ state: 'present', sessions: ['pt-ws-a-pane-9-tab-x'] });
+    fixture.failure = { code: 1, stderr: 'no server running on /tmp/tmux-1000/purple' };
+    expect(await observeTabSessionsStrict('ws-a', 'tab-x')).toMatchObject({ state: 'absent' });
+    for (const error of [{ code: 1, stderr: 'error connecting to /tmp/tmux-1000/purple' }, { code: 1, stderr: 'no server running on x', killed: true }, { code: 'EACCES' }]) {
+      fixture.failure = error; expect(await observeTabSessionsStrict('ws-a', 'tab-x')).toMatchObject({ state: 'unknown' });
     }
   });
   it('requires an unambiguous matching session and pane identity', async () => {

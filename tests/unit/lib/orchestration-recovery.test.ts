@@ -5,14 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ITab, IWorkspaceOrchestration } from '@/types/terminal';
 import type { IOrchestrationChange } from '@/lib/orchestration-recovery';
 
-const fixture = vi.hoisted(() => ({ home: '', runtime: vi.fn(), work: vi.fn(), model: vi.fn() }));
+const fixture = vi.hoisted(() => ({ home: '', runtime: vi.fn(), work: vi.fn(), model: vi.fn(), sessions: vi.fn() }));
 vi.mock('os', async (original) => {
   const actual = await original<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => fixture.home }, homedir: () => fixture.home };
 });
 vi.mock('@/lib/orchestration-runtime', () => ({ observeOrchestrationRuntime: fixture.runtime, candidateModelUsable: fixture.model }));
 vi.mock('@/lib/orchestration-work-state', () => ({ readOrchestrationWorkState: fixture.work }));
-vi.mock('@/lib/tmux', () => ({ killSession: vi.fn(async () => null), hasSession: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'), sendKeys: vi.fn(), listSessions: vi.fn(async () => []), workspaceSessionName: vi.fn() }));
+vi.mock('@/lib/tmux', () => ({ killSession: vi.fn(async () => null), hasSession: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'), sendKeys: vi.fn(), listSessions: vi.fn(async () => []), workspaceSessionName: vi.fn(), observeTabSessionsStrict: fixture.sessions }));
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
 const file = () => path.join(fixture.home, '.purplemux/workspaces.json');
 const layoutFile = () => path.join(fixture.home, '.purplemux/workspaces/ws-a/layout.json');
@@ -30,6 +30,7 @@ beforeEach(() => {
   fixture.runtime.mockImplementation(async (target: ITab) => target.id === 'tab-old' ? { state: 'absent', reason: 'strict session absence' } : { state: 'present', identity: target.sessionName });
   fixture.work.mockResolvedValue({ state: 'complete', evidence: [], incomplete: false });
   fixture.model.mockResolvedValue(true);
+  fixture.sessions.mockResolvedValue({ state: 'present', sessions: ['pt-ws-a-pane-a-tab-missing'] });
   for (const key of ['__purplemuxWorkspacesContentCache', '__ptWorkspacesMemo', '__ptTabTokens', '__ptWorkspaceTokens']) delete (globalThis as Record<string, unknown>)[key];
 });
 afterEach(() => { fs.rmSync(fixture.home, { recursive: true, force: true }); });
@@ -101,6 +102,20 @@ describe('guarded orchestration revision and recovery', () => {
     await expect(changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options())).rejects.toMatchObject({ code: 'orchestrator-state-unknown' });
     expect((await changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options({ mode: 'replace', actor: { kind: 'human' } }))).orchestration?.revision).toBe(1);
     expect((await import('@/lib/tmux')).killSession).not.toHaveBeenCalled();
+  });
+  it('recovers a closed incumbent: gone from the layout and no session of it survives', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-closed' });
+    fixture.sessions.mockResolvedValue({ state: 'absent', reason: 'no tmux session of the tab survives' });
+    const { changeOrchestration } = await load();
+    await expect(changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options({ mode: 'update' }))).rejects.toMatchObject({ code: 'orchestration-recovery-required' });
+    const result = await changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options());
+    expect(result.orchestration).toMatchObject({ orchestratorTabId: 'tab-next', revision: 1 });
+    expect(fixture.sessions).toHaveBeenCalledWith('ws-a', 'tab-closed');
+  });
+  it.each([{ state: 'unknown', reason: 'tmux unavailable' }, { state: 'present', sessions: ['pt-ws-a-pane-x-tab-closed'] }])('keeps a missing incumbent unknown while %j', async (sessions) => {
+    write({ enabled: true, orchestratorTabId: 'tab-closed' });
+    fixture.sessions.mockResolvedValue(sessions);
+    await expect((await load()).changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options())).rejects.toMatchObject({ code: 'orchestrator-state-unknown' });
   });
   it('requires launch-verified incumbent authority for handoff; forged session identity fails', async () => {
     write({ enabled: true, orchestratorTabId: 'tab-old' });

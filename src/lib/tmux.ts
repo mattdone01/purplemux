@@ -878,3 +878,29 @@ export const observeSessionStrict = async (sessionName: string): Promise<
     return { state: 'unknown', reason: 'tmux unavailable, timed out, or did not prove session absence' };
   }
 };
+
+/**
+ * A tab gone from the layout is closed only when no session of it survives.
+ * Its pane is unknown, so every `pt-<ws>-<pane>-<tab>` session is a match;
+ * only a readable listing (or tmux's explicit no-server reply) proves absence.
+ */
+export const observeTabSessionsStrict = async (wsId: string, tabId: string): Promise<
+  | { state: 'absent' | 'unknown'; reason: string }
+  | { state: 'present'; sessions: string[] }
+> => {
+  let names: string[];
+  try {
+    const { stdout } = await execFile('tmux', ['-L', TMUX_SOCKET, 'ls', '-F', '#{session_name}'], { timeout: CMD_TIMEOUT });
+    names = stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch (error) {
+    const failure = error as { code?: unknown; stderr?: string; killed?: boolean; signal?: unknown };
+    if (failure.code === 1 && !failure.killed && !failure.signal && failure.stderr?.trim().startsWith('no server running on ')) {
+      return { state: 'absent', reason: 'tmux positively reported no server' };
+    }
+    return { state: 'unknown', reason: 'tmux unavailable, timed out, or did not list sessions' };
+  }
+  const sessions = names.filter((name) => name.startsWith(`pt-${wsId}-`) && name.endsWith(`-${tabId}`));
+  return sessions.length
+    ? { state: 'present', sessions }
+    : { state: 'absent', reason: 'no tmux session of the tab survives' };
+};
