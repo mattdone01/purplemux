@@ -214,6 +214,20 @@ describe('deploy announcer', () => {
     expect(await code(svc.withdraw(ADMIN, 'd-nosuchone'))).toBe('deploy-not-found');
   });
 
+  it('counts only withdrawals when delivery completes after a status snapshot', async () => {
+    const a = await svc.announce(ADMIN, { inMinutes: 5, reason: 'r' });
+    const before = await svc.status(ADMIN, a.id);
+    expect(before.recipients.map((r) => r.state)).toEqual(['queued', 'queued', 'queued']);
+
+    // The dispatcher finishes one delivery while the caller is between status and withdraw.
+    const delivered = f.inbox.get('i-item3')!;
+    f.inbox.set(delivered.id, { ...delivered, state: 'delivered' });
+
+    expect(await svc.withdraw(ADMIN, a.id)).toEqual({ id: a.id, withdrawn: 2 });
+    const after = await svc.status(ADMIN, a.id);
+    expect(after.recipients.map((r) => r.state)).toEqual(['dropped', 'dropped', 'delivered']);
+  });
+
   it('status lists each recipient with its delivery state and cliState', async () => {
     const a = await svc.announce(ADMIN, { inMinutes: 5, reason: 'wave 2' });
     f.inbox.set('i-item1', { id: 'i-item1', state: 'delivered' } as IInboxItem);

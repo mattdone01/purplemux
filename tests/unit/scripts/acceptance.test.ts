@@ -492,6 +492,24 @@ describe('checks-wave3.cjs judgements (story 23)', () => {
     expect(wave3.judgeDeployLine(undefined, 'd-abcd1', 'SECRET')).toEqual({ ok: false, measured: 'null' });
   });
 
+  it('judgeDeployWithdrawal: a recipient delivered between status and withdrawal does not inflate the dropped count', () => {
+    const before = ['a', 'b', 'c'].map((itemId) => ({ itemId, state: 'queued' }));
+    const after = [
+      { itemId: 'a', state: 'dropped' },
+      { itemId: 'b', state: 'delivered' },
+      { itemId: 'c', state: 'dropped' },
+    ];
+    expect(wave3.judgeDeployWithdrawal(before, after, 2)).toBe(true);
+    expect(wave3.judgeDeployWithdrawal(before, after.map((r) => ({ ...r, state: 'dropped' })), 3)).toBe(true);
+    expect(wave3.judgeDeployWithdrawal(before, after.map((r) => ({ ...r, state: 'delivered' })), 0)).toBe(true);
+    expect(wave3.judgeDeployWithdrawal(before, after, 3)).toBe(false);
+    expect(wave3.judgeDeployWithdrawal(before, [{ ...after[0], state: 'queued' }, after[1], after[2]], 1)).toBe(false);
+    expect(wave3.judgeDeployWithdrawal(before, [after[0], after[0], after[2]], 2)).toBe(false);
+    expect(wave3.judgeDeployWithdrawal(before, null, 2)).toBe(false);
+    const alreadyDelivered = [{ itemId: 'a', state: 'delivered' }, before[1]];
+    expect(wave3.judgeDeployWithdrawal(alreadyDelivered, [{ itemId: 'a', state: 'dropped' }, { itemId: 'b', state: 'dropped' }], 2)).toBe(false);
+  });
+
   it('judgeWatchLine: needs the watch prefix, the target with its text, and the cleared tail', () => {
     const line = '[purplemux watch w-abcd1] o/r#1 is MERGED (aaaaaaaa) — watch cleared';
     expect(wave3.judgeWatchLine(line, 'o/r#1', 'is MERGED (aaaaaaaa)').ok).toBe(true);
