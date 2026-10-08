@@ -649,8 +649,8 @@ const Sidebar = () => {
                   useWebviewStore.getState().hide();
                   router.push('/mission-control');
                 }}
-                aria-label="Mission Control"
-                title="Mission Control"
+                aria-label="Portfolio board"
+                title="Portfolio board"
               >
                 <LayoutDashboard className="h-3.5 w-3.5" />
               </button>

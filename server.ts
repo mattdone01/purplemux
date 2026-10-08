@@ -19,6 +19,7 @@ import { startNotes, stopNotes } from './src/lib/notes-service';
 import { startGrants, stopGrants } from './src/lib/grant-service';
 import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
+import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio-runtime';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { dispatchHook } from './src/lib/hook-dispatch';
 import { drainHookSpool } from './src/lib/hook-spool';
@@ -107,7 +108,9 @@ const handleWsUpgrade = (
 const NO_AUTH_WS_PATHS = new Set(['/api/install']);
 
 const shutdownWs = async () => {
-  // The inbox first: it waits for a paste in flight to be recorded, and Mission Control's stop then
+  // Stop new portfolio notes before the inbox stops accepting deliveries.
+  await stopPortfolioRuntime();
+  // The inbox then waits for a paste in flight to be recorded, and Mission Control's stop
   // settles that paste in one last sync (story 12 review r1, N5). Notices enqueued after this wait
   // in inbox.json for the next boot.
   await stopInbox();
@@ -407,6 +410,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await startNotes();
   await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });
   await startWatches();
+  startPortfolioRuntime();
 
   const envHost = process.env.HOST?.trim();
   const configData = await getConfig();

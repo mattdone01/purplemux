@@ -58,7 +58,7 @@ export type TCliScope =
   /**
    * A token injected into one workspace's tabs. Confined to that workspace.
    * A per-tab token (ADR-0010) resolves to the same scope and additionally
-   * names its tab for verified read grants and caller attribution.
+   * names its tab for verified read grants, Scrum Master selection and caller attribution.
    */
   | { type: 'workspace'; workspaceId: string; tabId?: string; tabVerified?: true; tabIdentity?: 'launch' | 'hook' };
 

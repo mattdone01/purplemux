@@ -61,6 +61,15 @@ beforeEach(() => {
 });
 
 describe('Mission Control human authentication', () => {
+  it('does not let a Scrum Master tab token save the human-selected scope', async () => {
+    const { default: handler } = await import('@/pages/api/mission-control/portfolio');
+    const { state, res } = fakeResponse();
+    await handler({ method: 'PUT', headers: { 'x-pmux-token': 'manager-tab-token' }, body: {
+      managerWorkspaceId: 'ws-root', managerTabId: 'tab-root', workspaceIds: ['ws-a'],
+    } } as unknown as NextApiRequest, res);
+    expect(state.statusCode).toBe(401);
+  });
+
   it('does not accept the global CLI token as a human session', async () => {
     const { default: handler } = await import('@/pages/api/mission-control/index');
     const { state, res } = fakeResponse();

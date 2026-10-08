@@ -155,6 +155,31 @@ describe('harness watches (ADR-0015)', () => {
     expect(f.sent.map((s) => s.line)).toEqual([expect.stringContaining('o/r#5 checks settled at aaaaaaaa: 3 green, 1 red — watch cleared')]);
   });
 
+  it('does not emit settled-check proof if the PR head changes during check queries', async () => {
+    f.answer('/pulls/51', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A),
+      f.pull(false, 'open', SHA_B), f.pull(false, 'open', SHA_B), f.pull(false, 'open', SHA_B));
+    f.answer('/check-runs', { ok: true, stdout: 'completed\tsuccess\n' });
+    f.answer('/status', { ok: true, stdout: 'success\n' });
+    await m.create(B, { kind: 'pr', target: 'o/r#51', until: 'checks-settled' });
+    await tickAt(2);
+    expect(f.sent).toEqual([]);
+    expect(f.state.watches).toHaveLength(1);
+    await tickAt(2);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0].fields.sha).toBe(SHA_B);
+  });
+
+  it('drops stale settled-check proof when the head changes after evaluation but before enqueue', async () => {
+    f.answer('/pulls/52', f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_A),
+      f.pull(false, 'open', SHA_A), f.pull(false, 'open', SHA_B));
+    f.answer('/check-runs', { ok: true, stdout: 'completed\tsuccess\n' });
+    f.answer('/status', { ok: true, stdout: 'success\n' });
+    await m.create(B, { kind: 'pr', target: 'o/r#52', until: 'checks-settled' });
+    await tickAt(2);
+    expect(f.sent).toEqual([]);
+    expect(f.state.watches[0].pendingNotice).toBeUndefined();
+  });
+
   it('ref moved reports both shas', async () => {
     f.answer('/commits/feature%2Fx', { ok: true, stdout: `${SHA_A}\n` }, { ok: true, stdout: `${SHA_B}\n` });
     await m.create(B, { kind: 'ref', target: 'o/r@feature/x', until: 'moved' });
@@ -172,6 +197,25 @@ describe('harness watches (ADR-0015)', () => {
     await m.tick('merge:x/y');
     expect(f.sent.map((s) => s.line)).toEqual([expect.stringContaining('merge:x/y is free — watch cleared')]);
     expect(f.ghCalls).toEqual([]);
+  });
+
+  it('keeps a lease watch when it is reacquired between evaluation and notice routing', async () => {
+    let checks = 0;
+    let clearances = 0;
+    const deps = f.deps();
+    deps.leaseFree = async () => ++checks !== 2;
+    deps.onFired = async () => { clearances++; };
+    m = new WatchManager(deps);
+    const watch = await m.create(B, { kind: 'lease', target: 'merge:race/release', until: 'free' });
+    await m.tick('merge:race/release');
+    expect(f.sent).toEqual([]);
+    expect(clearances).toBe(0);
+    expect(f.state.watches.map((entry) => entry.id)).toEqual([watch.id]);
+    f.now += MIN;
+    await m.tick('merge:race/release');
+    expect(f.sent.map((entry) => entry.fields.notice)).toEqual(['free']);
+    expect(clearances).toBe(1);
+    expect(f.state.watches).toEqual([]);
   });
 
   it('three failures in a row send one failing notice with a server token; none again until it recovers and fails again', async () => {

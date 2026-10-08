@@ -9,7 +9,9 @@ else \`PMUX_TOKEN\`.
 ## Workspace scope
 
 Agent tokens may mutate tabs and workspace configuration only in their own workspace. Peer
-entries and legacy drive grants allow authorized reads only. The global CLI token
+entries and legacy drive grants allow authorized reads only. A human-saved Scrum Master
+selection also gives its exact current launch-verified manager tab reads in the selected
+workspaces. The global CLI token
 is not human identity and cannot mutate these surfaces. Foreign requests go through
 coordinator notes; use authenticated local human controls for human actions.
 An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
@@ -17,8 +19,8 @@ An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
 ## Caller identity
 
 Every tab created by the server also carries \`PMUX_TAB_TOKEN\`, \`PMUX_TAB_ID\` (the
-tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants exactly what the
-workspace token grants, and it also names the calling tab: verified (identity
+tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants the same own-workspace
+authority and names the calling tab for selected Scrum Master reads: verified (identity
 "launch") for a token the server bound when it created the session. A Claude tab
 created before tab tokens takes a hook-time token at its next session start
 (identity "hook", never verified; see POST /api/cli/tab-identity). A tab token
@@ -500,6 +502,68 @@ POST /api/cli/workspaces/<workspaceId>/standup
 
 GET /api/cli/workspaces/<workspaceId>/standup
   Response: { "latest": { ... } | null, "history": [...] }
+
+## Portfolio board
+
+GET /api/cli/portfolio?workspaces=WS1,WS2
+  The current launch-verified Scrum Master may read 1..100 workspaces from the human-saved
+  scope. The query may narrow that scope, never expand it. Ordinary own-workspace reads
+  remain available even if the portfolio scope does not include that workspace.
+  The response gives coverage for each requested workspace; blocker records and shared
+  dependency aggregates include only workspaces with current coordinators. Removing a
+  workspace or replacing the manager in the saved scope takes effect on the next read.
+  Open blockers are always included. Resolved blockers are paged 100 at a time; follow
+  resolvedNextCursor with &resolvedBefore=<cursor> to read older history. Actions and
+  milestones are limited to the latest entries used by the board for visible blockers.
+  Work commands in other workspaces still go through their configured orchestrators.
+
+POST /api/cli/portfolio/events
+  Only the launch-verified current orchestrator of the report's workspace, with the
+  current Mission Control run binding generation, may report, apply, or resolve.
+  \`purplemux portfolio report -w WS --json '{...}'\` submits one blocker report:
+  {"eventId":"evt-1","schemaVersion":1,"workspaceId":"WS","runId":"RUN","bindingGeneration":1,
+   "sourceKey":"stable-blocker-key","revision":0,"producerAt":1700000000000,
+   "resourceKey":"lease:merge:owner/repo","kind":"lease","watchId":"w-...",
+   "watchHead":null,"outcome":"Ship release","priority":90,"stage":"implemented",
+   "owner":"orchestrator","cause":"Merge lease held","evidence":"reported observation",
+   "nextAction":"Wait for lease release","decisionOwner":"orchestrator",
+   "checkpointAt":1700000300000,"capacity":{"host":"host-a","measuredReason":"lease held",
+   "limit":"1","use":"1","holder":"tab-holder","clearingCondition":"lease free"}}
+  Stable sourceKey preserves the first-blocked age across task renames and coordinator
+  replacement. Revisions begin at 0 and increment by one. Event IDs replay only identical
+  content. A newer revision needs a new watch ID. For PR/ref watches, watchHead must equal
+  the immutable watch baseline SHA; a changed head cannot clear the old blocker. Capacity
+  details are required for worker-limit, build-slots, memory, disk-reservation and lease.
+  Pre-upgrade blockers with multiple revisions have incomplete watch history. They remain
+  readable and accept unwatched edits, but a new watch binding requires an explicit linked
+  migration; changing sourceKey silently would lose the blocker history.
+  Reported stage/evidence are claims, not verified milestones. A matching green CI, merged
+  PR, moved ref or free lease watch clears only its linked dependency. It does not verify
+  deployment or the release. No arbitrary prose resolves a blocker.
+
+  \`purplemux portfolio applied -w WS --json '{...}'\` records that the current owner
+  applied a routed decision (separate from note acknowledgement):
+  {"schemaVersion":1,"workspaceId":"WS","runId":"RUN","bindingGeneration":1,
+   "impactId":"pb-...","noteId":"n-...","eventId":"apply-1","expectedRevision":0}
+
+  \`purplemux portfolio resolved -w WS --json '{...}'\` records capacity clearance only
+  for an unwatched worker-limit, build-slots, memory, or disk-reservation blocker:
+  {"schemaVersion":1,"type":"resolved","workspaceId":"WS","runId":"RUN",
+   "bindingGeneration":1,"impactId":"pb-...","eventId":"resolve-1",
+   "expectedRevision":0,"observedAt":1700000300000,
+   "evidence":{"host":"host-a","measuredReason":"slot available","limit":"4",
+   "use":"3","holder":null,"clearingCondition":"one free slot",
+   "reference":"host-signals:sample-123"}}
+  The coordinator claim is identified as such. It clears only this dependency, never
+  a release milestone; stale revisions and reused event IDs are refused.
+
+The human Mission Control portfolio board uses an authenticated session and same-origin
+checks to select scope, acknowledge a blocker, route decisions through NotesService,
+and confirm merged/deployed/verified release milestones with cited evidence. Human notes carry the
+session subject and human admission, never a manufactured orchestrator identity.
+The target orchestrator receives the ordinary durable note and inbox receipt. A missed
+checkpoint sends one deduplicated local coordinator note; watch proof wakes each affected
+coordinator once through the existing watch notice or a deduplicated note.
 
 ## Mission Control
 

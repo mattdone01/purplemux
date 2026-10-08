@@ -7,9 +7,11 @@ export type TNoteState = 'queued' | 'delivered' | 'acked' | 'undeliverable' | 'e
 export type TNoteRoutingStatus = 'pending' | 'routed' | 'undeliverable' | 'policyblocked';
 
 export interface INoteAdmission {
-  /** Local messages stay inside one workspace; coordinator admission may cross workspaces. */
-  mode: 'local' | 'coordinator';
-  sender: { workspaceId: string; tabId: string | null };
+  /** Human admission is bound to one target by the authenticated same-origin control. */
+  mode: 'local' | 'coordinator' | 'human';
+  sender: { workspaceId: string | null; tabId: string | null };
+  humanActor?: string;
+  targetWorkspaceId?: string;
   authorizedAt: number;
 }
 
@@ -22,6 +24,8 @@ export interface INoteParty {
   identity?: TCallerIdentity;
   /** Set only when the sender's tab held `epic:<slug>` at send time. */
   epic: string | null;
+  /** Authenticated browser-session subject; never a CLI tab identity. */
+  humanActor?: string;
 }
 
 export interface INoteTarget {
@@ -32,6 +36,8 @@ export interface INoteTarget {
 export interface INote {
   /** `n-<nanoid>`. */
   id: string;
+  /** Stable producer key for an idempotent portfolio action or escalation. */
+  externalKey?: string;
   from: INoteParty;
   to: INoteTarget;
   /** ≤ 120 characters, control characters removed. Shown by list/show, never typed. */

@@ -1,0 +1,37 @@
+import { collectAllTabs, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
+import { getPortfolioStore } from '@/lib/portfolio-store';
+import { getTabTokenRecord, tabIdentityOf } from '@/lib/tab-token';
+import { hasSession } from '@/lib/tmux';
+import { getWorkspaceById } from '@/lib/workspace-store';
+import type { TCliScope } from '@/lib/workspace-token';
+import type { IPortfolioSelection } from '@/types/portfolio';
+import type { IWorkspace } from '@/types/terminal';
+
+export const currentCoordinator = async (workspaceId: string, tabId: string,
+  snapshot?: { workspace: IWorkspace | undefined; liveSessions: ReadonlySet<string> }): Promise<boolean> => {
+  const workspace = snapshot ? snapshot.workspace : await getWorkspaceById(workspaceId);
+  if (workspace?.id !== workspaceId || !workspace.orchestration?.enabled
+    || workspace.orchestration.orchestratorTabId !== tabId) return false;
+  const layout = await readLayoutFile(resolveLayoutFile(workspaceId));
+  const tab = layout && collectAllTabs(layout.root).find((entry) => entry.id === tabId);
+  const token = getTabTokenRecord(tabId);
+  return !!tab?.sessionName && token?.workspaceId === workspaceId && token.sessionName === tab.sessionName
+    && tabIdentityOf(workspaceId, tabId) === 'launch'
+    && (snapshot ? snapshot.liveSessions.has(tab.sessionName) : await hasSession(tab.sessionName));
+};
+
+/** A persisted human selection is effective only for its exact, still-current launch tab. */
+export const selectedScrumMasterScope = async (scope: TCliScope, targetWorkspaceId?: string): Promise<IPortfolioSelection | null> => {
+  if (scope.type !== 'workspace' || !scope.tabVerified || !scope.tabId) return null;
+  const designation = getPortfolioStore().currentSelection();
+  if (!designation || designation.selection.managerWorkspaceId !== scope.workspaceId
+    || designation.selection.managerTabId !== scope.tabId
+    || (targetWorkspaceId && !designation.selection.workspaceIds.includes(targetWorkspaceId))
+    || !(await currentCoordinator(scope.workspaceId, scope.tabId))) return null;
+  const stillCurrent = getPortfolioStore().currentSelection();
+  return stillCurrent?.actor === designation.actor && stillCurrent.updatedAt === designation.updatedAt
+    ? designation.selection : null;
+};
+
+export const selectedScrumMasterCanRead = async (scope: TCliScope, workspaceId: string): Promise<boolean> =>
+  (await selectedScrumMasterScope(scope, workspaceId)) !== null;

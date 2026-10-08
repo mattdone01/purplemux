@@ -56,10 +56,12 @@ export type TNoteEvent = 'delivered' | 'reminder' | 'unacked' | 'expired';
 const NOTE_EVENTS: readonly TNoteEvent[] = ['delivered', 'reminder', 'unacked', 'expired'];
 
 /**
- * `fromWorkspaceId: null` is an admin-token sender; `fromTabId: null` a workspace token with no tab.
+ * `fromWorkspaceId: null` is an admin-token or human sender; `fromHuman` disambiguates them.
+ * `fromTabId: null` is a workspace token with no tab.
  * `event` defaults to `delivered`; `reminder` goes to the recipient, `unacked` and `expired` to the sender.
  */
-export interface INoteFields { noteId: string; fromWorkspaceId: string | null; fromTabId: string | null; sentAt: number; event?: TNoteEvent }
+export interface INoteFields { noteId: string; fromWorkspaceId: string | null; fromTabId: string | null;
+  fromHuman?: boolean; sentAt: number; event?: TNoteEvent }
 /** What a watch notice reports (ADR-0015). Every value is a server enum or a grammar-checked id. */
 export type TWatchNotice = 'merged' | 'closed' | 'head-moved' | 'checks-settled' | 'moved' | 'free' | 'failing' | 'expired';
 const WATCH_NOTICES: readonly TWatchNotice[] = ['merged', 'closed', 'head-moved', 'checks-settled', 'moved', 'free', 'failing', 'expired'];
@@ -78,6 +80,8 @@ export interface IWatchFields {
   fromSha?: string;
   green?: number;
   red?: number;
+  /** Successful checks only; neutral and skipped checks do not prove a CI dependency cleared. */
+  successful?: number;
   code?: (typeof WATCH_FAILURES)[number];
   until?: (typeof WATCH_UNTILS)[number];
 }
@@ -105,8 +109,10 @@ type TRenderer<K extends TInboxKind> = (fields: IInboxFields[K]) => { recordId: 
 const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
   note: (f) => {
     const id = field('noteId', f.noteId, 'noteId');
-    const from = f.fromWorkspaceId === null
-      ? 'admin'
+    if (f.fromHuman !== undefined && typeof f.fromHuman !== 'boolean') {
+      throw new InboxFieldError('inbox field fromHuman must be boolean');
+    }
+    const from = f.fromHuman ? 'human' : f.fromWorkspaceId === null ? 'admin'
       : `${field('fromWorkspaceId', f.fromWorkspaceId, 'workspaceId')}/${f.fromTabId === null ? 'workspace' : field('fromTabId', f.fromTabId, 'tabId')}`;
     const event = f.event ?? 'delivered';
     if (!NOTE_EVENTS.includes(event)) throw new InboxFieldError('inbox field event is not a note event');

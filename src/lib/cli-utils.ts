@@ -8,6 +8,7 @@ import { getBrowserBridge, type IBrowserBridgeClient } from '@/lib/browser-bridg
 import type { ITab } from '@/types/terminal';
 import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
 import { findActiveDriveGrant, grantsSnapshot } from '@/lib/grant-store';
+import { selectedScrumMasterCanRead } from '@/lib/scrum-master-access';
 import type { IGrant } from '@/types/grant';
 
 export interface ITabLocation {
@@ -28,7 +29,8 @@ export const accessDecision = async (scope: TCliScope, workspaceId: string): Pro
   const grant = scope.tabVerified === true && scope.tabId
     ? findActiveDriveGrant(grantsSnapshot(), { workspaceId: scope.workspaceId, tabId: scope.tabId }, workspaceId, Date.now())
     : null;
-  return { ok: !!grant, grant };
+  if (grant) return { ok: true, grant };
+  return { ok: await selectedScrumMasterCanRead(scope, workspaceId), grant: null };
 };
 
 export const isOwnWorkspace = (scope: TCliScope, workspaceId: string): boolean =>

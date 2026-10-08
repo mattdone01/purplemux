@@ -43,6 +43,7 @@ export interface IWatchDeps {
   /** Live tabs, and the workspaces whose layout could not be read (their tabs are unknown, not closed). */
   liveTabs: () => Promise<{ tabs: ReadonlyArray<{ workspaceId: string; tabId: string }>; uncertainWorkspaceIds: ReadonlySet<string> }>;
   enqueue: (req: IEnqueueRequest<'watch'>) => Promise<{ item: IInboxItem }>;
+  onFired?: (watch: IWatch, fields: Record<string, unknown>) => Promise<void>;
   read: () => Promise<IWatchesState>;
   mutate: typeof mutateWatches;
 }
@@ -161,7 +162,12 @@ export class WatchManager {
     const statuses = await this.gh(['api', `${base}/status`, '--jq', '.statuses[] | .state']);
     if (!statuses.ok) return { type: 'fail', code: statuses.code, message: statuses.message };
     const c = settleChecks(runs.stdout, statuses.stdout);
-    return c.settled ? { type: 'fire', fields: { notice: 'checks-settled', sha: p.head, green: c.green, red: c.red } } : { type: 'wait' };
+    const successful = runs.stdout.split('\n').filter((line) => line === 'completed\tsuccess').length
+      + statuses.stdout.split('\n').filter((state) => state === 'success').length;
+    const current = await this.pull(w.target);
+    if (!current.ok) return { type: 'fail', code: current.code, message: current.message };
+    if (current.head !== p.head) return { type: 'wait' };
+    return c.settled ? { type: 'fire', fields: { notice: 'checks-settled', sha: p.head, green: c.green, red: c.red, successful } } : { type: 'wait' };
   }
 
   // ─── the tick ───────────────────────────────────────────────────────────
@@ -267,8 +273,20 @@ export class WatchManager {
     }
     if (outcome === 'expired' || outcome.type === 'fire') {
       const fields: TFired = outcome === 'expired' ? { notice: 'expired', until: w.until } : outcome.fields;
+      // Evaluation happens outside the watch mutation lock. A lease may be reacquired
+      // before this point; keep its watch so the next actual release can still fire it.
+      if (w.kind === 'lease' && fields.notice === 'free' && !(await this.deps.leaseFree(w.target))) {
+        return replace({ ...w, pendingNotice: undefined, lastCheckedAt: now });
+      }
+      if (w.kind === 'pr' && fields.notice === 'checks-settled') {
+        const current = await this.pull(w.target);
+        if (!current.ok) return replace({ ...w, lastCheckedAt: now, lastError: { code: current.code,
+          message: current.message, at: now } });
+        if (current.head !== fields.sha) return replace({ ...w, pendingNotice: undefined, lastCheckedAt: now });
+      }
       try {
         await this.deps.enqueue(this.notice(w, fields));
+        if (outcome !== 'expired' && this.deps.onFired) await this.deps.onFired(w, fields as Record<string, unknown>);
       } catch (err) {
         // The condition held; only the notice is missing. Keep it, and retry the enqueue alone.
         log.warn(`watch ${w.id} notice not queued: ${err instanceof Error ? err.message : err}`);
@@ -403,6 +421,10 @@ const defaultDeps = async (): Promise<IWatchDeps> => {
       !leaseStore.pruneExpired(await leaseStore.readLeaseState(), Date.now()).state.leases.some((l) => l.name === name),
     liveTabs: tabLifecycle.readLiveTabs,
     enqueue: inboxStore.enqueueNotice,
+    onFired: async (watch, fields) => {
+      const { getPortfolioStore } = await import('@/lib/portfolio-store');
+      getPortfolioStore().clearByWatch(watch, fields);
+    },
     read: readWatches,
     mutate: mutateWatches,
   };

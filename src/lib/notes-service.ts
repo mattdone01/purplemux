@@ -1,4 +1,5 @@
 import type { ICaller } from '@/lib/caller';
+import { createHash } from 'crypto';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import type { TNoteEvent } from '@/lib/inbox-templates';
 import { createLogger } from '@/lib/logger';
@@ -64,6 +65,8 @@ export interface INotesDeps {
   /** Drop a notice still waiting in the inbox (queued or held); a delivered one is left alone. */
   withdraw: (itemId: string, reason: string) => Promise<boolean>;
   inboxItems: () => Promise<IInboxItem[]>;
+  /** Recheck a persisted portfolio action against its current blocker before routing or delivery. */
+  portfolioActionDeliverable?: (actionId: string, noteId: string, workspaceId: string) => Promise<boolean>;
 }
 
 export interface ILiveTabs {
@@ -97,6 +100,7 @@ export interface ISendInput {
   subject?: unknown;
   body?: unknown;
   fromEpic?: unknown;
+  externalKey?: string;
 }
 
 export interface IListFilter {
@@ -151,7 +155,8 @@ export class NotesService {
 
   // ─── routing ────────────────────────────────────────────────────────────
 
-  private async recipientOf(note: INote, r: IReads): Promise<TRecipientDecision> {
+  private async recipientOf(note: INote, r: IReads,
+    options: { requireActionDelivery?: boolean } = {}): Promise<TRecipientDecision> {
     if (!note.admission && note.deliveredAt === null) {
       return { status: 'policyblocked', reason: 'legacy-admission-missing' };
     }
@@ -169,9 +174,27 @@ export class NotesService {
     } else {
       return { status: 'policyblocked', reason: 'target-missing' };
     }
+    if (options.requireActionDelivery !== false && note.externalKey?.startsWith('portfolio:action:')) {
+      const actionId = note.externalKey.slice('portfolio:action:'.length);
+      if (!this.deps.portfolioActionDeliverable
+        || !(await this.deps.portfolioActionDeliverable(actionId, note.id, targetWorkspaceId))) {
+        return { status: 'policyblocked', reason: 'portfolio-action-superseded' };
+      }
+    }
 
     if (note.from.workspaceId === targetWorkspaceId) {
       if (localRecipient) return { status: 'routed', recipient: localRecipient };
+      const tabId = await r.orchestratorOf(targetWorkspaceId);
+      return tabId
+        ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
+        : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
+    }
+    if (note.admission?.mode === 'human') {
+      if (!note.from.humanActor || note.from.humanActor !== note.admission.humanActor
+        || note.from.workspaceId !== null || note.from.tabId !== null
+        || note.to.epic !== null || note.admission.targetWorkspaceId !== targetWorkspaceId) {
+        return { status: 'policyblocked', reason: 'human-admission-target-mismatch' };
+      }
       const tabId = await r.orchestratorOf(targetWorkspaceId);
       return tabId
         ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
@@ -195,7 +218,8 @@ export class NotesService {
       targetWorkspaceId: to.workspaceId,
       targetTabId: to.tabId,
       dedupeKey: `note:${note.id}:${event}:${to.tabId}`,
-      fields: { noteId: note.id, fromWorkspaceId: note.from.workspaceId, fromTabId: note.from.tabId, sentAt: note.createdAt, event },
+      fields: { noteId: note.id, fromWorkspaceId: note.from.workspaceId, fromTabId: note.from.tabId,
+        fromHuman: note.admission?.mode === 'human', sentAt: note.createdAt, event },
     };
   }
 
@@ -367,14 +391,14 @@ export class NotesService {
     // Re-route only when the line never reached the recipient: an explicit drop (its tab closed),
     // or an item gone before it was delivered. The inbox prunes a DELIVERED item after 7 days;
     // that is not a drop, and re-routing it would deliver the note again.
-    if (item?.state === 'dropped' || (!item && note.deliveredAt === null)) return this.route(requeued(note, now), now, r);
+    if (note.deliveredAt === null && (item?.state === 'dropped' || !item)) return this.route(requeued(note, now), now, r);
     let next = note;
     if (item?.state === 'delivered' && next.deliveredAt === null) next = reachedComposer(next, item.deliveredAt ?? now);
     const decision = await this.recipientOf(next, r);
     if (decision.status === 'policyblocked') {
-      // A legacy line already delivered to a composer cannot be recalled. Keep its routed record so
-      // the current coordinator can ACK it, while preflight still rejects every pending legacy line.
-      if (!next.admission && next.deliveredAt !== null) {
+      // An actual composer receipt survives a later action expiry. Delivery preflight still rejects
+      // pending stale notices, and no stale action is rerouted or reminded to a replacement tab.
+      if (next.deliveredAt !== null && (!next.admission || decision.reason === 'portfolio-action-superseded')) {
         if (next.reminderItemId) await this.deps.withdraw(next.reminderItemId, 'note-policyblocked');
         return next;
       }
@@ -517,12 +541,20 @@ export class NotesService {
   // ─── the CLI operations ─────────────────────────────────────────────────
 
   async send(caller: ICaller, input: ISendInput): Promise<INoteView> {
+    return this.sendCore(caller, input);
+  }
+
+  private async sendCore(caller: ICaller | null, input: ISendInput, humanActor?: string): Promise<INoteView> {
     const to = checkTarget(input.toEpic, input.toWorkspace);
     const subject = cleanSubject(input.subject);
     const body = checkBody(input.body);
+    const externalKey = input.externalKey;
+    if (externalKey !== undefined && !/^portfolio:(action|checkpoint|resolved):[A-Za-z0-9_-]{1,128}$/.test(externalKey)) {
+      throw new NoteError('note-invalid', 'invalid portfolio note key');
+    }
     let epic: string | null = null;
     if (input.fromEpic !== undefined && input.fromEpic !== null && input.fromEpic !== '') {
-      if (!isEpicSlug(input.fromEpic) || !(await this.deps.holdsEpic(caller, input.fromEpic))) {
+      if (!caller || !isEpicSlug(input.fromEpic) || !(await this.deps.holdsEpic(caller, input.fromEpic))) {
         throw new NoteError('forbidden', `fromEpic is accepted only from the holder of epic:${String(input.fromEpic)}`);
       }
       epic = input.fromEpic;
@@ -532,15 +564,19 @@ export class NotesService {
     }
     const now = this.deps.now();
     const reads = this.reads();
-    const admission = await this.admissionFor(caller, to, now, reads);
+    const admission: INoteAdmission = humanActor
+      ? { mode: 'human', sender: { workspaceId: null, tabId: null }, humanActor,
+        targetWorkspaceId: to.workspaceId!, authorizedAt: now }
+      : await this.admissionFor(caller!, to, now, reads);
     const note = createNote(
       {
         from: {
-          workspaceId: caller.admin ? null : caller.workspaceId,
-          tabId: caller.admin ? null : caller.tabId,
-          verified: caller.verified,
-          identity: caller.admin ? 'none' : caller.identity,
+          workspaceId: !caller || caller.admin ? null : caller.workspaceId,
+          tabId: !caller || caller.admin ? null : caller.tabId,
+          verified: caller?.verified ?? false,
+          identity: !caller || caller.admin ? 'none' : caller.identity,
           epic,
+          ...(humanActor ? { humanActor } : {}),
         },
         to,
         subject,
@@ -548,11 +584,23 @@ export class NotesService {
         admission,
       },
       now,
-      this.deps.newId(),
+      externalKey ? `n-${createHash('sha256').update(externalKey).digest('hex').slice(0, 24)}` : this.deps.newId(),
     );
+    if (externalKey) note.externalKey = externalKey;
     const sent = await this.withOperation(() => this.deps.mutate(async (state) => {
+      const existing = externalKey ? state.notes.find((n) => n.id === note.id) : null;
+      if (existing) {
+        if (existing.externalKey !== externalKey || existing.from.workspaceId !== note.from.workspaceId
+          || existing.from.tabId !== note.from.tabId || JSON.stringify(existing.to) !== JSON.stringify(note.to)
+          || existing.from.humanActor !== note.from.humanActor
+          || existing.subject !== subject || existing.body !== body) {
+          throw new NoteError('note-invalid', 'portfolio note key reused with different content');
+        }
+        return { state, value: existing };
+      }
       const mine = state.notes.filter((n) => OPEN_STATES.has(n.state)
-        && n.from.workspaceId === note.from.workspaceId && n.from.tabId === note.from.tabId).length;
+        && n.from.workspaceId === note.from.workspaceId && n.from.tabId === note.from.tabId
+        && n.from.humanActor === note.from.humanActor).length;
       if (mine >= NOTE_OPEN_PER_SENDER) {
         throw new NoteError('note-cap', `this sender already has ${mine} open notes (the limit is ${NOTE_OPEN_PER_SENDER}); wait for acks or expiry`);
       }
@@ -560,6 +608,21 @@ export class NotesService {
       return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
     }));
     return (await this.views([sent]))[0];
+  }
+
+  /** Only the authenticated human control route calls this with its session subject. */
+  async sendHumanPortfolio(actor: string, targetWorkspaceId: string, input: ISendInput): Promise<INoteView> {
+    if (!actor.trim()) throw new NoteError('forbidden', 'human actor is required');
+    return this.sendCore(null, { ...input, toWorkspace: targetWorkspaceId, toEpic: undefined,
+      fromEpic: undefined }, actor);
+  }
+
+  /** Server-originated evidence/checkpoint notices use the target workspace's durable note inbox. */
+  async sendSystemLocal(workspaceId: string, input: ISendInput): Promise<INoteView> {
+    return this.send({
+      scope: { type: 'workspace', workspaceId }, workspaceId, tabId: null, tabName: null,
+      verified: false, identity: 'none', admin: false,
+    }, { ...input, toWorkspace: workspaceId, toEpic: undefined, fromEpic: undefined });
   }
 
   async show(caller: ICaller, id: unknown): Promise<{ note: INoteView; body: string }> {
@@ -588,7 +651,8 @@ export class NotesService {
       if (requiresCoordinator) {
         const legacyDelivered = !note.admission && (note.deliveredAt !== null || item?.state === 'delivered');
         const reads = this.reads();
-        const decision = await this.recipientOf(note, reads);
+        const actualDelivery = note.deliveredAt !== null || item?.state === 'delivered';
+        const decision = await this.recipientOf(note, reads, { requireActionDelivery: !actualDelivery });
         const currentCoordinator = await reads.orchestratorOf(targetWorkspaceId);
         const routeMatches = legacyDelivered
           ? currentCoordinator === note.deliveredTo!.tabId
@@ -675,6 +739,10 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     enqueue: inboxStore.enqueueNotice,
     withdraw: inboxStore.withdrawNotice,
     inboxItems: async () => (await inboxStore.readInboxState()).items,
+    portfolioActionDeliverable: async (actionId, noteId, workspaceId) => {
+      const { getPortfolioStore } = await import('@/lib/portfolio-store');
+      return getPortfolioStore().actionNoteDeliverable(actionId, noteId, workspaceId);
+    },
   };
 };
 

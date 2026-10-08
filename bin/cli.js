@@ -117,6 +117,10 @@ const EXIT_HINT = Object.freeze({
 // The one code → exit table. A server route adds its `code` here, never a
 // table of its own. A code absent from the table exits 1.
 const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
+  'invalid-request': EXIT.USAGE,
+  conflict: EXIT.CONFLICT,
+  unauthorized: EXIT.CONFLICT,
+  'not-found': EXIT.NOT_FOUND,
   'gh-unavailable': EXIT.UNEXPECTED,
   'outcome-unknown': EXIT.UNEXPECTED,
   'close-not-confirmed': EXIT.UNEXPECTED,
@@ -570,6 +574,32 @@ const cmdMission = async (args) => {
     return out(body);
   }
   die('usage: mission snapshot|bootstrap|events|answers|ack -w WS [options]');
+};
+
+const cmdPortfolio = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub === 'board') {
+    const workspaceIds = flagValue(rest, '--workspaces');
+    if (!workspaceIds) die('--workspaces requires a comma-separated explicit selection');
+    const { body } = await api('GET', `/api/cli/portfolio?workspaces=${encodeURIComponent(workspaceIds)}`);
+    return out(body);
+  }
+  if (sub === 'report' || sub === 'applied' || sub === 'resolved') {
+    const workspaceId = missionWorkspace(rest);
+    const raw = flagValue(rest, '--json') || await readStdin();
+    let data;
+    try { data = JSON.parse(raw); } catch { die('portfolio event must be valid JSON'); }
+    if (!data || Array.isArray(data) || typeof data !== 'object' || data.workspaceId !== workspaceId) {
+      die('portfolio event workspaceId must match -w');
+    }
+    if (sub === 'applied') data.type = 'applied';
+    if (sub === 'resolved') data.type = 'resolved';
+    const { body } = await api('POST', '/api/cli/portfolio/events', data);
+    return out(body);
+  }
+  die('usage: portfolio board --workspaces WS,WS | portfolio report|applied|resolved -w WS --json JSON');
 };
 
 // ---- leases (ADR-0011) ----
@@ -1497,6 +1527,10 @@ Commands:
   mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items, each with its ackCommand; --all includes history
   mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
                                            Acknowledge one persisted answer after reading and applying it
+  portfolio board --workspaces WS,WS       Scoped release blockers for the explicitly selected workspaces (current manager tab and read grants)
+  portfolio report -w WS --json '{...}'    Current orchestrator reports a revisioned blocker; see API guide for schema
+  portfolio applied -w WS --json '{...}'   Current orchestrator records application of a routed note, not blocker resolution
+  portfolio resolved -w WS --json '{...}'  Current orchestrator records structured capacity clearance evidence
   lease acquire NAME [--ttl 45m|none] [--epic SLUG] [--note TEXT]
                                            Take a held-resource lease (<kind>:<resource>, e.g. merge:owner/repo,
                                            epic:SLUG, num:owner/repo:adr:0373). Exit 0 acquired or renewed,
@@ -1612,6 +1646,8 @@ const main = async () => {
       return cmdLease(args.slice(1));
     case 'mission':
       return cmdMission(args.slice(1));
+    case 'portfolio':
+      return cmdPortfolio(args.slice(1));
     case 'inbox':
       return cmdInbox(args.slice(1));
     case 'note':

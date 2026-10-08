@@ -62,6 +62,7 @@ class Fakes {
       orchestratorOf: async (ws) => this.orchestrators.get(ws) ?? null,
       withMappingRead: async (_workspaceId, work) => work(),
       workspaceExists: async (ws) => ['ws-1', 'ws-2', 'ws-3', 'ws-9'].includes(ws),
+      portfolioActionDeliverable: async () => true,
       liveTabs: async () => {
         this.reads.liveTabs += 1;
         return {
@@ -140,6 +141,27 @@ describe('notes (ADR-0013)', () => {
     expect(launch.from).toMatchObject({ verified: true, identity: 'launch' });
     expect(hook.from).toMatchObject({ verified: false, identity: 'hook' });
     await expectCode(svc.send(ADMIN, { toWorkspace: 'ws-9', subject: 's', body: 'b' }), 'forbidden');
+  });
+
+  it('routes an authenticated human portfolio decision with human provenance and exact target admission', async () => {
+    const note = await svc.sendHumanPortfolio('human-session-1', 'ws-1', {
+      subject: 'Portfolio action', body: 'Clear the release dependency', externalKey: 'portfolio:action:human-1',
+    });
+    expect(note.from).toMatchObject({ workspaceId: null, tabId: null, verified: false,
+      identity: 'none', humanActor: 'human-session-1' });
+    expect(note.admission).toMatchObject({ mode: 'human', humanActor: 'human-session-1',
+      targetWorkspaceId: 'ws-1', sender: { workspaceId: null, tabId: null } });
+    expect(note.deliveredTo).toEqual({ workspaceId: 'ws-1', tabId: 'tab-a' });
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0].line).toContain('from human');
+    await expect(svc.sendHumanPortfolio('other-human', 'ws-1', {
+      subject: 'Portfolio action', body: 'Clear the release dependency', externalKey: 'portfolio:action:human-1',
+    })).rejects.toMatchObject({ code: 'note-invalid' });
+    const tampered = f.note(note.id);
+    f.state = { notes: [{ ...tampered, to: { epic: null, workspaceId: 'ws-2' } }] };
+    await expect(svc.preflight(f.inbox.get(tampered.inboxItemId!)!)).resolves.toEqual({
+      ok: false, reason: 'note-policyblocked:human-admission-target-mismatch',
+    });
   });
 
   it('allows local worker messaging, but only the verified designated source coordinator may cross or retain an unresolved epic', async () => {
