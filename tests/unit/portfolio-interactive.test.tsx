@@ -36,7 +36,9 @@ vi.mock('@/lib/layout-store', () => ({ resolveLayoutFile: (workspaceId: string) 
   readLayoutFile: async (workspaceId: string) => ({ root: { id: workspaceId } }),
   collectAllTabs: (root: { id: string }) => [{ id: root.id === 'ws-root' ? 'tab-root' : 'tab-a',
     sessionName: `session-${root.id}` }] }));
-vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch' }));
+vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch',
+  getTabTokenRecord: (tabId: string) => ({ workspaceId: tabId === 'tab-root' ? 'ws-root' : 'ws-a',
+    sessionName: tabId === 'tab-root' ? 'session-ws-root' : 'session-ws-a' }) }));
 vi.mock('@/lib/tmux', async (original) => ({ ...await original<typeof import('@/lib/tmux')>(),
   hasSession: async () => true }));
 vi.mock('@/lib/watch-store', () => ({ readWatches: async () => ({ watches: [synthetic.watch] }) }));
@@ -108,6 +110,9 @@ describe('interactive synthetic portfolio API and UI journey', () => {
       return out.state;
     };
     expect((await human('PUT', { managerWorkspaceId: 'ws-root', managerTabId: 'tab-root', workspaceIds: ['ws-a'] })).status).toBe(200);
+    const { getPortfolioSnapshotForSelection } = await import('@/lib/portfolio-service');
+    await expect(getPortfolioSnapshotForSelection({ managerWorkspaceId: 'ws-root', managerTabId: 'tab-root',
+      workspaceIds: ['ws-root'] })).rejects.toMatchObject({ status: 403 });
     const report = { schemaVersion: 1, eventId: 'report-local', workspaceId: 'ws-a', runId: 'run-a',
       bindingGeneration: 1, sourceKey: 'lease-local', revision: 0, producerAt: Date.now(),
       resourceKey: 'lease:merge:o/r', kind: 'lease', watchId: 'w-local', watchHead: null,

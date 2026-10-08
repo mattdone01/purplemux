@@ -24,7 +24,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (workspaceIds.length === 0 || workspaceIds.length > 100 || new Set(workspaceIds).size !== workspaceIds.length) {
       throw new MissionControlError(400, 'invalid-request', 'Select 1–100 distinct workspace IDs');
     }
-    if (workspaceIds.some((id) => id !== saved.managerWorkspaceId && !saved.workspaceIds.includes(id))) {
+    if (workspaceIds.some((id) => !saved.workspaceIds.includes(id))) {
       throw new MissionControlError(403, 'forbidden', 'Workspace is outside the current Scrum Master scope');
     }
     return res.status(200).json(await getPortfolioSnapshotForSelection(parsePortfolioSelection({

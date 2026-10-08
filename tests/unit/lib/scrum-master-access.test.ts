@@ -8,8 +8,20 @@ const state = vi.hoisted(() => ({
   currentTab: 'tab-root',
   live: true,
   identity: 'launch',
+  layoutSessionName: 'session-ws-root',
+  tokenSessionName: 'session-ws-root',
+  tokenWorkspaceId: 'ws-root',
+  grantTarget: null as string | null,
+  portfolioError: false,
 }));
 
+vi.mock('@/lib/portfolio-store', async (original) => {
+  const actual = await original<typeof import('@/lib/portfolio-store')>();
+  return { ...actual, getPortfolioStore: () => {
+    if (state.portfolioError) throw new Error('portfolio storage unavailable');
+    return actual.getPortfolioStore();
+  } };
+});
 vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: () => state.scope }));
 vi.mock('@/lib/workspace-store', () => ({
   getWorkspaceById: async (id: string) => ({ id, orchestration: {
@@ -22,12 +34,15 @@ vi.mock('@/lib/layout-store', () => ({
   resolveLayoutFile: (id: string) => id,
   readLayoutFile: async (id: string) => ({ root: { id } }),
   collectAllTabs: (root: { id: string }) => [{ id: root.id === 'ws-root' ? state.currentTab : `tab-${root.id}`,
-    sessionName: `session-${root.id}` }],
+    sessionName: root.id === 'ws-root' ? state.layoutSessionName : `session-${root.id}` }],
   getLayout: vi.fn(),
 }));
-vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => state.identity }));
+vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => state.identity,
+  getTabTokenRecord: () => ({ workspaceId: state.tokenWorkspaceId, sessionName: state.tokenSessionName }) }));
 vi.mock('@/lib/tmux', () => ({ hasSession: async () => state.live }));
-vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: () => ({ grants: [] }), findActiveDriveGrant: () => null }));
+vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: () => ({ grants: [] }),
+  findActiveDriveGrant: (_grants: unknown, grantee: { tabId: string }, target: string) =>
+    state.grantTarget === target && grantee.tabId === 'tab-grantee' ? { id: 'g-legacy' } : null }));
 vi.mock('@/lib/portfolio-service', () => ({ getPortfolioSnapshotForSelection: vi.fn(async (selection: unknown) => ({ selection })) }));
 vi.mock('@/lib/mission-control-runtime', () => ({ getMissionSnapshot: async () => ({ schemaVersion: 1, cursor: 0 }) }));
 vi.mock('@/lib/mission-control-store', () => ({ getMissionControlStore: () => ({ humanInboxPolicy: () => ({ version: 1 }) }) }));
@@ -52,6 +67,11 @@ describe('human-selected Scrum Master read scope', () => {
     state.currentTab = 'tab-root';
     state.live = true;
     state.identity = 'launch';
+    state.layoutSessionName = 'session-ws-root';
+    state.tokenSessionName = 'session-ws-root';
+    state.tokenWorkspaceId = 'ws-root';
+    state.grantTarget = null;
+    state.portfolioError = false;
     store.select('human-a', { managerWorkspaceId: 'ws-root', managerTabId: 'tab-root', workspaceIds: ['ws-a'] });
   });
   afterEach(() => {
@@ -89,6 +109,27 @@ describe('human-selected Scrum Master read scope', () => {
     expect((await accessDecision(manager, 'ws-b')).ok).toBe(true);
   });
 
+  it('rejects a stale token whose session or workspace differs from the live layout', async () => {
+    const { accessDecision } = await import('@/lib/cli-utils');
+    state.tokenSessionName = 'session-old';
+    expect((await accessDecision(manager, 'ws-a')).ok).toBe(false);
+    state.tokenSessionName = 'session-ws-root';
+    state.tokenWorkspaceId = 'ws-other';
+    expect((await accessDecision(manager, 'ws-a')).ok).toBe(false);
+    state.tokenWorkspaceId = 'ws-root';
+    expect((await accessDecision(manager, 'ws-a')).ok).toBe(true);
+  });
+
+  it('honors an independent legacy grant when portfolio storage fails', async () => {
+    const { accessDecision } = await import('@/lib/cli-utils');
+    state.portfolioError = true;
+    state.grantTarget = 'ws-b';
+    const grantee: TCliScope = { type: 'workspace', workspaceId: 'ws-other', tabId: 'tab-grantee', tabVerified: true };
+    expect(await accessDecision(grantee, 'ws-b')).toMatchObject({ ok: true, grant: { id: 'g-legacy' } });
+    state.grantTarget = null;
+    await expect(accessDecision(grantee, 'ws-b')).rejects.toThrow('portfolio storage unavailable');
+  });
+
   it('lists only selected workspace reads and refuses CLI portfolio scope expansion', async () => {
     const { default: workspaces } = await import('@/pages/api/cli/workspaces');
     const listing = response();
@@ -100,11 +141,14 @@ describe('human-selected Scrum Master read scope', () => {
 
     const { default: portfolio } = await import('@/pages/api/cli/portfolio');
     const allowed = response();
-    await portfolio({ method: 'GET', headers: {}, query: { workspaces: 'ws-root,ws-a' } } as unknown as NextApiRequest, allowed.res);
+    await portfolio({ method: 'GET', headers: {}, query: { workspaces: 'ws-a' } } as unknown as NextApiRequest, allowed.res);
     expect(allowed.out.status).toBe(200);
     const denied = response();
-    await portfolio({ method: 'GET', headers: {}, query: { workspaces: 'ws-a,ws-b' } } as unknown as NextApiRequest, denied.res);
+    await portfolio({ method: 'GET', headers: {}, query: { workspaces: 'ws-root' } } as unknown as NextApiRequest, denied.res);
     expect(denied.out.status).toBe(403);
+    const other = response();
+    await portfolio({ method: 'GET', headers: {}, query: { workspaces: 'ws-a,ws-b' } } as unknown as NextApiRequest, other.res);
+    expect(other.out.status).toBe(403);
     const mutation = response();
     await portfolio({ method: 'POST', headers: {}, query: { workspaces: 'ws-a' } } as unknown as NextApiRequest, mutation.res);
     expect(mutation.out.status).toBe(405);

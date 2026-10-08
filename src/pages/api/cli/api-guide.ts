@@ -507,7 +507,8 @@ GET /api/cli/workspaces/<workspaceId>/standup
 
 GET /api/cli/portfolio?workspaces=WS1,WS2
   The current launch-verified Scrum Master may read 1..100 workspaces from the human-saved
-  scope, plus its own workspace. The query may narrow that scope, never expand it.
+  scope. The query may narrow that scope, never expand it. Ordinary own-workspace reads
+  remain available even if the portfolio scope does not include that workspace.
   The response gives coverage for each requested workspace; blocker records and shared
   dependency aggregates include only workspaces with current coordinators. Removing a
   workspace or replacing the manager in the saved scope takes effect on the next read.

@@ -6,7 +6,7 @@ import { readNotesState } from '@/lib/notes-store';
 import { getPortfolioStore } from '@/lib/portfolio-store';
 import { currentCoordinator } from '@/lib/scrum-master-access';
 import { readWatches } from '@/lib/watch-store';
-import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
+import { getWorkspaces } from '@/lib/workspace-store';
 import type { ICaller } from '@/lib/caller';
 import type { IMissionRun } from '@/types/mission-control';
 import type { IWorkspace } from '@/types/terminal';
@@ -106,7 +106,7 @@ const coverageFor = async (selection: IPortfolioSelection): Promise<IPortfolioCo
   })));
   const saved = getPortfolioStore().currentSelection()?.selection;
   if (!saved || saved.managerWorkspaceId !== selection.managerWorkspaceId || saved.managerTabId !== selection.managerTabId
-    || selection.workspaceIds.some((id) => id !== selection.managerWorkspaceId && !saved.workspaceIds.includes(id))) {
+    || selection.workspaceIds.some((id) => !saved.workspaceIds.includes(id))) {
     throw new MissionControlError(403, 'forbidden', 'Workspace is outside the current Scrum Master scope');
   }
   return portfolioCoverage(selection, workspaces, managerCurrent, targetCurrent);
@@ -169,7 +169,7 @@ export const getPortfolioSnapshotForSelection = async (selection: IPortfolioSele
   const milestones = getPortfolioStore().milestones().filter((entry) => allowed.has(entry.workspaceId));
   const saved = getPortfolioStore().currentSelection()?.selection;
   if (!saved || saved.managerWorkspaceId !== selection.managerWorkspaceId || saved.managerTabId !== selection.managerTabId
-    || selection.workspaceIds.some((id) => id !== selection.managerWorkspaceId && !saved.workspaceIds.includes(id))) {
+    || selection.workspaceIds.some((id) => !saved.workspaceIds.includes(id))) {
     throw new MissionControlError(403, 'forbidden', 'Scrum Master scope changed during the read');
   }
   return { selection, coverage, dependencies, actions, milestones, generatedAt: Date.now() };
