@@ -83,5 +83,27 @@ describe('portfolio board scope and presentation', () => {
     expect(history).toContain('Older resolved');
     expect(history).toContain('Latest resolved');
     expect(history).toContain('Resolved history is shown 100 at a time');
+
+    const laterOpen = { ...impact, firstBlockedAt: 120_000 };
+    const earlierHidden = { ...lower, firstBlockedAt: 0, state: 'resolved' as const };
+    const filteredSnapshot = { ...snapshot, generatedAt: 180_000, dependencies: [{ ...snapshot.dependencies[0],
+      firstBlockedAt: 0, impacts: [laterOpen, earlierHidden] }] };
+    const openOnly = renderToStaticMarkup(<PortfolioBoardContent snapshot={filteredSnapshot} priorityFilter="all"
+      onPriorityFilter={() => {}} decisions={{}} onDecision={() => {}} pendingId={null}
+      onAcknowledge={() => {}} onAssign={() => {}} />);
+    expect(openOnly).toContain('First blocked 1m ago');
+    expect(openOnly).not.toContain('First blocked 3m ago');
+    const resolvedShown = renderToStaticMarkup(<PortfolioBoardContent snapshot={filteredSnapshot} priorityFilter="all"
+      onPriorityFilter={() => {}} showResolved decisions={{}} onDecision={() => {}} pendingId={null}
+      onAcknowledge={() => {}} onAssign={() => {}} />);
+    expect(resolvedShown).toContain('First blocked 3m ago');
+    const lowerPriorityOpen = { ...earlierHidden, state: 'received' as const };
+    const prioritySnapshot = { ...filteredSnapshot, dependencies: [{ ...filteredSnapshot.dependencies[0],
+      impacts: [laterOpen, lowerPriorityOpen] }] };
+    const topOnly = renderToStaticMarkup(<PortfolioBoardContent snapshot={prioritySnapshot} priorityFilter="top"
+      onPriorityFilter={() => {}} decisions={{}} onDecision={() => {}} pendingId={null}
+      onAcknowledge={() => {}} onAssign={() => {}} />);
+    expect(topOnly).toContain('First blocked 1m ago');
+    expect(topOnly).not.toContain('First blocked 3m ago');
   });
 });
