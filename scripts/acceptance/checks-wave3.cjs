@@ -60,6 +60,22 @@ const judgeDeployLine = (line, id, reasonMarker) => {
   return { ok: fixed && !(line || '').includes(reasonMarker), measured: JSON.stringify(line ?? null) };
 };
 
+// Delivery may finish between `status` and `withdraw`; count the notices actually dropped,
+// while requiring every recipient to be terminal after withdrawal.
+const judgeDeployWithdrawal = (before, after, withdrawn) => {
+  if (!Array.isArray(before) || !Array.isArray(after) || !Number.isInteger(withdrawn)) return false;
+  const earlier = new Map(before.map((r) => [r.itemId, r.state]));
+  return earlier.size === before.length && after.length === before.length
+    && new Set(after.map((r) => r.itemId)).size === after.length
+    && after.every((r) => {
+      const previous = earlier.get(r.itemId);
+      return previous === 'queued' || previous === 'held'
+        ? r.state === 'delivered' || r.state === 'dropped'
+        : previous === r.state && (r.state === 'delivered' || r.state === 'dropped');
+    })
+    && after.filter((r) => r.state === 'dropped' && ['queued', 'held'].includes(earlier.get(r.itemId))).length === withdrawn;
+};
+
 /** A watch line (story 14) for `target` saying `text`, cleared. Exported for the unit suite. */
 const judgeWatchLine = (line, target, text) => {
   const ok = typeof line === 'string' && line.startsWith('[purplemux watch w-') && line.includes(` ${target} ${text}`) && line.endsWith('— watch cleared');
@@ -345,17 +361,17 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
   check('deploy-announce-refused', 'a tab that is neither admin nor the deploy lease holder is refused (exit 3)', refused.rc === 3, brief(refused), 'exit 3');
   const status = body ? parseJson((await inst.cli(['deploy', 'status', body.id, '--json'])).out) : null;
   const withdrawn = body ? parseJson((await inst.cli(['deploy', 'withdraw', body.id])).out) : null;
+  const afterStatus = body ? parseJson((await inst.cli(['deploy', 'status', body.id, '--json'])).out) : null;
   const afterItems = body ? (await inbox(wsA)).filter((i) => inA.some((r) => r.itemId === i.id)) : [];
-  const waiting = status?.recipients ? status.recipients.filter((r) => r.state === 'queued' || r.state === 'held').length : -1;
   check(
     'deploy-status-withdraw',
     'deploy status names each recipient with its state and cliState; withdraw drops every notice still waiting',
     Boolean(status?.reason === reason && status.recipients.length === body.recipients.length
       && status.recipients.every((r) => 'cliState' in r && typeof r.state === 'string')
-      && waiting >= 1 && withdrawn?.withdrawn === waiting
+      && judgeDeployWithdrawal(status.recipients, afterStatus?.recipients, withdrawn?.withdrawn)
       && afterItems.length === inA.length && afterItems.every((i) => i.state !== 'queued' && i.state !== 'held')),
-    `status ${status ? `${status.recipients.map((r) => `${r.tabId}=${r.state}`).join(',')} reason ${status.reason === reason}` : 'none'}; waiting ${waiting}; withdrawn ${withdrawn?.withdrawn ?? 'n/a'}; after ${afterItems.map((i) => i.state).join(',')}`,
-    'the reason and every recipient; withdrawn = the notices waiting (≥ 1); every workspace-A notice found and none left queued or held',
+    `status ${status ? `${status.recipients.map((r) => `${r.tabId}=${r.state}`).join(',')} reason ${status.reason === reason}` : 'none'}; withdrawn ${withdrawn?.withdrawn ?? 'n/a'}; after ${afterStatus?.recipients?.map((r) => `${r.tabId}=${r.state}`).join(',') ?? 'none'}; workspace-A ${afterItems.map((i) => i.state).join(',')}`,
+    'the reason and every recipient; withdrawn = newly dropped notices; every recipient terminal and every workspace-A notice found',
   );
   if (merger?.tabId) await inst.inTab(wsA, merger.tabId, inst.tabCli(['lease', 'release', `merge:acc/d-${nonce}`]));
 
@@ -368,4 +384,4 @@ const checks = async (inst, { parseJson, within, sleep, brief, shellQuote }, res
 
 };
 
-module.exports = { wave3, judgeDeployLine, judgeWatchLine, alertsFor, installFakeGh };
+module.exports = { wave3, judgeDeployLine, judgeDeployWithdrawal, judgeWatchLine, alertsFor, installFakeGh };
