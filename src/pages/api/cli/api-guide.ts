@@ -9,7 +9,9 @@ else \`PMUX_TOKEN\`.
 ## Workspace scope
 
 Agent tokens may mutate tabs and workspace configuration only in their own workspace. Peer
-entries and legacy drive grants allow authorized reads only. The global CLI token
+entries and legacy drive grants allow authorized reads only. A human-saved Scrum Master
+selection also gives its exact current launch-verified manager tab reads in the selected
+workspaces. The global CLI token
 is not human identity and cannot mutate these surfaces. Foreign requests go through
 coordinator notes; use authenticated local human controls for human actions.
 An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
@@ -17,8 +19,8 @@ An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
 ## Caller identity
 
 Every tab created by the server also carries \`PMUX_TAB_TOKEN\`, \`PMUX_TAB_ID\` (the
-tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants exactly what the
-workspace token grants, and it also names the calling tab: verified (identity
+tab's layout id) and \`PMUX_WORKSPACE_ID\`. The tab token grants the same own-workspace
+authority and names the calling tab for selected Scrum Master reads: verified (identity
 "launch") for a token the server bound when it created the session. A Claude tab
 created before tab tokens takes a hook-time token at its next session start
 (identity "hook", never verified; see POST /api/cli/tab-identity). A tab token
@@ -504,11 +506,12 @@ GET /api/cli/workspaces/<workspaceId>/standup
 ## Portfolio board
 
 GET /api/cli/portfolio?workspaces=WS1,WS2
-  A launch-verified current managing orchestrator explicitly selects 1..100 workspaces.
-  The response gives coverage for each selected workspace; blocker records and shared
-  dependency aggregates include only the manager's own workspace or workspaces in an
-  active tab-bound read grant. A missing grant/coordinator stays visible as incomplete
-  coverage. Revocation takes effect on the next read. This route never grants access.
+  The current launch-verified Scrum Master may read 1..100 workspaces from the human-saved
+  scope, plus its own workspace. The query may narrow that scope, never expand it.
+  The response gives coverage for each requested workspace; blocker records and shared
+  dependency aggregates include only workspaces with current coordinators. Removing a
+  workspace or replacing the manager in the saved scope takes effect on the next read.
+  Work commands in other workspaces still go through their configured orchestrators.
 
 POST /api/cli/portfolio/events
   Only the launch-verified current orchestrator of the report's workspace, with the

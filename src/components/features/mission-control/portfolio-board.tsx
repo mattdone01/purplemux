@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, RefreshCw } from 'lucide-react';
+import useSWR from 'swr';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import PortfolioGrantsDialog from '@/components/features/workspace/portfolio-grants-dialog';
-import useGrants from '@/hooks/use-grants';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
+import type { IGrantee } from '@/types/grant';
 import type { IPortfolioImpact, IPortfolioSnapshot } from '@/types/portfolio';
 
 const time = (at: number | null): string => at === null ? 'No checkpoint' : new Date(at).toLocaleString();
@@ -20,6 +20,12 @@ const readPortfolio = async (): Promise<IPortfolioSnapshot> => {
   const response = await fetch('/api/mission-control/portfolio', { cache: 'no-store' });
   if (!response.ok) throw new Error((await responseBody(response)).error || 'Portfolio unavailable');
   return response.json() as Promise<IPortfolioSnapshot>;
+};
+
+const readManagers = async (): Promise<IGrantee[]> => {
+  const response = await fetch('/api/mission-control/portfolio-managers', { cache: 'no-store' });
+  if (!response.ok) throw new Error((await responseBody(response)).error || 'Manager tabs unavailable');
+  return (await response.json() as { grantees: IGrantee[] }).grantees;
 };
 
 interface IPortfolioBoardContentProps {
@@ -71,7 +77,7 @@ export const PortfolioBoardContent = ({ snapshot, priorityFilter, onPriorityFilt
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             {gaps.map((gap) => <span key={gap.workspaceId} className="rounded bg-background px-2 py-1">{gap.name}: {gap.access.replaceAll('-', ' ')}</span>)}
           </div>
-          <p className="mt-2 text-xs text-muted-foreground">Unavailable workspace blockers are excluded from counts and cards. Use the existing Grants control for read access; restore a missing coordinator in its own workspace.</p>
+          <p className="mt-2 text-xs text-muted-foreground">Unavailable workspace blockers are excluded from counts and cards. Restore a missing coordinator in its own workspace or update the selected scope.</p>
         </div>
       )}
 
@@ -153,14 +159,13 @@ export const PortfolioBoardContent = ({ snapshot, priorityFilter, onPriorityFilt
 
 const PortfolioBoard = () => {
   const workspaces = useWorkspaceStore((state) => state.workspaces);
-  const { view: grants, refresh: refreshGrants } = useGrants('fresh');
+  const { data: grantees, error: managersError, mutate: refreshManagers } = useSWR('/api/mission-control/portfolio-managers', readManagers);
   const [snapshot, setSnapshot] = useState<IPortfolioSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [managerKey, setManagerKey] = useState('');
   const [workspaceIds, setWorkspaceIds] = useState<string[]>([]);
   const [editing, setEditing] = useState(false);
-  const [grantsOpen, setGrantsOpen] = useState(false);
   const [priorityFilter, setPriorityFilter] = useState<'all' | 'top'>('all');
   const [showResolved, setShowResolved] = useState(false);
   const [decisions, setDecisions] = useState<Record<string, string>>({});
@@ -195,9 +200,9 @@ const PortfolioBoard = () => {
     setWorkspaceIds(selection?.workspaceIds ?? []);
   }, [snapshot, editing]);
 
-  const managers = useMemo(() => grants?.grantees.filter((grantee) => grantee.identity === 'launch'
+  const managers = useMemo(() => grantees?.filter((grantee) => grantee.identity === 'launch'
     && workspaces.some((workspace) => workspace.id === grantee.workspaceId
-      && workspace.orchestration?.enabled && workspace.orchestration.orchestratorTabId === grantee.tabId)) ?? [], [grants, workspaces]);
+      && workspace.orchestration?.enabled && workspace.orchestration.orchestratorTabId === grantee.tabId)) ?? [], [grantees, workspaces]);
 
   const mutate = async (body: unknown, method: 'PUT' | 'POST') => {
     const response = await fetch('/api/mission-control/portfolio', { method,
@@ -251,14 +256,15 @@ const PortfolioBoard = () => {
   };
 
   return <div className="mx-auto w-full max-w-[1440px] space-y-5 px-3 py-5 sm:px-5 lg:px-8">
-    <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-xl font-semibold">Portfolio board</h1><p className="text-sm text-muted-foreground">A release view for the managing orchestrator. Scope is explicit and read grants stay read only.</p></div>
-      <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => { setGrantsOpen(true); void refreshGrants(); }}>Grants</Button><Button size="sm" variant="outline" onClick={() => void refresh()}><RefreshCw className="mr-1 h-3.5 w-3.5" /> Refresh</Button></div></div>
-    <Card className="shadow-none"><CardContent className="space-y-3 p-4"><div><h2 className="text-sm font-semibold">Managed scope</h2><p className="text-xs text-muted-foreground">Choose the manager tab and exactly the workspaces it supervises. Selection does not create a grant or authorize a command.</p></div>
+    <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-xl font-semibold">Portfolio board</h1><p className="text-sm text-muted-foreground">A release view for the selected Scrum Master. Saved scope gives its manager tab read access to selected workspaces.</p></div>
+      <Button size="sm" variant="outline" onClick={() => { void refresh(); void refreshManagers(); }}><RefreshCw className="mr-1 h-3.5 w-3.5" /> Refresh</Button></div>
+    <Card className="shadow-none"><CardContent className="space-y-3 p-4"><div><h2 className="text-sm font-semibold">Managed scope</h2><p className="text-xs text-muted-foreground">Choose the current manager tab and workspaces it supervises. Save scope to authorize its reads. Cross-workspace work requests go through each workspace orchestrator.</p></div>
       <div className="grid gap-3 sm:grid-cols-[minmax(200px,1fr)_2fr_auto]"><label className="space-y-1 text-xs">Manager tab
         <select aria-label="Manager tab" className="w-full rounded border bg-background px-2 py-2" value={managerKey} onChange={(event) => { setManagerKey(event.target.value); setEditing(true); }}><option value="">Choose a coordinator</option>{managers.map((manager) => <option key={`${manager.workspaceId}/${manager.tabId}`} value={`${manager.workspaceId}/${manager.tabId}`}>{manager.name || manager.tabId} · {manager.workspaceName}</option>)}</select></label>
         <div className="space-y-1 text-xs"><p>Managed workspaces</p><div className="flex max-h-28 flex-wrap gap-2 overflow-y-auto">{workspaces.map((workspace) => <label key={workspace.id} className="flex items-center gap-1 rounded border px-2 py-1"><input type="checkbox" checked={workspaceIds.includes(workspace.id)} onChange={(event) => { setEditing(true); setWorkspaceIds((current) => event.target.checked ? [...current, workspace.id] : current.filter((id) => id !== workspace.id)); }} />{workspace.name}</label>)}</div></div>
         <Button size="sm" className="self-end" disabled={!managerKey || pendingId === 'scope'} onClick={() => void saveSelection()}>Save scope</Button></div>
-      {!grants && <p className="text-xs text-muted-foreground">Loading eligible manager tabs…</p>}
+      {!grantees && !managersError && <p className="text-xs text-muted-foreground">Loading eligible manager tabs…</p>}
+      {managersError && <p role="alert" className="text-xs text-ui-red">Manager tabs unavailable. Refresh to retry.</p>}
     </CardContent></Card>
     {error && <p role="alert" className="rounded border border-ui-red/30 bg-ui-red/5 p-3 text-sm text-ui-red">{error}</p>}
     {loading ? <p className="rounded border border-dashed p-8 text-center text-sm text-muted-foreground">Loading portfolio coverage and blockers…</p>
@@ -271,7 +277,6 @@ const PortfolioBoard = () => {
             milestoneEvidence={milestoneEvidence} milestoneStage={milestoneStage} onMilestoneEvidence={(id, value) => setMilestoneEvidence((current) => ({ ...current, [id]: value }))}
             onMilestoneStage={(id, value) => setMilestoneStage((current) => ({ ...current, [id]: value }))}
             onConfirmMilestone={(impact) => void confirmMilestone(impact)} />}
-    {grantsOpen && <PortfolioGrantsDialog open={grantsOpen} onOpenChange={(open) => { setGrantsOpen(open); if (!open) void refresh(); }} />}
   </div>;
 };
 

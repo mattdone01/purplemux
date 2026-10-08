@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PortfolioStore } from '@/lib/portfolio-store';
 import { parsePortfolioReport, parsePortfolioResolution } from '@/lib/portfolio-validation';
 import type { IPortfolioReport } from '@/types/portfolio';
@@ -31,6 +31,21 @@ describe('portfolio dependency ledger', () => {
     return store;
   };
   afterEach(() => { for (const store of stores.splice(0)) store.close(); });
+
+  it('makes each human save the current designation even when the clock ties or moves backward', () => {
+    const store = newStore();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      store.select('human-b', { managerWorkspaceId: 'ws-old', managerTabId: 'tab-old', workspaceIds: ['ws-a'] });
+      store.select('human-a', { managerWorkspaceId: 'ws-new', managerTabId: 'tab-new', workspaceIds: ['ws-b'] });
+      expect(store.currentSelection()).toMatchObject({ actor: 'human-a', updatedAt: 1_001,
+        selection: { managerWorkspaceId: 'ws-new', workspaceIds: ['ws-b'] } });
+      now.mockReturnValue(900);
+      store.select('human-b', { managerWorkspaceId: 'ws-third', managerTabId: 'tab-third', workspaceIds: [] });
+      expect(store.currentSelection()).toMatchObject({ actor: 'human-b', updatedAt: 1_002,
+        selection: { managerWorkspaceId: 'ws-third', workspaceIds: [] } });
+    } finally { now.mockRestore(); }
+  });
 
   it('groups two impacted releases by resource while retaining each report and first blocked time', () => {
     const store = newStore();

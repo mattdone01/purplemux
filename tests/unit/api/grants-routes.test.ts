@@ -156,6 +156,13 @@ describe('grant routes', () => {
     fs.writeFileSync(grantsFile(), '{nope');
     reloadGrants();
     expect(await call('@/pages/api/grants', 'GET')).toMatchObject({ status: 500, body: { code: 'grant-store-unreadable' } });
+    const managers = await call('@/pages/api/mission-control/portfolio-managers', 'GET');
+    expect(managers.status).toBe(200);
+    expect(managers.body).toMatchObject({ grantees: [
+      { workspaceId: 'ws-1', tabId: 'tab-a', identity: 'launch' },
+      { workspaceId: 'ws-1', tabId: 'tab-old', identity: 'hook' },
+    ] });
+    expect((await call('@/pages/api/mission-control/portfolio-managers', 'GET', { cookie: null })).status).toBe(401);
   });
 
   it('GET /api/cli/grants lists read-only: admin sees all, a workspace sees what it holds or is driven under', async () => {

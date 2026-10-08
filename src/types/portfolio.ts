@@ -95,7 +95,7 @@ export interface IPortfolioSelection {
 export interface IPortfolioCoverage {
   workspaceId: string;
   name: string;
-  access: 'available' | 'grant-required' | 'coordinator-missing' | 'workspace-missing';
+  access: 'available' | 'coordinator-missing' | 'workspace-missing';
 }
 
 export interface IPortfolioSnapshot {

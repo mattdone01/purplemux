@@ -2,6 +2,8 @@
 
 > Superseded for mutation authority by ADR-0021. Existing `drive` records now provide read access only; they never authorize foreign agent mutations. No migration or token rotation is required.
 
+> 2026-10-08 amendment: A human-saved Scrum Master selection independently authorizes read access for its exact current launch-verified manager tab in the selected workspaces. Legacy grants remain available for other agents. The portfolio board and CLI no longer require a separate grant; cross-workspace mutations remain confined to each workspace's orchestrator.
+
 - **Status**: Amended by ADR-0021 (story 11, 2026-09-26)
 - **Context source**: `_output/purplemux-portfolio-coordination/architecture.md` (nomupay workspace), learning L13
 

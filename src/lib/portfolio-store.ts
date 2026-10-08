@@ -93,10 +93,22 @@ export class PortfolioStore {
     return row ? JSON.parse(row.selection_json) as IPortfolioSelection : null;
   };
 
+  currentSelection = (): { actor: string; selection: IPortfolioSelection; updatedAt: number } | null => {
+    const row = this.db.prepare('SELECT actor,selection_json,updated_at FROM portfolio_selection ORDER BY updated_at DESC,actor DESC LIMIT 1')
+      .get() as { actor: string; selection_json: string; updated_at: number } | undefined;
+    return row ? { actor: row.actor, selection: JSON.parse(row.selection_json) as IPortfolioSelection,
+      updatedAt: row.updated_at } : null;
+  };
+
   select = (actor: string, selection: IPortfolioSelection): void => {
-    this.db.prepare(`INSERT INTO portfolio_selection (actor,selection_json,updated_at) VALUES (?,?,?)
-      ON CONFLICT(actor) DO UPDATE SET selection_json=excluded.selection_json,updated_at=excluded.updated_at`)
-      .run(actor, JSON.stringify(selection), Date.now());
+    this.db.transaction(() => {
+      const row = this.db.prepare('SELECT MAX(updated_at) AS latest FROM portfolio_selection')
+        .get() as { latest: number | null };
+      const updatedAt = Math.max(Date.now(), (row.latest ?? 0) + 1);
+      this.db.prepare(`INSERT INTO portfolio_selection (actor,selection_json,updated_at) VALUES (?,?,?)
+        ON CONFLICT(actor) DO UPDATE SET selection_json=excluded.selection_json,updated_at=excluded.updated_at`)
+        .run(actor, JSON.stringify(selection), updatedAt);
+    }).immediate();
   };
 
   impacts = (): IPortfolioImpact[] =>

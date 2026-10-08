@@ -1,27 +1,16 @@
-import { findActiveDriveGrant, grantsRefusal, grantsSnapshot } from '@/lib/grant-store';
-import { collectAllTabs, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
 import { getMissionControlStore } from '@/lib/mission-control-store';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import type { IHumanControlAuthority } from '@/lib/mission-control-http';
 import { getNotesService } from '@/lib/notes-service';
 import { readNotesState } from '@/lib/notes-store';
 import { getPortfolioStore } from '@/lib/portfolio-store';
-import { tabIdentityOf } from '@/lib/tab-token';
+import { currentCoordinator } from '@/lib/scrum-master-access';
 import { readWatches } from '@/lib/watch-store';
 import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
 import type { ICaller } from '@/lib/caller';
 import type { IMissionRun } from '@/types/mission-control';
-import type { IGrant } from '@/types/grant';
 import type { IWorkspace } from '@/types/terminal';
 import type { IPortfolioCoverage, IPortfolioDependency, IPortfolioImpact, IPortfolioMilestone, IPortfolioReport, IPortfolioResolution, IPortfolioSelection, IPortfolioSnapshot } from '@/types/portfolio';
-
-const currentCoordinator = async (workspaceId: string, tabId: string): Promise<boolean> => {
-  const workspace = await getWorkspaceById(workspaceId);
-  if (!workspace?.orchestration?.enabled || workspace.orchestration.orchestratorTabId !== tabId) return false;
-  const layout = await readLayoutFile(resolveLayoutFile(workspaceId));
-  return !!layout && collectAllTabs(layout.root).some((tab) => tab.id === tabId)
-    && tabIdentityOf(workspaceId, tabId) === 'launch';
-};
 
 /** Serialize a report advance with human note routing for the same blocker in this server. */
 const impactOperations = new Map<string, Promise<void>>();
@@ -94,24 +83,15 @@ export const resolvePortfolioCapacity = async (caller: ICaller, event: IPortfoli
 export const portfolioCoverage = (
   selection: IPortfolioSelection,
   workspaces: IWorkspace[],
-  grants: IGrant[],
   managerCurrent: boolean,
-  now: number,
   targetCurrent: ReadonlyMap<string, boolean> = new Map(),
 ): IPortfolioCoverage[] => {
   const byId = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
   return selection.workspaceIds.map((workspaceId) => {
     const workspace = byId.get(workspaceId);
     const access = !workspace ? 'workspace-missing'
-      : !managerCurrent ? 'coordinator-missing'
-        : workspaceId === selection.managerWorkspaceId
-          || !!findActiveDriveGrant({ grants }, {
-            workspaceId: selection.managerWorkspaceId, tabId: selection.managerTabId,
-          }, workspaceId, now)
-          ? !workspace.orchestration?.enabled || !workspace.orchestration.orchestratorTabId
-            || targetCurrent.get(workspaceId) === false
-            ? 'coordinator-missing' : 'available'
-          : 'grant-required';
+      : !managerCurrent || !workspace.orchestration?.enabled || !workspace.orchestration.orchestratorTabId
+        || targetCurrent.get(workspaceId) === false ? 'coordinator-missing' : 'available';
     return { workspaceId, name: access === 'available' ? workspace!.name : workspaceId, access };
   });
 };
@@ -119,23 +99,27 @@ export const portfolioCoverage = (
 const coverageFor = async (selection: IPortfolioSelection): Promise<IPortfolioCoverage[]> => {
   const { workspaces } = await getWorkspaces();
   const managerCurrent = await currentCoordinator(selection.managerWorkspaceId, selection.managerTabId);
-  if (grantsRefusal()) throw new MissionControlError(503, 'storage-unavailable', 'Grant store unavailable');
   const targetCurrent = new Map(await Promise.all(selection.workspaceIds.map(async (workspaceId) => {
     const workspace = workspaces.find((entry) => entry.id === workspaceId);
     const tabId = workspace?.orchestration?.orchestratorTabId;
     return [workspaceId, !!tabId && await currentCoordinator(workspaceId, tabId)] as const;
   })));
-  return portfolioCoverage(selection, workspaces, grantsSnapshot().grants, managerCurrent, Date.now(), targetCurrent);
+  const saved = getPortfolioStore().currentSelection()?.selection;
+  if (!saved || saved.managerWorkspaceId !== selection.managerWorkspaceId || saved.managerTabId !== selection.managerTabId
+    || selection.workspaceIds.some((id) => id !== selection.managerWorkspaceId && !saved.workspaceIds.includes(id))) {
+    throw new MissionControlError(403, 'forbidden', 'Workspace is outside the current Scrum Master scope');
+  }
+  return portfolioCoverage(selection, workspaces, managerCurrent, targetCurrent);
 };
 
-export const requirePortfolioCoverage = async (actor: string, workspaceId: string): Promise<IPortfolioSelection> => {
-  const selection = getPortfolioStore().selection(actor);
+export const requirePortfolioCoverage = async (workspaceId: string): Promise<IPortfolioSelection> => {
+  const selection = getPortfolioStore().currentSelection()?.selection;
   if (!selection || !selection.workspaceIds.includes(workspaceId)) {
     throw new MissionControlError(403, 'forbidden', 'Workspace is not in the selected management scope');
   }
   const coverage = await coverageFor(selection);
   if (coverage.find((entry) => entry.workspaceId === workspaceId)?.access !== 'available') {
-    throw new MissionControlError(403, 'forbidden', 'Workspace requires a current coordinator and explicit read grant');
+    throw new MissionControlError(403, 'forbidden', 'Workspace requires a current coordinator in the Scrum Master scope');
   }
   return selection;
 };
@@ -147,8 +131,8 @@ export const selectPortfolioScope = async (actor: string, selection: IPortfolioS
   getPortfolioStore().select(actor, selection);
 };
 
-export const getPortfolioSnapshot = async (actor: string): Promise<IPortfolioSnapshot> => {
-  const selection = getPortfolioStore().selection(actor);
+export const getPortfolioSnapshot = async (): Promise<IPortfolioSnapshot> => {
+  const selection = getPortfolioStore().currentSelection()?.selection;
   if (!selection) return { selection: null, coverage: [], dependencies: [], actions: [], milestones: [], generatedAt: Date.now() };
   return getPortfolioSnapshotForSelection(selection);
 };
@@ -183,6 +167,11 @@ export const getPortfolioSnapshotForSelection = async (selection: IPortfolioSele
   const actions = getPortfolioStore().actions().filter((action) => visibleIds.has(action.impactId));
   const allowed = new Set(coverage.filter((entry) => entry.access === 'available').map((entry) => entry.workspaceId));
   const milestones = getPortfolioStore().milestones().filter((entry) => allowed.has(entry.workspaceId));
+  const saved = getPortfolioStore().currentSelection()?.selection;
+  if (!saved || saved.managerWorkspaceId !== selection.managerWorkspaceId || saved.managerTabId !== selection.managerTabId
+    || selection.workspaceIds.some((id) => id !== selection.managerWorkspaceId && !saved.workspaceIds.includes(id))) {
+    throw new MissionControlError(403, 'forbidden', 'Scrum Master scope changed during the read');
+  }
   return { selection, coverage, dependencies, actions, milestones, generatedAt: Date.now() };
 };
 
@@ -192,7 +181,7 @@ export const confirmPortfolioMilestone = async (authority: IHumanControlAuthorit
   if (authority.kind !== 'human-control' || !authority.actor) {
     throw new MissionControlError(403, 'forbidden', 'Authenticated human control required');
   }
-  await requirePortfolioCoverage(authority.actor, event.workspaceId);
+  await requirePortfolioCoverage(event.workspaceId);
   if (event.observedAt > Date.now() + 5 * 60_000) {
     throw new MissionControlError(400, 'invalid-request', 'milestone time is in the future');
   }
@@ -208,13 +197,13 @@ export const assignPortfolioAction = async (
   }
   const actor = authority.actor;
   const store = getPortfolioStore();
-  await requirePortfolioCoverage(actor, input.workspaceId);
+  await requirePortfolioCoverage(input.workspaceId);
   const impact = store.impact(input.impactId);
   if (!impact || impact.workspaceId !== input.workspaceId) {
     throw new MissionControlError(404, 'not-found', 'blocker not found in selected workspace');
   }
   return withImpactOperation(operationKey(impact.workspaceId, impact.runId, impact.sourceKey), async () => {
-    await requirePortfolioCoverage(actor, impact.workspaceId);
+    await requirePortfolioCoverage(impact.workspaceId);
     const reserved = store.reserveAction(input.actionId, input.impactId, input.expectedRevision, input.decision, actor);
     if (reserved.state === 'superseded') throw new MissionControlError(409, 'conflict', 'reserved action was superseded');
     if (reserved.state === 'sent') return store.impact(input.impactId)!;

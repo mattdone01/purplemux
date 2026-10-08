@@ -15,6 +15,7 @@ vi.mock('@/lib/workspace-token', async (importOriginal) => ({
 vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: vi.fn(async (id: string) => ({ id, allowedPeers: id === 'ws-3' ? ['ws-1'] : [] })) }));
 vi.mock('@/lib/coordination-audit', () => ({ appendCoordinationAudit: audit }));
 vi.mock('@/lib/caller', () => ({ resolveCaller: vi.fn(async () => scopeHolder.caller) }));
+vi.mock('@/lib/scrum-master-access', () => ({ selectedScrumMasterCanRead: async () => false }));
 
 const T0 = Date.now();
 const A_VERIFIED: TCliScope = { type: 'workspace', workspaceId: 'ws-1', tabId: 'tab-a', tabVerified: true, tabIdentity: 'launch' };

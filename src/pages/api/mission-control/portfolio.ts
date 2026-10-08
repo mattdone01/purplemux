@@ -9,11 +9,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   setMissionHeaders(res);
   try {
     const actor = await requireMissionHuman(req);
-    if (req.method === 'GET') return res.status(200).json(await getPortfolioSnapshot(actor));
+    if (req.method === 'GET') return res.status(200).json(await getPortfolioSnapshot());
     const authority = await requireMissionHumanMutation(req);
     if (req.method === 'PUT') {
       await selectPortfolioScope(actor, parsePortfolioSelection(req.body));
-      return res.status(200).json(await getPortfolioSnapshot(actor));
+      return res.status(200).json(await getPortfolioSnapshot());
     }
     if (req.method === 'POST') {
       const body = req.body as Record<string, unknown> | null;
@@ -25,7 +25,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           || !Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) {
           throw new MissionControlError(400, 'invalid-request', 'workspaceId, impactId and expectedRevision are required');
         }
-        await requirePortfolioCoverage(actor, workspaceId);
+        await requirePortfolioCoverage(workspaceId);
         const impact = getPortfolioStore().impact(impactId);
         if (!impact || impact.workspaceId !== workspaceId) {
           throw new MissionControlError(404, 'not-found', 'blocker not found in selected workspace');

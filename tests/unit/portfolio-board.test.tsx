@@ -4,7 +4,6 @@ import { PortfolioBoardContent } from '@/components/features/mission-control/por
 import { portfolioCoverage, portfolioProducerAuthorized, portfolioVisibleDependencies } from '@/lib/portfolio-service';
 import type { ICaller } from '@/lib/caller';
 import type { IMissionRun } from '@/types/mission-control';
-import type { IGrant } from '@/types/grant';
 import type { IPortfolioSelection, IPortfolioSnapshot } from '@/types/portfolio';
 import type { IWorkspace } from '@/types/terminal';
 
@@ -12,12 +11,6 @@ const selection: IPortfolioSelection = { managerWorkspaceId: 'ws-root', managerT
 const workspace = (id: string): IWorkspace => ({ id, name: id,
   orchestration: { enabled: true, orchestratorTabId: `tab-${id}` },
 } as IWorkspace);
-const grant = (workspaceIds: string[], revokedAt: number | null = null): IGrant => ({
-  id: 'g-a', capability: 'drive', grantee: { workspaceId: 'ws-root', tabId: 'tab-root' },
-  workspaces: workspaceIds, reason: 'portfolio', createdAt: 1, createdBy: 'human',
-  expiresAt: Date.now() + 60_000, revokedAt, revokedBy: null, revokeReason: null, expiryNotedAt: null,
-});
-
 describe('portfolio board scope and presentation', () => {
   it('rejects foreign workers and stale replacement generations', () => {
     const caller = { verified: true, workspaceId: 'ws-a', tabId: 'tab-a' } as ICaller;
@@ -28,20 +21,20 @@ describe('portfolio board scope and presentation', () => {
     expect(portfolioProducerAuthorized({ ...caller, verified: false }, 'ws-a', run, 2, true)).toBe(false);
     expect(portfolioProducerAuthorized(caller, 'ws-b', run, 2, true)).toBe(false);
   });
-  it('filters shared aggregates before rendering and removes revoked grants immediately', () => {
+  it('filters shared aggregates to current coordinators without a separate grant', () => {
     const workspaces = [workspace('ws-root'), workspace('ws-a'), workspace('ws-b')];
-    const coverage = portfolioCoverage(selection, workspaces, [grant(['ws-a', 'ws-b'])], true, Date.now());
+    const coverage = portfolioCoverage(selection, workspaces, true);
     expect(coverage.map((entry) => entry.access)).toEqual(['available', 'available']);
-    const missing = portfolioCoverage(selection, workspaces, [grant(['ws-a', 'ws-b'], Date.now())], true, Date.now());
-    expect(missing.map((entry) => entry.access)).toEqual(['grant-required', 'grant-required']);
+    const missing = portfolioCoverage(selection, workspaces, false);
+    expect(missing.map((entry) => entry.access)).toEqual(['coordinator-missing', 'coordinator-missing']);
     const impacts = [
       { id: 'pb-a', workspaceId: 'ws-a', resourceKey: 'lease:merge', kind: 'lease', firstBlockedAt: 10 },
       { id: 'pb-b', workspaceId: 'ws-b', resourceKey: 'lease:merge', kind: 'lease', firstBlockedAt: 20 },
     ] as Parameters<typeof portfolioVisibleDependencies>[0];
     expect(portfolioVisibleDependencies(impacts, coverage, new Map())[0].impacts).toHaveLength(2);
     expect(portfolioVisibleDependencies(impacts, missing, new Map())).toEqual([]);
-    const absentTab = portfolioCoverage(selection, workspaces, [grant(['ws-a', 'ws-b'])], true,
-      Date.now(), new Map([['ws-a', false], ['ws-b', true]]));
+    const absentTab = portfolioCoverage(selection, workspaces, true,
+      new Map([['ws-a', false], ['ws-b', true]]));
     expect(absentTab.map((entry) => entry.access)).toEqual(['coordinator-missing', 'available']);
   });
 
@@ -59,7 +52,7 @@ describe('portfolio board scope and presentation', () => {
     const lower = { ...impact, id: 'pb-b', workspaceId: 'ws-b', runId: 'run-b', outcome: 'Release lower', priority: 20 };
     const snapshot: IPortfolioSnapshot = {
       selection, coverage: [{ workspaceId: 'ws-a', name: 'A', access: 'available' },
-        { workspaceId: 'ws-b', name: 'B', access: 'grant-required' }],
+        { workspaceId: 'ws-b', name: 'B', access: 'coordinator-missing' }],
       dependencies: [{ resourceKey: impact.resourceKey, kind: 'lease', firstBlockedAt: 1, impacts: [impact, lower] }],
       actions: [],
       milestones: [{ workspaceId: 'ws-a', runId: 'run-a', stage: 'verified', source: 'human-confirmed',

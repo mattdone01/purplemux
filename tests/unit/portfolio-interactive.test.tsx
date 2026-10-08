@@ -34,12 +34,11 @@ vi.mock('@/lib/workspace-store', () => {
 });
 vi.mock('@/lib/layout-store', () => ({ resolveLayoutFile: (workspaceId: string) => workspaceId,
   readLayoutFile: async (workspaceId: string) => ({ root: { id: workspaceId } }),
-  collectAllTabs: (root: { id: string }) => [{ id: root.id === 'ws-root' ? 'tab-root' : 'tab-a' }] }));
+  collectAllTabs: (root: { id: string }) => [{ id: root.id === 'ws-root' ? 'tab-root' : 'tab-a',
+    sessionName: `session-${root.id}` }] }));
 vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch' }));
-vi.mock('@/lib/grant-store', () => ({ grantsRefusal: () => false,
-  grantsSnapshot: () => ({ grants: [{ id: 'g-local', grantee: { workspaceId: 'ws-root', tabId: 'tab-root' },
-    workspaces: ['ws-a'] }] }),
-  findActiveDriveGrant: (_state: unknown, _grantee: unknown, workspaceId: string) => workspaceId === 'ws-a' ? { id: 'g-local' } : null }));
+vi.mock('@/lib/tmux', async (original) => ({ ...await original<typeof import('@/lib/tmux')>(),
+  hasSession: async () => true }));
 vi.mock('@/lib/watch-store', () => ({ readWatches: async () => ({ watches: [synthetic.watch] }) }));
 vi.mock('@/lib/notes-store', async (original) => ({ ...await original<typeof import('@/lib/notes-store')>(),
   readNotesState: async () => synthetic.notes }));
@@ -213,6 +212,12 @@ describe('interactive synthetic portfolio API and UI journey', () => {
     expect(store!.actions().find((entry) => entry.id === 'action-stale-local')?.state).toBe('superseded');
     expect((await human('POST', { type: 'assign', workspaceId: 'ws-a', impactId: impact.id, expectedRevision: 0,
       actionId: 'bad-origin', decision: 'No' }, 'https://foreign.test')).status).toBe(403);
+    store!.select('another-human', { managerWorkspaceId: 'ws-root', managerTabId: 'tab-root', workspaceIds: [] });
+    snapshot = (await human('GET')).body as IPortfolioSnapshot;
+    expect(snapshot.selection?.workspaceIds).toEqual([]);
+    expect(snapshot.dependencies).toEqual([]);
+    expect((await human('POST', { type: 'acknowledge', workspaceId: 'ws-a', impactId: impact.id,
+      expectedRevision: 0 })).status).toBe(403);
   });
 
   it('closes the mobile sheet and opens the portfolio route on a tap', () => {

@@ -4,6 +4,7 @@ import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
 import { getPortfolioSnapshotForSelection } from '@/lib/portfolio-service';
 import { parsePortfolioSelection } from '@/lib/portfolio-validation';
+import { selectedScrumMasterScope } from '@/lib/scrum-master-access';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   setMissionHeaders(res);
@@ -16,10 +17,15 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (!caller?.verified || !caller.workspaceId || !caller.tabId) {
       throw new MissionControlError(403, 'forbidden', 'Portfolio reads require a launch-verified manager tab');
     }
+    const saved = await selectedScrumMasterScope(caller.scope);
+    if (!saved) throw new MissionControlError(403, 'forbidden', 'Portfolio reads require the current human-selected Scrum Master');
     const raw = req.query.workspaces;
     const workspaceIds = typeof raw === 'string' ? raw.split(',').filter(Boolean) : [];
     if (workspaceIds.length === 0 || workspaceIds.length > 100 || new Set(workspaceIds).size !== workspaceIds.length) {
       throw new MissionControlError(400, 'invalid-request', 'Select 1–100 distinct workspace IDs');
+    }
+    if (workspaceIds.some((id) => id !== saved.managerWorkspaceId && !saved.workspaceIds.includes(id))) {
+      throw new MissionControlError(403, 'forbidden', 'Workspace is outside the current Scrum Master scope');
     }
     return res.status(200).json(await getPortfolioSnapshotForSelection(parsePortfolioSelection({
       managerWorkspaceId: caller.workspaceId, managerTabId: caller.tabId, workspaceIds,

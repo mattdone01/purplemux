@@ -56,7 +56,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
-    // workers: a workspace-scoped caller sees only what it may already act on.
+    // workers: a workspace-scoped caller sees only what it may read.
     const allWorkspaceIds = (await getWorkspaces()).workspaces.map((w) => w.id);
     const visibleIds = wsId
       ? [wsId]
