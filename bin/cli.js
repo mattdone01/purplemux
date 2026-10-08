@@ -1548,7 +1548,7 @@ Commands:
                                            epic:SLUG; a tab of a claiming workspace releases its own claims)
   inbox list -w WS [--all]                 Server notices (notes, watches, deploys, Mission Control) queued or held
                                            for WS's tabs; --all adds delivered and dropped (kept 7 days)
-  inbox retry ID                           Re-queue a held notice once (the target workspace's token or admin).
+  inbox retry ID                           Re-queue a held notice once (the target workspace, the note's sender, or admin).
                                            Exit 3 inbox-not-held, 7 inbox-not-found
   note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]
                                            A local note to the live epic holder, or a cross-workspace note between

@@ -102,6 +102,26 @@ describe('inbox routes (ADR-0012)', () => {
     expect((await retry(ids.h)).statusCode).toBe(200);
   });
 
+  it('lets the workspace that sent a note retry its held notice in another workspace, and no third workspace', async () => {
+    const store = await import('@/lib/inbox-store');
+    const fields = { noteId: 'n-sent0001', fromWorkspaceId: 'ws-2', fromTabId: 'tab-sm', sentAt: Date.now(), event: 'delivered' as const };
+    const { item } = await store.enqueueNotice({ kind: 'note', targetWorkspaceId: 'ws-1', targetTabId: 'tab-o', dedupeKey: 'note:n-sent0001:delivered:tab-o', fields });
+    await store.mutateInbox((state) => ({ state: store.holdInState(state, item.id, 'composer-not-empty (30 refusals)', Date.now()), value: null }));
+    const note = {
+      id: 'n-sent0001', from: { workspaceId: 'ws-2', tabId: 'tab-sm', verified: true, epic: null }, to: { epic: null, workspaceId: 'ws-1' },
+      subject: 's', body: 'b', createdAt: Date.now(), state: 'delivered', deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-o' },
+      routedAt: Date.now(), deliveredAt: null, inboxItemId: item.id, ackedAt: null, ackedBy: null, ackComment: null,
+      remindedAt: null, senderNotifiedAt: null, expiredAt: null, transitionAt: Date.now(),
+    };
+    await fs.mkdir(path.join(mockHome.value, '.purplemux'), { recursive: true });
+    await fs.writeFile(path.join(mockHome.value, '.purplemux', 'notes.json'), JSON.stringify({ notes: [note] }));
+
+    auth.scope = { type: 'workspace', workspaceId: 'ws-3' };
+    expect(await retry(item.id)).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });
+    auth.scope = { type: 'workspace', workspaceId: 'ws-2' };
+    expect(await retry(item.id)).toMatchObject({ statusCode: 200, body: { item: { id: item.id, state: 'queued', attempts: 0 } } });
+  });
+
   it('answers inbox-not-held and inbox-not-found with their codes, and 404s another workspace\'s item', async () => {
     const ids = await seed();
     expect(await retry(ids.q)).toMatchObject({ statusCode: 409, body: { code: 'inbox-not-held' } });

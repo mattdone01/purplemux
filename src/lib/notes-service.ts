@@ -272,7 +272,10 @@ export class NotesService {
 
   private async views(notes: readonly INote[]): Promise<INoteView[]> {
     const items = new Map((await this.deps.inboxItems()).map((item) => [item.id, item]));
-    return notes.map((note) => ({ ...viewOf(note), receipt: this.receipt(note, items) }));
+    return notes.map((note) => ({
+      ...viewOf(note, note.inboxItemId ? items.get(note.inboxItemId) ?? null : null),
+      receipt: this.receipt(note, items),
+    }));
   }
 
   /** The inbox calls this under its dispatch lock immediately before a note line is pasted. */

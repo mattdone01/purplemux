@@ -69,6 +69,19 @@ describe('suggestion-aware readiness (story 17, L7)', () => {
     expect(await check('idle', { pane: 'x\n\x1b[39m❯\u00a0typed by the owner\x1b[0m\n' }).result).toEqual({ ok: false, reason: 'composer-not-empty' });
   });
 
+  it('accepts the cursor cell drawn over the suggestion (ws-5TO0NJ tab-v76BaE: 30 false refusals, 2026-10-08)', async () => {
+    expect(await check('idle', { pane: pane('claude-cursor-on-suggestion.ansi') }).result).toEqual({ ok: true });
+  });
+
+  it.each([
+    ['the cursor inside a draft', `x\n\x1b[39m❯\u00a0fix th\x1b[7me\x1b[0m build\n`],
+    ['the cursor after a draft', `x\n\x1b[39m❯\u00a0typed\x1b[7m \x1b[0m\n`],
+    ['the cursor on a draft\'s first character', `x\n\x1b[39m❯\u00a0\x1b[7mk\x1b[0meep going\n`],
+    ['a draft that a dim completion follows', `x\n\x1b[39m❯\u00a0k\x1b[7me\x1b[0;2mep going\x1b[0m\n`],
+  ])('still refuses a human draft: %s', async (_label, captured) => {
+    expect(await check('idle', { pane: captured }).result).toEqual({ ok: false, reason: 'composer-not-empty' });
+  });
+
   it.each([
     ['an empty composer', 'claude-empty-composer.ansi', true],
     ['a dim suggestion', 'claude-dim-suggestion.ansi', true],

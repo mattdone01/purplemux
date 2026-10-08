@@ -4,7 +4,8 @@ import path from 'path';
 import { nanoid } from 'nanoid';
 import { brandCodedError } from '@/lib/coded-error';
 import { EPIC_SLUG } from '@/lib/lease-policy';
-import type { INote, INoteAdmission, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode } from '@/types/note';
+import type { IInboxItem } from '@/types/inbox';
+import type { INote, INoteAdmission, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode, TNoteViewState } from '@/types/note';
 
 // Notes with acknowledgement (ADR-0013). Pure state transitions first, then the
 // one file store. Routing and delivery live in notes-service.ts.
@@ -193,9 +194,19 @@ export const canShow = (note: INote, caller: { workspaceId: string | null; admin
 export const canAck = (note: INote, caller: { workspaceId: string | null }): boolean =>
   caller.workspaceId !== null && note.deliveredTo !== null && caller.workspaceId === note.deliveredTo.workspaceId;
 
-export const viewOf = (note: INote): INoteView => {
+/** The workspace that sent the note whose notice (or reminder) this inbox item carries, or null. */
+export const noticeSenderWorkspace = (state: INotesState, itemId: string): string | null =>
+  state.notes.find((n) => n.inboxItemId === itemId || n.reminderItemId === itemId)?.from.workspaceId ?? null;
+
+export const presentedState = (note: INote, notice: Pick<IInboxItem, 'state'> | null): TNoteViewState => {
+  if (note.state !== 'delivered' || note.deliveredAt !== null || notice?.state === 'delivered') return note.state;
+  return notice?.state === 'held' ? 'held' : 'pending';
+};
+
+/** `notice` is the note's own inbox item (`inboxItemId`), or null when it is gone or unread. */
+export const viewOf = (note: INote, notice: Pick<IInboxItem, 'state'> | null): INoteView => {
   const { body, ...rest } = note;
-  return { ...rest, bodyBytes: Buffer.byteLength(body, 'utf8') };
+  return { ...rest, state: presentedState(note, notice), bodyBytes: Buffer.byteLength(body, 'utf8') };
 };
 
 // ─── the file store ───────────────────────────────────────────────────────

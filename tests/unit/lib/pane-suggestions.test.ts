@@ -38,6 +38,36 @@ describe('parseSgrLine', () => {
   });
 });
 
+describe('parseSgrLine: the cursor cell (ws-5TO0NJ tab-v76BaE, 2026-10-08)', () => {
+  // An idle Claude draws its cursor as one inverse (SGR 7) cell over the suggestion's first character.
+  it('reads an inverse cell directly before dim text as part of the suggestion', () => {
+    expect(parseSgrLine(`❯\u00a0${ESC}[7mk${ESC}[0;2meep${ESC}[0m ${ESC}[2mgoing${ESC}[0m`).segments)
+      .toEqual([{ text: '❯\u00a0', dim: false }, { text: 'keep going', dim: true }]);
+  });
+
+  it('keeps an inverse cell that no dim text follows: the cursor inside or after a typed draft', () => {
+    expect(parseSgrLine(`❯ fix th${ESC}[7me${ESC}[0m build`).segments)
+      .toEqual([{ text: '❯ fix the build', dim: false }]);
+    expect(parseSgrLine(`❯ typed${ESC}[7m ${ESC}[0m`).segments)
+      .toEqual([{ text: '❯ typed ', dim: false }]);
+  });
+
+  it('keeps typed text before the cursor cell, even when a dim completion follows it', () => {
+    expect(parseSgrLine(`❯ k${ESC}[7me${ESC}[0;2mep going${ESC}[0m`).segments)
+      .toEqual([{ text: '❯ k', dim: false }, { text: 'eep going', dim: true }]);
+  });
+
+  it('keeps an inverse run longer than one cell: a highlight, not a cursor', () => {
+    expect(parseSgrLine(`${ESC}[7mselected${ESC}[0;2mrest${ESC}[0m`).segments)
+      .toEqual([{ text: 'selected', dim: false }, { text: 'rest', dim: true }]);
+  });
+
+  it('reads the blanks between two dim runs as part of one suggestion', () => {
+    expect(parseSgrLine(`${ESC}[2mkeep${ESC}[0m ${ESC}[2mgoing${ESC}[0m x`).segments)
+      .toEqual([{ text: 'keep going', dim: true }, { text: ' x', dim: false }]);
+  });
+});
+
 describe('composerLineIndex', () => {
   it('finds the last line carrying the provider marker', () => {
     expect(composerLineIndex(['❯ old', 'x', '❯ ', 'footer'], 'claude-code')).toBe(2);
@@ -68,6 +98,12 @@ describe('renderPaneResult', () => {
     const { content, suggestion } = renderPaneResult(captured, 'claude-code');
     expect(composerOf(content)).toBe('❯ fix the [suggestion] build and rerun');
     expect(suggestion).toBe('build and rerun');
+  });
+
+  it('reads the real cursor-on-suggestion composer as one suggestion and an empty composer', () => {
+    const captured = pane('claude-cursor-on-suggestion.ansi');
+    expect(renderPaneResult(captured, 'claude-code').suggestion).toBe('keep going on the rest of the epic');
+    expect(composerOf(renderPaneResult(captured, 'claude-code', 'no-suggestions').content).trim()).toBe('❯');
   });
 
   it('--no-suggestions drops the dim text and reports none', () => {

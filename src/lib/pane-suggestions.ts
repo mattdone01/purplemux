@@ -18,16 +18,43 @@ interface ISegment {
 // CSI (ESC [ … final), OSC (ESC ] … BEL / ST), and two-character escapes.
 const ESCAPE = /\x1b\[([0-9;:?]*)([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
 
+interface IRun extends ISegment {
+  inverse: boolean;
+}
+
+/**
+ * An idle Claude draws its cursor as one inverse cell over the suggestion's first character
+ * (`❯ ␛[7mk␛[0;2meep going…`, ws-5TO0NJ 2026-10-08), so that cell belongs to the suggestion. A
+ * typed draft keeps its cursor cell: no dim text follows it, or typed text precedes it. Blanks
+ * between two dim runs join them, so a suggestion reads as one phrase.
+ */
+const joinSuggestionRuns = (runs: IRun[]): ISegment[] => {
+  const marked = runs.map((run, i) => {
+    const next = runs[i + 1];
+    const cursorCell = run.inverse && !run.dim && [...run.text].length === 1 && next?.dim === true;
+    const gap = !run.dim && !run.text.trim() && runs[i - 1]?.dim === true && next?.dim === true;
+    return { text: run.text, dim: run.dim || cursorCell || gap };
+  });
+  const segments: ISegment[] = [];
+  for (const run of marked) {
+    const prev = segments.at(-1);
+    if (prev && prev.dim === run.dim) prev.text += run.text;
+    else segments.push(run);
+  }
+  return segments;
+};
+
 /** Split one line into text runs, tracking only dim (SGR 2 on, 22 or 0 off). */
 export const parseSgrLine = (line: string, dimAtStart = false): { segments: ISegment[]; dimAtEnd: boolean } => {
-  const segments: ISegment[] = [];
+  const runs: IRun[] = [];
   let dim = dimAtStart;
+  let inverse = false;
   let last = 0;
   const push = (text: string) => {
     if (!text) return;
-    const prev = segments.at(-1);
-    if (prev && prev.dim === dim) prev.text += text;
-    else segments.push({ text, dim });
+    const prev = runs.at(-1);
+    if (prev && prev.dim === dim && prev.inverse === inverse) prev.text += text;
+    else runs.push({ text, dim, inverse });
   };
   for (const match of line.matchAll(ESCAPE)) {
     push(line.slice(last, match.index));
@@ -45,13 +72,17 @@ export const parseSgrLine = (line: string, dimAtStart = false): { segments: ISeg
         if (!group.includes(':')) i += params[i + 1] === '5' ? 2 : params[i + 1] === '2' ? 4 : 0;
         continue;
       }
-      if (p === '0' || p === '') dim = false;
-      else if (p === '2') dim = true;
+      if (p === '0' || p === '') {
+        dim = false;
+        inverse = false;
+      } else if (p === '2') dim = true;
       else if (p === '22') dim = false;
+      else if (p === '7') inverse = true;
+      else if (p === '27') inverse = false;
     }
   }
   push(line.slice(last));
-  return { segments, dimAtEnd: dim };
+  return { segments: joinSuggestionRuns(runs), dimAtEnd: dim };
 };
 
 const stripEscapes = (line: string): string => line.replace(ESCAPE, '');

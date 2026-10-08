@@ -15,6 +15,8 @@ export const INBOX_MAX_REFUSALS = 30;
 export const INBOX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const INBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const BACKOFF_MS = [10_000, 30_000, 120_000, 300_000];
+/** A recoverable hold is probed again this long after its last attempt, or earlier on a wake. */
+export const HELD_REPROBE_MS = 300_000;
 
 /** 10 s → 30 s → 2 min → 5 min, then 5 min: the wait after the nth refusal. */
 export const backoffAfter = (refusals: number): number =>
@@ -80,12 +82,32 @@ const replace = (state: IInboxState, id: string, fn: (item: IInboxItem) => IInbo
 });
 
 const hold = (item: IInboxItem, reason: string, now: number): IInboxItem =>
-  ({ ...item, state: 'held', heldReason: reason, transitionAt: now });
+  ({ ...item, state: 'held', heldReason: reason, transitionAt: item.state === 'held' ? item.transitionAt : now });
 
-/** One refusal: back off, or hold after the 30th refusal or past 24 h. */
+const REFUSAL_BUDGET_HOLD = / \(\d+ refusals\)$/;
+/**
+ * A held `resume` was escalated to the orchestrator, which may resume the tab by hand, and it has
+ * no paste-time preflight to catch that; a held `mission` row is closed, so its preflight would
+ * only reject the item.
+ */
+const RECOVERABLE_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['note', 'watch', 'deploy']);
+
+/**
+ * Held only because its refusal budget ran out, and not yet 24 h old: every refusal names a
+ * condition a later look may clear, so the dispatcher keeps probing it slowly. A paste that threw
+ * or stranded is never recoverable — typing it again could double it.
+ */
+export const isRecoverableHold = (item: IInboxItem, now: number): boolean =>
+  item.state === 'held' && RECOVERABLE_KINDS.has(item.kind) && REFUSAL_BUDGET_HOLD.test(item.heldReason ?? '') && now < item.expiresAt;
+
+/** Queued, or a recoverable hold: the item may still be typed. */
+const awaitsDelivery = (item: IInboxItem, now: number): boolean =>
+  item.state === 'queued' || isRecoverableHold(item, now);
+
+/** One refusal: back off, or hold after the 30th refusal or past 24 h. A recoverable hold stays held. */
 export const refuseInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState =>
   replace(state, id, (item) => {
-    if (item.state !== 'queued') return item;
+    if (!awaitsDelivery(item, now)) return item;
     const attempts = item.attempts + 1;
     const refused = { ...item, attempts, lastAttemptAt: now, lastRefusal: reason, notBefore: now + backoffAfter(attempts) };
     if (attempts >= INBOX_MAX_REFUSALS) return hold(refused, `${reason} (${attempts} refusals)`, now);
@@ -94,12 +116,12 @@ export const refuseInState = (state: IInboxState, id: string, reason: string, no
   });
 
 export const deliverInState = (state: IInboxState, id: string, now: number): IInboxState =>
-  replace(state, id, (item) => (item.state === 'queued'
+  replace(state, id, (item) => (awaitsDelivery(item, now)
     ? { ...item, state: 'delivered', deliveredAt: now, lastAttemptAt: now, transitionAt: now }
     : item));
 
 export const holdInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState =>
-  replace(state, id, (item) => (item.state === 'queued' ? hold({ ...item, lastAttemptAt: now }, reason, now) : item));
+  replace(state, id, (item) => (awaitsDelivery(item, now) ? hold({ ...item, lastAttemptAt: now }, reason, now) : item));
 
 export const dropForTabInState = (
   state: IInboxState,
@@ -202,19 +224,20 @@ export const retryInState = (state: IInboxState, id: string, now: number): { sta
 };
 
 /**
- * The next item per target tab, oldest first: due by its backoff, or woken
- * early by `wake` (the tab became ready after a state refusal).
+ * The next item per target tab, oldest first, a recoverable hold included: due by its backoff (a
+ * hold: `HELD_REPROBE_MS` after its last attempt), or woken early by `wake`.
  */
 export const dueItems = (state: IInboxState, now: number, wake: (item: IInboxItem) => boolean): IInboxItem[] => {
   const byTab = new Map<string, IInboxItem>();
-  const queued = state.items.filter((i) => i.state === 'queued').sort((a, b) => a.createdAt - b.createdAt);
-  for (const item of queued) {
+  const waiting = state.items.filter((i) => awaitsDelivery(i, now)).sort((a, b) => a.createdAt - b.createdAt);
+  for (const item of waiting) {
     const key = `${item.targetWorkspaceId}/${item.targetTabId}`;
     if (byTab.has(key)) continue;
     // Per tab, strictly in order: a later notice never overtakes a waiting one.
     byTab.set(key, item);
   }
-  return [...byTab.values()].filter((item) => item.notBefore <= now || wake(item));
+  const dueAt = (item: IInboxItem) => (item.state === 'held' ? (item.lastAttemptAt ?? item.transitionAt) + HELD_REPROBE_MS : item.notBefore);
+  return [...byTab.values()].filter((item) => dueAt(item) <= now || wake(item));
 };
 
 // ─── I/O ─────────────────────────────────────────────────────────────────

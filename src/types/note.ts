@@ -89,7 +89,14 @@ export interface INoteReceipt {
   composerDeliveredAt: number | null;
 }
 
+/**
+ * The state a response reports. A stored `delivered` note is only routed: it reads `pending` while
+ * its notice waits in the inbox, `held` while the notice is held, and `delivered` once the notice
+ * reached the recipient's composer.
+ */
+export type TNoteViewState = TNoteState | 'pending' | 'held';
+
 /** A note without its body: what `note list` returns. */
-export type INoteView = Omit<INote, 'body'> & { bodyBytes: number; receipt?: INoteReceipt };
+export type INoteView = Omit<INote, 'body' | 'state'> & { state: TNoteViewState; bodyBytes: number; receipt?: INoteReceipt };
 
 export type TNoteErrorCode = 'note-not-found' | 'note-too-large' | 'note-target-missing' | 'forbidden' | 'note-invalid' | 'note-cap';

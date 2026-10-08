@@ -102,9 +102,16 @@ export class InboxDispatcher {
       || (status.cliState === 'busy' && this.deps.waitingAtPrompt(tabId));
   }
 
-  /** Early wake: the last refusal was the tab's state, and the state is ready now. */
-  private wake = (item: IInboxItem): boolean =>
-    (item.lastRefusal ?? '').startsWith(STATE_REFUSAL) && this.isReadyState(item.targetTabId);
+  /**
+   * Early wake: the tab is ready now, and either the last refusal was its state or (for a held
+   * item) a turn ended after the last attempt — a sent turn also clears the composer.
+   */
+  private wake = (item: IInboxItem): boolean => {
+    if (!this.isReadyState(item.targetTabId)) return false;
+    if ((item.lastRefusal ?? '').startsWith(STATE_REFUSAL)) return true;
+    const turnEndAt = this.deps.status(item.targetTabId)?.turnEnd?.at;
+    return item.state === 'held' && typeof turnEndAt === 'number' && turnEndAt > (item.lastAttemptAt ?? 0);
+  };
 
   async tick(): Promise<void> {
     if (this.running) return;
@@ -202,11 +209,11 @@ export class InboxDispatcher {
         });
         if (!readiness.ok) return { outcome: 'refused', reason: readiness.reason };
         // Its owner may have withdrawn it since this tick picked it (a closed episode).
-        const stillQueued = await this.deps.mutate((state) => ({
+        const stillWaiting = await this.deps.mutate((state) => ({
           state,
-          value: state.items.find((i) => i.id === item.id)?.state === 'queued',
+          value: state.items.find((i) => i.id === item.id)?.state === item.state,
         }));
-        if (!stillQueued) return { outcome: 'withdrawn' };
+        if (!stillWaiting) return { outcome: 'withdrawn' };
         if (PREFLIGHT_KINDS.has(item.kind)) {
           const preflight = preflights().get(item.kind);
           // No owner listening yet (a boot before its runtime started): wait, within the bound.

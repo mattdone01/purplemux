@@ -26,12 +26,13 @@ interface IWorld {
   halted: boolean;
   deliverFails: boolean;
   stranded: boolean;
+  turnEndAt: number | null;
 }
 
 const setup = (overrides: Partial<IWorld> = {}) => {
   const world: IWorld = {
     clock: T0, state: { items: [] }, cliState: 'idle', waiting: false, pane: EMPTY_CLAUDE, panelType: 'claude-code',
-    tabPresent: true, gone: true, sessionName: 'pt-ws-1-pane-a-tab-w', alive: true, policy: { ok: true }, permission: false, halted: false, deliverFails: false, stranded: false,
+    tabPresent: true, gone: true, sessionName: 'pt-ws-1-pane-a-tab-w', alive: true, policy: { ok: true }, permission: false, halted: false, deliverFails: false, stranded: false, turnEndAt: null,
     ...overrides,
   };
   const deliver = vi.fn(async (_session: string, _line: string) => {
@@ -49,7 +50,11 @@ const setup = (overrides: Partial<IWorld> = {}) => {
     findTab: async () => { calls.push('findTab'); return world.tabPresent ? tab() : null; },
     tabGone: async () => world.gone,
     hasSession: async () => world.alive,
-    status: () => ({ cliState: world.cliState, permissionRequest: world.permission ? { id: 'p' } : null } as unknown as IClientTabStatusEntry),
+    status: () => ({
+      cliState: world.cliState,
+      permissionRequest: world.permission ? { id: 'p' } : null,
+      turnEnd: world.turnEndAt === null ? null : { kind: 'turn-marker', at: world.turnEndAt },
+    } as unknown as IClientTabStatusEntry),
     waitingAtPrompt: () => world.waiting,
     halted: () => world.halted,
     capture: async () => { calls.push('capture'); return world.pane; },
@@ -72,8 +77,15 @@ const setup = (overrides: Partial<IWorld> = {}) => {
     world.state = result.state;
     return result.item;
   };
+  const enqueueWatch = (dedupeKey = 'k1', watchId = 'w-abcd12') => {
+    const result = enqueueInState(world.state, {
+      kind: 'watch', targetWorkspaceId: 'ws-1', targetTabId: 'tab-w', dedupeKey, fields: { watchId, target: 'merge:o/r', notice: 'free' },
+    }, world.clock, () => `i-${dedupeKey}`);
+    world.state = result.state;
+    return result.item;
+  };
   const item = (id = 'i-k1') => world.state.items.find((i) => i.id === id)!;
-  return { world, dispatcher, deliver, enqueue, item, calls };
+  return { world, dispatcher, deliver, enqueue, enqueueWatch, item, calls };
 };
 
 const LINE = '[purplemux resume r-abcd12] the last turn ended on an API error — continue from where it was cut off';
@@ -163,17 +175,92 @@ describe('inbox dispatcher (ADR-0012)', () => {
     expect(item()).toMatchObject({ state: 'queued', lastRefusal: reason });
   });
 
-  it('holds after 30 consecutive refusals, with the last refusal, and stops trying', async () => {
+  it('holds after 30 consecutive refusals, then delivers once the tab\'s turn ends', async () => {
+    const { world, dispatcher, deliver, enqueueWatch, item, calls } = setup({ cliState: 'busy' });
+    enqueueWatch();
+    for (let i = 0; i < INBOX_MAX_REFUSALS; i++) {
+      await dispatcher.tick();
+      world.clock += 300_000;
+    }
+    expect(item()).toMatchObject({ state: 'held', attempts: 30, heldReason: 'composer-not-ready:busy (30 refusals)' });
+    calls.length = 0;
+    world.clock = item().lastAttemptAt! + 2_000;
+    await dispatcher.tick();
+    expect(calls).toEqual([]);
+    world.cliState = 'idle';
+    world.turnEndAt = world.clock;
+    world.clock += 2_000;
+    await dispatcher.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(item()).toMatchObject({ state: 'delivered', deliveredAt: world.clock });
+  });
+
+  it('keeps a held resume held: its orchestrator was told, and no preflight guards a late paste (story 26)', async () => {
     const { world, dispatcher, deliver, enqueue, item } = setup({ cliState: 'busy' });
     enqueue();
     for (let i = 0; i < INBOX_MAX_REFUSALS; i++) {
       await dispatcher.tick();
       world.clock += 300_000;
     }
-    expect(item()).toMatchObject({ state: 'held', attempts: 30, heldReason: 'composer-not-ready:busy (30 refusals)' });
     world.cliState = 'idle';
+    world.turnEndAt = world.clock;
+    world.clock += 3_600_000;
     await dispatcher.tick();
     expect(deliver).not.toHaveBeenCalled();
+    expect(item()).toMatchObject({ state: 'held', heldReason: 'composer-not-ready:busy (30 refusals)' });
+  });
+
+  it('re-probes a composer-not-empty hold every 5 minutes and delivers it before the notice queued behind it', async () => {
+    const { world, dispatcher, deliver, enqueueWatch, item, calls } = setup({ pane: TYPED_CLAUDE });
+    enqueueWatch('k1', 'w-first1');
+    for (let i = 0; i < INBOX_MAX_REFUSALS; i++) {
+      await dispatcher.tick();
+      world.clock += 300_000;
+    }
+    expect(item('i-k1')).toMatchObject({ state: 'held', heldReason: 'composer-not-empty (30 refusals)' });
+    enqueueWatch('k2', 'w-second');
+    world.pane = EMPTY_CLAUDE;
+    world.clock = item('i-k1').lastAttemptAt! + 2_000;
+    calls.length = 0;
+    await dispatcher.tick();
+    expect(calls).toEqual([]);
+    world.clock = item('i-k1').lastAttemptAt! + 300_000;
+    await dispatcher.tick();
+    world.clock += 2_000;
+    await dispatcher.tick();
+    expect(deliver.mock.calls.map(([, line]) => line.split(' ')[2])).toEqual(['w-first1]', 'w-second]']);
+    expect(item('i-k1').state).toBe('delivered');
+    expect(item('i-k2').state).toBe('delivered');
+  });
+
+  it('keeps a re-probed hold held while its composer still holds a draft, and never re-notifies it', async () => {
+    const { world, dispatcher, deliver, enqueueWatch, item } = setup({ pane: TYPED_CLAUDE });
+    enqueueWatch();
+    for (let i = 0; i < INBOX_MAX_REFUSALS + 2; i++) {
+      await dispatcher.tick();
+      world.clock += 300_000;
+    }
+    expect(deliver).not.toHaveBeenCalled();
+    expect(item()).toMatchObject({ state: 'held', attempts: 32, heldReason: 'composer-not-empty (32 refusals)' });
+  });
+
+  it('never re-probes a hold whose re-probe stranded the paste', async () => {
+    const { world, dispatcher, deliver, enqueueWatch, item } = setup({ cliState: 'busy' });
+    enqueueWatch();
+    for (let i = 0; i < INBOX_MAX_REFUSALS; i++) {
+      await dispatcher.tick();
+      world.clock += 300_000;
+    }
+    world.cliState = 'idle';
+    world.stranded = true;
+    await dispatcher.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(item()).toMatchObject({ state: 'held', heldReason: 'stranded-in-composer' });
+    world.stranded = false;
+    world.clock += 3_600_000;
+    world.turnEndAt = world.clock;
+    await dispatcher.tick();
+    expect(deliver).toHaveBeenCalledTimes(1);
   });
 
   it('holds a paste that throws as transport-uncertain and never retries it', async () => {
