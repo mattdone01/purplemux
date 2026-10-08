@@ -104,6 +104,8 @@ export interface IPortfolioSnapshot {
   dependencies: IPortfolioDependency[];
   actions: IPortfolioAction[];
   milestones: IPortfolioMilestone[];
+  /** Cursor for the next page of resolved blockers; null when no older page exists. */
+  resolvedNextCursor?: string | null;
   generatedAt: number;
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, RefreshCw } from 'lucide-react';
 import useSWR from 'swr';
 import { Button } from '@/components/ui/button';
@@ -16,8 +16,10 @@ const age = (at: number, now: number): string => {
 const responseBody = async (response: Response): Promise<{ error?: string }> =>
   response.json().catch(() => ({ error: response.statusText || 'Request failed' }));
 
-const readPortfolio = async (): Promise<IPortfolioSnapshot> => {
-  const response = await fetch('/api/mission-control/portfolio', { cache: 'no-store' });
+const readPortfolio = async (resolvedBefore: string | null): Promise<IPortfolioSnapshot> => {
+  const url = resolvedBefore ? `/api/mission-control/portfolio?resolvedBefore=${encodeURIComponent(resolvedBefore)}`
+    : '/api/mission-control/portfolio';
+  const response = await fetch(url, { cache: 'no-store' });
   if (!response.ok) throw new Error((await responseBody(response)).error || 'Portfolio unavailable');
   return response.json() as Promise<IPortfolioSnapshot>;
 };
@@ -34,6 +36,9 @@ interface IPortfolioBoardContentProps {
   onPriorityFilter: (value: 'all' | 'top') => void;
   showResolved?: boolean;
   onShowResolved?: (value: boolean) => void;
+  olderResolved?: boolean;
+  onOlderResolved?: () => void;
+  onLatestResolved?: () => void;
   decisions: Record<string, string>;
   onDecision: (id: string, value: string) => void;
   pendingId: string | null;
@@ -46,7 +51,8 @@ interface IPortfolioBoardContentProps {
   onConfirmMilestone?: (impact: IPortfolioImpact) => void;
 }
 
-export const PortfolioBoardContent = ({ snapshot, priorityFilter, onPriorityFilter, showResolved = false, onShowResolved, decisions, onDecision,
+export const PortfolioBoardContent = ({ snapshot, priorityFilter, onPriorityFilter, showResolved = false, onShowResolved,
+  olderResolved = false, onOlderResolved, onLatestResolved, decisions, onDecision,
   pendingId, onAcknowledge, onAssign, milestoneEvidence = {}, milestoneStage = {}, onMilestoneEvidence, onMilestoneStage,
   onConfirmMilestone }: IPortfolioBoardContentProps) => {
   const now = snapshot.generatedAt;
@@ -89,6 +95,14 @@ export const PortfolioBoardContent = ({ snapshot, priorityFilter, onPriorityFilt
           </select>
         </label><label className="flex items-center gap-1 text-xs"><input type="checkbox" checked={showResolved} onChange={(event) => onShowResolved?.(event.target.checked)} /> Show resolved</label></div>
       </div>
+
+      {showResolved && (olderResolved || snapshot.resolvedNextCursor) && (
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-muted-foreground">Resolved history is shown 100 at a time; older records remain available.</span>
+          {olderResolved && <Button size="sm" variant="outline" onClick={onLatestResolved}>Latest resolved</Button>}
+          {snapshot.resolvedNextCursor && <Button size="sm" variant="outline" onClick={onOlderResolved}>Older resolved</Button>}
+        </div>
+      )}
 
       {snapshot.selection?.workspaceIds.length === 0 ? (
         <p className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">Select the workspaces this manager is responsible for.</p>
@@ -168,6 +182,10 @@ const PortfolioBoard = () => {
   const [editing, setEditing] = useState(false);
   const [priorityFilter, setPriorityFilter] = useState<'all' | 'top'>('all');
   const [showResolved, setShowResolved] = useState(false);
+  const [resolvedBefore, setResolvedBefore] = useState<string | null>(null);
+  const currentCursor = useRef(resolvedBefore);
+  const requestSequence = useRef(0);
+  const changeResolvedPage = (next: string | null) => { currentCursor.current = next; setResolvedBefore(next); };
   const [decisions, setDecisions] = useState<Record<string, string>>({});
   const [actionIds, setActionIds] = useState<Record<string, string>>({});
   const [pendingId, setPendingId] = useState<string | null>(null);
@@ -177,15 +195,19 @@ const PortfolioBoard = () => {
     { eventId: string; observedAt: number; stage: 'merged' | 'deployed' | 'verified'; evidence: string }>>({});
 
   const refresh = useCallback(async () => {
+    const cursor = resolvedBefore;
+    const sequence = ++requestSequence.current;
     try {
-      const next = await readPortfolio();
+      const next = await readPortfolio(cursor);
+      if (sequence !== requestSequence.current || cursor !== currentCursor.current) return;
       setSnapshot(next);
       setError(null);
     } catch (failure) {
+      if (sequence !== requestSequence.current || cursor !== currentCursor.current) return;
       setSnapshot(null);
       setError(failure instanceof Error ? failure.message : 'Portfolio unavailable');
-    } finally { setLoading(false); }
-  }, []);
+    } finally { if (sequence === requestSequence.current && cursor === currentCursor.current) setLoading(false); }
+  }, [resolvedBefore]);
 
   useEffect(() => {
     void refresh();
@@ -217,6 +239,7 @@ const PortfolioBoard = () => {
     setPendingId('scope'); setError(null);
     try {
       await mutate({ managerWorkspaceId: managerKey.slice(0, slash), managerTabId: managerKey.slice(slash + 1), workspaceIds }, 'PUT');
+      changeResolvedPage(null);
       setEditing(false);
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Scope could not be saved'); }
     finally { setPendingId(null); }
@@ -271,7 +294,9 @@ const PortfolioBoard = () => {
       : !snapshot ? <p className="rounded border border-dashed p-8 text-center text-sm text-muted-foreground">Portfolio unavailable. Retry after the storage or connection error is fixed.</p>
         : snapshot.selection === null ? <p className="rounded border border-dashed p-8 text-center text-sm text-muted-foreground">Choose a manager and managed workspaces to begin. No portfolio is assumed.</p>
           : <PortfolioBoardContent snapshot={snapshot} priorityFilter={priorityFilter} onPriorityFilter={setPriorityFilter}
-            showResolved={showResolved} onShowResolved={setShowResolved}
+            showResolved={showResolved} onShowResolved={(value) => { setShowResolved(value); if (!value) changeResolvedPage(null); }}
+            olderResolved={resolvedBefore !== null} onOlderResolved={() => changeResolvedPage(snapshot.resolvedNextCursor ?? null)}
+            onLatestResolved={() => changeResolvedPage(null)}
             decisions={decisions} onDecision={(id, value) => { setDecisions((current) => ({ ...current, [id]: value })); setActionIds((current) => { const next = { ...current }; delete next[id]; return next; }); }}
             pendingId={pendingId} onAcknowledge={(impact) => void submit(impact, 'acknowledge')} onAssign={(impact) => void submit(impact, 'assign')}
             milestoneEvidence={milestoneEvidence} milestoneStage={milestoneStage} onMilestoneEvidence={(id, value) => setMilestoneEvidence((current) => ({ ...current, [id]: value }))}

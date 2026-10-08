@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import os from 'os';
+import path from 'path';
+import Database from 'better-sqlite3';
 import { PortfolioStore } from '@/lib/portfolio-store';
 import { parsePortfolioReport, parsePortfolioResolution } from '@/lib/portfolio-validation';
 import type { IPortfolioReport } from '@/types/portfolio';
@@ -58,6 +62,43 @@ describe('portfolio dependency ledger', () => {
     expect(store.impact(a.id)?.state).toBe('received');
   });
 
+  it('pages resolved history inside the selected workspaces while retaining all open blockers', () => {
+    const store = newStore();
+    const open = store.report(report({ eventId: 'open', sourceKey: 'open', watchId: 'w-open' })).impact;
+    const resolved = ['a', 'b', 'c'].map((suffix) => {
+      const id = `w-${suffix}`;
+      const impact = store.report(report({ eventId: `event-${suffix}`, sourceKey: `resolved-${suffix}`,
+        watchId: id })).impact;
+      expect(store.clearByWatch(watch({ id }), { notice: 'free' })).toHaveLength(1);
+      return impact.id;
+    });
+    store.report(report({ eventId: 'foreign', workspaceId: 'ws-b', runId: 'run-b',
+      sourceKey: 'foreign', watchId: 'w-foreign' }));
+    const first = store.impactsForSelection(['ws-a'], null, 2);
+    expect(first.impacts.filter((impact) => impact.state !== 'resolved').map((impact) => impact.id)).toEqual([open.id]);
+    expect(first.impacts.filter((impact) => impact.state === 'resolved')).toHaveLength(2);
+    expect(first.nextResolvedCursor).not.toBeNull();
+    const second = store.impactsForSelection(['ws-a'], first.nextResolvedCursor, 2);
+    expect(second.impacts.filter((impact) => impact.state === 'resolved')).toHaveLength(1);
+    expect(second.nextResolvedCursor).toBeNull();
+    expect(new Set([...first.impacts, ...second.impacts].map((impact) => impact.id)))
+      .toEqual(new Set([open.id, ...resolved]));
+    for (let index = 0; index < 4; index++) {
+      store.reserveAction(`action-${index}`, open.id, 0, `decision-${index}`, 'human');
+    }
+    expect(store.recentActionsForImpacts([open.id])).toHaveLength(3);
+    store.confirmMilestone({ eventId: 'milestone-merged', workspaceId: 'ws-a', runId: 'run-a',
+      stage: 'merged', evidence: 'merge', observedAt: now }, 'human');
+    store.confirmMilestone({ eventId: 'milestone-verified', workspaceId: 'ws-a', runId: 'run-a',
+      stage: 'verified', evidence: 'health', observedAt: now + 1 }, 'human');
+    expect(store.latestMilestonesForImpacts([open.id])).toMatchObject([{ stage: 'verified' }]);
+    const overSqliteLimit = Array.from({ length: 32_767 }, (_, index) => `absent-${index}`);
+    overSqliteLimit.push(open.id);
+    expect(store.recentActionsForImpacts(overSqliteLimit)).toHaveLength(3);
+    expect(store.latestMilestonesForImpacts(overSqliteLimit)).toMatchObject([{ stage: 'verified' }]);
+    expect(() => store.impactsForSelection(['ws-a'], 'bad-cursor', 2)).toThrow('invalid resolved history cursor');
+  });
+
   it('acknowledgement never resolves; a matching watch clears only its linked dependency', () => {
     const store = newStore();
     const a = store.report(report()).impact;
@@ -78,9 +119,44 @@ describe('portfolio dependency ledger', () => {
     expect(() => store.report(report({ eventId: 'event-stale', revision: 0 }))).toThrow('does not follow');
     expect(() => store.report(report({ eventId: 'event-new', revision: 1 }))).toThrow('new watch');
     store.report(report({ eventId: 'event-new', revision: 1, watchId: 'w-new' }));
+    store.report(report({ eventId: 'event-unwatched', revision: 2, watchId: null }));
+    expect(() => store.report(report({ eventId: 'event-reused', revision: 3, watchId: 'w-shared' })))
+      .toThrow('new watch');
     expect(store.clearByWatch(watch(), { notice: 'free' })).toEqual([]);
     expect(store.impact(a.id)?.state).toBe('received');
     expect(store.impact(a.id)?.firstBlockedAt).toBe(a.firstBlockedAt);
+  });
+
+  it('fails closed for pre-upgrade watch history that cannot be reconstructed', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'portfolio-watch-upgrade-'));
+    const databasePath = path.join(directory, 'mission-control.sqlite');
+    try {
+      const old = new PortfolioStore(databasePath);
+      old.report(report());
+      old.report(report({ eventId: 'unwatched', revision: 1, watchId: null }));
+      old.close();
+      const db = new Database(databasePath);
+      db.exec('DROP TABLE portfolio_watch_uses');
+      db.exec('DROP TABLE portfolio_watch_history_unknown');
+      db.close();
+      const upgraded = new PortfolioStore(databasePath);
+      try {
+        const clock = vi.spyOn(Date, 'now');
+        try {
+          clock.mockReturnValue(now - 120_000);
+          expect(() => upgraded.report(report({ eventId: 'reused', revision: 2, watchId: 'w-shared',
+            producerAt: now - 60_000 })))
+            .toThrow('legacy blocker watch history is unknown');
+          clock.mockReturnValue(now + 60_000);
+          expect(() => upgraded.report(report({ eventId: 'fresh', revision: 2, watchId: 'w-fresh',
+            producerAt: now + 120_000 })))
+            .toThrow('watched revision needs an explicit linked migration');
+        } finally { clock.mockRestore(); }
+        expect(upgraded.report(report({ eventId: 'new-independent', runId: 'run-independent',
+          sourceKey: 'new-independent', watchId: 'w-fresh' })).impact.watchId)
+          .toBe('w-fresh');
+      } finally { upgraded.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('requires green checks for the exact linked head', () => {

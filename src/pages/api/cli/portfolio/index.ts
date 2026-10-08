@@ -27,9 +27,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (workspaceIds.some((id) => !saved.workspaceIds.includes(id))) {
       throw new MissionControlError(403, 'forbidden', 'Workspace is outside the current Scrum Master scope');
     }
+    const before = req.query?.resolvedBefore;
+    if (before !== undefined && typeof before !== 'string') {
+      throw new MissionControlError(400, 'invalid-request', 'invalid resolved history cursor');
+    }
     return res.status(200).json(await getPortfolioSnapshotForSelection(parsePortfolioSelection({
       managerWorkspaceId: caller.workspaceId, managerTabId: caller.tabId, workspaceIds,
-    })));
+    }), before ?? null));
   } catch (error) {
     sendMissionError(res, error);
   }

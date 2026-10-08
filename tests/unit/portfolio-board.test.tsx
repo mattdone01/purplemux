@@ -70,5 +70,12 @@ describe('portfolio board scope and presentation', () => {
     expect(html).toContain('Last human-confirmed milestone: verified');
     expect(html).toContain('Confirmed by human-1');
     expect(html).toContain('sm:grid-cols-2');
+    const history = renderToStaticMarkup(<PortfolioBoardContent snapshot={{ ...snapshot, resolvedNextCursor: '100:pb-old' }}
+      priorityFilter="all" onPriorityFilter={() => {}} showResolved olderResolved
+      onOlderResolved={() => {}} onLatestResolved={() => {}}
+      decisions={{}} onDecision={() => {}} pendingId={null} onAcknowledge={() => {}} onAssign={() => {}} />);
+    expect(history).toContain('Older resolved');
+    expect(history).toContain('Latest resolved');
+    expect(history).toContain('Resolved history is shown 100 at a time');
   });
 });

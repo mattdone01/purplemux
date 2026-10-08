@@ -49,20 +49,25 @@ export const reportPortfolioBlocker = async (caller: ICaller, report: IPortfolio
     if (report.producerAt > Date.now() + 5 * 60_000) {
       throw new MissionControlError(400, 'invalid-request', 'producer time is in the future');
     }
+    const store = getPortfolioStore();
+    // An already committed event remains replayable after its one-shot watch has fired.
+    // The store still compares the full report hash, so a reused event ID cannot bypass validation.
     if (report.watchId) {
-      const watch = (await readWatches()).watches.find((entry) => entry.id === report.watchId);
-      if (!watch || report.resourceKey !== `${watch.kind}:${watch.target}`
-        || (report.kind === 'ci' && (watch.kind !== 'pr' || watch.until !== 'checks-settled'))
-        || (report.kind === 'lease' && (watch.kind !== 'lease' || watch.until !== 'free'))
-        || (watch.kind !== 'lease' && report.watchHead !== watch.baseline)
-        || (watch.kind === 'lease' && report.watchHead !== null)
-        || !watch.verified) {
-        throw new MissionControlError(400, 'invalid-request', 'linked watch identity or baseline does not match the dependency');
+      if (!store.hasEvent(report.eventId)) {
+        const watch = (await readWatches()).watches.find((entry) => entry.id === report.watchId);
+        if (!watch || report.resourceKey !== `${watch.kind}:${watch.target}`
+          || (report.kind === 'ci' && (watch.kind !== 'pr' || watch.until !== 'checks-settled'))
+          || (report.kind === 'lease' && (watch.kind !== 'lease' || watch.until !== 'free'))
+          || (watch.kind !== 'lease' && report.watchHead !== watch.baseline)
+          || (watch.kind === 'lease' && report.watchHead !== null)
+          || !watch.verified) {
+          throw new MissionControlError(400, 'invalid-request', 'linked watch identity or baseline does not match the dependency');
+        }
       }
     } else if (report.watchHead !== null) {
       throw new MissionControlError(400, 'invalid-request', 'watchHead requires a linked watch');
     }
-    return getPortfolioStore().report(report);
+    return store.report(report);
   });
 
 export const resolvePortfolioCapacity = async (caller: ICaller, event: IPortfolioResolution) => {
@@ -131,10 +136,11 @@ export const selectPortfolioScope = async (actor: string, selection: IPortfolioS
   getPortfolioStore().select(actor, selection);
 };
 
-export const getPortfolioSnapshot = async (): Promise<IPortfolioSnapshot> => {
+export const getPortfolioSnapshot = async (resolvedBefore: string | null = null): Promise<IPortfolioSnapshot> => {
   const selection = getPortfolioStore().currentSelection()?.selection;
-  if (!selection) return { selection: null, coverage: [], dependencies: [], actions: [], milestones: [], generatedAt: Date.now() };
-  return getPortfolioSnapshotForSelection(selection);
+  if (!selection) return { selection: null, coverage: [], dependencies: [], actions: [], milestones: [],
+    resolvedNextCursor: null, generatedAt: Date.now() };
+  return getPortfolioSnapshotForSelection(selection, resolvedBefore);
 };
 
 export const portfolioVisibleDependencies = (
@@ -158,21 +164,24 @@ export const portfolioVisibleDependencies = (
   return [...grouped.values()];
 };
 
-export const getPortfolioSnapshotForSelection = async (selection: IPortfolioSelection): Promise<IPortfolioSnapshot> => {
+export const getPortfolioSnapshotForSelection = async (selection: IPortfolioSelection,
+  resolvedBefore: string | null = null): Promise<IPortfolioSnapshot> => {
   const coverage = await coverageFor(selection);
-  const impacts = getPortfolioStore().impacts();
+  const allowed = coverage.filter((entry) => entry.access === 'available').map((entry) => entry.workspaceId);
+  const store = getPortfolioStore();
+  const { impacts, nextResolvedCursor } = store.impactsForSelection(allowed, resolvedBefore);
   const notes = new Map((await readNotesState()).notes.map((note) => [note.id, note]));
   const dependencies = portfolioVisibleDependencies(impacts, coverage, notes);
-  const visibleIds = new Set(dependencies.flatMap((dependency) => dependency.impacts.map((impact) => impact.id)));
-  const actions = getPortfolioStore().actions().filter((action) => visibleIds.has(action.impactId));
-  const allowed = new Set(coverage.filter((entry) => entry.access === 'available').map((entry) => entry.workspaceId));
-  const milestones = getPortfolioStore().milestones().filter((entry) => allowed.has(entry.workspaceId));
-  const saved = getPortfolioStore().currentSelection()?.selection;
+  const visibleIds = dependencies.flatMap((dependency) => dependency.impacts.map((impact) => impact.id));
+  const actions = store.recentActionsForImpacts(visibleIds);
+  const milestones = store.latestMilestonesForImpacts(visibleIds);
+  const saved = store.currentSelection()?.selection;
   if (!saved || saved.managerWorkspaceId !== selection.managerWorkspaceId || saved.managerTabId !== selection.managerTabId
     || selection.workspaceIds.some((id) => !saved.workspaceIds.includes(id))) {
     throw new MissionControlError(403, 'forbidden', 'Scrum Master scope changed during the read');
   }
-  return { selection, coverage, dependencies, actions, milestones, generatedAt: Date.now() };
+  return { selection, coverage, dependencies, actions, milestones,
+    resolvedNextCursor: nextResolvedCursor, generatedAt: Date.now() };
 };
 
 export const confirmPortfolioMilestone = async (authority: IHumanControlAuthority,

@@ -512,6 +512,9 @@ GET /api/cli/portfolio?workspaces=WS1,WS2
   The response gives coverage for each requested workspace; blocker records and shared
   dependency aggregates include only workspaces with current coordinators. Removing a
   workspace or replacing the manager in the saved scope takes effect on the next read.
+  Open blockers are always included. Resolved blockers are paged 100 at a time; follow
+  resolvedNextCursor with &resolvedBefore=<cursor> to read older history. Actions and
+  milestones are limited to the latest entries used by the board for visible blockers.
   Work commands in other workspaces still go through their configured orchestrators.
 
 POST /api/cli/portfolio/events
@@ -531,6 +534,9 @@ POST /api/cli/portfolio/events
   content. A newer revision needs a new watch ID. For PR/ref watches, watchHead must equal
   the immutable watch baseline SHA; a changed head cannot clear the old blocker. Capacity
   details are required for worker-limit, build-slots, memory, disk-reservation and lease.
+  Pre-upgrade blockers with multiple revisions have incomplete watch history. They remain
+  readable and accept unwatched edits, but a new watch binding requires an explicit linked
+  migration; changing sourceKey silently would lose the blocker history.
   Reported stage/evidence are claims, not verified milestones. A matching green CI, merged
   PR, moved ref or free lease watch clears only its linked dependency. It does not verify
   deployment or the release. No arbitrary prose resolves a blocker.

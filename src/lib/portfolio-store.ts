@@ -11,6 +11,7 @@ const DB_PATH = path.join(os.homedir(), '.purplemux', 'mission-control.sqlite');
 const hash = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const impactId = (workspaceId: string, runId: string, sourceKey: string): string =>
   `pb-${hash([workspaceId, runId, sourceKey]).slice(0, 32)}`;
+const IMPACT_QUERY_CHUNK = 500;
 
 interface IImpactRow {
   id: string;
@@ -47,7 +48,9 @@ export class PortfolioStore {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('synchronous = FULL');
-    this.db.exec(`
+    this.db.transaction(() => {
+      const upgradingWatchHistory = !this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portfolio_watch_uses'").get();
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS portfolio_selection (
         actor TEXT PRIMARY KEY, selection_json TEXT NOT NULL, updated_at INTEGER NOT NULL
       );
@@ -59,15 +62,23 @@ export class PortfolioStore {
         UNIQUE(workspace_id,run_id,source_key)
       );
       CREATE INDEX IF NOT EXISTS portfolio_resource_idx ON portfolio_impacts(resource_key,state);
+      CREATE INDEX IF NOT EXISTS portfolio_scope_history_idx ON portfolio_impacts(workspace_id,state,updated_at DESC,id DESC);
       CREATE TABLE IF NOT EXISTS portfolio_events (
         id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, impact_id TEXT NOT NULL,
         event_type TEXT NOT NULL, committed_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS portfolio_watch_uses (
+        impact_id TEXT NOT NULL, watch_id TEXT NOT NULL, PRIMARY KEY (impact_id,watch_id)
+      );
+      CREATE TABLE IF NOT EXISTS portfolio_watch_history_unknown (
+        impact_id TEXT PRIMARY KEY
       );
       CREATE TABLE IF NOT EXISTS portfolio_actions (
         id TEXT PRIMARY KEY, impact_id TEXT NOT NULL, request_hash TEXT NOT NULL,
         expected_revision INTEGER NOT NULL, resource_key TEXT NOT NULL, actor TEXT NOT NULL,
         decision TEXT NOT NULL, note_id TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS portfolio_actions_impact_time_idx ON portfolio_actions(impact_id,created_at DESC,id DESC);
       CREATE TABLE IF NOT EXISTS portfolio_wakes (
         id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, resource_key TEXT NOT NULL,
         watch_id TEXT NOT NULL, watch_owner_workspace_id TEXT NOT NULL,
@@ -83,7 +94,16 @@ export class PortfolioStore {
         run_id TEXT NOT NULL, stage TEXT NOT NULL, source TEXT NOT NULL,
         evidence TEXT NOT NULL, actor TEXT, observed_at INTEGER NOT NULL
       );
-    `);
+      CREATE INDEX IF NOT EXISTS portfolio_milestones_run_time_idx ON portfolio_milestones(workspace_id,run_id,observed_at DESC);
+      INSERT OR IGNORE INTO portfolio_watch_uses (impact_id,watch_id)
+        SELECT id,json_extract(report_json,'$.watchId') FROM portfolio_impacts
+        WHERE json_extract(report_json,'$.watchId') IS NOT NULL;
+      `);
+      // Old event hashes cannot reveal earlier watch IDs. Reject new watch bindings on
+      // these legacy impacts; replacing one requires an explicit linked migration.
+      if (upgradingWatchHistory) this.db.exec(`INSERT OR IGNORE INTO portfolio_watch_history_unknown (impact_id)
+        SELECT id FROM portfolio_impacts WHERE revision>0`);
+    }).immediate();
   }
 
   close = (): void => { this.db.close(); };
@@ -114,10 +134,34 @@ export class PortfolioStore {
   impacts = (): IPortfolioImpact[] =>
     (this.db.prepare('SELECT * FROM portfolio_impacts ORDER BY first_blocked_at,id').all() as IImpactRow[]).map(impactFromRow);
 
+  impactsForSelection = (workspaceIds: string[], before: string | null, pageSize = 100):
+    { impacts: IPortfolioImpact[]; nextResolvedCursor: string | null } => {
+    const cursor = before ? /^([0-9]{1,16}):(pb-[a-f0-9]{32})$/.exec(before) : null;
+    if (before && (!cursor || !Number.isSafeInteger(Number(cursor[1])))) {
+      throw new MissionControlError(400, 'invalid-request', 'invalid resolved history cursor');
+    }
+    if (workspaceIds.length === 0) return { impacts: [], nextResolvedCursor: null };
+    const placeholders = workspaceIds.map(() => '?').join(',');
+    const active = this.db.prepare(`SELECT * FROM portfolio_impacts WHERE workspace_id IN (${placeholders})
+      AND state != 'resolved' ORDER BY first_blocked_at,id`).all(...workspaceIds) as IImpactRow[];
+    const older = cursor ? 'AND (updated_at < ? OR (updated_at = ? AND id < ?))' : '';
+    const params: Array<string | number> = [...workspaceIds];
+    if (cursor) params.push(Number(cursor[1]), Number(cursor[1]), cursor[2]);
+    const resolved = this.db.prepare(`SELECT * FROM portfolio_impacts WHERE workspace_id IN (${placeholders})
+      AND state = 'resolved' ${older} ORDER BY updated_at DESC,id DESC LIMIT ?`)
+      .all(...params, pageSize + 1) as IImpactRow[];
+    const page = resolved.slice(0, pageSize);
+    const last = page.at(-1);
+    return { impacts: [...active, ...page].map(impactFromRow),
+      nextResolvedCursor: resolved.length > pageSize && last ? `${last.updated_at}:${last.id}` : null };
+  };
+
   impact = (id: string): IPortfolioImpact | null => {
     const row = this.db.prepare('SELECT * FROM portfolio_impacts WHERE id=?').get(id) as IImpactRow | undefined;
     return row ? impactFromRow(row) : null;
   };
+
+  hasEvent = (eventId: string): boolean => !!this.db.prepare('SELECT 1 FROM portfolio_events WHERE id=?').get(eventId);
 
   actions = (): IPortfolioAction[] =>
     (this.db.prepare('SELECT id,impact_id,actor,decision,note_id,state,created_at FROM portfolio_actions ORDER BY created_at DESC').all() as Array<{
@@ -125,12 +169,55 @@ export class PortfolioStore {
     }>).map((row) => ({ id: row.id, impactId: row.impact_id, actor: row.actor, decision: row.decision,
       noteId: row.note_id, state: row.state, createdAt: row.created_at }));
 
+  recentActionsForImpacts = (impactIds: string[]): IPortfolioAction[] => {
+    if (impactIds.length === 0) return [];
+    type ActionRow = {
+      id: string; impact_id: string; actor: string; decision: string; note_id: string | null; state: string; created_at: number;
+    };
+    const rows: ActionRow[] = [];
+    for (let offset = 0; offset < impactIds.length; offset += IMPACT_QUERY_CHUNK) {
+      const chunk = impactIds.slice(offset, offset + IMPACT_QUERY_CHUNK);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(...this.db.prepare(`SELECT id,impact_id,actor,decision,note_id,state,created_at FROM (
+        SELECT id,impact_id,actor,decision,note_id,state,created_at,
+          ROW_NUMBER() OVER (PARTITION BY impact_id ORDER BY created_at DESC,id DESC) AS rank
+        FROM portfolio_actions WHERE impact_id IN (${placeholders})
+      ) WHERE rank <= 3`).all(...chunk) as ActionRow[]);
+    }
+    rows.sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id));
+    return rows.map((row) => ({ id: row.id, impactId: row.impact_id, actor: row.actor, decision: row.decision,
+      noteId: row.note_id, state: row.state, createdAt: row.created_at }));
+  };
+
   milestones = (): IPortfolioMilestone[] =>
     (this.db.prepare('SELECT workspace_id,run_id,stage,source,evidence,actor,observed_at FROM portfolio_milestones ORDER BY observed_at').all() as Array<{
       workspace_id: string; run_id: string; stage: IPortfolioMilestone['stage'];
       source: IPortfolioMilestone['source']; evidence: string; actor: string | null; observed_at: number;
     }>).map((row) => ({ workspaceId: row.workspace_id, runId: row.run_id, stage: row.stage,
       source: row.source, evidence: row.evidence, actor: row.actor, observedAt: row.observed_at }));
+
+  latestMilestonesForImpacts = (impactIds: string[]): IPortfolioMilestone[] => {
+    if (impactIds.length === 0) return [];
+    type MilestoneRow = { workspace_id: string; run_id: string; stage: IPortfolioMilestone['stage'];
+      source: IPortfolioMilestone['source']; evidence: string; actor: string | null; observed_at: number };
+    const visible = new Map<string, MilestoneRow>();
+    for (let offset = 0; offset < impactIds.length; offset += IMPACT_QUERY_CHUNK) {
+      const chunk = impactIds.slice(offset, offset + IMPACT_QUERY_CHUNK);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`WITH visible_runs AS (
+        SELECT DISTINCT workspace_id,run_id FROM portfolio_impacts WHERE id IN (${placeholders})
+      ), ranked AS (
+        SELECT m.workspace_id,m.run_id,m.stage,m.source,m.evidence,m.actor,m.observed_at,
+          ROW_NUMBER() OVER (PARTITION BY m.workspace_id,m.run_id ORDER BY m.observed_at DESC,
+            CASE m.stage WHEN 'verified' THEN 3 WHEN 'deployed' THEN 2 ELSE 1 END DESC,m.id DESC) AS rank
+        FROM portfolio_milestones m JOIN visible_runs v ON v.workspace_id=m.workspace_id AND v.run_id=m.run_id
+      ) SELECT workspace_id,run_id,stage,source,evidence,actor,observed_at FROM ranked WHERE rank=1`)
+        .all(...chunk) as MilestoneRow[];
+      for (const row of rows) visible.set(`${row.workspace_id}\0${row.run_id}`, row);
+    }
+    return [...visible.values()].map((row) => ({ workspaceId: row.workspace_id, runId: row.run_id, stage: row.stage,
+      source: row.source, evidence: row.evidence, actor: row.actor, observedAt: row.observed_at }));
+  };
 
   confirmMilestone = (event: { eventId: string; workspaceId: string; runId: string;
     stage: 'merged' | 'deployed' | 'verified'; evidence: string; observedAt: number }, actor: string): IPortfolioMilestone => this.db.transaction(() => {
@@ -166,8 +253,15 @@ export class PortfolioStore {
     if ((!previous && report.revision !== 0) || (previous && report.revision !== previous.revision + 1)) {
       throw new MissionControlError(409, 'conflict', `blocker revision ${report.revision} does not follow ${previous?.revision ?? -1}`);
     }
-    if (previous && report.watchId && report.watchId === (JSON.parse(previous.report_json) as IPortfolioReport).watchId) {
+    if (report.watchId && this.db.prepare('SELECT 1 FROM portfolio_watch_uses WHERE impact_id=? AND watch_id=?')
+      .get(id, report.watchId)) {
       throw new MissionControlError(409, 'conflict', 'a newer blocker revision requires a new watch');
+    }
+    if (report.watchId && previous) {
+      const unknownHistory = this.db.prepare('SELECT 1 FROM portfolio_watch_history_unknown WHERE impact_id=?').get(id);
+      if (unknownHistory) {
+        throw new MissionControlError(409, 'conflict', 'legacy blocker watch history is unknown; watched revision needs an explicit linked migration');
+      }
     }
     const now = Date.now();
     const updatedAt = Math.max(now, (previous?.updated_at ?? 0) + 1);
@@ -187,6 +281,7 @@ export class PortfolioStore {
         sameEpisode ? previous.note_id : null, keepEscalation ? previous.escalated_at : null);
     this.db.prepare('INSERT INTO portfolio_events (id,input_hash,impact_id,event_type,committed_at) VALUES (?,?,?,?,?)')
       .run(report.eventId, inputHash, id, 'reported', now);
+    if (report.watchId) this.db.prepare('INSERT INTO portfolio_watch_uses (impact_id,watch_id) VALUES (?,?)').run(id, report.watchId);
     return { impact: this.impact(id)!, replayed: false };
   })();
 

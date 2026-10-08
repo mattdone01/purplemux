@@ -9,7 +9,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   setMissionHeaders(res);
   try {
     const actor = await requireMissionHuman(req);
-    if (req.method === 'GET') return res.status(200).json(await getPortfolioSnapshot());
+    if (req.method === 'GET') {
+      const before = req.query?.resolvedBefore;
+      if (before !== undefined && typeof before !== 'string') {
+        throw new MissionControlError(400, 'invalid-request', 'invalid resolved history cursor');
+      }
+      return res.status(200).json(await getPortfolioSnapshot(before ?? null));
+    }
     const authority = await requireMissionHumanMutation(req);
     if (req.method === 'PUT') {
       await selectPortfolioScope(actor, parsePortfolioSelection(req.body));

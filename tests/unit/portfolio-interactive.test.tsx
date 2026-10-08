@@ -16,6 +16,7 @@ const synthetic = vi.hoisted(() => ({
   service: null as NotesService | null,
   watch: { id: 'w-local', workspaceId: 'ws-a', tabId: 'tab-a', kind: 'lease', target: 'merge:o/r',
     until: 'free', baseline: null, verified: true } as IWatch,
+  watchAvailable: true,
 }));
 
 vi.mock('@/lib/caller', () => ({ resolveCaller: async () => ({ verified: true, identity: 'launch',
@@ -41,7 +42,7 @@ vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch',
     sessionName: tabId === 'tab-root' ? 'session-ws-root' : 'session-ws-a' }) }));
 vi.mock('@/lib/tmux', async (original) => ({ ...await original<typeof import('@/lib/tmux')>(),
   hasSession: async () => true }));
-vi.mock('@/lib/watch-store', () => ({ readWatches: async () => ({ watches: [synthetic.watch] }) }));
+vi.mock('@/lib/watch-store', () => ({ readWatches: async () => ({ watches: synthetic.watchAvailable ? [synthetic.watch] : [] }) }));
 vi.mock('@/lib/notes-store', async (original) => ({ ...await original<typeof import('@/lib/notes-store')>(),
   readNotesState: async () => synthetic.notes }));
 vi.mock('@/lib/notes-service', async (original) => ({ ...await original<typeof import('@/lib/notes-service')>(),
@@ -67,7 +68,7 @@ describe('interactive synthetic portfolio API and UI journey', () => {
   let store: PortfolioStore | null = null;
   afterEach(() => { store?.close(); store = null;
     delete (globalThis as { __ptPortfolioStore?: PortfolioStore }).__ptPortfolioStore;
-    synthetic.notes = { notes: [] }; synthetic.service = null; });
+    synthetic.notes = { notes: [] }; synthetic.service = null; synthetic.watchAvailable = true; });
 
   it('reports by coordinator API, assigns from human board, applies by owner API, clears on proof, and updates the board', async () => {
     process.env.NEXTAUTH_SECRET = 'portfolio-interactive-test-secret-at-least-32-bytes';
@@ -150,6 +151,9 @@ describe('interactive synthetic portfolio API and UI journey', () => {
       eventId: 'applied-local', expectedRevision: 0 })).status).toBe(200);
     expect(store!.impact(impact.id)?.state).toBe('waiting');
     expect(store!.clearByWatch(synthetic.watch, { notice: 'free' })).toHaveLength(1);
+    synthetic.watchAvailable = false;
+    expect((await producer(report)).status).toBe(200);
+    expect((await producer({ ...report, evidence: 'changed replay' })).status).toBe(409);
     snapshot = (await human('GET')).body as IPortfolioSnapshot;
     expect(snapshot.dependencies[0].impacts[0]).toMatchObject({ state: 'resolved', stage: 'implemented' });
     const html = renderToStaticMarkup(<PortfolioBoardContent snapshot={snapshot} priorityFilter="all"
@@ -223,6 +227,18 @@ describe('interactive synthetic portfolio API and UI journey', () => {
     expect(snapshot.dependencies).toEqual([]);
     expect((await human('POST', { type: 'acknowledge', workspaceId: 'ws-a', impactId: impact.id,
       expectedRevision: 0 })).status).toBe(403);
+    const leaseWatch = synthetic.watch;
+    try {
+      synthetic.watch = { ...leaseWatch, id: 'w-ci-local', kind: 'pr', target: 'owner/repo#1',
+        until: 'checks-settled', baseline: 'a'.repeat(40) };
+      synthetic.watchAvailable = true;
+      const ciReport = { ...report, eventId: 'ci-report-local', sourceKey: 'ci-source',
+        resourceKey: 'pr:owner/repo#1', kind: 'ci', watchId: 'w-ci-local',
+        watchHead: 'a'.repeat(40), capacity: null };
+      expect((await producer(ciReport)).status).toBe(200);
+      synthetic.watchAvailable = false;
+      expect((await producer(ciReport)).status).toBe(200);
+    } finally { synthetic.watch = leaseWatch; synthetic.watchAvailable = true; }
   });
 
   it('closes the mobile sheet and opens the portfolio route on a tap', () => {
