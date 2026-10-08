@@ -199,6 +199,25 @@ describe('harness watches (ADR-0015)', () => {
     expect(f.ghCalls).toEqual([]);
   });
 
+  it('keeps a lease watch when it is reacquired between evaluation and notice routing', async () => {
+    let checks = 0;
+    let clearances = 0;
+    const deps = f.deps();
+    deps.leaseFree = async () => ++checks !== 2;
+    deps.onFired = async () => { clearances++; };
+    m = new WatchManager(deps);
+    const watch = await m.create(B, { kind: 'lease', target: 'merge:race/release', until: 'free' });
+    await m.tick('merge:race/release');
+    expect(f.sent).toEqual([]);
+    expect(clearances).toBe(0);
+    expect(f.state.watches.map((entry) => entry.id)).toEqual([watch.id]);
+    f.now += MIN;
+    await m.tick('merge:race/release');
+    expect(f.sent.map((entry) => entry.fields.notice)).toEqual(['free']);
+    expect(clearances).toBe(1);
+    expect(f.state.watches).toEqual([]);
+  });
+
   it('three failures in a row send one failing notice with a server token; none again until it recovers and fails again', async () => {
     f.answer('/pulls/7', f.pull(false, 'open', SHA_A));
     const w = await m.create(B, { kind: 'pr', target: 'o/r#7', until: 'merged' });

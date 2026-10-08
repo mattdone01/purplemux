@@ -273,6 +273,11 @@ export class WatchManager {
     }
     if (outcome === 'expired' || outcome.type === 'fire') {
       const fields: TFired = outcome === 'expired' ? { notice: 'expired', until: w.until } : outcome.fields;
+      // Evaluation happens outside the watch mutation lock. A lease may be reacquired
+      // before this point; keep its watch so the next actual release can still fire it.
+      if (w.kind === 'lease' && fields.notice === 'free' && !(await this.deps.leaseFree(w.target))) {
+        return replace({ ...w, pendingNotice: undefined, lastCheckedAt: now });
+      }
       if (w.kind === 'pr' && fields.notice === 'checks-settled') {
         const current = await this.pull(w.target);
         if (!current.ok) return replace({ ...w, lastCheckedAt: now, lastError: { code: current.code,
@@ -417,10 +422,6 @@ const defaultDeps = async (): Promise<IWatchDeps> => {
     liveTabs: tabLifecycle.readLiveTabs,
     enqueue: inboxStore.enqueueNotice,
     onFired: async (watch, fields) => {
-      if (watch.kind === 'lease') {
-        const current = leaseStore.pruneExpired(await leaseStore.readLeaseState(), Date.now()).state;
-        if (current.leases.some((lease) => lease.name === watch.target)) return;
-      }
       const { getPortfolioStore } = await import('@/lib/portfolio-store');
       getPortfolioStore().clearByWatch(watch, fields);
     },

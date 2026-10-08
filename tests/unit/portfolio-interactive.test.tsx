@@ -17,6 +17,8 @@ const synthetic = vi.hoisted(() => ({
   watch: { id: 'w-local', workspaceId: 'ws-a', tabId: 'tab-a', kind: 'lease', target: 'merge:o/r',
     until: 'free', baseline: null, verified: true } as IWatch,
   watchAvailable: true,
+  sessionLists: 0,
+  hasSessionCalls: 0,
 }));
 
 vi.mock('@/lib/caller', () => ({ resolveCaller: async () => ({ verified: true, identity: 'launch',
@@ -41,7 +43,8 @@ vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch',
   getTabTokenRecord: (tabId: string) => ({ workspaceId: tabId === 'tab-root' ? 'ws-root' : 'ws-a',
     sessionName: tabId === 'tab-root' ? 'session-ws-root' : 'session-ws-a' }) }));
 vi.mock('@/lib/tmux', async (original) => ({ ...await original<typeof import('@/lib/tmux')>(),
-  hasSession: async () => true }));
+  hasSession: async () => { synthetic.hasSessionCalls++; return true; },
+  listSessions: async () => { synthetic.sessionLists++; return ['session-ws-root', 'session-ws-a']; } }));
 vi.mock('@/lib/watch-store', () => ({ readWatches: async () => ({ watches: synthetic.watchAvailable ? [synthetic.watch] : [] }) }));
 vi.mock('@/lib/notes-store', async (original) => ({ ...await original<typeof import('@/lib/notes-store')>(),
   readNotesState: async () => synthetic.notes }));
@@ -68,7 +71,8 @@ describe('interactive synthetic portfolio API and UI journey', () => {
   let store: PortfolioStore | null = null;
   afterEach(() => { store?.close(); store = null;
     delete (globalThis as { __ptPortfolioStore?: PortfolioStore }).__ptPortfolioStore;
-    synthetic.notes = { notes: [] }; synthetic.service = null; synthetic.watchAvailable = true; });
+    synthetic.notes = { notes: [] }; synthetic.service = null; synthetic.watchAvailable = true;
+    synthetic.sessionLists = 0; synthetic.hasSessionCalls = 0; });
 
   it('reports by coordinator API, assigns from human board, applies by owner API, clears on proof, and updates the board', async () => {
     process.env.NEXTAUTH_SECRET = 'portfolio-interactive-test-secret-at-least-32-bytes';
@@ -123,7 +127,11 @@ describe('interactive synthetic portfolio API and UI journey', () => {
       capacity: { host: 'local', measuredReason: 'held lease', limit: '1', use: '1', holder: 'tab-holder',
         clearingCondition: 'lease free' } };
     expect((await producer(report)).status).toBe(200);
+    const beforeSnapshotSessionLists = synthetic.sessionLists;
+    const beforeSnapshotHasSessionCalls = synthetic.hasSessionCalls;
     let snapshot = (await human('GET')).body as IPortfolioSnapshot;
+    expect(synthetic.sessionLists).toBe(beforeSnapshotSessionLists + 1);
+    expect(synthetic.hasSessionCalls).toBe(beforeSnapshotHasSessionCalls);
     const impact = snapshot.dependencies[0].impacts[0];
     let decision = '';
     let pending: Promise<unknown> = Promise.resolve();
@@ -206,6 +214,16 @@ describe('interactive synthetic portfolio API and UI journey', () => {
     expect(capacityHtml).toContain('Coordinator capacity evidence on local');
     expect(capacityHtml).toContain('worker count below limit');
     expect(capacityHtml).toContain('worker-slots:sample-1');
+    const oversizeReport = { ...capacityReport, eventId: 'report-oversize', sourceKey: 'oversize-capacity',
+      nextAction: '界'.repeat(2000) };
+    expect((await producer(oversizeReport)).status).toBe(200);
+    const oversizeImpact = store!.impacts().find((entry) => entry.sourceKey === 'oversize-capacity')!;
+    const oversizeAction = { type: 'assign', workspaceId: 'ws-a', impactId: oversizeImpact.id,
+      expectedRevision: 0, actionId: 'action-oversize', decision: '界'.repeat(4000) };
+    expect((await human('POST', oversizeAction)).status).toBe(400);
+    expect(store!.actions().find((entry) => entry.id === 'action-oversize')).toBeUndefined();
+    expect((await human('POST', { ...oversizeAction, actionId: 'action:bad', decision: 'Wait' })).status).toBe(400);
+    expect(store!.actions().find((entry) => entry.id === 'action:bad')).toBeUndefined();
     const staleReport = { ...capacityReport, eventId: 'report-stale', sourceKey: 'stale-capacity' };
     expect((await producer(staleReport)).status).toBe(200);
     const staleImpact = store!.impacts().find((entry) => entry.sourceKey === 'stale-capacity')!;

@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PortfolioBoardContent } from '@/components/features/mission-control/portfolio-board';
+import { createMissionSubmissionId } from '@/components/features/mission-control/mission-control-utils';
 import { portfolioCoverage, portfolioProducerAuthorized, portfolioVisibleDependencies } from '@/lib/portfolio-service';
 import type { ICaller } from '@/lib/caller';
 import type { IMissionRun } from '@/types/mission-control';
@@ -12,6 +13,11 @@ const workspace = (id: string): IWorkspace => ({ id, name: id,
   orchestration: { enabled: true, orchestratorTabId: `tab-${id}` },
 } as IWorkspace);
 describe('portfolio board scope and presentation', () => {
+  it('creates valid submission IDs when secure-context randomUUID is unavailable', () => {
+    vi.stubGlobal('crypto', { randomUUID: undefined });
+    try { expect(createMissionSubmissionId()).toMatch(/^[a-f0-9-]{36}$/); }
+    finally { vi.unstubAllGlobals(); }
+  });
   it('rejects foreign workers and stale replacement generations', () => {
     const caller = { verified: true, workspaceId: 'ws-a', tabId: 'tab-a' } as ICaller;
     const run = { workspaceId: 'ws-a', state: 'waiting', binding: { tabId: 'tab-a', generation: 2 } } as IMissionRun;

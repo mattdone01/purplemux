@@ -5,15 +5,19 @@ import { hasSession } from '@/lib/tmux';
 import { getWorkspaceById } from '@/lib/workspace-store';
 import type { TCliScope } from '@/lib/workspace-token';
 import type { IPortfolioSelection } from '@/types/portfolio';
+import type { IWorkspace } from '@/types/terminal';
 
-export const currentCoordinator = async (workspaceId: string, tabId: string): Promise<boolean> => {
-  const workspace = await getWorkspaceById(workspaceId);
-  if (!workspace?.orchestration?.enabled || workspace.orchestration.orchestratorTabId !== tabId) return false;
+export const currentCoordinator = async (workspaceId: string, tabId: string,
+  snapshot?: { workspace: IWorkspace | undefined; liveSessions: ReadonlySet<string> }): Promise<boolean> => {
+  const workspace = snapshot ? snapshot.workspace : await getWorkspaceById(workspaceId);
+  if (workspace?.id !== workspaceId || !workspace.orchestration?.enabled
+    || workspace.orchestration.orchestratorTabId !== tabId) return false;
   const layout = await readLayoutFile(resolveLayoutFile(workspaceId));
   const tab = layout && collectAllTabs(layout.root).find((entry) => entry.id === tabId);
   const token = getTabTokenRecord(tabId);
   return !!tab?.sessionName && token?.workspaceId === workspaceId && token.sessionName === tab.sessionName
-    && tabIdentityOf(workspaceId, tabId) === 'launch' && await hasSession(tab.sessionName);
+    && tabIdentityOf(workspaceId, tabId) === 'launch'
+    && (snapshot ? snapshot.liveSessions.has(tab.sessionName) : await hasSession(tab.sessionName));
 };
 
 /** A persisted human selection is effective only for its exact, still-current launch tab. */

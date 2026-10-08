@@ -4,6 +4,7 @@ import useSWR from 'swr';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
+import { createMissionSubmissionId } from '@/components/features/mission-control/mission-control-utils';
 import type { IGrantee } from '@/types/grant';
 import type { IPortfolioImpact, IPortfolioSnapshot } from '@/types/portfolio';
 
@@ -248,7 +249,7 @@ const PortfolioBoard = () => {
   const submit = async (impact: IPortfolioImpact, kind: 'acknowledge' | 'assign') => {
     setPendingId(impact.id); setError(null);
     try {
-      const actionId = actionIds[impact.id] ?? crypto.randomUUID();
+      const actionId = actionIds[impact.id] ?? createMissionSubmissionId();
       if (kind === 'assign' && !actionIds[impact.id]) setActionIds((current) => ({ ...current, [impact.id]: actionId }));
       await mutate(kind === 'assign'
         ? { type: kind, workspaceId: impact.workspaceId, impactId: impact.id, expectedRevision: impact.revision,
@@ -267,7 +268,7 @@ const PortfolioBoard = () => {
     const evidence = milestoneEvidence[impact.id]?.trim() ?? '';
     const previous = milestoneRequests[impact.id];
     const request = previous?.stage === stage && previous.evidence === evidence
-      ? previous : { eventId: crypto.randomUUID(), observedAt: Date.now(), stage, evidence };
+      ? previous : { eventId: createMissionSubmissionId(), observedAt: Date.now(), stage, evidence };
     setMilestoneRequests((current) => ({ ...current, [impact.id]: request }));
     setPendingId(impact.id); setError(null);
     try {

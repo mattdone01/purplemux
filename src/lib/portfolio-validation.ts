@@ -3,6 +3,7 @@ import { MissionControlError } from '@/lib/mission-control-errors';
 import type { IPortfolioReport, IPortfolioResolution, IPortfolioSelection } from '@/types/portfolio';
 
 const id = z.string().trim().min(1).max(128);
+const actionId = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/, 'actionId must use letters, numbers, hyphens or underscores');
 const text = z.string().trim().min(1).max(500);
 const time = z.number().int().safe().nonnegative();
 const capacity = z.object({
@@ -62,7 +63,7 @@ export const parsePortfolioReport = (input: unknown): IPortfolioReport => parse(
 export const parsePortfolioSelection = (input: unknown): IPortfolioSelection => parse(selection, input);
 export const parsePortfolioAction = (input: unknown): { actionId: string; workspaceId: string; impactId: string;
   expectedRevision: number; decision: string } =>
-  parse(z.object({ actionId: id, workspaceId: id, impactId: id, expectedRevision: time,
+  parse(z.object({ actionId, workspaceId: id, impactId: id, expectedRevision: time,
     decision: z.string().trim().min(1).max(4000) }).strict(), input);
 
 export const parsePortfolioApplied = (input: unknown): { workspaceId: string; runId: string; bindingGeneration: number;

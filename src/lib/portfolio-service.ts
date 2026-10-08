@@ -2,11 +2,12 @@ import { getMissionControlStore } from '@/lib/mission-control-store';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import type { IHumanControlAuthority } from '@/lib/mission-control-http';
 import { getNotesService } from '@/lib/notes-service';
-import { readNotesState } from '@/lib/notes-store';
+import { NOTE_BODY_MAX_BYTES, readNotesState } from '@/lib/notes-store';
 import { getPortfolioStore } from '@/lib/portfolio-store';
 import { currentCoordinator } from '@/lib/scrum-master-access';
 import { readWatches } from '@/lib/watch-store';
 import { getWorkspaces } from '@/lib/workspace-store';
+import { listSessions } from '@/lib/tmux';
 import type { ICaller } from '@/lib/caller';
 import type { IMissionRun } from '@/types/mission-control';
 import type { IWorkspace } from '@/types/terminal';
@@ -103,11 +104,15 @@ export const portfolioCoverage = (
 
 const coverageFor = async (selection: IPortfolioSelection): Promise<IPortfolioCoverage[]> => {
   const { workspaces } = await getWorkspaces();
-  const managerCurrent = await currentCoordinator(selection.managerWorkspaceId, selection.managerTabId);
+  const byId = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+  const liveSessions = new Set(await listSessions());
+  const managerCurrent = await currentCoordinator(selection.managerWorkspaceId, selection.managerTabId,
+    { workspace: byId.get(selection.managerWorkspaceId), liveSessions });
   const targetCurrent = new Map(await Promise.all(selection.workspaceIds.map(async (workspaceId) => {
-    const workspace = workspaces.find((entry) => entry.id === workspaceId);
+    const workspace = byId.get(workspaceId);
     const tabId = workspace?.orchestration?.orchestratorTabId;
-    return [workspaceId, !!tabId && await currentCoordinator(workspaceId, tabId)] as const;
+    return [workspaceId, !!tabId && await currentCoordinator(workspaceId, tabId,
+      { workspace, liveSessions })] as const;
   })));
   const saved = getPortfolioStore().currentSelection()?.selection;
   if (!saved || saved.managerWorkspaceId !== selection.managerWorkspaceId || saved.managerTabId !== selection.managerTabId
@@ -213,6 +218,10 @@ export const assignPortfolioAction = async (
   }
   return withImpactOperation(operationKey(impact.workspaceId, impact.runId, impact.sourceKey), async () => {
     await requirePortfolioCoverage(impact.workspaceId);
+    const noteBody = `Blocker ${impact.id} (revision ${impact.revision})\nDecision by ${actor}: ${input.decision}\nNext action: ${impact.nextAction}\nCheckpoint: ${impact.checkpointAt ?? 'none'}\nReport application separately; note acknowledgement does not resolve this blocker.`;
+    if (Buffer.byteLength(noteBody, 'utf8') > NOTE_BODY_MAX_BYTES) {
+      throw new MissionControlError(400, 'invalid-request', 'composed portfolio note exceeds the 16 KiB body limit');
+    }
     const reserved = store.reserveAction(input.actionId, input.impactId, input.expectedRevision, input.decision, actor);
     if (reserved.state === 'superseded') throw new MissionControlError(409, 'conflict', 'reserved action was superseded');
     if (reserved.state === 'sent') return store.impact(input.impactId)!;
@@ -229,7 +238,7 @@ export const assignPortfolioAction = async (
     const note = await (await getNotesService()).sendHumanPortfolio(
       actor, impact.workspaceId,
       { toWorkspace: impact.workspaceId, subject: `Portfolio clearing action: ${impact.resourceKey}`,
-        body: `Blocker ${impact.id} (revision ${impact.revision})\nDecision by ${actor}: ${input.decision}\nNext action: ${impact.nextAction}\nCheckpoint: ${impact.checkpointAt ?? 'none'}\nReport application separately; note acknowledgement does not resolve this blocker.`,
+        body: noteBody,
         externalKey: `portfolio:action:${input.actionId}` },
     );
     return store.completeAction(input.actionId, note.id);
