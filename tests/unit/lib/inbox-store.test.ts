@@ -216,6 +216,85 @@ describe('inbox store — pure transitions', () => {
   });
 });
 
+describe('inbox store — held recovery (ws-5TO0NJ, 2026-10-08)', () => {
+  beforeEach(() => { seq = 0; });
+
+  const watchReq = (overrides: Record<string, unknown> = {}) =>
+    req({ kind: 'watch', fields: { watchId: 'w-abcd1234', target: 'merge:o/r', notice: 'free' }, ...overrides });
+
+  const heldByRefusals = async (reason = 'composer-not-empty', request = watchReq()) => {
+    const { enqueueInState, refuseInState } = await load();
+    let { state, item } = enqueueInState({ items: [] }, request, T0, ids);
+    for (let i = 1; i <= 30; i++) state = refuseInState(state, item.id, reason, T0 + i * MIN);
+    item = state.items[0];
+    return { state, item };
+  };
+
+  it('reads a refusal-budget hold as recoverable until the item expires; a paste-uncertain hold never', async () => {
+    const { isRecoverableHold, enqueueInState, holdInState, INBOX_MAX_AGE_MS } = await load();
+    const { item } = await heldByRefusals();
+    expect(item).toMatchObject({ state: 'held', heldReason: 'composer-not-empty (30 refusals)' });
+    expect(isRecoverableHold(item, T0 + HOUR)).toBe(true);
+    expect(isRecoverableHold(item, T0 + INBOX_MAX_AGE_MS)).toBe(false);
+    const queued = enqueueInState({ items: [] }, watchReq(), T0, ids);
+    for (const reason of ['transport-uncertain:tmux paste failed', 'stranded-in-composer', 'target-not-agent', 'composer-not-empty (undelivered after 24 h)']) {
+      expect(isRecoverableHold(holdInState(queued.state, queued.item.id, reason, T0).items[0], T0 + 1)).toBe(false);
+    }
+    expect(isRecoverableHold(queued.item, T0)).toBe(false);
+  });
+
+  it('never recovers a held resume (its orchestrator was told and may resume by hand) or a held mission (its row closed)', async () => {
+    const { isRecoverableHold } = await load();
+    const resume = await heldByRefusals('composer-not-empty', req());
+    expect(isRecoverableHold(resume.item, T0 + HOUR)).toBe(false);
+    const mission = await heldByRefusals('composer-not-empty', req({
+      kind: 'mission', fields: { event: 'bootstrap', bootstrapKey: `boot-${'a'.repeat(32)}`, workspaceId: 'ws-1' },
+    }));
+    expect(isRecoverableHold(mission.item, T0 + HOUR)).toBe(false);
+  });
+
+  it('keeps a recoverable hold at the head of its tab: probed every 5 min or on a wake, and nothing behind it overtakes', async () => {
+    const { enqueueInState, dueItems, HELD_REPROBE_MS } = await load();
+    const held = await heldByRefusals();
+    let state = held.state;
+    const lastAttempt = held.item.lastAttemptAt!;
+    state = enqueueInState(state, watchReq({ dedupeKey: 'later' }), lastAttempt + 1, ids).state;
+    state = enqueueInState(state, watchReq({ dedupeKey: 'other', targetTabId: 'tab-o' }), lastAttempt + 1, ids).state;
+    expect(dueItems(state, lastAttempt + 2, () => false).map((i) => i.dedupeKey)).toEqual(['other']);
+    expect(dueItems(state, lastAttempt + 2, (i) => i.id === held.item.id).map((i) => i.dedupeKey)).toEqual([held.item.dedupeKey, 'other']);
+    expect(dueItems(state, lastAttempt + HELD_REPROBE_MS, () => false).map((i) => i.dedupeKey)).toEqual([held.item.dedupeKey, 'other']);
+  });
+
+  it('lets the queue pass a hold that is not recoverable', async () => {
+    const { enqueueInState, holdInState, dueItems } = await load();
+    const first = enqueueInState({ items: [] }, watchReq({ dedupeKey: 'stranded' }), T0, ids);
+    let state = holdInState(first.state, first.item.id, 'stranded-in-composer', T0 + 1);
+    state = enqueueInState(state, watchReq({ dedupeKey: 'next' }), T0 + 2, ids).state;
+    expect(dueItems(state, T0 + 3, () => false).map((i) => i.dedupeKey)).toEqual(['next']);
+  });
+
+  it('records a re-probe of a recoverable hold: a refusal keeps it held, a delivery delivers it, a strand ends recovery', async () => {
+    const { refuseInState, deliverInState, holdInState, isRecoverableHold } = await load();
+    const { state, item } = await heldByRefusals();
+    const at = T0 + 2 * HOUR;
+    const refused = refuseInState(state, item.id, 'composer-not-ready:busy', at).items[0];
+    expect(refused).toMatchObject({ state: 'held', attempts: 31, lastAttemptAt: at, lastRefusal: 'composer-not-ready:busy', heldReason: 'composer-not-ready:busy (31 refusals)', transitionAt: item.transitionAt });
+    expect(deliverInState(state, item.id, at).items[0]).toMatchObject({ state: 'delivered', deliveredAt: at, transitionAt: at });
+    const stranded = holdInState(state, item.id, 'stranded-in-composer', at).items[0];
+    expect(stranded).toMatchObject({ state: 'held', heldReason: 'stranded-in-composer', lastAttemptAt: at });
+    expect(isRecoverableHold(stranded, at)).toBe(false);
+  });
+
+  it('never delivers or re-holds a hold that is not recoverable', async () => {
+    const { enqueueInState, holdInState, deliverInState, refuseInState } = await load();
+    const queued = enqueueInState({ items: [] }, watchReq(), T0, ids);
+    const state = holdInState(queued.state, queued.item.id, 'transport-uncertain:x', T0 + 1);
+    expect(deliverInState(state, queued.item.id, T0 + 2)).toEqual(state);
+    expect(refuseInState(state, queued.item.id, 'composer-not-empty', T0 + 2)).toEqual(state);
+    expect(holdInState(state, queued.item.id, 'stranded-in-composer', T0 + 2)).toEqual(state);
+  });
+});
+
 describe('inbox store — file', () => {
   beforeEach(async () => {
     vi.resetModules();

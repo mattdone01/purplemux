@@ -33,9 +33,16 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
   const orchestratorSnapshot = getOrchestratorPresenceMonitor().snapshot();
   const [leases, openNotes, watches, grants, inboxHeld, host] = await Promise.all([
     section(async () => viewsOf(await listLeases(undefined, now))),
-    section(async (): Promise<INoteRow[]> => (await notes.readNotesState()).notes
-      .filter((n) => notes.OPEN_STATES.has(n.state))
-      .map((n) => ({ ...notes.viewOf(n), ageSeconds: Math.max(0, Math.floor((now - n.createdAt) / 1000)) }))),
+    section(async (): Promise<INoteRow[]> => {
+      const [{ notes: all }, inbox] = await Promise.all([notes.readNotesState(), readInboxState()]);
+      const notices = new Map(inbox.items.map((item) => [item.id, item]));
+      return all
+        .filter((n) => notes.OPEN_STATES.has(n.state))
+        .map((n) => ({
+          ...notes.viewOf(n, n.inboxItemId ? notices.get(n.inboxItemId) ?? null : null),
+          ageSeconds: Math.max(0, Math.floor((now - n.createdAt) / 1000)),
+        }));
+    }),
     section(async () => (await getWatchManager()).list(PANEL_CALLER, null)),
     section(async () => {
       const refusal = grantStore.grantsRefusal();

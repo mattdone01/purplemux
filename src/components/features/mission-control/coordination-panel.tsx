@@ -10,7 +10,7 @@ import type { ICoordinationSnapshot, THostSignals, TSection } from '@/types/coor
 // never block the fleet silently, and a full disk must show before it bites.
 
 const HOLDER_LABEL: Record<string, string> = { live: 'live', 'agent-gone': 'agent gone', closed: 'closed', admin: 'admin' };
-const NOTE_LABEL: Record<string, string> = { queued: 'queued', delivered: 'delivered', undeliverable: 'undeliverable' };
+const NOTE_LABEL: Record<string, string> = { queued: 'queued', pending: 'pending', held: 'held', delivered: 'delivered', undeliverable: 'undeliverable' };
 const OWNER_LABEL: Record<string, string> = { live: 'live', closed: 'owner closed', unknown: 'owner unknown' };
 const WATCH_KIND_LABEL: Record<string, string> = { pr: 'PR', ref: 'ref', lease: 'lease' };
 const WATCH_UNTIL_LABEL: Record<string, string> = {

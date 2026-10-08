@@ -303,8 +303,10 @@ Delivery waits for an agent at its prompt (idle, ready-for-review, or WAITING pe
 with an empty composer and no prompt or option list on screen. A refusal backs off
 10 s → 30 s → 2 min → 5 min; a tab that becomes ready is tried on the next 2 s tick. After
 30 refusals or 24 h the item is "held"; a paste that throws or strands in the composer is
-"held" at once and never retried blind. Closing the target tab drops its queued and held
-items. Delivered, dropped and held items are kept 7 days.
+"held" at once and never retried blind. A note, watch or deploy item held after 30 refusals is
+probed again every 5 min, and sooner when its tab ends a turn, until 24 h after it was queued. It
+stays first in its tab's queue, so notices behind it arrive in order. Closing the target tab drops
+its queued and held items. Delivered, dropped and held items are kept 7 days.
 
 GET /api/cli/inbox?workspaceId=WS[&all=1]
   Read scope. Queued and held items targeting WS's tabs; all=1 adds delivered and dropped.
@@ -313,10 +315,11 @@ GET /api/cli/inbox?workspaceId=WS[&all=1]
     "droppedReason", "expiresAt", "transitionAt", ... }] }
 
 POST /api/cli/inbox/<id>/retry
-  The target workspace's own token or the admin token. Re-queues a held item once, with a
-  fresh refusal budget. 404 { "code": "inbox-not-found" } (CLI exit 7) for an unknown id AND
-  for another workspace's item; 409 { "code": "inbox-not-held" } (CLI exit 3) when the item
-  is not held, or when a newer notice with its key is already queued for that tab.
+  The target workspace's own token, the workspace that sent the note the item carries, or the
+  admin token. Re-queues a held item once, with a fresh refusal budget. 404 { "code":
+  "inbox-not-found" } (CLI exit 7) for an unknown id AND for any other workspace's item;
+  409 { "code": "inbox-not-held" } (CLI exit 3) when the item is not held, or when a newer
+  notice with its key is already queued for that tab.
 
 ## Notes (ADR-0013)
 
@@ -333,8 +336,9 @@ the line reached its composer, and one notice reaches the sender's tab (if live)
 more. A note unacked or undeliverable for 14 days expires (one notice to a live sender); acked and
 expired notes are pruned 14 days later. At turn start, run \`note list --open --to-me\`.
 
-The compatible note state "delivered" means ROUTED. The notice reached a composer only when
-deliveredAt (also receipt.composerDeliveredAt) is non-null. Each authorized response includes this
+A routed note reads state "pending" while its notice waits in the inbox, "held" while the inbox
+holds it, and "delivered" only after the notice reached a composer (deliveredAt, also
+receipt.composerDeliveredAt, is then non-null). Each authorized response includes this
 note's receipt: routing status/reason, authorized sender/recipient, and its own notice state,
 last refusal, held reason, and composer delivery time. It never includes the recipient's inbox.
 Queued notices are revalidated immediately before paste; terminal, legacy-policy-blocked, or stale

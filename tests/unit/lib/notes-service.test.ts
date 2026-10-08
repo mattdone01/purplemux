@@ -310,9 +310,22 @@ describe('notes (ADR-0013)', () => {
     if (verdict.ok) verdict.settle();
   });
 
+  it('reports a routed note as pending, then held, and delivered only once its notice reached the composer (n-xVHNr3aVfm)', async () => {
+    const sent = await svc.send(B, { toEpic: 'ddh', subject: 'state', body: 'b' });
+    const itemId = f.note(sent.id).inboxItemId!;
+    expect(sent).toMatchObject({ state: 'pending', deliveredAt: null, receipt: { routingStatus: 'routed', notice: { state: 'queued' } } });
+    f.inbox.set(itemId, { ...f.inbox.get(itemId)!, state: 'held', heldReason: 'composer-not-empty (30 refusals)' } as IInboxItem);
+    expect((await svc.show(B, sent.id)).note).toMatchObject({ state: 'held', deliveredAt: null, receipt: { notice: { state: 'held' } } });
+    expect((await svc.list(B, { fromMe: true }))[0]).toMatchObject({ state: 'held' });
+    f.deliverInbox(itemId, T0 + 5);
+    expect((await svc.show(B, sent.id)).note).toMatchObject({ state: 'delivered', receipt: { composerDeliveredAt: T0 + 5 } });
+    // The stored state stays the routed value that ack, --open and the paste preflight key on.
+    expect(f.note(sent.id).state).toBe('delivered');
+  });
+
   it('routes a note to the live epic owner with exactly the one fixed line, and the owner reads the body', async () => {
     const view = await svc.send(B, { toEpic: 'ddh', subject: 'tolerance', body: 'Adopt REPROVE_DUE_TOLERANCE=2 in story 03.' });
-    expect(view).toMatchObject({ state: 'delivered', deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a' }, subject: 'tolerance' });
+    expect(view).toMatchObject({ state: 'pending', deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a' }, subject: 'tolerance' });
     expect(view).not.toHaveProperty('body');
     expect(f.sent).toHaveLength(1);
     expect(f.sent[0]).toMatchObject({ targetWorkspaceId: 'ws-1', targetTabId: 'tab-a' });
