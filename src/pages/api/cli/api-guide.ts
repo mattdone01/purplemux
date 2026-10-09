@@ -469,6 +469,8 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   The human UI can explicitly replace after confirmation; it uses cookie, same origin and CAS,
   and leaves the former process running. Global tokens, peers and grants confer no mutation right.
   CLI: orchestration recover -w WS TAB; orchestration handoff -w WS TAB; on aliases recover.
+  A committed change of the coordinator tab moves each open Mission Control run of the workspace
+  to the new coordinator at the next binding generation (see "Orchestrator rebind" below).
   Clear/off requires fresh complete work evidence: no active epic lease, agent work or background
   job, no unfinished standup, and no unknown observations. awaiting-human retains ownership and
   pauses idle heartbeats. A tab's live reportsTo still overrides the coordinator nudge target.
@@ -631,8 +633,27 @@ POST /api/cli/mission-control/events?workspaceId=WS
     "expectedRevision":2,"producerAt":1700000000002,"bindingGeneration":1,"type":"answer.acknowledged",
     "payload":{"answerId":"ANSWER_ID"}}]}
 
+  Orchestrator rebind (server-authored, never sent by a producer):
+  A handoff, recovery or human replacement of the workspace orchestrator moves each open bound
+  run to the new orchestrator's live identity: binding.generation and the run revision each
+  increase by 1, and the run's event log gains one "run.rebound" event with payload
+  { "cause": "handoff" | "recover" | "replace" | "heal", "previousBinding", "binding",
+    "actor": "system:orchestration" }. "heal" is the same rebind applied at server start to a
+  run whose bound tab left the workspace. Events from the previous generation then return 409
+  (stale or unbound orchestrator generation). The new orchestrator reads its run ID, revision
+  and binding generation with \`purplemux mission bootstrap -w WS\` or the snapshot, and uses
+  them on its next event. The rebind waits until the new orchestrator's agent session is
+  known; until then the run keeps its previous binding. Repeating the handoff or recovery for
+  the orchestrator already in place changes no revision and re-asserts the binding of a run
+  left on another tab; when the run is already bound it changes nothing. Answers not yet
+  delivered follow the run to the new orchestrator; an answer whose paste was in flight stays
+  held and is read with \`purplemux mission answers -w WS\`. An unbound provisional run is
+  still bound by run.resumed.
+  Clients must treat an event type they do not know as an opaque audit row.
+
 CLI equivalents:
   purplemux mission snapshot -w WS
+  purplemux mission bootstrap -w WS
   purplemux mission events -w WS --json '{"events":[...]}'
   purplemux mission answers -w WS [--run RUN] [--all]
   purplemux mission ack -w WS --run RUN --answer ANSWER --generation N --revision N --event-id EVENT --producer-at MS

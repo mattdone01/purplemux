@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   panes: new Map<string, { command: string; path: string; pid: number; windowActivity: number }>(),
   getWorkspaces: vi.fn(),
   readLayoutFile: vi.fn(),
+  readWorkspaceLayout: vi.fn(),
   readStandups: vi.fn(),
   getAllPanesInfo: vi.fn(),
   findTab: vi.fn(),
@@ -48,6 +49,7 @@ vi.mock('@/lib/layout-store', async () => {
   };
 });
 
+vi.mock('@/lib/workspace-layout-read', () => ({ readWorkspaceLayout: mocks.readWorkspaceLayout }));
 vi.mock('@/lib/standup-store', () => ({ readStandups: mocks.readStandups }));
 vi.mock('@/lib/tmux', async () => {
   const actual = await vi.importActual<typeof import('@/lib/tmux')>('@/lib/tmux');
@@ -74,6 +76,7 @@ import {
   missionBootstrapKey,
   missionLiveRunSourceKey,
   MissionControlRuntime,
+  resolveMissionOrchestratorTarget,
   type IMissionControlRuntimeStore,
   type IMissionRuntimeDeps,
 } from '@/lib/mission-control-runtime';
@@ -265,6 +268,51 @@ describe('Mission Control runtime discovery', () => {
     expect(workspace.run).toBeNull();
     expect(workspace.lastProgressAt).toBe(NOW - 24 * 60 * 60_000);
     expect(workspace.candidates).toHaveLength(1);
+  });
+});
+
+describe('Mission Control orchestrator target (the tab a stale binding may heal to)', () => {
+  const layoutWith = (...tabIds: string[]): ILayoutData => ({
+    root: {
+      type: 'split', orientation: 'horizontal', ratio: 0.5,
+      children: [
+        { type: 'pane', id: 'pane-one', activeTabId: tabIds[0] ?? null, tabs: tabIds.slice(0, 1).map((id, order) => ({ id, sessionName: `pt-${id}`, name: id, order, panelType: 'claude-code' })) },
+        { type: 'pane', id: 'pane-two', activeTabId: tabIds[1] ?? null, tabs: tabIds.slice(1).map((id, order) => ({ id, sessionName: `pt-${id}`, name: id, order, panelType: 'terminal' })) },
+      ],
+    },
+    activePaneId: 'pane-one',
+    updatedAt: new Date(NOW).toISOString(),
+  });
+  const configure = (orchestration: IWorkspace['orchestration']) => mocks.getWorkspaces.mockResolvedValue({
+    workspaces: [{ id: 'ws-one', name: 'One', directories: ['/repo'], orchestration }], groups: [], sidebarCollapsed: false, sidebarWidth: 220,
+  });
+
+  beforeEach(() => {
+    configure({ enabled: true, orchestratorTabId: 'orch' });
+    mocks.readWorkspaceLayout.mockReset();
+    mocks.readWorkspaceLayout.mockResolvedValue(layoutWith('orch', 'worker', 'shell'));
+  });
+
+  it('names the configured orchestrator and every tab of the workspace layout', async () => {
+    expect(await resolveMissionOrchestratorTarget('ws-one')).toEqual({ tabId: 'orch', tabIds: ['orch', 'worker', 'shell'] });
+    expect(mocks.readWorkspaceLayout).toHaveBeenCalledWith('ws-one');
+  });
+
+  it('uses the configured tab the event authority uses, enabled or not', async () => {
+    configure({ enabled: false, orchestratorTabId: 'orch' });
+    expect(await resolveMissionOrchestratorTarget('ws-one')).toMatchObject({ tabId: 'orch' });
+  });
+
+  it.each([
+    ['no orchestrator is configured', () => configure({ enabled: false, orchestratorTabId: null })],
+    ['the workspace has no orchestration record', () => configure(undefined)],
+    ['the workspace is unknown', () => mocks.getWorkspaces.mockResolvedValue({ workspaces: [], groups: [], sidebarCollapsed: false, sidebarWidth: 220 })],
+    ['the configured tab left the layout', () => mocks.readWorkspaceLayout.mockResolvedValue(layoutWith('worker', 'shell'))],
+    ['the layout file is missing', () => mocks.readWorkspaceLayout.mockResolvedValue(null)],
+    ['the layout is unreadable', () => mocks.readWorkspaceLayout.mockRejectedValue(new Error('Invalid workspace layout'))],
+  ])('is null when %s', async (_case, arrange) => {
+    arrange();
+    expect(await resolveMissionOrchestratorTarget('ws-one')).toBeNull();
   });
 });
 
@@ -484,6 +532,8 @@ const runtimeHarness = (options: {
     validateDeliveryAttempt,
     finalizeDeliveryAttempt,
     recoverDispatching: vi.fn(() => 0),
+    listOpenRunBindings: vi.fn(() => []),
+    rebindOpenRuns: vi.fn(() => []),
     listQueuedBootstrapEntries: vi.fn(() => options.bootstrap
       ? [{ bootstrapId: 'bootstrap-one', entry: options.bootstrap.entry, attempts: 0, nextAttemptAt: NOW }]
       : []),
@@ -515,6 +565,8 @@ const runtimeHarness = (options: {
     discover: vi.fn(),
     workspaceViews: vi.fn(async () => []),
     resolveIdentity: vi.fn(async () => (options.identity === undefined ? liveIdentity : options.identity)),
+    orchestratorTarget: vi.fn(async () => null),
+    withMappingRead: (_workspaceId, work) => work(),
     inbox,
     setInterval: vi.fn(() => 1 as unknown as ReturnType<typeof setInterval>),
     clearInterval: vi.fn(),

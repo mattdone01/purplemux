@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ITab, IWorkspaceOrchestration } from '@/types/terminal';
 import type { IOrchestrationChange } from '@/lib/orchestration-recovery';
 
-const fixture = vi.hoisted(() => ({ home: '', runtime: vi.fn(), work: vi.fn(), model: vi.fn(), sessions: vi.fn() }));
+const fixture = vi.hoisted(() => ({ home: '', runtime: vi.fn(), work: vi.fn(), model: vi.fn(), sessions: vi.fn(), rebind: vi.fn() }));
 vi.mock('os', async (original) => {
   const actual = await original<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => fixture.home }, homedir: () => fixture.home };
@@ -14,6 +14,7 @@ vi.mock('@/lib/orchestration-runtime', () => ({ observeOrchestrationRuntime: fix
 vi.mock('@/lib/orchestration-work-state', () => ({ readOrchestrationWorkState: fixture.work }));
 vi.mock('@/lib/tmux', () => ({ killSession: vi.fn(async () => null), hasSession: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'), sendKeys: vi.fn(), listSessions: vi.fn(async () => []), workspaceSessionName: vi.fn(), observeTabSessionsStrict: fixture.sessions }));
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
+vi.mock('@/lib/mission-control-runtime', () => ({ rebindMissionRunsToOrchestrator: fixture.rebind }));
 const file = () => path.join(fixture.home, '.purplemux/workspaces.json');
 const layoutFile = () => path.join(fixture.home, '.purplemux/workspaces/ws-a/layout.json');
 const tab = (id: string): ITab => ({ id, name: id, sessionName: `session-${id}`, panelType: 'claude-code', order: 0 });
@@ -31,6 +32,7 @@ beforeEach(() => {
   fixture.work.mockResolvedValue({ state: 'complete', evidence: [], incomplete: false });
   fixture.model.mockResolvedValue(true);
   fixture.sessions.mockResolvedValue({ state: 'present', sessions: ['pt-ws-a-pane-a-tab-missing'] });
+  fixture.rebind.mockResolvedValue([]);
   for (const key of ['__purplemuxWorkspacesContentCache', '__ptWorkspacesMemo', '__ptTabTokens', '__ptWorkspaceTokens']) delete (globalThis as Record<string, unknown>)[key];
 });
 afterEach(() => { fs.rmSync(fixture.home, { recursive: true, force: true }); });
@@ -188,4 +190,72 @@ it.each(['pane-close', 'workspace-delete'])('%s cannot cross recovery validation
   expect(finished).toBe(false); expect((await import('@/lib/tmux')).killSession).not.toHaveBeenCalled();
   release.resolve(); await changing; await completion;
   expect(finished).toBe(true); expect((await import('@/lib/tmux')).killSession).toHaveBeenCalled();
+});
+
+describe('a committed coordinator change rebinds the workspace Mission Control runs', () => {
+  const verifiedIncumbent = { kind: 'workspace' as const, workspaceId: 'ws-a', tabId: 'tab-old', verified: true };
+  const bothLive = () => fixture.runtime.mockImplementation(async (target: ITab) => ({ state: 'present', identity: target.sessionName }));
+
+  it('a verified handoff reports the new coordinator with cause handoff, after the commit', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old' }); bothLive();
+    fixture.rebind.mockImplementation(async () => {
+      expect(JSON.parse(fs.readFileSync(file(), 'utf8')).workspaces[0].orchestration).toMatchObject({ orchestratorTabId: 'tab-next', revision: 1 });
+      return [];
+    });
+    await (await load()).changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options({ mode: 'handoff', actor: verifiedIncumbent }));
+    expect(fixture.rebind.mock.calls).toEqual([['ws-a', 'tab-next', 'handoff']]);
+  });
+  it('an own-workspace recovery reports cause recover, and a human replacement cause replace', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old' });
+    const { changeOrchestration } = await load();
+    await changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options());
+    bothLive();
+    await changeOrchestration('ws-a', { orchestratorTabId: 'tab-old' }, options({ mode: 'replace', actor: { kind: 'human' }, expectedRevision: 1 }));
+    expect(fixture.rebind.mock.calls).toEqual([['ws-a', 'tab-next', 'recover'], ['ws-a', 'tab-old', 'replace']]);
+  });
+  it('the first designation of a coordinator reports cause recover', async () => {
+    await (await load()).changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options());
+    expect(fixture.rebind.mock.calls).toEqual([['ws-a', 'tab-next', 'recover']]);
+  });
+  it('reports nothing when the commit is refused, only the template changes, a human saves the same tab, or orchestration is switched off', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old' }); bothLive();
+    const { changeOrchestration } = await load();
+    await expect(changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options())).rejects.toMatchObject({ code: 'orchestrator-live' });
+    await expect(changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options({ mode: 'handoff', actor: verifiedIncumbent, expectedRevision: 7 }))).rejects.toMatchObject({ code: 'orchestration-conflict' });
+    await expect(changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-old' }, options({ expectedRevision: 7 }))).rejects.toMatchObject({ code: 'orchestration-conflict' });
+    await changeOrchestration('ws-a', { kickoffTemplate: 'changed' }, options());
+    await changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-old' }, options({ mode: 'update', actor: { kind: 'human' }, expectedRevision: 1 }));
+    await changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-old' }, options({ mode: 'replace', actor: { kind: 'human' }, expectedRevision: 1 }));
+    await changeOrchestration('ws-a', { enabled: false }, options({ expectedRevision: 1 }));
+    await changeOrchestration('ws-a', { enabled: false, orchestratorTabId: 'tab-old' }, options({ expectedRevision: 2 }));
+    expect(fixture.rebind).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(file(), 'utf8')).workspaces[0].orchestration).toMatchObject({ enabled: false, orchestratorTabId: 'tab-old', revision: 2 });
+  });
+  it('a handoff or recovery that names the coordinator already in place re-asserts it without a mapping change', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old' }); bothLive();
+    const { changeOrchestration } = await load();
+    const again = { enabled: true, orchestratorTabId: 'tab-old' };
+    expect((await changeOrchestration('ws-a', again, options({ mode: 'handoff', actor: verifiedIncumbent }))).orchestration?.revision).toBe(0);
+    expect((await changeOrchestration('ws-a', again, options())).orchestration?.revision).toBe(0);
+    expect(fixture.rebind.mock.calls).toEqual([['ws-a', 'tab-old', 'handoff'], ['ws-a', 'tab-old', 'recover']]);
+    expect(fixture.runtime).not.toHaveBeenCalled();
+  });
+  it('a failing Mission Control rebind never fails or undoes the committed handoff', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old' }); bothLive();
+    fixture.rebind.mockRejectedValue(new Error('mission storage unavailable'));
+    const updated = await (await load()).changeOrchestration('ws-a', { orchestratorTabId: 'tab-next' }, options({ mode: 'handoff', actor: verifiedIncumbent }));
+    expect(updated.orchestration).toMatchObject({ orchestratorTabId: 'tab-next', revision: 1 });
+    expect(JSON.parse(fs.readFileSync(file(), 'utf8')).workspaces[0].orchestration.orchestratorTabId).toBe('tab-next');
+    expect(fixture.rebind).toHaveBeenCalledTimes(1);
+  });
+  it('a human start reports the tab it created, and nothing when its commit fails', async () => {
+    const { startOrchestrationTransaction } = await load();
+    const started = await startOrchestrationTransaction('ws-a', options({ mode: 'update', actor: { kind: 'human' } }), undefined, async () => tab('tab-new'));
+    expect(started.workspace.orchestration).toMatchObject({ orchestratorTabId: 'tab-new', revision: 1 });
+    expect(fixture.rebind.mock.calls).toEqual([['ws-a', 'tab-new', 'recover']]);
+    fixture.rebind.mockClear();
+    await expect(startOrchestrationTransaction('ws-a', options({ expectedRevision: 1, mode: 'replace', actor: { kind: 'human' } }), undefined, async () => { fs.mkdirSync(file()+'.tmp'); return tab('tab-newer'); }))
+      .rejects.toMatchObject({ code: 'orchestration-persist-failed' });
+    expect(fixture.rebind).not.toHaveBeenCalled();
+  });
 });

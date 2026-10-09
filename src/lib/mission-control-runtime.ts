@@ -5,12 +5,14 @@ import { registerInboxPreflight, type TInboxPreflight } from '@/lib/inbox-dispat
 import { enqueueNotice, readInboxState, withdrawNotice, type IEnqueueRequest } from '@/lib/inbox-store';
 import { collectAllTabs, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
 import { createLogger } from '@/lib/logger';
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
 import { getProviderByPanelType } from '@/lib/providers/registry';
 import { verifyCodexActiveRuntime } from '@/lib/providers/codex/launch-lifecycle';
 import { getChildPids } from '@/lib/process-utils';
 import { readStandups } from '@/lib/standup-store';
 import { getStatusManager } from '@/lib/status-manager';
 import { getAllPanesInfo } from '@/lib/tmux';
+import { readWorkspaceLayout } from '@/lib/workspace-layout-read';
 import { getWorkspaces } from '@/lib/workspace-store';
 import {
   getMissionControlStore,
@@ -26,10 +28,12 @@ import type {
   IMissionBinding,
   IMissionBootstrap,
   IMissionDelivery,
+  IMissionEvent,
   IMissionEvidence,
   IMissionSnapshot,
   IMissionWorkspaceView,
   TMissionActivity,
+  TMissionRebindCause,
 } from '@/types/mission-control';
 import type { IInboxItem } from '@/types/inbox';
 import type { IWorkspaceStandup } from '@/types/status';
@@ -42,6 +46,7 @@ const BOOTSTRAP_LIMIT = 10;
 const WORKER_INTERVAL_MS = 1_000;
 const STALE_BUSY_MS = 10 * 60_000;
 const RECENT_STANDUP_MS = 30 * 60_000;
+const REBIND_RETRY_MS = 5_000;
 
 export type IMissionControlRuntimeStore = Pick<MissionControlStore,
   | 'snapshot'
@@ -53,11 +58,19 @@ export type IMissionControlRuntimeStore = Pick<MissionControlStore,
   | 'validateDeliveryAttempt'
   | 'finalizeDeliveryAttempt'
   | 'recoverDispatching'
+  | 'listOpenRunBindings'
+  | 'rebindOpenRuns'
   | 'listQueuedBootstrapEntries'
   | 'claimBootstrapEntry'
   | 'validateBootstrapAttempt'
   | 'completeBootstrapAttempt'
 >;
+
+/** The configured orchestrator of a workspace and every tab its layout holds. */
+export interface IMissionOrchestratorTarget {
+  tabId: string;
+  tabIds: string[];
+}
 
 export interface IMissionRuntimeDeps {
   getStore: () => IMissionControlRuntimeStore;
@@ -65,6 +78,10 @@ export interface IMissionRuntimeDeps {
   discover: (bootstrapId: string, reconcile: boolean, boundarySeq: number) => Promise<IMissionDiscoveryInput>;
   workspaceViews: () => Promise<IMissionWorkspaceView[]>;
   resolveIdentity: (workspaceId: string, tabId: string) => Promise<Omit<IMissionBinding, 'generation'> | null>;
+  /** Null without a configured orchestrator tab that a readable layout still holds. */
+  orchestratorTarget: (workspaceId: string) => Promise<IMissionOrchestratorTarget | null>;
+  /** Excludes an orchestrator change of the workspace while a deferred rebind reads the mapping and writes. */
+  withMappingRead: <T>(workspaceId: string, work: () => Promise<T>) => Promise<T>;
   inbox: IMissionInbox;
   setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
   clearInterval: (timer: ReturnType<typeof setInterval>) => void;
@@ -422,12 +439,24 @@ const discover = async (
   workspaces: await discoverMissionControlWorkspaces(),
 });
 
+export const resolveMissionOrchestratorTarget = async (workspaceId: string): Promise<IMissionOrchestratorTarget | null> => {
+  const { workspaces } = await getWorkspaces();
+  const tabId = workspaces.find((workspace) => workspace.id === workspaceId)?.orchestration?.orchestratorTabId;
+  if (!tabId) return null;
+  const layout = await readWorkspaceLayout(workspaceId).catch(() => null);
+  if (!layout) return null;
+  const tabIds = collectAllTabs(layout.root).map((tab) => tab.id);
+  return tabIds.includes(tabId) ? { tabId, tabIds } : null;
+};
+
 const defaultDeps: IMissionRuntimeDeps = {
   getStore: getMissionControlStore,
   now: () => Date.now(),
   discover,
   workspaceViews,
   resolveIdentity: resolveMissionTargetIdentity,
+  orchestratorTarget: resolveMissionOrchestratorTarget,
+  withMappingRead: withOrchestrationMappingRead,
   inbox: {
     enqueue: enqueueNotice,
     items: async () => (await readInboxState()).items,
@@ -453,6 +482,9 @@ export class MissionControlRuntime {
   private unregisterPreflight: (() => void) | null = null;
   private lastInboxReadError: string | null = null;
   private stopping = false;
+  private pendingRebinds = new Map<string, TMissionRebindCause>();
+  private bindingsScanned = false;
+  private nextRebindAttemptAt = 0;
 
   constructor(private deps: IMissionRuntimeDeps = defaultDeps) {}
 
@@ -508,6 +540,76 @@ export class MissionControlRuntime {
     return result;
   }
 
+  /**
+   * The commit point of an orchestrator change. The open runs of the workspace follow the new
+   * orchestrator once its live identity resolves; until then the rebind waits for the worker, and no
+   * binding is written from a guess. Never throws: the mapping is already committed.
+   */
+  async rebindToOrchestrator(workspaceId: string, tabId: string, cause: TMissionRebindCause): Promise<IMissionEvent[]> {
+    try {
+      const store = this.deps.getStore();
+      if (store.listOpenRunBindings(workspaceId).length === 0) {
+        this.pendingRebinds.delete(workspaceId);
+        return [];
+      }
+      const identity = await this.deps.resolveIdentity(workspaceId, tabId);
+      if (!identity) {
+        this.pendingRebinds.set(workspaceId, cause);
+        return [];
+      }
+      const events = store.rebindOpenRuns({ workspaceId, identity, cause });
+      this.pendingRebinds.delete(workspaceId);
+      this.logRebound(workspaceId, cause, events);
+      return events;
+    } catch (error) {
+      this.pendingRebinds.set(workspaceId, cause);
+      log.error({ err: error, workspaceId, tabId, cause }, 'Mission Control rebind deferred after a failure');
+      return [];
+    }
+  }
+
+  private logRebound(workspaceId: string, cause: TMissionRebindCause, events: IMissionEvent[]): void {
+    if (events.length === 0) return;
+    log.info({ workspaceId, cause, runIds: events.map((event) => event.runId) }, 'Mission Control runs rebound to the orchestrator');
+  }
+
+  /**
+   * Rebinds that could not complete at their commit point, and — once per process — the bindings an
+   * earlier release or a restart left on a tab that is gone. Each waits until the configured
+   * orchestrator's live identity resolves.
+   */
+  private async settleRebinds(store: IMissionControlRuntimeStore): Promise<void> {
+    if (!this.bindingsScanned) {
+      for (const run of store.listOpenRunBindings()) {
+        if (!this.pendingRebinds.has(run.workspaceId)) this.pendingRebinds.set(run.workspaceId, 'heal');
+      }
+      this.bindingsScanned = true;
+    }
+    if (this.pendingRebinds.size === 0 || this.deps.now() < this.nextRebindAttemptAt) return;
+    this.nextRebindAttemptAt = this.deps.now() + REBIND_RETRY_MS;
+    for (const workspaceId of [...this.pendingRebinds.keys()]) {
+      await this.deps.withMappingRead(workspaceId, async () => {
+        const cause = this.pendingRebinds.get(workspaceId);
+        if (cause && await this.settleRebind(store, workspaceId, cause)) this.pendingRebinds.delete(workspaceId);
+      });
+    }
+  }
+
+  /** True when nothing is left to wait for: the runs were rebound, or there is nothing to bind or to bind to. */
+  private async settleRebind(store: IMissionControlRuntimeStore, workspaceId: string, cause: TMissionRebindCause): Promise<boolean> {
+    const target = await this.deps.orchestratorTarget(workspaceId);
+    if (!target) return true;
+    // A heal moves a binding only off a tab that left the workspace: a run a live sibling tab holds stays.
+    const eligible = cause === 'heal'
+      ? (binding: IMissionBinding) => binding.tabId !== target.tabId && !target.tabIds.includes(binding.tabId)
+      : undefined;
+    if (!store.listOpenRunBindings(workspaceId).some((run) => !eligible || eligible(run.binding))) return true;
+    const identity = await this.deps.resolveIdentity(workspaceId, target.tabId);
+    if (!identity) return false;
+    this.logRebound(workspaceId, cause, store.rebindOpenRuns({ workspaceId, identity, cause, eligible }));
+    return true;
+  }
+
   async tick(): Promise<void> {
     if (this.stopping) return;
     if (this.running) return this.running;
@@ -526,6 +628,10 @@ export class MissionControlRuntime {
       store.recoverDispatching('server-restarted-during-uncertain-delivery');
       this.recovered = true;
     }
+    // Contained: deliveries never wait on a workspace whose orchestrator cannot be read.
+    await this.settleRebinds(store).catch((error) => {
+      log.error({ err: error }, 'Mission Control rebind pass failed');
+    });
     this.unregisterPreflight ??= this.deps.inbox.registerPreflight('mission', (item) => this.preflight(item));
     // An unreadable inbox skips the whole pass: a handoff would only fail to enqueue and hold the row.
     if (!await this.sync(store)) return;
@@ -778,6 +884,13 @@ export const getMissionControlRuntime = (): MissionControlRuntime => {
   if (!g.__ptMissionControlRuntime) g.__ptMissionControlRuntime = new MissionControlRuntime();
   return g.__ptMissionControlRuntime;
 };
+
+/** Called once by each committed change of a workspace's orchestrator tab. */
+export const rebindMissionRunsToOrchestrator = (
+  workspaceId: string,
+  tabId: string,
+  cause: TMissionRebindCause,
+): Promise<IMissionEvent[]> => getMissionControlRuntime().rebindToOrchestrator(workspaceId, tabId, cause);
 
 export const getMissionSnapshot = (workspaceId?: string): Promise<IMissionSnapshot> =>
   getMissionControlRuntime().snapshot(workspaceId);

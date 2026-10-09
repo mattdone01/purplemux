@@ -214,7 +214,7 @@ const checks = async (inst, helpers, results) => {
   const password = `acc-pw-${crypto.createHash('sha256').update(inst.state.scratch).digest('hex').slice(0, 16)}`;
   const session = await humanSession(ctx.port, password);
   if (!session.cookie) {
-    for (const id of ['grant-step-up', 'grant-reads-without-driving', 'grant-only-grantee', 'grant-revoke', 'grant-audit', 'grants-read-session-only', 'coordination-route', 'coordination-panel-built', 'mission-bootstrap-inbox']) {
+    for (const id of ['grant-step-up', 'grant-reads-without-driving', 'grant-only-grantee', 'grant-revoke', 'grant-audit', 'grants-read-session-only', 'coordination-route', 'coordination-panel-built', 'mission-bootstrap-inbox', MISSION_REBIND.id]) {
       fail(id, 'needs the scratch human session', session.why, 'setup 200, login 200 with a session-token cookie');
     }
     return;
@@ -506,6 +506,85 @@ const coordination = async (inst, { check, port, cookie }) => {
   );
 };
 
+// ─── an orchestrator change rebinds the workspace's open Mission Control run ─────────────────────
+const MISSION_REBIND = {
+  id: 'mission-rebind-orchestrator-change',
+  what: 'a committed orchestrator change moves the open Mission Control run to the new orchestrator at the next generation, audited; the old generation is refused and a later change leaves the finished run alone',
+  expected: 'run.started 0; successor bound; replace 0; run bound to the successor at generation 2 and revision 2; one run.rebound (cause replace, previous tab the first orchestrator); mission bootstrap lists the run at generation 2; generation 1 refused with exit 3; human review from the successor accepted as open; after finish and a change back, the finished run still on the successor at generation 2',
+};
+
+/** Pure: the verdict of the rebind check over what the isolated instance returned. */
+const judgeMissionRebind = ({ started, bound, replaced, rebound, audit, listed, stale, asked, item, restored, finished, orchTabId, nextTabId }) => {
+  const auditOk = audit.length === 1 && audit[0].payload?.cause === 'replace'
+    && audit[0].payload?.previousBinding?.tabId === orchTabId && audit[0].payload?.previousBinding?.generation === 1
+    && audit[0].payload?.binding?.tabId === nextTabId && audit[0].payload?.binding?.generation === 2 && audit[0].revision === 2;
+  const staleRefused = stale.rc === 3 && /stale or unbound orchestrator generation/.test(`${stale.err}${stale.out}`);
+  const finishedUntouched = finished?.state === 'completed' && finished.binding?.tabId === nextTabId && finished.binding?.generation === 2;
+  const ok = started.rc === 0 && Boolean(bound) && replaced.rc === 0
+    && rebound?.binding?.tabId === nextTabId && rebound.binding.generation === 2 && rebound.revision === 2
+    && auditOk && listed?.tabId === nextTabId && listed.bindingGeneration === 2
+    && staleRefused && asked.rc === 0 && item?.state === 'open'
+    && restored.rc === 0 && finishedUntouched;
+  return {
+    ok,
+    measured: `run.started ${started.rc}; successor bound ${Boolean(bound)}; replace ${replaced.rc}; run binding ${JSON.stringify(rebound?.binding ?? null)} revision ${rebound?.revision ?? 'none'}; `
+      + `run.rebound ${JSON.stringify(audit.map((event) => ({ cause: event.payload?.cause, from: event.payload?.previousBinding?.tabId, to: event.payload?.binding?.tabId, generation: event.payload?.binding?.generation, revision: event.revision })))}; `
+      + `bootstrap ${JSON.stringify(listed ?? null)}; generation 1 exit ${stale.rc} ${JSON.stringify(`${stale.err}`.trim().slice(0, 120))}; review ${asked.rc} item ${item?.state ?? 'none'}; `
+      + `change back ${restored.rc}; finished run ${JSON.stringify(finished ? { state: finished.state, tabId: finished.binding?.tabId, generation: finished.binding?.generation } : null)}`,
+  };
+};
+
+/**
+ * Human replacement is the commit point this instance can drive: `orchestration handoff` needs a
+ * launch-verified caller inside the incumbent's own pane, which the foreground stand-in owns. Handoff,
+ * recovery and replacement all commit through the same changeOrchestration call that rebinds.
+ */
+const missionRebind = async (inst, { check, nonce, within, tab, status: tabStatus, parseJson }, orch) => {
+  const { a: wsA } = inst.state.workspaces;
+  const runId = `acc-rebind-${nonce}`;
+  const itemId = `${runId}-item`;
+  const send = (event) => inst.cli(['mission', 'events', '-w', wsA, '--json', JSON.stringify({ events: [event] })]);
+  const base = (name, expectedRevision, bindingGeneration) => ({
+    eventId: `${runId}-${name}`, schemaVersion: 1, workspaceId: wsA, runId, expectedRevision, producerAt: Date.now(), bindingGeneration,
+  });
+  const snapshot = async () => parseJson((await inst.cli(['mission', 'snapshot', '-w', wsA])).out);
+  const run = async () => (await snapshot())?.runs?.find((candidate) => candidate.id === runId) ?? null;
+
+  const started = await send({ ...base('start', 0, 0), type: 'run.started', payload: { objective: `acc rebind ${nonce}`, tabId: orch.tabId } });
+  const next = await tab(wsA, `acc4-mc-next-${nonce}`, 'claude-code', ['--no-launch']);
+  const standIn = next?.tabId ? await inst.startLiveFixtureAgent(wsA, next) : { rc: -1 };
+  const bound = standIn.rc === 0
+    ? await within(150000, async () => (await tabStatus(wsA, next.tabId))?.agentSessionId ?? null)
+    : null;
+  const replaced = started.rc === 0 && bound ? await inst.designate(wsA, next.tabId) : { rc: -1, out: '', err: 'no bound successor' };
+  // A rebind whose identity did not resolve at the commit is retried by the worker every 5 s.
+  const rebound = replaced.rc === 0
+    ? await within(60000, async () => {
+        const current = await run();
+        return current?.binding?.tabId === next.tabId ? current : null;
+      })
+    : null;
+  const audit = ((await snapshot())?.recentEvents ?? []).filter((event) => event.type === 'run.rebound' && event.runId === runId);
+  const listed = (parseJson((await inst.cli(['mission', 'bootstrap', '-w', wsA])).out)?.runs ?? []).find((candidate) => candidate.runId === runId) ?? null;
+  const stale = await send({ ...base('stale', rebound?.revision ?? 2, 1), type: 'progress.updated', payload: { phase: 'stale generation' } });
+  const asked = await send({ ...base('ask', 0, 2), type: 'attention.opened', payload: {
+    itemId, kind: 'question', title: `acc rebind ${nonce}`, context: 'acceptance: the new orchestrator escalates', storyIds: [], options: [],
+    recommendation: null, blockingScope: 'none', canContinue: true,
+    humanReview: { humanNeed: 'decision', humanReason: 'acceptance check', handling: 'acceptance check', reviewerTabId: next?.tabId ?? 'tab-none' },
+  } });
+  const item = ((await snapshot())?.items ?? []).find((candidate) => candidate.id === itemId) ?? null;
+  // Leave nothing open for the later checks, then give the workspace back to its first orchestrator.
+  if (item) await send({ ...base('cancel', item.revision, 2), type: 'attention.cancelled', payload: { itemId, reason: 'acceptance cleanup' } });
+  const beforeFinish = await run();
+  if (beforeFinish) await send({ ...base('finish', beforeFinish.revision, 2), type: 'run.finished', payload: { state: 'completed', summary: 'acceptance done', closeoutPending: false } });
+  const restored = await inst.designate(wsA, orch.tabId);
+  const judged = judgeMissionRebind({
+    started, bound, replaced, rebound, audit, listed, stale, asked, item, restored, finished: await run(), orchTabId: orch.tabId, nextTabId: next?.tabId ?? null,
+  });
+  check(MISSION_REBIND.id, MISSION_REBIND.what, judged.ok, judged.measured, MISSION_REBIND.expected);
+  return next;
+};
+
 // ─── story 12: a reconcile bootstrap reaches the orchestrator through the inbox ─────────────────
 const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: tabStatus, brief, port, cookie, readIf, parseJson, retainDesignatedFixture }) => {
   const { a: wsA } = inst.state.workspaces;
@@ -525,6 +604,7 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
       `stand-in ${brief(standIn)}`,
       'a bound live stand-in before bootstrap',
     );
+    check(MISSION_REBIND.id, MISSION_REBIND.what, false, `stand-in ${brief(standIn)}`, 'a bound live orchestrator stand-in before the change');
     check(
       'mission-designated-housekeeping',
       'mission cleanup retains the actual designated coordinator live with unchanged mapping',
@@ -565,7 +645,8 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
     `orchestration ${on.rc}, stand-in ${standIn.rc}, idle ${idle}, session bound ${Boolean(bound)}; standup ${brief(standup)}; bootstrap ${bootstrap.status} with ${entries.length} entries; mission items ${mission.map((i) => i.state).join(',') || 'none'}; composer input: ${judged.measured}`,
     'standup 0; bootstrap 200 with an entry; one delivered mission item; the composer received exactly one line, the fixed bootstrap notice for this workspace',
   );
-  const retained = await retainDesignatedFixture(inst, wsA, [orch]);
+  const successor = await missionRebind(inst, { check, nonce, within, tab, status: tabStatus, parseJson }, orch);
+  const retained = await retainDesignatedFixture(inst, wsA, [orch, successor]);
   check(
     'mission-designated-housekeeping',
     'mission cleanup retains the actual designated coordinator live with unchanged mapping',
@@ -576,6 +657,6 @@ const missionInbox = async (inst, { check, nonce, sleep, within, tab, status: ta
 };
 
 module.exports = {
-  wave4, request, humanSession, liveStandIn, standInRecord, standInStart, judgeMissionTyped, judgeSubagentWait,
+  wave4, request, humanSession, liveStandIn, standInRecord, standInStart, judgeMissionTyped, judgeMissionRebind, judgeSubagentWait,
   userLine, assistantEnd, queuedCompletion, subagentMovedShell, subagentDelivery, asyncAgentLaunch,
 };

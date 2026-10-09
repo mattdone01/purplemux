@@ -4,7 +4,7 @@ import { collectAllTabs, isAgentPanelType } from '@/lib/layout-store';
 import { readWorkspaceLayout } from '@/lib/workspace-layout-read';
 import { getWorkspaceStrict, commitWorkspaceOrchestrationLocked } from '@/lib/workspace-store';
 import { normalizeOrchestration, OrchestrationError, requireOrchestrationRevision, parseOrchestrationPrecondition,
-  type TOrchestrationActor, type IOrchestrationPrecondition, type TOrchestrationPatch } from '@/lib/orchestration-contract';
+  type TOrchestrationActor, type TOrchestrationMode, type IOrchestrationPrecondition, type TOrchestrationPatch } from '@/lib/orchestration-contract';
 import { observeOrchestrationRuntime, candidateModelUsable } from '@/lib/orchestration-runtime';
 import { readOrchestrationWorkState } from '@/lib/orchestration-work-state';
 import { createLogger } from '@/lib/logger';
@@ -52,6 +52,19 @@ const checkIncumbent = async (workspace: IWorkspace, tabs: ITab[], options: IOrc
   if (observed.state === 'present') throw new OrchestrationError(409, 'orchestrator-live', 'The incumbent is live; only its verified handoff or explicit human replacement may change ownership', current);
   if (options.mode !== 'recover' && options.actor.kind !== 'human') throw new OrchestrationError(409, 'orchestration-recovery-required', 'Use explicit local recovery for the positively absent incumbent', current);
 };
+/**
+ * The Mission Control runs of the workspace follow the committed coordinator. The mapping is already
+ * durable, so a failure here is logged and never thrown.
+ */
+const rebindMissionRuns = async (workspaceId: string, tabId: string, mode: TOrchestrationMode): Promise<void> => {
+  const cause = mode === 'handoff' ? 'handoff' : mode === 'replace' ? 'replace' : 'recover';
+  try {
+    const { rebindMissionRunsToOrchestrator } = await import('@/lib/mission-control-runtime');
+    await rebindMissionRunsToOrchestrator(workspaceId, tabId, cause);
+  } catch (error) {
+    log.error({ err: error, workspaceId, tabId, cause }, 'Mission Control rebind failed after the coordinator commit');
+  }
+};
 
 /** One public transaction boundary for CLI, UI and controlled human start. */
 export const changeOrchestration = async (
@@ -65,7 +78,12 @@ export const changeOrchestration = async (
     const next = { ...current, ...patch };
     if (!next.enabled && next.orchestratorTabId && next.orchestratorTabId !== current.orchestratorTabId) throw new OrchestrationError(400, 'orchestration-invalid', 'A replacement coordinator must be enabled');
     const mappingChanged = current.enabled !== next.enabled || current.orchestratorTabId !== next.orchestratorTabId;
-    if (!mappingChanged) return commitWorkspaceOrchestrationLocked(workspaceId, patch, options.expectedRevision);
+    if (!mappingChanged) {
+      const unchanged = await commitWorkspaceOrchestrationLocked(workspaceId, patch, options.expectedRevision);
+      // A handoff or recovery that names the coordinator already in place re-asserts it: a run left on another tab follows.
+      if (next.enabled && next.orchestratorTabId && patch.orchestratorTabId && (options.mode === 'handoff' || options.mode === 'recover')) await rebindMissionRuns(workspaceId, next.orchestratorTabId, options.mode);
+      return unchanged;
+    }
     return underTargets(workspaceId, [current.orchestratorTabId, next.orchestratorTabId].filter((id): id is string => !!id), async () => {
       if (!next.enabled || !next.orchestratorTabId) {
         const work = await readOrchestrationWorkState(workspace);
@@ -88,6 +106,7 @@ export const changeOrchestration = async (
       }
       const updated = await commitWorkspaceOrchestrationLocked(workspaceId, patch, options.expectedRevision);
       log.info({ workspaceId, mode: options.mode, oldTabId: current.orchestratorTabId, newTabId: updated.orchestration?.orchestratorTabId, revision: updated.orchestration?.revision }, 'coordinator mapping committed');
+      if (next.enabled && next.orchestratorTabId && next.orchestratorTabId !== current.orchestratorTabId) await rebindMissionRuns(workspaceId, next.orchestratorTabId, options.mode);
       return updated;
     });
   });
@@ -107,14 +126,16 @@ export const startOrchestrationTransaction = async (
     return underTargets(workspaceId, current.orchestratorTabId ? [current.orchestratorTabId] : [], async () => {
       await checkIncumbent(workspace, await strictTabs(workspaceId), options);
       const tab = await create(workspace);
+      let updated: IWorkspace;
       try {
-        const updated = await commitWorkspaceOrchestrationLocked(workspaceId, {
+        updated = await commitWorkspaceOrchestrationLocked(workspaceId, {
           enabled: true, orchestratorTabId: tab.id, ...(template !== undefined ? { kickoffTemplate: template } : {}),
         }, options.expectedRevision);
-        return { workspace: updated, tab };
       } catch {
         throw new OrchestrationError(503, 'orchestration-persist-failed', `Tab ${tab.id} was created but is undesignated; no kickoff was queued. Refresh before acting.`, undefined, tab.id);
       }
+      await rebindMissionRuns(workspaceId, tab.id, options.mode);
+      return { workspace: updated, tab };
     });
   });
 };

@@ -106,9 +106,11 @@ const parse = <T>(schema: z.ZodType<T>, input: unknown): T => {
   return result.data;
 };
 
+const RESERVED_EVENT_ID_PREFIXES = ['system:migration:', 'system:rebind:'];
+
 export const parseMissionEvents = (input: unknown): TMissionProducerEvent[] => {
   const events = parse(z.array(eventSchema).min(1).max(25), input);
-  if (events.some((event) => event.eventId.startsWith('system:migration:'))) {
+  if (events.some((event) => RESERVED_EVENT_ID_PREFIXES.some((prefix) => event.eventId.startsWith(prefix)))) {
     throw new MissionControlError(400, 'invalid-request', 'event ID uses a reserved namespace');
   }
   const eventIds = events.map((event) => event.eventId);

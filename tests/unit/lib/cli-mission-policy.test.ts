@@ -128,3 +128,32 @@ describe('mission bootstrap reads every pending bootstrap, keyed like the notice
   });
 });
 
+describe('mission bootstrap lists the bound runs of the workspace (orchestrator rebind)', () => {
+  const boundTo = (tabId: string, generation: number) => ({ tabId, providerId: 'claude', sessionId: `session-${tabId}`, generation, runtimeGeneration: null });
+
+  it('prints an open run with the tab and generation the server holds after a handoff', async () => {
+    const output = await runMission(['bootstrap'], {
+      bootstrap: null,
+      pendingBootstrapEntries: [],
+      runs: [
+        { id: 'run-a', workspaceId: 'ws-one', state: 'waiting', revision: 5, objective: 'Safeguard the cutover', phase: 'cutover', binding: boundTo('tab-next', 2) },
+        { id: 'run-done', workspaceId: 'ws-one', state: 'completed', revision: 9, objective: 'Old', phase: null, binding: boundTo('tab-next', 4) },
+        { id: 'run-dropped', workspaceId: 'ws-one', state: 'cancelled', revision: 3, objective: 'Dropped', phase: null, binding: boundTo('tab-next', 1) },
+        { id: 'run-provisional', workspaceId: 'ws-one', state: 'running', revision: 0, objective: 'Unknown', phase: null, binding: null },
+        { id: 'run-foreign', workspaceId: 'ws-two', state: 'running', revision: 1, objective: 'Other', phase: null, binding: boundTo('tab-x', 1) },
+      ],
+      items: [],
+    });
+
+    expect(output.entries).toEqual([]);
+    expect(output.runs).toEqual([
+      { runId: 'run-a', objective: 'Safeguard the cutover', phase: 'cutover', state: 'waiting', revision: 5, tabId: 'tab-next', bindingGeneration: 2 },
+    ]);
+  });
+
+  it('prints no bound run for a workspace that has none', async () => {
+    const output = await runMission(['bootstrap'], { bootstrap: null, pendingBootstrapEntries: [], runs: [], items: [] });
+
+    expect(output).toEqual({ workspaceId: 'ws-one', entries: [], runs: [] });
+  });
+});
