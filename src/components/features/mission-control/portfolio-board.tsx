@@ -4,6 +4,7 @@ import useSWR from 'swr';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
+import BurndownPanel from '@/components/features/mission-control/burndown-panel';
 import { createMissionSubmissionId } from '@/components/features/mission-control/mission-control-utils';
 import type { IGrantee } from '@/types/grant';
 import type { IPortfolioImpact, IPortfolioSnapshot } from '@/types/portfolio';
@@ -295,7 +296,7 @@ const PortfolioBoard = () => {
     {loading ? <p className="rounded border border-dashed p-8 text-center text-sm text-muted-foreground">Loading portfolio coverage and blockers…</p>
       : !snapshot ? <p className="rounded border border-dashed p-8 text-center text-sm text-muted-foreground">Portfolio unavailable. Retry after the storage or connection error is fixed.</p>
         : snapshot.selection === null ? <p className="rounded border border-dashed p-8 text-center text-sm text-muted-foreground">Choose a manager and managed workspaces to begin. No portfolio is assumed.</p>
-          : <PortfolioBoardContent snapshot={snapshot} priorityFilter={priorityFilter} onPriorityFilter={setPriorityFilter}
+          : <><BurndownPanel /><PortfolioBoardContent snapshot={snapshot} priorityFilter={priorityFilter} onPriorityFilter={setPriorityFilter}
             showResolved={showResolved} onShowResolved={(value) => { setShowResolved(value); if (!value) changeResolvedPage(null); }}
             olderResolved={resolvedBefore !== null} onOlderResolved={() => changeResolvedPage(snapshot.resolvedNextCursor ?? null)}
             onLatestResolved={() => changeResolvedPage(null)}
@@ -303,7 +304,7 @@ const PortfolioBoard = () => {
             pendingId={pendingId} onAcknowledge={(impact) => void submit(impact, 'acknowledge')} onAssign={(impact) => void submit(impact, 'assign')}
             milestoneEvidence={milestoneEvidence} milestoneStage={milestoneStage} onMilestoneEvidence={(id, value) => setMilestoneEvidence((current) => ({ ...current, [id]: value }))}
             onMilestoneStage={(id, value) => setMilestoneStage((current) => ({ ...current, [id]: value }))}
-            onConfirmMilestone={(impact) => void confirmMilestone(impact)} />}
+            onConfirmMilestone={(impact) => void confirmMilestone(impact)} /></>}
   </div>;
 };
 
