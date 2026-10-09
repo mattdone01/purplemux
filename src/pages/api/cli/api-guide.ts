@@ -509,6 +509,25 @@ POST /api/cli/workspaces/<workspaceId>/standup
 GET /api/cli/workspaces/<workspaceId>/standup
   Response: { "latest": { ... } | null, "history": [...] }
 
+## Epic burndown
+
+POST /api/cli/workspaces/<workspaceId>/burndown        (purplemux burndown publish -w WS --json @FILE)
+  Body: the Scrum Master generator's burndown.json:
+        { "generated_at": "<ISO-8601 UTC, not in the future>",
+          "epics": [{ "slug", "name", "stories", "unpointed", "total", "burned", "remaining", "pct",
+                      "in_progress", "blocked", "done_events": [{ "at", "points" }], "undated_burned" }],
+          "history": [{ "at", "slug", "total", "burned", "remaining", "pct", "stories", "unpointed" }] }
+  Own workspace only. Counts and points are non-negative integers; pct is 0..100; burned +
+  remaining = total; done_events points + undated_burned = burned; slugs are unique. A refusal
+  (400 invalid-burndown) names the field, what it saw and what it expected; nothing is stored.
+  Unknown fields are dropped. At most 100 epics; history keeps the newest 2000 rows by "at"
+  (the CLI trims before sending); the stored snapshot is at most 1 MiB (413 otherwise).
+  Each publish replaces the previous one. The portfolio board renders the burndown of the
+  selected Scrum Master's workspace and marks it stale 2 h after "generated_at".
+
+GET /api/cli/workspaces/<workspaceId>/burndown         (purplemux burndown show -w WS)
+  Response: { "burndown": { "workspaceId", "receivedAt", "snapshot": { ... } } | null }
+
 ## Portfolio board
 
 GET /api/cli/portfolio?workspaces=WS1,WS2

@@ -462,6 +462,18 @@ describe('checks-wave4.cjs fixtures (story 39)', () => {
   });
 });
 
+describe('checks-burndown.cjs fixture', () => {
+  const wave6 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-burndown.cjs'));
+
+  it('publishes a burndown the validator accepts, with more history rows than the store keeps', async () => {
+    const { MAX_BURNDOWN_HISTORY, parseBurndownSnapshot } = await import('@/lib/burndown');
+    const now = Date.now();
+    const result = parseBurndownSnapshot(wave6.burndownFixture(now), now);
+    expect(result.ok && result.droppedHistory).toBe(100);
+    expect(result.ok && result.snapshot.history).toHaveLength(MAX_BURNDOWN_HISTORY);
+  });
+});
+
 describe('checks-wave5.cjs fixtures (ADR-0021)', () => {
   const wave5 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave5.cjs'));
 

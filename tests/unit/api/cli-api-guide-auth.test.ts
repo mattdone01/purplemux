@@ -25,6 +25,13 @@ describe('GET /api/cli/api-guide', () => {
     expect(String(state.body)).toContain('## Caller identity');
   });
 
+  it('documents the burndown publish contract', async () => {
+    scope.resolveCliScope.mockReturnValue({ type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-1', tabVerified: true });
+    const guide = String((await call()).body);
+    expect(guide).toContain('POST /api/cli/workspaces/<workspaceId>/burndown        (purplemux burndown publish -w WS --json @FILE)');
+    expect(guide).toContain('GET /api/cli/workspaces/<workspaceId>/burndown');
+  });
+
   it('refuses a caller no token resolves', async () => {
     scope.resolveCliScope.mockReturnValue(null);
     expect((await call()).status).toBe(403);

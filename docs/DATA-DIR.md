@@ -18,6 +18,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── message-history.json  # per-workspace input history
 │       ├── claude-prompt.md      # --append-system-prompt-file content
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
+│       ├── burndown.json         # latest published epic burndown (Scrum Master)
 │       ├── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
 │       └── grok-home/            # per-workspace GROK_HOME
 ├── hooks.json               # Claude Code hook + statusline config (generated)
@@ -266,6 +267,15 @@ The `--append-system-prompt-file` content passed to every Claude tab in the work
 Orchestrator standup ticks, newest first, capped at 50. The latest tick renders in the
 workspace sidebar; `StatusManager` hydrates from this file on boot so "where are things
 at" survives a server restart. See STATUS.md → Standup Ticks for the full flow.
+
+### `burndown.json` — `src/lib/burndown-store.ts`
+
+The latest epic burndown the workspace published with `purplemux burndown publish`
+(`{ workspaceId, receivedAt, snapshot }`, mode 0600). Each publish replaces the file; the
+snapshot is validated by `src/lib/burndown.ts`, history keeps the newest 2000 rows, and the
+file is at most 1 MiB. The portfolio board reads the selected Scrum Master's workspace file
+through `GET /api/mission-control/burndown`. A file that does not validate is reported as a
+storage error, never read as "nothing published".
 
 ### `claude-home/` — `src/lib/workspace-home.ts`
 

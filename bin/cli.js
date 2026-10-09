@@ -439,6 +439,46 @@ const cmdStandup = async (args) => {
   die("usage: standup report -w WS --json '{...}' | standup show -w WS");
 };
 
+// Mirrors MAX_BURNDOWN_HISTORY (src/lib/burndown.ts). The generator's history file only grows;
+// trimming here keeps the request under the route's body limit long after the server cap applies.
+const BURNDOWN_HISTORY_ROWS = 2000;
+
+const readJsonFlag = async (rest, what) => {
+  const value = flagValue(rest, '--json');
+  let raw;
+  if (value && value.startsWith('@')) {
+    try { raw = fs.readFileSync(value.slice(1), 'utf8'); } catch (err) { die(`${what}: cannot read ${value.slice(1)}: ${err.code || err.message}`); }
+  } else {
+    raw = value || await readStdin();
+  }
+  try { return JSON.parse(raw); } catch { return die(`${what} must be valid JSON — pass --json @FILE, --json '{...}', or pipe JSON on stdin`); }
+};
+
+const newestHistory = (snapshot) => {
+  if (!snapshot || !Array.isArray(snapshot.history) || snapshot.history.length <= BURNDOWN_HISTORY_ROWS) return snapshot;
+  const history = snapshot.history.map((row, index) => ({ row, index, at: Date.parse(row && row.at) }))
+    .sort((a, b) => (a.at - b.at) || (a.index - b.index)).slice(-BURNDOWN_HISTORY_ROWS).map((entry) => entry.row);
+  return { ...snapshot, history };
+};
+
+const cmdBurndown = async (args) => {
+  requireEnv();
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  if (sub === 'show') {
+    const { body } = await api('GET', `/api/cli/workspaces/${wsId}/burndown`);
+    return out(body);
+  }
+  if (sub === 'publish') {
+    const snapshot = newestHistory(await readJsonFlag(rest, 'burndown'));
+    const { body } = await api('POST', `/api/cli/workspaces/${wsId}/burndown`, snapshot);
+    return out(body);
+  }
+  die('usage: burndown publish -w WS --json @burndown.json | burndown show -w WS');
+};
+
 // A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
 const shellArg = (value) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, `'\\''`)}'`);
 
@@ -1535,6 +1575,9 @@ Commands:
                                             "items":[{"label":"...","status":"done|active|blocked|todo","note":"..."}],
                                             "blockers":[{"what":"...","needs":"..."}],"needsHuman":false,"next":["..."]}
   standup show -w WS                       Latest standup + history for a workspace
+  burndown publish -w WS --json @FILE      Publish the Scrum Master burndown.json (or '{...}', or pipe JSON). Validated
+                                           strictly; history keeps the newest 2000 rows. Shown on the portfolio board
+  burndown show -w WS                      The latest published burndown for a workspace
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
   mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap, and
@@ -1658,6 +1701,8 @@ const main = async () => {
       return cmdOrchestration(args.slice(1));
     case 'standup':
       return cmdStandup(args.slice(1));
+    case 'burndown':
+      return cmdBurndown(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':
