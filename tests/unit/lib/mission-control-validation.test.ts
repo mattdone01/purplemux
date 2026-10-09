@@ -76,4 +76,19 @@ describe('Mission Control human review validation', () => {
     expect(() => parseMissionEvents([{ ...event(undefined), eventId: 'system:migration:forged' }]))
       .toThrowError(/reserved namespace/);
   });
+
+  it('keeps the orchestrator rebind server-authored: producers cannot send run.rebound or claim its event IDs', () => {
+    const rebound = {
+      ...event(undefined),
+      type: 'run.rebound',
+      payload: {
+        cause: 'handoff',
+        previousBinding: { tabId: 'tab-a', providerId: 'claude', sessionId: 'session-a', generation: 1, runtimeGeneration: null },
+        binding: { tabId: 'tab-b', providerId: 'claude', sessionId: 'session-b', generation: 2, runtimeGeneration: null },
+      },
+    };
+    expect(() => parseMissionEvents([rebound])).toThrowError(MissionControlError);
+    expect(() => parseMissionEvents([{ ...event(undefined), eventId: 'system:rebind:forged' }]))
+      .toThrowError(/reserved namespace/);
+  });
 });

@@ -399,6 +399,48 @@ describe('checks-wave4.cjs fixtures (story 39)', () => {
     expect(wave4.judgeMissionTyped('', 'ws-5wqnrB').ok).toBe(false);
   });
 
+  it('judgeMissionRebind: passes only a run moved to the successor at generation 2 with one replace audit event', () => {
+    const boundTo = (tabId: string, generation: number) => ({ tabId, providerId: 'claude', sessionId: `session-${tabId}`, generation, runtimeGeneration: null });
+    const ok = { rc: 0, out: '', err: '' };
+    const base = {
+      started: ok, bound: 'session-next', replaced: ok, restored: ok, asked: ok,
+      rebound: { revision: 2, binding: boundTo('tab-next', 2) },
+      audit: [{ revision: 2, payload: { cause: 'replace', previousBinding: boundTo('tab-orch', 1), binding: boundTo('tab-next', 2) } }],
+      listed: { runId: 'run-a', tabId: 'tab-next', bindingGeneration: 2 },
+      stale: { rc: 3, out: '', err: 'error: conflict (refused) — stale or unbound orchestrator generation' },
+      item: { state: 'open' },
+      finished: { state: 'completed', binding: boundTo('tab-next', 2) },
+      orchTabId: 'tab-orch', nextTabId: 'tab-next',
+    };
+    expect(wave4.judgeMissionRebind(base)).toMatchObject({ ok: true });
+    for (const rejected of [
+      { rebound: null },
+      { rebound: { revision: 1, binding: boundTo('tab-orch', 1) } },
+      { rebound: { revision: 3, binding: boundTo('tab-next', 3) } },
+      { audit: [] },
+      { audit: [...base.audit, ...base.audit] },
+      { audit: [{ revision: 2, payload: { cause: 'heal', previousBinding: boundTo('tab-orch', 1), binding: boundTo('tab-next', 2) } }] },
+      { audit: [{ revision: 2, payload: { cause: 'replace', previousBinding: boundTo('tab-other', 1), binding: boundTo('tab-next', 2) } }] },
+      { listed: null },
+      { listed: { runId: 'run-a', tabId: 'tab-next', bindingGeneration: 1 } },
+      { stale: ok },
+      { stale: { rc: 3, out: '', err: 'error: conflict (refused) — stale run revision' } },
+      { asked: { rc: 3, out: '', err: 'human review requires a run bound to the configured orchestrator' } },
+      { item: { state: 'candidate' } },
+      { item: null },
+      { finished: { state: 'completed', binding: boundTo('tab-orch', 3) } },
+      { finished: { state: 'running', binding: boundTo('tab-next', 2) } },
+      { started: { rc: 3, out: '', err: 'target agent binding is not live' } },
+      { bound: null },
+      { replaced: { rc: 1, out: '', err: 'changed' } },
+      { restored: { rc: 1, out: '', err: 'changed' } },
+    ]) {
+      const judged = wave4.judgeMissionRebind({ ...base, ...rejected });
+      expect(judged.ok, JSON.stringify(rejected)).toBe(false);
+      expect(judged.measured).toContain('run binding');
+    }
+  });
+
   it('judgeSubagentWait: WAITING needs the control READY first, busy, no nudge, turnEnd waiting with the open count, then a READY stamped after the end', () => {
     const good = {
       controlReady: { kind: 'ready-for-review', at: 1 },
@@ -942,7 +984,7 @@ describe.skipIf(!E2E)('acceptance end to end (opt-in)', () => {
     expect(r.status, fs.readFileSync(log, 'utf-8')).toBe(0);
     const body = fs.readFileSync(log, 'utf-8');
     // Without --bash-guard the guard check is the one SKIP; every other check must pass.
-    expect(body).toMatch(/^ACCEPTANCE=PASS checks=81 passed=80 failed=0 skipped=1$/m);
+    expect(body).toMatch(/^ACCEPTANCE=PASS checks=82 passed=81 failed=0 skipped=1$/m);
     // The wave-2 checks (story 22) ran, each by id.
     for (const id of ['config-authority', 'config-constructor-key', 'tab-close-reaps-own', 'note-delivered', 'note-ack',
       'api-error-resume', 'usage-warning-negative', 'compaction-no-turn-end', 'result-suggestion']) {

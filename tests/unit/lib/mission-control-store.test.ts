@@ -1220,3 +1220,296 @@ describe('MissionControlStore', () => {
     store.close();
   });
 });
+
+describe('MissionControlStore orchestrator rebind', () => {
+  const successor = { tabId: 'tab-successor', providerId: 'claude', sessionId: 'session-successor', runtimeGeneration: null };
+  const successorAuthority = { resolvedIdentity: successor, configuredOrchestratorTabId: successor.tabId };
+  const successorReview = { ...humanReview, reviewerTabId: successor.tabId };
+  const runEvents = (store: MissionControlStore, runId = 'run-a') =>
+    store.eventsAfter(0, 200).events.filter((event) => event.runId === runId);
+  const progress = (eventId: string, expectedRevision: number, bindingGeneration: number): TMissionProducerEvent => ({
+    eventId, schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision,
+    producerAt: 1_700_000_000_500, bindingGeneration, type: 'progress.updated', payload: { phase: 'verification' },
+  });
+  const answer = (store: MissionControlStore, submissionId = 'submission-rebind') => store.submitAnswer('item-a', {
+    submissionId, expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false,
+  }, 'user');
+
+  it('moves an open run to the new orchestrator at the next generation and audits it in the same event log', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const before = store.snapshot().runs[0];
+    const cursor = store.snapshot().cursor;
+
+    const [event, ...rest] = store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' });
+
+    expect(rest).toEqual([]);
+    const after = store.snapshot().runs[0];
+    expect(after.binding).toEqual({ ...successor, generation: 2 });
+    expect(after.revision).toBe(before.revision + 1);
+    expect(after).toMatchObject({
+      state: before.state, objective: before.objective, evidence: before.evidence, lastProgressAt: before.lastProgressAt,
+    });
+    expect(event).toMatchObject({
+      type: 'run.rebound', workspaceId: 'ws-a', runId: 'run-a', entityId: 'run-a', revision: after.revision, schemaVersion: 1,
+      payload: { cause: 'handoff', previousBinding: binding, binding: { ...successor, generation: 2 }, actor: 'system:orchestration' },
+    });
+    expect(event.seq).toBe(cursor + 1);
+    expect(store.snapshot().cursor).toBe(event.seq);
+    expect(store.eventsAfter(cursor, 10)).toMatchObject({ events: [event], cursor: event.seq, hasMore: false });
+    expect(store.snapshot().recentEvents.at(-1)).toEqual(event);
+    store.close();
+  });
+
+  it('refuses producer events from the old generation after a rebind and accepts the new one', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'recover' });
+
+    expect(() => store.applyEvents([progress('event-old-progress', 1, 1)]))
+      .toThrowError('stale run revision');
+    expect(() => store.applyEvents([progress('event-old-generation', 2, 1)]))
+      .toThrowError('stale or unbound orchestrator generation');
+    const staleQuestion: TMissionProducerEvent = { ...openEvent('event-old-open'), payload: { itemId: 'item-old', ...question } };
+    expect(() => store.applyEvents([staleQuestion])).toThrowError('stale or unbound orchestrator generation');
+    const restart = startEvent('event-restart');
+    expect(() => store.applyEvents([restart], new Map([[restart.eventId, successor]]))).toThrowError('run already exists');
+
+    const accepted = store.applyEvents([progress('event-new-progress', 2, 2)]);
+    expect(accepted.events[0]).toMatchObject({ type: 'progress.updated', revision: 3 });
+    expect(store.snapshot().runs[0]).toMatchObject({ revision: 3, phase: 'verification', binding: { tabId: successor.tabId, generation: 2 } });
+    store.close();
+  });
+
+  it('accepts human review from the new orchestrator at the new generation and refuses the old tab', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const reviewed = (eventId: string, itemId: string, bindingGeneration: number, review: typeof humanReview): TMissionProducerEvent => ({
+      ...openEvent(eventId), bindingGeneration, payload: { itemId, ...question, humanReview: review },
+    });
+    const blocked = reviewed('event-review-before', 'item-before', 1, successorReview);
+    expect(() => store.applyEvents([blocked], new Map([[blocked.eventId, successorAuthority]])))
+      .toThrowError('human review requires a run bound to the configured orchestrator');
+
+    store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' });
+
+    const fromOldTab = reviewed('event-review-old-tab', 'item-old-tab', 2, humanReview);
+    expect(() => store.applyEvents([fromOldTab], new Map([[fromOldTab.eventId, { resolvedIdentity: identity, configuredOrchestratorTabId: successor.tabId }]])))
+      .toThrowError('human review requires the configured orchestrator');
+    const opened = reviewed('event-review-after', 'item-after', 2, successorReview);
+    store.applyEvents([opened], new Map([[opened.eventId, successorAuthority]]));
+    expect(store.snapshot().items.find((item) => item.id === 'item-after')).toMatchObject({
+      state: 'open', humanReview: { reviewerTabId: successor.tabId, binding: { ...successor, generation: 2 } },
+    });
+
+    const candidate: TMissionProducerEvent = { ...openEvent('event-candidate'), bindingGeneration: 2, payload: { itemId: 'item-candidate', ...question } };
+    store.applyEvents([candidate]);
+    const promoted: TMissionProducerEvent = {
+      ...candidate, eventId: 'event-promote', expectedRevision: 1, type: 'attention.updated',
+      payload: { itemId: 'item-candidate', ...question, humanReview: successorReview },
+    };
+    store.applyEvents([promoted], new Map([[promoted.eventId, successorAuthority]]));
+    expect(store.snapshot().items.find((item) => item.id === 'item-candidate')).toMatchObject({ state: 'open', revision: 2 });
+    store.close();
+  });
+
+  it('leaves finished runs, unbound provisional runs and other workspaces untouched', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const finished: TMissionProducerEvent = {
+      eventId: 'event-finish', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 1,
+      producerAt: 1_700_000_000_200, bindingGeneration: 1, type: 'run.finished',
+      payload: { state: 'completed', summary: 'Shipped', closeoutPending: false },
+    };
+    store.applyEvents([finished]);
+    const cancelledStart: TMissionProducerEvent = { ...startEvent('event-start-cancelled'), runId: 'run-cancelled' };
+    store.applyEvents([cancelledStart], new Map([[cancelledStart.eventId, identity]]));
+    store.applyEvents([{ ...finished, eventId: 'event-cancel', runId: 'run-cancelled', payload: { state: 'cancelled', summary: 'Dropped', closeoutPending: false } }]);
+    const foreign: TMissionProducerEvent = { ...startEvent('event-start-foreign'), workspaceId: 'ws-b', runId: 'run-b' };
+    store.applyEvents([foreign], new Map([[foreign.eventId, identity]]));
+    store.reconcileDiscovery(discoveryInput('bootstrap-provisional', 'ws-c/run', 'ws-c'));
+    const before = store.snapshot();
+
+    expect(store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' })).toEqual([]);
+    expect(store.rebindOpenRuns({ workspaceId: 'ws-c', identity: successor, cause: 'recover' })).toEqual([]);
+
+    const after = store.snapshot();
+    expect(after.cursor).toBe(before.cursor);
+    expect(after.recentEvents).toEqual(before.recentEvents);
+    for (const run of before.runs) {
+      expect(after.runs.find((candidate) => candidate.id === run.id)).toEqual(run);
+    }
+    expect(after.runs.find((run) => run.workspaceId === 'ws-c')).toMatchObject({ revision: 0, binding: null });
+    expect(store.listOpenRunBindings()).toEqual([{ runId: 'run-b', workspaceId: 'ws-b', binding }]);
+    store.close();
+  });
+
+  it('rebinds only the named workspace when two workspaces hold open runs', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const foreign: TMissionProducerEvent = { ...startEvent('event-start-foreign'), workspaceId: 'ws-b', runId: 'run-b' };
+    store.applyEvents([foreign], new Map([[foreign.eventId, identity]]));
+    const foreignBefore = store.snapshot().runs.find((run) => run.id === 'run-b')!;
+    const foreignEvents = runEvents(store, 'run-b');
+
+    expect(store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' })).toHaveLength(1);
+
+    expect(store.snapshot().runs.find((run) => run.id === 'run-b')).toEqual(foreignBefore);
+    expect(runEvents(store, 'run-b')).toEqual(foreignEvents);
+    expect(store.listOpenRunBindings('ws-a')).toEqual([{ runId: 'run-a', workspaceId: 'ws-a', binding: { ...successor, generation: 2 } }]);
+    store.close();
+  });
+
+  it('is idempotent: a repeated rebind to the same identity changes nothing', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' });
+    const settled = store.snapshot();
+
+    expect(store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' })).toEqual([]);
+    expect(store.rebindOpenRuns({ workspaceId: 'ws-a', identity: { ...successor }, cause: 'recover' })).toEqual([]);
+
+    const repeated = store.snapshot();
+    expect(repeated.runs).toEqual(settled.runs);
+    expect(repeated.cursor).toBe(settled.cursor);
+    expect(runEvents(store).filter((event) => event.type === 'run.rebound')).toHaveLength(1);
+
+    const [again] = store.rebindOpenRuns({ workspaceId: 'ws-a', identity: { ...successor, sessionId: 'session-relaunched' }, cause: 'recover' });
+    expect(again.payload).toMatchObject({ cause: 'recover', binding: { sessionId: 'session-relaunched', generation: 3 } });
+    store.close();
+  });
+
+  it('narrows the rebind to the bindings the caller declares eligible', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const second: TMissionProducerEvent = {
+      eventId: 'event-start-second', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-second', expectedRevision: 0,
+      producerAt: 1_700_000_000_000, bindingGeneration: 0, type: 'run.started', payload: { objective: 'Second', tabId: 'tab-worker' },
+    };
+    store.applyEvents([second], new Map([[second.eventId, { ...identity, tabId: 'tab-worker' }]]));
+
+    const events = store.rebindOpenRuns({
+      workspaceId: 'ws-a', identity: successor, cause: 'heal', eligible: (current) => current.tabId === binding.tabId,
+    });
+
+    expect(events.map((event) => [event.runId, event.payload.cause])).toEqual([['run-a', 'heal']]);
+    expect(store.snapshot().runs.find((run) => run.id === 'run-second')?.binding).toMatchObject({ tabId: 'tab-worker', generation: 1 });
+    store.close();
+  });
+
+  it('rolls back every run of the batch when one rebind fails', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const second: TMissionProducerEvent = { ...startEvent('event-start-second'), runId: 'run-second' };
+    store.applyEvents([second], new Map([[second.eventId, identity]]));
+    const before = store.snapshot();
+    let seen = 0;
+
+    expect(() => store.rebindOpenRuns({
+      workspaceId: 'ws-a', identity: successor, cause: 'handoff',
+      eligible: () => {
+        seen += 1;
+        if (seen === 2) throw new Error('eligibility failed');
+        return true;
+      },
+    })).toThrowError('eligibility failed');
+
+    expect(seen).toBe(2);
+    expect(store.snapshot().runs).toEqual(before.runs);
+    expect(store.snapshot().cursor).toBe(before.cursor);
+    store.close();
+  });
+
+  it('carries queued and held answers to the new binding and holds a paste in flight as uncertain', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const reviewedOpen = (eventId: string, itemId: string): TMissionProducerEvent => ({
+      ...openEvent(eventId), payload: { itemId, ...question, humanReview },
+    });
+    for (const itemId of ['item-flight', 'item-held', 'item-cancelled', 'item-acknowledged']) {
+      const opened = reviewedOpen(`event-open-${itemId}`, itemId);
+      store.applyEvents([opened], new Map([[opened.eventId, reviewAuthority]]));
+    }
+    const submit = (itemId: string) => store.submitAnswer(itemId, {
+      submissionId: `submission-${itemId}`, expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false,
+    }, 'user');
+    const waiting = answer(store);
+    const claimedWaiting = store.claimDelivery(waiting.delivery.id, waiting.delivery.updatedAt)!;
+    store.finalizeDeliveryAttempt(claimedWaiting.id, claimedWaiting.updatedAt, binding, { state: 'queued', nextAttemptAt: null, lastError: 'inbox:i-old-tab' });
+    const flight = submit('item-flight');
+    const pasting = store.claimDelivery(flight.delivery.id, flight.delivery.updatedAt)!;
+    const held = submit('item-held');
+    const claimedHeld = store.claimDelivery(held.delivery.id, held.delivery.updatedAt)!;
+    store.finalizeDeliveryAttempt(claimedHeld.id, claimedHeld.updatedAt, binding, { state: 'held', nextAttemptAt: null, lastError: 'bound-agent-not-live' });
+    const cancelled = submit('item-cancelled');
+    store.applyEvents([{
+      eventId: 'event-cancel-item', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 2,
+      producerAt: 1_700_000_000_300, bindingGeneration: 1, type: 'attention.cancelled', payload: { itemId: 'item-cancelled', reason: 'Superseded' },
+    }]);
+    const acknowledged = submit('item-acknowledged');
+    store.applyEvents([{
+      eventId: 'event-ack-item', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 2,
+      producerAt: 1_700_000_000_350, bindingGeneration: 1, type: 'answer.acknowledged', payload: { answerId: acknowledged.answer.id },
+    }]);
+
+    store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'handoff' });
+
+    const rebound = { ...successor, generation: 2 };
+    const row = (id: string) => store.snapshot().deliveries.find((delivery) => delivery.id === id)!;
+    expect(row(waiting.delivery.id)).toMatchObject({ state: 'queued', lastError: null, binding: rebound });
+    expect(row(waiting.delivery.id).nextAttemptAt).not.toBeNull();
+    expect(row(held.delivery.id)).toMatchObject({ state: 'queued', lastError: null, binding: rebound });
+    expect(row(flight.delivery.id)).toMatchObject({
+      state: 'held', nextAttemptAt: null, lastError: 'transport-uncertain:run-rebound-during-dispatch', binding,
+    });
+    expect(row(cancelled.delivery.id)).toMatchObject({ state: 'held', lastError: 'attention item cancelled', binding });
+    expect(row(acknowledged.delivery.id)).toMatchObject({ state: 'acknowledged', binding });
+
+    expect(store.finalizeDeliveryAttempt(pasting.id, pasting.updatedAt, binding, {
+      state: 'submitted', nextAttemptAt: null, lastError: null, submittedAt: Date.now(),
+    })).toMatchObject({ state: 'held', lastError: 'transport-uncertain:post-paste-eligibility-changed:delivery-not-dispatching' });
+    const due = store.listDueDeliveries(Date.now() + 1_000, 10).map((delivery) => delivery.id).sort();
+    expect(due).toEqual([waiting.delivery.id, held.delivery.id].sort());
+    const claimed = store.claimDelivery(waiting.delivery.id, row(waiting.delivery.id).updatedAt)!;
+    expect(claimed).toMatchObject({ state: 'dispatching', binding: rebound });
+    expect(store.validateDeliveryAttempt(claimed.id, claimed.updatedAt, rebound)).toEqual({ ok: true });
+
+    const ackFlight: TMissionProducerEvent = {
+      eventId: 'event-ack-flight', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 2,
+      producerAt: 1_700_000_000_600, bindingGeneration: 2, type: 'answer.acknowledged', payload: { answerId: flight.answer.id },
+    };
+    store.applyEvents([ackFlight]);
+    expect(row(flight.delivery.id).state).toBe('acknowledged');
+    store.close();
+  });
+
+  it('keeps the run.resumed delivery handling it shares with the rebind', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const accepted = answer(store, 'submission-resume-shared');
+    const resume = (eventId: string, expectedRevision: number, bindingGeneration: number, transferPendingAnswers: boolean): TMissionProducerEvent => ({
+      eventId, schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision, producerAt: 1_700_000_000_300,
+      bindingGeneration, type: 'run.resumed', payload: { tabId: binding.tabId, transferPendingAnswers },
+    });
+    const withheld = resume('event-resume-withheld', 1, 1, false);
+    store.applyEvents([withheld], new Map([[withheld.eventId, identity]]));
+    expect(store.snapshot().deliveries[0]).toMatchObject({ id: accepted.delivery.id, state: 'held', lastError: 'run resumed without answer transfer', binding });
+    const transferred = resume('event-resume-transferred', 2, 2, true);
+    store.applyEvents([transferred], new Map([[transferred.eventId, identity]]));
+    expect(store.snapshot().deliveries[0]).toMatchObject({ state: 'queued', lastError: null, binding: { ...binding, generation: 3 } });
+    store.close();
+  });
+
+  it('keeps a reopened store on the rebound binding and its audit event', () => {
+    const file = databasePath();
+    const store = new MissionControlStore(file);
+    seedRun(store);
+    const [event] = store.rebindOpenRuns({ workspaceId: 'ws-a', identity: successor, cause: 'heal' });
+    store.close();
+
+    const reopened = new MissionControlStore(file);
+    expect(reopened.snapshot().runs[0].binding).toEqual({ ...successor, generation: 2 });
+    expect(reopened.eventsAfter(0, 200).events.find((candidate) => candidate.type === 'run.rebound')).toEqual(event);
+    reopened.close();
+  });
+});

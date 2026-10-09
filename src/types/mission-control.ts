@@ -175,6 +175,19 @@ export interface IMissionEvent {
   committedAt: number;
 }
 
+export type TMissionRebindCause = 'handoff' | 'recover' | 'replace' | 'heal';
+
+/**
+ * Payload of the server-authored `run.rebound` event: a change of the workspace orchestrator moved the
+ * run binding. Producers cannot send this type.
+ */
+export interface IMissionRunReboundPayload {
+  cause: TMissionRebindCause;
+  previousBinding: IMissionBinding;
+  binding: IMissionBinding;
+  actor: 'system:orchestration';
+}
+
 export interface IMissionEventBase {
   eventId: string;
   schemaVersion: 1;

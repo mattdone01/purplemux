@@ -106,6 +106,8 @@ const world = (file: string) => {
       discover: vi.fn(),
       workspaceViews: async () => [],
       resolveIdentity: async (_workspaceId, tabId) => identities.get(tabId) ?? null,
+      orchestratorTarget: async () => null,
+      withMappingRead: (_workspaceId, work) => work(),
       inbox: {
         enqueue: (request) => mutate((state) => {
           const result = enqueueInState(state, request, clock, () => `i-test${(seq += 1)}`);
@@ -211,6 +213,66 @@ describe('Mission Control through the inbox (story 12, ruling A′)', () => {
     const row = store.snapshot().deliveries.find((candidate) => candidate.id === accepted.delivery.id)!;
     expect(row).toMatchObject({ state: 'submitted', lastError: null, submittedAt: w.items()[1].deliveredAt });
     expect(row.binding?.sessionId).toBe('session-replacement');
+    store.close();
+  });
+
+  it('an answer waiting for a closed orchestrator moves with the rebind and is typed once into the new tab', async () => {
+    const w = world(databasePath());
+    const store = new MissionControlStore(w.file);
+    const accepted = seedAnswer(store);
+    const runtime = w.runtime(store);
+    await runtime.tick();
+    const itemId = w.items()[0].id;
+    expect(w.items()[0]).toMatchObject({ targetTabId: binding.tabId, state: 'queued' });
+
+    const successor = { tabId: 'tab-successor', providerId: 'claude', sessionId: 'session-successor', runtimeGeneration: null };
+    w.identities.delete(binding.tabId);
+    w.identities.set(successor.tabId, successor);
+    const [rebound] = await runtime.rebindToOrchestrator('ws-a', successor.tabId, 'recover');
+    expect(rebound.payload).toMatchObject({ cause: 'recover', previousBinding: binding, binding: { ...successor, generation: 2 } });
+    expect(store.snapshot().deliveries[0]).toMatchObject({ state: 'queued', lastError: null, binding: { ...successor, generation: 2 } });
+
+    await runtime.tick();
+    // A NEW notice is queued for the new orchestrator; the one for the closed tab is never typed.
+    const fresh = w.items().find((item) => item.targetTabId === successor.tabId)!;
+    expect(fresh).toMatchObject({ state: 'queued' });
+    expect(store.snapshot().deliveries[0]).toMatchObject({ state: 'queued', lastError: `inbox:${fresh.id}` });
+    await w.dispatcher().tick();
+    await runtime.tick();
+
+    expect(w.deliver).toHaveBeenCalledOnce();
+    expect(w.items().find((item) => item.id === itemId)).toMatchObject({ targetTabId: binding.tabId, state: 'dropped' });
+    expect(w.items().filter((item) => item.state === 'delivered')).toEqual([expect.objectContaining({ id: fresh.id })]);
+    expect(w.deliver.mock.calls[0][0]).toBe(`pt-${successor.tabId}`);
+    const row = store.snapshot().deliveries.find((candidate) => candidate.id === accepted.delivery.id)!;
+    expect(row).toMatchObject({ state: 'submitted', lastError: null, binding: { ...successor, generation: 2 } });
+    store.close();
+  });
+
+  it('a paste in flight to the old orchestrator is never typed again after the rebind: it stays held and readable', async () => {
+    const w = world(databasePath());
+    const store = new MissionControlStore(w.file);
+    const accepted = seedAnswer(store);
+    const runtime = w.runtime(store);
+    await runtime.tick();
+    const item = w.items()[0];
+    expect(await runtime.preflight(item)).toEqual({ ok: true });
+    expect(store.snapshot().deliveries[0].state).toBe('dispatching');
+
+    const successor = { tabId: 'tab-successor', providerId: 'claude', sessionId: 'session-successor', runtimeGeneration: null };
+    w.identities.set(successor.tabId, successor);
+    await runtime.rebindToOrchestrator('ws-a', successor.tabId, 'handoff');
+    await runtime.tick();
+    await w.dispatcher().tick();
+    await runtime.tick();
+
+    const row = store.snapshot().deliveries.find((candidate) => candidate.id === accepted.delivery.id)!;
+    expect(row.state).toBe('held');
+    expect(row.lastError).toMatch(/^transport-uncertain:/);
+    expect(row.binding).toEqual(binding);
+    expect(w.deliver).not.toHaveBeenCalled();
+    expect(w.items().filter((candidate) => candidate.targetTabId === successor.tabId)).toEqual([]);
+    expect(store.snapshot().items[0]).toMatchObject({ state: 'answered', answerId: accepted.answer.id });
     store.close();
   });
 

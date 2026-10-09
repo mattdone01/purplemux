@@ -18,11 +18,13 @@ import type {
   IMissionHumanInboxPolicy,
   IMissionQuestion,
   IMissionRun,
+  IMissionRunReboundPayload,
   IMissionSnapshot,
   IMissionWorkspaceView,
   TMissionProducerEvent,
   TMissionCandidateReason,
   TMissionHumanReview,
+  TMissionRebindCause,
 } from '@/types/mission-control';
 import {
   isMissionControlError,
@@ -86,6 +88,20 @@ export interface IMissionApplyEventsResult {
 export interface IMissionEventAuthority {
   resolvedIdentity: TMissionIdentity | null;
   configuredOrchestratorTabId: string | null;
+}
+
+export interface IMissionRebindInput {
+  workspaceId: string;
+  identity: TMissionIdentity;
+  cause: TMissionRebindCause;
+  /** Narrows the rebind to the runs whose current binding passes; every open bound run when omitted. */
+  eligible?: (binding: IMissionBinding) => boolean;
+}
+
+export interface IMissionOpenRunBinding {
+  runId: string;
+  workspaceId: string;
+  binding: IMissionBinding;
 }
 
 export interface IMissionDeliveryOutcome {
@@ -473,6 +489,18 @@ export class MissionControlStore {
     return eventFromRow(this.database.prepare('SELECT * FROM events WHERE id = ?').get(event.eventId) as IEventRow);
   };
 
+  private insertServerEvent = (
+    event: { id: string; workspaceId: string; runId: string; entityId: string; revision: number; type: string; payload: object },
+    committedAt: number,
+  ): IMissionEvent => {
+    this.database.prepare(`INSERT INTO events
+      (id, request_hash, schema_version, workspace_id, run_id, entity_id, revision, type, payload_json, producer_at, committed_at)
+      VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(event.id, contentHash(event.payload), event.workspaceId, event.runId, event.entityId, event.revision,
+        event.type, toJson(event.payload), committedAt, committedAt);
+    return eventFromRow(this.database.prepare('SELECT * FROM events WHERE id = ?').get(event.id) as IEventRow);
+  };
+
   snapshot = (workspaces: IMissionWorkspaceView[] = [], workspaceId?: string): IMissionSnapshot => {
     const read = this.database.transaction((): IMissionSnapshot => {
       const where = workspaceId ? ' WHERE workspace_id = ?' : '';
@@ -702,19 +730,11 @@ export class MissionControlStore {
       if (run.state === 'completed' || run.state === 'cancelled') missionConflict('finished run cannot be resumed', run);
       const binding: IMissionBinding = { ...resolvedIdentity, generation: (run.binding?.generation ?? 0) + 1 };
       const revision = run.revision + 1;
-      this.database.prepare(`UPDATE deliveries SET state='held', next_attempt_at=NULL,
-        last_error='transport-uncertain:run-resumed-during-dispatch', updated_at=MAX(?,updated_at+1)
-        WHERE run_id=? AND state='dispatching'`).run(now, run.id);
+      this.holdDispatchingDeliveries(run.id, 'transport-uncertain:run-resumed-during-dispatch', now);
       this.database.prepare(`UPDATE runs SET revision=?, state='running', binding_json=?, evidence_json=?, last_progress_at=?, updated_at=? WHERE id=?`)
         .run(revision, toJson(binding), toJson({ source: 'agent', sourceId: event.eventId, observedAt: event.producerAt, confidence: 'confirmed' }), event.producerAt, now, run.id);
       if (event.payload.transferPendingAnswers) {
-        this.database.prepare(`UPDATE deliveries SET binding_json=?, state='queued', next_attempt_at=?, last_error=NULL,
-          updated_at=MAX(?,updated_at+1)
-          WHERE run_id=? AND state IN ('queued','held','failed')
-          AND (last_error IS NULL OR last_error NOT LIKE 'transport-uncertain:%')
-          AND EXISTS (SELECT 1 FROM attention_items item
-            WHERE item.run_id=deliveries.run_id AND item.answer_id=deliveries.answer_id AND item.state='answered')`)
-          .run(toJson(binding), now, now, run.id);
+        this.transferPendingDeliveries(run.id, binding, now);
       } else {
         this.database.prepare(`UPDATE deliveries SET state='held', next_attempt_at=NULL, last_error='run resumed without answer transfer', updated_at=MAX(?,updated_at+1)
           WHERE run_id=? AND state='queued'`).run(now, run.id);
@@ -854,6 +874,80 @@ export class MissionControlStore {
         .run(now, now, delivery.id);
     }
     return this.insertEvent(event, item.id, item.revision, now, requestHash);
+  };
+
+  /** A paste may be in flight to the binding the run is leaving: held as uncertain, never sent again. */
+  private holdDispatchingDeliveries = (runId: string, reason: string, now: number): void => {
+    this.database.prepare(`UPDATE deliveries SET state='held', next_attempt_at=NULL, last_error=?, updated_at=MAX(?,updated_at+1)
+      WHERE run_id=? AND state='dispatching'`).run(reason, now, runId);
+  };
+
+  /** Answers not yet delivered, for items still answered, follow the run to its new binding. */
+  private transferPendingDeliveries = (runId: string, binding: IMissionBinding, now: number): void => {
+    this.database.prepare(`UPDATE deliveries SET binding_json=?, state='queued', next_attempt_at=?, last_error=NULL,
+      updated_at=MAX(?,updated_at+1)
+      WHERE run_id=? AND state IN ('queued','held','failed')
+      AND (last_error IS NULL OR last_error NOT LIKE 'transport-uncertain:%')
+      AND EXISTS (SELECT 1 FROM attention_items item
+        WHERE item.run_id=deliveries.run_id AND item.answer_id=deliveries.answer_id AND item.state='answered')`)
+      .run(toJson(binding), now, now, runId);
+  };
+
+  listOpenRunBindings = (workspaceId?: string): IMissionOpenRunBinding[] =>
+    (this.database.prepare(`SELECT id, workspace_id, binding_json FROM runs
+      WHERE state NOT IN ('completed','cancelled') AND binding_json IS NOT NULL${workspaceId ? ' AND workspace_id=?' : ''}
+      ORDER BY workspace_id, id`).all(...(workspaceId ? [workspaceId] : [])) as Array<Pick<IRunRow, 'id' | 'workspace_id' | 'binding_json'>>)
+      .map((row) => ({ runId: row.id, workspaceId: row.workspace_id, binding: JSON.parse(row.binding_json as string) as IMissionBinding }));
+
+  /**
+   * A change of the workspace orchestrator moves each open bound run to the new orchestrator's
+   * identity at the next binding generation, in one transaction with its `run.rebound` audit event.
+   * A run already on that identity is left alone, so a repeat is a no-op. An unbound provisional run
+   * keeps waiting for the `run.resumed` its bootstrap asks for.
+   */
+  rebindOpenRuns = (input: IMissionRebindInput): IMissionEvent[] => {
+    const transaction = this.database.transaction((): IMissionEvent[] => {
+      const now = Date.now();
+      const rows = this.database.prepare(`SELECT * FROM runs
+        WHERE workspace_id=? AND state NOT IN ('completed','cancelled') AND binding_json IS NOT NULL ORDER BY id`)
+        .all(input.workspaceId) as IRunRow[];
+      const events: IMissionEvent[] = [];
+      for (const row of rows) {
+        const previousBinding = JSON.parse(row.binding_json as string) as IMissionBinding;
+        if (boundToIdentity(previousBinding, input.identity)) continue;
+        if (input.eligible && !input.eligible(previousBinding)) continue;
+        const binding: IMissionBinding = {
+          tabId: input.identity.tabId,
+          providerId: input.identity.providerId,
+          sessionId: input.identity.sessionId,
+          generation: previousBinding.generation + 1,
+          runtimeGeneration: input.identity.runtimeGeneration,
+        };
+        const revision = row.revision + 1;
+        this.holdDispatchingDeliveries(row.id, 'transport-uncertain:run-rebound-during-dispatch', now);
+        this.database.prepare('UPDATE runs SET revision=?, binding_json=?, updated_at=? WHERE id=?')
+          .run(revision, toJson(binding), now, row.id);
+        this.transferPendingDeliveries(row.id, binding, now);
+        const payload: IMissionRunReboundPayload = { cause: input.cause, previousBinding, binding, actor: 'system:orchestration' };
+        events.push(this.insertServerEvent({
+          id: `system:rebind:${createHash('sha256').update(row.id).digest('hex').slice(0, 32)}:${binding.generation}`,
+          workspaceId: row.workspace_id,
+          runId: row.id,
+          entityId: row.id,
+          revision,
+          type: 'run.rebound',
+          payload,
+        }, now));
+      }
+      return events;
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      if (isMissionControlError(error)) throw error;
+      if (isSqliteFailure(error)) throw new MissionControlError(503, 'storage-unavailable', 'Mission Control storage unavailable');
+      throw error;
+    }
   };
 
   private confirmBootstrap = (runId: string, now: number): void => {
@@ -1341,11 +1435,13 @@ export const getMissionControlStore = (): MissionControlStore => {
   globalStore.__ptMissionControlStore ??= new MissionControlStore();
   return globalStore.__ptMissionControlStore;
 };
+const boundToIdentity = (binding: IMissionBinding, identity: TMissionIdentity): boolean =>
+  binding.tabId === identity.tabId
+  && binding.providerId === identity.providerId
+  && binding.sessionId === identity.sessionId
+  && binding.runtimeGeneration === identity.runtimeGeneration;
 const bindingsEqual = (left: IMissionBinding | null, right: IMissionBinding | null): boolean =>
   left !== null
   && right !== null
-  && left.tabId === right.tabId
-  && left.providerId === right.providerId
-  && left.sessionId === right.sessionId
-  && left.generation === right.generation
-  && left.runtimeGeneration === right.runtimeGeneration;
+  && boundToIdentity(left, right)
+  && left.generation === right.generation;

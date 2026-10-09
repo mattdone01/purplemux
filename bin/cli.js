@@ -482,6 +482,20 @@ const missionBootstrapSteps = (body, wsId) => {
     });
 };
 
+// Every open run the server holds a binding for: after a handoff or a recovery the new orchestrator
+// reads its run id, revision and binding generation here.
+const missionBoundRuns = (body, wsId) => (Array.isArray(body.runs) ? body.runs : [])
+  .filter((run) => run.workspaceId === wsId && run.binding && !['completed', 'cancelled'].includes(run.state))
+  .map((run) => ({
+    runId: run.id,
+    objective: run.objective,
+    phase: run.phase,
+    state: run.state,
+    revision: run.revision,
+    tabId: run.binding.tabId,
+    bindingGeneration: run.binding.generation,
+  }));
+
 const missionWorkspace = (args) => {
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
   if (!wsId) die('--workspace is required');
@@ -536,7 +550,7 @@ const cmdMission = async (args) => {
   }
   if (sub === 'bootstrap') {
     const { body } = await api('GET', endpoint);
-    return out({ workspaceId: wsId, entries: missionBootstrapSteps(body, wsId) });
+    return out({ workspaceId: wsId, entries: missionBootstrapSteps(body, wsId), runs: missionBoundRuns(body, wsId) });
   }
   if (sub === 'events') {
     const raw = flagValue(rest, '--json') || await readStdin();
@@ -1523,7 +1537,9 @@ Commands:
   standup show -w WS                       Latest standup + history for a workspace
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
-  mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap
+  mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap, and
+                                           each open bound run with its revision, bound tab and binding generation
+                                           (a handoff, recovery or replacement of the orchestrator moves the binding)
   mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items, each with its ackCommand; --all includes history
   mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
                                            Acknowledge one persisted answer after reading and applying it
