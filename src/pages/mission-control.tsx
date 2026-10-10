@@ -9,6 +9,7 @@ import MissionControlDashboard, {
   MissionControlDashboardSkeleton,
   MissionControlErrorState,
 } from '@/components/features/mission-control/mission-control-dashboard';
+import MissionControlNeedsYou from '@/components/features/mission-control/mission-control-needs-you';
 import {
   adoptCurrentMissionItem,
   createMissionDraft,
@@ -56,7 +57,7 @@ const MissionControlPage = () => {
     refresh,
     applyAnswer,
     applyBootstrap,
-  } = useMissionControl(legacyOpen);
+  } = useMissionControl();
   const [drafts, setDrafts] = useState<Record<string, IMissionDraft>>({});
   const [bootstrapPending, setBootstrapPending] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
@@ -183,7 +184,25 @@ const MissionControlPage = () => {
 
   let content;
   if (!legacyOpen) {
-    content = <PortfolioBoard />;
+    content = (
+      <>
+        <div className="mx-auto w-full max-w-[1440px] px-3 pt-5 sm:px-5 lg:px-8">
+          <MissionControlNeedsYou
+            snapshot={snapshot}
+            loading={loading}
+            unsupported={unsupported}
+            error={error}
+            refreshing={refreshing}
+            drafts={drafts}
+            onRetry={() => void refresh()}
+            onDraftChange={handleDraftChange}
+            onAdoptCurrent={handleAdoptCurrent}
+            onSubmit={(item) => void handleSubmit(item)}
+          />
+        </div>
+        <PortfolioBoard />
+      </>
+    );
   } else if (loading) {
     content = <MissionControlDashboardSkeleton />;
   } else if (!snapshot) {
@@ -204,9 +223,6 @@ const MissionControlPage = () => {
           bootstrapPending={bootstrapPending}
           bootstrapError={bootstrapError}
           onRefresh={() => void refresh()}
-          onDraftChange={handleDraftChange}
-          onAdoptCurrent={handleAdoptCurrent}
-          onSubmit={(item) => void handleSubmit(item)}
           onOpenWorkspace={selectWorkspace}
           onBootstrap={() => void handleBootstrap()}
         />

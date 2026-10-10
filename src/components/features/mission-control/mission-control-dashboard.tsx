@@ -18,15 +18,14 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 import CoordinationPanel from '@/components/features/mission-control/coordination-panel';
-import MissionControlAnswerCard, {
-  MissionControlDeliveryCard,
-} from '@/components/features/mission-control/mission-control-answer-card';
+import { MissionControlDeliveryCard } from '@/components/features/mission-control/mission-control-answer-card';
+import { EmptyPanel, SectionHeading } from '@/components/features/mission-control/mission-control-needs-you';
 import {
   formatMissionAge,
   isMissionHumanInboxItem,
   missionWorkspaceIssuePresentation,
 } from '@/components/features/mission-control/mission-control-utils';
-import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
+import type { IMissionDraft } from '@/components/features/mission-control/mission-control-utils';
 import type {
   IMissionAttentionItem,
   IMissionBootstrapEntry,
@@ -43,9 +42,6 @@ interface IMissionControlDashboardProps {
   bootstrapPending: boolean;
   bootstrapError: string | null;
   onRefresh: () => void;
-  onDraftChange: (item: IMissionAttentionItem, patch: IMissionDraftPatch) => void;
-  onAdoptCurrent: (itemId: string) => void;
-  onSubmit: (item: IMissionAttentionItem) => void;
   onOpenWorkspace: (workspaceId: string) => void;
   onBootstrap: () => void;
 }
@@ -83,20 +79,6 @@ const bootstrapReasonLabel = (reason: string | null): string | null => {
   return label ? `${label[0].toUpperCase()}${label.slice(1)}` : null;
 };
 
-const itemGroups = (
-  items: IMissionAttentionItem[],
-  workspaces: IMissionWorkspaceView[],
-): Array<{ workspace: IMissionWorkspaceView | undefined; items: IMissionAttentionItem[] }> => {
-  const grouped = new Map<string, IMissionAttentionItem[]>();
-  for (const item of items) {
-    grouped.set(item.workspaceId, [...(grouped.get(item.workspaceId) ?? []), item]);
-  }
-  return [...grouped.entries()].map(([workspaceId, groupedItems]) => ({
-    workspace: workspaces.find((workspace) => workspace.workspaceId === workspaceId),
-    items: groupedItems.sort((left, right) => left.createdAt - right.createdAt),
-  }));
-};
-
 const currentRun = (workspace: IMissionWorkspaceView, runs: IMissionRun[]): IMissionRun | undefined =>
   runs
     .filter((run) => workspace.runIds.includes(run.id))
@@ -105,36 +87,6 @@ const currentRun = (workspace: IMissionWorkspaceView, runs: IMissionRun[]): IMis
       const rightCurrent = right.state === 'running' || right.state === 'waiting' ? 1 : 0;
       return rightCurrent - leftCurrent || right.updatedAt - left.updatedAt;
     })[0];
-
-const SectionHeading = ({
-  title,
-  count,
-  description,
-}: {
-  title: string;
-  count?: number;
-  description: string;
-}) => (
-  <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-    <div>
-      <div className="flex items-center gap-2">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        {count !== undefined && (
-          <span className="rounded bg-muted px-1.5 py-0.5 text-xs tabular-nums text-muted-foreground">
-            {count}
-          </span>
-        )}
-      </div>
-      <p className="mt-1 text-xs text-muted-foreground">{description}</p>
-    </div>
-  </div>
-);
-
-const EmptyPanel = ({ children }: { children: React.ReactNode }) => (
-  <div className="rounded-lg border border-dashed border-foreground/15 px-4 py-8 text-center text-sm text-muted-foreground">
-    {children}
-  </div>
-);
 
 const CandidateCard = ({
   item,
@@ -451,14 +403,10 @@ const MissionControlDashboard = ({
   bootstrapPending,
   bootstrapError,
   onRefresh,
-  onDraftChange,
-  onAdoptCurrent,
-  onSubmit,
   onOpenWorkspace,
   onBootstrap,
 }: IMissionControlDashboardProps) => {
   const [activityFilter, setActivityFilter] = useState<TMissionActivity>('active');
-  const actionableItems = snapshot.items.filter(isMissionHumanInboxItem);
   const workspaceIssueItems = snapshot.items.filter((item) =>
     item.state === 'candidate' || (item.state === 'open' && !isMissionHumanInboxItem(item)));
   const answeredItems = snapshot.items.filter((item) => item.state === 'answered');
@@ -485,7 +433,7 @@ const MissionControlDashboard = ({
             <h1 className="text-base font-semibold">Mission Control</h1>
           </div>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            Your decisions and active work across all workspaces.
+            Answer delivery, active work, and workspace issues across all workspaces.
           </p>
         </div>
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -497,39 +445,6 @@ const MissionControlDashboard = ({
       </header>
 
       <BootstrapPanel snapshot={snapshot} pending={bootstrapPending} error={bootstrapError} onBootstrap={onBootstrap} />
-
-      <section className="space-y-3" aria-labelledby="needs-you-heading">
-        <div id="needs-you-heading">
-          <SectionHeading
-            title="Needs you"
-            count={actionableItems.length}
-            description="Decisions and actions explicitly escalated for you."
-          />
-        </div>
-        {actionableItems.length === 0 ? (
-          <EmptyPanel>No confirmed questions need an answer.</EmptyPanel>
-        ) : itemGroups(actionableItems, snapshot.workspaces).map(({ workspace, items }) => (
-          <div key={workspace?.workspaceId ?? items[0].workspaceId} className="space-y-3">
-            <p className="text-xs font-medium text-muted-foreground">{workspace?.name ?? items[0].workspaceId}</p>
-            <div className="grid min-w-0 gap-3 xl:grid-cols-2">
-              {items.map((item) => {
-                const draft = drafts[item.id];
-                if (!draft) return null;
-                return (
-                  <MissionControlAnswerCard
-                    key={item.id}
-                    draft={draft}
-                    workspaceName={workspace?.name ?? item.workspaceId}
-                    onChange={(patch) => onDraftChange(item, patch)}
-                    onAdoptCurrent={() => onAdoptCurrent(item.id)}
-                    onSubmit={() => onSubmit(item)}
-                  />
-                );
-              })}
-            </div>
-          </div>
-        ))}
-      </section>
 
       {answeredItems.length > 0 && (
         <section className="space-y-3" aria-labelledby="answer-delivery-heading">
