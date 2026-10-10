@@ -300,7 +300,7 @@ describe('Mission Control draft lifecycle', () => {
 });
 
 describe('Mission Control dashboard', () => {
-  it('renders the inbox first, keeps candidates separate, and exposes honest delivery state', () => {
+  it('leaves the inbox to the default view, keeps candidates separate, and exposes honest delivery state', () => {
     const data = snapshot();
     data.bootstrap = {
       id: 'bootstrap-1',
@@ -324,24 +324,20 @@ describe('Mission Control dashboard', () => {
         bootstrapPending={false}
         bootstrapError={null}
         onRefresh={() => {}}
-        onDraftChange={() => {}}
-        onAdoptCurrent={() => {}}
-        onSubmit={() => {}}
         onOpenWorkspace={() => {}}
         onBootstrap={() => {}}
       />,
     );
 
-    expect(html.indexOf('Needs you')).toBeLessThan(html.indexOf('Workspaces'));
+    expect(html).not.toContain('id="needs-you-heading"');
+    expect(html).not.toContain('Why you&#x27;re needed');
+    expect(html.indexOf('Answer delivery')).toBeLessThan(html.indexOf('Workspaces'));
     expect(html.indexOf('Workspaces')).toBeLessThan(html.indexOf('Workspace issues'));
-    expect(html).toContain('Choose a release path');
-    expect(html).toContain('Why you&#x27;re needed');
-    expect(html).toContain('Choose the release path that matches the product risk tolerance.');
     expect(html).toContain('Delivered · awaiting acknowledgement');
     expect(html).toContain('Workspace issues');
     expect(html).toContain('Orchestrator review required');
     expect(html).toContain('Epic closeout pending');
-    expect(html).toContain('Your decisions and active work across all workspaces.');
+    expect(html).toContain('Answer delivery, active work, and workspace issues across all workspaces.');
     expect(html).toContain('1 confirmed');
     expect(html).toContain('Discover again');
     expect(html).toContain('<details');
@@ -357,9 +353,6 @@ describe('Mission Control dashboard', () => {
         bootstrapPending={false}
         bootstrapError={null}
         onRefresh={() => {}}
-        onDraftChange={() => {}}
-        onAdoptCurrent={() => {}}
-        onSubmit={() => {}}
         onOpenWorkspace={() => {}}
         onBootstrap={() => {}}
       />,
@@ -409,9 +402,6 @@ describe('Mission Control dashboard', () => {
         bootstrapPending={false}
         bootstrapError={null}
         onRefresh={() => {}}
-        onDraftChange={() => {}}
-        onAdoptCurrent={() => {}}
-        onSubmit={() => {}}
         onOpenWorkspace={() => {}}
         onBootstrap={() => {}}
       />,
@@ -424,7 +414,7 @@ describe('Mission Control dashboard', () => {
     expect(draft.submissionId).toBe('11111111-1111-4111-8111-111111111111');
   });
 
-  it('shows a competing-device answer draft outside Needs you with submission disabled', () => {
+  it('shows a competing-device answer draft as a saved draft with submission disabled', () => {
     const open = item({ id: 'competing-answer' });
     const original = {
       ...createMissionDraft(open, '11111111-1111-4111-8111-111111111111'),
@@ -447,9 +437,6 @@ describe('Mission Control dashboard', () => {
         bootstrapPending={false}
         bootstrapError={null}
         onRefresh={() => {}}
-        onDraftChange={() => {}}
-        onAdoptCurrent={() => {}}
-        onSubmit={() => {}}
         onOpenWorkspace={() => {}}
         onBootstrap={() => {}}
       />,
@@ -460,7 +447,6 @@ describe('Mission Control dashboard', () => {
       text: 'Keep this competing answer',
       currentItem: answered,
     });
-    expect(html).toContain('No confirmed questions need an answer.');
     expect(html).toContain('Saved drafts');
     expect(html).toContain('Keep this competing answer');
     expect(html).toContain('The item changed elsewhere. This draft is retained for reference and cannot be submitted.');
@@ -498,9 +484,6 @@ describe('Mission Control dashboard', () => {
         bootstrapPending={false}
         bootstrapError={null}
         onRefresh={() => {}}
-        onDraftChange={() => {}}
-        onAdoptCurrent={() => {}}
-        onSubmit={() => {}}
         onOpenWorkspace={() => {}}
         onBootstrap={() => {}}
       />,
@@ -511,7 +494,6 @@ describe('Mission Control dashboard', () => {
       text: 'Keep this migrated answer',
       currentItem: cancelled,
     });
-    expect(html).toContain('No confirmed questions need an answer.');
     expect(html).toContain('Saved drafts');
     expect(html).toContain('Keep this migrated answer');
     expect(html).toContain('data-disabled=""');
@@ -528,9 +510,6 @@ describe('Mission Control dashboard', () => {
         bootstrapPending={false}
         bootstrapError={null}
         onRefresh={() => {}}
-        onDraftChange={() => {}}
-        onAdoptCurrent={() => {}}
-        onSubmit={() => {}}
         onOpenWorkspace={() => {}}
         onBootstrap={() => {}}
       />,
@@ -538,7 +517,7 @@ describe('Mission Control dashboard', () => {
 
     expect(html).toContain('px-3');
     expect(html).toContain('min-w-0');
-    expect(html).toContain('w-full sm:w-auto');
+    expect(html).toContain('w-full shrink-0 sm:w-auto');
     expect(html).toContain('lg:grid-cols-2');
   });
 });

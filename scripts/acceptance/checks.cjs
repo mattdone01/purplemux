@@ -4,7 +4,8 @@
 // failures, refusal codes) live in checks-wave3.cjs and run after wave 2; the wave-4 checks (subagent
 // background work, hook-time identity, drive grants, the grants read, the coordination panel, Mission
 // Control delivery through the inbox) live in checks-wave4.cjs; the wave-5 recovery checks in
-// checks-wave5.cjs; the wave-6 epic burndown publish and board read in checks-burndown.cjs, run last.
+// checks-wave5.cjs; the wave-6 epic burndown publish and board read in checks-burndown.cjs; the wave-7
+// default Mission Control page (Needs you before the portfolio board) in checks-mission-control-page.cjs, run last.
 //
 //   checks.cjs --state <state.json> [--bash-guard <bash-guard.py>] [--require-bash-guard]
 //
@@ -48,6 +49,7 @@ const { wave3 } = require('./checks-wave3.cjs');
 const { wave4, request, humanSession, liveStandIn, standInRecord } = require('./checks-wave4.cjs');
 const { wave5 } = require('./checks-wave5.cjs');
 const { wave6 } = require('./checks-burndown.cjs');
+const { wave7 } = require('./checks-mission-control-page.cjs');
 
 const POLL_MS = 200;
 /** The idle window the run sets (fleet config, minutes): 3 s. */
@@ -1604,7 +1606,7 @@ const main = async (argv) => {
   const waves = opts.targetedFixture
     ? [() => targetedFixtureWithNotes(inst)]
     : [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers),
-      () => wave6(inst, helpers)];
+      () => wave6(inst, helpers), () => wave7(inst)];
   const results = [];
   for (const [i, wave] of waves.entries()) {
     if (opts.targetedFixture || opts.onlyWave === null || opts.onlyWave === i + 1) results.push(...(await wave()));

@@ -474,6 +474,19 @@ describe('checks-burndown.cjs fixture', () => {
   });
 });
 
+describe('checks-mission-control-page.cjs', () => {
+  const wave7 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-mission-control-page.cjs'));
+
+  it('passes only when the Needs you section precedes the portfolio board heading', () => {
+    const section = '<section aria-labelledby="needs-you-heading"><div id="needs-you-heading"></div></section>';
+    const board = '<h1 class="text-xl font-semibold">Portfolio board</h1>';
+    expect(wave7.pageOrder(`<title>Portfolio board · PurpleMux</title>${section}${board}`).first).toBe(true);
+    expect(wave7.pageOrder(`${board}${section}`).first).toBe(false);
+    expect(wave7.pageOrder(board)).toMatchObject({ needsYou: -1, first: false });
+    expect(wave7.pageOrder(section)).toMatchObject({ board: -1, first: false });
+  });
+});
+
 describe('checks-wave5.cjs fixtures (ADR-0021)', () => {
   const wave5 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wave5.cjs'));
 
