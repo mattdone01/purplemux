@@ -93,4 +93,48 @@ describe('watchdogTurnEnd persists through the real layout file (review r2 nit 4
       expect(raw.root.type === 'pane' && raw.root.tabs[0].watchdogTurnEnd).toBeUndefined();
     });
   });
+
+  it('an end-line stop survives a restart too (ADR-0023): restored to a ready-for-review tab or one dismissed to idle after it, dropped otherwise', async () => {
+    // The first test's layout content cache would skip this identical write.
+    resetStores();
+    const store = await import('@/lib/layout-store');
+    const layout: ILayoutData = {
+      root: { type: 'pane', id: paneId, activeTabId: tabId, tabs: [{ id: tabId, sessionName, name: 'w', order: 0, panelType: 'claude-code', cliState: 'ready-for-review' }] },
+      activePaneId: paneId,
+      updatedAt: new Date().toISOString(),
+    };
+    await store.writeLayoutFile(layout, store.resolveLayoutFile(wsId));
+    const { StatusManager } = await import('@/lib/status-manager');
+    const writer = new StatusManager();
+    const entry = { ...entryFor('sess-1'), lastEvent: { name: 'stop' as const, at: 1_790_000_000_000, seq: 9 }, eventSeq: 9 };
+    entry.turnEnd = { kind: 'turn-marker', at: 1_790_000_000_000, seq: 9, marker: ['NEEDS-DECISION: q-1'] };
+    writer.registerTab(tabId, entry);
+    (writer as unknown as { persistTurnEnd: (e: ITabStatusEntry) => void }).persistTurnEnd(entry);
+    await vi.waitFor(async () => {
+      const raw = JSON.parse(await fs.readFile(store.resolveLayoutFile(wsId), 'utf-8')) as ILayoutData;
+      expect(raw.root.type === 'pane' && raw.root.tabs[0].watchdogTurnEnd?.kind).toBe('turn-marker');
+    });
+    writer.shutdown();
+
+    const persisted = await readTab();
+    const { StatusManager: Rebuilt } = await import('@/lib/status-manager');
+    const restore = (tab: ITab, e: ITabStatusEntry) =>
+      (new Rebuilt() as unknown as { applyRestoredStop: (t: ITab, x: ITabStatusEntry) => void }).applyRestoredStop(tab, e);
+    const rfr = { ...entryFor('sess-1'), cliState: 'ready-for-review' as const };
+    restore(persisted, rfr);
+    expect(rfr.turnEnd).toMatchObject({ kind: 'turn-marker', seq: 9, marker: ['NEEDS-DECISION: q-1'] });
+    expect(rfr.lastEvent).toEqual({ name: 'stop', at: 1_790_000_000_000, seq: 9 });
+    // Idle and dismissed after the stop: the line still stands.
+    const dismissed = { ...entryFor('sess-1'), cliState: 'idle' as const };
+    restore({ ...persisted, dismissedAt: 1_790_000_060_000 }, dismissed);
+    expect(dismissed.turnEnd).toMatchObject({ kind: 'turn-marker', seq: 9 });
+    // Idle with no dismiss since the stop: prompted then interrupted, so the line is stale.
+    const interrupted = { ...entryFor('sess-1'), cliState: 'idle' as const };
+    restore({ ...persisted, dismissedAt: null }, interrupted);
+    expect(interrupted.turnEnd ?? null).toBeNull();
+    expect(interrupted.lastEvent).toBeNull();
+    const busy = { ...entryFor('sess-1'), cliState: 'unknown' as const };
+    restore(persisted, busy);
+    expect(busy.turnEnd ?? null).toBeNull();
+  });
 });

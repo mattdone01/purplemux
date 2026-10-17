@@ -206,7 +206,10 @@ export class StatusManager {
   private automatedPrompts: AutomatedPromptDispatcher;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
   private updateAgentState: typeof updateTabAgentState;
-  private stuckNudgedTabs = new Set<string>();
+  /** Tab → when its once-per-busy-stretch `stuck` nudge went out (the fleet panel reads the time, ADR-0023). */
+  private stuckNudgedTabs = new Map<string, number>();
+  /** Tab → when it last became `inactive` (runtime only; the fleet panel times the dead agent from it). */
+  private inactiveSince = new Map<string, number>();
   private transcriptFallbackLogged = new Set<string>();
   /** When the poll first saw each tab `inactive` (the pane-probe clock). */
   private inactiveSeenAt = new Map<string, number>();
@@ -855,7 +858,7 @@ export class StatusManager {
           // A registered job that died speaks first: its completion event, not a stall (L49, tab-peo88o).
           if (!this.stuckNudgedTabs.has(tab.id) && !(await this.reportDeadJobs(tab.id))
               && await this.looksStalled(tab.id, existing, now)) {
-            this.stuckNudgedTabs.add(tab.id);
+            this.stuckNudgedTabs.set(tab.id, now);
             this.nudgeOrchestrator(tab.id, existing, 'stuck').catch((err) => {
               log.warn(`stuck nudge failed: ${err instanceof Error ? err.message : err}`);
             });
@@ -918,6 +921,7 @@ export class StatusManager {
         this.stuckNudgedTabs.delete(tabId);
         this.transcriptFallbackLogged.delete(tabId);
         this.inactiveSeenAt.delete(tabId);
+        this.inactiveSince.delete(tabId);
         this.pollBoundSessions.delete(tabId);
         this.sessionBindingEpoch.delete(tabId);
         this.processStartCache.delete(tabId);
@@ -1339,6 +1343,17 @@ export class StatusManager {
     });
   }
 
+  /** The server-only facts the fleet status panel reads (ADR-0023): read only, no side effect. */
+  fleetFacts(tabId: string): { jsonlPath: string | null; stallReportedAt: number | null; inactiveSince: number | null } | null {
+    const entry = this.tabs.get(tabId);
+    if (!entry) return null;
+    return {
+      jsonlPath: entry.jsonlPath ?? null,
+      stallReportedAt: this.stuckNudgedTabs.get(tabId) ?? null,
+      inactiveSince: entry.cliState === 'inactive' ? this.inactiveSince.get(tabId) ?? null : null,
+    };
+  }
+
   getAllForClient(): Record<string, IClientTabStatusEntry> {
     const result: Record<string, IClientTabStatusEntry> = {};
     for (const [tabId, entry] of this.tabs) {
@@ -1388,6 +1403,8 @@ export class StatusManager {
     if (newState === 'inactive' && entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'agent-exited');
     entry.readyForReviewAt = newState === 'ready-for-review' ? Date.now() : null;
     entry.busySince = newState === 'busy' ? Date.now() : null;
+    if (newState === 'inactive') this.inactiveSince.set(tabId, Date.now());
+    else this.inactiveSince.delete(tabId);
     if (newState === 'busy') entry.dismissedAt = null;
     if (prevState === 'needs-input' && newState !== 'needs-input' && entry.permissionRequest) {
       entry.permissionRequest = null;
@@ -1993,9 +2010,12 @@ export class StatusManager {
     await this.nudgeOrchestrator(tabId, entry, 'long-wait', `${hours} h on ${named}`, `long-wait:${seq}`);
   }
 
-  /** The stop record the idle nudge is derived from survives a restart (finding 2). */
+  /**
+   * The stop record the idle nudge is derived from survives a restart (finding 2). An end-line
+   * stop survives too, so the tab still reads as ended on its line after a restart (ADR-0023).
+   */
   private persistTurnEnd(entry: ITabStatusEntry): void {
-    const record = entry.turnEnd?.kind === 'ready-for-review'
+    const record = entry.turnEnd?.kind === 'ready-for-review' || entry.turnEnd?.kind === 'turn-marker'
       ? { ...entry.turnEnd, agentSessionId: entry.agentSessionId ?? null }
       : null;
     updateTabWatchdogTurnEnd(entry.tmuxSession, record).catch((err) => {
@@ -2013,7 +2033,15 @@ export class StatusManager {
   private applyRestoredStop(tab: ITab, entry: ITabStatusEntry): void {
     const record = tab.watchdogTurnEnd;
     if (!record) return;
-    const usable = entry.cliState === 'ready-for-review' && record.kind === 'ready-for-review'
+    // An end-line stop also comes back to a tab dismissed to idle after it; it fires no nudge (the
+    // idle nudge reads only a `ready-for-review` record, and the marker nudge only a new stop). An
+    // idle tab not dismissed since the stop was prompted and interrupted: that line is stale.
+    const dismissedAfterStop = typeof tab.dismissedAt === 'number' && tab.dismissedAt >= record.at;
+    const kindFits = record.kind === 'ready-for-review'
+      ? entry.cliState === 'ready-for-review'
+      : record.kind === 'turn-marker'
+        && (entry.cliState === 'ready-for-review' || (entry.cliState === 'idle' && dismissedAfterStop));
+    const usable = kindFits
       && Number.isSafeInteger(record.seq) && Number.isFinite(record.at)
       && (record.agentSessionId ?? null) === (entry.agentSessionId ?? null);
     if (!usable) {
@@ -2639,6 +2667,7 @@ export class StatusManager {
       this.compactStaleTimers.delete(tabId);
     }
     this.stuckNudgedTabs.delete(tabId);
+    this.inactiveSince.delete(tabId);
     this.jobEventAt.delete(tabId);
     // A poll that read the layout before the close must not bring the tab back (L38).
     this.retiredTabs.set(tabId, Date.now() + CLOSED_RETIRE_MS);
