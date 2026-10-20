@@ -66,6 +66,14 @@ describe('POST /api/cli/workspaces', () => {
     expect(r.body.defaultTabId).toBeNull();
   });
 
+  it('answers 200 with the created workspace when the first-tab registration fails afterwards', async () => {
+    vi.mocked(readDefaultTab).mockRejectedValue(new Error('layout unreadable'));
+    const r = await call('POST', { name: 'x', directories: ['/srv/a'] });
+    expect(r.statusCode).toBe(200);
+    expect(r.body).toEqual({ ...created, defaultTabId: null });
+    expect(appendCoordinationAudit).toHaveBeenCalled();
+  });
+
   it.each([
     ['a workspace token', { type: 'workspace', workspaceId: 'ws-a' }],
     ['a tab token', { type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-a', tabVerified: true, tabIdentity: 'launch' }],

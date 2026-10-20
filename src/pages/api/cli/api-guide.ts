@@ -139,7 +139,9 @@ POST /api/cli/workspaces                                (purplemux workspace cre
   (workspace-create) goes to ~/.purplemux/audit/coordination.jsonl.
   Response: { "id": "ws-...", "name", "directories": [...], "defaultTabId": "tab-..." | null }
   Errors: invalid-request 400 (exit 2: bad body, missing or non-directory path), forbidden 403
-  (exit 3), conflict 409 (exit 3: the name is taken; the message names the holder's id).
+  (exit 3), conflict 409 (exit 3: the name is taken; the message names the holder's id),
+  workspace-create-failed 500 (exit 1: nothing was created). A failure to register the first
+  tab after the create answers 200 with "defaultTabId": null; the workspace exists.
 
 GET /api/cli/workspaces/<workspaceId>/directories
   Response: { "workspaceId", "name", "directories": [...] }

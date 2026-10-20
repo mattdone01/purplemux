@@ -88,6 +88,7 @@ const handlers: Record<string, () => Promise<{ default: (req: NextApiRequest, re
   'workspace/group/reorder': () => import('@/pages/api/workspace/group/reorder'),
   'workspace/index': () => import('@/pages/api/workspace/index'),
   'workspace/reorder': () => import('@/pages/api/workspace/reorder'),
+  'cli/workspaces': () => import('@/pages/api/cli/workspaces'),
 };
 
 const request = (method: string, cookie = false, origin = 'http://localhost:8022') => ({
@@ -133,6 +134,29 @@ describe('route mutation authority matrix', () => {
       }
     });
   }
+  // ADR-0024: creating a workspace is the one CLI mutation the global token holds, and only it.
+  it.each(['local', 'foreign', 'grant', 'human'])('%s cannot create a workspace', async (token) => {
+    state.token = token; state.granted = token === 'grant';
+    const { default: handler } = await handlers['cli/workspaces']();
+    const { state: result, res } = response();
+    await handler(request('POST'), res);
+    expect(result.code).toBe(403);
+    for (const runtime of await runtimeModules()) for (const value of Object.values(runtime)) {
+      if (vi.isMockFunction(value)) expect(value).not.toHaveBeenCalled();
+    }
+  });
+  it('global passes the workspace-create boundary', async () => {
+    state.token = 'global';
+    const { default: handler } = await handlers['cli/workspaces']();
+    const reachedRuntime = new Error('authorized runtime reached');
+    for (const runtime of await runtimeModules()) for (const value of Object.values(runtime)) {
+      if (vi.isMockFunction(value)) value.mockImplementation(() => { throw reachedRuntime; });
+    }
+    const { state: result, res } = response();
+    await handler({ ...request('POST'), body: { name: 'n', directories: ['/srv/a'] } } as unknown as NextApiRequest, res)
+      .catch((error: unknown) => expect(error).toBe(reachedRuntime));
+    expect(result.code).not.toBe(403);
+  });
   it.each(uiRoutes)('cross-origin human cannot mutate %s %s', async (route, method) => {
     const { default: handler } = await handlers[route]();
     const { state: result, res } = response();

@@ -440,6 +440,16 @@ export const createWorkspace = async (
   options?: ICreateWorkspaceOptions,
 ): Promise<IWorkspace> =>
   withLock(async () => {
+    const data = (await readWorkspacesFile()) ?? emptyState();
+
+    const taken = options?.uniqueName && name?.trim() ? data.workspaces.find((w) => sameName(w.name, name)) : undefined;
+    if (taken) {
+      throw Object.assign(new Error(`a workspace named "${taken.name}" already exists (${taken.id})`), {
+        code: WORKSPACE_NAME_TAKEN_CODE,
+        workspaceId: taken.id,
+      });
+    }
+
     const plan = planDirectoryCreate({
       directory,
       home: os.homedir(),
@@ -456,16 +466,6 @@ export const createWorkspace = async (
         throw directoryError(`Could not create directory: ${err instanceof Error ? err.message : 'unknown error'}`);
       }
       log.info(`Created directory ${directory} for a new workspace`);
-    }
-
-    const data = (await readWorkspacesFile()) ?? emptyState();
-
-    const taken = options?.uniqueName && name?.trim() ? data.workspaces.find((w) => sameName(w.name, name)) : undefined;
-    if (taken) {
-      throw Object.assign(new Error(`a workspace named "${taken.name}" already exists (${taken.id})`), {
-        code: WORKSPACE_NAME_TAKEN_CODE,
-        workspaceId: taken.id,
-      });
     }
 
     const owner = findPrimaryDirOwner(data, directory);

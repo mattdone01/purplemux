@@ -78,26 +78,9 @@ const create = async (req: NextApiRequest, res: NextApiResponse) => {
     }
   }
 
+  let workspace;
   try {
-    const workspace = await createWorkspace(primary, parsed.name, undefined, { uniqueName: true, extraDirectories: extra });
-    // Loaded on create only: the provider registry pulls in the terminal server, which the read path never needs.
-    const { readDefaultTab, registerDefaultTab } = await import('@/lib/workspace-default-tab');
-    const defaultTab = await readDefaultTab(workspace.id);
-    registerDefaultTab(workspace, defaultTab);
-    await appendCoordinationAudit({
-      event: 'workspace-create',
-      workspaceId: workspace.id,
-      name: workspace.name,
-      directories: workspace.directories,
-      by: 'admin',
-    });
-    log.info(`created ${workspace.id} (${workspace.name}) via CLI`);
-    return res.status(200).json({
-      id: workspace.id,
-      name: workspace.name,
-      directories: workspace.directories,
-      defaultTabId: defaultTab?.id ?? null,
-    });
+    workspace = await createWorkspace(primary, parsed.name, undefined, { uniqueName: true, extraDirectories: extra });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     if (isWorkspaceNameTakenError(err)) return res.status(409).json({ error: message, code: 'conflict' });
@@ -105,6 +88,33 @@ const create = async (req: NextApiRequest, res: NextApiResponse) => {
     log.error(`workspace create failed: ${message}`);
     return res.status(500).json({ error: message, code: 'workspace-create-failed' });
   }
+
+  await appendCoordinationAudit({
+    event: 'workspace-create',
+    workspaceId: workspace.id,
+    name: workspace.name,
+    directories: workspace.directories,
+    by: 'admin',
+  });
+  log.info(`created ${workspace.id} (${workspace.name}) via CLI`);
+
+  let defaultTabId: string | null = null;
+  try {
+    // Loaded on create only: the provider registry pulls in the terminal server, which the read path never needs.
+    const { readDefaultTab, registerDefaultTab } = await import('@/lib/workspace-default-tab');
+    const defaultTab = await readDefaultTab(workspace.id);
+    registerDefaultTab(workspace, defaultTab);
+    defaultTabId = defaultTab?.id ?? null;
+  } catch (err) {
+    // The workspace exists; the status manager learns the tab at its first status event or restart.
+    log.warn(`${workspace.id} created, first-tab registration failed: ${err instanceof Error ? err.message : err}`);
+  }
+  return res.status(200).json({
+    id: workspace.id,
+    name: workspace.name,
+    directories: workspace.directories,
+    defaultTabId,
+  });
 };
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {

@@ -129,6 +129,34 @@ describe('createWorkspace name uniqueness and extra directories (CLI create, ADR
     expect(stored.workspaces.map((w: { name: string }) => w.name)).toEqual(['Treasury v2']);
   });
 
+  it('lets exactly one of two concurrent creates of the same name through', async () => {
+    const { createWorkspace, isWorkspaceNameTakenError } = await importStore();
+    const { createDefaultLayout } = await import('@/lib/layout-store');
+    vi.mocked(createDefaultLayout).mockClear();
+
+    const results = await Promise.allSettled([
+      createWorkspace(mockHome.value, 'Race', undefined, { uniqueName: true }),
+      createWorkspace(mockHome.value, 'race', undefined, { uniqueName: true }),
+    ]);
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const refused = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(refused).toHaveLength(1);
+    expect(isWorkspaceNameTakenError(refused[0].reason)).toBe(true);
+    expect(createDefaultLayout).toHaveBeenCalledTimes(1);
+    const stored = JSON.parse(await fs.readFile(path.join(mockHome.value, '.purplemux', 'workspaces.json'), 'utf-8'));
+    expect(stored.workspaces).toHaveLength(1);
+  });
+
+  it('refuses a taken name before it creates a missing directory', async () => {
+    const { createWorkspace } = await importStore();
+    await createWorkspace(mockHome.value, 'Taken', undefined, { uniqueName: true });
+    const target = path.join(mockHome.value, 'would-be-created');
+
+    await expect(createWorkspace(target, 'taken', undefined, { uniqueName: true, mkdir: true })).rejects.toThrow('already exists');
+    expect(await exists(target)).toBe(false);
+  });
+
   it('keeps the UI behaviour: without uniqueName a repeated name is accepted', async () => {
     const { createWorkspace } = await importStore();
     await createWorkspace(mockHome.value, 'same');

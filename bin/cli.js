@@ -1562,8 +1562,8 @@ Commands:
   workspace create -n NAME -d DIR [-d DIR...] [--json]
                                            Create a workspace as the web UI does (its first tab, its own agent
                                            homes); prints the new id (--json: id, name, directories, defaultTabId).
-                                           The first DIR is the primary and must exist (no mkdir); later DIRs are
-                                           navigation shortcuts. A name another workspace holds (case-insensitive)
+                                           Every DIR must exist (no mkdir). The first DIR is the primary (the cwd of
+                                           new tabs); later DIRs are navigation shortcuts. A name another workspace holds (case-insensitive)
                                            exits 3 conflict. Admin token only: run it from a shell outside every
                                            tab, else exit 3 forbidden (a tab's own tokens never create workspaces)
   workspace dirs show -w WS                Show a workspace's directories
