@@ -419,7 +419,19 @@ const statDirectory = async (directory: string): Promise<TDirectoryStat> => {
 
 export interface ICreateWorkspaceOptions {
   mkdir?: boolean;
+  /** Refuse a name another workspace already holds (trimmed, case-insensitive), checked under the store lock. */
+  uniqueName?: boolean;
+  /** Navigation directories after the primary, stored in the same write. */
+  extraDirectories?: string[];
 }
+
+export const WORKSPACE_NAME_TAKEN_CODE = 'WORKSPACE_NAME_TAKEN';
+
+// Duck-typed for the same reason as isDirectoryError (CLAUDE.md §18).
+export const isWorkspaceNameTakenError = (err: unknown): boolean =>
+  typeof err === 'object' && err !== null && (err as { code?: unknown }).code === WORKSPACE_NAME_TAKEN_CODE;
+
+const sameName = (a: string, b: string): boolean => a.trim().toLowerCase() === b.trim().toLowerCase();
 
 export const createWorkspace = async (
   directory: string,
@@ -448,6 +460,14 @@ export const createWorkspace = async (
 
     const data = (await readWorkspacesFile()) ?? emptyState();
 
+    const taken = options?.uniqueName && name?.trim() ? data.workspaces.find((w) => sameName(w.name, name)) : undefined;
+    if (taken) {
+      throw Object.assign(new Error(`a workspace named "${taken.name}" already exists (${taken.id})`), {
+        code: WORKSPACE_NAME_TAKEN_CODE,
+        workspaceId: taken.id,
+      });
+    }
+
     const owner = findPrimaryDirOwner(data, directory);
     if (owner) {
       log.info(`${directory} is also workspace "${owner.name}"'s primary directory; sessions stay separate via per-workspace CLAUDE_CONFIG_DIR`);
@@ -460,7 +480,7 @@ export const createWorkspace = async (
     await fs.mkdir(resolveLayoutDir(wsId), { recursive: true });
     await writeLayoutFile(layout, resolveLayoutFile(wsId));
 
-    const workspace: IWorkspace = { id: wsId, name: wsName, directories: [directory] };
+    const workspace: IWorkspace = { id: wsId, name: wsName, directories: [directory, ...(options?.extraDirectories ?? [])] };
     data.workspaces.push(workspace);
     await writeWorkspacesFile(data);
     await writeWorkspacePrompts(workspace);

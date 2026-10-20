@@ -13,7 +13,8 @@ entries and legacy drive grants allow authorized reads only. A human-saved Scrum
 selection also gives its exact current launch-verified manager tab reads in the selected
 workspaces. The global CLI token
 is not human identity and cannot mutate these surfaces. Foreign requests go through
-coordinator notes; use authenticated local human controls for human actions.
+coordinator notes; use authenticated local human controls for human actions. Creating a
+workspace is the one exception: only the global token may (POST /api/cli/workspaces, ADR-0024).
 An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
 
 ## Caller identity
@@ -49,12 +50,14 @@ to an exit code through one table:
      1  unexpected error                         unmapped code, 5xx, gh-unavailable,        investigate
                                                  outcome-unknown (a write lost its
                                                  connection: check the state first)
-     2  usage error                              bad or missing argument; lease-policy,     fix the command
+     2  usage error                              bad or missing argument; invalid-request,  fix the command
+                                                 lease-policy,
                                                  watch-invalid, reports-to-invalid,
                                                  note-too-large, note-invalid,
                                                  config-invalid, note-target-missing,
                                                  deploy-invalid
-     3  conflict / refused by state              forbidden, lease-held, lease-held-by-other, after the state changes
+     3  conflict / refused by state              conflict, forbidden, lease-held,           after the state changes
+                                                 lease-held-by-other,
                                                  watch-cap, inbox-not-held, caller-unresolved,
                                                  grant-tab-unverified, grant-password-invalid,
                                                  grant-locked, config-version-conflict,
@@ -121,6 +124,22 @@ what, so treat it as a refusal.
 
 GET /api/cli/workspaces
   Response: { "workspaces": [{ "id": "...", "name": "...", "directories": [...] }] }
+
+POST /api/cli/workspaces                                (purplemux workspace create -n NAME -d DIR...)
+  Body: { "name": "...", "directories": ["/abs/primary", "/abs/other", ...] }
+  Admin token only (ADR-0024): the one workspace write the global token holds, because no
+  workspace exists yet to scope a token to. A workspace or tab token answers 403 forbidden;
+  inside a tab the CLI presents the tab's own token, so run it from a shell outside every tab
+  (or with PMUX_TAB_TOKEN and PMUX_TOKEN unset). Cooperative, not a security boundary.
+  Creates the workspace through the same store call as the web UI: the registry entry, the
+  first terminal tab with its tmux session, and the workspace's own agent homes. directories[0]
+  is the primary (the cwd of new tabs) and must exist; every entry must be an existing absolute
+  directory (nothing is created). Name: 1-100 characters, trimmed, no control characters, and
+  unique across workspaces ignoring case. Orchestration starts off. One audit line
+  (workspace-create) goes to ~/.purplemux/audit/coordination.jsonl.
+  Response: { "id": "ws-...", "name", "directories": [...], "defaultTabId": "tab-..." | null }
+  Errors: invalid-request 400 (exit 2: bad body, missing or non-directory path), forbidden 403
+  (exit 3), conflict 409 (exit 3: the name is taken; the message names the holder's id).
 
 GET /api/cli/workspaces/<workspaceId>/directories
   Response: { "workspaceId", "name", "directories": [...] }

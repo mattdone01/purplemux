@@ -371,6 +371,48 @@ const cmdWorkspaceDirs = async (args) => {
   die('usage: workspace dirs show|set -w WS [DIR...]');
 };
 
+const WORKSPACE_CREATE_USAGE = 'usage: workspace create -n NAME -d DIR [-d DIR ...] [--json]';
+
+/**
+ * Parse `workspace create` arguments. Returns { name, directories, json } or a
+ * usage error string. DIRs are resolved against the caller's cwd, as
+ * `workspace dirs set` does; the first is the primary.
+ */
+const parseWorkspaceCreateArgs = (args, cwd = process.cwd()) => {
+  let name = null;
+  const directories = [];
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--json') {
+      json = true;
+    } else if (arg === '-n' || arg === '--name') {
+      if (i + 1 >= args.length) return `${arg} needs a value`;
+      if (name !== null) return `${arg} given more than once`;
+      name = args[++i];
+    } else if (arg === '-d' || arg === '--dir') {
+      if (i + 1 >= args.length) return `${arg} needs a value`;
+      const dir = args[++i];
+      if (!dir.trim()) return `${arg} needs a non-empty path`;
+      directories.push(path.resolve(cwd, dir));
+    } else {
+      return `unexpected argument: ${arg}. ${WORKSPACE_CREATE_USAGE}`;
+    }
+  }
+  if (name === null || !name.trim()) return `-n NAME is required. ${WORKSPACE_CREATE_USAGE}`;
+  if (!directories.length) return `at least one -d DIR is required. ${WORKSPACE_CREATE_USAGE}`;
+  return { name: name.trim(), directories, json };
+};
+
+const cmdWorkspaceCreate = async (args) => {
+  const parsed = parseWorkspaceCreateArgs(args);
+  if (typeof parsed === 'string') die(parsed);
+  requireEnv();
+  const { body } = await api('POST', '/api/cli/workspaces', { name: parsed.name, directories: parsed.directories });
+  if (parsed.json) return out(body);
+  process.stdout.write(`${body.id}\n`);
+};
+
 const cmdWorkspacePeers = async (args) => {
   requireEnv();
   const sub = args[0];
@@ -1517,6 +1559,13 @@ Usage: purplemux <command> [args...]
 
 Commands:
   workspaces                               List workspaces
+  workspace create -n NAME -d DIR [-d DIR...] [--json]
+                                           Create a workspace as the web UI does (its first tab, its own agent
+                                           homes); prints the new id (--json: id, name, directories, defaultTabId).
+                                           The first DIR is the primary and must exist (no mkdir); later DIRs are
+                                           navigation shortcuts. A name another workspace holds (case-insensitive)
+                                           exits 3 conflict. Admin token only: run it from a shell outside every
+                                           tab, else exit 3 forbidden (a tab's own tokens never create workspaces)
   workspace dirs show -w WS                Show a workspace's directories
   workspace dirs set -w WS DIR [DIR...]    Repoint a workspace. The first DIR is the primary: it is the cwd for
                                            new tabs and keys the agent chat store, and must be unique across
@@ -1717,6 +1766,7 @@ const main = async () => {
       return cmdWorkspaces();
     case 'workspace':
       switch (sub) {
+        case 'create': return cmdWorkspaceCreate(rest);
         case 'dirs': return cmdWorkspaceDirs(rest);
         case 'peers': return cmdWorkspacePeers(rest);
         default: die(`unknown workspace command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
