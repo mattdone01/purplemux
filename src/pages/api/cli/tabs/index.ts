@@ -14,7 +14,7 @@ import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
-import { checkReportsTo } from '@/lib/reports-to';
+import { checkReportOn, checkReportsTo, isReportOnInvalid } from '@/lib/reports-to';
 import { tabIdentityOf } from '@/lib/tab-token';
 import { RemoteHostError, isValidRemoteHostName, readRemoteHosts, remoteDirExists } from '@/lib/remote-host';
 import fs from 'fs/promises';
@@ -108,6 +108,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       lastEvent: ILastEvent | null;
       busySince: number | null;
       reportsTo: string | null;
+      /** The markers whose end lines the tab forwards (ADR-0025); null: every marker. */
+      reportOn: string[] | null;
       /** launch: the server bound its token at launch; hook: taken at a SessionStart (story 36); none: no tab identity. */
       identity: 'launch' | 'hook' | 'none';
       /** The remote host that runs the tab (ADR-0022); absent for a local tab. */
@@ -148,6 +150,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             lastEvent: liveStatus[tab.id]?.lastEvent ?? null,
             busySince: liveStatus[tab.id]?.busySince ?? null,
             reportsTo: tab.reportsTo ?? null,
+            reportOn: tab.reportOn ?? null,
             identity: tab.panelType === 'web-browser' ? 'none' : tabIdentityOf(id, tab.id),
             ...(tab.host ? { host: tab.host } : {}),
           });
@@ -158,7 +161,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, host, cwd } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -167,6 +170,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       launch?: boolean;
       scope?: unknown;
       reportsTo?: unknown;
+      reportOn?: unknown;
       host?: unknown;
       cwd?: unknown;
     };
@@ -185,6 +189,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       const refused = await checkReportsTo(workspaceId, reportsTo);
       if (refused) return res.status(400).json(refused);
     }
+    // The markers whose end lines reach the target (ADR-0025); absent or null forwards every marker.
+    const reportOnChecked = reportOn === undefined ? { markers: null } : checkReportOn(reportOn);
+    if (isReportOnInvalid(reportOnChecked)) return res.status(400).json(reportOnChecked);
     const dispatchPolicy = await checkAgentDispatchPolicy(workspaceId);
     if (!dispatchPolicy.ok) {
       return res.status(409).json(dispatchPolicy);
@@ -246,6 +253,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         scope: scope as string[] | undefined,
         agentLaunchConfig: agentLaunchConfigFromOptions(model, reasoning),
         reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
+        reportOn: reportOnChecked.markers ?? undefined,
         host: remoteHost,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
@@ -261,6 +269,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           agentProviderId: provider?.id,
           agentSessionId: provider?.readSessionId(tab) ?? null,
           reportsTo: tab.reportsTo ?? null,
+          reportOn: tab.reportOn ?? null,
           lastEvent: null,
           eventSeq: 0,
         });
@@ -312,6 +321,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         agentSessionId: null,
         agentLaunchConfig: tab.agentLaunchConfig,
         launched: !!command || codexLaunchState === 'active',
+        ...(tab.reportsTo ? { reportsTo: tab.reportsTo } : {}),
+        ...(tab.reportOn ? { reportOn: tab.reportOn } : {}),
         ...(codexLaunchState ? { launchState: codexLaunchState } : {}),
         ...(tab.host ? { host: tab.host } : {}),
       });

@@ -52,7 +52,7 @@ to an exit code through one table:
                                                  connection: check the state first)
      2  usage error                              bad or missing argument; invalid-request,  fix the command
                                                  lease-policy,
-                                                 watch-invalid, reports-to-invalid,
+                                                 watch-invalid, reports-to-invalid, report-on-invalid,
                                                  note-too-large, note-invalid,
                                                  config-invalid, note-target-missing,
                                                  deploy-invalid
@@ -176,7 +176,7 @@ GET /api/cli/tabs?workspaceId=WS
   launch (token bound at launch), hook (taken at a Claude SessionStart and used at least once,
   story 36) or none (no tab token yet: a hook token that was minted but never presented shows none).
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
-    "cliState", "lastEvent", "busySince", "reportsTo", "identity", "host"? }] }
+    "cliState", "lastEvent", "busySince", "reportsTo", "reportOn", "identity", "host"? }] }
   "host" is present only on a remote tab (ADR-0022): the ssh alias whose tmux runs it.
   cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).
   A busy tab whose lastEvent is "stop" waits only on open background work (WAITING, ADR-0018:
@@ -185,7 +185,8 @@ GET /api/cli/tabs?workspaceId=WS
 
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
-          "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-...", "host"?: "HOST", "cwd"?: "/abs/dir" }
+          "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-...", "reportOn"?: ["DONE", ...] | "DONE,BLOCKED",
+          "host"?: "HOST", "cwd"?: "/abs/dir" }
   Invalid panelType returns HTTP 400 with validPanelTypes.
   "host" runs the tab's tmux on that host over ssh (ADR-0022). It must be listed in fleet config
   remote.hosts, else 400 { "code": "remote-host-invalid" }; terminal and claude-code tabs run remote,
@@ -199,6 +200,11 @@ POST /api/cli/tabs
   "reportsTo" names a live tab of the SAME workspace that receives this tab's watchdog nudges
   ahead of the workspace orchestrator; anything else is 400 { "code": "reports-to-invalid" }
   (CLI exit 2). It is cleared when that tab closes.
+  "reportOn" (ADR-0025) names the end-line markers whose turn-marker nudges the target receives:
+  a non-empty subset of DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED, as an array
+  or a comma-separated string; absent, null or "all" forwards every marker. A turn that ends on a
+  marker outside the list is classified and recorded (tab status shows turnEnd) but nudges nobody,
+  and no idle nudge follows it. An unknown name or an empty list is 400 { "code": "report-on-invalid" } (exit 2).
   Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
@@ -212,11 +218,13 @@ POST /api/cli/tabs
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
   Tab info.
-  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId", "reportsTo" }
+  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId", "reportsTo", "reportOn" }
 
 PATCH /api/cli/tabs/<tabId>?workspaceId=WS
-  Body: { "reportsTo": "tab-..." | null } — on its own. Sets or clears the nudge target (same rules
-  as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
+  Body: { "reportsTo"?: "tab-..." | null, "reportOn"?: [...] | "DONE,BLOCKED" | null } — one or both, and
+  nothing else. reportsTo sets or clears the nudge target (same rules as create; a tab cannot report
+  to itself); reportOn sets or clears (null / "all") the markers it forwards (ADR-0025).
+  Response: { "tabId", "workspaceId", "reportsTo", "reportOn" } with the tab's current values.
   Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
 DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
@@ -508,7 +516,9 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
 
   Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:,
   READY-TO-MERGE: or CHECKPOINTED: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
-  — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
+  — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along),
+  unless the tab's reportOn (tab create --report-on / tab reports-to --on, ADR-0025) leaves that
+  marker out: then the stop is recorded and no nudge goes anywhere.
   No marker and open background work (the agent's own tasks, a live tab bg job, or an armed
   purplemux watch the tab owns) → WAITING, no nudge. Otherwise no nudge at once: if the tab stays
   on that stop for the idle window (fleet config watchdog.idle-nudge-minutes, default 15) with

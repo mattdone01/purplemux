@@ -125,6 +125,12 @@ export interface ITab {
    */
   reportsTo?: string;
   /**
+   * The end-line markers whose `turn-marker` nudges this tab's target receives
+   * (ADR-0025). Absent: every marker, as before. A turn that ends on a marker
+   * outside the list is classified and recorded but nudges nobody.
+   */
+  reportOn?: import('@/lib/turn-end').TTurnMarkerName[];
+  /**
    * The ssh alias of the host whose tmux runs this tab (ADR-0022). Absent: this
    * server's host. Set once at create; a tab never changes host.
    */

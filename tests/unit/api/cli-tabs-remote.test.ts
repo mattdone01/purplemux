@@ -44,7 +44,7 @@ vi.mock('@/lib/status-manager', () => ({
   getStatusManager: () => ({ registerTab, markAgentLaunch: vi.fn(), getAllForClient: () => ({}) }),
 }));
 vi.mock('@/lib/agent-dispatch-policy', () => ({ checkAgentDispatchPolicy: vi.fn(async () => ({ ok: true })) }));
-vi.mock('@/lib/reports-to', () => ({ checkReportsTo: vi.fn(async () => null) }));
+vi.mock('@/lib/reports-to', async (importOriginal) => ({ ...(await importOriginal<typeof import('@/lib/reports-to')>()), checkReportsTo: vi.fn(async () => null) }));
 vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: vi.fn(() => 'none') }));
 vi.mock('@/lib/providers/codex/managed-launch', () => ({
   prepareCodexManagedLaunch: vi.fn(),

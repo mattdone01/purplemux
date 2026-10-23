@@ -53,7 +53,8 @@ vi.mock('@/lib/status-manager', () => ({
 vi.mock('@/lib/agent-dispatch-policy', () => dispatch);
 vi.mock('@/lib/providers/codex/managed-launch', () => managed);
 const reportsTo = vi.hoisted(() => ({ checkReportsTo: vi.fn() }));
-vi.mock('@/lib/reports-to', () => reportsTo);
+// The pure reportOn helpers (ADR-0025) run for real; only the tmux-backed target check is stubbed.
+vi.mock('@/lib/reports-to', async (importOriginal) => ({ ...(await importOriginal<typeof import('@/lib/reports-to')>()), ...reportsTo }));
 
 interface IFakeResponse {
   statusCode: number;

@@ -23,6 +23,7 @@ import {
   isEqualized,
 } from '@/lib/layout-tree';
 import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig } from '@/types/terminal';
+import type { TTurnMarkerName } from '@/lib/turn-end';
 import type { TCliState } from '@/types/timeline';
 import type { IAgentProvider } from '@/lib/providers/types';
 import { claudeProvider } from '@/lib/providers/claude';
@@ -364,7 +365,7 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; host?: string }): Promise<ITab | null> =>
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; reportOn?: TTurnMarkerName[]; host?: string }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -392,7 +393,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}), ...(host ? { host } : {}) };
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}), ...(opts?.reportOn?.length ? { reportOn: [...opts.reportOn] } : {}), ...(host ? { host } : {}) };
 
     if (command && !isWebBrowser) prepareOrchestrationLaunch(tab);
     pane.tabs.push(tab);
@@ -795,6 +796,18 @@ export const setTabReportsTo = async (wsId: string, tabId: string, reportsTo: st
     if ((tab.reportsTo ?? null) === reportsTo) return { changed: false, value: true };
     if (reportsTo) tab.reportsTo = reportsTo;
     else delete tab.reportsTo;
+    return { changed: true, value: true };
+  })).found;
+
+/** The markers whose end lines this tab forwards (ADR-0025); null clears the filter. */
+export const setTabReportOn = async (wsId: string, tabId: string, reportOn: TTurnMarkerName[] | null): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    const current = tab.reportOn ?? null;
+    if ((current === null && reportOn === null) || (current && reportOn && current.join(',') === reportOn.join(','))) {
+      return { changed: false, value: true };
+    }
+    if (reportOn) tab.reportOn = [...reportOn];
+    else delete tab.reportOn;
     return { changed: true, value: true };
   })).found;
 

@@ -51,6 +51,8 @@ export interface ITabStatusEntry {
   lastResumeOrStartedAt?: number;
   /** Live same-workspace tab that receives this tab's nudges (ADR-0018); mirrors ITab.reportsTo. */
   reportsTo?: string | null;
+  /** The markers whose end lines are forwarded (ADR-0025); mirrors ITab.reportOn. Null: every marker. */
+  reportOn?: import('@/lib/turn-end').TTurnMarkerName[] | null;
   /** How the watchdog classified the last `stop` (ADR-0018). Runtime only. */
   turnEnd?: ITurnEndRecord | null;
   /** The provider-error episode this tab is in; a clean stop ends it (story 26). Runtime only. */

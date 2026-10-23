@@ -48,6 +48,7 @@ import {
   longWaitDue,
   parseIdleNudgeMinutes,
   parseWaitBackstopHours,
+  reportOnAdmits,
 } from '@/lib/turn-end';
 import { NudgeDeduper } from '@/lib/nudge-dedupe';
 import { readWatches } from '@/lib/watch-store';
@@ -198,6 +199,8 @@ export class StatusManager {
   private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean }>();
   /** Identical nudges within 60 s are dropped and counted (L49). */
   private nudgeDedupe = new NudgeDeduper();
+  /** Turn-marker nudges a tab's `reportOn` withheld since the server started (ADR-0025). */
+  private reportOnFiltered = 0;
   /** When each tab's last registered job reported its exit: a sign of life for the stall check. */
   private jobEventAt = new Map<string, number>();
   /** Tabs being closed, or just closed, with the time their retirement ends (L38). */
@@ -353,6 +356,7 @@ export class StatusManager {
           listeningPorts,
           ...entryAgentFields(provider, tab, detected.jsonlPath),
           reportsTo: tab.reportsTo ?? null,
+          reportOn: tab.reportOn ?? null,
           lastUserMessage: tab.lastUserMessage,
           lastAssistantMessage: detected.lastAssistantSnippet,
           currentAction: detected.currentAction,
@@ -753,6 +757,7 @@ export class StatusManager {
             listeningPorts,
             ...entryAgentFields(provider, tab, detected.jsonlPath),
             reportsTo: tab.reportsTo ?? null,
+            reportOn: tab.reportOn ?? null,
             lastUserMessage: tab.lastUserMessage,
             lastAssistantMessage: detected.lastAssistantSnippet,
             currentAction: detected.currentAction,
@@ -794,6 +799,7 @@ export class StatusManager {
         existing.jsonlPath = refreshed.jsonlPath ?? existing.jsonlPath;
         existing.lastUserMessage = tab.lastUserMessage;
         existing.reportsTo = tab.reportsTo ?? null;
+        existing.reportOn = tab.reportOn ?? null;
         this.reconcileJsonlWatch(tab.id, existing);
 
         if (processChanged) {
@@ -1600,6 +1606,11 @@ export class StatusManager {
     return this.nudgeDedupe.dropped;
   }
 
+  /** How many turn-marker nudges a tab's `reportOn` withheld since the server started (ADR-0025). */
+  getReportOnFilteredCount(): number {
+    return this.reportOnFiltered;
+  }
+
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
     return this.orchestrationNudges.filter((n) => n.workspaceId === workspaceId);
   }
@@ -2391,7 +2402,13 @@ export class StatusManager {
       }
     }
     // Only an end line nudges at once (L49); a stop without one waits out the idle window.
-    const nudge = turnEnd.kind === 'turn-marker'
+    // A marker outside the tab's `reportOn` is recorded like any other and nudges nobody (ADR-0025).
+    const forwarded = turnEnd.kind === 'turn-marker' && reportOnAdmits(entry.reportOn, turnEnd.lines);
+    if (turnEnd.kind === 'turn-marker' && !forwarded) {
+      this.reportOnFiltered += 1;
+      log.info({ tabId, marker: turnEnd.lines.at(-1), reportOn: entry.reportOn, filtered: this.reportOnFiltered }, 'turn-marker nudge withheld: the marker is outside the tab\'s reportOn');
+    }
+    const nudge = forwarded && turnEnd.kind === 'turn-marker'
       ? { kind: 'turn-marker' as const, detail: turnEnd.lines.join('\n') }
       : null;
     if (entry.cliState !== 'ready-for-review') {

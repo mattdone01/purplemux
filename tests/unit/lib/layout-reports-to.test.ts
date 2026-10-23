@@ -84,6 +84,25 @@ describe('reportsTo in the layout (ADR-0018)', () => {
     expect(await store.setTabReportsTo(workspaceId, 'tab-gone', 'tab-o2')).toBe(false);
   });
 
+  it('persists reportOn given at tab creation and sets or clears it later (ADR-0025)', async () => {
+    const { store, workspaceId } = await seed();
+    const reportOnOf = async (id: string) => {
+      const layout = await store.readLayoutFile(store.resolveLayoutFile(workspaceId));
+      if (layout?.root.type !== 'pane') throw new Error('Expected pane layout');
+      return layout.root.tabs.find((t) => t.id === id)?.reportOn;
+    };
+    const created = await store.addTabToPane(workspaceId, 'pane-one', 'w3', undefined, 'terminal', undefined, { reportsTo: 'tab-o2', reportOn: ['DONE', 'BLOCKED'] });
+    expect(await reportOnOf(created!.id)).toEqual(['DONE', 'BLOCKED']);
+    expect(await store.setTabReportOn(workspaceId, 'tab-w1', ['BLOCKED'])).toBe(true);
+    expect(await reportOnOf('tab-w1')).toEqual(['BLOCKED']);
+    expect(await store.setTabReportOn(workspaceId, 'tab-w1', null)).toBe(true);
+    expect(await reportOnOf('tab-w1')).toBeUndefined();
+    expect(await store.setTabReportOn(workspaceId, 'tab-gone', ['DONE'])).toBe(false);
+    // The list is the tab's own: clearing a closed target leaves it in place.
+    expect(await store.clearReportsTo(workspaceId, 'tab-o2')).toEqual(['tab-w1', created!.id]);
+    expect(await reportOnOf(created!.id)).toEqual(['DONE', 'BLOCKED']);
+  });
+
   it('clears every reportsTo that names a closed tab, and only those', async () => {
     const { store, workspaceId, tabs } = await seed();
     expect(await store.clearReportsTo(workspaceId, 'tab-o2')).toEqual(['tab-w1']);

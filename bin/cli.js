@@ -130,6 +130,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'lease-policy': EXIT.USAGE,
   'watch-invalid': EXIT.USAGE,
   'reports-to-invalid': EXIT.USAGE,
+  'report-on-invalid': EXIT.USAGE,
   'remote-host-invalid': EXIT.USAGE,
   'remote-type-unsupported': EXIT.USAGE,
   'cwd-missing': EXIT.USAGE,
@@ -1188,12 +1189,15 @@ const cmdTabCreate = async (args) => {
   const scope = scopeRaw ? scopeRaw.split(',').map((s) => s.trim()).filter(Boolean) : null;
   // Nudges go to this live tab of the same workspace first (ADR-0018).
   const reportsTo = flagValue(args, '--reports-to');
+  // The end-line markers whose nudges the target receives (ADR-0025); the server validates the names.
+  const reportOn = flagValue(args, '--report-on');
   // The ssh alias of a registered remote host (ADR-0022); the tab's tmux runs there.
   const host = flagValue(args, '--host');
   // The tab's start directory: it must exist on the host the tab runs on.
   const cwd = flagValue(args, '--cwd');
   if (!wsId) die('--workspace is required');
   if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
+  if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
   if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
   if (args.includes('--cwd') && !cwd) die('--cwd needs an absolute directory on the tab\'s host');
   const { body } = await api('POST', '/api/cli/tabs', {
@@ -1205,6 +1209,7 @@ const cmdTabCreate = async (args) => {
     ...(noLaunch ? { launch: false } : {}),
     ...(scope && scope.length ? { scope } : {}),
     ...(reportsTo ? { reportsTo } : {}),
+    ...(reportOn ? { reportOn } : {}),
     ...(host ? { host } : {}),
     ...(cwd ? { cwd } : {}),
   });
@@ -1214,14 +1219,22 @@ const cmdTabCreate = async (args) => {
 const cmdTabReportsTo = async (args) => {
   requireEnv();
   const clear = args.includes('--clear');
-  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--clear']);
+  // --on MARKERS narrows which end lines reach the target (ADR-0025); `--on all` lifts the filter.
+  const on = flagValue(args, '--on');
+  if (args.includes('--on') && !on) die('--on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w', '--on']), ['--clear']);
   const [tabId, target] = rest;
-  if (!tabId || (clear ? target : !target)) die('usage: tab reports-to -w WS TAB_ID (TARGET_TAB_ID | --clear)');
+  const usage = 'usage: tab reports-to -w WS TAB_ID (TARGET_TAB_ID | --clear) [--on MARKERS|all]  |  tab reports-to -w WS TAB_ID --on MARKERS|all';
+  if (!tabId || (clear && target) || (!clear && !target && !on)) die(usage);
   const wsId = resolveWsForTab(args);
+  const patch = {
+    ...(clear ? { reportsTo: null } : target ? { reportsTo: target } : {}),
+    ...(on ? { reportOn: on.toLowerCase() === 'all' ? null : on } : {}),
+  };
   const { body } = await api(
     'PATCH',
     `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
-    { reportsTo: clear ? null : target },
+    patch,
   );
   out(body);
 };
@@ -1579,6 +1592,10 @@ Commands:
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
              [--reports-to TAB_ID]         Send this tab's watchdog nudges to TAB_ID (a live tab of the SAME
                                            workspace) instead of the workspace orchestrator; exit 2 otherwise
+             [--report-on MARKERS]         Forward only the end lines that start with one of these markers
+                                           (comma-separated: DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE,
+                                           CHECKPOINTED). A turn ending on another marker is recorded but nudges
+                                           nobody. Default: every marker; exit 2 on an unknown name
              [--host HOST]                 Run the tab's tmux on HOST over ssh (ADR-0022): an ssh alias listed in
                                            fleet config remote.hosts. terminal and claude-code only; exit 2
                                            otherwise, exit 6 when HOST does not answer. The pane's purplemux
@@ -1592,7 +1609,9 @@ Commands:
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
   tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
-                  [--clear]                restores the workspace orchestrator. Cleared when TARGET closes
+                  [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
+                                           --on MARKERS (alone or with a target) forwards only those end lines,
+                                           e.g. --on DONE,BLOCKED,NEEDS-DECISION; --on all lifts the filter
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
                                            for an agent tab to be able to accept a turn; --wait-ms N (max
