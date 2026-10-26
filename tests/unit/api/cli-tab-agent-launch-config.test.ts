@@ -126,6 +126,7 @@ describe('POST /api/cli/tabs launch config', () => {
       {
         scope: undefined,
         agentLaunchConfig: { model: 'gpt-5.6-sol', effort: 'high' },
+        admit: expect.any(Function),
       },
     );
     expect(managed.prepareCodexManagedLaunch).toHaveBeenCalledWith('ws-pins', 'tab-new');
@@ -149,6 +150,7 @@ describe('POST /api/cli/tabs launch config', () => {
     expect(layout.addTabToPane.mock.calls[0][6]).toEqual({
       scope: undefined,
       agentLaunchConfig: undefined,
+      admit: expect.any(Function),
     });
   });
 

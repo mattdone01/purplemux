@@ -77,6 +77,7 @@
   "layoutFetchError": "无法加载布局",
   "splitFailed": "无法分割",
   "tabCreateFailed": "无法创建标签页",
+  "wipOverCap": "此工作区有 {count} 个代理标签页，超过了 WIP 上限 {cap}",
   "tabDeleteError": "删除标签页时出错",
   "sessionRestartFailed": "无法重启会话",
   "tabRenameFailed": "标签页重命名失败",

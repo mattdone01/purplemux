@@ -9,6 +9,9 @@ import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { sendKeys } from '@/lib/tmux';
 import { createLogger } from '@/lib/logger';
+import { isAgentPanelType } from '@/lib/agent-panel-types';
+import { readTabCount, wipOf } from '@/lib/tab-cap';
+import type { IFleetWip } from '@/types/fleet-status';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
 import {
   prepareCodexManagedLaunch,
@@ -19,6 +22,17 @@ import {
 const log = createLogger('layout');
 
 const SHELL_READY_DELAY_MS = 500;
+
+/** The human is warned, never refused (ADR-0027); a count that cannot be read leaves the answer without `wip`. */
+const wipAfterCreate = async (wsId: string): Promise<IFleetWip | null> => {
+  try {
+    const view = await readTabCount(wsId);
+    return wipOf(view.count, view.cap);
+  } catch (err) {
+    log.warn(`wip count after a human create failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+};
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(req.method ?? '') && !(await authorizeHumanMutation(req, res))) return;
@@ -109,7 +123,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       }, SHELL_READY_DELAY_MS);
     }
 
-    return res.status(200).json(tab);
+    const wip = isAgentPanelType(tab.panelType) ? await wipAfterCreate(wsId) : null;
+    return res.status(200).json(wip ? { ...tab, wip } : tab);
   } catch (err) {
     log.error(`tab creation failed: ${err instanceof Error ? err.message : err}`);
     return res.status(500).json({ error: 'Failed to create tab' });

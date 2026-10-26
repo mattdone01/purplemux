@@ -78,6 +78,13 @@ export interface IFleetThresholds {
   composerMinutes: number;
 }
 
+/** A workspace's agent tabs against the WIP cap (ADR-0027); `overCap := count > cap`. */
+export interface IFleetWip {
+  count: number;
+  cap: number;
+  overCap: boolean;
+}
+
 export interface IFleetView {
   at: number;
   thresholds: IFleetThresholds;
@@ -86,6 +93,8 @@ export interface IFleetView {
   unattributed: IFleetUnattributed[];
   /** Read errors by scope (a workspace name, or `watches`, `jobs`, `leases`, `SM inbox`); the rest still renders. */
   errors: Array<{ scope: string; error: string }>;
+  /** Per workspace id (ADR-0027); absent from a server older than it, or when the cap could not be read. */
+  wip?: Record<string, IFleetWip>;
 }
 
 export type TComposerReading = 'empty' | 'text' | 'unreadable';

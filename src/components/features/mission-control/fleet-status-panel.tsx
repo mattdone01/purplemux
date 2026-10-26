@@ -129,6 +129,32 @@ const thresholdsText = (view: IFleetView): string => {
   return `STALL? after ${t.stallMinutes} min (composer text after ${t.composerMinutes} min) · WAITING-LONG after ${t.waitingLongMinutes} min · UNANSWERED after ${t.unansweredMinutes} min`;
 };
 
+/**
+ * Agent tabs against the WIP cap per workspace (ADR-0027). A workspace with no
+ * agent tab has no row, so no name: it is left out rather than shown by its id.
+ */
+const WipLine = ({ view, workspace }: { view: IFleetView; workspace: string | null }) => {
+  if (!view.wip) return null;
+  const names = new Map(view.rows.map((row) => [row.workspaceId, row.workspaceName]));
+  const entries = Object.entries(view.wip).filter(([id]) => names.has(id) && (workspace === null || id === workspace));
+  if (entries.length === 0) return null;
+  return (
+    <p className="flex flex-wrap gap-x-3 text-muted-foreground" data-wip="">
+      <span>Agent tabs / WIP cap:</span>
+      {entries.map(([id, wip]) => (
+        <span
+          key={id}
+          className={cn('tabular-nums', wip.overCap && 'font-medium text-ui-red')}
+          data-wip-workspace={id}
+          data-over-cap={wip.overCap ? 'true' : 'false'}
+        >
+          {names.get(id)} {wip.count}/{wip.cap}{wip.overCap ? ' over cap' : ''}
+        </span>
+      ))}
+    </p>
+  );
+};
+
 export interface IFleetFilter {
   showAll: boolean;
   workspace: string | null;
@@ -152,6 +178,7 @@ const FleetView = ({ view, filter, onFilter }: { view: IFleetView; filter: IFlee
   return (
     <div className="space-y-2 text-xs" data-fleet-view="" data-state={view.rows.length === 0 ? 'empty' : 'populated'}>
       <p className="text-muted-foreground" data-thresholds="">{thresholdsText(view)}</p>
+      <WipLine view={view} workspace={workspace} />
       {view.errors.map((e) => (
         <p key={`${e.scope}:${e.error}`} className="text-destructive" data-state="partial-error">Could not read {e.scope}: {e.error}</p>
       ))}

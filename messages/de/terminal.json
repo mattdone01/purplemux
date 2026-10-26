@@ -77,6 +77,7 @@
   "layoutFetchError": "Layout konnte nicht geladen werden",
   "splitFailed": "Teilen fehlgeschlagen",
   "tabCreateFailed": "Tab konnte nicht erstellt werden",
+  "wipOverCap": "Dieser Arbeitsbereich hat {count} Agent-Tabs, über dem WIP-Limit von {cap}",
   "tabDeleteError": "Fehler beim Löschen des Tabs",
   "sessionRestartFailed": "Sitzung konnte nicht neu gestartet werden",
   "tabRenameFailed": "Tab-Umbenennung fehlgeschlagen",

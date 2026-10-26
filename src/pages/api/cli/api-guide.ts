@@ -72,6 +72,7 @@ to an exit code through one table:
      7  not found                                lease-not-found, note-not-found,           —
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found
+     3  refused by state (ADR-0027)              wip-cap, config-store-unreadable           after the state changes
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -186,8 +187,20 @@ GET /api/cli/tabs?workspaceId=WS
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
           "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-...", "reportOn"?: ["DONE", ...] | "DONE,BLOCKED",
-          "host"?: "HOST", "cwd"?: "/abs/dir" }
+          "host"?: "HOST", "cwd"?: "/abs/dir", "overCap"?: { "reason": "1..500 chars" } }
   Invalid panelType returns HTTP 400 with validPanelTypes.
+  WIP cap (ADR-0027): an agent tab (claude-code, codex-cli, grok-cli; local or remote; --no-launch
+  tabs too) is refused while the workspace already holds fleet config tabs.cap-per-workspace agent
+  tabs (default 8; terminal, web-browser, diff and agent-sessions tabs do not count). The count and
+  the add run under one lock, so two creates at cap - 1 cannot both pass. Refusal: 409 { "code":
+  "wip-cap", "error": "WS holds 8 of 8 agent tabs", "workspaceId", "count", "cap", "capSource" }
+  (exit 3); nothing is created. A fleet config that cannot be read refuses every agent create with
+  503 { "code": "config-store-unreadable" } (exit 3), never "no cap". "overCap" passes the cap: only
+  from a verified tab that is its workspace's enabled orchestrator, else 403 forbidden (exit 3);
+  a reason that is empty or longer than 500 characters is 400 invalid-request (exit 2). A create
+  that passed the cap appends { "event": "tab-over-cap", "workspaceId", "tabId", "count", "cap",
+  "reason", "by" } to ~/.purplemux/audit/coordination.jsonl. The human's own create
+  (POST /api/layout/pane/<paneId>/tabs) is never refused; its agent answer gains "wip".
   "host" runs the tab's tmux on that host over ssh (ADR-0022). It must be listed in fleet config
   remote.hosts, else 400 { "code": "remote-host-invalid" }; terminal and claude-code tabs run remote,
   codex-cli and grok-cli do not: 400 { "code": "remote-type-unsupported" } (both CLI exit 2). A host that does not answer
@@ -214,7 +227,14 @@ POST /api/cli/tabs
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (grok --effort);
   codex-cli: "minimal" | "low" | "medium" | "high" (model_reasoning_effort). "launch": false
   keeps the old bare-shell behavior.
-  Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched", "host"? }
+  Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched", "host"?,
+              "wip"?: { "count", "cap", "overCap" } } — wip on an agent tab: the count with the new tab; overCap = count > cap
+
+GET /api/cli/workspaces/<WS>/tab-count   (any scope that may read WS)
+  The workspace's agent tabs against the WIP cap; \`purplemux tab count -w WS [--json]\` prints
+  "<count> <cap>". Repository hooks read it instead of counting tmux sessions.
+  Response: { "workspaceId", "count", "cap", "capSource": "fleet-config" | "default" | "default-invalid", "overCap" }
+  404 not-found (exit 7) for an unknown workspace; 503 config-store-unreadable (exit 3); 500 tab-count-unreadable (exit 1).
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
   Tab info.
@@ -452,6 +472,11 @@ Keys in use:
   watchdog.wait-backstop-hours
                Hours (0, 168], decimals allowed, a tab may wait on a live registered job or armed
                watch before its one "has been WAITING" nudge. Unset or invalid means 4.
+  tabs.cap-per-workspace
+               The WIP cap (ADR-0027): an integer 1..200 of agent tabs per workspace, one value
+               for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
+               (capSource "default-invalid", the value logged). Admin token only (exit 3 forbidden
+               for a tab): any one orchestrator could otherwise raise it for every workspace.
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }

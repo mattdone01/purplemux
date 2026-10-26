@@ -3,9 +3,10 @@ import {
   DEFAULT_FLEET_THRESHOLDS, deriveFleetRow, inboxOf, isAtPrompt, parseThresholdMinutes, sortFleetRows, unansweredFlag,
 } from '@/lib/fleet-status';
 import { readComposer } from '@/lib/composer-readiness';
+import { readTabCap, wipOf } from '@/lib/tab-cap';
 import type { IMissionOpenItemOpener } from '@/lib/mission-control-store';
 import type {
-  IFleetTabFacts, IFleetThresholds, IFleetUnattributed, IFleetView, TComposerReading,
+  IFleetTabFacts, IFleetThresholds, IFleetUnattributed, IFleetView, IFleetWip, TComposerReading,
 } from '@/types/fleet-status';
 import type { ILease } from '@/types/lease';
 import type { IClientTabStatusEntry } from '@/types/status';
@@ -103,13 +104,15 @@ const composerSince = (tab: ITab, status: IClientTabStatusEntry, reading: TCompo
 
 export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promise<IFleetView> => {
   const errors: IFleetView['errors'] = [];
-  const [workspaces, thresholds, watches, leases, openers] = await Promise.all([
+  const [workspaces, thresholds, watches, leases, openers, tabCap] = await Promise.all([
     deps.workspaces(),
     readThresholds(deps.config),
     settle(deps.watches),
     settle(deps.leases),
     settle(async () => deps.openers()),
+    settle(() => readTabCap(deps.config)),
   ]);
+  if (!tabCap.ok) errors.push({ scope: 'WIP cap', error: tabCap.error });
   if (!watches.ok) errors.push({ scope: 'watches', error: watches.error });
   if (!leases.ok) errors.push({ scope: 'leases', error: leases.error });
   if (!openers.ok) errors.push({ scope: 'SM inbox', error: openers.error });
@@ -117,6 +120,7 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
   const statuses = deps.statuses();
   const facts: IFleetTabFacts[] = [];
   const liveTabKeys = new Set<string>();
+  const agentTabCounts = new Map<string, number>();
   let jobsFailed = false;
   let layoutFailed = false;
 
@@ -130,6 +134,7 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
       layoutFailed = true;
       return;
     }
+    agentTabCounts.set(workspace.id, tabs.length);
     await Promise.all(tabs.map(async (tab) => {
       const key = `${workspace.id}/${tab.id}`;
       liveTabKeys.add(key);
@@ -195,12 +200,21 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
     }
   }
 
+  // A workspace whose layout was not read has no count: it is left out, never shown as 0.
+  const wip: Record<string, IFleetWip> | undefined = tabCap.ok
+    ? Object.fromEntries(workspaces.flatMap((w) => {
+      const count = agentTabCounts.get(w.id);
+      return count === undefined ? [] : [[w.id, wipOf(count, tabCap.value.cap)] as const];
+    }))
+    : undefined;
+
   return {
     at: now,
     thresholds,
     rows: sortFleetRows(facts.map((f) => deriveFleetRow(f, now, thresholds))),
     unattributed,
     errors,
+    ...(wip ? { wip } : {}),
   };
 };
 

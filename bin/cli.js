@@ -171,6 +171,8 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'inbox-not-found': EXIT.NOT_FOUND,
   'deploy-not-found': EXIT.NOT_FOUND,
   'config-not-found': EXIT.NOT_FOUND,
+  'wip-cap': EXIT.CONFLICT,
+  'config-store-unreadable': EXIT.CONFLICT,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -180,6 +182,7 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
   'routes-absent': 'no such route on this server (an older server, a foreign server, or a malformed id) — retrying cannot help',
   'remote-host-unreachable': 'the remote host did not answer over ssh — retry, bounded, once it answers',
+  'wip-cap': "refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason",
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -1175,6 +1178,8 @@ const cmdLease = async (args) => {
   }
 };
 
+const OVER_CAP_REASON_MAX = 500;
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -1200,6 +1205,12 @@ const cmdTabCreate = async (args) => {
   if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
   if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
   if (args.includes('--cwd') && !cwd) die('--cwd needs an absolute directory on the tab\'s host');
+  // Past the WIP cap (ADR-0027): only the workspace's enabled orchestrator, with a reason that is audited.
+  const overCap = args.includes('--over-cap');
+  const reason = flagValue(args, '--reason');
+  if (overCap && reason === null) die('--over-cap needs --reason TEXT');
+  if (!overCap && args.includes('--reason')) die('--reason goes with --over-cap');
+  if (overCap && (reason.trim().length === 0 || reason.length > OVER_CAP_REASON_MAX)) die(`--reason needs 1..${OVER_CAP_REASON_MAX} characters`);
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
     ...(name ? { name } : {}),
@@ -1212,8 +1223,18 @@ const cmdTabCreate = async (args) => {
     ...(reportOn ? { reportOn } : {}),
     ...(host ? { host } : {}),
     ...(cwd ? { cwd } : {}),
+    ...(overCap ? { overCap: { reason } } : {}),
   });
   out(body);
+};
+
+const cmdTabCount = async (args) => {
+  requireEnv();
+  const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
+  if (!wsId) die('--workspace is required');
+  const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/tab-count`);
+  if (args.includes('--json')) return out(body);
+  process.stdout.write(`${body.count} ${body.cap}\n`);
 };
 
 const cmdTabReportsTo = async (args) => {
@@ -1608,6 +1629,14 @@ Commands:
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
+             [--over-cap --reason TEXT]    An agent tab is refused at the WIP cap (fleet config tabs.cap-per-workspace,
+                                           default 8): exit 3 wip-cap. Only the workspace's verified, enabled
+                                           orchestrator tab passes it, with a reason (1-500 characters, else exit 2)
+                                           that is audited; any other caller exits 3 forbidden. The answer's
+                                           "wip" is { count, cap, overCap } after the create
+  tab count -w WS [--json]                 Print "<count> <cap>": WS's agent tabs (claude-code, codex-cli, grok-cli)
+                                           and the WIP cap; --json adds workspaceId, capSource, overCap. Hooks use it
+                                           instead of counting tmux sessions
   tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
                   [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
                                            --on MARKERS (alone or with a target) forwards only those end lines,
@@ -1819,6 +1848,7 @@ const main = async () => {
       switch (sub) {
         case 'list': return cmdTabList(rest);
         case 'create': return cmdTabCreate(rest);
+        case 'count': return cmdTabCount(rest);
         case 'send': return cmdTabSend(rest);
         case 'steer': return cmdTabSteer(rest);
         case 'status': return cmdTabStatus(rest);

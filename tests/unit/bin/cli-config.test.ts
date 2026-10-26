@@ -185,12 +185,13 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     expect(await auditLines()).toMatchObject([{ event: 'fleet-config-set', by: { workspaceId: 'ws-a', tabId: 'tab-o', admin: false, verified: false, identity: 'session' } }]);
   });
 
-  it('a malformed store exits 1 with nothing on stdout, never 7 (unset) and never read as empty', async () => {
+  // ADR-0027 maps config-store-unreadable to exit 3 (refused by state) in the one table.
+  it('a malformed store exits 3 with nothing on stdout, never 7 (unset) and never read as empty', async () => {
     await fs.writeFile(path.join(mockHome.value, '.purplemux', 'fleet-config.json'), '{"values":');
     const r = await cli(['config', 'get', 'gate.slots'], worker);
-    expect(r).toMatchObject({ code: 1, stdout: '' });
+    expect(r).toMatchObject({ code: 3, stdout: '' });
     expect(r.stderr).toContain('config-store-unreadable');
-    expect((await cli(['config', 'set', 'gate.slots', '6'], orch)).code).toBe(1);
+    expect((await cli(['config', 'set', 'gate.slots', '6'], orch)).code).toBe(3);
   });
 
   it('a stale --expect-version exits 3 config-version-conflict and leaves the value', async () => {
