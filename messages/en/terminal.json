@@ -77,6 +77,7 @@
   "layoutFetchError": "Failed to load layout",
   "splitFailed": "Failed to split pane",
   "tabCreateFailed": "Failed to create tab",
+  "wipOverCap": "This workspace holds {count} agent tabs, over the WIP cap of {cap}",
   "tabDeleteError": "Error while deleting tab",
   "sessionRestartFailed": "Failed to restart session",
   "tabRenameFailed": "Failed to rename tab",

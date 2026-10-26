@@ -77,6 +77,7 @@
   "layoutFetchError": "Impossible de charger la disposition",
   "splitFailed": "Impossible de diviser le panneau",
   "tabCreateFailed": "Impossible de créer l'onglet",
+  "wipOverCap": "Cet espace de travail compte {count} onglets d’agent, au-delà de la limite WIP de {cap}",
   "tabDeleteError": "Erreur lors de la suppression de l'onglet",
   "sessionRestartFailed": "Impossible de redémarrer la session",
   "tabRenameFailed": "Échec du renommage de l'onglet",

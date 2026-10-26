@@ -77,6 +77,7 @@
   "layoutFetchError": "Falha ao carregar layout",
   "splitFailed": "Falha ao dividir painel",
   "tabCreateFailed": "Falha ao criar aba",
+  "wipOverCap": "Este espaço de trabalho tem {count} abas de agente, acima do limite WIP de {cap}",
   "tabDeleteError": "Erro ao excluir aba",
   "sessionRestartFailed": "Falha ao reiniciar sessão",
   "tabRenameFailed": "Falha ao renomear aba",

@@ -77,6 +77,7 @@
   "layoutFetchError": "無法載入佈局",
   "splitFailed": "無法分割",
   "tabCreateFailed": "無法建立分頁",
+  "wipOverCap": "此工作區有 {count} 個代理分頁，超過了 WIP 上限 {cap}",
   "tabDeleteError": "刪除分頁時發生錯誤",
   "sessionRestartFailed": "無法重新啟動工作階段",
   "tabRenameFailed": "分頁重新命名失敗",

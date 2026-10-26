@@ -77,6 +77,7 @@
   "layoutFetchError": "No se pudo cargar el diseño",
   "splitFailed": "No se pudo dividir el panel",
   "tabCreateFailed": "No se pudo crear la pestaña",
+  "wipOverCap": "Este espacio de trabajo tiene {count} pestañas de agente, por encima del límite WIP de {cap}",
   "tabDeleteError": "Error al eliminar la pestaña",
   "sessionRestartFailed": "No se pudo reiniciar la sesión",
   "tabRenameFailed": "Error al renombrar la pestaña",

@@ -28,6 +28,7 @@ import type { TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ILastEvent } from '@/types/status';
 import { remoteHostUnreachableBody } from '@/lib/cli-error';
+import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
 
 const log = createLogger('api:cli:tabs');
 
@@ -161,7 +162,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd, overCap } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -173,6 +174,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       reportOn?: unknown;
       host?: unknown;
       cwd?: unknown;
+      overCap?: unknown;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
@@ -231,6 +233,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         return res.status(400).json({ error: reasoningErrorForPanelType(resolvedType) });
       }
     }
+    const wipCheck = await admitAgentCreate(req, workspaceId, resolvedType, overCap);
+    if (!wipCheck.ok) return res.status(wipCheck.status).json(wipCheck.body);
+    const { admission } = wipCheck;
 
     // Agent tabs launch their CLI by default (mirrors UI tab creation) —
     // a bare shell made `tab send` briefs land in bash, not the agent.
@@ -255,8 +260,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
         reportOn: reportOnChecked.markers ?? undefined,
         host: remoteHost,
+        admit: admission?.admit,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
+      const wip = admission?.wip() ?? null;
+      if (wip && admission?.passedCap() && wipCheck.overCapReason !== null && wipCheck.caller) {
+        await auditOverCap({ workspaceId, tabId: tab.id, wip, reason: wipCheck.overCapReason, caller: wipCheck.caller });
+      }
 
       if (tab.panelType !== 'web-browser') {
         const provider = getProviderByPanelType(tab.panelType);
@@ -325,8 +335,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         ...(tab.reportOn ? { reportOn: tab.reportOn } : {}),
         ...(codexLaunchState ? { launchState: codexLaunchState } : {}),
         ...(tab.host ? { host: tab.host } : {}),
+        ...(wip ? { wip } : {}),
       });
     } catch (err) {
+      if (err instanceof WipCapError) return res.status(409).json(err.body);
       if (err instanceof RemoteHostError) {
         return res.status(503).json(remoteHostUnreachableBody(err));
       }

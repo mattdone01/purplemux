@@ -77,6 +77,7 @@
   "layoutFetchError": "레이아웃을 불러올 수 없습니다",
   "splitFailed": "분할할 수 없습니다",
   "tabCreateFailed": "탭을 생성할 수 없습니다",
+  "wipOverCap": "이 워크스페이스의 에이전트 탭은 {count}개로 WIP 한도 {cap}을(를) 넘었습니다",
   "tabDeleteError": "탭 삭제 중 오류가 발생했습니다",
   "sessionRestartFailed": "세션을 재시작할 수 없습니다",
   "tabRenameFailed": "탭 이름 변경에 실패했습니다",

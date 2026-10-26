@@ -41,8 +41,12 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * read the admin token. A write needs it, or the tab that is its workspace's
  * enabled orchestrator — the same rule as the deploy lease.
  */
-/** Keys that decide where tabs run and where their tokens are sent (ADR-0022): the admin token only. */
-const ADMIN_ONLY_KEYS = /^remote\./;
+/**
+ * The admin token only: keys that decide where tabs run and where their tokens
+ * are sent (ADR-0022), and fleet-wide keys any one workspace's orchestrator must
+ * not set for every other workspace (ADR-0027 ruling R2).
+ */
+const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts)\./;
 
 /** Values the remote keys must hold, checked at write time so a bad one never reaches a create. */
 const checkRemoteValue = (key: string, value: string, state: IFleetConfigState): void => {
@@ -62,7 +66,7 @@ const checkRemoteValue = (key: string, value: string, state: IFleetConfigState):
 
 const requireWriter = async (caller: ICaller, authority: IFleetConfigAuthority, key: string): Promise<void> => {
   if (caller.admin) return;
-  if (ADMIN_ONLY_KEYS.test(key)) throw new FleetConfigError('forbidden', `${key} is written by the admin token only (ADR-0022)`);
+  if (ADMIN_ONLY_KEYS.test(key)) throw new FleetConfigError('forbidden', `${key} is written by the admin token only (ADR-0022, ADR-0027)`);
   if (caller.workspaceId && caller.tabId && (await authority.isWorkspaceOrchestrator(caller.workspaceId, caller.tabId))) return;
   throw new FleetConfigError('forbidden', "fleet config is written by the admin token or the workspace's enabled orchestrator tab");
 };

@@ -365,7 +365,13 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; reportOn?: TTurnMarkerName[]; host?: string }): Promise<ITab | null> =>
+/**
+ * Decides, under the layout lock and before any session exists, whether a
+ * create may go ahead (ADR-0027). A refusal is thrown as given.
+ */
+export type TTabAdmit = (layout: ILayoutData) => { ok: true } | { ok: false; refusal: Error };
+
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; reportOn?: TTurnMarkerName[]; host?: string; admit?: TTabAdmit }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -373,6 +379,9 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
 
     const pane = collectPanes(layout.root).find((p) => p.id === paneId);
     if (!pane) return null;
+
+    const admitted = opts?.admit?.(layout);
+    if (admitted && !admitted.ok) throw admitted.refusal;
 
     const isWebBrowser = panelType === 'web-browser';
     const tabId = generateTabId();
