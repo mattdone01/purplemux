@@ -20,6 +20,7 @@ import { startGrants, stopGrants } from './src/lib/grant-service';
 import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio-runtime';
+import { startSpend, stopSpend } from './src/lib/spend/spend-service';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { dispatchHook } from './src/lib/hook-dispatch';
 import { drainHookSpoolsWithRemotePull } from './src/lib/remote-spool';
@@ -115,6 +116,7 @@ const shutdownWs = async () => {
   // in inbox.json for the next boot.
   await stopInbox();
   await getMissionControlRuntime().stop();
+  await stopSpend();
   await stopWatches();
   await stopNotes();
   stopGrants();
@@ -405,6 +407,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   // The Mission Control coordination panel's optional host signals (story 20).
   startHostSignals();
   await getMissionControlRuntime().start();
+  // The spend index starts its first pass 120 s after boot, one transcript at a time (ADR-0030).
+  await startSpend();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most
   // 10 s): a tab's state from before the restart gap must not look ready (ADR-0020).
   // Note paste-time policy must be registered before the inbox can drain legacy notices.

@@ -530,6 +530,55 @@ const cmdBurndown = async (args) => {
   die('usage: burndown publish -w WS --json @burndown.json | burndown show -w WS');
 };
 
+const SPEND_USAGE = 'usage: spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]';
+const SPEND_VALUE_FLAGS = ['-w', '--workspace', '--since', '--until', '--by'];
+const SPEND_BOOL_FLAGS = ['--json'];
+
+// A cost the server could not price is null: it prints as "—", never as $0.
+const spendCost = (row) => {
+  const cost = row.costUsd === null ? '—' : `est. $${row.costUsd.toFixed(row.costUsd < 1 ? 4 : 2)}`;
+  return row.unpricedTokens > 0 && row.costUsd !== null ? `${cost} (+${row.unpricedTokens} unpriced)` : cost;
+};
+
+const printSpend = (view) => {
+  const columns = ['KEY', 'LABEL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'SUBAGENTS', 'COST'];
+  const line = (row) => [row.key, row.label, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheCreationTokens,
+    row.totalTokens, row.sidechainTokens, spendCost(row)].map(String);
+  const table = [columns, ...view.rows.map(line), ...(view.unattributed ? [line(view.unattributed)] : []), line(view.totals)];
+  const widths = columns.map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
+  process.stdout.write(`spend ${view.workspaceId} ${view.from}..${view.to} UTC by ${view.by} (cost is an estimate)\n`);
+  for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
+  if (view.roleBasis === 'current-orchestrator') process.stdout.write('note: role uses the current orchestrator mapping, not the one at the time of use\n');
+  process.stdout.write('note: Codex and Grok usage counts on the session start day\n');
+  const index = view.index || {};
+  if (index.state === 'indexing') process.stdout.write(`note: partial — indexing ${index.filesIndexed} of ${index.filesTotal} files\n`);
+  else if (index.state !== 'ready') process.stdout.write(`note: spend index state ${index.state} is not one this CLI knows\n`);
+  if (index.error) process.stdout.write(`note: ${index.error}\n`);
+};
+
+const cmdSpend = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub !== 'show') die(SPEND_USAGE);
+  const positional = stripBooleanFlags(stripFlags(rest, SPEND_VALUE_FLAGS), SPEND_BOOL_FLAGS);
+  if (positional.length) die(`unexpected argument: ${positional[0]} — ${SPEND_USAGE}`);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const qs = new URLSearchParams({ workspaceId: wsId });
+  for (const name of ['since', 'until', 'by']) {
+    const value = flagValue(rest, `--${name}`);
+    if (value !== null) qs.set(name, value);
+  }
+  requireEnv();
+  const { body } = await api('GET', `/api/cli/spend?${qs}`);
+  if (rest.includes('--json')) out(body);
+  // An index that cannot be read has no numbers: its totals are zeros that mean nothing.
+  if (body.index && body.index.state === 'unavailable') {
+    return fail(null, `spend not available: ${body.index.error || 'the spend index cannot be read'}`);
+  }
+  if (!rest.includes('--json')) printSpend(body);
+};
+
 // A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
 const shellArg = (value) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, `'\\''`)}'`);
 
@@ -1670,6 +1719,13 @@ Commands:
   burndown publish -w WS --json @FILE      Publish the Scrum Master burndown.json (or '{...}', or pipe JSON). Validated
                                            strictly; history keeps the newest 2000 rows. Shown on the portfolio board
   burndown show -w WS                      The latest published burndown for a workspace
+  spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]
+                                           Tokens (input, output, cache read, cache creation, subagents) and the
+                                           estimated cost ("est."; "—" when no price is known) per tab, UTC day, model
+                                           or role, plus the unattributed row and the total. Default: the last 7 UTC
+                                           days by tab; at most 92 days, none before today - 91 (exit 2). Role uses
+                                           the current orchestrator. An unreadable spend index exits 1.
+                                           Read scope on WS (ADR-0030)
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
   mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap, and
@@ -1797,6 +1853,8 @@ const main = async () => {
       return cmdStandup(args.slice(1));
     case 'burndown':
       return cmdBurndown(args.slice(1));
+    case 'spend':
+      return cmdSpend(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':

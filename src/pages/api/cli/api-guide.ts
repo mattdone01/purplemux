@@ -569,6 +569,35 @@ POST /api/cli/workspaces/<workspaceId>/burndown        (purplemux burndown publi
 GET /api/cli/workspaces/<workspaceId>/burndown         (purplemux burndown show -w WS)
   Response: { "burndown": { "workspaceId", "receivedAt", "snapshot": { ... } } | null }
 
+## Spend (ADR-0030)
+
+GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role]
+                                                       (purplemux spend show -w WS [--since D] [--until D] [--by ...] [--json])
+  Read scope on WS. since/until are UTC days, both inclusive; the default is the last 7 UTC days
+  and by=tab. Spend keeps the last 92 UTC days (today − 91 … today), including usage whose
+  transcript has since left the disk. A bad date, since after until, a range over 92 days, a
+  since before today − 91, or a bad "by" is 400 invalid-request (exit 2). An unknown workspace
+  is 404 not-found. An index that cannot be read (index.state "unavailable") has no numbers:
+  the CLI prints the served error and exits 1.
+  Response (ISpendView):
+    { "workspaceId", "from", "to", "by", "generatedAt",
+      "totals": ISpendRow, "rows": [ISpendRow], "unattributed": ISpendRow | null,
+      "roleBasis"?: "current-orchestrator",
+      "dayBasis": { "claude": "message", "codex": "session-start", "grok": "session-start" },
+      "index": { "state": "ready"|"indexing"|"unavailable", "filesIndexed", "filesTotal",
+                 "indexedThrough": <ms>|null, "error"? } }
+    ISpendRow: { "key", "label", "providerId": "claude"|"codex"|"grok"|null, "inputTokens",
+      "outputTokens", "cacheReadTokens", "cacheCreationTokens", "totalTokens", "sidechainTokens",
+      "costUsd": <USD estimate>|null, "unpricedTokens" }
+  sum(rows) + unattributed = totals for every token field. Usage of an agent session that no
+  tab binding names is "unattributed": never dropped, never 0. Subagent transcripts count under
+  the parent session's tab and are reported in sidechainTokens. costUsd sums the tokens of
+  priced models; tokens of a model with no known price go to unpricedTokens, and a row with no
+  priced token has costUsd null (print "—", never $0). by=role rows are "orchestrator" (the
+  workspace's enabled orchestrator NOW) and "other". Transcripts are read by a background
+  index; while index.state is "indexing" the numbers are partial. A request never parses a
+  transcript.
+
 ## Portfolio board
 
 GET /api/cli/portfolio?workspaces=WS1,WS2

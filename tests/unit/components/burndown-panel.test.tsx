@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { SWRConfig } from 'swr';
 import { describe, expect, it } from 'vitest';
-import BurndownPanel, { BurndownChart, BurndownPanelContent, stepPath } from '@/components/features/mission-control/burndown-panel';
+import BurndownPanel, { BurndownChart, BurndownPanelContent, stepPath, tokenDaysInSpan } from '@/components/features/mission-control/burndown-panel';
 import { BURNDOWN_STALE_MS } from '@/lib/burndown';
 import type { IBurndownEpic, IBurndownHistoryRow, IMissionBurndownResponse } from '@/types/burndown';
 
@@ -122,5 +122,47 @@ describe('burndown panel through the SWR cache', () => {
       </SWRConfig>,
     );
     expect(html).toContain('epic-a name');
+  });
+});
+
+describe('burndown chart tokens line', () => {
+  const history = [row('a', '2026-10-07T10:00:00Z', 16), row('a', '2026-10-08T10:00:00Z', 12), row('a', GENERATED, 8)];
+  const tokens = [
+    { day: '2026-10-06', totalTokens: 9_000_000, sidechainTokens: 0 },
+    { day: '2026-10-07', totalTokens: 2_000_000, sidechainTokens: 500_000 },
+    { day: '2026-10-08', totalTokens: 4_000_000, sidechainTokens: 0 },
+    { day: '2026-10-09', totalTokens: 1_000_000, sidechainTokens: 0 },
+  ];
+
+  it('draws tokens per day on a second axis over the days the chart spans', () => {
+    const html = renderToStaticMarkup(<BurndownChart rows={history} tokensByDay={tokens} />);
+    expect(html).toContain('data-series="tokens"');
+    expect(html).toContain('var(--ui-purple)');
+    expect(html).toContain('workspace 7.0M tokens over 3 days, peak 4.0M a day');
+    expect(html).toContain('Workspace tokens/day (own scale, peak 4.0M)');
+    expect(html).not.toContain('right axis');
+    const d = /data-series="tokens" d="([^"]+)"/.exec(html)?.[1] ?? '';
+    expect(d.match(/[ML]/g)).toHaveLength(3);
+    expect(d).toContain(' 4');
+  });
+
+  it('draws the chart as before for a client or server without the field', () => {
+    const before = renderToStaticMarkup(<BurndownChart rows={history} />);
+    expect(before).not.toContain('data-series="tokens"');
+    expect(before).not.toContain('tokens/day');
+    expect(renderToStaticMarkup(<BurndownChart rows={history} tokensByDay={[]} />)).toBe(before);
+  });
+
+  it('places each overlapping day at its UTC noon, clamped to the span', () => {
+    const start = Date.parse('2026-10-07T18:00:00Z');
+    const end = Date.parse('2026-10-08T06:00:00Z');
+    expect(tokenDaysInSpan(tokens, start, end).map(({ entry, at }) => [entry.day, new Date(at).toISOString()])).toEqual([
+      ['2026-10-07', '2026-10-07T18:00:00.000Z'], ['2026-10-08', '2026-10-08T06:00:00.000Z'],
+    ]);
+  });
+
+  it('passes the served tokens to every epic chart', () => {
+    const html = render({ response: { ...response([epic('epic-a')], history.map((r) => ({ ...r, slug: 'epic-a' }))), tokensByDay: tokens } });
+    expect(html).toContain('data-series="tokens"');
   });
 });

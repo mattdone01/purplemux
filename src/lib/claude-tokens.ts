@@ -9,6 +9,15 @@ interface IModelPricing {
 }
 
 const MODEL_PRICING: Record<string, IModelPricing> = {
+  // Claude 5: Anthropic first-party price table (claude-api skill, cached 2026-10-06). Haiku 5.5 is its
+  // <= 100K-prompt tier; the > 100K tier ($0.50 / $2.50) is not modelled.
+  'fable-5-1': { input: 10, output: 50, cacheWrite5m: 12.5, cacheWrite1h: 20, cacheRead: 0.25 },
+  'fable-5': { input: 10, output: 50, cacheWrite5m: 12.5, cacheWrite1h: 20, cacheRead: 1 },
+  'opus-5-5': { input: 4, output: 20, cacheWrite5m: 5, cacheWrite1h: 8, cacheRead: 0.2 },
+  'opus-5': { input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 },
+  'sonnet-5-5': { input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.2 },
+  'sonnet-5': { input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.2 },
+  'haiku-5-5': { input: 0.1, output: 0.5, cacheWrite5m: 0.125, cacheWrite1h: 0.2, cacheRead: 0.01 },
   'opus-4-8': { input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 },
   'opus-4-7': { input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 },
   'opus-4-6': { input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 },
@@ -33,6 +42,13 @@ const FAST_PRICING: Record<string, IModelPricing> = {
 };
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
+  'fable-5-1': 'Fable 5.1',
+  'fable-5': 'Fable 5',
+  'opus-5-5': 'Opus 5.5',
+  'opus-5': 'Opus 5',
+  'sonnet-5-5': 'Sonnet 5.5',
+  'sonnet-5': 'Sonnet 5',
+  'haiku-5-5': 'Haiku 5.5',
   'opus-4-8': 'Opus 4.8',
   'opus-4-7': 'Opus 4.7',
   'opus-4-6': 'Opus 4.6',
@@ -54,7 +70,8 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
 
 const extractModelKey = (modelId: string): string | null => {
   const cleaned = modelId.replace(/\[.*?\]$/, '');
-  const match = cleaned.match(/claude-(\w+-[\d]+(?:-[\d]+)*)(?:-\d{8}|-v\d)?(?:\:\d)?$/);
+  // Version parts are 1-2 digits, so an 8-digit date suffix is never read as part of the key.
+  const match = cleaned.match(/claude-(\w+-\d{1,2}(?:-\d{1,2})*)(?:-\d{8})?(?:-v\d)?(?:\:\d)?$/);
   return match ? match[1] : null;
 };
 

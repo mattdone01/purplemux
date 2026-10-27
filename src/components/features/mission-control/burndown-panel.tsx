@@ -5,7 +5,9 @@ import useSWR from 'swr';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { isBurndownStale } from '@/lib/burndown';
+import { formatTokenCount } from '@/lib/claude-tokens';
 import type { IBurndownEpic, IBurndownHistoryRow, IMissionBurndownResponse } from '@/types/burndown';
+import type { ISpendTokensByDay } from '@/types/spend';
 
 const BURNDOWN_URL = '/api/mission-control/burndown';
 const REFRESH_MS = 60_000;
@@ -38,7 +40,15 @@ export const stepPath = (points: Array<{ x: number; y: number }>): string =>
 
 const round = (value: number): number => Math.round(value * 10) / 10;
 
-export const BurndownChart = ({ rows }: { rows: IBurndownHistoryRow[] }) => {
+const DAY_MS = 86_400_000;
+
+/** The days that overlap the chart's span, each placed at its UTC noon (clamped to the span). */
+export const tokenDaysInSpan = (days: ISpendTokensByDay[], start: number, end: number) =>
+  days.map((entry) => ({ entry, dayStart: Date.parse(`${entry.day}T00:00:00Z`) }))
+    .filter(({ dayStart }) => Number.isFinite(dayStart) && dayStart + DAY_MS > start && dayStart <= end)
+    .map(({ entry, dayStart }) => ({ entry, at: Math.min(end, Math.max(start, dayStart + DAY_MS / 2)) }));
+
+export const BurndownChart = ({ rows, tokensByDay }: { rows: IBurndownHistoryRow[]; tokensByDay?: ISpendTokensByDay[] }) => {
   if (rows.length === 0) return <p className="text-xs text-muted-foreground">No history yet</p>;
   const times = rows.map((row) => Date.parse(row.at));
   const start = times[0];
@@ -51,7 +61,14 @@ export const BurndownChart = ({ rows }: { rows: IBurndownHistoryRow[] }) => {
   const total = rows.map((row, index) => ({ x: x(times[index]), y: y(row.total) }));
   const last = rows[rows.length - 1];
   const endpoint = remaining[remaining.length - 1];
-  const label = `Remaining ${last.remaining} of ${last.total} points across ${plural(rows.length, 'snapshot', 'snapshots')}`;
+  const tokenDays = tokensByDay && rows.length > 1 ? tokenDaysInSpan(tokensByDay, start, end) : [];
+  const topTokens = Math.max(1, ...tokenDays.map(({ entry }) => entry.totalTokens));
+  const tokenPoints = tokenDays.map(({ entry, at }) => ({
+    x: x(at), y: round(CHART_HEIGHT - CHART_PAD - (entry.totalTokens / topTokens) * (CHART_HEIGHT - 2 * CHART_PAD)),
+  }));
+  const tokenTotal = tokenDays.reduce((sum, { entry }) => sum + entry.totalTokens, 0);
+  const label = `Remaining ${last.remaining} of ${last.total} points across ${plural(rows.length, 'snapshot', 'snapshots')}`
+    + (tokenDays.length ? `; workspace ${formatTokenCount(tokenTotal)} tokens over ${plural(tokenDays.length, 'day', 'days')}, peak ${formatTokenCount(topTokens)} a day` : '');
 
   return (
     <figure className="space-y-1">
@@ -61,6 +78,8 @@ export const BurndownChart = ({ rows }: { rows: IBurndownHistoryRow[] }) => {
           <path d={stepPath(total)} fill="none" stroke="var(--muted-foreground)" strokeWidth={1} strokeDasharray="3 3" vectorEffect="non-scaling-stroke" />
           <path d={stepPath(remaining)} fill="none" stroke="var(--ui-blue)" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
         </>}
+        {tokenPoints.length > 0 && <path data-series="tokens" d={tokenPoints.map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x} ${point.y}`).join('')}
+          fill="none" stroke="var(--ui-purple)" strokeWidth={1} vectorEffect="non-scaling-stroke" />}
         <circle cx={endpoint.x} cy={endpoint.y} r={2.5} fill="var(--ui-blue)" />
       </svg>
       <figcaption className="flex justify-between gap-2 text-[11px] text-muted-foreground">
@@ -68,6 +87,7 @@ export const BurndownChart = ({ rows }: { rows: IBurndownHistoryRow[] }) => {
         <span className="flex gap-3">
           <span className="text-ui-blue">— Remaining</span>
           <span>- - Total</span>
+          {tokenPoints.length > 0 && <span className="text-ui-purple">— Workspace tokens/day (own scale, peak {formatTokenCount(topTokens)})</span>}
         </span>
         <span>{dayjs(end).format('MMM D HH:mm')}</span>
       </figcaption>
@@ -89,7 +109,7 @@ const Counts = ({ remaining, inProgress, blocked }: { remaining: number; inProgr
   </div>
 );
 
-const EpicCard = ({ epic, history }: { epic: IBurndownEpic; history: IBurndownHistoryRow[] }) => (
+const EpicCard = ({ epic, history, tokensByDay }: { epic: IBurndownEpic; history: IBurndownHistoryRow[]; tokensByDay?: ISpendTokensByDay[] }) => (
   <Card className="min-w-0 shadow-none">
     <CardContent className="space-y-3 p-4">
       <div className="flex items-start justify-between gap-2">
@@ -103,7 +123,7 @@ const EpicCard = ({ epic, history }: { epic: IBurndownEpic; history: IBurndownHi
       <ProgressBar pct={epic.pct} label={`${epic.name} points burned`} />
       <Counts remaining={epic.remaining} inProgress={epic.in_progress} blocked={epic.blocked} />
       {epic.unpointed > 0 && <p className="text-xs text-ui-amber">{plural(epic.unpointed, 'unpointed story', 'unpointed stories')} not counted</p>}
-      <BurndownChart rows={history} />
+      <BurndownChart rows={history} tokensByDay={tokensByDay} />
     </CardContent>
   </Card>
 );
@@ -176,7 +196,7 @@ export const BurndownPanelContent = ({ response, loading, error, now, onRetry }:
           </CardContent>
         </Card>
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {epics.map((epic) => <EpicCard key={epic.slug} epic={epic} history={snapshot.history.filter((row) => row.slug === epic.slug)} />)}
+          {epics.map((epic) => <EpicCard key={epic.slug} epic={epic} history={snapshot.history.filter((row) => row.slug === epic.slug)} tokensByDay={response.tokensByDay} />)}
         </div>
       </>}
     </section>
