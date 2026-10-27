@@ -1,6 +1,7 @@
 import { buildManagedCodexLaunchCommand } from '@/lib/providers/codex';
 import {
   beginCodexLaunch,
+  beginCodexLaunchLocked,
   holdCodexLaunch,
   holdCodexLaunchLocked,
   markCodexLaunchSubmittedLocked,
@@ -53,12 +54,15 @@ export type TCodexLaunchActivationResult =
 const ACTIVATION_WAIT_ATTEMPTS = 75;
 const ACTIVATION_WAIT_INTERVAL_MS = 40;
 
-export const prepareCodexManagedLaunch = async (
+const prepareManagedLaunch = async (
   workspaceId: string,
   tabId: string,
-  resumeSessionId?: string | null,
+  resumeSessionId: string | null | undefined,
+  targetLockHeld: boolean,
 ): Promise<TPrepareCodexLaunchResult> => {
-  const prepared = await beginCodexLaunch(workspaceId, tabId, {
+  const begin = targetLockHeld ? beginCodexLaunchLocked : beginCodexLaunch;
+  const hold = targetLockHeld ? holdCodexLaunchLocked : holdCodexLaunch;
+  const prepared = await begin(workspaceId, tabId, {
     resumeSessionId,
     transitionToCodexPanel: true,
   });
@@ -69,10 +73,23 @@ export const prepareCodexManagedLaunch = async (
     return { ok: true, launch: { ...prepared.intent, command } };
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'managed-command-build-failed';
-    await holdCodexLaunch(workspaceId, tabId, prepared.intent.generation, reason);
+    await hold(workspaceId, tabId, prepared.intent.generation, reason);
     return { ok: false, reason };
   }
 };
+
+export const prepareCodexManagedLaunch = async (
+  workspaceId: string,
+  tabId: string,
+  resumeSessionId?: string | null,
+): Promise<TPrepareCodexLaunchResult> => prepareManagedLaunch(workspaceId, tabId, resumeSessionId, false);
+
+/** For a caller that holds the tab's Codex target lock (`withAgentDispatchLock`); the lock is not re-entrant. */
+export const prepareCodexManagedLaunchLocked = async (
+  workspaceId: string,
+  tabId: string,
+  resumeSessionId?: string | null,
+): Promise<TPrepareCodexLaunchResult> => prepareManagedLaunch(workspaceId, tabId, resumeSessionId, true);
 
 export const submitCodexManagedLaunch = async (
   workspaceId: string,
@@ -80,41 +97,49 @@ export const submitCodexManagedLaunch = async (
   generation: string,
   shellStartWaitMs: number = CODEX_SHELL_START_WAIT_MS,
 ): Promise<TSubmitCodexLaunchResult> =>
-  withCodexTargetLock(workspaceId, tabId, async () => {
-    const found = await findTab(workspaceId, tabId);
-    const sessionName = found?.tab.sessionName;
-    if (!sessionName) {
-      return { ok: false, generation, phase: 'held', reason: 'tab-not-found' };
-    }
-    const intent = await resolvePreparedCodexLaunchIntent(workspaceId, tabId, generation, sessionName);
-    if (!intent) {
-      return { ok: false, generation, phase: 'held', reason: 'launch-generation-not-current' };
-    }
-    const terminal = await waitForStartingShell(sessionName, shellStartWaitMs);
-    if (!terminal.isSafe) {
-      await holdCodexLaunchLocked(workspaceId, tabId, generation, `terminal-not-ready:${terminal.processName}`);
-      return {
-        ok: false,
-        generation,
-        phase: 'held',
-        reason: `terminal-not-ready:${terminal.processName}`,
-      };
-    }
-    const command = await buildManagedCodexLaunchCommand(intent);
-    try {
-      await sendKeys(sessionName, command);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : 'unknown';
-      const reason = `terminal-submit-failed:${detail}`;
-      await holdCodexLaunchLocked(workspaceId, tabId, generation, reason);
-      return { ok: false, generation, phase: 'held', reason };
-    }
-    const submitted = await markCodexLaunchSubmittedLocked(workspaceId, tabId, generation);
-    if (!submitted.ok) {
-      return { ok: false, generation, phase: 'held', reason: submitted.reason };
-    }
-    return { ok: true, generation, phase: 'submitted' };
-  });
+  withCodexTargetLock(workspaceId, tabId, () => submitCodexManagedLaunchLocked(workspaceId, tabId, generation, shellStartWaitMs));
+
+/** For a caller that holds the tab's Codex target lock (`withAgentDispatchLock`); the lock is not re-entrant. */
+export const submitCodexManagedLaunchLocked = async (
+  workspaceId: string,
+  tabId: string,
+  generation: string,
+  shellStartWaitMs: number = CODEX_SHELL_START_WAIT_MS,
+): Promise<TSubmitCodexLaunchResult> => {
+  const found = await findTab(workspaceId, tabId);
+  const sessionName = found?.tab.sessionName;
+  if (!sessionName) {
+    return { ok: false, generation, phase: 'held', reason: 'tab-not-found' };
+  }
+  const intent = await resolvePreparedCodexLaunchIntent(workspaceId, tabId, generation, sessionName);
+  if (!intent) {
+    return { ok: false, generation, phase: 'held', reason: 'launch-generation-not-current' };
+  }
+  const terminal = await waitForStartingShell(sessionName, shellStartWaitMs);
+  if (!terminal.isSafe) {
+    await holdCodexLaunchLocked(workspaceId, tabId, generation, `terminal-not-ready:${terminal.processName}`);
+    return {
+      ok: false,
+      generation,
+      phase: 'held',
+      reason: `terminal-not-ready:${terminal.processName}`,
+    };
+  }
+  const command = await buildManagedCodexLaunchCommand(intent);
+  try {
+    await sendKeys(sessionName, command);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : 'unknown';
+    const reason = `terminal-submit-failed:${detail}`;
+    await holdCodexLaunchLocked(workspaceId, tabId, generation, reason);
+    return { ok: false, generation, phase: 'held', reason };
+  }
+  const submitted = await markCodexLaunchSubmittedLocked(workspaceId, tabId, generation);
+  if (!submitted.ok) {
+    return { ok: false, generation, phase: 'held', reason: submitted.reason };
+  }
+  return { ok: true, generation, phase: 'submitted' };
+};
 
 export const waitForCodexManagedLaunch = async (
   workspaceId: string,

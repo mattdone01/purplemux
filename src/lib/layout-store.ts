@@ -6,7 +6,8 @@ import os from 'os';
 import { nanoid } from 'nanoid';
 import { assertRemoteHostsAnswer, createSession, hasSession, hasSessionOrUnreachable, killSession, resolveExistingDir, sendKeys, workspaceSessionName } from '@/lib/tmux';
 import { broadcastSync } from '@/lib/sync-server';
-import { isAgentPanelType as isAgentPanel } from '@/lib/agent-panel-types';
+import { isAgentPanelType as isAgentPanel, toSessionHistoryProvider } from '@/lib/agent-panel-types';
+import { recordSessionTab } from '@/lib/spend/session-tabs-store';
 import { createLogger } from '@/lib/logger';
 import { emitTabClosing, hasKnownTabs, observeLayoutTabs, observeWorkspaceRemoved } from '@/lib/tab-lifecycle';
 import { findTabIdBySession, revokeTabToken } from '@/lib/tab-token';
@@ -23,6 +24,7 @@ import {
   isEqualized,
 } from '@/lib/layout-tree';
 import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig } from '@/types/terminal';
+import type { TTurnMarkerName } from '@/lib/turn-end';
 import type { TCliState } from '@/types/timeline';
 import type { IAgentProvider } from '@/lib/providers/types';
 import { claudeProvider } from '@/lib/providers/claude';
@@ -364,7 +366,13 @@ export const deletePane = async (
   }
 };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; host?: string }): Promise<ITab | null> =>
+/**
+ * Decides, under the layout lock and before any session exists, whether a
+ * create may go ahead (ADR-0027). A refusal is thrown as given.
+ */
+export type TTabAdmit = (layout: ILayoutData) => { ok: true } | { ok: false; refusal: Error };
+
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; reportOn?: TTurnMarkerName[]; host?: string; admit?: TTabAdmit }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -372,6 +380,9 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
 
     const pane = collectPanes(layout.root).find((p) => p.id === paneId);
     if (!pane) return null;
+
+    const admitted = opts?.admit?.(layout);
+    if (admitted && !admitted.ok) throw admitted.refusal;
 
     const isWebBrowser = panelType === 'web-browser';
     const tabId = generateTabId();
@@ -392,7 +403,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}), ...(host ? { host } : {}) };
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}), ...(opts?.reportOn?.length ? { reportOn: [...opts.reportOn] } : {}), ...(host ? { host } : {}) };
 
     if (command && !isWebBrowser) prepareOrchestrationLaunch(tab);
     pane.tabs.push(tab);
@@ -536,21 +547,33 @@ export const renameTabInPane = async (wsId: string, paneId: string, tabId: strin
   });
 
 export const restartTabSession = async (wsId: string, paneId: string, tabId: string, command?: string): Promise<boolean> =>
-  withOrchestrationMappingRead(wsId, () => withLock(async () => {
+  withOrchestrationMappingRead(wsId, async () => (await restartTabSessionUnguarded(wsId, paneId, tabId, command)).found);
+
+/** `cwdLost`: the tab's cwd was gone, so the session started in the nearest existing parent and no command was typed. */
+export type TRestartSessionResult = { found: false } | { found: true; cwdLost: boolean };
+
+/**
+ * `restartTabSession` without the workspace mapping read guard, for a caller
+ * that already holds it (`tab restart` inside `withAgentDispatchLock`). The
+ * mapping lease is not re-entrant and a queued writer blocks later readers, so
+ * a second read under the first deadlocks (ADR-0028 §2).
+ */
+export const restartTabSessionUnguarded = async (wsId: string, paneId: string, tabId: string, command?: string): Promise<TRestartSessionResult> =>
+  withLock(async (): Promise<TRestartSessionResult> => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
-    if (!layout) return false;
+    if (!layout) return { found: false };
 
     const pane = collectPanes(layout.root).find((p) => p.id === paneId);
-    if (!pane) return false;
+    if (!pane) return { found: false };
 
     const tab = pane.tabs.find((t) => t.id === tabId);
-    if (!tab) return false;
+    if (!tab) return { found: false };
 
     if (tab.host) registerSessionHost(tab.sessionName, tab.host);
     // A remote host that does not answer is no proof the session is gone: never recreate over it (B2).
     const exists = tab.host ? await hasSessionOrUnreachable(tab.sessionName) : await hasSession(tab.sessionName);
-    if (exists) return true;
+    if (exists) return { found: true, cwdLost: false };
 
     // A remote cwd is checked by the remote tmux, which starts a missing one in HOME (ADR-0022 §8).
     const effectiveCwd = tab.host ? tab.cwd : await resolveExistingDir(tab.cwd);
@@ -571,8 +594,15 @@ export const restartTabSession = async (wsId: string, paneId: string, tabId: str
       layout.updatedAt = new Date().toISOString();
       await writeLayoutFile(layout, filePath);
     }
-    return true;
-  }));
+    return { found: true, cwdLost };
+  });
+
+/** Stamp a tab's last restart (ADR-0028); older releases ignore the field. */
+export const markTabRestarted = async (wsId: string, tabId: string, at: number): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    tab.lastRestartAt = at;
+    return { changed: true, value: undefined };
+  })).found;
 
 export const reconcileTabCwd = async (sessionName: string): Promise<void> =>
   withLock(async () => {
@@ -651,16 +681,36 @@ const mutateTab = async (
   });
 };
 
-export const updateTabAgentSessionId = (
+/**
+ * The spend read model's tab attribution (ADR-0030 §3). Both session-id writers call it after their
+ * layout write; a failure is logged and never fails the hook path.
+ */
+const recordSpendBinding = async (
+  sessionName: string,
+  provider: IAgentProvider,
+  sessionId: string | null | undefined,
+  tabId: string | undefined,
+): Promise<void> => {
+  const wsId = parseSessionName(sessionName)?.wsId;
+  if (!sessionId || !tabId || !wsId) return;
+  await recordSessionTab({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: wsId, tabId })
+    .catch((err) => log.warn(`session-tabs binding not recorded for ${sessionName}: ${err instanceof Error ? err.message : err}`));
+};
+
+export const updateTabAgentSessionId = async (
   sessionName: string,
   provider: IAgentProvider,
   sessionId: string | null,
-): Promise<void> =>
-  mutateTab(sessionName, (tab) => {
+): Promise<void> => {
+  const found: { tabId?: string } = {};
+  await mutateTab(sessionName, (tab) => {
+    found.tabId = tab.id;
     if (provider.readSessionId(tab) === sessionId) return false;
     provider.writeSessionId(tab, sessionId);
     return true;
   });
+  await recordSpendBinding(sessionName, provider, sessionId, found.tabId);
+};
 
 export const updateTabAgentSummary = (
   sessionName: string,
@@ -673,7 +723,7 @@ export const updateTabAgentSummary = (
     return true;
   });
 
-export const updateTabAgentState = (
+export const updateTabAgentState = async (
   sessionName: string,
   provider: IAgentProvider,
   state: {
@@ -682,8 +732,10 @@ export const updateTabAgentState = (
     summary?: string | null;
     lastUserMessage?: string | null;
   },
-): Promise<void> =>
-  mutateTab(sessionName, (tab) => {
+): Promise<void> => {
+  const found: { tabId?: string } = {};
+  await mutateTab(sessionName, (tab) => {
+    found.tabId = tab.id;
     let changed = false;
     if (state.sessionId !== undefined && provider.readSessionId(tab) !== state.sessionId) {
       provider.writeSessionId(tab, state.sessionId);
@@ -703,6 +755,8 @@ export const updateTabAgentState = (
     }
     return changed;
   });
+  await recordSpendBinding(sessionName, provider, state.sessionId, found.tabId);
+};
 
 export const updateTabClaudeSessionId = (
   sessionName: string,
@@ -795,6 +849,18 @@ export const setTabReportsTo = async (wsId: string, tabId: string, reportsTo: st
     if ((tab.reportsTo ?? null) === reportsTo) return { changed: false, value: true };
     if (reportsTo) tab.reportsTo = reportsTo;
     else delete tab.reportsTo;
+    return { changed: true, value: true };
+  })).found;
+
+/** The markers whose end lines this tab forwards (ADR-0025); null clears the filter. */
+export const setTabReportOn = async (wsId: string, tabId: string, reportOn: TTurnMarkerName[] | null): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    const current = tab.reportOn ?? null;
+    if ((current === null && reportOn === null) || (current && reportOn && current.join(',') === reportOn.join(','))) {
+      return { changed: false, value: true };
+    }
+    if (reportOn) tab.reportOn = [...reportOn];
+    else delete tab.reportOn;
     return { changed: true, value: true };
   })).found;
 

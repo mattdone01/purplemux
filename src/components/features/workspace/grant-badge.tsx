@@ -3,7 +3,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import useGrants, { GRANTS_POLL_MS, serverTimeOf } from '@/hooks/use-grants';
 import useNowTick from '@/hooks/use-now-tick';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
-import { describeGrantFailure, grantBadgeOf, type IGrantBadge } from '@/lib/grant-view';
+import { describeGrantFailure, grantBadgeOf, ownerBadgeOf, type IGrantBadge } from '@/lib/grant-view';
 import { cn } from '@/lib/utils';
 
 // "reads N workspaces" on a grantee tab (story 28; ADR-0014), with the
@@ -40,6 +40,30 @@ export const GrantBadgeView = ({ badge, workspaceNames, staleReason = null }: {
   );
 };
 
+/** "owner" on the tab that holds the owner grant (ADR-0029): it reads every workspace and sends notes as owner. */
+export const OwnerBadgeView = ({ expiresAt, staleReason = null }: { expiresAt: number; staleReason?: string | null }) => {
+  const t = useTranslations('grants');
+  const format = useFormatter();
+  const detail = t('ownerBadgeTooltip', { time: format.dateTime(new Date(expiresAt), { dateStyle: 'medium', timeStyle: 'short' }) });
+  const label = staleReason ? `${detail} (${t('staleSuffix', { reason: staleReason })})` : detail;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        className={cn(
+          'ml-0.5 inline-flex h-3.5 shrink-0 items-center rounded bg-[var(--ui-purple)] px-1 text-[9px] font-medium leading-none text-white',
+          staleReason && 'opacity-60',
+        )}
+        aria-label={label}
+        data-owner-badge=""
+        data-stale={staleReason ? 'true' : undefined}
+      >
+        {t('ownerBadge')}
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+};
+
 /** The badge's clock: one poll, so an expired grant loses its badge within one poll (architect CONFIRM, story 28). */
 export const GRANT_BADGE_TICK_MS = GRANTS_POLL_MS;
 
@@ -51,14 +75,22 @@ const GrantBadge = ({ workspaceId, tabId }: { workspaceId: string | null; tabId:
   // A poll-length clock: the badge goes at expiry without waiting for the next grants read.
   const now = useNowTick(GRANT_BADGE_TICK_MS);
   if (!workspaceId || !view) return null;
-  const badge = grantBadgeOf(view.grants, workspaceId, tabId, serverTimeOf(view, now));
-  if (!badge) return null;
+  const serverNow = serverTimeOf(view, now);
+  const badge = grantBadgeOf(view.grants, workspaceId, tabId, serverNow);
+  const owner = ownerBadgeOf(view.grants, workspaceId, tabId, serverNow);
+  if (!badge && !owner) return null;
+  const staleReason = stale && failure ? describeGrantFailure(failure, (key, values) => t(key, values)) : null;
   return (
-    <GrantBadgeView
-      badge={badge}
-      workspaceNames={Object.fromEntries(workspaces.map((w) => [w.id, w.name]))}
-      staleReason={stale && failure ? describeGrantFailure(failure, (key, values) => t(key, values)) : null}
-    />
+    <>
+      {owner && <OwnerBadgeView expiresAt={owner.expiresAt} staleReason={staleReason} />}
+      {badge && (
+        <GrantBadgeView
+          badge={badge}
+          workspaceNames={Object.fromEntries(workspaces.map((w) => [w.id, w.name]))}
+          staleReason={staleReason}
+        />
+      )}
+    </>
   );
 };
 

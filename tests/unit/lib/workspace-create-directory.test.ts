@@ -112,6 +112,70 @@ describe('createWorkspace directory handling', () => {
   });
 });
 
+describe('createWorkspace name uniqueness and extra directories (CLI create, ADR-0024)', () => {
+  it('refuses a name another workspace holds, ignoring case and outer spaces, before any session starts', async () => {
+    const { createWorkspace } = await importStore();
+    const { createDefaultLayout } = await import('@/lib/layout-store');
+    const first = await createWorkspace(mockHome.value, 'Treasury v2', undefined, { uniqueName: true });
+    vi.mocked(createDefaultLayout).mockClear();
+
+    const err = await createWorkspace(mockHome.value, '  treasury V2 ', undefined, { uniqueName: true }).catch((e: unknown) => e);
+
+    const { isWorkspaceNameTakenError } = await importStore();
+    expect(isWorkspaceNameTakenError(err)).toBe(true);
+    expect((err as Error).message).toBe(`a workspace named "Treasury v2" already exists (${first.id})`);
+    expect(createDefaultLayout).not.toHaveBeenCalled();
+    const stored = JSON.parse(await fs.readFile(path.join(mockHome.value, '.purplemux', 'workspaces.json'), 'utf-8'));
+    expect(stored.workspaces.map((w: { name: string }) => w.name)).toEqual(['Treasury v2']);
+  });
+
+  it('lets exactly one of two concurrent creates of the same name through', async () => {
+    const { createWorkspace, isWorkspaceNameTakenError } = await importStore();
+    const { createDefaultLayout } = await import('@/lib/layout-store');
+    vi.mocked(createDefaultLayout).mockClear();
+
+    const results = await Promise.allSettled([
+      createWorkspace(mockHome.value, 'Race', undefined, { uniqueName: true }),
+      createWorkspace(mockHome.value, 'race', undefined, { uniqueName: true }),
+    ]);
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const refused = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(refused).toHaveLength(1);
+    expect(isWorkspaceNameTakenError(refused[0].reason)).toBe(true);
+    expect(createDefaultLayout).toHaveBeenCalledTimes(1);
+    const stored = JSON.parse(await fs.readFile(path.join(mockHome.value, '.purplemux', 'workspaces.json'), 'utf-8'));
+    expect(stored.workspaces).toHaveLength(1);
+  });
+
+  it('refuses a taken name before it creates a missing directory', async () => {
+    const { createWorkspace } = await importStore();
+    await createWorkspace(mockHome.value, 'Taken', undefined, { uniqueName: true });
+    const target = path.join(mockHome.value, 'would-be-created');
+
+    await expect(createWorkspace(target, 'taken', undefined, { uniqueName: true, mkdir: true })).rejects.toThrow('already exists');
+    expect(await exists(target)).toBe(false);
+  });
+
+  it('keeps the UI behaviour: without uniqueName a repeated name is accepted', async () => {
+    const { createWorkspace } = await importStore();
+    await createWorkspace(mockHome.value, 'same');
+    await expect(createWorkspace(mockHome.value, 'same')).resolves.toMatchObject({ name: 'same' });
+  });
+
+  it('stores the extra directories after the primary in the same write', async () => {
+    const { createWorkspace } = await importStore();
+    const other = path.join(mockHome.value, 'other');
+    await fs.mkdir(other);
+
+    const workspace = await createWorkspace(mockHome.value, 'multi', undefined, { uniqueName: true, extraDirectories: [other] });
+
+    expect(workspace.directories).toEqual([mockHome.value, other]);
+    const stored = JSON.parse(await fs.readFile(path.join(mockHome.value, '.purplemux', 'workspaces.json'), 'utf-8'));
+    expect(stored.workspaces[0].directories).toEqual([mockHome.value, other]);
+  });
+});
+
 describe('validateDirectory', () => {
   it('reports an existing directory', async () => {
     const { validateDirectory } = await importStore();

@@ -1,14 +1,23 @@
 import { Component, useState, type ReactNode } from 'react';
+import { RotateCcw, Send, Unlock } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { LeaseBreakDialog, OwnerNoteDialog, toastOutcome } from '@/components/features/mission-control/coordination-actions';
 import { FleetStatusView, type IFleetFilter } from '@/components/features/mission-control/fleet-status-panel';
 import useCoordination from '@/hooks/use-coordination';
+import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { hostWarnings } from '@/lib/host-warnings';
+import { humanRetryRefusal, postHumanAction } from '@/lib/human-actions';
 import { cn } from '@/lib/utils';
-import type { ICoordinationSnapshot, THostSignals, TSection } from '@/types/coordination';
+import type { ICoordinationSnapshot, IDeployRow, TGrantsSection, THostSignals, TSection } from '@/types/coordination';
+import type { IInboxItem } from '@/types/inbox';
+import type { ILeaseView } from '@/types/lease';
 
 // Mission Control coordination panel (story 20): leases, open notes, watches,
-// grants, held deliveries and host pressure — read only. A stale holder must
-// never block the fleet silently, and a full disk must show before it bites.
+// grants, held deliveries, host pressure and deploy announcements. A stale
+// holder must never block the fleet silently, and a full disk must show before
+// it bites. The human actions (ADR-0029 §6-§8) sit on the coordination rows
+// only; the fleet status view stays read-only (ADR-0023).
 
 const HOLDER_LABEL: Record<string, string> = { live: 'live', 'agent-gone': 'agent gone', closed: 'closed', admin: 'admin' };
 const NOTE_LABEL: Record<string, string> = { queued: 'queued', pending: 'pending', held: 'held', delivered: 'delivered', undeliverable: 'undeliverable' };
@@ -75,23 +84,70 @@ export const formatBytes = (bytes: number): string => {
   return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
 };
 
+const GRANT_REFUSAL_LABEL: Record<string, string> = {
+  drive: 'Read grants are not honoured: grants.json cannot be read',
+  owner: 'Owner sessions are not honoured: owner-grants.json cannot be read',
+};
+
+/** One sentence per grant file the server could not read (ADR-0029 §1), with the served reason. */
+export const grantRefusals = (section: TGrantsSection): string[] => (section.ok
+  ? (section.refused ?? []).map((r) => `${Object.hasOwn(GRANT_REFUSAL_LABEL, r.capability) ? GRANT_REFUSAL_LABEL[r.capability] : 'A grant file cannot be read'} — ${r.error}`)
+  : []);
+
 const WARN = 'text-ui-amber';
 
-const Section = <T,>({ title, section, empty, render }: {
+const DEPLOY_PHASE_LABEL: Record<string, string> = { pending: 'restart in', past: 'restarted' };
+
+/** "restart in 4m" / "restarted 2h ago"; an unknown phase reads its time only. */
+export const deployWhen = (row: Pick<IDeployRow, 'phase' | 'restartAt'>, now: number): string => {
+  const seconds = Math.abs(row.restartAt - now) / 1000;
+  if (!Object.hasOwn(DEPLOY_PHASE_LABEL, row.phase)) return `restart at ${formatStamp(row.restartAt)}`;
+  return row.phase === 'pending' ? `${DEPLOY_PHASE_LABEL.pending} ${formatAge(seconds)}` : `${DEPLOY_PHASE_LABEL.past} ${formatAge(seconds)} ago`;
+};
+
+/** Who announced it: the admin token or a tab; never a bare id pair with a missing half. */
+export const deployBy = (by: IDeployRow['by']): string =>
+  (by.admin ? 'admin' : `${by.workspaceId ?? '—'}/${by.tabId ?? '—'}`);
+
+/**
+ * Delivered of total, then any notice still waiting or stopped, then the notices the inbox no longer
+ * has (`deploy status` reads them `pruned`): served in `total` only, so named here, never left silent.
+ */
+export const deployRecipients = (r: IDeployRow['recipients']): string => {
+  if (r.total === 0) return 'no recipients';
+  const untracked = r.total - r.delivered - r.queued - r.held - r.dropped;
+  const rest = ([['queued', r.queued], ['held', r.held], ['dropped', r.dropped], ['no longer tracked', untracked]] as const)
+    .filter(([, n]) => n > 0).map(([word, n]) => `${n} ${word}`);
+  return [`${r.delivered}/${r.total} delivered`, ...rest].join(' · ');
+};
+
+/** The actions the container wires; without them the rows render read-only. */
+export interface ICoordinationActions {
+  onRetry: (item: IInboxItem) => void;
+  onBreak: (lease: ILeaseView) => void;
+  onSendNote: () => void;
+  /** Held notices whose retry is in flight: their button is disabled. */
+  busy: ReadonlySet<string>;
+}
+
+const Section = <T,>({ title, section, empty, render, refusals = [] }: {
   title: string;
   section: TSection<T>;
   empty: string;
   render: (item: T, i: number) => ReactNode;
+  /** Parts of the section the server could not read: named, and the section is then never "empty". */
+  refusals?: string[];
 }) => (
   <div className="min-w-0 space-y-1.5" data-section={title}>
     <h3 className="text-xs font-semibold">
       {title}
       {section.ok && <span className="ml-1.5 tabular-nums text-muted-foreground">{section.items.length}</span>}
     </h3>
+    {refusals.map((text) => <p key={text} className="text-xs text-destructive" data-state="partial">{text}</p>)}
     {!section.ok ? (
       <p className="text-xs text-destructive" data-state="error">Could not read: {section.error}</p>
     ) : section.items.length === 0 ? (
-      <p className="text-xs text-muted-foreground" data-state="empty">{empty}</p>
+      refusals.length === 0 && <p className="text-xs text-muted-foreground" data-state="empty">{empty}</p>
     ) : (
       <ul className="space-y-1 text-xs" data-state="populated">{section.items.map(render)}</ul>
     )}
@@ -115,7 +171,12 @@ const SignalsView = ({ signals, now }: { signals: THostSignals; now: number }) =
   );
 };
 
-export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: ICoordinationSnapshot | null; error: string | null; loading: boolean }) => {
+export const CoordinationPanelView = ({ snapshot, error, loading, actions }: {
+  snapshot: ICoordinationSnapshot | null;
+  error: string | null;
+  loading: boolean;
+  actions?: ICoordinationActions;
+}) => {
   if (!snapshot) {
     return (
       <Card className="border-foreground/10 shadow-none">
@@ -132,6 +193,13 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
     <Card className="border-foreground/10 shadow-none" data-coordination-panel="">
       <CardContent className="grid gap-4 p-4 sm:grid-cols-2 sm:p-5">
         {error && <p className="text-xs text-destructive sm:col-span-2" data-state="refresh-error">Last refresh failed: {error}</p>}
+        {actions && (
+          <div className="flex justify-end sm:col-span-2">
+            <Button type="button" size="xs" variant="outline" onClick={actions.onSendNote} data-action="send-note">
+              <Send />Send note as owner
+            </Button>
+          </div>
+        )}
         <Section title="Leases" section={snapshot.leases} empty="No leases" render={(l) => {
           const stale = l.holderState === 'agent-gone' || l.holderState === 'closed';
           return (
@@ -141,6 +209,12 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
                 {l.holder.admin ? 'admin' : `${l.holder.workspaceName ?? l.holder.workspaceId ?? '—'}/${l.holder.tabName ?? l.holder.tabId ?? '—'}`}
                 {' · '}{formatAge(l.ageSeconds)}{' · '}{l.expiresInSeconds === null ? 'no expiry' : `expires ${formatAge(l.expiresInSeconds)}`}{' · '}
                 <span className={cn(stale && WARN)}>{label(HOLDER_LABEL, l.holderState)}</span>
+                {actions && (
+                  <Button type="button" size="xs" variant="ghost" className="ml-1"
+                    onClick={() => actions.onBreak(l)} data-action="break" aria-label={`Break lease ${l.name}`}>
+                    <Unlock />Break…
+                  </Button>
+                )}
               </span>
             </li>
           );
@@ -161,16 +235,24 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
             </span>
           </li>
         )} />
-        <Section title="Grants" section={snapshot.grants} empty="No active grants" render={(g) => (
-          <li key={g.id} className="flex min-w-0 justify-between gap-2" data-grant={g.id}>
-            <span className="truncate">{g.grantee.workspaceId}/{g.grantee.tabId} reads {g.workspaces.join(', ')}</span>
+        <Section title="Grants" section={snapshot.grants} empty="No active grants" refusals={grantRefusals(snapshot.grants)} render={(g) => (
+          <li key={g.id} className="flex min-w-0 justify-between gap-2" data-grant={g.id} data-grant-capability={g.capability}>
+            <span className="truncate">{g.grantee.workspaceId}/{g.grantee.tabId} {g.capability === 'owner' ? 'owner session — reads every workspace' : `reads ${g.workspaces.join(', ')}`}</span>
             <span className="shrink-0 text-muted-foreground">until {new Date(g.expiresAt).toLocaleString()}</span>
           </li>
         )} />
         <Section title="Held deliveries" section={snapshot.inboxHeld} empty="No held deliveries" render={(i) => (
           <li key={i.id} className="flex min-w-0 justify-between gap-2" data-held={i.id}>
             <span className="truncate">{label(INBOX_LABEL, i.kind)} → {i.targetWorkspaceId}/{i.targetTabId}</span>
-            <span className={cn('shrink-0', WARN)}>{heldReasonLabel(i.heldReason)}</span>
+            <span className="shrink-0">
+              <span className={WARN}>{heldReasonLabel(i.heldReason)}</span>
+              {actions && humanRetryRefusal(i) === null && (
+                <Button type="button" size="xs" variant="ghost" className="ml-1" disabled={actions.busy.has(i.id)}
+                  onClick={() => actions.onRetry(i)} data-action="retry" aria-label={`Retry ${label(INBOX_LABEL, i.kind)}`}>
+                  <RotateCcw />Retry
+                </Button>
+              )}
+            </span>
           </li>
         )} />
         <Section title="Orchestrator coverage" section={snapshot.orchestrators} empty="Every unfinished workspace has a usable orchestrator" render={(issue) => (
@@ -187,6 +269,22 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
             )}
           </li>
         )} />
+        {snapshot.deploys ? (
+          <Section title="Deploys" section={snapshot.deploys} empty="No deploy announced in the last 24 h" render={(d) => (
+            <li key={d.id} className="min-w-0" data-deploy={d.id} data-phase={d.phase}>
+              <span className="flex min-w-0 justify-between gap-2">
+                <span className="truncate">{d.reason}</span>
+                <span className={cn('shrink-0', d.phase === 'pending' ? WARN : 'text-muted-foreground')}>{deployWhen(d, now)}</span>
+              </span>
+              <span className="block text-muted-foreground">by {deployBy(d.by)} · {deployRecipients(d.recipients)}</span>
+            </li>
+          )} />
+        ) : (
+          <div className="min-w-0 space-y-1.5" data-section="Deploys">
+            <h3 className="text-xs font-semibold">Deploys</h3>
+            <p className="text-xs text-muted-foreground" data-state="unsupported">Not available from this server version</p>
+          </div>
+        )}
         <div className="min-w-0 space-y-1.5" data-section="Host">
           <h3 className="text-xs font-semibold">Host</h3>
           {!host.available ? (
@@ -242,6 +340,23 @@ export class CoordinationErrorBoundary extends Component<{ children: ReactNode; 
 const CoordinationPanel = () => {
   const { snapshot, error, loading, refresh } = useCoordination();
   const [fleetFilter, setFleetFilter] = useState<IFleetFilter>({ showAll: false, workspace: null });
+  const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [breaking, setBreaking] = useState<ILeaseView | null>(null);
+  const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
+  const retry = async (item: IInboxItem) => {
+    setBusy((b) => new Set(b).add(item.id));
+    const outcome = await postHumanAction<{ item: IInboxItem }>(`/api/mission-control/inbox/${encodeURIComponent(item.id)}/retry`);
+    setBusy((b) => { const next = new Set(b); next.delete(item.id); return next; });
+    toastOutcome(outcome, () => 'Notice re-queued; the inbox types it when the tab is ready');
+    void refresh();
+  };
+  const actions: ICoordinationActions = {
+    onRetry: (item) => { void retry(item); },
+    onBreak: setBreaking,
+    onSendNote: () => setNoteOpen(true),
+    busy,
+  };
   return (
     <>
       <section className="space-y-3" aria-labelledby="fleet-status-heading">
@@ -261,8 +376,10 @@ const CoordinationPanel = () => {
         <h2 id="coordination-heading" className="text-sm font-semibold">Coordination</h2>
         {/* Keyed on the snapshot: a new poll clears a render error without a Retry click. */}
         <CoordinationErrorBoundary key={snapshot?.at ?? 'none'}>
-          <CoordinationPanelView snapshot={snapshot} error={error} loading={loading} />
+          <CoordinationPanelView snapshot={snapshot} error={error} loading={loading} actions={actions} />
         </CoordinationErrorBoundary>
+        <OwnerNoteDialog open={noteOpen} onOpenChange={setNoteOpen} workspaces={workspaces} onDone={() => { void refresh(); }} />
+        <LeaseBreakDialog lease={breaking} onClose={() => setBreaking(null)} onDone={() => { void refresh(); }} />
       </section>
     </>
   );

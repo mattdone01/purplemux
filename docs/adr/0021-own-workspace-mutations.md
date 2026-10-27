@@ -1,5 +1,7 @@
 # ADR-0021: Own-workspace agent mutations
 
+Amended by [ADR-0024](0024-cli-workspace-create.md): the global token may create a workspace.
+
 Agent tab and workspace mutations require a token scoped to the target workspace.
 Peer entries, legacy drive grants, and the global CLI token cannot authorize them.
 Read access retains its existing scope. Legacy `drive` grant records remain compatible,

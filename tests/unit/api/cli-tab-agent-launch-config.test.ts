@@ -53,7 +53,8 @@ vi.mock('@/lib/status-manager', () => ({
 vi.mock('@/lib/agent-dispatch-policy', () => dispatch);
 vi.mock('@/lib/providers/codex/managed-launch', () => managed);
 const reportsTo = vi.hoisted(() => ({ checkReportsTo: vi.fn() }));
-vi.mock('@/lib/reports-to', () => reportsTo);
+// The pure reportOn helpers (ADR-0025) run for real; only the tmux-backed target check is stubbed.
+vi.mock('@/lib/reports-to', async (importOriginal) => ({ ...(await importOriginal<typeof import('@/lib/reports-to')>()), ...reportsTo }));
 
 interface IFakeResponse {
   statusCode: number;
@@ -125,6 +126,7 @@ describe('POST /api/cli/tabs launch config', () => {
       {
         scope: undefined,
         agentLaunchConfig: { model: 'gpt-5.6-sol', effort: 'high' },
+        admit: expect.any(Function),
       },
     );
     expect(managed.prepareCodexManagedLaunch).toHaveBeenCalledWith('ws-pins', 'tab-new');
@@ -148,6 +150,7 @@ describe('POST /api/cli/tabs launch config', () => {
     expect(layout.addTabToPane.mock.calls[0][6]).toEqual({
       scope: undefined,
       agentLaunchConfig: undefined,
+      admit: expect.any(Function),
     });
   });
 

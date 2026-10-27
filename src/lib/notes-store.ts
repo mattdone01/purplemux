@@ -3,7 +3,9 @@ import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
 import { brandCodedError } from '@/lib/coded-error';
+import { NOTE_BODY_MAX_BYTES, NOTE_SUBJECT_MAX } from '@/lib/human-actions';
 import { EPIC_SLUG } from '@/lib/lease-policy';
+import { noteFromWords } from '@/lib/inbox-templates';
 import type { IInboxItem } from '@/types/inbox';
 import type { INote, INoteAdmission, INoteParty, INoteTarget, INotesState, INoteView, TNoteErrorCode, TNoteViewState } from '@/types/note';
 
@@ -18,8 +20,7 @@ export class NoteError extends Error {
   }
 }
 
-export const NOTE_SUBJECT_MAX = 120;
-export const NOTE_BODY_MAX_BYTES = 16 * 1024;
+export { NOTE_BODY_MAX_BYTES, NOTE_SUBJECT_MAX };
 export const NOTE_COMMENT_MAX = 500;
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;
@@ -206,7 +207,13 @@ export const presentedState = (note: INote, notice: Pick<IInboxItem, 'state'> | 
 /** `notice` is the note's own inbox item (`inboxItemId`), or null when it is gone or unread. */
 export const viewOf = (note: INote, notice: Pick<IInboxItem, 'state'> | null): INoteView => {
   const { body, ...rest } = note;
-  return { ...rest, state: presentedState(note, notice), bodyBytes: Buffer.byteLength(body, 'utf8') };
+  const fromLabel = noteFromWords({
+    workspaceId: note.from.workspaceId,
+    tabId: note.from.tabId,
+    human: note.admission?.mode === 'human',
+    owner: note.admission?.mode === 'owner',
+  });
+  return { ...rest, state: presentedState(note, notice), bodyBytes: Buffer.byteLength(body, 'utf8'), fromLabel };
 };
 
 // ─── the file store ───────────────────────────────────────────────────────

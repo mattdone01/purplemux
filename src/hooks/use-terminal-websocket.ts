@@ -11,6 +11,7 @@ import {
   encodeResize,
   encodeHeartbeat,
   decodeMessage,
+  TAB_RESTARTING_CODE,
 } from '@/lib/terminal-protocol';
 import { shouldPromptMobileReloadRecovery } from '@/lib/ws-reload-recovery';
 
@@ -18,6 +19,32 @@ const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000];
 const MAX_RETRIES = 5;
 const HEARTBEAT_INTERVAL = 30_000;
 const CLIENT_ID_PREFIX = 'pt-ws-cid-';
+export const RESTART_RETRY_DELAY_MS = 1_000;
+/** About as long as the server counts a restart as open (ADR-0028 §12). */
+export const MAX_RESTART_RETRIES = 120;
+
+export type TTerminalCloseAction =
+  | { kind: 'session-ended' }
+  | { kind: 'disconnected'; reason: Exclude<TDisconnectReason, null> }
+  /** `restart`: a 4002 retry, counted apart so it spends none of the backoff budget. */
+  | { kind: 'retry'; delay: number; restart: boolean }
+  | { kind: 'exhausted' };
+
+/**
+ * What a terminal socket close means. 1000 is the only code that ends the
+ * session (the caller closes the tab); 4002 is a restarting tab, re-attached
+ * every second without spending the backoff budget (ADR-0028 §12).
+ */
+export const terminalCloseAction = (code: number, retries: number, restartRetries: number): TTerminalCloseAction => {
+  if (code === 1000) return { kind: 'session-ended' };
+  if (code === 1011) return { kind: 'disconnected', reason: 'session-not-found' };
+  if (code === 1013) return { kind: 'disconnected', reason: 'max-connections' };
+  if (code === TAB_RESTARTING_CODE && restartRetries < MAX_RESTART_RETRIES) {
+    return { kind: 'retry', delay: RESTART_RETRY_DELAY_MS, restart: true };
+  }
+  if (retries < MAX_RETRIES) return { kind: 'retry', delay: RECONNECT_DELAYS[retries] ?? 16000, restart: false };
+  return { kind: 'exhausted' };
+};
 
 const getOrCreateClientId = (sessionName: string): string => {
   const key = `${CLIENT_ID_PREFIX}${sessionName}`;
@@ -52,6 +79,7 @@ const useTerminalWebSocket = ({
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
+  const restartRetryCountRef = useRef(0);
   const sessionNameRef = useRef('');
   const connectIdRef = useRef(0);
   const initialSizeRef = useRef<{ cols: number; rows: number } | null>(null);
@@ -82,7 +110,7 @@ const useTerminalWebSocket = ({
       }
 
       setDisconnectReason(null);
-      setStatus(retryCountRef.current > 0 ? 'reconnecting' : 'connecting');
+      setStatus(retryCountRef.current > 0 || restartRetryCountRef.current > 0 ? 'reconnecting' : 'connecting');
 
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const clientId = getOrCreateClientId(sessionName);
@@ -98,6 +126,7 @@ const useTerminalWebSocket = ({
         if (connectIdRef.current !== connectId) return;
         setStatus('connected');
         retryCountRef.current = 0;
+        restartRetryCountRef.current = 0;
         setRetryCount(0);
         callbacksRef.current.onConnected?.();
 
@@ -129,32 +158,30 @@ const useTerminalWebSocket = ({
         clearTimers();
         wsRef.current = null;
 
-        if (event.code === 1000) {
+        const action = terminalCloseAction(event.code, retryCountRef.current, restartRetryCountRef.current);
+        if (action.kind === 'session-ended') {
           setStatus('session-ended');
           callbacksRef.current.onSessionEnded?.();
           return;
         }
 
-        if (event.code === 1011) {
-          setDisconnectReason('session-not-found');
+        if (action.kind === 'disconnected') {
+          setDisconnectReason(action.reason);
           setStatus('disconnected');
           return;
         }
 
-        if (event.code === 1013) {
-          setDisconnectReason('max-connections');
-          setStatus('disconnected');
-          return;
-        }
-
-        if (retryCountRef.current < MAX_RETRIES) {
-          const delay = RECONNECT_DELAYS[retryCountRef.current] ?? 16000;
-          retryCountRef.current++;
-          setRetryCount(retryCountRef.current);
+        if (action.kind === 'retry') {
+          if (action.restart) {
+            restartRetryCountRef.current++;
+          } else {
+            retryCountRef.current++;
+            setRetryCount(retryCountRef.current);
+          }
           setStatus('reconnecting');
           retryTimerRef.current = setTimeout(() => {
             doConnectRef.current(sessionNameRef.current, connectId);
-          }, delay);
+          }, action.delay);
         } else {
           if (shouldPromptMobileReloadRecovery()) {
             setDisconnectReason('reconnect-exhausted');
@@ -179,6 +206,7 @@ const useTerminalWebSocket = ({
       sessionNameRef.current = sessionName;
       initialSizeRef.current = cols && rows ? { cols, rows } : null;
       retryCountRef.current = 0;
+      restartRetryCountRef.current = 0;
       setRetryCount(0);
       connectIdRef.current++;
       doConnect(sessionName, connectIdRef.current);
@@ -200,6 +228,7 @@ const useTerminalWebSocket = ({
   const reconnect = useCallback(() => {
     if (!sessionNameRef.current) return;
     retryCountRef.current = 0;
+    restartRetryCountRef.current = 0;
     setRetryCount(0);
     connectIdRef.current++;
     doConnect(sessionNameRef.current, connectIdRef.current);
@@ -244,6 +273,7 @@ const useTerminalWebSocket = ({
       const ws = wsRef.current;
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       retryCountRef.current = 0;
+      restartRetryCountRef.current = 0;
       setRetryCount(0);
       connectIdRef.current++;
       doConnectRef.current(sessionNameRef.current, connectIdRef.current);

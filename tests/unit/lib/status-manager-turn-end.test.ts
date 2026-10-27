@@ -5,6 +5,7 @@ import path from 'path';
 import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '@/lib/automated-prompt-dispatcher';
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab, TPanelType } from '@/types/terminal';
+import type { TTurnMarkerName } from '@/lib/turn-end';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 const workspaceStore = vi.hoisted(() => ({
@@ -162,6 +163,57 @@ describe('stop classification (ADR-0018)', () => {
     expect(entry.cliState).toBe('ready-for-review');
     expect(entry.turnEnd).toMatchObject({ kind: 'turn-marker', marker: [BLOCKED] });
     expect(manager.getOrchestrationNudges('ws-1')).toEqual([expect.objectContaining({ kind: 'turn-marker', tabId: 'worker' })]);
+  });
+
+  // ADR-0025: a tab's reportOn narrows which end lines leave it. The stop is still
+  // classified and recorded; only the push is withheld, and no idle nudge follows.
+  describe('reportOn (ADR-0025)', () => {
+    const CHECKPOINT = 'CHECKPOINTED: inc 3 receipted; next is its landing';
+
+    it('withholds a CHECKPOINTED line from a tab set to DONE,BLOCKED and counts it, recording the stop as usual', async () => {
+      const { manager, paste } = await managerWithPaste();
+      const entry = { ...worker('claude-code', await writeLines('claude/cp.jsonl', [claudeEnd(`Gate green.\n\n${CHECKPOINT}`)])), reportOn: ['DONE', 'BLOCKED'] as TTurnMarkerName[] };
+      manager.registerTab('worker', entry );
+
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
+      await settle();
+
+      expect(paste).not.toHaveBeenCalled();
+      expect(entry.turnEnd).toMatchObject({ kind: 'turn-marker', marker: [CHECKPOINT] });
+      expect(manager.getOrchestrationNudges('ws-1')).toEqual([]);
+      expect(manager.getReportOnFilteredCount()).toBe(1);
+    });
+
+    it('still forwards a marker inside the list, verbatim', async () => {
+      const { manager, paste } = await managerWithPaste();
+      const entry = { ...worker('claude-code', await writeLines('claude/bl.jsonl', [claudeEnd(`Gate r2 failed on lint.\n\n${BLOCKED}`)])), reportOn: ['DONE', 'BLOCKED'] as TTurnMarkerName[] };
+      manager.registerTab('worker', entry );
+
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+
+      expect(paste).toHaveBeenCalledWith(
+        'tmux-root',
+        `[orchestrator-watchdog] worker worker (w1) ended: ${BLOCKED} — read with: purplemux tab result -w ws-1 worker`,
+      );
+      expect(manager.getReportOnFilteredCount()).toBe(0);
+    });
+
+    it('sends no idle nudge after a withheld marker: the stop had an end line', async () => {
+      const { manager, paste } = await managerWithPaste();
+      const entry = { ...worker('claude-code', await writeLines('claude/cp2.jsonl', [claudeEnd(`Gate green.\n\n${CHECKPOINT}`)])), reportOn: ['DONE'] as TTurnMarkerName[] };
+      manager.registerTab('worker', entry );
+
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
+      await settle();
+      const at = entry.turnEnd!.at;
+      await (manager as unknown as { runWatchdogTimers: (n: number) => Promise<void> }).runWatchdogTimers(at + 16 * MIN);
+
+      expect(paste).not.toHaveBeenCalled();
+      expect(manager.getOrchestrationNudges('ws-1')).toEqual([]);
+    });
   });
 
   it('holds the recorded "Waiting for 1 background agent" stop whose shell started 20 turns earlier', async () => {

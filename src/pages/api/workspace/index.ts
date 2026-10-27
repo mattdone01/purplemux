@@ -5,7 +5,8 @@ import os from 'os';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getWorkspaces, createWorkspace } from '@/lib/workspace-store';
 import { isDirectoryError } from '@/lib/path-safety';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabAgentSessionId } from '@/lib/layout-store';
+import { updateTabAgentSessionId } from '@/lib/layout-store';
+import { readDefaultTab, registerDefaultTab } from '@/lib/workspace-default-tab';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { sendKeys } from '@/lib/tmux';
@@ -45,28 +46,14 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       const layoutOptions = provider ? { panelType: provider.panelType } : undefined;
       const workspace = await createWorkspace(resolvedDirectory, name, layoutOptions, { mkdir: mkdir === true });
 
-      const layout = await readLayoutFile(resolveLayoutFile(workspace.id));
-      const defaultTab = layout ? collectAllTabs(layout.root)[0] : null;
+      const defaultTab = await readDefaultTab(workspace.id);
 
       if (resumeSessionId && provider && defaultTab) {
         provider.writeSessionId(defaultTab, resumeSessionId);
         await updateTabAgentSessionId(defaultTab.sessionName, provider, resumeSessionId);
       }
 
-      if (defaultTab && defaultTab.panelType !== 'web-browser') {
-        const tabProvider = getProviderByPanelType(defaultTab.panelType);
-        getStatusManager().registerTab(defaultTab.id, {
-          cliState: 'inactive',
-          workspaceId: workspace.id,
-          tabName: defaultTab.name,
-          tmuxSession: defaultTab.sessionName,
-          panelType: defaultTab.panelType,
-          agentProviderId: tabProvider?.id,
-          agentSessionId: tabProvider?.readSessionId(defaultTab) ?? null,
-          lastEvent: null,
-          eventSeq: 0,
-        });
-      }
+      registerDefaultTab(workspace, defaultTab);
 
       if (resumeSessionId && provider && defaultTab) {
         setTimeout(async () => {

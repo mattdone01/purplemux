@@ -38,6 +38,11 @@ export interface ILeaseView extends Omit<ILease, 'holder'> {
   holderState: THolderState;
 }
 
+/** A human session that breaks a lease from Mission Control (ADR-0029 §8): its session subject. */
+export interface ILeaseHumanBreaker {
+  human: string;
+}
+
 export type TLeaseReleaseReason =
   | 'released'
   | 'broken'

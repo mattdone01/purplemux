@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
-import { closeTab, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
+import { closeTab, setTabReportOn, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
 import { getProviderByPanelType } from '@/lib/providers';
 import { isValidModelName } from '@/lib/claude-command-shared';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
@@ -8,7 +8,7 @@ import type { IAgentLaunchConfig } from '@/types/terminal';
 import { withCodexTargetLock } from '@/lib/providers/codex/launch-lifecycle';
 import { TAB_NOT_FOUND_BODY, remoteHostUnreachableBody } from '@/lib/cli-error';
 import { RemoteHostError } from '@/lib/remote-host';
-import { checkReportsTo } from '@/lib/reports-to';
+import { checkReportOn, checkReportsTo, isReportOnInvalid } from '@/lib/reports-to';
 
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
@@ -38,6 +38,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentSessionId: provider?.readSessionId(found.tab) ?? null,
       agentLaunchConfig: found.tab.agentLaunchConfig,
       reportsTo: found.tab.reportsTo ?? null,
+      reportOn: found.tab.reportOn ?? null,
     });
   }
 
@@ -58,22 +59,34 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(200).json({ ok, ...(reap ? { reaper: reap.reaper, envMarker: reap.envMarker, killed: reap.killed, survivors: reap.survivors } : {}) });
   }
 
-  if (req.method === 'PATCH' && req.body && typeof req.body === 'object' && 'reportsTo' in req.body) {
+  // The nudge route of a tab: its target (reportsTo) and the markers it forwards (reportOn,
+  // ADR-0025), together or on their own, and nothing else in the same patch.
+  if (req.method === 'PATCH' && req.body && typeof req.body === 'object' && ('reportsTo' in req.body || 'reportOn' in req.body)) {
     const body = req.body as Record<string, unknown>;
-    if (Object.keys(body).some((key) => key !== 'reportsTo')) {
-      return res.status(400).json({ error: 'reportsTo is patched on its own' });
+    if (Object.keys(body).some((key) => key !== 'reportsTo' && key !== 'reportOn')) {
+      return res.status(400).json({ error: 'reportsTo and reportOn are patched on their own' });
     }
     const found = await findTab(workspaceId, tabId);
     if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
-    const reportsTo = body.reportsTo === null ? null : body.reportsTo;
-    if (reportsTo !== null) {
+    const reportsTo = 'reportsTo' in body ? (body.reportsTo === null ? null : body.reportsTo) : undefined;
+    if (reportsTo !== undefined && reportsTo !== null) {
       const refused = await checkReportsTo(workspaceId, reportsTo, tabId);
       if (refused) return res.status(400).json(refused);
     }
-    if (!(await setTabReportsTo(workspaceId, tabId, reportsTo as string | null))) {
+    const reportOn = 'reportOn' in body ? checkReportOn(body.reportOn) : undefined;
+    if (reportOn !== undefined && isReportOnInvalid(reportOn)) return res.status(400).json(reportOn);
+    if (reportsTo !== undefined && !(await setTabReportsTo(workspaceId, tabId, reportsTo as string | null))) {
       return res.status(404).json(TAB_NOT_FOUND_BODY);
     }
-    return res.status(200).json({ tabId, workspaceId, reportsTo });
+    if (reportOn !== undefined && !(await setTabReportOn(workspaceId, tabId, reportOn.markers))) {
+      return res.status(404).json(TAB_NOT_FOUND_BODY);
+    }
+    return res.status(200).json({
+      tabId,
+      workspaceId,
+      reportsTo: reportsTo !== undefined ? reportsTo : found.tab.reportsTo ?? null,
+      reportOn: reportOn !== undefined ? reportOn.markers : found.tab.reportOn ?? null,
+    });
   }
 
   if (req.method === 'PATCH') {

@@ -183,4 +183,35 @@ describe('fleet status panel', () => {
     boundary.state = { error: 'Invalid time value' };
     expect(renderToStaticMarkup(<>{boundary.render()}</>)).toContain('Fleet status failed to render: Invalid time value');
   });
+
+  describe('WIP per workspace (ADR-0027)', () => {
+    const rows = [row(), row({ workspaceId: 'ws-2', workspaceName: 'Billing', tabId: 'tab-z' })];
+
+    it('shows count/cap per workspace and marks an over-cap workspace', () => {
+      const html = render(ok(view({ rows, wip: { 'ws-1': { count: 9, cap: 8, overCap: true }, 'ws-2': { count: 3, cap: 8, overCap: false } } })));
+      expect(html).toContain('data-wip=""');
+      expect(html).toMatch(/data-wip-workspace="ws-1"[^>]*data-over-cap="true"[^>]*>Portfolio 9\/8 over cap</);
+      expect(html).toMatch(/data-wip-workspace="ws-2"[^>]*data-over-cap="false"[^>]*>Billing 3\/8</);
+      expect(html).not.toMatch(/Billing 3\/8 over cap/);
+    });
+
+    it('follows the workspace filter', () => {
+      const html = render(ok(view({ rows, wip: { 'ws-1': { count: 9, cap: 8, overCap: true }, 'ws-2': { count: 3, cap: 8, overCap: false } } })),
+        { filter: { showAll: false, workspace: 'ws-2' } });
+      expect(html).toContain('data-wip-workspace="ws-2"');
+      expect(html).not.toContain('data-wip-workspace="ws-1"');
+    });
+
+    it('absent wip (an older server, or an unread cap) renders no WIP line, never 0', () => {
+      const html = render(ok(view({ rows })));
+      expect(html).not.toContain('data-wip');
+      expect(html).not.toContain('WIP cap');
+    });
+
+    it('a workspace with no agent tab row is left out rather than shown by its id', () => {
+      const html = render(ok(view({ rows: [row()], wip: { 'ws-1': { count: 1, cap: 8, overCap: false }, 'ws-empty': { count: 0, cap: 8, overCap: false } } })));
+      expect(html).toContain('Portfolio 1/8');
+      expect(html).not.toContain('ws-empty');
+    });
+  });
 });

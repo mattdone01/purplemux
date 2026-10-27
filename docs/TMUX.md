@@ -258,12 +258,53 @@ A tab with `host` set runs its tmux session on that host. The server stays the o
 | Close | local reaper (ADR-0016) | `REMOTE_REAP_SCRIPT` over `ssh … sh -s`, `reaper: 'remote'`; an ssh failure throws `RemoteHostError` |
 | Close of a pane or workspace | tabs in order | every remote host asked first; remote tabs closed first, outside the layout and store locks; a silent host refuses the whole close |
 | Session presence | `hasSession` | `sessionPresence`: only tmux's own answer is `absent`; ssh failing is `unknown` (503 on send, status, result, restart) |
-| Attach ends | close 1000 | 1000 only when tmux says the session is gone, else 4001 (the client retries) |
+| Attach ends | 1000 only when tmux says the session is gone and no restart is open; 4002 while the tab restarts; else 4001 | 1000 only when tmux says the session is gone and no restart is open; 4002 while the tab restarts; else 4001 (the client retries) |
 | Agent hooks (claude-code) | `~/.purplemux/status-hook.sh` to localhost | the kit's `status-hook.sh` on the host posts to `PMUX_URL` with the tab token; spools beside itself |
 | Transcript | read where Claude writes it | copied to `~/.purplemux/remote-transcripts/` by bounded ssh reads before each hook and stop read |
 | Agent process proof | local `/proc` walk | `REMOTE_PROVIDER_SCRIPT` on the host (`observeRemoteProviderProcess`) |
 
 ssh runs with `BatchMode=yes`, `ConnectTimeout=5` and no ControlMaster (one connection per call, about 90 ms from Node). The registry is fleet config `remote.hosts` (comma-separated ssh aliases).
+
+---
+
+## Tab Restart (ADR-0028)
+
+`purplemux tab restart` (`POST /api/cli/tabs/{tabId}/restart`, cookie twin `POST /api/tabs/{tabId}/restart`) gives a tab a fresh agent process under the same tab id and the same session name. One service, `restartTab` in `src/lib/tab-restart.ts`, runs it:
+
+1. `withAgentDispatchLock` takes the workspace mapping read guard and the tab's dispatch lock once; no dispatch types into the session while it restarts, and nothing inside takes the read guard again (the lease is not re-entrant).
+2. A busy tab (`cliState` busy, or a pending `orchestrationActivity` launch or turn) is refused with `tab-busy` unless `--interrupt`.
+3. A remote tab's host is probed first (`hasSessionOrUnreachable`); a silent host kills nothing.
+4. `emitTabRestart({restartId, phase: 'restarting'})` (`src/lib/tab-lifecycle.ts`) opens the restart: the StatusManager retires the watchdog checks and takes the tab's registered background jobs. No `tab-closing` or `tab-closed` fires.
+5. While the restart is open, the terminal server closes an attach that ends with 4002 `Tab restarting` (never 1000, which makes the web client close the tab) and refuses a connect with 4002 before any probe or attach. The web client re-attaches every second, up to 120 tries.
+6. `killSession(name, {tabId})` reaps the ADR-0016 process set. A survivor, a session still present, or a failure after the kill stops the restart (`restart-not-confirmed`).
+7. `restartTabSessionUnguarded` recreates the session with no command; `createSession` keeps a launch token and replaces a hook token (`ensureTabToken`). A lost cwd starts the agent fresh (`resumeSkipped: 'cwd-lost'`).
+8. `launchAgentInTab` (`src/lib/agent-launch.ts`, shared with tab create and auto-resume) builds and types the launch from the tab's persisted settings: resume where the provider has a session id and the tab is local, else fresh; Codex through its managed launch, confirmed after the lock is released.
+9. The tab gains `lastRestartAt`; one `tab-restart` audit line; then, from a `finally`, exactly one `restarted` or `failed` with the same `restartId` closes the restart and restores the checks (a `failed` gives the jobs back).
+
+The existing route `POST /api/layout/pane/{p}/tabs/{t}` still recreates only a dead session. It takes the tab's target lock inside its read guard, so it waits for a restart instead of recreating the session between the reap and its confirmation.
+
+---
+
+## Counting tabs from a repo hook
+
+A repository hook that limits parallel agents must count the tabs of its workspace. Obey three rules:
+
+1. **purplemux runs tmux on its own socket, `-L purple`** (`TMUX_SOCKET` in `src/lib/tmux.ts`). A hook that runs `tmux ls` without `-L purple` reads the user's own tmux server. That server does not hold the purplemux tabs, so the count is wrong. A count of `tmux -L purple ls` is also wrong: it holds the sessions of every workspace and of every tab type.
+2. **Use `purplemux tab count -w WS`** (ADR-0027). It prints `<count> <cap>`: the agent tabs (`claude-code`, `codex-cli`, `grok-cli`) of workspace `WS`, and the WIP cap. `--json` adds `capSource` and `overCap`. Inside a tab, `WS` is `$PMUX_WORKSPACE_ID`. The server counts under the layout lock, the same count that refuses a create at the cap. The exit codes are in the api-guide (`GET /api/cli/workspaces/<WS>/tab-count`).
+3. **A remote tab does not run on this host** (ADR-0022). Its session is on `ssh <host> tmux -L pmux-<origin>`. `<origin>` is the host name of the purplemux server, made safe by `originName` in `src/lib/remote-host.ts`: lower case, each run of characters outside `[a-z0-9-]` replaced by one `-`, leading and trailing `-` removed, at most 40 characters, and `origin` when nothing is left. No local tmux command sees the session. `tab count` counts it.
+
+```bash
+out=$(purplemux tab count -w "$PMUX_WORKSPACE_ID")
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "tab count failed (exit $status); not limiting" >&2
+  exit 0
+fi
+read -r count cap <<< "$out"
+[ "$count" -lt "$cap" ] || { echo "WIP cap: $count of $cap agent tabs" >&2; exit 2; }
+```
+
+If the CLI fails, the hook decides its own policy from the exit code (ADR-0016). The example reports the exit code and lets the action continue, because a hook that blocks on a server outage stops every tab.
 
 ---
 
@@ -273,6 +314,8 @@ ssh runs with `BatchMode=yes`, `ConnectTimeout=5` and no ControlMaster (one conn
 | --- | --- |
 | `src/config/tmux.conf` | tmux config (purple socket only) |
 | `src/lib/tmux.ts` | tmux command wrapper |
+| `src/lib/tab-restart.ts` | `tab restart`: reap, recreate and relaunch under the same tab id (ADR-0028) |
+| `src/lib/agent-launch.ts` | the one agent launcher for tab create, auto-resume and tab restart |
 | `src/lib/terminal-server.ts` | Terminal WebSocket handler (node-pty) |
 | `src/lib/terminal-protocol.ts` | Terminal binary protocol constants and encoders |
 | `src/lib/session-detection.ts` | Claude session detection (`detectActiveSession`, `watchSessionsDir`) |

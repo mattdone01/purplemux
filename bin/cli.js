@@ -127,15 +127,21 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'gh-unavailable': EXIT.UNEXPECTED,
   'outcome-unknown': EXIT.UNEXPECTED,
   'close-not-confirmed': EXIT.UNEXPECTED,
+  'restart-unsupported': EXIT.USAGE,
+  'tab-busy': EXIT.CONFLICT,
+  'restart-not-confirmed': EXIT.UNEXPECTED,
   'lease-policy': EXIT.USAGE,
   'watch-invalid': EXIT.USAGE,
   'reports-to-invalid': EXIT.USAGE,
+  'report-on-invalid': EXIT.USAGE,
   'remote-host-invalid': EXIT.USAGE,
   'remote-type-unsupported': EXIT.USAGE,
   'cwd-missing': EXIT.USAGE,
   'note-too-large': EXIT.USAGE,
   'deploy-invalid': EXIT.USAGE,
   'config-invalid': EXIT.USAGE,
+  'invalid-burndown': EXIT.USAGE,
+  'burndown-too-large': EXIT.USAGE,
   'orchestration-precondition-required': EXIT.USAGE,
   'orchestration-invalid': EXIT.USAGE,
   'orchestration-conflict': EXIT.CONFLICT,
@@ -157,6 +163,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'caller-unresolved': EXIT.CONFLICT,
   'grant-password-invalid': EXIT.CONFLICT,
   'grant-locked': EXIT.CONFLICT,
+  'grant-owner-active': EXIT.CONFLICT,
   'tab-not-found': EXIT.GONE,
   'session-not-running': EXIT.GONE,
   'target-changed': EXIT.GONE,
@@ -170,6 +177,12 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'inbox-not-found': EXIT.NOT_FOUND,
   'deploy-not-found': EXIT.NOT_FOUND,
   'config-not-found': EXIT.NOT_FOUND,
+  'wip-cap': EXIT.CONFLICT,
+  'config-store-unreadable': EXIT.CONFLICT,
+  'flow-invalid': EXIT.USAGE,
+  'flow-too-large': EXIT.USAGE,
+  'flow-unreadable': EXIT.UNEXPECTED,
+  'flow-not-found': EXIT.NOT_FOUND,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -179,6 +192,9 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
   'routes-absent': 'no such route on this server (an older server, a foreign server, or a malformed id) — retrying cannot help',
   'remote-host-unreachable': 'the remote host did not answer over ssh — retry, bounded, once it answers',
+  'wip-cap': "refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason",
+  'tab-busy': 'the tab is mid-turn — retry when it is idle, or restart with --interrupt to abandon the turn',
+  'restart-not-confirmed': 'a process or the session outlived the reap; nothing was relaunched — inspect the tab before a retry',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -371,6 +387,48 @@ const cmdWorkspaceDirs = async (args) => {
   die('usage: workspace dirs show|set -w WS [DIR...]');
 };
 
+const WORKSPACE_CREATE_USAGE = 'usage: workspace create -n NAME -d DIR [-d DIR ...] [--json]';
+
+/**
+ * Parse `workspace create` arguments. Returns { name, directories, json } or a
+ * usage error string. DIRs are resolved against the caller's cwd, as
+ * `workspace dirs set` does; the first is the primary.
+ */
+const parseWorkspaceCreateArgs = (args, cwd = process.cwd()) => {
+  let name = null;
+  const directories = [];
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--json') {
+      json = true;
+    } else if (arg === '-n' || arg === '--name') {
+      if (i + 1 >= args.length) return `${arg} needs a value`;
+      if (name !== null) return `${arg} given more than once`;
+      name = args[++i];
+    } else if (arg === '-d' || arg === '--dir') {
+      if (i + 1 >= args.length) return `${arg} needs a value`;
+      const dir = args[++i];
+      if (!dir.trim()) return `${arg} needs a non-empty path`;
+      directories.push(path.resolve(cwd, dir));
+    } else {
+      return `unexpected argument: ${arg}. ${WORKSPACE_CREATE_USAGE}`;
+    }
+  }
+  if (name === null || !name.trim()) return `-n NAME is required. ${WORKSPACE_CREATE_USAGE}`;
+  if (!directories.length) return `at least one -d DIR is required. ${WORKSPACE_CREATE_USAGE}`;
+  return { name: name.trim(), directories, json };
+};
+
+const cmdWorkspaceCreate = async (args) => {
+  const parsed = parseWorkspaceCreateArgs(args);
+  if (typeof parsed === 'string') die(parsed);
+  requireEnv();
+  const { body } = await api('POST', '/api/cli/workspaces', { name: parsed.name, directories: parsed.directories });
+  if (parsed.json) return out(body);
+  process.stdout.write(`${body.id}\n`);
+};
+
 const cmdWorkspacePeers = async (args) => {
   requireEnv();
   const sub = args[0];
@@ -485,6 +543,156 @@ const cmdBurndown = async (args) => {
     return out(body);
   }
   die('usage: burndown publish -w WS --json @burndown.json | burndown show -w WS');
+};
+
+// Mirrors MAX_FLOW_BYTES (src/lib/flow.ts): above it the route answers 413, and well above it
+// the body limit answers without a code, so the CLI refuses before sending.
+const FLOW_MAX_BYTES = 1024 * 1024;
+const FLOW_HISTORY_MODES = ['all', 'window', 'none'];
+const FLOW_USAGE = 'usage: flow publish -w WS --json @FILE | flow show -w WS [--json] [--history all|window|none]';
+
+const durationText = (ms) => {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
+};
+
+// Mirrors flowDurationText and lockBusyPhrase (src/lib/flow-flags.ts): the derived flag text, the
+// panel and this line say the same sentence; tests/unit/bin/cli-flow.test.ts pins the parity.
+const flowMinutesText = (ms) => {
+  const minutes = Math.max(0, Math.floor(ms / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`;
+};
+
+// Mirrors SHARE_EPSILON (src/lib/flow-flags.ts): the shown percent floors, so it never shows a threshold the flag missed.
+const FLOW_SHARE_EPSILON = 1e-9;
+
+const flowLockBusyPhrase = (share, knownMinutes, windowMinutes) => {
+  const window = flowMinutesText(windowMinutes * 60_000);
+  const known = flowMinutesText(knownMinutes * 60_000);
+  if (share === null) return `busy share unknown: ${known} known in the last ${window}`;
+  const shown = `${Math.floor(share * 100 + FLOW_SHARE_EPSILON)}%`;
+  return Math.round(knownMinutes * 60_000) >= Math.round(windowMinutes * 60_000)
+    ? `held ${shown} of the last ${window}`
+    : `held ${shown} of ${known} known in the last ${window}`;
+};
+
+const flowSection = (title, entries, line) => (entries.length ? [title, ...entries.map((entry) => `  ${line(entry)}`)] : [`${title}  none`]);
+
+const flowText = (wsId, body, now) => {
+  const { snapshot, receivedAt } = body.flow;
+  const iso = (ms) => new Date(ms).toISOString();
+  const lines = [`flow ${wsId}  source ${snapshot.source}  generated ${iso(snapshot.generatedAt)}  received ${iso(receivedAt)} (${durationText(now - receivedAt)} ago)`];
+  if (body.stale) lines.push(`stale — last published ${durationText(now - receivedAt)} ago`);
+  lines.push(...flowSection('queues', snapshot.queues, (queue) => {
+    const length = queue.capacity === null ? `${queue.items.length}` : `${queue.items.length}/${queue.capacity}`;
+    const oldest = queue.items.length ? durationText(now - Math.min(...queue.items.map((item) => item.since))) : '—';
+    return `${queue.name}  ${length}  oldest ${oldest}`;
+  }));
+  const { derived } = body;
+  // A server before story 02 sends no `derived`: the busy share is then left out, never shown as 0.
+  const busy = (name) => {
+    if (!derived || !Object.hasOwn(derived.lockBusyShare, name) || !Object.hasOwn(derived.lockKnownMinutes, name)) return '';
+    return `  (${flowLockBusyPhrase(derived.lockBusyShare[name], derived.lockKnownMinutes[name], derived.windowMinutes)})`;
+  };
+  lines.push(...flowSection('locks', snapshot.locks, (lock) => {
+    if (lock.heldBy === null) return `${lock.name}  free${busy(lock.name)}`;
+    return lock.since === null
+      ? `${lock.name}  held by ${lock.heldBy} (since unknown)${busy(lock.name)}`
+      : `${lock.name}  held by ${lock.heldBy} since ${iso(lock.since)} (${durationText(now - lock.since)})${busy(lock.name)}`;
+  }));
+  lines.push(...flowSection('meters', snapshot.meters, (meter) => [
+    `${meter.name}  ${meter.unit ? `${meter.value} ${meter.unit}` : meter.value}`,
+    ...(meter.limit === null ? [] : [`limit ${meter.limit}`]),
+    ...(meter.windowMinutes === null ? [] : [`window ${meter.windowMinutes}m`]),
+  ].join('  ')));
+  lines.push(...flowSection('flags', snapshot.flags, (flag) => `${flag.severity}  ${flag.text}`));
+  if (derived) lines.push(...flowSection('derived flags', derived.flags, (flag) => `${flag.severity}  ${flag.rule}  ${flag.text}`));
+  return `${lines.join('\n')}\n`;
+};
+
+const cmdFlow = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!['show', 'publish'].includes(sub)) die(FLOW_USAGE);
+  if (!wsId) die('--workspace is required');
+  if (sub === 'show') {
+    const history = flagValue(rest, '--history') || 'all';
+    if (!FLOW_HISTORY_MODES.includes(history)) die(`--history: saw ${history}, expected all, window or none`);
+    requireEnv();
+    const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/flow?history=${history}`);
+    // Like `config get` for an unset key: absence is its own exit, never an empty board.
+    if (!body.flow) return fail('flow-not-found', `no flow published for ${wsId}`);
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(flowText(wsId, body, Date.now()));
+    return;
+  }
+  const snapshot = await readJsonFlag(rest, 'flow');
+  const bytes = Buffer.byteLength(JSON.stringify(snapshot));
+  if (bytes > FLOW_MAX_BYTES) fail('flow-too-large', `saw ${bytes} bytes, expected at most ${FLOW_MAX_BYTES}; nothing was sent`);
+  requireEnv();
+  const { body } = await api('POST', `/api/cli/workspaces/${encodeURIComponent(wsId)}/flow`, snapshot);
+  if (body.historyReset) {
+    process.stderr.write('warning: history reset: the stored record did not validate and was kept aside (flow.json.corrupt-<receivedAt>)\n');
+  }
+  process.stdout.write(`ok ${body.receivedAt} ${body.historyRows}\n`);
+};
+
+const SPEND_USAGE = 'usage: spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]';
+const SPEND_VALUE_FLAGS = ['-w', '--workspace', '--since', '--until', '--by'];
+const SPEND_BOOL_FLAGS = ['--json'];
+
+// A cost the server could not price is null: it prints as "—", never as $0.
+const spendCost = (row) => {
+  const cost = row.costUsd === null ? '—' : `est. $${row.costUsd.toFixed(row.costUsd < 1 ? 4 : 2)}`;
+  return row.unpricedTokens > 0 && row.costUsd !== null ? `${cost} (+${row.unpricedTokens} unpriced)` : cost;
+};
+
+const printSpend = (view) => {
+  const columns = ['KEY', 'LABEL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'SUBAGENTS', 'COST'];
+  const line = (row) => [row.key, row.label, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheCreationTokens,
+    row.totalTokens, row.sidechainTokens, spendCost(row)].map(String);
+  const table = [columns, ...view.rows.map(line), ...(view.unattributed ? [line(view.unattributed)] : []), line(view.totals)];
+  const widths = columns.map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
+  process.stdout.write(`spend ${view.workspaceId} ${view.from}..${view.to} UTC by ${view.by} (cost is an estimate)\n`);
+  for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
+  if (view.roleBasis === 'current-orchestrator') process.stdout.write('note: role uses the current orchestrator mapping, not the one at the time of use\n');
+  process.stdout.write('note: Codex and Grok usage counts on the session start day\n');
+  const index = view.index || {};
+  if (index.state === 'indexing') process.stdout.write(`note: partial — indexing ${index.filesIndexed} of ${index.filesTotal} files\n`);
+  else if (index.state !== 'ready') process.stdout.write(`note: spend index state ${index.state} is not one this CLI knows\n`);
+  if (index.error) process.stdout.write(`note: ${index.error}\n`);
+};
+
+const cmdSpend = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub !== 'show') die(SPEND_USAGE);
+  const positional = stripBooleanFlags(stripFlags(rest, SPEND_VALUE_FLAGS), SPEND_BOOL_FLAGS);
+  if (positional.length) die(`unexpected argument: ${positional[0]} — ${SPEND_USAGE}`);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const qs = new URLSearchParams({ workspaceId: wsId });
+  for (const name of ['since', 'until', 'by']) {
+    const value = flagValue(rest, `--${name}`);
+    if (value !== null) qs.set(name, value);
+  }
+  requireEnv();
+  const { body } = await api('GET', `/api/cli/spend?${qs}`);
+  if (rest.includes('--json')) out(body);
+  // An index that cannot be read has no numbers: its totals are zeros that mean nothing.
+  if (body.index && body.index.state === 'unavailable') {
+    return fail(null, `spend not available: ${body.index.error || 'the spend index cannot be read'}`);
+  }
+  if (!rest.includes('--json')) printSpend(body);
 };
 
 // A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
@@ -938,23 +1146,42 @@ const cmdWatch = async (args) => {
   }
 };
 
-// Portfolio drive grants (ADR-0014): read-only here. A grant is created and revoked only in the
-// web UI (a human session plus the purplemux password); no CLI token can do either.
+// Portfolio drive grants (ADR-0014) and the owner grant (ADR-0029): read-only here. A grant is
+// created and revoked only in the web UI (a human session plus the purplemux password); no CLI token can do either.
 const cmdGrant = async (args) => {
   if (args[0] !== 'list') die('usage: grant list [--json] (grants are created and revoked in the web UI only)');
   requireEnv();
   const { body } = await api('GET', '/api/cli/grants');
-  if (args.includes('--json')) return out(body);
+  // ADR-0029: one unreadable grant file still lists the other file's grants; the refused kind is
+  // unknown, never "no grants", and the command exits 1 so a script sees the damage.
+  const refused = Array.isArray(body.refused) ? body.refused : [];
+  const reportRefused = () => {
+    for (const r of refused) process.stderr.write(`error: grant-store-unreadable (${hintFor('grant-store-unreadable')}) — ${r.error}\n`);
+    if (refused.length) process.exitCode = exitFor('grant-store-unreadable');
+  };
+  if (args.includes('--json')) {
+    out(body);
+    reportRefused();
+    return;
+  }
   const now = Date.now();
   const grants = Array.isArray(body.grants) ? body.grants : [];
-  if (!grants.length) {
+  if (!grants.length && !refused.length) {
     process.stdout.write('no grants\n');
     return;
   }
+  if (refused.length) {
+    const refusedKinds = new Set(refused.map((r) => r.capability));
+    for (const kind of ['drive', 'owner']) {
+      if (!refusedKinds.has(kind) && !grants.some((g) => (g.capability ?? 'drive') === kind)) process.stdout.write(`no ${kind} grants\n`);
+    }
+  }
   for (const g of grants) {
     const state = g.revokedAt !== null ? `ended (${g.revokeReason})` : g.expiresAt <= now ? 'expired' : `active until ${new Date(g.expiresAt).toISOString()}`;
-    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} reads ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
+    const scope = g.capability === 'owner' ? `capability: owner workspaces: ${g.workspaces.join(',')}` : `reads ${g.workspaces.join(',')}`;
+    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} ${scope}  ${state}  "${g.reason}"\n`);
   }
+  reportRefused();
 };
 
 // The inbox (ADR-0012): server notices queued for this workspace's tabs.
@@ -1132,6 +1359,8 @@ const cmdLease = async (args) => {
   }
 };
 
+const OVER_CAP_REASON_MAX = 500;
+
 const cmdTabCreate = async (args) => {
   requireEnv();
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
@@ -1146,14 +1375,23 @@ const cmdTabCreate = async (args) => {
   const scope = scopeRaw ? scopeRaw.split(',').map((s) => s.trim()).filter(Boolean) : null;
   // Nudges go to this live tab of the same workspace first (ADR-0018).
   const reportsTo = flagValue(args, '--reports-to');
+  // The end-line markers whose nudges the target receives (ADR-0025); the server validates the names.
+  const reportOn = flagValue(args, '--report-on');
   // The ssh alias of a registered remote host (ADR-0022); the tab's tmux runs there.
   const host = flagValue(args, '--host');
   // The tab's start directory: it must exist on the host the tab runs on.
   const cwd = flagValue(args, '--cwd');
   if (!wsId) die('--workspace is required');
   if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
+  if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
   if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
   if (args.includes('--cwd') && !cwd) die('--cwd needs an absolute directory on the tab\'s host');
+  // Past the WIP cap (ADR-0027): only the workspace's enabled orchestrator, with a reason that is audited.
+  const overCap = args.includes('--over-cap');
+  const reason = flagValue(args, '--reason');
+  if (overCap && reason === null) die('--over-cap needs --reason TEXT');
+  if (!overCap && args.includes('--reason')) die('--reason goes with --over-cap');
+  if (overCap && (reason.trim().length === 0 || reason.length > OVER_CAP_REASON_MAX)) die(`--reason needs 1..${OVER_CAP_REASON_MAX} characters`);
   const { body } = await api('POST', '/api/cli/tabs', {
     workspaceId: wsId,
     ...(name ? { name } : {}),
@@ -1163,23 +1401,42 @@ const cmdTabCreate = async (args) => {
     ...(noLaunch ? { launch: false } : {}),
     ...(scope && scope.length ? { scope } : {}),
     ...(reportsTo ? { reportsTo } : {}),
+    ...(reportOn ? { reportOn } : {}),
     ...(host ? { host } : {}),
     ...(cwd ? { cwd } : {}),
+    ...(overCap ? { overCap: { reason } } : {}),
   });
   out(body);
+};
+
+const cmdTabCount = async (args) => {
+  requireEnv();
+  const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
+  if (!wsId) die('--workspace is required');
+  const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/tab-count`);
+  if (args.includes('--json')) return out(body);
+  process.stdout.write(`${body.count} ${body.cap}\n`);
 };
 
 const cmdTabReportsTo = async (args) => {
   requireEnv();
   const clear = args.includes('--clear');
-  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--clear']);
+  // --on MARKERS narrows which end lines reach the target (ADR-0025); `--on all` lifts the filter.
+  const on = flagValue(args, '--on');
+  if (args.includes('--on') && !on) die('--on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w', '--on']), ['--clear']);
   const [tabId, target] = rest;
-  if (!tabId || (clear ? target : !target)) die('usage: tab reports-to -w WS TAB_ID (TARGET_TAB_ID | --clear)');
+  const usage = 'usage: tab reports-to -w WS TAB_ID (TARGET_TAB_ID | --clear) [--on MARKERS|all]  |  tab reports-to -w WS TAB_ID --on MARKERS|all';
+  if (!tabId || (clear && target) || (!clear && !target && !on)) die(usage);
   const wsId = resolveWsForTab(args);
+  const patch = {
+    ...(clear ? { reportsTo: null } : target ? { reportsTo: target } : {}),
+    ...(on ? { reportOn: on.toLowerCase() === 'all' ? null : on } : {}),
+  };
   const { body } = await api(
     'PATCH',
     `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`,
-    { reportsTo: clear ? null : target },
+    patch,
   );
   out(body);
 };
@@ -1316,6 +1573,33 @@ const cmdTabClose = async (args) => {
   if (body.reaper === 'unavailable') lines.push('reaper: unavailable (no /proc): only the pane group was signalled');
   if (body.reaper === 'remote-skipped') lines.push('reaper: skipped (the host is out of remote.hosts and did not answer): nothing on it was reaped');
   if (body.envMarker === 'absent') lines.push('envMarker: absent (a tab created before per-tab identity): only its pane descendants were reaped');
+  process.stdout.write(`${lines.join('\n')}\n`);
+};
+
+// A fresh agent process under the same tab id (ADR-0028): the server reaps the
+// tab's processes, recreates its session and relaunches the agent with the
+// tab's own launch settings. Leases, watches, probes and notes stay.
+const cmdTabRestart = async (args) => {
+  requireEnv();
+  const clear = args.includes('--clear');
+  const interrupt = args.includes('--interrupt');
+  const asJson = args.includes('--json');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--clear', '--interrupt', '--json']);
+  const tabId = rest[0];
+  if (!tabId) die('tab ID is required');
+  const wsId = resolveWsForTab(args);
+  const { body } = await api(
+    'POST',
+    `/api/cli/tabs/${encodeURIComponent(tabId)}/restart?workspaceId=${encodeURIComponent(wsId)}`,
+    { clear, interrupt },
+  );
+  if (body?.ok !== true) return fail('restart-not-confirmed', `the server answered ${JSON.stringify(body)}`);
+  if (asJson) return out(body);
+  const lines = [`ok ${tabId} restarted (${body.resumed ? 'resumed' : 'fresh'})`];
+  if (body.resumeSkipped) lines.push(`resume skipped: ${body.resumeSkipped}`);
+  if (body.reaped) lines.push(`reaped: ${body.reaped.killed} killed, ${body.reaped.survivors} survivors`);
+  if (body.identity) lines.push(`identity: ${body.identity}`);
+  if (body.launchState === 'held') lines.push('launch: held (the Codex launch was not confirmed; see tab status)');
   process.stdout.write(`${lines.join('\n')}\n`);
 };
 
@@ -1517,6 +1801,13 @@ Usage: purplemux <command> [args...]
 
 Commands:
   workspaces                               List workspaces
+  workspace create -n NAME -d DIR [-d DIR...] [--json]
+                                           Create a workspace as the web UI does (its first tab, its own agent
+                                           homes); prints the new id (--json: id, name, directories, defaultTabId).
+                                           Every DIR must exist (no mkdir). The first DIR is the primary (the cwd of
+                                           new tabs); later DIRs are navigation shortcuts. A name another workspace holds (case-insensitive)
+                                           exits 3 conflict. Admin token only: run it from a shell outside every
+                                           tab, else exit 3 forbidden (a tab's own tokens never create workspaces)
   workspace dirs show -w WS                Show a workspace's directories
   workspace dirs set -w WS DIR [DIR...]    Repoint a workspace. The first DIR is the primary: it is the cwd for
                                            new tabs and keys the agent chat store, and must be unique across
@@ -1530,6 +1821,10 @@ Commands:
                                            --scope takes comma-separated path globs the tab should edit, e.g. --scope 'src/**,tests/**'
              [--reports-to TAB_ID]         Send this tab's watchdog nudges to TAB_ID (a live tab of the SAME
                                            workspace) instead of the workspace orchestrator; exit 2 otherwise
+             [--report-on MARKERS]         Forward only the end lines that start with one of these markers
+                                           (comma-separated: DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE,
+                                           CHECKPOINTED). A turn ending on another marker is recorded but nudges
+                                           nobody. Default: every marker; exit 2 on an unknown name
              [--host HOST]                 Run the tab's tmux on HOST over ssh (ADR-0022): an ssh alias listed in
                                            fleet config remote.hosts. terminal and claude-code only; exit 2
                                            otherwise, exit 6 when HOST does not answer. The pane's purplemux
@@ -1542,8 +1837,18 @@ Commands:
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
+             [--over-cap --reason TEXT]    An agent tab is refused at the WIP cap (fleet config tabs.cap-per-workspace,
+                                           default 8): exit 3 wip-cap. Only the workspace's verified, enabled
+                                           orchestrator tab passes it, with a reason (1-500 characters, else exit 2)
+                                           that is audited; any other caller exits 3 forbidden. The answer's
+                                           "wip" is { count, cap, overCap } after the create
+  tab count -w WS [--json]                 Print "<count> <cap>": WS's agent tabs (claude-code, codex-cli, grok-cli)
+                                           and the WIP cap; --json adds workspaceId, capSource, overCap. Hooks use it
+                                           instead of counting tmux sessions
   tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
-                  [--clear]                restores the workspace orchestrator. Cleared when TARGET closes
+                  [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
+                                           --on MARKERS (alone or with a target) forwards only those end lines,
+                                           e.g. --on DONE,BLOCKED,NEEDS-DECISION; --on all lifts the filter
   tab steer -w WS TAB_ID CONTENT...        Interrupt the current turn, then send CONTENT (use for a mid-turn correction; --no-interrupt to queue instead)
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
                                            for an agent tab to be able to accept a turn; --wait-ms N (max
@@ -1560,6 +1865,15 @@ Commands:
              [--keep-processes]            every process it reaped: the pane's descendants and every process whose
                                            environment carries PMUX_TAB_ID=TAB_ID (SIGTERM, 3 s, SIGKILL).
                                            --keep-processes signals only the pane group, as before
+  tab restart -w WS TAB_ID                 Restart the tab's agent as a fresh process under the SAME tab id (ADR-0028):
+             [--clear] [--interrupt]       reap its processes, recreate its session, relaunch with its own model,
+             [--json]                      effort, cwd, scope, reports-to and host. Leases, watches, probes, notes and
+                                           its token stay. Resumes the agent's last session where the provider can
+                                           (a remote tab restarts fresh); --clear starts a new session. A tab
+                                           mid-turn exits 3 (tab-busy) unless --interrupt abandons the turn.
+                                           Prints "ok TAB_ID restarted (resumed|fresh)". web-browser, diff and
+                                           agent-sessions tabs exit 2 (restart-unsupported); a process or session
+                                           left after the reap exits 1 (restart-not-confirmed), nothing relaunched
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
@@ -1600,10 +1914,27 @@ Commands:
                                             "blockers":[{"what":"...","needs":"..."}],"needsHuman":false,"next":["..."]}
   standup show -w WS                       Latest standup + history for a workspace
   burndown publish -w WS --json @FILE      Publish the Scrum Master burndown.json (or '{...}', or pipe JSON). Validated
-                                           strictly; history keeps the newest 2000 rows. Shown on the portfolio board
+                                           strictly; history keeps the newest 2000 rows. Shown on the portfolio board.
+                                           Exit 2 invalid-burndown (names the field) or burndown-too-large (over 1 MiB)
   burndown show -w WS                      The latest published burndown for a workspace
+  flow publish -w WS --json @FILE          Publish the workspace's pipeline snapshot: queues, locks, meters, flags
+                                           (ADR-0026; or '{...}', or pipe JSON). Own workspace only. Prints
+                                           ok <receivedAt> <historyRows>; the server keeps the history. Exit 2
+                                           flow-invalid (names the field) or flow-too-large (over 1 MiB)
+  flow show -w WS [--json]                 The latest flow: queues (length, capacity, oldest age), locks (holder,
+            [--history all|window|none]    since), meters, producer flags, and "stale" after 10 min without a
+                                           publish. No record: "no flow published", exit 7 (flow-not-found);
+                                           a damaged record: exit 1 (flow-unreadable)
+  spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]
+                                           Tokens (input, output, cache read, cache creation, subagents) and the
+                                           estimated cost ("est."; "—" when no price is known) per tab, UTC day, model
+                                           or role, plus the unattributed row and the total. Default: the last 7 UTC
+                                           days by tab; at most 92 days, none before today - 91 (exit 2). Role uses
+                                           the current orchestrator. An unreadable spend index exits 1.
+                                           Read scope on WS (ADR-0030)
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
+                                           attention.opened/updated accept class (money|irreversible|scope|bookkeeping) and defaultOptionId
   mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap, and
                                            each open bound run with its revision, bound tab and binding generation
                                            (a handoff, recovery or replacement of the orchestrator moves the binding)
@@ -1636,9 +1967,11 @@ Commands:
   note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]
                                            A local note to the live epic holder, or a cross-workspace note between
                                            verified current orchestrators; body <= 16 KiB (exit 2). Only a fixed line is typed
-                                           into the recipient; it pulls the body. --from-epic needs that epic lease (3)
+                                           into the recipient; it pulls the body. --from-epic needs that epic lease (3).
+                                           The owner-granted tab sends to any workspace as owner (to its orchestrator)
   note list [--open] [--to-me] [--from-me] [--epic SLUG]
-                                           Notes your workspace sent or receives (no bodies). Run --open --to-me at turn start
+                                           Notes your workspace sent or receives (no bodies; fromLabel names the sender,
+                                           e.g. "owner (WS/TAB)"). Run --open --to-me at turn start
   note show ID                             The note and its body (recipient or sender workspace, or admin; else exit 3; 7 unknown)
   note ack ID [--comment TEXT]             Acknowledge a local note in your workspace, or a cross-workspace note as
                                            its verified currently routed coordinator (else exit 3)
@@ -1651,7 +1984,11 @@ Commands:
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
   grant list [--json]                      Portfolio read grants held by or targeting your workspace (read-only; a human
-                                           creates and revokes them in the web UI with the purplemux password)
+                                           creates and revokes them in the web UI with the purplemux password).
+                                           An owner grant shows capability: owner workspaces: * (it reads every
+                                           workspace and sends notes as owner; the web dialog refuses a second
+                                           active owner grant). One unreadable grant file: the other file's grants
+                                           print, the refusal goes to stderr, exit 1
   deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json]
                                            Tell every enabled orchestrator and tab-bound lease holder that purplemux
                                            restarts in 1-60 min (admin token or the deploy:purplemux holder; else
@@ -1675,6 +2012,8 @@ Commands:
 Mission event examples:
   Ordinary attention events create workspace candidates. Workers route blockers to the orchestrator; they do not open the human inbox directly.
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-open-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":0,"producerAt":1700000000001,"bindingGeneration":1,"type":"attention.opened","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true}}]}'
+  A producer may set class (money|irreversible|scope|bookkeeping) and defaultOptionId (one of the item's option IDs; refused on an action item); a producer that cannot name the class omits it, and money, irreversible and scope items are never auto-answered.
+  purplemux mission events -w WS --json '{"events":[{"eventId":"evt-open-2","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":0,"producerAt":1700000000003,"bindingGeneration":1,"type":"attention.opened","payload":{"itemId":"question-2","kind":"question","title":"Record the release note","context":"Add the rollout to the release notes","storyIds":[],"options":[{"id":"gradual","label":"Gradual"},{"id":"direct","label":"Direct"}],"recommendation":"gradual","blockingScope":"none","canContinue":true,"class":"bookkeeping","defaultOptionId":"gradual"}}]}'
   The configured orchestrator may promote that same item only after checking existing authority and identifying the remaining human-exclusive need.
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-review-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":1,"producerAt":1700000000002,"bindingGeneration":1,"type":"attention.updated","payload":{"itemId":"question-1","kind":"question","title":"Choose rollout","context":"Choose the production rollout strategy","storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual","blockingScope":"story","canContinue":true,"humanReview":{"humanNeed":"decision","humanReason":"Choose the acceptable product rollout risk.","handling":"Existing rollout guidance does not choose product risk tolerance.","reviewerTabId":"tab-orchestrator"}}}]}'
   purplemux mission events -w WS --json '{"events":[{"eventId":"evt-resolve-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1","expectedRevision":2,"producerAt":1700000000004,"bindingGeneration":1,"type":"attention.resolved","payload":{"itemId":"question-1","resolution":"Applied the gradual rollout"}}]}'
@@ -1717,6 +2056,7 @@ const main = async () => {
       return cmdWorkspaces();
     case 'workspace':
       switch (sub) {
+        case 'create': return cmdWorkspaceCreate(rest);
         case 'dirs': return cmdWorkspaceDirs(rest);
         case 'peers': return cmdWorkspacePeers(rest);
         default: die(`unknown workspace command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
@@ -1728,6 +2068,10 @@ const main = async () => {
       return cmdStandup(args.slice(1));
     case 'burndown':
       return cmdBurndown(args.slice(1));
+    case 'flow':
+      return cmdFlow(args.slice(1));
+    case 'spend':
+      return cmdSpend(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':
@@ -1750,11 +2094,13 @@ const main = async () => {
       switch (sub) {
         case 'list': return cmdTabList(rest);
         case 'create': return cmdTabCreate(rest);
+        case 'count': return cmdTabCount(rest);
         case 'send': return cmdTabSend(rest);
         case 'steer': return cmdTabSteer(rest);
         case 'status': return cmdTabStatus(rest);
         case 'result': return cmdTabResult(rest);
         case 'close': return cmdTabClose(rest);
+        case 'restart': return cmdTabRestart(rest);
         case 'probe': return cmdTabProbe(rest);
         case 'bg': return cmdTabBg(rest);
         case 'reports-to': return cmdTabReportsTo(rest);
@@ -1773,6 +2119,12 @@ const main = async () => {
   }
 };
 
-main().catch((err) => {
+const run = () => main().catch((err) => {
   fail(null, err.message || String(err));
 });
+
+// bin/purplemux.js requires this file and calls run(); a remote tab's kit runs it directly
+// (ADR-0022). A test requires it for CODE_EXIT, so loading it alone runs nothing.
+if (require.main === module) run();
+
+module.exports = { CODE_EXIT, run };

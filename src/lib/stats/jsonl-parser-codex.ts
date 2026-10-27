@@ -529,6 +529,9 @@ export const parseCodexJsonl = async (period: TPeriod): Promise<ICodexProviderSt
   };
 };
 
+/** Every Codex transcript under `~/.codex/sessions`, for readers that index all of them (spend). */
+export const listAllCodexJsonlFiles = (): Promise<string[]> => collectAllCodexJsonlPaths();
+
 export const countCodexJsonlFiles = async (): Promise<number> => {
   const paths = await collectAllCodexJsonlPaths();
   return paths.length;

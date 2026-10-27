@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
+import type { NextApiRequest, NextApiResponse } from 'next';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { callRoute, drainRouteLocks, resetRouteGlobals, serveLeaseRoutes, writeFixture } from '../api/leases-harness';
 
@@ -96,6 +97,14 @@ describe('purplemux config — the installed CLI against the real fleet-config r
         req.query.key = 'constructor';
         return (await import('@/pages/api/cli/fleet-config/[key]')).default(req, res);
       },
+      ...Object.fromEntries(['flow.window-minutes', 'flow.lock-busy-percent', 'flow.queue-length', 'flow.oldest-minutes',
+        'alerts.flags', 'alerts.flag-repeat-minutes'].map((key) => [
+        `/api/cli/fleet-config/${key}`,
+        async (req: NextApiRequest, res: NextApiResponse) => {
+          req.query.key = key;
+          return (await import('@/pages/api/cli/fleet-config/[key]')).default(req, res);
+        },
+      ])),
     });
     const port = String(server.port);
     orch = { PMUX_PORT: port, PMUX_TAB_TOKEN: await ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-o' }, 'pt-ws-a-pane-1-tab-o') };
@@ -125,6 +134,31 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     expect(JSON.parse(second.stdout).value).toMatchObject({ value: '6', version: 2, setBy: { workspaceId: 'ws-a', tabId: 'tab-o', admin: false } });
     for (const env of [orch, worker, other, admin]) {
       expect(await cli(['config', 'get', 'gate.slots'], env)).toEqual({ code: 0, stdout: '6\n', stderr: '' });
+    }
+  });
+
+  it('the flow.* thresholds keep the ADR-0019 writer rule: the orchestrator or the admin token (purplemux-flow story 02)', async () => {
+    for (const key of ['flow.window-minutes', 'flow.lock-busy-percent', 'flow.queue-length', 'flow.oldest-minutes']) {
+      const byOrch = await cli(['config', 'set', key, '30'], orch);
+      expect(byOrch.code, byOrch.stderr).toBe(0);
+      expect((await cli(['config', 'set', key, '40'], admin)).code).toBe(0);
+      const byWorker = await cli(['config', 'set', key, '50'], worker);
+      expect(byWorker.code).toBe(3);
+      expect(byWorker.stderr).toContain('forbidden');
+      expect((await cli(['config', 'get', key], worker)).stdout).toBe('40\n');
+    }
+  });
+
+  it('alerts.* keys are the admin token\'s only (ADR-0032, ruling R2)', async () => {
+    for (const [key, value] of [['alerts.flags', 'off'], ['alerts.flag-repeat-minutes', '30']]) {
+      for (const env of [orch, worker]) {
+        const refused = await cli(['config', 'set', key, value], env);
+        expect(refused.code, key).toBe(3);
+        expect(refused.stderr).toContain('admin token only');
+      }
+      expect((await cli(['config', 'set', key, value], admin)).code, key).toBe(0);
+      expect((await cli(['config', 'get', key], worker)).stdout).toBe(`${value}\n`);
+      expect((await cli(['config', 'unset', key], orch)).code, key).toBe(3);
     }
   });
 
@@ -185,12 +219,13 @@ describe('purplemux config — the installed CLI against the real fleet-config r
     expect(await auditLines()).toMatchObject([{ event: 'fleet-config-set', by: { workspaceId: 'ws-a', tabId: 'tab-o', admin: false, verified: false, identity: 'session' } }]);
   });
 
-  it('a malformed store exits 1 with nothing on stdout, never 7 (unset) and never read as empty', async () => {
+  // ADR-0027 maps config-store-unreadable to exit 3 (refused by state) in the one table.
+  it('a malformed store exits 3 with nothing on stdout, never 7 (unset) and never read as empty', async () => {
     await fs.writeFile(path.join(mockHome.value, '.purplemux', 'fleet-config.json'), '{"values":');
     const r = await cli(['config', 'get', 'gate.slots'], worker);
-    expect(r).toMatchObject({ code: 1, stdout: '' });
+    expect(r).toMatchObject({ code: 3, stdout: '' });
     expect(r.stderr).toContain('config-store-unreadable');
-    expect((await cli(['config', 'set', 'gate.slots', '6'], orch)).code).toBe(1);
+    expect((await cli(['config', 'set', 'gate.slots', '6'], orch)).code).toBe(3);
   });
 
   it('a stale --expect-version exits 3 config-version-conflict and leaves the value', async () => {

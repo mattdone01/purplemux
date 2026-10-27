@@ -1,6 +1,7 @@
 import { findTab } from '@/lib/cli-utils';
 import { hasSession } from '@/lib/tmux';
 import { isAgentPanelType } from '@/lib/agent-panel-types';
+import { parseReportOn, type TTurnMarkerName } from '@/lib/turn-end';
 
 export interface IReportsToInvalid {
   error: string;
@@ -29,3 +30,22 @@ export const checkReportsTo = async (
   if (!(await hasSession(found.tab.sessionName))) return invalid(reportsTo, `reportsTo ${reportsTo} is not a live tab`);
   return null;
 };
+
+export interface IReportOnInvalid {
+  error: string;
+  code: 'report-on-invalid';
+  reportOn: unknown;
+}
+
+/**
+ * `reportOn` (ADR-0025): the markers whose end lines reach the target, or null
+ * for all. Refused with `report-on-invalid` (CLI exit 2) when a name is unknown
+ * or the set is empty.
+ */
+export const checkReportOn = (reportOn: unknown): { markers: TTurnMarkerName[] | null } | IReportOnInvalid => {
+  const parsed = parseReportOn(reportOn);
+  if (parsed.ok) return { markers: parsed.markers };
+  return { error: parsed.error, code: 'report-on-invalid', reportOn };
+};
+
+export const isReportOnInvalid = (checked: ReturnType<typeof checkReportOn>): checked is IReportOnInvalid => 'code' in checked;

@@ -18,7 +18,7 @@ Option 3.
 - Versions count per key and never repeat: an unset raises the version too, and `versions` remembers it, so an `--expect-version` taken before an unset cannot match after a new set. Setting the value a key already holds is not a change.
 - Routes: `GET /api/cli/fleet-config[?key=|?history=1[&key=]]` (any valid scope); `PUT` and `DELETE /api/cli/fleet-config/<key>` with an optional `expectedVersion`.
 - Authority: the admin token, or the tab that is its workspace's enabled `orchestratorTabId` — the rule of the deploy lease. This is cooperative, not a security boundary (C-312 class): every agent can read the admin token.
-- Codes (ADR-0016): `config-invalid` 400 (exit 2), `forbidden` 403 (exit 3), `config-version-conflict` 409 (exit 3), `config-not-found` 404 (exit 7).
+- Codes (ADR-0016): `config-invalid` 400 (exit 2), `forbidden` 403 (exit 3), `config-version-conflict` 409 (exit 3), `config-not-found` 404 (exit 7). A malformed store answers 500 `config-store-unreadable` on every fleet-config route; ADR-0027 maps it to exit 3, so `config get/set/list/unset/history` exit 3 (was 1, unmapped) on a malformed store.
 - CLI: `config get KEY` prints the bare value (exit 7 and nothing on stdout when unset), `config list [--json]`, `config set KEY VALUE [--expect-version N]`, `config unset KEY [--expect-version N]`, `config history [KEY] [--json]`.
 - Every change appends one line to `~/.purplemux/audit/coordination.jsonl` (`fleet-config-set` / `fleet-config-unset`, key, old and new value, version, setter). No broadcast, no nudge, no inbox notice.
 - Tools read with an explicit precedence and log the source they used. For `gate.sh`: `--slots` > `$GATE_HOST_SLOTS` > `gate.slots` > 3.

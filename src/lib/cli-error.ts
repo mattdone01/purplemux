@@ -9,6 +9,9 @@
  * stay as they were: the web UI and the phone read them (ADR-0004, additive
  * wire changes only).
  */
+/** The supported path a foreign-mutation denial names (ADR-0014, ADR-0029). */
+export const FOREIGN_MUTATION_HINT = 'Use coordinator notes for cross-workspace requests (from the owner-granted tab: send a note as owner), or local human controls.';
+
 export const TAB_NOT_FOUND_BODY = Object.freeze({ error: 'Tab not found', code: 'tab-not-found' as const });
 
 /** A remote tab's host did not answer over ssh (ADR-0022): retryable, never "the tab is gone". */

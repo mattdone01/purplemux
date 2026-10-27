@@ -4,6 +4,7 @@ import type { GetServerSideProps } from 'next';
 import { AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import PortfolioBoard from '@/components/features/mission-control/portfolio-board';
+import FlowPanel from '@/components/features/mission-control/flow-panel';
 import { getPageShellWithTitlebarLayout } from '@/components/layout/page-shell';
 import MissionControlDashboard, {
   MissionControlDashboardSkeleton,
@@ -21,7 +22,7 @@ import {
 } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
 import useBrowserTitle from '@/hooks/use-browser-title';
-import useMissionControl from '@/hooks/use-mission-control';
+import useMissionControl, { normalizeMissionItem } from '@/hooks/use-mission-control';
 import { useSelectWorkspace } from '@/hooks/use-sidebar-actions';
 import type {
   IMissionAnswerResponse,
@@ -117,7 +118,7 @@ const MissionControlPage = () => {
         const responseBody = await parseError(response);
         if (response.status === 409) {
           const latest = isAttentionItem(responseBody.current)
-            ? responseBody.current
+            ? normalizeMissionItem(responseBody.current)
             : snapshot?.items.find((candidate) => candidate.id === item.id) ?? submittingDraft.item;
           setDrafts((current) => ({
             ...current,
@@ -199,6 +200,9 @@ const MissionControlPage = () => {
             onAdoptCurrent={handleAdoptCurrent}
             onSubmit={(item) => void handleSubmit(item)}
           />
+        </div>
+        <div className="mx-auto w-full max-w-[1440px] px-3 pt-5 empty:hidden sm:px-5 lg:px-8">
+          <FlowPanel />
         </div>
         <PortfolioBoard />
       </>

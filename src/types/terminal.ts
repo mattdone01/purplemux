@@ -125,12 +125,20 @@ export interface ITab {
    */
   reportsTo?: string;
   /**
+   * The end-line markers whose `turn-marker` nudges this tab's target receives
+   * (ADR-0025). Absent: every marker, as before. A turn that ends on a marker
+   * outside the list is classified and recorded but nudges nobody.
+   */
+  reportOn?: import('@/lib/turn-end').TTurnMarkerName[];
+  /**
    * The ssh alias of the host whose tmux runs this tab (ADR-0022). Absent: this
    * server's host. Set once at create; a tab never changes host.
    */
   host?: string;
   cliState?: TCliState;
   dismissedAt?: number | null;
+  /** When `tab restart` last relaunched the tab under this id (ADR-0028), Unix ms. */
+  lastRestartAt?: number;
   /**
    * The watchdog's record of the last markerless stop (ADR-0018, L49): the poll
    * derives the idle nudge from it, so a server restart keeps a pending nudge

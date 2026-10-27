@@ -13,6 +13,8 @@ const CLI_COMMANDS = new Set([
   'orchestration',
   'standup',
   'burndown',
+  'flow',
+  'spend',
   'mission',
   'portfolio',
   'lease',

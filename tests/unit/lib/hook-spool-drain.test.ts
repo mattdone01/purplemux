@@ -204,7 +204,8 @@ describe('the status manager replays the hook spool (ADR-0020)', () => {
     // A hook that saw no port file renames its file after the first drain listed the spool.
     await spoolEvent(t0 + 3_000, claudePrompt());
     await waitFor(() => expect(applied).toHaveLength(3));
-    expect(await fs.readdir(spoolDir())).toEqual([]);
+    // The drain removes a file only after its event applied: on a loaded host the removal lands a moment later.
+    await waitFor(async () => expect(await fs.readdir(spoolDir())).toEqual([]));
   });
 
   it('bootHookSpoolDrained settles only once the first boot drain has applied the spool (the inbox waits for it)', async () => {

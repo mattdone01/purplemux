@@ -10,6 +10,54 @@ const READY_TO_MERGE = 'READY-TO-MERGE:';
 const MAX_MARKER_LINE_CHARS = 300;
 const MAX_READY_TO_MERGE_LINES = 5;
 
+/** A marker without its colon: the value of `--report-on` and of `ITab.reportOn` (ADR-0025). */
+export type TTurnMarkerName = 'DONE' | 'BLOCKED' | 'NEEDS-DECISION' | 'READY-TO-MERGE' | 'CHECKPOINTED';
+export const TURN_MARKER_NAMES: readonly TTurnMarkerName[] = TURN_MARKERS.map((m) => m.slice(0, -1) as TTurnMarkerName);
+
+/** The marker a classified end line starts with (`extractTurnMarker` guarantees one), or null. */
+export const turnMarkerName = (line: string): TTurnMarkerName | null =>
+  TURN_MARKER_NAMES.find((name) => line.startsWith(`${name}:`)) ?? null;
+
+export type TReportOnParse =
+  | { ok: true; markers: TTurnMarkerName[] | null }
+  | { ok: false; error: string };
+
+/**
+ * `--report-on` / `reportOn`: a non-empty subset of the five markers, or `all` /
+ * null to clear the filter (every end line is forwarded, today's behaviour).
+ * Names are read case-insensitively, with or without the colon; duplicates
+ * collapse; order is the markers' own. An empty set is refused: a tab that
+ * reports nothing silences itself, and `tab close` is the way to do that.
+ */
+export const parseReportOn = (value: unknown): TReportOnParse => {
+  if (value === null || value === undefined) return { ok: true, markers: null };
+  const raw: unknown[] = typeof value === 'string' ? value.split(',') : Array.isArray(value) ? value : [value];
+  const names = new Set<TTurnMarkerName>();
+  for (const item of raw) {
+    if (typeof item !== 'string') return { ok: false, error: `reportOn takes marker names, not ${JSON.stringify(item)}` };
+    const name = item.trim().toUpperCase().replace(/:$/, '');
+    if (!name) continue;
+    if (name === 'ALL') return { ok: true, markers: null };
+    const known = TURN_MARKER_NAMES.find((m) => m === name);
+    if (!known) return { ok: false, error: `reportOn: unknown marker ${JSON.stringify(item.trim())}; expected ${TURN_MARKER_NAMES.join(', ')} or all` };
+    names.add(known);
+  }
+  if (names.size === 0) return { ok: false, error: `reportOn needs at least one marker (${TURN_MARKER_NAMES.join(', ')}) or all` };
+  return { ok: true, markers: TURN_MARKER_NAMES.filter((m) => names.has(m)) };
+};
+
+/**
+ * Whether a turn's end lines reach the tab's nudge target: the LAST line's
+ * marker (the turn's own verdict; READY-TO-MERGE lines above it ride along)
+ * must be in the tab's `reportOn`. No filter forwards every marker.
+ */
+export const reportOnAdmits = (reportOn: readonly TTurnMarkerName[] | null | undefined, lines: readonly string[]): boolean => {
+  if (!reportOn || reportOn.length === 0) return true;
+  const last = lines.at(-1);
+  const name = last ? turnMarkerName(last) : null;
+  return name !== null && reportOn.includes(name);
+};
+
 export type TTurnEnd =
   | { kind: 'turn-marker'; lines: string[] }
   | { kind: 'waiting'; openBackgroundTasks: number; liveRegisteredJobs: number; armedWatches: number }

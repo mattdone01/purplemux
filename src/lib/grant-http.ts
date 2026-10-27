@@ -21,6 +21,7 @@ const STATUS: Record<string, number> = {
   'grant-password-invalid': 403,
   'grant-locked': 429,
   'grant-store-unreadable': 500,
+  'grant-owner-active': 409,
 };
 
 export const defaultGrantDeps = (): IGrantDeps => ({

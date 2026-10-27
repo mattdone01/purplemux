@@ -1,5 +1,6 @@
+import type { IDeployAnnouncement } from '@/types/deploy';
 import type { IFleetView } from '@/types/fleet-status';
-import type { IGrant } from '@/types/grant';
+import type { IGrant, IGrantRefusal } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
 import type { ILeaseView } from '@/types/lease';
 import type { INoteView } from '@/types/note';
@@ -94,13 +95,36 @@ export interface ICoordinationSnapshot {
   leases: TSection<ILeaseView>;
   notes: TSection<INoteRow>;
   watches: TSection<IWatchView>;
-  grants: TSection<IGrant>;
+  grants: TGrantsSection;
   inboxHeld: TSection<IInboxItem>;
   orchestrators: TSection<IOrchestratorPresenceIssue>;
   host: THostMetrics;
   signals: THostSignals;
   /** The fleet status panel (ADR-0023). Absent from a server older than it. */
   fleet?: TFleetSection;
+  /** Deploy announcements of the last 24 h, newest first (ADR-0029 §9). Absent from a server older than story 06. */
+  deploys?: TSection<IDeployRow>;
 }
+
+/**
+ * One deploy announcement and how far its notices got. A recipient whose inbox item is gone counts
+ * in `total` only, so the four states may sum to less than `total`.
+ */
+export interface IDeployRow {
+  id: string;
+  reason: string;
+  createdAt: number;
+  restartAt: number;
+  phase: 'pending' | 'past';
+  by: IDeployAnnouncement['by'];
+  recipients: { total: number; delivered: number; queued: number; held: number; dropped: number };
+}
+
+/**
+ * The active grants of each readable grant file, drive then owner (`capability` shown), and the
+ * files the server could not read (ADR-0029 §1: each file fails alone). `ok: false` only when both
+ * files are refused. `refused` is absent from a server older than story 05.
+ */
+export type TGrantsSection = { ok: true; items: IGrant[]; refused?: IGrantRefusal[] } | { ok: false; error: string };
 
 export type TFleetSection = { ok: true; view: IFleetView } | { ok: false; error: string };

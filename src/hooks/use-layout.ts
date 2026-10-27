@@ -11,6 +11,8 @@ import useWorkspaceStore from '@/hooks/use-workspace-store';
 import useTabMetadataStore from '@/hooks/use-tab-metadata-store';
 import { resolveTabNameForPanelTypeChange } from '@/lib/tab-name';
 import { isAgentPanelType, panelTypeForProviderId } from '@/lib/agent-panel-types';
+import { splitCreateAnswer, wipWarningText } from '@/lib/wip-warning';
+import type { IFleetWip } from '@/types/fleet-status';
 import type { TSessionHistoryProvider } from '@/types/session-history';
 import {
   collectPanes,
@@ -24,6 +26,11 @@ import {
 
 export { collectPanes, equalizeNode, getFirstPaneId, findAdjacentPaneInDirection } from '@/lib/layout-tree';
 export type { TDirection } from '@/lib/layout-tree';
+
+const warnOverCap = (wip: IFleetWip | null) => {
+  const text = wip ? wipWarningText(t('terminal', 'wipOverCap'), wip) : null;
+  if (text) toast.warning(text);
+};
 
 const cloneLayout = (data: ILayoutData): ILayoutData =>
   JSON.parse(JSON.stringify(data));
@@ -466,7 +473,8 @@ const useLayoutStore = create<ILayoutState>((set, get) => ({
         body: JSON.stringify({ cwd, panelType, command, resumeSessionId }),
       });
       if (!res.ok) throw new Error();
-      const newTab: ITab = await res.json();
+      const { tab: newTab, wip } = splitCreateAnswer(await res.json());
+      warnOverCap(wip);
 
       if (command || resumeSessionId) {
         useTabStore.getState().initTab(newTab.id, { panelType, sessionView: 'check' });
@@ -832,7 +840,8 @@ export const navigateToTabOrCreate = async (
     body: JSON.stringify(body),
   });
   if (!tabRes.ok) return;
-  const newTab: ITab = await tabRes.json();
+  const { tab: newTab, wip } = splitCreateAnswer(await tabRes.json());
+  warnOverCap(wip);
 
   if (agentSessionId) {
     useTabStore.getState().initTab(newTab.id, { panelType, sessionView: 'check' });

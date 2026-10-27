@@ -11,6 +11,7 @@ const layout = vi.hoisted(() => ({
   removeTabFromPane: vi.fn(),
   updateTabAgentLaunchConfig: vi.fn(),
   setTabReportsTo: vi.fn(async () => true),
+  setTabReportOn: vi.fn(async () => true),
 }));
 const tmux = vi.hoisted(() => ({ hasSession: vi.fn(async () => true) }));
 const liveness = vi.hoisted(() => ({ registerJob: vi.fn(async (_job: { pid: number; notify?: string }) => {}) }));
@@ -57,8 +58,8 @@ describe('reportsTo on the tab routes (ADR-0018)', () => {
   };
 
   it('sets and clears reportsTo with input-grade authorization', async () => {
-    expect(await patch({ reportsTo: 'tab-o' })).toEqual({ statusCode: 200, body: { tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: 'tab-o' } });
-    expect(await patch({ reportsTo: null })).toEqual({ statusCode: 200, body: { tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: null } });
+    expect(await patch({ reportsTo: 'tab-o' })).toEqual({ statusCode: 200, body: { tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: 'tab-o', reportOn: null } });
+    expect(await patch({ reportsTo: null })).toEqual({ statusCode: 200, body: { tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: null, reportOn: null } });
     expect(layout.setTabReportsTo.mock.calls).toEqual([['ws-1', 'tab-w', 'tab-o'], ['ws-1', 'tab-w', null]]);
     expect(cli.authorizeWorkspaceInput).toHaveBeenCalled();
   });
@@ -85,6 +86,46 @@ describe('reportsTo on the tab routes (ADR-0018)', () => {
 
   it('refuses reportsTo mixed with other fields', async () => {
     expect((await patch({ reportsTo: 'tab-o', agentLaunchConfig: null })).statusCode).toBe(400);
+    expect((await patch({ reportOn: 'DONE', agentLaunchConfig: null })).statusCode).toBe(400);
+  });
+
+  describe('reportOn (ADR-0025)', () => {
+    it('sets the markers from a string or an array, alone or beside reportsTo, and clears them with null or all', async () => {
+      expect(await patch({ reportOn: 'DONE,BLOCKED' })).toEqual({ statusCode: 200, body: { tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: null, reportOn: ['DONE', 'BLOCKED'] } });
+      expect(await patch({ reportsTo: 'tab-o', reportOn: ['NEEDS-DECISION'] })).toEqual({ statusCode: 200, body: { tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: 'tab-o', reportOn: ['NEEDS-DECISION'] } });
+      expect((await patch({ reportOn: null })).body).toMatchObject({ reportOn: null });
+      expect((await patch({ reportOn: 'all' })).body).toMatchObject({ reportOn: null });
+      expect(layout.setTabReportOn.mock.calls).toEqual([
+        ['ws-1', 'tab-w', ['DONE', 'BLOCKED']],
+        ['ws-1', 'tab-w', ['NEEDS-DECISION']],
+        ['ws-1', 'tab-w', null],
+        ['ws-1', 'tab-w', null],
+      ]);
+      expect(layout.setTabReportsTo.mock.calls).toEqual([['ws-1', 'tab-w', 'tab-o']]);
+    });
+
+    it.each<[string, unknown]>([
+      ['an unknown marker', 'DONE,FINISHED'],
+      ['an empty list', []],
+      ['a non-string', 7],
+    ])('refuses %s with report-on-invalid and writes nothing', async (_label, reportOn) => {
+      const state = await patch({ reportsTo: 'tab-o', reportOn });
+      expect(state.statusCode).toBe(400);
+      expect(state.body).toMatchObject({ code: 'report-on-invalid' });
+      expect(layout.setTabReportOn).not.toHaveBeenCalled();
+      expect(layout.setTabReportsTo).not.toHaveBeenCalled();
+    });
+
+    it('shows reportOn on GET and reports the untouched value after a reportsTo-only patch', async () => {
+      cli.findTab.mockResolvedValue({ workspaceId: 'ws-1', paneId: 'pane-a', tab: tab('tab-w', { reportsTo: 'tab-o', reportOn: ['DONE'] }) });
+      const { state, res } = fakeResponse();
+      const { default: handler } = await import('@/pages/api/cli/tabs/[tabId]');
+      await handler({ method: 'GET', query: { workspaceId: 'ws-1', tabId: 'tab-w' } } as unknown as NextApiRequest, res);
+      expect(state.body).toMatchObject({ reportsTo: 'tab-o', reportOn: ['DONE'] });
+      cli.findTab.mockImplementation(async (ws: string, id: string) =>
+        tabsIn[ws]?.includes(id) ? { workspaceId: ws, paneId: 'pane-a', tab: tab(id, id === 'tab-w' ? { reportOn: ['DONE'] } : {}) } : null);
+      expect((await patch({ reportsTo: null })).body).toEqual({ tabId: 'tab-w', workspaceId: 'ws-1', reportsTo: null, reportOn: ['DONE'] });
+    });
   });
 
   it('shows reportsTo on GET', async () => {

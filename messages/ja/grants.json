@@ -37,5 +37,16 @@
   "errorUnknown": "リクエストに失敗しました ({status})",
   "granteesUnreadable": "{workspaces} のタブを読み込めませんでした",
   "granteesFailed": "タブ一覧を読み込めませんでした: {error}",
-  "staleSuffix": "未更新: {reason}"
+  "staleSuffix": "未更新: {reason}",
+  "capabilityLabel": "種類",
+  "capabilityDrive": "他のワークスペースを読む",
+  "capabilityOwner": "オーナーセッション",
+  "ownerScope": "後から作成されたものも含むすべてのワークスペース。オーナーとしてノートを送れますが、他のワークスペースを操作することはできません",
+  "ownerActive": "{tab} · {workspace} が {time} までオーナーセッションを保持しています。先に取り消してください",
+  "ownerReads": "オーナーセッション — すべてのワークスペースを読む",
+  "ownerBadge": "オーナー",
+  "ownerBadgeTooltip": "オーナーセッション: {time} まですべてのワークスペースを読み、オーナーとしてノートを送ります",
+  "errorOwnerActive": "オーナーセッションはすでに有効です",
+  "refusedDrive": "読み取り許可は無効です: grants.json を読み取れません — {reason}",
+  "refusedOwner": "オーナーセッションは無効です: owner-grants.json を読み取れません — {reason}"
 }

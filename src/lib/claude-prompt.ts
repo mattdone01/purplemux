@@ -28,6 +28,7 @@ purplemux workspaces                                # list all workspaces
 purplemux tab list -w ${ws.id}                        # list tabs in this workspace
 purplemux tab create -w ${ws.id} [-n NAME] [-t TYPE]  # create a tab (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
                     [--reports-to TAB_ID]              # its watchdog nudges go to TAB_ID, not the workspace orchestrator
+                    [--report-on MARKERS]              # forward only these end lines, e.g. DONE,BLOCKED,NEEDS-DECISION (default: all five)
 purplemux tab send -w ${ws.id} TAB_ID CONTENT...      # send input to a tab
 purplemux tab status -w ${ws.id} TAB_ID               # tab status
 purplemux tab result -w ${ws.id} TAB_ID               # capture current pane content

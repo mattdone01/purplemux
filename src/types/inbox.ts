@@ -40,4 +40,7 @@ export interface IInboxState {
   items: IInboxItem[];
 }
 
-export type TInboxErrorCode = 'inbox-not-found' | 'inbox-not-held' | 'inbox-field-invalid';
+export type TInboxErrorCode = 'inbox-not-found' | 'inbox-not-held' | 'inbox-field-invalid' | 'inbox-not-retryable';
+
+/** A hold the human retry refuses (ADR-0029 §7, consult Q1): the leading token of its `heldReason`. */
+export type THumanRetryRefusal = 'stranded-in-composer' | 'transport-uncertain' | 'target-not-agent';

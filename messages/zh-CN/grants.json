@@ -37,5 +37,16 @@
   "errorUnknown": "请求失败（{status}）",
   "granteesUnreadable": "无法读取 {workspaces} 的标签页",
   "granteesFailed": "无法读取标签页列表：{error}",
-  "staleSuffix": "未刷新：{reason}"
+  "staleSuffix": "未刷新：{reason}",
+  "capabilityLabel": "类型",
+  "capabilityDrive": "读取其他工作区",
+  "capabilityOwner": "所有者会话",
+  "ownerScope": "所有工作区，包括之后创建的；可以以所有者身份发送笔记，但不能操作其他工作区",
+  "ownerActive": "{tab} · {workspace} 持有所有者会话直到 {time}；请先撤销",
+  "ownerReads": "所有者会话 — 读取所有工作区",
+  "ownerBadge": "所有者",
+  "ownerBadgeTooltip": "所有者会话：在 {time} 前读取所有工作区并以所有者身份发送笔记",
+  "errorOwnerActive": "已有一个有效的所有者会话",
+  "refusedDrive": "读取授权未生效：无法读取 grants.json — {reason}",
+  "refusedOwner": "所有者会话未生效：无法读取 owner-grants.json — {reason}"
 }

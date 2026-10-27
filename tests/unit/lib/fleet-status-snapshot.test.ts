@@ -68,6 +68,13 @@ describe('buildFleetView', () => {
     expect(view.errors).toEqual([]);
   });
 
+  it('reads each tab\'s lastRestartAt from the layout as restartedAt (ADR-0028)', async () => {
+    deps.agentTabs = async () => [tab('tab-busy', { lastRestartAt: NOW - 7 * MIN }), tab('tab-idle')];
+    const view = await buildFleetView(deps, NOW);
+    expect(row(view, 'tab-busy').restartedAt).toBe(NOW - 7 * MIN);
+    expect(row(view, 'tab-idle').restartedAt).toBeNull();
+  });
+
   it('also captures a tab WAITING at its prompt, never a tab mid-turn', async () => {
     deps.agentTabs = async () => [tab('tab-waiting'), tab('tab-busy')];
     deps.statuses = () => ({
@@ -136,7 +143,17 @@ describe('buildFleetView', () => {
     deps.agentTabs = async (id) => (id === 'ws-2' ? null : [tab('tab-busy')]);
     const view = await buildFleetView(deps, NOW);
     expect(view.rows.map((r) => r.tabId)).toEqual(['tab-busy']);
-    expect(view.errors).toEqual([{ scope: 'Broken', error: 'workspace layout could not be read' }]);
+    expect(view.errors).toEqual([{ scope: 'Broken', error: 'workspace layout could not be read', workspaceId: 'ws-2' }]);
+  });
+
+  it('a layout that throws names its workspace by id too, so a workspace named like a scope stays a workspace', async () => {
+    deps.workspaces = async () => [{ id: 'ws-1', name: 'Portfolio' }, { id: 'ws-2', name: 'leases' }];
+    deps.agentTabs = async (id) => {
+      if (id === 'ws-2') throw new Error('EACCES');
+      return [tab('tab-busy')];
+    };
+    const view = await buildFleetView(deps, NOW);
+    expect(view.errors).toEqual([{ scope: 'leases', error: 'EACCES', workspaceId: 'ws-2' }]);
   });
 
   it('a status entry of another workspace is not this tab\'s status', async () => {
@@ -149,6 +166,29 @@ describe('buildFleetView', () => {
     deps.config = async (key) => ({ [FLEET_CONFIG_KEYS.stallMinutes]: '10', [FLEET_CONFIG_KEYS.unansweredMinutes]: 'soon' })[key] ?? null;
     const view = await buildFleetView(deps, NOW);
     expect(view.thresholds).toEqual({ stallMinutes: 10, waitingLongMinutes: 120, unansweredMinutes: 30, composerMinutes: 2 });
+  });
+});
+
+describe('buildFleetView: WIP per workspace (ADR-0027)', () => {
+  it('counts each workspace\'s agent tabs against the fleet cap; an unread layout has no count', async () => {
+    deps.workspaces = async () => [{ id: 'ws-1', name: 'Portfolio' }, { id: 'ws-2', name: 'Quiet' }, { id: 'ws-3', name: 'Broken' }];
+    deps.agentTabs = async (id) => (id === 'ws-3' ? null : id === 'ws-2' ? [] : [tab('tab-a'), tab('tab-b', { host: 'ai-server' }), tab('tab-c')]);
+    deps.config = async (key) => (key === 'tabs.cap-per-workspace' ? '2' : null);
+    const view = await buildFleetView(deps, NOW);
+    expect(view.wip).toEqual({ 'ws-1': { count: 3, cap: 2, overCap: true }, 'ws-2': { count: 0, cap: 2, overCap: false } });
+    expect(Object.keys(view.wip ?? {})).toEqual(['ws-1', 'ws-2']);
+  });
+
+  it('defaults to a cap of 8', async () => {
+    expect((await buildFleetView(deps, NOW)).wip).toEqual({ 'ws-1': { count: 4, cap: 8, overCap: false } });
+  });
+
+  it('a fleet config that cannot be read leaves wip out and names the error; the rows still render', async () => {
+    deps.config = async () => { throw new Error('fleet-config.json is malformed'); };
+    const view = await buildFleetView(deps, NOW);
+    expect(view).not.toHaveProperty('wip');
+    expect(view.errors).toContainEqual({ scope: 'WIP cap', error: 'fleet-config.json is malformed' });
+    expect(view.rows).toHaveLength(4);
   });
 });
 

@@ -131,6 +131,28 @@ describe('alertFor', () => {
     expect(alertFor({ ...base, kind: 'bg-job-unknown', detail: null }).body).toBe('orchestrator');
   });
 
+  it('builds a flag alert from its detail, then its flag text, then the tab name, and carries the flag (ADR-0032)', () => {
+    const flag = { source: 'flow' as const, rule: 'queue-long', subject: 'landing', text: 'landing holds 12 items (threshold 10)' };
+    const alert = alertFor({ ...base, kind: 'flag', detail: 'worker: landing holds 12 items', flag });
+    expect(alert.title).toBe('Flag Raised');
+    expect(alert.body).toBe('worker: landing holds 12 items');
+    expect(alert.flag).toEqual(flag);
+    expect(alert.flag).not.toBe(flag);
+    expect(alertFor({ ...base, kind: 'flag', flag }).body).toBe('landing holds 12 items (threshold 10)');
+    expect(alertFor({ ...base, kind: 'flag' }).body).toBe('orchestrator');
+    expect(alertFor({ ...base, kind: 'flag' })).not.toHaveProperty('flag');
+  });
+
+  it('cuts a flag body to 100 code points, never inside a surrogate pair, and keeps the full text on the flag', () => {
+    const text = `${'🚦'.repeat(60)}${'x'.repeat(60)}`;
+    const alert = alertFor({ ...base, kind: 'flag', flag: { source: 'flow', rule: 'meter-over', subject: 'm', text } });
+    expect(Array.from(alert.body)).toHaveLength(100);
+    expect(alert.body).toBe(`${'🚦'.repeat(60)}${'x'.repeat(40)}`);
+    expect(alert.flag?.text).toBe(text);
+    expect(alertFor({ ...base, kind: 'flag', detail: 'y'.repeat(100) }).body).toBe('y'.repeat(100));
+    expect(alertFor({ ...base, kind: 'flag', detail: 'y'.repeat(101) }).body).toBe('y'.repeat(100));
+  });
+
   it('describes a stall with the supplied detail', () => {
     const alert = alertFor({ ...base, kind: 'orchestrator-stalled', detail: 'idle 30 min, no workers' });
     expect(alert.title).toBe('Orchestrator Stalled');

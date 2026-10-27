@@ -37,5 +37,16 @@
   "errorUnknown": "La solicitud falló ({status})",
   "granteesUnreadable": "No se pudieron leer las pestañas de {workspaces}",
   "granteesFailed": "No se pudo leer la lista de pestañas: {error}",
-  "staleSuffix": "no actualizado: {reason}"
+  "staleSuffix": "no actualizado: {reason}",
+  "capabilityLabel": "Tipo",
+  "capabilityDrive": "Leer otros espacios de trabajo",
+  "capabilityOwner": "Sesión de propietario",
+  "ownerScope": "Todos los espacios de trabajo, incluidos los creados después; puede enviar notas como propietario, pero nunca controlar otro espacio",
+  "ownerActive": "{tab} · {workspace} tiene la sesión de propietario hasta {time}; revócala primero",
+  "ownerReads": "sesión de propietario — lee todos los espacios",
+  "ownerBadge": "propietario",
+  "ownerBadgeTooltip": "Sesión de propietario: lee todos los espacios y envía notas como propietario hasta {time}",
+  "errorOwnerActive": "Ya hay una sesión de propietario activa",
+  "refusedDrive": "Los permisos de lectura no se aplican: no se puede leer grants.json — {reason}",
+  "refusedOwner": "Las sesiones de propietario no se aplican: no se puede leer owner-grants.json — {reason}"
 }

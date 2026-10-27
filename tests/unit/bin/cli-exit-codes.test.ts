@@ -197,6 +197,19 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     expect(create.stderr).toContain('web UI only');
   });
 
+  it('grant list shows an owner grant as capability: owner workspaces: * (ADR-0029)', async () => {
+    const future = Date.now() + 3_600_000;
+    reply = json(200, { grants: [
+      { id: 'g-drive1', capability: 'drive', grantee: { workspaceId: 'ws-1', tabId: 'tab-a' }, workspaces: ['ws-2'], reason: 'portfolio', expiresAt: future, revokedAt: null, revokeReason: null },
+      { id: 'g-owner1', capability: 'owner', grantee: { workspaceId: 'ws-1', tabId: 'tab-o' }, workspaces: ['*'], reason: 'owner session', expiresAt: future, revokedAt: null, revokeReason: null },
+    ] });
+    const listed = await cli(['grant', 'list']);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toMatch(/^g-drive1 {2}ws-1\/tab-a reads ws-2 {2}active until /m);
+    expect(listed.stdout).toMatch(/^g-owner1 {2}ws-1\/tab-o capability: owner workspaces: \* {2}active until .+ {2}"owner session"$/m);
+    expect(JSON.parse((await cli(['grant', 'list', '--json'])).stdout).grants[1]).toMatchObject({ capability: 'owner', workspaces: ['*'] });
+  });
+
   it('exits 1 for a success that is not JSON: another server holds the port', async () => {
     reply = (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -254,6 +267,7 @@ describe('the code → exit table', () => {
     ['lease-policy', 2],
     ['watch-invalid', 2],
     ['reports-to-invalid', 2],
+    ['report-on-invalid', 2],
     ['note-too-large', 2],
     ['config-invalid', 2],
     ['note-target-missing', 2],
@@ -267,6 +281,7 @@ describe('the code → exit table', () => {
     ['caller-unresolved', 3],
     ['grant-password-invalid', 3],
     ['grant-locked', 3],
+    ['grant-owner-active', 3],
     ['tab-not-found', 4],
     ['session-not-running', 4],
     ['target-changed', 4],
@@ -545,9 +560,36 @@ describe('reportsTo and bg --notify (ADR-0018)', () => {
   it.each([
     [['tab', 'reports-to', '-w', 'WS', 'tab-w']],
     [['tab', 'reports-to', '-w', 'WS', 'tab-w', 'tab-o', '--clear']],
+    [['tab', 'reports-to', '-w', 'WS', 'tab-w', '--on']],
   ])('refuses an ambiguous reports-to call: %j', async (args) => {
     expect((await cli(args)).code).toBe(2);
     expect(requests).toHaveLength(0);
+  });
+
+  it('sends --on as reportOn, alone or with a target, and --on all as null (ADR-0025)', async () => {
+    reply = json(200, { tabId: 'tab-w', workspaceId: 'WS', reportsTo: 'tab-o', reportOn: ['DONE', 'BLOCKED'] });
+    expect((await cli(['tab', 'reports-to', '-w', 'WS', 'tab-w', 'tab-o', '--on', 'DONE,BLOCKED'])).code).toBe(0);
+    expect((await cli(['tab', 'reports-to', '-w', 'WS', 'tab-w', '--on', 'NEEDS-DECISION'])).code).toBe(0);
+    expect((await cli(['tab', 'reports-to', '-w', 'WS', 'tab-w', '--on', 'all'])).code).toBe(0);
+    expect((await cli(['tab', 'reports-to', '-w', 'WS', 'tab-w', '--clear', '--on', 'DONE'])).code).toBe(0);
+
+    expect(requests.map((r) => [r.method, r.url, r.body])).toEqual([
+      ['PATCH', '/api/cli/tabs/tab-w?workspaceId=WS', { reportsTo: 'tab-o', reportOn: 'DONE,BLOCKED' }],
+      ['PATCH', '/api/cli/tabs/tab-w?workspaceId=WS', { reportOn: 'NEEDS-DECISION' }],
+      ['PATCH', '/api/cli/tabs/tab-w?workspaceId=WS', { reportOn: null }],
+      ['PATCH', '/api/cli/tabs/tab-w?workspaceId=WS', { reportsTo: null, reportOn: 'DONE' }],
+    ]);
+  });
+
+  it('sends --report-on on tab create and exits 2 on report-on-invalid; a bare flag is refused before any request', async () => {
+    reply = json(400, { error: 'reportOn: unknown marker "FINISHED"', code: 'report-on-invalid', reportOn: 'FINISHED' });
+    const { code, stderr } = await cli(['tab', 'create', '-w', 'WS', '-t', 'claude-code', '--report-on', 'FINISHED']);
+    expect(code).toBe(2);
+    expect(stderr).toContain('report-on-invalid');
+    expect(requests[0].body).toEqual({ workspaceId: 'WS', panelType: 'claude-code', reportOn: 'FINISHED' });
+
+    expect((await cli(['tab', 'create', '-w', 'WS', '--report-on'])).code).toBe(2);
+    expect(requests).toHaveLength(1);
   });
 
   it('sends --notify self on tab bg add, and refuses any other value', async () => {

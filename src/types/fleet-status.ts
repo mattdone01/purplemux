@@ -62,6 +62,8 @@ export interface IFleetRow {
   /** null when the SM inbox could not be read. */
   inbox: IFleetInbox | null;
   flags: IFleetFlag[];
+  /** When `tab restart` last relaunched the tab (ADR-0028); null when it never did. */
+  restartedAt?: number | null;
 }
 
 export interface IFleetUnattributed {
@@ -78,14 +80,26 @@ export interface IFleetThresholds {
   composerMinutes: number;
 }
 
+/** A workspace's agent tabs against the WIP cap (ADR-0027); `overCap := count > cap`. */
+export interface IFleetWip {
+  count: number;
+  cap: number;
+  overCap: boolean;
+}
+
 export interface IFleetView {
   at: number;
   thresholds: IFleetThresholds;
   rows: IFleetRow[];
   /** SM-inbox items whose posting tab is not known, per workspace (never hidden). */
   unattributed: IFleetUnattributed[];
-  /** Read errors by scope (a workspace name, or `watches`, `jobs`, `leases`, `SM inbox`); the rest still renders. */
-  errors: Array<{ scope: string; error: string }>;
+  /**
+   * Read errors by scope (a workspace name, or `watches`, `jobs`, `leases`, `SM inbox`, `WIP cap`); the rest still
+   * renders. A workspace's error also names its `workspaceId`, since a workspace may share a name with a scope.
+   */
+  errors: Array<{ scope: string; error: string; workspaceId?: string }>;
+  /** Per workspace id (ADR-0027); absent from a server older than it, or when the cap could not be read. */
+  wip?: Record<string, IFleetWip>;
 }
 
 export type TComposerReading = 'empty' | 'text' | 'unreadable';
@@ -115,4 +129,6 @@ export interface IFleetTabFacts {
   composer: { reading: TComposerReading; since: number | null } | null;
   /** Open SM-inbox items this tab opened; null when the SM inbox could not be read. */
   inbox: Array<{ createdAt: number; reviewed: boolean }> | null;
+  /** The layout's `lastRestartAt` (ADR-0028); null when the tab was never restarted. */
+  restartedAt?: number | null;
 }

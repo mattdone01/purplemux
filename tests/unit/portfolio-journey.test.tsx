@@ -44,7 +44,7 @@ describe('synthetic local portfolio journey', () => {
           clearingCondition: 'one free slot' } };
       const impact = store.report(report).impact;
       store.reserveAction('orphan-action', impact.id, 0, 'Use current slot', 'human');
-      const note = await new NotesService(deps).sendHumanPortfolio('human', 'ws-a', {
+      const note = await new NotesService(deps).sendHuman('human', 'ws-a', {
         toWorkspace: 'ws-a', subject: 'Portfolio action', body: 'Use current slot',
         externalKey: 'portfolio:action:orphan-action',
       });
@@ -97,7 +97,7 @@ describe('synthetic local portfolio journey', () => {
     try {
       const impact = store.report(report).impact;
       store.reserveAction('delivered-action', impact.id, 0, 'Wait for proof', 'human');
-      const note = await new NotesService(deps).sendHumanPortfolio('human', 'ws-a', {
+      const note = await new NotesService(deps).sendHuman('human', 'ws-a', {
         subject: 'Portfolio action', body: 'Wait for proof', externalKey: 'portfolio:action:delivered-action',
       });
       store.completeAction('delivered-action', note.id);
@@ -183,10 +183,10 @@ describe('synthetic local portfolio journey', () => {
     try {
       const impact = store.report(report).impact;
       store.reserveAction('action-a', impact.id, 0, 'Ask holder to release', 'human');
-      const note = await notes.sendHumanPortfolio('human', 'ws-a', {
+      const note = await notes.sendHuman('human', 'ws-a', {
         toWorkspace: 'ws-a', subject: 'Portfolio action', body: 'Ask holder to release', externalKey: 'portfolio:action:action-a',
       });
-      const replay = await notes.sendHumanPortfolio('human', 'ws-a', {
+      const replay = await notes.sendHuman('human', 'ws-a', {
         toWorkspace: 'ws-a', subject: 'Portfolio action', body: 'Ask holder to release', externalKey: 'portfolio:action:action-a',
       });
       expect(replay.id).toBe(note.id);

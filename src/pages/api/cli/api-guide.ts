@@ -13,7 +13,10 @@ entries and legacy drive grants allow authorized reads only. A human-saved Scrum
 selection also gives its exact current launch-verified manager tab reads in the selected
 workspaces. The global CLI token
 is not human identity and cannot mutate these surfaces. Foreign requests go through
-coordinator notes; use authenticated local human controls for human actions.
+coordinator notes; use authenticated local human controls for human actions. Creating a
+workspace is the one exception: only the global token may (POST /api/cli/workspaces, ADR-0024).
+The owner grant (ADR-0029) gives its one verified tab reads of every workspace and notes with
+admission "owner" ("send a note as owner"); it never permits a foreign mutation.
 An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
 
 ## Caller identity
@@ -44,31 +47,59 @@ is kept for compatibility; "code" is the machine-readable class. HTTP statuses a
 Branch on "code" (or on the CLI's exit code), never on the "error" text. The CLI maps each code
 to an exit code through one table:
 
-  exit  meaning                                  codes                                       retry?
-     0  success                                  —                                           —
+  exit  meaning                                  codes                                      retry?
+     0  success                                  —                                          —
      1  unexpected error                         unmapped code, 5xx, gh-unavailable,        investigate
                                                  outcome-unknown (a write lost its
-                                                 connection: check the state first)
-     2  usage error                              bad or missing argument; lease-policy,     fix the command
-                                                 watch-invalid, reports-to-invalid,
+                                                 connection: check the state first),
+                                                 close-not-confirmed; unmapped server
+                                                 codes, for example: burndown-unreadable,
+                                                 workspace-create-failed,
+                                                 tab-count-unreadable
+     2  usage error                              bad or missing argument; invalid-request,  fix the command
+                                                 lease-policy, watch-invalid,
+                                                 reports-to-invalid, report-on-invalid,
                                                  note-too-large, note-invalid,
                                                  config-invalid, note-target-missing,
-                                                 deploy-invalid
-     3  conflict / refused by state              forbidden, lease-held, lease-held-by-other, after the state changes
-                                                 watch-cap, inbox-not-held, caller-unresolved,
-                                                 grant-tab-unverified, grant-password-invalid,
-                                                 grant-locked, config-version-conflict,
-                                                 note-cap
+                                                 deploy-invalid, invalid-burndown,
+                                                 burndown-too-large, remote-host-invalid,
+                                                 remote-type-unsupported, cwd-missing,
+                                                 orchestration-precondition-required,
+                                                 orchestration-invalid
+     3  conflict / refused by state              conflict, unauthorized, forbidden,         after the state changes
+                                                 lease-held, lease-held-by-other,
+                                                 watch-cap, inbox-not-held,
+                                                 caller-unresolved, grant-tab-unverified,
+                                                 grant-password-invalid, grant-locked,
+                                                 config-version-conflict, note-cap,
+                                                 grant-owner-active,
+                                                 orchestration-conflict,
+                                                 orchestrator-state-unknown,
+                                                 orchestrator-live,
+                                                 orchestrator-candidate-invalid,
+                                                 orchestration-work-remains,
+                                                 orchestration-recovery-required
      4  target gone (permanent)                  tab-not-found, session-not-running,        NEVER
                                                  target-changed
      5  not ready yet                            readiness-timeout                          yes, bounded
-     6  server unreachable                       connection refused, no port configured,    yes, bounded
-                                                 a read interrupted; routes-absent (404     (routes-absent:
-                                                 without JSON: no such route — an older     no, until the
-                                                 server, a foreign one, or a malformed id)  cause is fixed)
-     7  not found                                lease-not-found, note-not-found,           —
+     6  server unreachable                       server-unreachable: connection refused,    yes, bounded
+                                                 no port configured, a read interrupted;    (routes-absent:
+                                                 routes-absent (404 without JSON: no such   no, until the
+                                                 route — an older server, a foreign one,    cause is fixed)
+                                                 or a malformed id);
+                                                 remote-host-unreachable (a remote tab's
+                                                 host did not answer)
+     7  not found                                not-found (an unknown workspace or         —
+                                                 record), lease-not-found, note-not-found,
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found
+     3  refused by state (ADR-0027)              wip-cap, config-store-unreadable           after the state changes
+     1  (flow, ADR-0026)                         flow-unreadable; flow-write-failed         investigate
+     2  (flow, ADR-0026)                         flow-invalid, flow-too-large               fix the command
+     7  (flow, ADR-0026)                         flow-not-found (client-side: flow show)    —
+     1  unexpected error (tab restart, ADR-0028) restart-not-confirmed                      inspect the tab
+     2  usage error (tab restart, ADR-0028)      restart-unsupported                        fix the command
+     3  conflict (tab restart, ADR-0028)         tab-busy                                   when idle, or --interrupt
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -122,6 +153,24 @@ what, so treat it as a refusal.
 GET /api/cli/workspaces
   Response: { "workspaces": [{ "id": "...", "name": "...", "directories": [...] }] }
 
+POST /api/cli/workspaces                                (purplemux workspace create -n NAME -d DIR...)
+  Body: { "name": "...", "directories": ["/abs/primary", "/abs/other", ...] }
+  Admin token only (ADR-0024): the one workspace write the global token holds, because no
+  workspace exists yet to scope a token to. A workspace or tab token answers 403 forbidden;
+  inside a tab the CLI presents the tab's own token, so run it from a shell outside every tab
+  (or with PMUX_TAB_TOKEN and PMUX_TOKEN unset). Cooperative, not a security boundary.
+  Creates the workspace through the same store call as the web UI: the registry entry, the
+  first terminal tab with its tmux session, and the workspace's own agent homes. directories[0]
+  is the primary (the cwd of new tabs) and must exist; every entry must be an existing absolute
+  directory (nothing is created). Name: 1-100 characters, trimmed, no control characters, and
+  unique across workspaces ignoring case. Orchestration starts off. One audit line
+  (workspace-create) goes to ~/.purplemux/audit/coordination.jsonl.
+  Response: { "id": "ws-...", "name", "directories": [...], "defaultTabId": "tab-..." | null }
+  Errors: invalid-request 400 (exit 2: bad body, missing or non-directory path), forbidden 403
+  (exit 3), conflict 409 (exit 3: the name is taken; the message names the holder's id),
+  workspace-create-failed 500 (exit 1: nothing was created). A failure to register the first
+  tab after the create answers 200 with "defaultTabId": null; the workspace exists.
+
 GET /api/cli/workspaces/<workspaceId>/directories
   Response: { "workspaceId", "name", "directories": [...] }
 
@@ -142,6 +191,17 @@ GET /api/cli/grants
   Legacy portfolio grants retain read access for their verified grantee tab until expiry or revocation.
   They never authorize foreign input, tab creation/closure, browser evaluation, or settings changes.
   Grant administration remains in the authenticated human UI. No CLI token proves human identity.
+  An owner grant (ADR-0029; capability "owner", workspaces ["*"]) lets its one verified grantee tab
+  read every workspace, including one created later, and send notes with admission "owner"; it
+  confers no mutation right either. Every token sees it in this list. Only the web UI creates one
+  (POST /api/grants with the purplemux password); a second while one is active answers 409
+  grant-owner-active (exit 3). Reads under it are audited as owner-read, at most once per
+  (grant, workspace) per hour.
+  Response: { "grants": [...], "refused": [{ "capability", "file", "error", "code": "grant-store-unreadable" }] }.
+  Each grant file fails alone: grants holds the records of each readable file (the grants in force),
+  refused names an unreadable one (always present, [] when both read; not filtered by scope). Only
+  both files refused answers 500 grant-store-unreadable naming both. grant list then prints the
+  readable grants and exits 1 with the refusal on stderr.
 
 POST /api/cli/tab-identity  { session }
   Story 36: the Claude SessionStart hook of a tab created before tab tokens asks for a hook-time
@@ -155,7 +215,7 @@ GET /api/cli/tabs?workspaceId=WS
   launch (token bound at launch), hook (taken at a Claude SessionStart and used at least once,
   story 36) or none (no tab token yet: a hook token that was minted but never presented shows none).
   Response: { "tabs": [{ "tabId", "workspaceId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId",
-    "cliState", "lastEvent", "busySince", "reportsTo", "identity", "host"? }] }
+    "cliState", "lastEvent", "busySince", "reportsTo", "reportOn", "identity", "host"? }] }
   "host" is present only on a remote tab (ADR-0022): the ssh alias whose tmux runs it.
   cliState / lastEvent ({ name, at, seq }) / busySince are the live status (null when unknown).
   A busy tab whose lastEvent is "stop" waits only on open background work (WAITING, ADR-0018:
@@ -164,8 +224,21 @@ GET /api/cli/tabs?workspaceId=WS
 
 POST /api/cli/tabs
   Body: { "workspaceId": "WS", "name"?: "...", "panelType"?: "terminal" | "claude-code" | "codex-cli" | "grok-cli" | "agent-sessions" | "web-browser" | "diff",
-          "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-...", "host"?: "HOST", "cwd"?: "/abs/dir" }
+          "model"?: "...", "reasoning"?: "...", "launch"?: boolean, "reportsTo"?: "tab-...", "reportOn"?: ["DONE", ...] | "DONE,BLOCKED",
+          "host"?: "HOST", "cwd"?: "/abs/dir", "overCap"?: { "reason": "1..500 chars" } }
   Invalid panelType returns HTTP 400 with validPanelTypes.
+  WIP cap (ADR-0027): an agent tab (claude-code, codex-cli, grok-cli; local or remote; --no-launch
+  tabs too) is refused while the workspace already holds fleet config tabs.cap-per-workspace agent
+  tabs (default 8; terminal, web-browser, diff and agent-sessions tabs do not count). The count and
+  the add run under one lock, so two creates at cap - 1 cannot both pass. Refusal: 409 { "code":
+  "wip-cap", "error": "WS holds 8 of 8 agent tabs", "workspaceId", "count", "cap", "capSource" }
+  (exit 3); nothing is created. A fleet config that cannot be read refuses every agent create with
+  503 { "code": "config-store-unreadable" } (exit 3), never "no cap". "overCap" passes the cap: only
+  from a verified tab that is its workspace's enabled orchestrator, else 403 forbidden (exit 3);
+  a reason that is empty or longer than 500 characters is 400 invalid-request (exit 2). A create
+  that passed the cap appends { "event": "tab-over-cap", "workspaceId", "tabId", "count", "cap",
+  "reason", "by" } to ~/.purplemux/audit/coordination.jsonl. The human's own create
+  (POST /api/layout/pane/<paneId>/tabs) is never refused; its agent answer gains "wip".
   "host" runs the tab's tmux on that host over ssh (ADR-0022). It must be listed in fleet config
   remote.hosts, else 400 { "code": "remote-host-invalid" }; terminal and claude-code tabs run remote,
   codex-cli and grok-cli do not: 400 { "code": "remote-type-unsupported" } (both CLI exit 2). A host that does not answer
@@ -178,6 +251,11 @@ POST /api/cli/tabs
   "reportsTo" names a live tab of the SAME workspace that receives this tab's watchdog nudges
   ahead of the workspace orchestrator; anything else is 400 { "code": "reports-to-invalid" }
   (CLI exit 2). It is cleared when that tab closes.
+  "reportOn" (ADR-0025) names the end-line markers whose turn-marker nudges the target receives:
+  a non-empty subset of DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED, as an array
+  or a comma-separated string; absent, null or "all" forwards every marker. A turn that ends on a
+  marker outside the list is classified and recorded (tab status shows turnEnd) but nudges nobody,
+  and no idle nudge follows it. An unknown name or an empty list is 400 { "code": "report-on-invalid" } (exit 2).
   Creates a tab in the first pane of the workspace. Agent tabs (claude-code / codex-cli / grok-cli)
   auto-launch their CLI with purplemux hooks wired, so the tab reports cliState and can
   receive prompts via send immediately. "model" sets the agent model (claude --model /
@@ -187,15 +265,27 @@ POST /api/cli/tabs
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (grok --effort);
   codex-cli: "minimal" | "low" | "medium" | "high" (model_reasoning_effort). "launch": false
   keeps the old bare-shell behavior.
-  Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched", "host"? }
+  Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched", "host"?,
+              "wip"?: { "count", "cap", "overCap" } } — wip on an agent tab: the count with the new tab; overCap = count > cap
+  A codex-cli tab whose launch fails after the create keeps its tab, and the tab counts against the
+  cap: 500 { "error", "reason", "tabId", "generation"?, "launchState", "wip" } when the launch
+  could not be prepared or submitted, 503 with the same fields when it was not confirmed.
+
+GET /api/cli/workspaces/<WS>/tab-count   (any scope that may read WS)
+  The workspace's agent tabs against the WIP cap; \`purplemux tab count -w WS [--json]\` prints
+  "<count> <cap>". Repository hooks read it instead of counting tmux sessions.
+  Response: { "workspaceId", "count", "cap", "capSource": "fleet-config" | "default" | "default-invalid", "overCap" }
+  404 not-found (exit 7) for an unknown workspace; 503 config-store-unreadable (exit 3); 500 tab-count-unreadable (exit 1).
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
   Tab info.
-  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId", "reportsTo" }
+  Response: { "tabId", "workspaceId", "paneId", "name", "sessionName", "panelType", "agentProviderId", "agentSessionId", "reportsTo", "reportOn" }
 
 PATCH /api/cli/tabs/<tabId>?workspaceId=WS
-  Body: { "reportsTo": "tab-..." | null } — on its own. Sets or clears the nudge target (same rules
-  as create; a tab cannot report to itself). Response: { "tabId", "workspaceId", "reportsTo" }
+  Body: { "reportsTo"?: "tab-..." | null, "reportOn"?: [...] | "DONE,BLOCKED" | null } — one or both, and
+  nothing else. reportsTo sets or clears the nudge target (same rules as create; a tab cannot report
+  to itself); reportOn sets or clears (null / "all") the markers it forwards (ADR-0025).
+  Response: { "tabId", "workspaceId", "reportsTo", "reportOn" } with the tab's current values.
   Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
 
 DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
@@ -207,6 +297,35 @@ DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
               "killed": [{ "pid", "comm", "args" }], "survivors": [...] } — ok false means the layout kept
   the tab; the CLI then exits 1 (close-not-confirmed) instead of printing ok. Every kill is audited
   in ~/.purplemux/audit/coordination.jsonl.
+
+POST /api/cli/tabs/<tabId>/restart?workspaceId=WS
+  Body: { "clear"?: boolean, "interrupt"?: boolean }   (ADR-0028; own workspace only)
+  A fresh agent process under the SAME tab id: the tab's processes are reaped (as for a close),
+  its tmux session is recreated with the same name, and the server relaunches the agent with the
+  tab's own agentLaunchConfig (model, effort), cwd, scope, reportsTo and host. No tab-closing or
+  tab-closed fires, so the tab's token, leases, watches, probes, notes, grants, reports-to links
+  and Mission Control run binding stay. A hook-time token is replaced by a fresh launch token.
+  The agent resumes its last session where the provider can; clear starts a new one; a remote tab
+  restarts fresh. A terminal tab restarts its shell. The tab's registered background jobs die with
+  the reap and raise no failure; probes stay.
+  Response: { "ok": true, "workspaceId", "tabId", "resumed": boolean,
+              "resumeSkipped"?: "clear" | "no-session" | "remote" | "cwd-lost", "identity": "launch" | "hook" | "none",
+              "reaped": { "killed": N, "survivors": N }, "launchState"?: "active" | "held" }
+  400 { "code": "restart-unsupported" } (exit 2) for a web-browser, diff or agent-sessions tab.
+  404 { "code": "tab-not-found" } (exit 4). 409 { "code": "tab-busy", "cliState" } (exit 3) while
+  the tab is mid-turn or holds a pending launch or turn; interrupt: true abandons the turn, and the
+  audit line records it. 503 { "code": "remote-host-unreachable" } (exit 6): nothing was killed.
+  500 { "code": "restart-not-confirmed", "reaped" } (exit 1): a process or the session outlived the
+  reap, or the restart failed after the kill (a remote host that stops answering, the tab gone),
+  and nothing was relaunched. cwd-lost: the tab's cwd was gone, so the agent started fresh in the
+  nearest existing parent. An attached terminal is closed with 4002 "Tab restarting" (never 1000)
+  and re-attaches; a connect during the restart gets 4002. 403 forbidden (exit 3) for the admin token or another
+  workspace. Each restart appends one "tab-restart" line to ~/.purplemux/audit/coordination.jsonl.
+  The tab gains lastRestartAt in layout.json; the fleet row shows restartedAt.
+  The web UI and the phone use the cookie twin POST /api/tabs/<tabId>/restart?workspaceId=WS
+  (a human session and this server's Origin).
+  CLI: purplemux tab restart -w WS TAB_ID [--clear] [--interrupt] [--json]
+       prints "ok TAB_ID restarted (resumed)" or "(fresh)".
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }
@@ -336,11 +455,14 @@ POST /api/cli/inbox/<id>/retry
 A note is a body the recipient pulls. A same-workspace --to-epic note routes directly to the live
 epic holder. A cross-workspace note routes to the enabled, live orchestrator of the holder's
 workspace; --to-workspace uses that workspace's orchestrator too. Cross-workspace and unresolved
-epic sends require the verified current source orchestrator. Admission is persisted across source
-orchestrator handover. With no target orchestrator the note is "undeliverable" with a reason and
+epic sends require the verified current source orchestrator, or the verified tab holding the active
+owner grant (admission "owner", with its grantId; it routes like an orchestrator's note, and each
+send is audited as owner-note). Admission is persisted across source orchestrator handover and
+survives a later revoke of the owner grant. With no target orchestrator the note is "undeliverable" with a reason and
 never falls back to a worker. The recipient's tab
 receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
-show n-…, then purplemux note ack n-…"; the subject and body are never typed. If that tab closes
+show n-…, then purplemux note ack n-…" (from "owner (<ws>/<tab>)" for an owner note); the subject and
+body are never typed. Every note view carries fromLabel, the same server-made words after "from". If that tab closes
 before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
 the line reached its composer, and one notice reaches the sender's tab (if live) at 60 min; no
 more. A note unacked or undeliverable for 14 days expires (one notice to a live sender); acked and
@@ -359,12 +481,12 @@ POST /api/cli/notes
   characters removed), "body" (≤ 16 KiB UTF-8), "fromEpic"? (only the holder of epic:<slug>) }.
   Response: { "note": INoteView }. 413 note-too-large (exit 2), 400 note-target-missing / note-invalid
   (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold or a cross-workspace
-  sender that is not the verified current source orchestrator.
+  sender that is neither the verified current source orchestrator nor the owner-granted tab.
 
 GET /api/cli/notes[?open=1][&toMe=1][&fromMe=1][&epic=SLUG]
   Notes the caller's workspace sent or receives (admin: all), without bodies.
   Response: { "notes": [{ "id", "from", "to", "subject", "state", "deliveredTo", "routedAt",
-    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", "receipt", ... }] }
+    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", "fromLabel", "receipt", ... }] }
 
 GET /api/cli/notes/<id>
   The recipient workspace, the sender workspace, or admin. Response: { "note", "body" }.
@@ -423,6 +545,43 @@ Keys in use:
   watchdog.wait-backstop-hours
                Hours (0, 168], decimals allowed, a tab may wait on a live registered job or armed
                watch before its one "has been WAITING" nudge. Unset or invalid means 4.
+  fleet-status.stall-minutes  fleet-status.waiting-long-minutes  fleet-status.unanswered-minutes
+  fleet-status.composer-minutes
+               The fleet flag thresholds (ADR-0023), in minutes (0, 10080], decimals allowed:
+               STALL? after N quiet minutes (default 30), WAITING-LONG after M minutes waiting
+               (120), UNANSWERED after K minutes (30), and STALL? after C minutes of composer text
+               (2). Read on every fleet read; unset or invalid means the default. Written by the
+               admin token or an enabled orchestrator (ADR-0019).
+  remote.hosts The ssh aliases that remote tabs may use (ADR-0022), comma-separated; a name that is
+               not an ssh alias is 400 config-invalid. Unset means no remote host. Admin token only.
+  remote.callback-url
+               The URL a remote tab's hooks and CLI use to reach this server, http(s)://host[:port].
+               Plain http only to loopback, 100.64.0.0/10, a *.ts.net name or a bare name on
+               remote.callback-allow-hosts; else 400 config-invalid. Unset means
+               http://<this hostname>:<port>. Admin token only.
+  remote.callback-allow-hosts
+               Bare lower-case host names that remote.callback-url may name over plain http,
+               comma-separated. Admin token only.
+  tabs.cap-per-workspace
+               The WIP cap (ADR-0027): an integer 1..200 of agent tabs per workspace, one value
+               for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
+               (capSource "default-invalid", the value logged). Admin token only (exit 3 forbidden
+               for a tab): any one orchestrator could otherwise raise it for every workspace.
+  flow.window-minutes  flow.lock-busy-percent  flow.queue-length  flow.oldest-minutes
+               The flow-flag thresholds (ADR-0026): the busy-share window in minutes 10..10080
+               (default 360), the busy percent 1..100 (80), the queue length, a whole number
+               1..10000 (10), and the oldest-item age in minutes 1..10080 (240). Read on every flow
+               read; unset or invalid means the default, and the server logs why. Written by the
+               admin token or an enabled orchestrator (ADR-0019).
+  attention.auto-answer.bookkeeping-minutes
+               The bookkeeping auto-answer rule (ADR-0031): an integer 1..10080 of minutes. Unset
+               (the default) or any invalid value is off (an invalid value is logged). Admin token
+               only (exit 3 forbidden for a tab): the rule answers items in every workspace.
+  alerts.flags  alerts.flag-repeat-minutes
+               Flag alerts (ADR-0032). alerts.flags "off" stops every flag alert; any other value,
+               or unset, is on. alerts.flag-repeat-minutes, 1..10080 (default 60, decimals allowed),
+               is the least time between two alerts for one flag. Admin token only (exit 3
+               forbidden for a tab): they decide what reaches the owner's phone.
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
@@ -487,7 +646,9 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
 
   Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:,
   READY-TO-MERGE: or CHECKPOINTED: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>
-  — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along).
+  — read with: purplemux tab result -w <ws> <tab>" (up to 5 READY-TO-MERGE lines ride along),
+  unless the tab's reportOn (tab create --report-on / tab reports-to --on, ADR-0025) leaves that
+  marker out: then the stop is recorded and no nudge goes anywhere.
   No marker and open background work (the agent's own tasks, a live tab bg job, or an armed
   purplemux watch the tab owns) → WAITING, no nudge. Otherwise no nudge at once: if the tab stays
   on that stop for the idle window (fleet config watchdog.idle-nudge-minutes, default 15) with
@@ -529,14 +690,125 @@ POST /api/cli/workspaces/<workspaceId>/burndown        (purplemux burndown publi
           "history": [{ "at", "slug", "total", "burned", "remaining", "pct", "stories", "unpointed" }] }
   Own workspace only. Counts and points are non-negative integers; pct is 0..100; burned +
   remaining = total; done_events points + undated_burned = burned; slugs are unique. A refusal
-  (400 invalid-burndown) names the field, what it saw and what it expected; nothing is stored.
+  (400 invalid-burndown, exit 2) names the field, what it saw and what it expected; nothing is
+  stored.
   Unknown fields are dropped. At most 100 epics; history keeps the newest 2000 rows by "at"
-  (the CLI trims before sending); the stored snapshot is at most 1 MiB (413 otherwise).
+  (the CLI trims before sending); the stored snapshot is at most 1 MiB (413 burndown-too-large, exit 2,
+  otherwise).
   Each publish replaces the previous one. The portfolio board renders the burndown of the
   selected Scrum Master's workspace and marks it stale 2 h after "generated_at".
 
 GET /api/cli/workspaces/<workspaceId>/burndown         (purplemux burndown show -w WS)
   Response: { "burndown": { "workspaceId", "receivedAt", "snapshot": { ... } } | null }
+  A stored file that does not validate is 500 burndown-unreadable (exit 1), never null.
+
+## Flow (ADR-0026)
+
+POST /api/cli/workspaces/<workspaceId>/flow            (purplemux flow publish -w WS --json @FILE)
+  Body: one flow snapshot (src/types/flow.ts IFlowSnapshot). Every key is required; an unknown key
+  is refused, so a typo never drops data. Times are Unix ms:
+        { "schemaVersion": 1, "generatedAt", "source": "<1..64>",
+          "queues": [{ "name": "<1..64, unique>", "capacity": 1..10000 | null,
+                       "items": [{ "id": "<1..128, unique in its queue>", "label": "<= 120" | null, "since",
+                                   "state": "queued" | "active" | "held", "pinned": bool, "holder": "<= 128" | null }] }],
+          "locks":  [{ "name": "<1..64, unique>", "heldBy": "<= 128" | null (free), "since" | null (null when free) }],
+          "meters": [{ "name": "<1..64, unique>", "value": finite, "unit": "<= 16", "limit": finite | null,
+                       "windowMinutes": 1..10080 | null }],
+          "flags":  [{ "text": "<1..200>", "severity": "info" | "warn" | "block" }] }
+  Own workspace only: a peer, a grant or the admin token gets 403 forbidden. At most 20 queues,
+  500 items per queue, 20 locks, 50 meters and 20 flags; no time more than 5 min after the server
+  clock. No string holds a control character (newline, ESC) or a bidi control (U+061C, U+200E,
+  U+200F, U+202A-U+202E, U+2066-U+2069); an identifier (source, a queue, lock or meter name, an item
+  id, holder, heldBy, unit) also holds no other format character such as ZWJ or a soft hyphen,
+  while label and flag text keep them (emoji sequences, ZWNJ scripts). A held lock names a
+  non-blank heldBy. A refusal (400 flow-invalid, exit 2) names the field, what it saw (format and
+  bidi characters echoed as \\u{...}) and what it expected; the stored record does not change.
+  Over 1 MiB serialized: 413 flow-too-large (exit 2; the CLI refuses before it sends). 404
+  not-found for an unknown workspace. 500 flow-write-failed (exit 1, investigate) when the store
+  cannot write; the previous record stays as it was.
+  Response: { "ok": true, "workspaceId", "receivedAt", "generatedAt", "historyRows", "historyReset", "bytes" }
+  The server appends one history row per publish, derived from the snapshot; a producer never
+  sends history: { "at": receivedAt, "queues": { name: length }, "oldest": { name: since of the
+  oldest item | null }, "locks": { name: held }, "meters": { name: value } }. The record keeps the
+  newest 2000 rows and at most 4 MiB; the oldest rows go first. A stored record that does not
+  validate is kept as flow.json.corrupt-<receivedAt> by the next publish, which starts a fresh
+  history and answers "historyReset": true. "bytes" is the stored record's size.
+
+  Example, from a board script on a timer (the CLI prints ok <receivedAt> <historyRows>):
+    purplemux flow publish -w "$PMUX_WORKSPACE_ID" --json @flow.json
+    ok 1793001600000 412
+  with flow.json:
+    { "schemaVersion": 1, "generatedAt": 1793001590000, "source": "v2-flow",
+      "queues": [{ "name": "landing", "capacity": null, "items": [{ "id": "lane/a0", "label": null,
+                   "since": 1792760000000, "state": "queued", "pinned": false, "holder": null }] }],
+      "locks": [{ "name": "landing", "heldBy": "lane/b1", "since": 1792999800000 }],
+      "meters": [{ "name": "gate-slots", "value": 4, "unit": "slots", "limit": 5, "windowMinutes": null }],
+      "flags": [{ "text": "main is red", "severity": "block" }] }
+
+GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
+                                                       (purplemux flow show -w WS [--json] [--history all|window|none])
+  Read scope: the own token, a peer, a grant, the admin token. history defaults to all; window
+  keeps the rows of the last flow.window-minutes (360 by default); none sends no rows. Response:
+  { "flow": { "workspaceId", "receivedAt", "snapshot", "history" } | null, "stale": bool | null,
+  "derived"?: { "flags": [{ "rule", "subject", "text", "severity": "warn" | "block" }],
+  "lockBusyShare": { name: 0..1 | null }, "lockKnownMinutes": { name: minutes },
+  "insufficientHistory": [lock name], "windowMinutes", "thresholds": { "windowMinutes",
+  "lockBusyPercent", "queueLength", "oldestMinutes" } } }; stale is true more than 10 min after
+  receivedAt; derived is absent when flow is null. A stored record that does not validate
+  answers 500 flow-unreadable (exit 1), never "no flow published". For "flow": null the CLI
+  prints "no flow published" and exits 7 (flow-not-found, decided by the CLI). flow show prints
+  each lock's busy share and a "derived flags" section.
+  The derived flags come from the full record, whatever history the answer carries, sorted block,
+  warn, then rule and subject:
+    stale       no publish for 10 min. A stale record raises only this flag.
+    lock-busy   the lock's busy share over the window is at least flow.lock-busy-percent. The share
+                is time-weighted: each history row's state holds until the next row (the newest
+                until now); a gap over 10 min, a clock step back and a row without the lock are
+                unknown time. Known time under half the window: share null, the lock listed in
+                insufficientHistory, no flag.
+    queue-long  a queue holds at least flow.queue-length items.
+    queue-old   a queue's oldest item is older than flow.oldest-minutes.
+    queue-full  (block) a queue with a capacity holds at least that many items.
+    meter-over  a meter's value is above its limit.
+  Flag alerts (ADR-0032): every 60 s the server reads the fleet flags (STALL?, WAITING-LONG,
+  UNANSWERED) and these derived flags. A flag raised since the previous read sends the human one
+  status-socket notification:alert of kind "flag" with "flag": { "source": "fleet" | "flow",
+  "rule", "subject", "text" }. tabId is the flagged tab, or the workspace's enabled orchestrator
+  for a flow flag and a workspace-level UNANSWERED; with no orchestrator nothing is sent. A flag
+  that stays raised sends nothing more, and one raised again alerts only after
+  alerts.flag-repeat-minutes. The first read after a server start sends nothing, and so does the
+  first good read of any source read late; an unreadable store raises nothing and clears nothing;
+  a target that cannot be checked is retried next tick. The orchestrator-only alert setting does
+  not apply. No inbox notice is sent: the alert is for the human, not for an agent.
+
+## Spend (ADR-0030)
+
+GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role]
+                                                       (purplemux spend show -w WS [--since D] [--until D] [--by ...] [--json])
+  Read scope on WS. since/until are UTC days, both inclusive; the default is the last 7 UTC days
+  and by=tab. Spend keeps the last 92 UTC days (today − 91 … today), including usage whose
+  transcript has since left the disk. A bad date, since after until, a range over 92 days, a
+  since before today − 91, or a bad "by" is 400 invalid-request (exit 2). An unknown workspace
+  is 404 not-found. An index that cannot be read (index.state "unavailable") has no numbers:
+  the CLI prints the served error and exits 1.
+  Response (ISpendView):
+    { "workspaceId", "from", "to", "by", "generatedAt",
+      "totals": ISpendRow, "rows": [ISpendRow], "unattributed": ISpendRow | null,
+      "roleBasis"?: "current-orchestrator",
+      "dayBasis": { "claude": "message", "codex": "session-start", "grok": "session-start" },
+      "index": { "state": "ready"|"indexing"|"unavailable", "filesIndexed", "filesTotal",
+                 "indexedThrough": <ms>|null, "error"? } }
+    ISpendRow: { "key", "label", "providerId": "claude"|"codex"|"grok"|null, "inputTokens",
+      "outputTokens", "cacheReadTokens", "cacheCreationTokens", "totalTokens", "sidechainTokens",
+      "costUsd": <USD estimate>|null, "unpricedTokens" }
+  sum(rows) + unattributed = totals for every token field. Usage of an agent session that no
+  tab binding names is "unattributed": never dropped, never 0. Subagent transcripts count under
+  the parent session's tab and are reported in sidechainTokens. costUsd sums the tokens of
+  priced models; tokens of a model with no known price go to unpricedTokens, and a row with no
+  priced token has costUsd null (print "—", never $0). by=role rows are "orchestrator" (the
+  workspace's enabled orchestrator NOW) and "other". Transcripts are read by a background
+  index; while index.state is "indexing" the numbers are partial. A request never parses a
+  transcript.
 
 ## Portfolio board
 
@@ -626,6 +898,49 @@ POST /api/cli/mission-control/events?workspaceId=WS
       "storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual",
       "blockingScope":"story","canContinue":true}}]}
 
+  Attention class and stated default (ADR-0031): attention.opened and attention.updated accept
+  two optional payload fields. "class" is one of "money", "irreversible", "scope" or
+  "bookkeeping". "defaultOptionId" names one of the item's options[].id; an action item has no
+  options, so a default on it is refused. An unknown class or a default that names no option
+  refuses the whole batch with 400, and the error names the field. A producer that cannot name
+  the class omits it; money, irreversible and scope are never auto-answered. Only the producer
+  sets the class: the server never guesses one, and an item without a class reads "class": null
+  (shown as Unclassified). The snapshot item carries "class" and "defaultOptionId" (null when
+  absent); attention.updated replaces both under the item revision rule, and a change of either
+  on an open item needs renewed review like any other question change. The snapshot also carries
+  "answersByClass": [{ "day": "YYYY-MM-DD", "class": "money"|...|"unclassified",
+  "by": "human"|"rule", "count": N }] for the last 7 UTC days: the days end on the UTC day of the
+  snapshot's "generatedAt", today included. Rows are sparse: when "answersByClass" is present, a
+  missing (day, class, by) row is a count of 0; when the field is absent, the counts are unknown.
+  {"events":[{"eventId":"evt-question-2","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
+    "expectedRevision":0,"producerAt":1700000000003,"bindingGeneration":1,"type":"attention.opened",
+    "payload":{"itemId":"question-2","kind":"question","title":"Record the release note",
+      "context":"Add the rollout to the release notes","storyIds":[],
+      "options":[{"id":"gradual","label":"Gradual"},{"id":"direct","label":"Direct"}],
+      "recommendation":"gradual","blockingScope":"none","canContinue":true,
+      "class":"bookkeeping","defaultOptionId":"gradual"}}]}
+
+  Bookkeeping auto-answer (ADR-0031): when the admin sets fleet config
+  attention.auto-answer.bookkeeping-minutes to N, the server checks once a minute for an item
+  that is open, has a humanReview whose humanNeed is not "none", has "class": "bookkeeping", is
+  not an action, has a "defaultOptionId" that names a current option, and whose last revision is
+  at least N minutes old. It records an answer for that item with "optionIds": [defaultOptionId]
+  as the actor "system:auto-answer". The answer is delivered and acknowledged like a human
+  answer; the rule never resolves or cancels an item. Money, irreversible, scope, unclassified
+  and default-less items are never auto-answered. A human answer or a cancel that comes first
+  wins. The answer text, and the item's "autoAnswer" note, read: Auto-answered under fleet
+  config attention.auto-answer.bookkeeping-minutes=N (version V) at ISO-TIME: applied the
+  stated default "LABEL". The "answer.recorded" event of a rule answer carries
+  "actor": "system:auto-answer". The submission IDs "auto:..." and the event IDs
+  "answer:auto:..." are reserved for the rule (400 invalid-request), and a human session
+  subject that starts with "system:" is refused (403 forbidden).
+  Each snapshot item carries "autoAnswer": { "rule", "ruleVersion", "appliedOptionId", "at",
+  "note" }, or null when no rule answered it. The snapshot carries "autoAnswered": [{ "itemId",
+  "workspaceId", "runId", "title", "class", "appliedOptionId", "appliedOptionLabel", "at",
+  "note", "itemState" }] for the last 7 days, newest first, at most 100 rows. An absent field
+  means the server does not report it (not available), never 0 and never "no auto-answers"; an
+  absent "autoAnswer" on an item reads as null.
+
   Ordinary attention creates a durable candidate. Workers route blockers to the
   orchestrator. The configured orchestrator checks existing instructions, authority,
   evidence, and delegated handling. Routine setup, coordination, already-granted
@@ -691,11 +1006,33 @@ CLI equivalents:
   Both forms forward humanInboxPolicy so ordinary turns can review pending legacy candidates.
   Reuse the exact event ID and producer timestamp after a lost response; changing either is a conflict.
 
+## Human coordination routes (ADR-0029 §6-§10)
+
+The web coordination panel and the phone act through these cookie routes. A CLI token cannot call
+them (401 without the human session cookie, 403 for another Origin). None of them types into a tab.
+Agents use the CLI routes above; this list says what a human can do to your coordination state.
+
+GET  /api/mission-control/coordination   gains "deploys": { ok, items: [{ id, reason, createdAt,
+  restartAt, phase: "pending"|"past", by, recipients: { total, delivered, queued, held, dropped } }] }
+  | { ok: false, error } — the deploy announcements of the last 24 h, newest first.
+POST /api/mission-control/notes          { toWorkspace? | toEpic?, subject, body } → { note }
+  A note from "human" (its fromLabel): admission "human", to the target workspace's orchestrator;
+  toEpic resolves at send time to the live epic holder's workspace (none: 400 note-target-missing).
+  Same bounds as POST /api/cli/notes; note-too-large is 400 here. A human never acks a note.
+POST /api/mission-control/inbox/<id>/retry → { item }
+  Re-queues a held item of any workspace once. 409 inbox-not-retryable with "reason" for a hold whose
+  leading token is stranded-in-composer, transport-uncertain (either could type the line twice) or
+  target-not-agent (never deliverable). Refusal-budget and 24 h holds are retried.
+POST /api/mission-control/leases/break   { name, reason (1..500) } → { broken }
+  The admin break transition; the lease-release audit line names by: { human: <session subject> }.
+  400 invalid-request, 404 lease-not-found.
+
 ## Web-browser tabs
 
 These endpoints only work when the tab's panelType is "web-browser" and the webview
 has attached (dom-ready has fired at least once). Electron runtime required;
-503 is returned in headless/remote mode.
+503 is returned in headless/remote mode. On a headless host, use the crawl container of the
+repository under test, never a host-wide Chrome on localhost:9222 (docs/cookbook/browser-evidence.md).
 
 GET /api/cli/tabs/<tabId>/browser/url?workspaceId=WS
   Current URL + title of the webview.

@@ -1,13 +1,14 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { bodyOf, defaultGrantDeps, listGrantees, requireGrantHuman, sendGrantError } from '@/lib/grant-http';
 import { createGrant } from '@/lib/grant-service';
-import { grantsRefusal, grantsSnapshot } from '@/lib/grant-store';
+import { listAllGrants } from '@/lib/grant-store';
 import { requireMissionHuman } from '@/lib/mission-control-http';
 
 /**
- * Portfolio drive grants (ADR-0014). GET lists them for the signed-in human
- * with the grantee tabs; POST creates one — a web session, this server's Origin
- * AND the purplemux password. No CLI token, admin or workspace, reaches this route.
+ * Portfolio grants (ADR-0014) and the owner grant (ADR-0029). GET lists both
+ * files for the signed-in human with the grantee tabs; POST creates one — a web
+ * session, this server's Origin AND the purplemux password. No CLI token, admin
+ * or workspace, reaches this route.
  */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   try {
@@ -15,8 +16,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       // A read needs the session only, like the other human reads (story 28 review r1): a browser's
       // same-origin GET over plain HTTP to a LAN address carries neither Origin nor Sec-Fetch-Site.
       await requireMissionHuman(req);
-      const refusal = grantsRefusal();
-      if (refusal) return res.status(500).json({ error: refusal, code: 'grant-store-unreadable' });
+      const listed = listAllGrants();
+      if (!listed.ok) return res.status(500).json({ error: listed.error, code: 'grant-store-unreadable' });
       let grantees: Awaited<ReturnType<typeof listGrantees>> | null = null;
       let granteesError: string | null = null;
       try {
@@ -25,7 +26,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         granteesError = err instanceof Error ? err.message : String(err);
       }
       return res.status(200).json({
-        grants: grantsSnapshot().grants,
+        grants: listed.grants,
+        refused: listed.refused,
         grantees: grantees?.grantees ?? [],
         unreadableWorkspaceIds: grantees?.unreadableWorkspaceIds ?? [],
         granteesError,

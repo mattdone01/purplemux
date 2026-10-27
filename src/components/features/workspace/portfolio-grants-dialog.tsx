@@ -7,6 +7,7 @@ import useNowTick from '@/hooks/use-now-tick';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { createGrantRequest, revokeGrantRequest } from '@/lib/grants-client';
 import { describeGrantFailure, GRANT_DEFAULT_EXPIRY_HOURS, grantDialogError, runGrantAction, withoutKey } from '@/lib/grant-view';
+import type { TGrantCapability } from '@/types/grant';
 
 interface IPortfolioGrantsDialogProps {
   open: boolean;
@@ -15,8 +16,8 @@ interface IPortfolioGrantsDialogProps {
 
 /**
  * Portfolio grants (story 28; ADR-0014): pick a verified grantee tab, the
- * workspaces it may read, an expiry, a reason and the purplemux password;
- * list the active grants with Revoke. A refusal shows the served reason. The
+ * workspaces it may read — or "Owner session" for every workspace (ADR-0029) —
+ * an expiry, a reason and the purplemux password; list the active grants with Revoke. A refusal shows the served reason. The
  * sidebar mounts this only while open, so each open starts from a clean form.
  */
 const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogProps) => {
@@ -24,6 +25,7 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
   const { view, failure, refresh } = useGrants('fresh');
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const now = useNowTick(30_000);
+  const [capability, setCapability] = useState<TGrantCapability>('drive');
   const [granteeKey, setGranteeKey] = useState<string | null>(null);
   const [targets, setTargets] = useState<string[]>([]);
   const [hours, setHours] = useState<number>(GRANT_DEFAULT_EXPIRY_HOURS);
@@ -44,14 +46,16 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
     setSubmitting(true);
     setError(null);
     const result = await runGrantAction({
-      call: () => createGrantRequest({
-        granteeWorkspaceId: granteeKey.slice(0, slash),
-        granteeTabId: granteeKey.slice(slash + 1),
-        workspaces: targets,
-        reason: reason.trim(),
-        expiresInHours: hours,
-        password,
-      }),
+      call: () => {
+        const fields = {
+          granteeWorkspaceId: granteeKey.slice(0, slash),
+          granteeTabId: granteeKey.slice(slash + 1),
+          reason: reason.trim(),
+          expiresInHours: hours,
+          password,
+        };
+        return createGrantRequest(capability === 'owner' ? { ...fields, capability } : { ...fields, workspaces: targets });
+      },
       refresh,
       describe,
     });
@@ -87,8 +91,11 @@ const PortfolioGrantsDialog = ({ open, onOpenChange }: IPortfolioGrantsDialogPro
           granteesError={view?.granteesError ?? null}
           unreadableWorkspaceIds={view?.unreadableWorkspaceIds ?? []}
           grants={view?.grants ?? []}
+          refused={view?.refused ?? []}
           workspaceNames={Object.fromEntries(workspaces.map((w) => [w.id, w.name]))}
           now={serverTimeOf(view, now)}
+          capability={capability}
+          onCapabilityChange={(next) => { setCapability(next); setTargets([]); }}
           granteeKey={granteeKey}
           onGranteeChange={(key) => { setGranteeKey(key); setTargets([]); }}
           workspaces={targets}

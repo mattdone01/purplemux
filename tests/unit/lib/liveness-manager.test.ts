@@ -472,3 +472,18 @@ describe('isPidAliveReal: a zombie is an exit (behaviour 6)', () => {
     }
   });
 });
+
+describe('takeJobs (ADR-0028: a restart retires the jobs and gives them back on failure)', () => {
+  it('unregisters the tab\'s jobs and returns them; another tab\'s job stays', async () => {
+    const h = harness();
+    await h.manager.registerJob(job({ pid: 1 }));
+    await h.manager.registerJob(job({ pid: 2, label: 'gate' }));
+    await h.manager.registerJob(job({ pid: 3, tabId: 'tab-2' }));
+    const taken = await h.manager.takeJobs('ws-1', 'tab-1');
+    expect(taken.map((j) => j.pid).sort()).toEqual([1, 2]);
+    expect((await h.manager.statusForTab('tab-1')).backgroundJobs).toEqual([]);
+    expect((await h.manager.statusForTab('tab-2')).backgroundJobs.map((j) => j.pid)).toEqual([3]);
+    for (const taken1 of taken) await h.manager.registerJob(taken1);
+    expect((await h.manager.statusForTab('tab-1')).backgroundJobs.map((j) => j.pid).sort()).toEqual([1, 2]);
+  });
+});

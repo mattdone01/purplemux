@@ -1,6 +1,8 @@
 import { authorizeHumanMutation } from '@/lib/human-mutation';
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { removeTabFromPane, restartTabSession, patchTab } from '@/lib/layout-store';
+import { removeTabFromPane, restartTabSessionUnguarded, patchTab } from '@/lib/layout-store';
+import { withOrchestrationMappingRead } from '@/lib/orchestration-mapping-lock';
+import { withCodexTargetLock } from '@/lib/providers/codex/launch-lifecycle';
 import { getActiveWorkspaceId } from '@/lib/workspace-store';
 import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
@@ -39,7 +41,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method === 'POST') {
     try {
       const { command } = req.body ?? {};
-      const ok = await restartTabSession(wsId, paneId, tabId, command);
+      // The tab's target lock, inside the read guard as `tab restart` takes them: a dead-session recreate waits for a
+      // restart instead of landing between its reap and the reap's confirmation (ADR-0028 §12).
+      const ok = await withOrchestrationMappingRead(wsId, () => withCodexTargetLock(wsId, tabId, async () =>
+        (await restartTabSessionUnguarded(wsId, paneId, tabId, command)).found));
       if (!ok) {
         return res.status(404).json({ error: 'Tab not found' });
       }

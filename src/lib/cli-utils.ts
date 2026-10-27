@@ -6,8 +6,9 @@ import { getWorkspaceById } from '@/lib/workspace-store';
 import { resolveCliScope, type TCliScope } from '@/lib/workspace-token';
 import { getBrowserBridge, type IBrowserBridgeClient } from '@/lib/browser-bridge-client';
 import type { ITab } from '@/types/terminal';
-import { TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
-import { findActiveDriveGrant, grantsSnapshot } from '@/lib/grant-store';
+import { FOREIGN_MUTATION_HINT, TAB_NOT_FOUND_BODY } from '@/lib/cli-error';
+import { auditOwnerRead } from '@/lib/grant-service';
+import { findActiveDriveGrant, findActiveOwnerGrant, grantsSnapshot } from '@/lib/grant-store';
 import { selectedScrumMasterCanRead } from '@/lib/scrum-master-access';
 import type { IGrant } from '@/types/grant';
 
@@ -30,6 +31,14 @@ export const accessDecision = async (scope: TCliScope, workspaceId: string): Pro
     ? findActiveDriveGrant(grantsSnapshot(), { workspaceId: scope.workspaceId, tabId: scope.tabId }, workspaceId, Date.now())
     : null;
   if (grant) return { ok: true, grant };
+  // ADR-0029: the owner's verified tab reads every workspace, including one created after the grant.
+  const owner = scope.tabVerified === true && scope.tabId
+    ? findActiveOwnerGrant(grantsSnapshot('owner'), { workspaceId: scope.workspaceId, tabId: scope.tabId }, Date.now())
+    : null;
+  if (owner) {
+    await auditOwnerRead(owner, workspaceId);
+    return { ok: true, grant: owner };
+  }
   return { ok: await selectedScrumMasterCanRead(scope, workspaceId), grant: null };
 };
 
@@ -55,7 +64,7 @@ export const authorizeWorkspaceMutation = async (
   }
   if (!isOwnWorkspace(scope, workspaceId)) {
     res.status(403).json({
-      error: 'Agent mutations are confined to the caller workspace. Use coordinator notes for cross-workspace requests, or local human controls.',
+      error: `Agent mutations are confined to the caller workspace. ${FOREIGN_MUTATION_HINT}`,
       code: 'forbidden',
     });
     return null;

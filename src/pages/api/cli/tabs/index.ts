@@ -8,26 +8,22 @@ import { resolveCliScope } from '@/lib/workspace-token';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
-import { buildClaudeFlags, buildRemoteClaudeLaunch, isValidModelName } from '@/lib/claude-command';
-import { grokProvider } from '@/lib/providers/grok';
+import { isValidModelName } from '@/lib/claude-command';
+import { buildFreshLaunchCommand, launchCodexManaged } from '@/lib/agent-launch';
 import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
-import { checkReportsTo } from '@/lib/reports-to';
+import { checkReportOn, checkReportsTo, isReportOnInvalid } from '@/lib/reports-to';
 import { tabIdentityOf } from '@/lib/tab-token';
 import { RemoteHostError, isValidRemoteHostName, readRemoteHosts, remoteDirExists } from '@/lib/remote-host';
 import fs from 'fs/promises';
 import path from 'path';
-import {
-  prepareCodexManagedLaunch,
-  submitCodexManagedLaunch,
-  waitForCodexManagedLaunch,
-} from '@/lib/providers/codex/managed-launch';
 import type { TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ILastEvent } from '@/types/status';
 import { remoteHostUnreachableBody } from '@/lib/cli-error';
+import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
 
 const log = createLogger('api:cli:tabs');
 
@@ -108,6 +104,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       lastEvent: ILastEvent | null;
       busySince: number | null;
       reportsTo: string | null;
+      /** The markers whose end lines the tab forwards (ADR-0025); null: every marker. */
+      reportOn: string[] | null;
       /** launch: the server bound its token at launch; hook: taken at a SessionStart (story 36); none: no tab identity. */
       identity: 'launch' | 'hook' | 'none';
       /** The remote host that runs the tab (ADR-0022); absent for a local tab. */
@@ -148,6 +146,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             lastEvent: liveStatus[tab.id]?.lastEvent ?? null,
             busySince: liveStatus[tab.id]?.busySince ?? null,
             reportsTo: tab.reportsTo ?? null,
+            reportOn: tab.reportOn ?? null,
             identity: tab.panelType === 'web-browser' ? 'none' : tabIdentityOf(id, tab.id),
             ...(tab.host ? { host: tab.host } : {}),
           });
@@ -158,7 +157,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, host, cwd } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd, overCap } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -167,8 +166,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       launch?: boolean;
       scope?: unknown;
       reportsTo?: unknown;
+      reportOn?: unknown;
       host?: unknown;
       cwd?: unknown;
+      overCap?: unknown;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
@@ -185,6 +186,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       const refused = await checkReportsTo(workspaceId, reportsTo);
       if (refused) return res.status(400).json(refused);
     }
+    // The markers whose end lines reach the target (ADR-0025); absent or null forwards every marker.
+    const reportOnChecked = reportOn === undefined ? { markers: null } : checkReportOn(reportOn);
+    if (isReportOnInvalid(reportOnChecked)) return res.status(400).json(reportOnChecked);
     const dispatchPolicy = await checkAgentDispatchPolicy(workspaceId);
     if (!dispatchPolicy.ok) {
       return res.status(409).json(dispatchPolicy);
@@ -224,31 +228,32 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         return res.status(400).json({ error: reasoningErrorForPanelType(resolvedType) });
       }
     }
+    const wipCheck = await admitAgentCreate(req, workspaceId, resolvedType, overCap);
+    if (!wipCheck.ok) return res.status(wipCheck.status).json(wipCheck.body);
+    const { admission } = wipCheck;
 
     // Agent tabs launch their CLI by default (mirrors UI tab creation) —
     // a bare shell made `tab send` briefs land in bash, not the agent.
     const shouldLaunch = launch !== false && isAgentPanelType(resolvedType);
-    let command: string | undefined;
-    if (shouldLaunch) {
-      if (resolvedType === 'claude-code') {
-        command = remoteHost
-          ? await buildRemoteClaudeLaunch(workspaceId, { model, effort: reasoning })
-          : `claude ${await buildClaudeFlags(workspaceId, { model, effort: reasoning })}`;
-      } else if (resolvedType === 'grok-cli') {
-        // Catch-all else is codex; routing grok through it launched codex
-        // inside a grok tab. Pin model/effort at launch the same as the others.
-        command = await grokProvider.buildLaunchCommand({ workspaceId, model, effort: reasoning });
-      }
-    }
+    const agentLaunchConfig = agentLaunchConfigFromOptions(model, reasoning);
+    const command = shouldLaunch
+      ? await buildFreshLaunchCommand(workspaceId, { panelType: resolvedType, host: remoteHost, agentLaunchConfig })
+      : undefined;
 
     try {
       const tab = await addTabToPane(workspaceId, paneId, name, typeof cwd === 'string' ? cwd : ws.directories[0], resolvedType, command, {
         scope: scope as string[] | undefined,
-        agentLaunchConfig: agentLaunchConfigFromOptions(model, reasoning),
+        agentLaunchConfig,
         reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
+        reportOn: reportOnChecked.markers ?? undefined,
         host: remoteHost,
+        admit: admission?.admit,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
+      const wip = admission?.wip() ?? null;
+      if (wip && admission?.passedCap() && wipCheck.overCapReason !== null && wipCheck.caller) {
+        await auditOverCap({ workspaceId, tabId: tab.id, wip, reason: wipCheck.overCapReason, caller: wipCheck.caller });
+      }
 
       if (tab.panelType !== 'web-browser') {
         const provider = getProviderByPanelType(tab.panelType);
@@ -261,6 +266,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           agentProviderId: provider?.id,
           agentSessionId: provider?.readSessionId(tab) ?? null,
           reportsTo: tab.reportsTo ?? null,
+          reportOn: tab.reportOn ?? null,
           lastEvent: null,
           eventSeq: 0,
         });
@@ -269,36 +275,37 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
       let codexLaunchState: 'active' | 'held' | undefined;
       if (shouldLaunch && resolvedType === 'codex-cli') {
-        const prepared = await prepareCodexManagedLaunch(workspaceId, tab.id);
-        if (!prepared.ok) {
+        const launched = await launchCodexManaged(workspaceId, tab.id);
+        if (!launched.ok && launched.step === 'prepare') {
           return res.status(500).json({
             error: 'Failed to prepare Codex launch',
-            reason: prepared.reason,
+            reason: launched.reason,
             tabId: tab.id,
             launchState: 'held',
+            ...(wip ? { wip } : {}),
           });
         }
-        const submitted = await submitCodexManagedLaunch(workspaceId, tab.id, prepared.launch.generation);
-        if (!submitted.ok) {
+        if (!launched.ok && launched.step === 'submit') {
           return res.status(500).json({
             error: 'Failed to submit Codex launch',
-            reason: submitted.reason,
+            reason: launched.reason,
             tabId: tab.id,
-            generation: submitted.generation,
-            launchState: submitted.phase,
+            generation: launched.generation,
+            launchState: launched.phase,
+            ...(wip ? { wip } : {}),
           });
         }
-        const activated = await waitForCodexManagedLaunch(workspaceId, tab.id, submitted.generation);
-        codexLaunchState = activated.ok ? activated.phase : 'held';
-        if (!activated.ok) {
+        if (!launched.ok) {
           return res.status(503).json({
             error: 'Codex launch was not confirmed',
-            reason: activated.reason,
+            reason: launched.reason,
             tabId: tab.id,
-            generation: activated.generation,
-            launchState: activated.phase,
+            generation: launched.generation,
+            launchState: launched.phase,
+            ...(wip ? { wip } : {}),
           });
         }
+        codexLaunchState = 'active';
       }
 
       return res.status(201).json({
@@ -312,10 +319,14 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         agentSessionId: null,
         agentLaunchConfig: tab.agentLaunchConfig,
         launched: !!command || codexLaunchState === 'active',
+        ...(tab.reportsTo ? { reportsTo: tab.reportsTo } : {}),
+        ...(tab.reportOn ? { reportOn: tab.reportOn } : {}),
         ...(codexLaunchState ? { launchState: codexLaunchState } : {}),
         ...(tab.host ? { host: tab.host } : {}),
+        ...(wip ? { wip } : {}),
       });
     } catch (err) {
+      if (err instanceof WipCapError) return res.status(409).json(err.body);
       if (err instanceof RemoteHostError) {
         return res.status(503).json(remoteHostUnreachableBody(err));
       }

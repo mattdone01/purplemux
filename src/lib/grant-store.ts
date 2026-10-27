@@ -3,7 +3,7 @@ import fsp from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
-import type { IGrant, IGrantsState, TGrantEndReason, TGrantErrorCode } from '@/types/grant';
+import type { IGrant, IGrantRefusal, IGrantsState, TGrantCapability, TGrantEndReason, TGrantErrorCode } from '@/types/grant';
 
 // Portfolio drive grants (ADR-0014, story 11). A human, through the web session
 // plus the purplemux password, lets ONE verified tab drive other workspaces for
@@ -11,6 +11,11 @@ import type { IGrant, IGrantsState, TGrantEndReason, TGrantErrorCode } from '@/t
 // cache on globalThis that every write refreshes; the server bundle and each
 // Next API route share it. A malformed grants.json means NO grants (fail
 // closed) and refuses writes until it is repaired or moved aside.
+//
+// Owner grants (ADR-0029) live in their own file, owner-grants.json, with the
+// same record shape, its own cache and its own lock: a release that predates
+// them refuses the WHOLE grants.json on one non-`drive` record, so a rollback
+// would honour no drive grant. Each file fails closed on its own.
 
 export const GRANT_DEFAULT_HOURS = 24;
 export const GRANT_MAX_HOURS = 168;
@@ -27,7 +32,11 @@ export class GrantError extends Error {
 
 const GRANT_ERROR_CODES: ReadonlySet<string> = new Set<TGrantErrorCode>([
   'grant-invalid', 'grant-not-found', 'grant-tab-unverified', 'grant-password-invalid', 'grant-locked', 'grant-store-unreadable',
+  'grant-owner-active',
 ]);
+
+/** The one `workspaces` value of an owner grant: every workspace, including one created later. */
+export const OWNER_GRANT_WORKSPACES: readonly string[] = Object.freeze(['*']);
 
 /** By name as well as by class: the store may be reached from another bundle's module copy (story 22). */
 export const isGrantError = (err: unknown): err is GrantError =>
@@ -51,6 +60,13 @@ export const findActiveDriveGrant = (
     && g.grantee.tabId === grantee.tabId
     && g.workspaces.includes(targetWorkspaceId)) ?? null;
 
+/** The active owner grant held by this exact tab, or null. */
+export const findActiveOwnerGrant = (state: IGrantsState, grantee: { workspaceId: string; tabId: string }, now: number): IGrant | null =>
+  state.grants.find((g) => isActive(g, now)
+    && g.capability === 'owner'
+    && g.grantee.workspaceId === grantee.workspaceId
+    && g.grantee.tabId === grantee.tabId) ?? null;
+
 export interface ICreateGrantInput {
   granteeWorkspaceId: string;
   granteeTabId: string;
@@ -58,12 +74,13 @@ export interface ICreateGrantInput {
   reason: string;
   expiresInHours: number;
   createdBy: string;
+  capability?: TGrantCapability;
 }
 
 export const createGrantInState = (state: IGrantsState, input: ICreateGrantInput, now: number, id: string): { state: IGrantsState; grant: IGrant } => {
   const grant: IGrant = {
     id,
-    capability: 'drive',
+    capability: input.capability ?? 'drive',
     grantee: { workspaceId: input.granteeWorkspaceId, tabId: input.granteeTabId },
     workspaces: [...input.workspaces],
     reason: input.reason,
@@ -132,7 +149,7 @@ export const sweepInState = (state: IGrantsState, now: number): { state: IGrants
   return { state: changed ? { grants: kept } : state, expired, pruned: state.grants.length - kept.length };
 };
 
-// ─── the file store and its cache ─────────────────────────────────────────
+// ─── the file stores and their caches ─────────────────────────────────────
 
 interface IGrantsCache {
   state: IGrantsState;
@@ -140,28 +157,50 @@ interface IGrantsCache {
   refusal: string | null;
 }
 
-const g = globalThis as unknown as { __ptGrants?: IGrantsCache; __ptGrantsLock?: Promise<void> };
+/** Which file a grant lives in: the drive file or the owner file. */
+export type TGrantStore = TGrantCapability;
+
+export const GRANT_STORES: readonly TGrantStore[] = ['drive', 'owner'];
+
+const g = globalThis as unknown as {
+  __ptGrants?: IGrantsCache;
+  __ptGrantsLock?: Promise<void>;
+  __ptOwnerGrants?: IGrantsCache;
+  __ptOwnerGrantsLock?: Promise<void>;
+};
 if (!g.__ptGrantsLock) g.__ptGrantsLock = Promise.resolve();
+if (!g.__ptOwnerGrantsLock) g.__ptOwnerGrantsLock = Promise.resolve();
+
+const CACHE_KEY = { drive: '__ptGrants', owner: '__ptOwnerGrants' } as const;
+const LOCK_KEY = { drive: '__ptGrantsLock', owner: '__ptOwnerGrantsLock' } as const;
 
 export const grantsFile = (): string => path.join(os.homedir(), '.purplemux', 'grants.json');
 
+export const ownerGrantsFile = (): string => path.join(os.homedir(), '.purplemux', 'owner-grants.json');
+
+export const grantStoreFile = (store: TGrantStore): string => (store === 'owner' ? ownerGrantsFile() : grantsFile());
+
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
-const isGrant = (v: unknown): v is IGrant => {
+/** A record of `store`: each file holds its own capability only, and an owner record reads exactly `['*']`. */
+const isGrant = (v: unknown, store: TGrantStore): v is IGrant => {
   if (!isObject(v)) return false;
   const grantee = v.grantee;
-  return typeof v.id === 'string' && v.capability === 'drive'
+  const workspaces = store === 'owner'
+    ? Array.isArray(v.workspaces) && v.workspaces.length === 1 && v.workspaces[0] === '*'
+    : Array.isArray(v.workspaces) && v.workspaces.every((w) => typeof w === 'string');
+  return typeof v.id === 'string' && v.capability === store
     && isObject(grantee) && typeof grantee.workspaceId === 'string' && typeof grantee.tabId === 'string'
-    && Array.isArray(v.workspaces) && v.workspaces.every((w) => typeof w === 'string')
+    && workspaces
     && typeof v.reason === 'string' && Number.isFinite(v.createdAt) && typeof v.createdBy === 'string'
     && Number.isFinite(v.expiresAt)
     && (v.revokedAt === null || Number.isFinite(v.revokedAt))
     && (v.expiryNotedAt === null || v.expiryNotedAt === undefined || Number.isFinite(v.expiryNotedAt));
 };
 
-/** Reads the file into the cache. Absent = no grants; malformed or unreadable = no grants AND refused writes. */
-const load = (): IGrantsCache => {
-  const file = grantsFile();
+/** Reads one file. Absent = no grants; malformed or unreadable = no grants AND refused writes. */
+const load = (store: TGrantStore): IGrantsCache => {
+  const file = grantStoreFile(store);
   let raw: string;
   try {
     raw = fs.readFileSync(file, 'utf-8');
@@ -175,33 +214,57 @@ const load = (): IGrantsCache => {
   } catch {
     parsed = null;
   }
-  if (!isObject(parsed) || !Array.isArray(parsed.grants) || !parsed.grants.every(isGrant)) {
+  if (!isObject(parsed) || !Array.isArray(parsed.grants) || !parsed.grants.every((v) => isGrant(v, store))) {
     return { state: { grants: [] }, refusal: `${file} is malformed; no grant is honoured until it is repaired or moved aside` };
   }
   const grants = (parsed.grants as IGrant[]).map((grant) => ({ ...grant, expiryNotedAt: grant.expiryNotedAt ?? null }));
   return { state: { grants }, refusal: null };
 };
 
-const cache = (): IGrantsCache => {
-  if (!g.__ptGrants) g.__ptGrants = load();
-  return g.__ptGrants;
+const cache = (store: TGrantStore): IGrantsCache => {
+  const key = CACHE_KEY[store];
+  if (!g[key]) g[key] = load(store);
+  return g[key]!;
 };
 
-/** The grants as the predicates see them (fail closed: none while the file is refused). */
-export const grantsSnapshot = (): IGrantsState => cache().state;
+/** The grants of one file as the predicates see them (fail closed: none while that file is refused). */
+export const grantsSnapshot = (store: TGrantStore = 'drive'): IGrantsState => cache(store).state;
 
-export const grantsRefusal = (): string | null => cache().refusal;
+export const grantsRefusal = (store: TGrantStore = 'drive'): string | null => cache(store).refusal;
 
-/** Drop the cache so the next read reloads the file (boot, tests). */
+/**
+ * Every grant of both files (ADR-0029 §1: each file fails alone). `grants` holds
+ * the records of each readable file, drive then owner — the same cache the
+ * predicates read, so its active entries are exactly the grants in force.
+ * `refused` names each unreadable file; only both refused is a total failure.
+ */
+export const listAllGrants = (): { ok: true; grants: IGrant[]; refused: IGrantRefusal[] } | { ok: false; error: string } => {
+  const refused: IGrantRefusal[] = [];
+  const grants: IGrant[] = [];
+  for (const store of GRANT_STORES) {
+    const refusal = grantsRefusal(store);
+    if (refusal) {
+      refused.push({ capability: store, file: store === 'owner' ? 'owner-grants.json' : 'grants.json', error: refusal, code: 'grant-store-unreadable' });
+    } else {
+      grants.push(...grantsSnapshot(store).grants);
+    }
+  }
+  if (refused.length === GRANT_STORES.length) return { ok: false, error: refused.map((r) => r.error).join('; ') };
+  return { ok: true, grants, refused };
+};
+
+/** Drop both caches so the next read reloads the files (boot, tests). */
 export const reloadGrants = (): void => {
   g.__ptGrants = undefined;
+  g.__ptOwnerGrants = undefined;
 };
 
-const withLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+const withLock = async <T>(store: TGrantStore, fn: () => Promise<T>): Promise<T> => {
+  const key = LOCK_KEY[store];
   let release: () => void;
   const next = new Promise<void>((r) => { release = r; });
-  const prev = g.__ptGrantsLock!;
-  g.__ptGrantsLock = next;
+  const prev = g[key]!;
+  g[key] = next;
   await prev;
   try {
     return await fn();
@@ -210,8 +273,8 @@ const withLock = async <T>(fn: () => Promise<T>): Promise<T> => {
   }
 };
 
-const write = async (state: IGrantsState): Promise<void> => {
-  const file = grantsFile();
+const write = async (store: TGrantStore, state: IGrantsState): Promise<void> => {
+  const file = grantStoreFile(store);
   const tmp = `${file}.tmp`;
   await fsp.mkdir(path.dirname(file), { recursive: true });
   try {
@@ -223,16 +286,20 @@ const write = async (state: IGrantsState): Promise<void> => {
   }
 };
 
-/** Read (fresh from disk), transform, write, refresh the cache — one lock. A refused file is never written. */
-export const mutateGrants = <T>(fn: (state: IGrantsState) => { state: IGrantsState; value: T }): Promise<T> =>
-  withLock(async () => {
-    const fresh = load();
-    g.__ptGrants = fresh;
+/** Read (fresh from disk), transform, write, refresh the cache — one lock per file. A refused file is never written. */
+export const mutateGrants = <T>(
+  fn: (state: IGrantsState) => { state: IGrantsState; value: T },
+  store: TGrantStore = 'drive',
+): Promise<T> =>
+  withLock(store, async () => {
+    const key = CACHE_KEY[store];
+    const fresh = load(store);
+    g[key] = fresh;
     if (fresh.refusal) throw new GrantError('grant-store-unreadable', fresh.refusal);
     const { state, value } = fn(fresh.state);
     if (state !== fresh.state) {
-      await write(state);
-      g.__ptGrants = { state, refusal: null };
+      await write(store, state);
+      g[key] = { state, refusal: null };
     }
     return value;
   });

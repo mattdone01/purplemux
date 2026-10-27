@@ -8,7 +8,9 @@ vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: () => state.token ===
 vi.mock('@/lib/auth', async (original) => ({ ...await original<typeof import('@/lib/auth')>(),
   verifySessionToken: vi.fn(async (token: string) => token === 'human' ? { sub: 'human' } : null),
 }));
-vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: vi.fn(() => ({})), findActiveDriveGrant: vi.fn(() => state.granted ? { id: 'g-active' } : null) }));
+vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: vi.fn(() => ({})), findActiveDriveGrant: vi.fn(() => state.granted ? { id: 'g-active' } : null),
+  // ADR-0029: the owner tab reads everywhere; it mutates nowhere but its own workspace.
+  findActiveOwnerGrant: vi.fn(() => state.token === 'owner' ? { id: 'g-owner', capability: 'owner', workspaces: ['*'] } : null) }));
 vi.mock('@/lib/workspace-store');
 vi.mock('@/lib/layout-store');
 vi.mock('@/lib/tmux');
@@ -34,6 +36,8 @@ const cliRoutes = [
   ['codex/launch-command', 'POST'], ['codex/launch-submit', 'POST'], ['codex/launch-args', 'POST'],
   ['codex/launch-confirm', 'POST'], ['claude/launch-command', 'POST'],
   ['cli/codex/launch-args', 'POST'], ['cli/codex/launch-confirm', 'POST'],
+  ['cli/workspaces/[workspaceId]/flow', 'POST'],
+  ['cli/tabs/[tabId]/restart', 'POST'],
 ];
 const uiRoutes = [
   ['tabs/[tabId]/send', 'POST'], ['tmux/send-input', 'POST'], ['tmux/reset', 'POST'], ['tmux/recover-unknown', 'POST'],
@@ -46,6 +50,7 @@ const uiRoutes = [
   ['workspace/[workspaceId]/orchestrate', 'POST'], ['workspace/active', 'PATCH'], ['workspace/reorder', 'PATCH'],
   ['workspace/group/index', 'POST'], ['workspace/group/[groupId]', 'PATCH'], ['workspace/group/[groupId]', 'DELETE'],
   ['workspace/group/reorder', 'PATCH'], ['cli/workspaces/[workspaceId]/peers', 'PATCH'],
+  ['tabs/[tabId]/restart', 'POST'],
 ];
 
 const handlers: Record<string, () => Promise<{ default: (req: NextApiRequest, res: NextApiResponse) => Promise<unknown> }>> = {
@@ -88,6 +93,10 @@ const handlers: Record<string, () => Promise<{ default: (req: NextApiRequest, re
   'workspace/group/reorder': () => import('@/pages/api/workspace/group/reorder'),
   'workspace/index': () => import('@/pages/api/workspace/index'),
   'workspace/reorder': () => import('@/pages/api/workspace/reorder'),
+  'cli/workspaces': () => import('@/pages/api/cli/workspaces'),
+  'cli/workspaces/[workspaceId]/flow': () => import('@/pages/api/cli/workspaces/[workspaceId]/flow'),
+  'cli/tabs/[tabId]/restart': () => import('@/pages/api/cli/tabs/[tabId]/restart'),
+  'tabs/[tabId]/restart': () => import('@/pages/api/tabs/[tabId]/restart'),
 };
 
 const request = (method: string, cookie = false, origin = 'http://localhost:8022') => ({
@@ -109,7 +118,7 @@ describe('route mutation authority matrix', () => {
       if (vi.isMockFunction(value)) value.mockReset();
     }
   });
-  for (const token of ['foreign', 'grant', 'global']) {
+  for (const token of ['foreign', 'grant', 'owner', 'global']) {
     it.each(cliRoutes)(`${token} cannot mutate %s %s`, async (route, method) => {
       state.token = token; state.granted = token === 'grant';
       const { default: handler } = await handlers[route]();
@@ -121,7 +130,7 @@ describe('route mutation authority matrix', () => {
       }
     });
   }
-  for (const token of ['local', 'foreign', 'grant', 'global']) {
+  for (const token of ['local', 'foreign', 'grant', 'owner', 'global']) {
     it.each(uiRoutes)(`${token} is not a human at %s %s`, async (route, method) => {
       state.token = token; state.granted = token === 'grant';
       const { default: handler } = await handlers[route]();
@@ -133,6 +142,29 @@ describe('route mutation authority matrix', () => {
       }
     });
   }
+  // ADR-0024: creating a workspace is the one CLI mutation the global token holds, and only it.
+  it.each(['local', 'foreign', 'grant', 'owner', 'human'])('%s cannot create a workspace', async (token) => {
+    state.token = token; state.granted = token === 'grant';
+    const { default: handler } = await handlers['cli/workspaces']();
+    const { state: result, res } = response();
+    await handler(request('POST'), res);
+    expect(result.code).toBe(403);
+    for (const runtime of await runtimeModules()) for (const value of Object.values(runtime)) {
+      if (vi.isMockFunction(value)) expect(value).not.toHaveBeenCalled();
+    }
+  });
+  it('global passes the workspace-create boundary', async () => {
+    state.token = 'global';
+    const { default: handler } = await handlers['cli/workspaces']();
+    const reachedRuntime = new Error('authorized runtime reached');
+    for (const runtime of await runtimeModules()) for (const value of Object.values(runtime)) {
+      if (vi.isMockFunction(value)) value.mockImplementation(() => { throw reachedRuntime; });
+    }
+    const { state: result, res } = response();
+    await handler({ ...request('POST'), body: { name: 'n', directories: ['/srv/a'] } } as unknown as NextApiRequest, res)
+      .catch((error: unknown) => expect(error).toBe(reachedRuntime));
+    expect(result.code).not.toBe(403);
+  });
   it.each(uiRoutes)('cross-origin human cannot mutate %s %s', async (route, method) => {
     const { default: handler } = await handlers[route]();
     const { state: result, res } = response();

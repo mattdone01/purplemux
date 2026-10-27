@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveCaller } from '@/lib/caller';
+import { FOREIGN_MUTATION_HINT } from '@/lib/cli-error';
 import { isOwnWorkspace } from '@/lib/cli-utils';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
@@ -26,7 +27,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const { scope } = caller;
     // Own workspace only: a portfolio grant never lets a tab write another workspace's MC events (ADR-0014).
     if (!isOwnWorkspace(scope, workspaceId)) {
-      throw new MissionControlError(403, 'forbidden', 'Mission Control writes require this workspace token');
+      throw new MissionControlError(403, 'forbidden', `Mission Control writes require this workspace token. ${FOREIGN_MUTATION_HINT}`);
     }
     const body = req.body as { events?: unknown } | null;
     const events = parseMissionEvents(body?.events);

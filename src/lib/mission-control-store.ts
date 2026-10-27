@@ -5,9 +5,13 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import type {
   IMissionAnswer,
+  IMissionAnswerClassCount,
   IMissionAnswerRequest,
   IMissionAnswerResponse,
+  IMissionAttentionClassInput,
   IMissionAttentionItem,
+  IMissionAutoAnswer,
+  IMissionAutoAnsweredItem,
   IMissionBinding,
   IMissionBootstrap,
   IMissionBootstrapEntry,
@@ -26,15 +30,27 @@ import type {
   TMissionHumanReview,
   TMissionRebindCause,
 } from '@/types/mission-control';
+import { AUTO_ANSWERED_LIMIT } from '@/types/mission-control';
 import {
   isMissionControlError,
   MissionControlError,
   invalidMissionRequest,
   missionConflict,
 } from '@/lib/mission-control-errors';
+import { ATTENTION_CLASS_KEYS, MISSION_AUTO_ANSWER_ACTOR, attentionClassKey } from '@/lib/attention-class';
+import {
+  AUTO_ANSWER_KEY,
+  autoAnswerNote,
+  autoAnswerRefusal,
+  autoAnswerSubmissionId,
+  type IAutoAnswerRule,
+} from '@/lib/mission-control-auto-answer';
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.purplemux', 'mission-control.sqlite');
 const SCHEMA_VERSION = 4;
+const DAY_MS = 86_400_000;
+const ANSWER_CLASS_WINDOW_DAYS = 7;
+const AUTO_ANSWERED_WINDOW_MS = 7 * DAY_MS;
 const HUMAN_INBOX_POLICY_GUIDANCE = 'On your next ordinary turn, the configured orchestrator should review legacy candidates: record workspace handling or explicitly identify the human-exclusive need. Reuse item IDs. Do not rerun bootstrap.';
 
 type TMissionIdentity = Omit<IMissionBinding, 'generation'>;
@@ -189,6 +205,17 @@ interface IAnswerRow {
   created_at: number;
 }
 
+interface IAutoAnswerRow {
+  answer_id: string;
+  item_id: string;
+  workspace_id: string;
+  rule: string;
+  rule_version: number;
+  applied_option_id: string;
+  at: number;
+  note: string;
+}
+
 interface IDeliveryRow {
   id: string;
   answer_id: string;
@@ -288,21 +315,35 @@ const runFromRow = (row: IRunRow): IMissionRun => ({
   updatedAt: row.updated_at,
 });
 
-const itemFromRow = (row: IItemRow): IMissionAttentionItem => ({
-  id: row.id,
-  workspaceId: row.workspace_id,
-  runId: row.run_id,
-  revision: row.revision,
-  state: row.state,
-  ...(JSON.parse(row.question_json) as IMissionQuestion),
-  evidence: JSON.parse(row.evidence_json) as IMissionEvidence,
-  answerId: row.answer_id,
-  resolution: row.resolution,
-  humanReview: parseJson<TMissionHumanReview>(row.human_review_json),
-  candidateReason: row.candidate_reason,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at,
+const autoAnswerFromRow = (row: IAutoAnswerRow): IMissionAutoAnswer => ({
+  rule: row.rule,
+  ruleVersion: row.rule_version,
+  appliedOptionId: row.applied_option_id,
+  at: row.at,
+  note: row.note,
 });
+
+const itemFromRow = (row: IItemRow, autoAnswer: IMissionAutoAnswer | null = null): IMissionAttentionItem => {
+  const question = JSON.parse(row.question_json) as IMissionQuestion & IMissionAttentionClassInput;
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    runId: row.run_id,
+    revision: row.revision,
+    state: row.state,
+    ...question,
+    evidence: JSON.parse(row.evidence_json) as IMissionEvidence,
+    answerId: row.answer_id,
+    resolution: row.resolution,
+    humanReview: parseJson<TMissionHumanReview>(row.human_review_json),
+    candidateReason: row.candidate_reason,
+    class: question.class ?? null,
+    defaultOptionId: question.defaultOptionId ?? null,
+    autoAnswer,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
 
 const answerFromRow = (row: IAnswerRow): IMissionAnswer => ({
   id: row.id,
@@ -368,6 +409,7 @@ export class MissionControlStore {
     this.database.pragma('synchronous = FULL');
     this.migrate();
     this.ensureOpenerTable();
+    this.ensureAutoAnswerTable();
   }
 
   /**
@@ -382,6 +424,21 @@ export class MissionControlStore {
         identity TEXT NOT NULL, event_id TEXT NOT NULL, opened_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS mission_item_openers_tab_idx ON mission_item_openers(workspace_id, tab_id);
+    `);
+  };
+
+  /**
+   * The bookkeeping rule's record (ADR-0031 §7): an unversioned side table like the
+   * openers, so the schema-4 release that ignores it still opens the file.
+   */
+  private ensureAutoAnswerTable = (): void => {
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS mission_auto_answers (
+        answer_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, workspace_id TEXT NOT NULL, rule TEXT NOT NULL,
+        rule_version INTEGER NOT NULL, applied_option_id TEXT NOT NULL, at INTEGER NOT NULL, note TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS mission_auto_answers_at_idx ON mission_auto_answers(at DESC);
+      CREATE INDEX IF NOT EXISTS mission_auto_answers_item_idx ON mission_auto_answers(item_id);
     `);
   };
 
@@ -507,6 +564,14 @@ export class MissionControlStore {
   private itemRow = (itemId: string): IItemRow | undefined =>
     this.database.prepare('SELECT * FROM attention_items WHERE id = ?').get(itemId) as IItemRow | undefined;
 
+  private autoAnswerOf = (itemId: string): IMissionAutoAnswer | null => {
+    const row = this.database.prepare('SELECT * FROM mission_auto_answers WHERE item_id = ? ORDER BY at DESC, answer_id LIMIT 1')
+      .get(itemId) as IAutoAnswerRow | undefined;
+    return row ? autoAnswerFromRow(row) : null;
+  };
+
+  private item = (row: IItemRow): IMissionAttentionItem => itemFromRow(row, this.autoAnswerOf(row.id));
+
   private insertEvent = (
     event: TMissionProducerEvent,
     entityId: string,
@@ -540,7 +605,13 @@ export class MissionControlStore {
       const where = workspaceId ? ' WHERE workspace_id = ?' : '';
       const args = workspaceId ? [workspaceId] : [];
       const runs = (this.database.prepare(`SELECT * FROM runs${where} ORDER BY updated_at DESC`).all(...args) as IRunRow[]).map(runFromRow);
-      const items = (this.database.prepare(`SELECT * FROM attention_items${where} ORDER BY updated_at DESC`).all(...args) as IItemRow[]).map(itemFromRow);
+      const generatedAt = Date.now();
+      const autoAnswerByItem = new Map((this.database.prepare(`SELECT * FROM mission_auto_answers${where} ORDER BY at, answer_id`)
+        .all(...args) as IAutoAnswerRow[]).map((row) => [row.item_id, autoAnswerFromRow(row)]));
+      const items = (this.database.prepare(`SELECT * FROM attention_items${where} ORDER BY updated_at DESC`).all(...args) as IItemRow[])
+        .map((row) => itemFromRow(row, autoAnswerByItem.get(row.id) ?? null));
+      const answersByClass = this.answersByClass(generatedAt, workspaceId);
+      const autoAnswered = this.autoAnswered(generatedAt, workspaceId);
       const answers = (this.database.prepare(`SELECT * FROM answers${where} ORDER BY created_at DESC`).all(...args) as IAnswerRow[]).map(answerFromRow);
       const deliveries = (this.database.prepare(`SELECT * FROM deliveries${where} ORDER BY updated_at DESC`).all(...args) as IDeliveryRow[]).map(deliveryFromRow);
       const eventWhere = workspaceId ? 'WHERE workspace_id = ?' : '';
@@ -631,7 +702,7 @@ export class MissionControlStore {
       return {
         schemaVersion: 1,
         cursor,
-        generatedAt: Date.now(),
+        generatedAt,
         workspaces: merged,
         runs,
         items,
@@ -640,10 +711,75 @@ export class MissionControlStore {
         recentEvents,
         bootstrap,
         pendingBootstrapEntries,
+        answersByClass,
+        autoAnswered,
       };
     });
     return read();
   };
+
+  /** ADR-0031 §3: answers of the last 7 UTC days (today included) per day, item class and actor kind. */
+  private answersByClass = (now: number, workspaceId?: string): IMissionAnswerClassCount[] => {
+    const tomorrow = (Math.floor(now / DAY_MS) + 1) * DAY_MS;
+    const since = tomorrow - ANSWER_CLASS_WINDOW_DAYS * DAY_MS;
+    const rows = this.database.prepare(`SELECT strftime('%Y-%m-%d', answer.created_at / 1000, 'unixepoch') AS day,
+        json_extract(item.question_json, '$.class') AS class, answer.actor = ? AS rule, COUNT(*) AS count
+      FROM answers answer JOIN attention_items item ON item.id = answer.item_id
+      WHERE answer.created_at >= ? AND answer.created_at < ?${workspaceId ? ' AND answer.workspace_id = ?' : ''}
+      GROUP BY day, class, rule`)
+      .all(MISSION_AUTO_ANSWER_ACTOR, since, tomorrow, ...(workspaceId ? [workspaceId] : [])) as Array<{
+        day: string; class: unknown; rule: number; count: number;
+      }>;
+    const counts = new Map<string, IMissionAnswerClassCount>();
+    for (const row of rows) {
+      const entry: IMissionAnswerClassCount = {
+        day: row.day,
+        class: attentionClassKey(row.class),
+        by: row.rule ? 'rule' : 'human',
+        count: 0,
+      };
+      const key = `${entry.day}|${entry.class}|${entry.by}`;
+      const current = counts.get(key) ?? entry;
+      current.count += row.count;
+      counts.set(key, current);
+    }
+    return [...counts.values()].sort((left, right) => left.day.localeCompare(right.day)
+      || ATTENTION_CLASS_KEYS.indexOf(left.class) - ATTENTION_CLASS_KEYS.indexOf(right.class)
+      || (left.by === right.by ? 0 : left.by === 'human' ? -1 : 1));
+  };
+
+  /** ADR-0031 §7: the rule's answers of the last 7 days, newest first, at most 100. */
+  private autoAnswered = (now: number, workspaceId?: string): IMissionAutoAnsweredItem[] => {
+    const rows = this.database.prepare(`SELECT record.*, item.run_id, item.state AS item_state, item.question_json
+      FROM mission_auto_answers record JOIN attention_items item ON item.id = record.item_id
+      WHERE record.at >= ?${workspaceId ? ' AND record.workspace_id = ?' : ''}
+      ORDER BY record.at DESC, record.answer_id LIMIT ?`)
+      .all(now - AUTO_ANSWERED_WINDOW_MS, ...(workspaceId ? [workspaceId] : []), AUTO_ANSWERED_LIMIT) as Array<IAutoAnswerRow & {
+        run_id: string; item_state: IMissionAttentionItem['state']; question_json: string;
+      }>;
+    return rows.map((row) => {
+      const question = JSON.parse(row.question_json) as IMissionQuestion & IMissionAttentionClassInput;
+      return {
+        itemId: row.item_id,
+        workspaceId: row.workspace_id,
+        runId: row.run_id,
+        title: question.title,
+        class: question.class ?? null,
+        appliedOptionId: row.applied_option_id,
+        // An answered question is frozen, so its options still name the applied one.
+        appliedOptionLabel: question.options.find((option) => option.id === row.applied_option_id)?.label ?? row.applied_option_id,
+        at: row.at,
+        note: row.note,
+        itemState: row.item_state,
+      };
+    });
+  };
+
+  /** Open items a producer classed as bookkeeping: the rule's candidates, before its eligibility check. */
+  listAutoAnswerCandidates = (): IMissionAttentionItem[] =>
+    (this.database.prepare(`SELECT * FROM attention_items
+      WHERE state = 'open' AND json_extract(question_json, '$.class') = 'bookkeeping' ORDER BY updated_at, id`)
+      .all() as IItemRow[]).map(this.item);
 
   eventsAfter = (after: number, limit: number, workspaceId?: string): IMissionEventsResponse => {
     const where = workspaceId ? 'seq > ? AND workspace_id = ?' : 'seq > ?';
@@ -833,7 +969,7 @@ export class MissionControlStore {
       if (itemRow && (itemRow.workspace_id !== event.workspaceId || itemRow.run_id !== event.runId)) {
         missionConflict('attention item ID is already in use');
       }
-      if (itemRow) missionConflict('attention item already exists', itemFromRow(itemRow));
+      if (itemRow) missionConflict('attention item already exists', this.item(itemRow));
       const { itemId: ignored, humanReview: reviewInput, ...question } = event.payload;
       void ignored;
       const humanReview = reviewInput
@@ -858,7 +994,7 @@ export class MissionControlStore {
 
     if (!itemRow) throw new MissionControlError(404, 'not-found', `attention item ${itemId} not found`);
     if (itemRow.workspace_id !== event.workspaceId || itemRow.run_id !== event.runId) missionConflict('attention item is outside this run');
-    const item = itemFromRow(itemRow);
+    const item = this.item(itemRow);
     if (event.expectedRevision !== item.revision) missionConflict('stale attention revision', item);
 
     if (event.type === 'attention.updated') {
@@ -1014,7 +1150,7 @@ export class MissionControlStore {
       WHERE run_id=? AND state IN ('queued','dispatching','submitted','held')`).run(now, runId);
   };
 
-  private questionFromItem = (item: IMissionAttentionItem): IMissionQuestion => ({
+  private questionFromItem = (item: IMissionAttentionItem): IMissionQuestion & IMissionAttentionClassInput => ({
     kind: item.kind,
     title: item.title,
     context: item.context,
@@ -1023,6 +1159,8 @@ export class MissionControlStore {
     recommendation: item.recommendation,
     blockingScope: item.blockingScope,
     canContinue: item.canContinue,
+    ...(item.class === null ? {} : { class: item.class }),
+    ...(item.defaultOptionId === null ? {} : { defaultOptionId: item.defaultOptionId }),
   });
 
   private stampHumanReview = (
@@ -1093,62 +1231,70 @@ export class MissionControlStore {
     itemId: string,
     request: IMissionAnswerRequest,
     actor: string,
-  ): IMissionAnswerResponse => {
-    const transaction = this.database.transaction(() => {
-      const requestHash = contentHash({ itemId, request });
-      const existing = this.database.prepare('SELECT * FROM answers WHERE submission_id=?').get(request.submissionId) as IAnswerRow | undefined;
-      if (existing) {
-        if (existing.request_hash !== requestHash) missionConflict(`submission ${request.submissionId} was already used with different content`);
-        return this.answerResponse(existing, true);
-      }
-      const row = this.itemRow(itemId);
-      if (!row) throw new MissionControlError(404, 'not-found', `attention item ${itemId} not found`);
-      const item = itemFromRow(row);
-      if (item.state !== 'open') missionConflict('attention item is no longer open', item);
-      if (!item.humanReview || item.humanReview.humanNeed === 'none') {
-        missionConflict('attention item is not eligible for a human answer', item);
-      }
-      if (item.revision !== request.expectedRevision) missionConflict('stale attention revision', item);
-      const allowedOptions = new Set(item.options.map((option) => option.id));
-      if (request.optionIds.some((optionId) => !allowedOptions.has(optionId))) invalidMissionRequest('answer selected an unknown option');
-      if (item.kind === 'action' && request.optionIds.length) invalidMissionRequest('action answers cannot select question options');
+  ): IMissionAnswerResponse => this.answerTransaction(() => {
+    // ADR-0031 §8: only the rule's tick answers as a system actor; a session subject never does.
+    if (actor.startsWith('system:')) throw new MissionControlError(403, 'forbidden', 'a system actor cannot submit a human answer');
+    const requestHash = contentHash({ itemId, request });
+    const existing = this.database.prepare('SELECT * FROM answers WHERE submission_id=?').get(request.submissionId) as IAnswerRow | undefined;
+    if (existing) {
+      if (existing.request_hash !== requestHash) missionConflict(`submission ${request.submissionId} was already used with different content`);
+      return this.answerResponse(existing, true);
+    }
+    const row = this.itemRow(itemId);
+    if (!row) throw new MissionControlError(404, 'not-found', `attention item ${itemId} not found`);
+    const item = this.item(row);
+    if (item.state !== 'open') missionConflict('attention item is no longer open', item);
+    if (!item.humanReview || item.humanReview.humanNeed === 'none') {
+      missionConflict('attention item is not eligible for a human answer', item);
+    }
+    if (item.revision !== request.expectedRevision) missionConflict('stale attention revision', item);
+    const allowedOptions = new Set(item.options.map((option) => option.id));
+    if (request.optionIds.some((optionId) => !allowedOptions.has(optionId))) invalidMissionRequest('answer selected an unknown option');
+    if (item.kind === 'action' && request.optionIds.length) invalidMissionRequest('action answers cannot select question options');
+    const answerId = this.recordAnswer(item, request, requestHash, actor, Date.now(), {});
+    return this.answerResponse(this.database.prepare('SELECT * FROM answers WHERE id=?').get(answerId) as IAnswerRow, false);
+  });
 
-      const now = Date.now();
-      const answerId = randomUUID();
-      const deliveryId = randomUUID();
-      this.database.prepare(`INSERT INTO answers
-        (id,submission_id,request_hash,workspace_id,run_id,item_id,actor,request_json,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)`)
-        .run(answerId, request.submissionId, requestHash, item.workspaceId, item.runId, item.id, actor, toJson(request), now);
-      const revision = item.revision + 1;
-      this.database.prepare(`UPDATE attention_items SET revision=?, state='answered', answer_id=?, updated_at=? WHERE id=?`)
-        .run(revision, answerId, now, item.id);
-      const run = this.runRow(item.runId);
-      if (!run) throw new MissionControlError(404, 'not-found', `run ${item.runId} not found`);
-      const binding = parseJson<IMissionBinding>(run.binding_json);
-      this.database.prepare(`INSERT INTO deliveries
-        (id,answer_id,workspace_id,run_id,binding_json,state,attempts,next_attempt_at,last_error,submitted_at,acknowledged_at,updated_at)
-        VALUES (?,?,?,?,?,'queued',0,?,NULL,NULL,NULL,?)`)
-        .run(deliveryId, answerId, item.workspaceId, item.runId, binding ? toJson(binding) : null, now, now);
-      const syntheticEvent: TMissionProducerEvent = {
-        eventId: `answer:${request.submissionId}`,
-        schemaVersion: 1,
-        workspaceId: item.workspaceId,
-        runId: item.runId,
-        expectedRevision: item.revision,
-        producerAt: now,
-        bindingGeneration: binding?.generation ?? 0,
-        type: 'attention.updated',
-        payload: { itemId: item.id, kind: item.kind, title: item.title, context: item.context, storyIds: item.storyIds, options: item.options, recommendation: item.recommendation, blockingScope: item.blockingScope, canContinue: item.canContinue },
-      };
-      this.database.prepare(`INSERT INTO events
-        (id,request_hash,schema_version,workspace_id,run_id,entity_id,revision,type,payload_json,producer_at,committed_at)
-        VALUES (?,?,1,?,?,?,?, 'answer.recorded',?,?,?)`)
-        .run(syntheticEvent.eventId, requestHash, item.workspaceId, item.runId, item.id, revision, toJson({ answerId, submissionId: request.submissionId }), now, now);
-      return this.answerResponse(this.database.prepare('SELECT * FROM answers WHERE id=?').get(answerId) as IAnswerRow, false);
-    });
+  /**
+   * The bookkeeping rule's answer (ADR-0031 §6): the stated default, as `system:auto-answer`, at the
+   * revision the tick read. The deterministic submission ID makes a repeat a replay, and the revision
+   * check lets a human answer or a cancel that came first win. Only the tick calls this.
+   */
+  submitSystemAnswer = (
+    itemId: string,
+    expectedRevision: number,
+    rule: IAutoAnswerRule,
+    now = Date.now(),
+  ): IMissionAnswerResponse => this.answerTransaction(() => {
+    const submissionId = autoAnswerSubmissionId(itemId, expectedRevision);
+    const existing = this.database.prepare('SELECT * FROM answers WHERE submission_id=?').get(submissionId) as IAnswerRow | undefined;
+    if (existing) {
+      if (existing.actor !== MISSION_AUTO_ANSWER_ACTOR || existing.item_id !== itemId) {
+        missionConflict(`submission ${submissionId} was already used by another answer`);
+      }
+      return this.answerResponse(existing, true);
+    }
+    const row = this.itemRow(itemId);
+    if (!row) throw new MissionControlError(404, 'not-found', `attention item ${itemId} not found`);
+    const item = this.item(row);
+    if (item.state === 'open' && item.revision !== expectedRevision) missionConflict('stale attention revision', item);
+    const refusal = autoAnswerRefusal(item, rule, now);
+    if (refusal) missionConflict(refusal, item);
+    const optionId = item.defaultOptionId as string;
+    const optionLabel = item.options.find((option) => option.id === optionId)?.label as string;
+    const note = autoAnswerNote(rule, now, optionLabel);
+    const request: IMissionAnswerRequest = { submissionId, expectedRevision, optionIds: [optionId], text: note, actionCompleted: false };
+    const answerId = this.recordAnswer(item, request, contentHash({ itemId, request }), MISSION_AUTO_ANSWER_ACTOR, now,
+      { actor: MISSION_AUTO_ANSWER_ACTOR });
+    this.database.prepare(`INSERT INTO mission_auto_answers
+      (answer_id,item_id,workspace_id,rule,rule_version,applied_option_id,at,note) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(answerId, item.id, item.workspaceId, AUTO_ANSWER_KEY, rule.version, optionId, now, note);
+    return this.answerResponse(this.database.prepare('SELECT * FROM answers WHERE id=?').get(answerId) as IAnswerRow, false);
+  });
+
+  private answerTransaction = (work: () => IMissionAnswerResponse): IMissionAnswerResponse => {
     try {
-      return transaction();
+      return this.database.transaction(work)();
     } catch (error) {
       if (isMissionControlError(error)) throw error;
       if (isSqliteFailure(error)) throw new MissionControlError(503, 'storage-unavailable', 'Mission Control storage unavailable');
@@ -1156,12 +1302,45 @@ export class MissionControlStore {
     }
   };
 
+  /** Answer, item, delivery and `answer.recorded` event of one checked answer; inside the caller's transaction. */
+  private recordAnswer = (
+    item: IMissionAttentionItem,
+    request: IMissionAnswerRequest,
+    requestHash: string,
+    actor: string,
+    now: number,
+    eventDetail: Record<string, unknown>,
+  ): string => {
+    const answerId = randomUUID();
+    const deliveryId = randomUUID();
+    this.database.prepare(`INSERT INTO answers
+      (id,submission_id,request_hash,workspace_id,run_id,item_id,actor,request_json,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(answerId, request.submissionId, requestHash, item.workspaceId, item.runId, item.id, actor, toJson(request), now);
+    const revision = item.revision + 1;
+    this.database.prepare(`UPDATE attention_items SET revision=?, state='answered', answer_id=?, updated_at=? WHERE id=?`)
+      .run(revision, answerId, now, item.id);
+    const run = this.runRow(item.runId);
+    if (!run) throw new MissionControlError(404, 'not-found', `run ${item.runId} not found`);
+    const binding = parseJson<IMissionBinding>(run.binding_json);
+    this.database.prepare(`INSERT INTO deliveries
+      (id,answer_id,workspace_id,run_id,binding_json,state,attempts,next_attempt_at,last_error,submitted_at,acknowledged_at,updated_at)
+      VALUES (?,?,?,?,?,'queued',0,?,NULL,NULL,NULL,?)`)
+      .run(deliveryId, answerId, item.workspaceId, item.runId, binding ? toJson(binding) : null, now, now);
+    this.database.prepare(`INSERT INTO events
+      (id,request_hash,schema_version,workspace_id,run_id,entity_id,revision,type,payload_json,producer_at,committed_at)
+      VALUES (?,?,1,?,?,?,?, 'answer.recorded',?,?,?)`)
+      .run(`answer:${request.submissionId}`, requestHash, item.workspaceId, item.runId, item.id, revision,
+        toJson({ answerId, submissionId: request.submissionId, ...eventDetail }), now, now);
+    return answerId;
+  };
+
   private answerResponse = (answerRow: IAnswerRow, replayed: boolean): IMissionAnswerResponse => {
     const item = this.itemRow(answerRow.item_id);
     const delivery = this.database.prepare('SELECT * FROM deliveries WHERE answer_id=?').get(answerRow.id) as IDeliveryRow | undefined;
     if (!item || !delivery) throw new Error('stored answer is incomplete');
     const cursor = Number((this.database.prepare('SELECT COALESCE(MAX(seq), 0) AS cursor FROM events').get() as { cursor: number }).cursor);
-    return { answer: answerFromRow(answerRow), item: itemFromRow(item), delivery: deliveryFromRow(delivery), cursor, replayed };
+    return { answer: answerFromRow(answerRow), item: this.item(item), delivery: deliveryFromRow(delivery), cursor, replayed };
   };
 
   listDueDeliveries = (now: number, limit: number): IMissionDelivery[] =>

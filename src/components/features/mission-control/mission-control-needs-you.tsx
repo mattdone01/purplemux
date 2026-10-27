@@ -2,14 +2,19 @@ import type { ReactNode } from 'react';
 import { AlertCircle, RefreshCw, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import MissionControlAnswerCard from '@/components/features/mission-control/mission-control-answer-card';
+import MissionControlAnswerCard, { MissionControlAutoAnswerCard } from '@/components/features/mission-control/mission-control-answer-card';
+import { AnswersByClassStrip } from '@/components/features/mission-control/attention-class-view';
+import { ATTENTION_CLASS_KEYS, ATTENTION_CLASS_LABELS, attentionClassKey } from '@/lib/attention-class';
+import type { TAttentionClassKey } from '@/lib/attention-class';
 import { isMissionHumanInboxItem } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
 import type {
   IMissionAttentionItem,
+  IMissionAutoAnsweredItem,
   IMissionSnapshot,
   IMissionWorkspaceView,
 } from '@/types/mission-control';
+import { AUTO_ANSWERED_LIMIT } from '@/types/mission-control';
 
 export const SectionHeading = ({
   title,
@@ -17,7 +22,7 @@ export const SectionHeading = ({
   description,
 }: {
   title: string;
-  count?: number;
+  count?: number | string;
   description: string;
 }) => (
   <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
@@ -66,6 +71,55 @@ export const needsYouGroups = (
       || left.workspaceId.localeCompare(right.workspaceId));
 };
 
+interface INeedsYouClassGroup {
+  attentionClass: TAttentionClassKey;
+  workspaces: INeedsYouGroup[];
+}
+
+/** Classes in ADR-0031 order (money first, unclassified last); the workspace grouping holds inside each class. */
+export const needsYouClassGroups = (
+  items: IMissionAttentionItem[],
+  workspaces: IMissionWorkspaceView[],
+): INeedsYouClassGroup[] => ATTENTION_CLASS_KEYS
+  .map((attentionClass) => ({
+    attentionClass,
+    workspaces: needsYouGroups(items.filter((item) => attentionClassKey(item.class) === attentionClass), workspaces),
+  }))
+  .filter((group) => group.workspaces.length > 0);
+
+/**
+ * ADR-0031: what the bookkeeping rule answered in the last 7 days, newest first. Nothing renders
+ * when there is none, or when an older server does not send the list.
+ */
+export const AutoAnsweredSection = ({
+  entries,
+  workspaces,
+}: {
+  entries: IMissionAutoAnsweredItem[] | undefined;
+  workspaces: IMissionWorkspaceView[];
+}) => {
+  if (!entries?.length) return null;
+  const sorted = [...entries].sort((left, right) => right.at - left.at || left.itemId.localeCompare(right.itemId));
+  return (
+    <div className="min-w-0 space-y-3" data-auto-answered-section>
+      <SectionHeading
+        title="Auto-answered"
+        count={sorted.length >= AUTO_ANSWERED_LIMIT ? `${AUTO_ANSWERED_LIMIT}+` : sorted.length}
+        description="Bookkeeping items the fleet rule answered with their stated default in the last 7 days."
+      />
+      <div className="grid min-w-0 gap-3 xl:grid-cols-2">
+        {sorted.map((entry) => (
+          <MissionControlAutoAnswerCard
+            key={entry.itemId}
+            entry={entry}
+            workspaceName={workspaces.find((workspace) => workspace.workspaceId === entry.workspaceId)?.name ?? entry.workspaceId}
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
 interface INeedsYouHandlers {
   drafts: Record<string, IMissionDraft>;
   onDraftChange: (item: IMissionAttentionItem, patch: IMissionDraftPatch) => void;
@@ -90,29 +144,38 @@ const NeedsYouList = ({
       <div id={HEADING_ID}>
         <SectionHeading title={TITLE} count={items.length} description={DESCRIPTION} />
       </div>
+      <AnswersByClassStrip rows={snapshot.answersByClass} generatedAt={snapshot.generatedAt} />
       {items.length === 0 ? (
         <EmptyPanel>No confirmed questions need an answer.</EmptyPanel>
-      ) : needsYouGroups(items, snapshot.workspaces).map(({ workspaceId, workspace, items: groupItems }) => (
-        <div key={workspaceId} className="min-w-0 space-y-3">
-          <p className="break-words text-xs font-medium text-muted-foreground">{workspace?.name ?? workspaceId}</p>
-          <div className="grid min-w-0 gap-3 xl:grid-cols-2">
-            {groupItems.map((item) => {
-              const draft = drafts[item.id];
-              if (!draft) return null;
-              return (
-                <MissionControlAnswerCard
-                  key={item.id}
-                  draft={draft}
-                  workspaceName={workspace?.name ?? item.workspaceId}
-                  onChange={(patch) => onDraftChange(item, patch)}
-                  onAdoptCurrent={() => onAdoptCurrent(item.id)}
-                  onSubmit={() => onSubmit(item)}
-                />
-              );
-            })}
-          </div>
+      ) : needsYouClassGroups(items, snapshot.workspaces).map(({ attentionClass, workspaces }) => (
+        <div key={attentionClass} className="min-w-0 space-y-3" data-attention-class-group={attentionClass}>
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            {ATTENTION_CLASS_LABELS[attentionClass]}
+          </h3>
+          {workspaces.map(({ workspaceId, workspace, items: groupItems }) => (
+            <div key={workspaceId} className="min-w-0 space-y-3">
+              <p className="break-words text-xs font-medium text-muted-foreground">{workspace?.name ?? workspaceId}</p>
+              <div className="grid min-w-0 gap-3 xl:grid-cols-2">
+                {groupItems.map((item) => {
+                  const draft = drafts[item.id];
+                  if (!draft) return null;
+                  return (
+                    <MissionControlAnswerCard
+                      key={item.id}
+                      draft={draft}
+                      workspaceName={workspace?.name ?? item.workspaceId}
+                      onChange={(patch) => onDraftChange(item, patch)}
+                      onAdoptCurrent={() => onAdoptCurrent(item.id)}
+                      onSubmit={() => onSubmit(item)}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </div>
       ))}
+      <AutoAnsweredSection entries={snapshot.autoAnswered} workspaces={snapshot.workspaces} />
     </>
   );
 };

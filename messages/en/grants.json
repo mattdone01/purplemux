@@ -37,5 +37,16 @@
   "errorUnknown": "The request failed ({status})",
   "granteesUnreadable": "Tabs of {workspaces} could not be read",
   "granteesFailed": "The tab list could not be read: {error}",
-  "staleSuffix": "not refreshed: {reason}"
+  "staleSuffix": "not refreshed: {reason}",
+  "capabilityLabel": "Kind",
+  "capabilityDrive": "Read other workspaces",
+  "capabilityOwner": "Owner session",
+  "ownerScope": "Every workspace, including ones created later; it can send notes as owner but never drive another workspace",
+  "ownerActive": "{tab} · {workspace} holds the owner session until {time}; revoke it first",
+  "ownerReads": "owner session — reads every workspace",
+  "ownerBadge": "owner",
+  "ownerBadgeTooltip": "Owner session: reads every workspace and sends notes as owner until {time}",
+  "errorOwnerActive": "An owner session is already active",
+  "refusedDrive": "Read grants are not honoured: grants.json cannot be read — {reason}",
+  "refusedOwner": "Owner sessions are not honoured: owner-grants.json cannot be read — {reason}"
 }

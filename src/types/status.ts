@@ -51,6 +51,8 @@ export interface ITabStatusEntry {
   lastResumeOrStartedAt?: number;
   /** Live same-workspace tab that receives this tab's nudges (ADR-0018); mirrors ITab.reportsTo. */
   reportsTo?: string | null;
+  /** The markers whose end lines are forwarded (ADR-0025); mirrors ITab.reportOn. Null: every marker. */
+  reportOn?: import('@/lib/turn-end').TTurnMarkerName[] | null;
   /** How the watchdog classified the last `stop` (ADR-0018). Runtime only. */
   turnEnd?: ITurnEndRecord | null;
   /** The provider-error episode this tab is in; a clean stop ends it (story 26). Runtime only. */
@@ -227,7 +229,7 @@ export interface IOrchestrationNudgeMessage {
   nudge: IOrchestrationNudge;
 }
 
-export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'orchestrator-missing' | 'work-stalled' | 'bg-job-died' | 'bg-job-unknown';
+export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'orchestrator-missing' | 'work-stalled' | 'bg-job-died' | 'bg-job-unknown' | 'flag';
 
 export type TAlertProviderId = 'claude' | 'codex' | 'grok';
 
@@ -244,6 +246,17 @@ export interface IAlert {
   title: string;
   body: string;
   at: number;
+  /** Kind `flag` only (ADR-0032): the raised fleet or flow flag. */
+  flag?: IAlertFlag;
+}
+
+export type TAlertFlagSource = 'fleet' | 'flow';
+
+export interface IAlertFlag {
+  source: TAlertFlagSource;
+  rule: string;
+  subject: string;
+  text: string;
 }
 
 export interface INotificationAlertMessage {
