@@ -98,3 +98,56 @@ side table `mission_item_openers`, inside the same transaction. The opener comes
 credential (ADR-0010), never from the payload: `launch` is verified, `hook` and `session` are asserted. It is not
 authorization, and `IMissionSnapshot` and the event feed do not carry it. A missing row means unattributed. The
 trust-boundary sentence above still holds for a workspace-token caller; a launch tab token does name its tab.
+
+## Flow (ADR-0026)
+
+An orchestrator publishes its pipeline with `purplemux flow publish -w WS --json @FILE` (`IFlowSnapshot`,
+`src/types/flow.ts`); the server keeps the record and one history row per publish in `workspaces/{ws}/flow.json`.
+`GET /api/mission-control/flow` (human session only; a CLI token gets 401) lists each workspace with a record:
+`{workspaceId, workspaceName, receivedAt, generatedAt, source, stale, producerFlagCount, derivedFlagCount}`, and an
+unreadable record goes to `errors` without blanking the list. `?workspaceId=WS[&history=window|none|all]` answers
+`{workspaceId, flow, stale, derived}` (default `history=window`); an unreadable record answers 503
+`storage-unavailable`. `GET /api/cli/workspaces/{ws}/flow` serves the same `derived` answer from the same service
+(`src/lib/flow-view.ts`), and `flow show` prints it. `derived` is absent when there is no record, and from a server
+before purplemux-flow story 02; a client without it still parses the answer.
+
+**Derived flags** (`deriveFlowFlags` in `src/lib/flow-flags.ts`, pure). They come from the full record, whatever
+history the answer carries, and sort `block`, then `warn`, then by rule and subject.
+
+| Rule | Severity | Raised when |
+|---|---|---|
+| `stale` | warn | no publish for 10 min. A stale record raises only this flag; the other rules do not run. |
+| `lock-busy` | warn | the lock's busy share over the window is at least `flow.lock-busy-percent` |
+| `queue-long` | warn | a queue holds at least `flow.queue-length` items |
+| `queue-old` | warn | a queue's oldest item is older than `flow.oldest-minutes` |
+| `queue-full` | block | a queue with a `capacity` holds at least that many items |
+| `meter-over` | warn | a meter's `value` is above its `limit` |
+
+The busy share is time-weighted: each history row's lock state holds from its `at` to the next row's `at`, and the
+newest row holds until now. A gap longer than 10 min, a negative interval (the clock stepped back) and a row without
+the lock are unknown time, on neither side; no instant counts twice. If the known time is less than half the window,
+`lockBusyShare` is `null`, the lock is in `insufficientHistory`, and no flag is raised. `lockKnownMinutes` gives the
+known time. The shares are served on a stale record too; there, the time since the last publish is unknown time.
+
+**Fleet config keys** (ADR-0019; the admin token or the workspace's enabled orchestrator writes them). An unset or
+invalid value reads as the default, and the server logs why. The served `thresholds` state the values in use.
+
+| Key | Default | Valid values |
+|---|---|---|
+| `flow.window-minutes` | 360 | 10..10080, decimals allowed. It also sets the rows of `history=window`. |
+| `flow.lock-busy-percent` | 80 | 1..100, decimals allowed |
+| `flow.queue-length` | 10 | a whole number 1..10000 |
+| `flow.oldest-minutes` | 240 | 1..10080, decimals allowed |
+
+**The panel** (`src/components/features/mission-control/flow-panel.tsx`) is on the default Mission Control view,
+after "Needs you" and before the portfolio board, and only when a workspace has a record or an unreadable one. It
+selects the newest published workspace by default and keeps that selection until the workspace leaves the list. It
+polls both GETs every 60 s while the page is visible; the detail asks `history=none`, since the panel draws no rows. It shows
+the derived and producer flags first, then each queue as a bar of its items (coloured by state, pinned items marked,
+the oldest item's age, the capacity), the locks (holder, held since, busy share) and the meters against their limit.
+A stale record shows "stale — last published <age> ago" above the data; the panel also decides staleness from the
+record's `receivedAt` at render time, so a last answer kept through failed refreshes turns stale too. The busy sentence
+("held 92% of the last 6 h", or "held 100% of 3 h 1 min known in the last 6 h" when the known time is shorter than the
+window) is built by `lockBusyPhrase` for the flag text, the panel and `flow show`. The shown percent is rounded down, and
+the rule compares busy and known milliseconds, so a shown percent never meets the threshold without the flag. It sends
+nothing to a tab and writes nothing.

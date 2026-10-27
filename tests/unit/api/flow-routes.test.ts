@@ -38,6 +38,13 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
 
 const row = (at: number) => ({ at, queues: { landing: 1 }, oldest: { landing: at - MIN }, locks: { landing: true }, meters: { 'gate-slots': 4 } });
 
+const writeFleetConfig = (values: Record<string, string>) => fs.writeFile(path.join(mockHome.value, '.purplemux', 'fleet-config.json'),
+  JSON.stringify({
+    values: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value, version: 1, setBy: { kind: 'admin' } }])),
+    versions: Object.fromEntries(Object.keys(values).map((key) => [key, 1])),
+    history: [],
+  }));
+
 const wsDir = (wsId: string) => path.join(mockHome.value, '.purplemux', 'workspaces', wsId);
 const flowFile = (wsId: string) => path.join(wsDir(wsId), 'flow.json');
 
@@ -61,6 +68,7 @@ describe('flow routes', () => {
     resetRouteGlobals();
     delete (globalThis as Record<string, unknown>).__ptFlowReadCache;
     delete (globalThis as Record<string, unknown>).__ptFlowLocks;
+    delete (globalThis as Record<string, unknown>).__ptFlowThresholdsLogged;
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-flow-routes-'));
     process.env.NEXTAUTH_SECRET = 'flow-route-test-secret-at-least-32-bytes';
     await writeFixture(mockHome.value, [
@@ -237,6 +245,52 @@ describe('flow routes', () => {
       expect((await cli('GET', 'ws-a', tokenA)).body.stale).toBe(true);
     });
 
+    it('serves derived flags from the full record, with the thresholds that fleet config sets', async () => {
+      const now = Date.now();
+      // Held for the whole window, in rows 5 minutes apart: the busy share is 1.
+      const history = Array.from({ length: 73 }, (_, index) => row(now - (360 - index * 5) * MIN));
+      await fs.writeFile(flowFile('ws-a'), JSON.stringify({ workspaceId: 'ws-a', receivedAt: now - MIN, snapshot: snapshot(), history }));
+      const defaults = await cli('GET', 'ws-a', tokenA);
+      expect(defaults.status).toBe(200);
+      expect(defaults.body.derived).toMatchObject({
+        flags: [
+          { rule: 'lock-busy', subject: 'landing', severity: 'warn' },
+          { rule: 'queue-old', subject: 'landing', severity: 'warn', text: 'landing oldest item waits 67 h (threshold 4 h)' },
+        ],
+        lockBusyShare: { landing: 1 }, insufficientHistory: [], windowMinutes: 360,
+        thresholds: { windowMinutes: 360, lockBusyPercent: 80, queueLength: 10, oldestMinutes: 240 },
+      });
+
+      await writeFleetConfig({ 'flow.window-minutes': '60', 'flow.queue-length': '1', 'flow.oldest-minutes': 'soon', 'flow.lock-busy-percent': '101' });
+      const configured = await cli('GET', 'ws-a', tokenA, { query: { history: 'window' } });
+      const derived = configured.body.derived as Record<string, unknown>;
+      expect(derived.thresholds).toEqual({ windowMinutes: 60, lockBusyPercent: 80, queueLength: 1, oldestMinutes: 240 });
+      expect(derived.windowMinutes).toBe(60);
+      expect((derived.flags as Array<{ rule: string }>).map((flag) => flag.rule)).toEqual(['lock-busy', 'queue-long', 'queue-old']);
+      // The served window follows flow.window-minutes (the route's clock is a few ms past the row at −60 min).
+      const served = (configured.body.flow as { history: Array<{ at: number }> }).history.map((entry) => entry.at);
+      expect(served[0]).toBe(now - 55 * MIN);
+      expect(served).toHaveLength(12);
+    });
+
+    it('reads every threshold as its default when fleet config is unreadable, and still answers', async () => {
+      await cli('POST', 'ws-a', tokenA, { body: snapshot() });
+      await fs.writeFile(path.join(mockHome.value, '.purplemux', 'fleet-config.json'), 'not json');
+      const read = await cli('GET', 'ws-a', tokenA);
+      expect(read.status).toBe(200);
+      expect((read.body.derived as { thresholds: unknown }).thresholds).toEqual({ windowMinutes: 360, lockBusyPercent: 80, queueLength: 10, oldestMinutes: 240 });
+      // One publish is too little history for a busy share: it says so, and raises no lock flag.
+      expect(read.body.derived).toMatchObject({ lockBusyShare: { landing: null }, insufficientHistory: ['landing'] });
+    });
+
+    it('raises only stale on a stale record', async () => {
+      const crowded = snapshot({ queues: [{ name: 'landing', capacity: 1, items: snapshot().queues[0].items }] });
+      await fs.writeFile(flowFile('ws-a'), JSON.stringify({ workspaceId: 'ws-a', receivedAt: Date.now() - 11 * MIN, snapshot: crowded, history: [] }));
+      const read = await cli('GET', 'ws-a', tokenA);
+      expect(read.body.stale).toBe(true);
+      expect((read.body.derived as { flags: Array<{ rule: string }> }).flags.map((flag) => flag.rule)).toEqual(['stale']);
+    });
+
     it('answers flow-unreadable for a damaged file, then the next publish moves it aside', async () => {
       await fs.writeFile(flowFile('ws-a'), JSON.stringify({ workspaceId: 'ws-a', receivedAt: 1, snapshot: { schemaVersion: 2 }, history: [] }));
       const read = await cli('GET', 'ws-a', tokenA);
@@ -261,7 +315,7 @@ describe('flow routes', () => {
       }
     });
 
-    it('lists every workspace with a record, without a derived count before story 02', async () => {
+    it('lists every workspace with a record, with its producer and derived flag counts', async () => {
       const empty = await mission();
       expect(empty.status).toBe(200);
       expect(empty.body).toEqual({ workspaces: [], errors: [] });
@@ -276,10 +330,9 @@ describe('flow routes', () => {
       const rows = list.body.workspaces as Array<Record<string, unknown>>;
       expect(rows).toEqual([
         { workspaceId: 'ws-a', workspaceName: 'alpha', receivedAt: publishedA.body.receivedAt, generatedAt: long.generatedAt,
-          source: 'v2-flow', stale: false, producerFlagCount: 2 },
-        expect.objectContaining({ workspaceId: 'ws-b', workspaceName: 'beta', stale: true, producerFlagCount: 0 }),
+          source: 'v2-flow', stale: false, producerFlagCount: 2, derivedFlagCount: 2 },
+        expect.objectContaining({ workspaceId: 'ws-b', workspaceName: 'beta', stale: true, producerFlagCount: 0, derivedFlagCount: 1 }),
       ]);
-      for (const entry of rows) expect(Object.hasOwn(entry, 'derivedFlagCount')).toBe(false);
       expect(list.body.errors).toEqual([]);
     });
 
@@ -306,6 +359,24 @@ describe('flow routes', () => {
       const bad = await mission({ workspaceId: 'ws-a', history: 'every' });
       expect(bad.status).toBe(400);
       expect(bad.body.code).toBe('invalid-request');
+    });
+
+    it('serves the same derived answer as the CLI route, from the full record while the rows are the window', async () => {
+      const now = Date.now();
+      // The window starts in the middle of a hold: the row 362 minutes ago holds the lock state at the window start.
+      const history = [row(now - 362 * MIN), ...Array.from({ length: 72 }, (_, index) => row(now - (356 - index * 5) * MIN))];
+      await fs.writeFile(flowFile('ws-a'), JSON.stringify({ workspaceId: 'ws-a', receivedAt: now - MIN, snapshot: snapshot(), history }));
+      const detail = await mission({ workspaceId: 'ws-a' });
+      expect(detail.status).toBe(200);
+      const served = (detail.body.flow as { history: Array<{ at: number }> }).history;
+      expect(served).toHaveLength(72);
+      expect(served[0].at).toBe(now - 356 * MIN);
+      const derived = detail.body.derived as { lockKnownMinutes: Record<string, number>; lockBusyShare: Record<string, number> };
+      expect(derived.lockBusyShare.landing).toBe(1);
+      expect(derived.lockKnownMinutes.landing).toBeGreaterThan(359);
+      const cliRead = await cli('GET', 'ws-a', tokenA, { query: { history: 'window' } });
+      expect({ ...(cliRead.body.derived as object) }).toEqual({ ...(detail.body.derived as object), lockKnownMinutes: expect.any(Object) });
+      expect(Object.keys(detail.body)).toEqual(['workspaceId', 'flow', 'stale', 'derived']);
     });
 
     it('answers storage-unavailable for a damaged record and not-found for an unknown workspace', async () => {

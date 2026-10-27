@@ -26,8 +26,6 @@ export const MAX_FLOW_ITEMS = 500;
 export const MAX_FLOW_LOCKS = 20;
 export const MAX_FLOW_METERS = 50;
 export const MAX_FLOW_FLAGS = 20;
-/** `flow.window-minutes` default; story 02 reads the fleet-config value. */
-export const FLOW_WINDOW_MINUTES = 360;
 
 const FUTURE_TOLERANCE_MS = 5 * 60_000;
 // `flow show` prints producer strings raw to other workspaces' terminals, so no string carries a

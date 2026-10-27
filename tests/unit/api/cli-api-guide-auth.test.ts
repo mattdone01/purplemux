@@ -40,6 +40,11 @@ describe('GET /api/cli/api-guide', () => {
     expect(guide).toContain('purplemux flow publish -w "$PMUX_WORKSPACE_ID" --json @flow.json');
     expect(guide).toContain('GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]');
     for (const code of ['flow-invalid', 'flow-too-large', 'flow-unreadable', 'flow-not-found']) expect(guide).toContain(code);
+    for (const key of ['flow.window-minutes', 'flow.lock-busy-percent', 'flow.queue-length', 'flow.oldest-minutes']) {
+      expect(guide.slice(guide.indexOf('Keys in use:'), guide.indexOf('GET /api/cli/fleet-config'))).toContain(key);
+    }
+    for (const rule of ['stale', 'lock-busy', 'queue-long', 'queue-old', 'queue-full', 'meter-over']) expect(guide).toContain(`    ${rule} `);
+    expect(guide).toContain('"derived"?:');
   });
 
   it('refuses a caller no token resolves', async () => {

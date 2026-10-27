@@ -4,6 +4,7 @@ import type { GetServerSideProps } from 'next';
 import { AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import PortfolioBoard from '@/components/features/mission-control/portfolio-board';
+import FlowPanel from '@/components/features/mission-control/flow-panel';
 import { getPageShellWithTitlebarLayout } from '@/components/layout/page-shell';
 import MissionControlDashboard, {
   MissionControlDashboardSkeleton,
@@ -199,6 +200,9 @@ const MissionControlPage = () => {
             onAdoptCurrent={handleAdoptCurrent}
             onSubmit={(item) => void handleSubmit(item)}
           />
+        </div>
+        <div className="mx-auto w-full max-w-[1440px] px-3 pt-5 empty:hidden sm:px-5 lg:px-8">
+          <FlowPanel />
         </div>
         <PortfolioBoard />
       </>
