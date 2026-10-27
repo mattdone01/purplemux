@@ -28,7 +28,7 @@ Option 3.
    queue, `label` ≤ 120 or null, `since` ms, `state` `queued|active|held`, `pinned` boolean, `holder` ≤ 128 or null),
    `locks` (≤ 20: `name` unique, `heldBy` ≤ 128 or null for a free lock, `since` ms or null, null when free), `meters`
    (≤ 50: `name` unique, `value` finite, `unit` ≤ 16, `limit` finite or null, `windowMinutes` 1..10080 or null),
-   `flags` (≤ 20: `text` 1..200, `severity` `info|warn|block`). Unknown keys are refused, so a typo never drops data. No
+   `flags` (≤ 20: `text` 1..200, `severity` `info|warn|block`). Unknown keys are refused, so a typo never drops data. No producer string holds a control character (`\p{Cc}`) or a bidi control (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069), because `flow show` prints them raw; an identifier (`source`, a queue, lock or meter name, an item `id`, `holder`, `heldBy`, `unit`) also holds no other format character (`\p{Cf}`), so two look-alike names cannot both pass the uniqueness check; `label` and flag `text` keep the other format characters (ZWJ, ZWNJ, tag characters, soft hyphen). A refusal echoes such a character as `\u{…}`. `heldBy` is null or non-blank. No
    time is more than 5 min after the receive time. The serialized snapshot is at most 1 MiB.
 2. **Validation** is one pure, hand-written function, `parseFlowSnapshot(raw, receivedAt)` in `src/lib/flow.ts` (new),
    with no Node import, so the UI may import it. Each refusal names the field, what it saw and what it expected (the
@@ -59,7 +59,7 @@ Option 3.
 6. **Routes.**
    - `POST /api/cli/workspaces/{ws}/flow`: an own-workspace token only (`authorizeWorkspace`, so a peer, a grant or the
      admin token gets `forbidden`). 2 MB body limit. 200 `{ok, workspaceId, receivedAt, generatedAt, historyRows,
-     historyReset, bytes}`; 400 `flow-invalid`; 413 `flow-too-large`; 404 `not-found` for an unknown workspace.
+     historyReset, bytes}`; 400 `flow-invalid`; 413 `flow-too-large`; 404 `not-found` for an unknown workspace; 500 `flow-write-failed` when the store cannot write (the previous record stays).
    - `GET /api/cli/workspaces/{ws}/flow[?history=all|window|none]`: read scope (`accessDecision`). 200 `{flow:
      IFlowRecord | null, stale: boolean | null, derived?: IFlowDerived}`; 500 `flow-unreadable`. Default `history=all`.
    - `GET /api/mission-control/flow`: human session (`requireMissionHuman`). 200 `{workspaces: [{workspaceId,
@@ -68,7 +68,7 @@ Option 3.
    - `GET /api/mission-control/flow?workspaceId=WS[&history=window|none|all]`: 200 `{workspaceId, flow, stale,
      derived?}`; 503 `storage-unavailable` for an unreadable record. Default `history=window` (the rows of the derived
      window only). A CLI token on either human route gets 401.
-   - Every route sets `Cache-Control: no-store`. `derived` arrives with story 02; a client without it ignores it.
+   - Every route sets `Cache-Control: no-store`. `derived` and the list row's `derivedFlagCount` arrive with story 02; a client without them ignores them.
 7. **CLI.** `purplemux flow publish -w WS --json @FILE` prints `ok <receivedAt> <historyRows>`; `purplemux flow show -w WS
    [--json] [--history all|window|none]` prints queues, locks with busy share, meters, producer and derived flags, and
    `stale` when stale. `flow show` with `flow: null` prints `no flow published` and exits 7 (`flow-not-found`,

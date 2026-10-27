@@ -72,6 +72,9 @@ to an exit code through one table:
      7  not found                                lease-not-found, note-not-found,           —
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found
+     1  (flow, ADR-0026)                         flow-unreadable                            investigate
+     2  (flow, ADR-0026)                         flow-invalid, flow-too-large               fix the command
+     7  (flow, ADR-0026)                         flow-not-found (client-side: flow show)    —
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -568,6 +571,58 @@ POST /api/cli/workspaces/<workspaceId>/burndown        (purplemux burndown publi
 
 GET /api/cli/workspaces/<workspaceId>/burndown         (purplemux burndown show -w WS)
   Response: { "burndown": { "workspaceId", "receivedAt", "snapshot": { ... } } | null }
+
+## Flow (ADR-0026)
+
+POST /api/cli/workspaces/<workspaceId>/flow            (purplemux flow publish -w WS --json @FILE)
+  Body: one flow snapshot (src/types/flow.ts IFlowSnapshot). Every key is required; an unknown key
+  is refused, so a typo never drops data. Times are Unix ms:
+        { "schemaVersion": 1, "generatedAt", "source": "<1..64>",
+          "queues": [{ "name": "<1..64, unique>", "capacity": 1..10000 | null,
+                       "items": [{ "id": "<1..128, unique in its queue>", "label": "<= 120" | null, "since",
+                                   "state": "queued" | "active" | "held", "pinned": bool, "holder": "<= 128" | null }] }],
+          "locks":  [{ "name": "<1..64, unique>", "heldBy": "<= 128" | null (free), "since" | null (null when free) }],
+          "meters": [{ "name": "<1..64, unique>", "value": finite, "unit": "<= 16", "limit": finite | null,
+                       "windowMinutes": 1..10080 | null }],
+          "flags":  [{ "text": "<1..200>", "severity": "info" | "warn" | "block" }] }
+  Own workspace only: a peer, a grant or the admin token gets 403 forbidden. At most 20 queues,
+  500 items per queue, 20 locks, 50 meters and 20 flags; no time more than 5 min after the server
+  clock. No string holds a control character (newline, ESC) or a bidi control (U+061C, U+200E,
+  U+200F, U+202A-U+202E, U+2066-U+2069); an identifier (source, a queue, lock or meter name, an item
+  id, holder, heldBy, unit) also holds no other format character such as ZWJ or a soft hyphen,
+  while label and flag text keep them (emoji sequences, ZWNJ scripts). A held lock names a
+  non-blank heldBy. A refusal (400 flow-invalid, exit 2) names the field, what it saw (format and
+  bidi characters echoed as \\u{...}) and what it expected; the stored record does not change.
+  Over 1 MiB serialized: 413 flow-too-large (exit 2; the CLI refuses before it sends). 404
+  not-found for an unknown workspace. 500 flow-write-failed (exit 1, investigate) when the store
+  cannot write; the previous record stays as it was.
+  Response: { "ok": true, "workspaceId", "receivedAt", "generatedAt", "historyRows", "historyReset", "bytes" }
+  The server appends one history row per publish, derived from the snapshot; a producer never
+  sends history: { "at": receivedAt, "queues": { name: length }, "oldest": { name: since of the
+  oldest item | null }, "locks": { name: held }, "meters": { name: value } }. The record keeps the
+  newest 2000 rows and at most 4 MiB; the oldest rows go first. A stored record that does not
+  validate is kept as flow.json.corrupt-<receivedAt> by the next publish, which starts a fresh
+  history and answers "historyReset": true. "bytes" is the stored record's size.
+
+  Example, from a board script on a timer (the CLI prints ok <receivedAt> <historyRows>):
+    purplemux flow publish -w "$PMUX_WORKSPACE_ID" --json @flow.json
+    ok 1793001600000 412
+  with flow.json:
+    { "schemaVersion": 1, "generatedAt": 1793001590000, "source": "v2-flow",
+      "queues": [{ "name": "landing", "capacity": null, "items": [{ "id": "lane/a0", "label": null,
+                   "since": 1792760000000, "state": "queued", "pinned": false, "holder": null }] }],
+      "locks": [{ "name": "landing", "heldBy": "lane/b1", "since": 1792999800000 }],
+      "meters": [{ "name": "gate-slots", "value": 4, "unit": "slots", "limit": 5, "windowMinutes": null }],
+      "flags": [{ "text": "main is red", "severity": "block" }] }
+
+GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
+                                                       (purplemux flow show -w WS [--json] [--history all|window|none])
+  Read scope: the own token, a peer, a grant, the admin token. history defaults to all; window
+  keeps the rows of the last 360 min; none sends no rows. Response: { "flow": { "workspaceId",
+  "receivedAt", "snapshot", "history" } | null, "stale": bool | null }; stale is true more than
+  10 min after receivedAt. A stored record that does not validate answers 500 flow-unreadable
+  (exit 1), never "no flow published". For "flow": null the CLI prints "no flow published" and
+  exits 7 (flow-not-found, decided by the CLI).
 
 ## Portfolio board
 
