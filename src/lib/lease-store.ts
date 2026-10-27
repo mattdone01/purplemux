@@ -3,11 +3,13 @@ import os from 'os';
 import path from 'path';
 import { createLogger } from '@/lib/logger';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
+import { BREAK_REASON_MAX, codePoints } from '@/lib/human-actions';
 import { LeasePolicyError, parseLeaseName, policyFor, resolveEpic, resolveNote, resolveTtl } from '@/lib/lease-policy';
 import type { ICaller } from '@/lib/caller';
 import type {
   ILease,
   ILeaseHolder,
+  ILeaseHumanBreaker,
   ILeaseState,
   ILeaseView,
   THolderState,
@@ -221,7 +223,7 @@ export const toLeaseView = (lease: ILease, facts: IViewFacts): ILeaseView => ({
 
 type TLeaseEffect =
   | { type: 'acquired'; lease: ILease; outcome: 'acquired' | 'renewed' }
-  | { type: 'released'; lease: ILease; reason: TLeaseReleaseReason; by: ILeaseHolder | null; extra?: Record<string, unknown> };
+  | { type: 'released'; lease: ILease; reason: TLeaseReleaseReason; by: ILeaseHolder | ILeaseHumanBreaker | null; extra?: Record<string, unknown> };
 
 const g = globalThis as unknown as {
   __ptLeaseLock?: Promise<void>;
@@ -361,6 +363,8 @@ const notify = <A extends unknown[]>(listeners: Set<(...args: A) => void>, ...ar
 
 const auditHolder = (h: ILeaseHolder) => ({ workspaceId: h.workspaceId, tabId: h.tabId, verified: h.verified, identity: h.identity, admin: h.admin });
 
+const auditBreaker = (by: ILeaseHolder | ILeaseHumanBreaker) => ('human' in by ? { human: by.human } : auditHolder(by));
+
 /** Runs inside the lock, so audit lines and hooks follow the order of the mutations. */
 const applyEffects = async (effects: TLeaseEffect[]): Promise<void> => {
   for (const effect of effects) {
@@ -374,7 +378,7 @@ const applyEffects = async (effects: TLeaseEffect[]): Promise<void> => {
     } else {
       const { lease, reason, by, extra } = effect;
       await appendCoordinationAudit({
-        event: 'lease-release', name: lease.name, reason, holder: auditHolder(lease.holder), by: by ? auditHolder(by) : null, ...extra,
+        event: 'lease-release', name: lease.name, reason, holder: auditHolder(lease.holder), by: by ? auditBreaker(by) : null, ...extra,
       });
       notify(g.__ptLeaseListeners!.released, lease, reason);
     }
@@ -498,15 +502,28 @@ export const releaseLease = async (rawName: unknown, holder: ILeaseHolder, autho
   return lease.value!;
 };
 
-/** Admin only, with a reason. Cooperative: the admin token is readable by every agent (C-312 class). */
-export const breakLease = async (rawName: unknown, reason: unknown, holder: ILeaseHolder, authority: ILeaseAuthority): Promise<ILease> => {
-  if (!holder.admin) throw new LeaseError('forbidden', 'breaking a lease needs the admin token');
+/**
+ * The admin token, or a human session from Mission Control (ADR-0029 §8), with a reason; audited.
+ * Cooperative for the admin: the admin token is readable by every agent (C-312 class).
+ * The admin's reason is cut to 500 code points; a human's longer reason is refused.
+ */
+export const breakLease = async (
+  rawName: unknown,
+  reason: unknown,
+  breaker: ILeaseHolder | ILeaseHumanBreaker,
+  authority: ILeaseAuthority,
+): Promise<ILease> => {
+  const human = 'human' in breaker;
+  if (human ? !breaker.human.trim() : !breaker.admin) throw new LeaseError('forbidden', 'breaking a lease needs the admin token');
   const text = typeof reason === 'string' ? reason.trim() : '';
   if (!text) throw new LeasePolicyError('break needs a reason');
+  if (human && codePoints(text) > BREAK_REASON_MAX) {
+    throw new LeasePolicyError(`the reason is ${codePoints(text)} characters; the limit is ${BREAK_REASON_MAX}`);
+  }
   const { name } = parseLeaseName(rawName);
   const lease = await transact(authority.now(), (state) => {
     const r = removeInState(state, name);
-    return { state: r.state, value: r.lease, effects: [{ type: 'released', lease: r.lease, reason: 'broken', by: holder, extra: { breakReason: text.slice(0, 500) } }] };
+    return { state: r.state, value: r.lease, effects: [{ type: 'released', lease: r.lease, reason: 'broken', by: breaker, extra: { breakReason: [...text].slice(0, BREAK_REASON_MAX).join('') } }] };
   });
   return lease.value!;
 };

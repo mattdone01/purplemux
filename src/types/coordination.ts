@@ -1,3 +1,4 @@
+import type { IDeployAnnouncement } from '@/types/deploy';
 import type { IFleetView } from '@/types/fleet-status';
 import type { IGrant, IGrantRefusal } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
@@ -101,6 +102,22 @@ export interface ICoordinationSnapshot {
   signals: THostSignals;
   /** The fleet status panel (ADR-0023). Absent from a server older than it. */
   fleet?: TFleetSection;
+  /** Deploy announcements of the last 24 h, newest first (ADR-0029 §9). Absent from a server older than story 06. */
+  deploys?: TSection<IDeployRow>;
+}
+
+/**
+ * One deploy announcement and how far its notices got. A recipient whose inbox item is gone counts
+ * in `total` only, so the four states may sum to less than `total`.
+ */
+export interface IDeployRow {
+  id: string;
+  reason: string;
+  createdAt: number;
+  restartAt: number;
+  phase: 'pending' | 'past';
+  by: IDeployAnnouncement['by'];
+  recipients: { total: number; delivered: number; queued: number; held: number; dropped: number };
 }
 
 /**

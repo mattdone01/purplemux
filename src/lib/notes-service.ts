@@ -645,11 +645,26 @@ export class NotesService {
     }
   }
 
-  /** Only the authenticated human control route calls this with its session subject. */
-  async sendHumanPortfolio(actor: string, targetWorkspaceId: string, input: ISendInput): Promise<INoteView> {
+  /**
+   * A note from an authenticated human session (ADR-0029 §6): the `human` admission, bound to one
+   * target workspace. Only the human control routes call this, with their session subject.
+   */
+  async sendHuman(actor: string, targetWorkspaceId: string, input: ISendInput): Promise<INoteView> {
     if (!actor.trim()) throw new NoteError('forbidden', 'human actor is required');
     return this.sendCore(null, { ...input, toWorkspace: targetWorkspaceId, toEpic: undefined,
       fromEpic: undefined }, actor);
+  }
+
+  /**
+   * The workspace a human note goes to: `toWorkspace`, or the workspace of the live `epic:<slug>`
+   * holder now. A human admission is bound to one workspace, so an epic never stays unresolved.
+   */
+  async humanTarget(input: Pick<ISendInput, 'toEpic' | 'toWorkspace'>): Promise<string> {
+    const to = checkTarget(input.toEpic, input.toWorkspace);
+    if (to.workspaceId) return to.workspaceId;
+    const holder = await this.deps.epicHolder(to.epic!);
+    if (!holder) throw new NoteError('note-target-missing', `nobody live holds epic:${to.epic}`);
+    return holder.workspaceId;
   }
 
   /** Server-originated evidence/checkpoint notices use the target workspace's durable note inbox. */

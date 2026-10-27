@@ -8,13 +8,14 @@ import {
   DeployAnnouncer,
   DeployError,
   cleanReason,
+  deployRowsOf,
   recipientsOf,
   type IDeployDeps,
   type IRecipientFacts,
 } from '@/lib/deploy-announce';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import { renderInboxLine } from '@/lib/inbox-templates';
-import type { IDeployAnnouncementsState } from '@/types/deploy';
+import type { IDeployAnnouncement, IDeployAnnouncementsState } from '@/types/deploy';
 import type { IInboxItem } from '@/types/inbox';
 import type { ILease } from '@/types/lease';
 
@@ -282,5 +283,35 @@ describe('deploy announcements file', () => {
     expect((await m.readAnnouncements()).announcements).toEqual([record]);
     await fs.writeFile(m.announcementsFile(), '{"announcements":[{"id":"bad"}]}');
     await expect(m.readAnnouncements()).rejects.toThrow(/malformed/);
+  });
+});
+
+describe('deployRowsOf (ADR-0029 §9)', () => {
+  const by = { workspaceId: null, tabId: null, admin: true };
+  const announcement = (id: string, createdAt: number, restartAt: number, itemIds: string[]): IDeployAnnouncement => ({
+    id, reason: `r ${id}`, inMinutes: 5, createdAt, restartAt, by,
+    recipients: itemIds.map((itemId) => ({ workspaceId: 'ws-a', tabId: `t-${itemId}`, reasons: ['orchestrator'], itemId })),
+  });
+  const item = (id: string, state: IInboxItem['state']) => ({ id, state }) as IInboxItem;
+
+  it('counts each notice by its inbox state; a pruned notice counts in total only', () => {
+    const rows = deployRowsOf(
+      [announcement('d-aaaaaaaaaa', T0, T0 + 1, ['i-1', 'i-2', 'i-3', 'i-4', 'i-5', 'i-gone'])],
+      [item('i-1', 'delivered'), item('i-2', 'queued'), item('i-3', 'held'), item('i-4', 'dropped'), item('i-5', 'delivered')],
+      T0,
+    );
+    expect(rows).toEqual([{ id: 'd-aaaaaaaaaa', reason: 'r d-aaaaaaaaaa', createdAt: T0, restartAt: T0 + 1, phase: 'pending', by,
+      recipients: { total: 6, delivered: 2, queued: 1, held: 1, dropped: 1 } }]);
+  });
+
+  it('keeps the last 24 h only, newest first; a restart at now is past', () => {
+    const day = 24 * 60 * 60 * 1000;
+    const rows = deployRowsOf([
+      announcement('d-edge', T0 - day, T0 - day + 1, []),
+      announcement('d-old', T0 - day + 1, T0, []),
+      announcement('d-new', T0 - 1, T0 + 60_000, []),
+    ], [], T0);
+    expect(rows.map((r) => [r.id, r.phase])).toEqual([['d-new', 'pending'], ['d-old', 'past']]);
+    expect(deployRowsOf([], [], T0)).toEqual([]);
   });
 });

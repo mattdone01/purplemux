@@ -2,11 +2,12 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
+import { humanRetryRefusal } from '@/lib/human-actions';
 import { renderInboxLine, type IInboxFields } from '@/lib/inbox-templates';
-import type { IInboxItem, IInboxState, TInboxErrorCode, TInboxKind } from '@/types/inbox';
+import type { IInboxItem, IInboxState, THumanRetryRefusal, TInboxErrorCode, TInboxKind } from '@/types/inbox';
 
 export class InboxError extends Error {
-  constructor(readonly code: TInboxErrorCode, message: string) {
+  constructor(readonly code: TInboxErrorCode, message: string, readonly reason: THumanRetryRefusal | null = null) {
     super(message);
   }
 }
@@ -221,6 +222,17 @@ export const retryInState = (state: IInboxState, id: string, now: number): { sta
     transitionAt: now,
   };
   return { state: replace(state, id, () => next), item: next };
+};
+
+// The predicate is defined beside the web form's bounds so the panel can import it without fs.
+export { humanRetryRefusal };
+
+/** `retryInState` for a human session: the same transition, refused for a hold `humanRetryRefusal` names. */
+export const retryHumanInState = (state: IInboxState, id: string, now: number): { state: IInboxState; item: IInboxItem } => {
+  const item = state.items.find((i) => i.id === id);
+  const refusal = item?.state === 'held' ? humanRetryRefusal(item) : null;
+  if (refusal) throw new InboxError('inbox-not-retryable', `inbox item ${id} is held ${item!.heldReason}; a retry is refused`, refusal);
+  return retryInState(state, id, now);
 };
 
 /**

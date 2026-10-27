@@ -870,6 +870,27 @@ CLI equivalents:
   Both forms forward humanInboxPolicy so ordinary turns can review pending legacy candidates.
   Reuse the exact event ID and producer timestamp after a lost response; changing either is a conflict.
 
+## Human coordination routes (ADR-0029 §6-§10)
+
+The web coordination panel and the phone act through these cookie routes. A CLI token cannot call
+them (401 without the human session cookie, 403 for another Origin). None of them types into a tab.
+Agents use the CLI routes above; this list says what a human can do to your coordination state.
+
+GET  /api/mission-control/coordination   gains "deploys": { ok, items: [{ id, reason, createdAt,
+  restartAt, phase: "pending"|"past", by, recipients: { total, delivered, queued, held, dropped } }] }
+  | { ok: false, error } — the deploy announcements of the last 24 h, newest first.
+POST /api/mission-control/notes          { toWorkspace? | toEpic?, subject, body } → { note }
+  A note from "human" (its fromLabel): admission "human", to the target workspace's orchestrator;
+  toEpic resolves at send time to the live epic holder's workspace (none: 400 note-target-missing).
+  Same bounds as POST /api/cli/notes; note-too-large is 400 here. A human never acks a note.
+POST /api/mission-control/inbox/<id>/retry → { item }
+  Re-queues a held item of any workspace once. 409 inbox-not-retryable with "reason" for a hold whose
+  leading token is stranded-in-composer, transport-uncertain (either could type the line twice) or
+  target-not-agent (never deliverable). Refusal-budget and 24 h holds are retried.
+POST /api/mission-control/leases/break   { name, reason (1..500) } → { broken }
+  The admin break transition; the lease-release audit line names by: { human: <session subject> }.
+  400 invalid-request, 404 lease-not-found.
+
 ## Web-browser tabs
 
 These endpoints only work when the tab's panelType is "web-browser" and the webview

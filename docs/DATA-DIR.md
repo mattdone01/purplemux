@@ -36,6 +36,9 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
 ├── orchestrator-presence.json # durable missing-owner notification episode latches
 ├── owner-grants.json        # the owner grant (ADR-0029; 0600; never written to grants.json)
+├── deploy-announcements.json # deploy announcements, 7 days (ADR-0017; 0600; coordination `deploys` reads the last 24 h)
+├── audit/
+│   └── coordination.jsonl   # coordination audit lines (leases, notes, grants, deploys; rotated at 10 MiB, 3 kept)
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
 ├── hook-spool/              # hook events no server answered (0700; ADR-0020)
@@ -255,6 +258,14 @@ file is refused, never read as empty: no owner grant is honoured, owner grant ch
 readable file's grants and name the refused file in `refused`; an unreadable `grants.json` is
 treated the same way. Only both files refused fails the listing (500). Ended grants stay listed 7
 days, then the minute sweep prunes them, as in `grants.json`.
+
+### `audit/coordination.jsonl` — `src/lib/coordination-audit.ts`
+
+One JSON line per coordination event, appended under one lock, rotated to `.1`…`.3` at 10 MiB. A failed append
+never fails the operation it records. A `lease-release` line names the lease, the `reason` (`released`, `broken`,
+`expired`, …), the `holder`, and `by`: the releasing tab or admin token (`{workspaceId, tabId, verified, identity,
+admin}`), `{human: <session subject>}` when a human session breaks the lease from Mission Control (ADR-0029 §8), or
+`null` for a server-made release. A break adds `breakReason` (at most 500 code points).
 
 ### FCM service account (outside `~/.purplemux`)
 

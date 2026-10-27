@@ -14,6 +14,7 @@ const m = vi.hoisted(() => ({
   ownerGrants: [] as unknown[],
   inbox: vi.fn(),
   fleet: vi.fn(),
+  announcements: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', async (importOriginal) => ({
@@ -44,6 +45,11 @@ vi.mock('@/lib/grant-store', () => ({
 }));
 vi.mock('@/lib/inbox-store', () => ({ readInboxState: m.inbox }));
 vi.mock('@/lib/fleet-status-snapshot', () => ({ readFleetView: m.fleet }));
+// The real row builder over a mocked store, so no test reads ~/.purplemux/deploy-announcements.json.
+vi.mock('@/lib/deploy-announce', async (importOriginal) => ({
+  deployRowsOf: (await importOriginal<typeof import('@/lib/deploy-announce')>()).deployRowsOf,
+  readAnnouncements: m.announcements,
+}));
 vi.mock('@/lib/host-metrics', () => ({ readHostMetrics: vi.fn(async () => ({ available: false, reason: 'test host' })) }));
 
 const call = async (headers: Record<string, string>) => {
@@ -68,6 +74,7 @@ describe('GET /api/mission-control/coordination', () => {
     m.ownerRefusal = null;
     m.ownerGrants = [];
     m.inbox.mockResolvedValue({ items: [{ id: 'i-1', state: 'held' }, { id: 'i-2', state: 'queued' }] });
+    m.announcements.mockResolvedValue({ announcements: [] });
     m.fleet.mockResolvedValue({ at: 1, thresholds: { stallMinutes: 30, waitingLongMinutes: 120, unansweredMinutes: 30, composerMinutes: 2 }, rows: [], unattributed: [], errors: [] });
   });
 
@@ -82,6 +89,7 @@ describe('GET /api/mission-control/coordination', () => {
     expect(m.watches).not.toHaveBeenCalled();
     expect(m.inbox).not.toHaveBeenCalled();
     expect(m.fleet).not.toHaveBeenCalled();
+    expect(m.announcements).not.toHaveBeenCalled();
   });
 
   it('serves the fleet view (ADR-0023) as its own section', async () => {
@@ -96,6 +104,35 @@ describe('GET /api/mission-control/coordination', () => {
     expect(r.status).toBe(200);
     expect(r.body.fleet).toEqual({ ok: false, error: 'workspaces.json unreadable' });
     expect(r.body.leases.ok).toBe(true);
+  });
+
+  it('serves the deploy announcements of the last 24 h, newest first, with notice counts (ADR-0029 §9)', async () => {
+    const now = Date.now();
+    const by = { workspaceId: 'ws-ops', tabId: 'tab-d', admin: false };
+    const recipient = (itemId: string) => ({ workspaceId: 'ws-a', tabId: 'tab-a', reasons: ['orchestrator'], itemId });
+    m.announcements.mockResolvedValue({ announcements: [
+      { id: 'd-older', reason: 'old', inMinutes: 5, createdAt: now - 25 * 3600_000, restartAt: now - 25 * 3600_000 + 300_000, by, recipients: [] },
+      { id: 'd-past', reason: 'release 1', inMinutes: 5, createdAt: now - 3600_000, restartAt: now - 3300_000, by, recipients: [recipient('i-1'), recipient('i-gone')] },
+      { id: 'd-next', reason: 'release 2', inMinutes: 10, createdAt: now - 60_000, restartAt: now + 540_000, by, recipients: [recipient('i-2')] },
+    ] });
+    const r = await call({ cookie: 'session-token=good-session' });
+    expect(r.status).toBe(200);
+    expect(r.body.deploys).toEqual({ ok: true, items: [
+      { id: 'd-next', reason: 'release 2', createdAt: now - 60_000, restartAt: now + 540_000, phase: 'pending', by,
+        recipients: { total: 1, delivered: 0, queued: 1, held: 0, dropped: 0 } },
+      { id: 'd-past', reason: 'release 1', createdAt: now - 3600_000, restartAt: now - 3300_000, phase: 'past', by,
+        recipients: { total: 2, delivered: 0, queued: 0, held: 1, dropped: 0 } },
+    ] });
+  });
+
+  it('an unreadable deploy store fails the deploys section alone', async () => {
+    m.announcements.mockRejectedValue(new Error('deploy-announcements.json is malformed'));
+    const r = await call({ cookie: 'session-token=good-session' });
+    expect(r.status).toBe(200);
+    expect(r.body.deploys).toEqual({ ok: false, error: 'deploy-announcements.json is malformed' });
+    expect(r.body.leases.ok).toBe(true);
+    expect(r.body.inboxHeld.ok).toBe(true);
+    expect(r.body.fleet.ok).toBe(true);
   });
 
   it('serves every section to a human: closed lease kept, open notes with age, active grants, held deliveries', async () => {

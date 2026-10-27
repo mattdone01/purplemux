@@ -6,6 +6,7 @@ import type { ICaller } from '@/lib/caller';
 import { brandCodedError } from '@/lib/coded-error';
 import { createLogger } from '@/lib/logger';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
+import type { IDeployRow } from '@/types/coordination';
 import type { IInboxItem } from '@/types/inbox';
 import type { ILease } from '@/types/lease';
 import type {
@@ -175,6 +176,27 @@ const writeAnnouncements = async (state: IDeployAnnouncementsState): Promise<voi
 export const pruneAnnouncements = (state: IDeployAnnouncementsState, now: number): IDeployAnnouncementsState => {
   const keep = state.announcements.filter((a) => now - a.createdAt < DEPLOY_RETENTION_MS);
   return keep.length === state.announcements.length ? state : { announcements: keep };
+};
+
+export const DEPLOY_ROWS_WINDOW_MS = DAY;
+
+/** The coordination panel's deploy rows (ADR-0029 §9): the last 24 h, newest first. */
+export const deployRowsOf = (announcements: readonly IDeployAnnouncement[], items: readonly IInboxItem[], now: number): IDeployRow[] => {
+  const states = new Map(items.map((i) => [i.id, i.state]));
+  return announcements
+    .filter((a) => now - a.createdAt < DEPLOY_ROWS_WINDOW_MS)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map((a) => {
+      const recipients = { total: a.recipients.length, delivered: 0, queued: 0, held: 0, dropped: 0 };
+      for (const r of a.recipients) {
+        const state = states.get(r.itemId);
+        if (state) recipients[state] += 1;
+      }
+      return {
+        id: a.id, reason: a.reason, createdAt: a.createdAt, restartAt: a.restartAt,
+        phase: a.restartAt > now ? 'pending' : 'past', by: a.by, recipients,
+      };
+    });
 };
 
 // ─── the service ──────────────────────────────────────────────────────────

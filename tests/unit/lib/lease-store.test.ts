@@ -179,6 +179,42 @@ describe('lease store', () => {
     expect(last).toMatchObject({ event: 'lease-release', name: 'merge:x/y', reason: 'broken', breakReason: 'holder crashed mid-merge', by: { admin: true } });
   });
 
+  it('breaks for a human session with a 1..500 character reason and records the session subject (ADR-0029 §8)', async () => {
+    const { acquireLease, breakLease, findLease } = await store();
+    const released: string[] = [];
+    (await store()).onLeaseReleased((lease, reason) => released.push(`${lease.name}:${reason}`));
+    await acquireLease({ name: 'merge:x/y' }, tabA, authority);
+
+    await expect(breakLease('merge:x/y', '', { human: 'owner' }, authority)).rejects.toMatchObject({ code: 'lease-policy' });
+    await expect(breakLease('merge:x/y', 'x'.repeat(501), { human: 'owner' }, authority)).rejects.toMatchObject({ code: 'lease-policy' });
+    await expect(breakLease('merge:x/y', 'stuck', { human: '  ' }, authority)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(await findLease('merge:x/y')).not.toBeNull();
+
+    await breakLease('merge:x/y', 'x'.repeat(500), { human: 'owner' }, authority);
+    expect(await findLease('merge:x/y')).toBeNull();
+    expect(released).toEqual(['merge:x/y:broken']);
+    await drainLeaseLocks();
+    const last = (await readAudit(mockHome.value)).at(-1);
+    expect(last).toMatchObject({ event: 'lease-release', name: 'merge:x/y', reason: 'broken', breakReason: 'x'.repeat(500), by: { human: 'owner' } });
+    expect(last?.holder).toMatchObject({ workspaceId: 'ws1', tabId: 'tab-a' });
+    await expect(breakLease('merge:x/y', 'again', { human: 'owner' }, authority)).rejects.toMatchObject({ code: 'lease-not-found' });
+  });
+
+  it('records a break reason cut by code points, never a lone surrogate (human 500 emoji kept whole, admin cut to 500)', async () => {
+    const { acquireLease, breakLease } = await store();
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    await acquireLease({ name: 'merge:x/y' }, tabA, authority);
+    await breakLease('merge:x/y', '😀'.repeat(500), { human: 'owner' }, authority);
+    await acquireLease({ name: 'merge:x/z' }, tabA, authority);
+    await breakLease('merge:x/z', '😀'.repeat(600), admin, authority);
+    await acquireLease({ name: 'merge:x/q' }, tabA, authority);
+    await breakLease('merge:x/q', 'y'.repeat(600), admin, authority);
+    await drainLeaseLocks();
+    const reasons = (await readAudit(mockHome.value)).filter((l) => l.reason === 'broken').map((l) => String(l.breakReason));
+    expect(reasons).toEqual(['😀'.repeat(500), '😀'.repeat(500), 'y'.repeat(500)]);
+    for (const r of reasons) expect(r).not.toMatch(loneSurrogate);
+  });
+
   describe('release-epic', () => {
     const claim = async (name: string, holder: ILeaseHolder, epic = 'p4') => {
       const { acquireLease } = await store();
