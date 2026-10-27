@@ -1,8 +1,9 @@
-import { AlertTriangle, Check, CircleHelp, Clock3, Send } from 'lucide-react';
+import { AlertTriangle, Bot, Check, CircleHelp, Clock3, Send } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { MISSION_AUTO_ANSWER_ACTOR } from '@/lib/attention-class';
 import { AttentionClassBadge, statedDefaultLabel } from '@/components/features/mission-control/attention-class-view';
 import {
   deliveryStatus,
@@ -13,7 +14,9 @@ import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mi
 import type {
   IMissionAnswer,
   IMissionAttentionItem,
+  IMissionAutoAnsweredItem,
   IMissionDelivery,
+  TMissionItemState,
 } from '@/types/mission-control';
 
 interface IMissionAnswerCardProps {
@@ -241,6 +244,58 @@ const toneClass = {
   negative: 'text-ui-red bg-ui-red/10',
 } as const;
 
+export const AnsweredByRuleBadge = () => (
+  <span className="inline-flex items-center gap-1 rounded bg-ui-teal/10 px-2 py-1 text-xs font-medium text-ui-teal">
+    <Bot className="h-3.5 w-3.5" />Answered by rule
+  </span>
+);
+
+const ITEM_STATE_LABELS: Readonly<Record<TMissionItemState, string>> = {
+  candidate: 'Candidate',
+  open: 'Open',
+  answered: 'Answered, waiting for the agent',
+  resolved: 'Resolved',
+  cancelled: 'Cancelled',
+};
+
+const itemStateLabel = (state: string): { label: string; served: string | null } =>
+  Object.hasOwn(ITEM_STATE_LABELS, state)
+    ? { label: ITEM_STATE_LABELS[state as TMissionItemState], served: null }
+    : { label: 'Unknown state', served: state };
+
+/** One item the bookkeeping rule answered (ADR-0031): the default it applied and the rule's note. */
+export const MissionControlAutoAnswerCard = ({
+  entry,
+  workspaceName,
+}: {
+  entry: IMissionAutoAnsweredItem;
+  workspaceName: string;
+}) => {
+  const state = itemStateLabel(entry.itemState);
+  return (
+    <Card className="min-w-0 border-foreground/10 shadow-none" data-auto-answered-item={entry.itemId}>
+      <CardContent className="space-y-3 p-4 sm:p-5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span className="rounded bg-muted px-2 py-1 font-medium text-foreground">{workspaceName}</span>
+          <AttentionClassBadge value={entry.class} />
+          <AnsweredByRuleBadge />
+          <span title={state.served ? `Served state: ${state.served}` : undefined}>{state.label}</span>
+          <span>·</span>
+          <span>{formatMissionAge(entry.at)}</span>
+        </div>
+        <p className="break-words text-sm font-medium">{entry.title}</p>
+        <p className="break-words text-sm">
+          <span className="font-medium">Applied default: </span>
+          {entry.appliedOptionLabel}
+        </p>
+        <p className="whitespace-pre-wrap break-words rounded-md bg-muted/50 px-3 py-2 text-xs text-muted-foreground" data-auto-answer-note>
+          {entry.note}
+        </p>
+      </CardContent>
+    </Card>
+  );
+};
+
 export const MissionControlDeliveryCard = ({
   item,
   answer,
@@ -256,6 +311,7 @@ export const MissionControlDeliveryCard = ({
           <span className={cn('rounded px-2 py-1 text-xs font-medium', toneClass[status.tone])}>
             {status.label}
           </span>
+          {(item.autoAnswer !== null || answer?.actor === MISSION_AUTO_ANSWER_ACTOR) && <AnsweredByRuleBadge />}
         </div>
         <div>
           <p className="break-words text-sm font-medium">{item.title}</p>

@@ -535,6 +535,10 @@ Keys in use:
                1..10000 (10), and the oldest-item age in minutes 1..10080 (240). Read on every flow
                read; unset or invalid means the default, and the server logs why. Written by the
                admin token or an enabled orchestrator (ADR-0019).
+  attention.auto-answer.bookkeeping-minutes
+               The bookkeeping auto-answer rule (ADR-0031): an integer 1..10080 of minutes. Unset
+               (the default) or any invalid value is off (an invalid value is logged). Admin token
+               only (exit 3 forbidden for a tab): the rule answers items in every workspace.
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
@@ -859,6 +863,27 @@ POST /api/cli/mission-control/events?workspaceId=WS
       "options":[{"id":"gradual","label":"Gradual"},{"id":"direct","label":"Direct"}],
       "recommendation":"gradual","blockingScope":"none","canContinue":true,
       "class":"bookkeeping","defaultOptionId":"gradual"}}]}
+
+  Bookkeeping auto-answer (ADR-0031): when the admin sets fleet config
+  attention.auto-answer.bookkeeping-minutes to N, the server checks once a minute for an item
+  that is open, has a humanReview whose humanNeed is not "none", has "class": "bookkeeping", is
+  not an action, has a "defaultOptionId" that names a current option, and whose last revision is
+  at least N minutes old. It records an answer for that item with "optionIds": [defaultOptionId]
+  as the actor "system:auto-answer". The answer is delivered and acknowledged like a human
+  answer; the rule never resolves or cancels an item. Money, irreversible, scope, unclassified
+  and default-less items are never auto-answered. A human answer or a cancel that comes first
+  wins. The answer text, and the item's "autoAnswer" note, read: Auto-answered under fleet
+  config attention.auto-answer.bookkeeping-minutes=N (version V) at ISO-TIME: applied the
+  stated default "LABEL". The "answer.recorded" event of a rule answer carries
+  "actor": "system:auto-answer". The submission IDs "auto:..." and the event IDs
+  "answer:auto:..." are reserved for the rule (400 invalid-request), and a human session
+  subject that starts with "system:" is refused (403 forbidden).
+  Each snapshot item carries "autoAnswer": { "rule", "ruleVersion", "appliedOptionId", "at",
+  "note" }, or null when no rule answered it. The snapshot carries "autoAnswered": [{ "itemId",
+  "workspaceId", "runId", "title", "class", "appliedOptionId", "appliedOptionLabel", "at",
+  "note", "itemState" }] for the last 7 days, newest first, at most 100 rows. An absent field
+  means the server does not report it (not available), never 0 and never "no auto-answers"; an
+  absent "autoAnswer" on an item reads as null.
 
   Ordinary attention creates a durable candidate. Workers route blockers to the
   orchestrator. The configured orchestrator checks existing instructions, authority,

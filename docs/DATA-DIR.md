@@ -36,6 +36,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
 ├── orchestrator-presence.json # durable missing-owner notification episode latches
 ├── owner-grants.json        # the owner grant (ADR-0029; 0600; never written to grants.json)
+├── mission-control.sqlite   # Mission Control runs, items, answers, deliveries, events (0600)
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
 ├── hook-spool/              # hook events no server answered (0700; ADR-0020)
@@ -255,6 +256,22 @@ file is refused, never read as empty: no owner grant is honoured, owner grant ch
 readable file's grants and name the refused file in `refused`; an unreadable `grants.json` is
 treated the same way. Only both files refused fails the listing (500). Ended grants stay listed 7
 days, then the minute sweep prunes them, as in `grants.json`.
+
+### `mission-control.sqlite` — `src/lib/mission-control-store.ts`
+
+The Mission Control record (`docs/mission-control-contract.md`), SQLite in WAL mode, `0600`. The
+versioned tables (`runs`, `attention_items`, `answers`, `deliveries`, `events`, `bootstrap`,
+`bootstrap_entries`) are at `user_version` 4; a newer version is refused, never read. Two
+unversioned side tables are created with `CREATE TABLE IF NOT EXISTS` and carry no foreign key, so
+a schema-4 release rolled back onto the file still opens it and ignores them:
+
+- `mission_item_openers` — the tab that opened each item (ADR-0023).
+- `mission_auto_answers` — one row per bookkeeping auto-answer (ADR-0031): `answer_id` (primary
+  key), `item_id`, `workspace_id`, `rule`, `rule_version`, `applied_option_id`, `at`, `note`.
+  Written in the answer's transaction. The rule's answers are also audit lines
+  (`attention-auto-answer`) in `audit/coordination.jsonl`.
+
+Not regeneratable: deleting the file drops every run, open question and answer history.
 
 ### FCM service account (outside `~/.purplemux`)
 

@@ -6,8 +6,11 @@ import MissionControlNeedsYou, { needsYouClassGroups, needsYouGroups } from '@/c
 import { createMissionDraft } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft } from '@/components/features/mission-control/mission-control-utils';
 import MissionControlPage from '@/pages/mission-control';
+import { MissionControlDeliveryCard } from '@/components/features/mission-control/mission-control-answer-card';
 import type {
+  IMissionAnswer,
   IMissionAttentionItem,
+  IMissionAutoAnsweredItem,
   IMissionSnapshot,
   IMissionWorkspaceView,
 } from '@/types/mission-control';
@@ -43,6 +46,7 @@ const question = (over: Partial<IMissionAttentionItem> = {}): IMissionAttentionI
   candidateReason: null,
   class: null,
   defaultOptionId: null,
+  autoAnswer: null,
   createdAt: now - 60_000,
   updatedAt: now,
   ...over,
@@ -321,5 +325,75 @@ describe('Needs you with an item from a server older than ADR-0031', () => {
     expect(html).not.toContain('Default:');
     expect(html).not.toContain('undefined');
     expect(html).toContain('Legacy question');
+  });
+});
+
+describe('Auto-answered section (ADR-0031)', () => {
+  const note = (at: string, label: string) =>
+    `Auto-answered under fleet config attention.auto-answer.bookkeeping-minutes=30 (version 2) at ${at}: applied the stated default "${label}".`;
+  const entry = (over: Partial<IMissionAutoAnsweredItem> = {}): IMissionAutoAnsweredItem => ({
+    itemId: 'auto-1', workspaceId: 'ws-pay', runId: 'run-1', title: 'Raise the turn budget?', class: 'bookkeeping',
+    appliedOptionId: 'raise', appliedOptionLabel: 'Raise by 20', at: now - 120_000,
+    note: note('2026-10-27T08:00:00.000Z', 'Raise by 20'), itemState: 'answered', ...over,
+  });
+  const withAuto = (autoAnswered: IMissionAutoAnsweredItem[] | undefined, items: IMissionAttentionItem[] = []): IMissionSnapshot =>
+    ({ ...snapshot(items), ...(autoAnswered ? { autoAnswered } : {}) });
+
+  it('lists the rule\'s answers newest first, each "Answered by rule" with its default and note', () => {
+    const older = entry({ itemId: 'auto-old', title: 'Rotate the log?', appliedOptionLabel: 'Rotate now', at: now - 600_000, itemState: 'resolved', workspaceId: 'ws-tre' });
+    const html = render({ snapshot: withAuto([older, entry()]) });
+
+    expect(html).toMatch(/Auto-answered<\/h2><span[^>]*>2<\/span>/);
+    const full = render({ snapshot: withAuto(Array.from({ length: 100 }, (_, i) => entry({ itemId: `auto-${i}`, at: now - i * 1000 }))) });
+    expect(full).toMatch(/Auto-answered<\/h2><span[^>]*>100\+<\/span>/);
+    expect(html.indexOf('Raise the turn budget?')).toBeLessThan(html.indexOf('Rotate the log?'));
+    expect(html.match(/Answered by rule/g)).toHaveLength(2);
+    expect(html).toContain(note('2026-10-27T08:00:00.000Z', 'Raise by 20').replace(/"/g, '&quot;'));
+    expect(html).toContain('Applied default: </span>Raise by 20');
+    expect(html).toContain('Answered, waiting for the agent');
+    expect(html).toContain('>Resolved<');
+    expect(html).toContain('>Payments</span>');
+    expect(html).toContain('>Treasury</span>');
+    expect(html).toContain('data-attention-class="bookkeeping"');
+    expect(html).not.toContain('system:auto-answer');
+  });
+
+  it('keeps an auto-answered item out of the Needs you count', () => {
+    const answered = question({ id: 'auto-1', state: 'answered', answerId: 'a-1', class: 'bookkeeping', defaultOptionId: 'staged' });
+    const html = render({ snapshot: withAuto([entry()], [answered]) });
+    expect(html).toMatch(/Needs you<\/h2><span[^>]*>0<\/span>/);
+    expect(html).toContain('No confirmed questions need an answer.');
+    expect(html).toContain('data-auto-answered-item="auto-1"');
+  });
+
+  it.each([['an empty list', []], ['an older server that omits the list', undefined]] as const)('renders no section for %s', (_case, list) => {
+    const html = render({ snapshot: withAuto(list as IMissionAutoAnsweredItem[] | undefined) });
+    expect(html).not.toContain('Auto-answered');
+    expect(html).not.toContain('data-auto-answered-section');
+  });
+
+  it('labels an unknown served state neutrally and keeps the served value in detail', () => {
+    const html = render({ snapshot: withAuto([entry({ itemState: 'archived' as IMissionAutoAnsweredItem['itemState'] })]) });
+    expect(html).toContain('title="Served state: archived">Unknown state<');
+  });
+});
+
+describe('MissionControlDeliveryCard: who answered', () => {
+  const answer = (actor: string): IMissionAnswer => ({
+    id: 'a-1', workspaceId: 'ws-pay', runId: 'run-1', itemId: 'q-1', actor, submissionId: 's', expectedRevision: 1,
+    optionIds: ['staged'], text: 'Auto-answered under …', actionCompleted: false, createdAt: now,
+  });
+
+  it('shows "Answered by rule" for the rule\'s answer, never the actor token', () => {
+    const item = question({ state: 'answered', answerId: 'a-1', autoAnswer: { rule: 'attention.auto-answer.bookkeeping-minutes', ruleVersion: 2, appliedOptionId: 'staged', at: now, note: 'n' } });
+    const html = renderToStaticMarkup(<MissionControlDeliveryCard item={item} answer={answer('system:auto-answer')} delivery={undefined} workspaceName="Payments" />);
+    expect(html).toContain('Answered by rule');
+    expect(html).not.toContain('system:auto-answer');
+  });
+
+  it('shows no rule badge for a human answer', () => {
+    const item = question({ state: 'answered', answerId: 'a-1' });
+    const html = renderToStaticMarkup(<MissionControlDeliveryCard item={item} answer={answer('user')} delivery={undefined} workspaceName="Payments" />);
+    expect(html).not.toContain('Answered by rule');
   });
 });
