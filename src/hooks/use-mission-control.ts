@@ -9,11 +9,12 @@ import type {
 
 const POLL_INTERVAL_MS = 5_000;
 
-/** A server older than ADR-0031 omits `class` and `defaultOptionId`; every consumer reads one absence value, null. */
+/** A server older than ADR-0031 omits `class`, `defaultOptionId` and `autoAnswer`; every consumer reads one absence value, null. */
 export const normalizeMissionItem = (item: IMissionAttentionItem): IMissionAttentionItem => ({
   ...item,
   class: item.class ?? null,
   defaultOptionId: item.defaultOptionId ?? null,
+  autoAnswer: item.autoAnswer ?? null,
 });
 
 export const normalizeMissionSnapshot = (snapshot: IMissionSnapshot): IMissionSnapshot => ({

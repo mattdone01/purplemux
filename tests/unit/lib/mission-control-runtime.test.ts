@@ -428,6 +428,7 @@ const snapshot = (runBinding: IMissionBinding | null = binding, runRevision = 4)
     candidateReason: null,
     class: null,
     defaultOptionId: null,
+    autoAnswer: null,
     createdAt: NOW,
     updatedAt: NOW,
   }],

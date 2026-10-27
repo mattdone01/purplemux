@@ -1668,7 +1668,7 @@ describe('MissionControlStore attention class and stated default (ADR-0031)', ()
     vi.setSystemTime(today);
     answer(store, 'money-today');
     answer(store, 'book-human');
-    answer(store, 'book-rule', 'system:auto-answer');
+    store.submitSystemAnswer('book-rule', 1, { minutes: 1, version: 1 }, today);
     answer(store, 'plain');
 
     expect(store.snapshot().answersByClass).toEqual([

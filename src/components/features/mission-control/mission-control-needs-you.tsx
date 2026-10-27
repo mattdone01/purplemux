@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { AlertCircle, RefreshCw, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import MissionControlAnswerCard from '@/components/features/mission-control/mission-control-answer-card';
+import MissionControlAnswerCard, { MissionControlAutoAnswerCard } from '@/components/features/mission-control/mission-control-answer-card';
 import { AnswersByClassStrip } from '@/components/features/mission-control/attention-class-view';
 import { ATTENTION_CLASS_KEYS, ATTENTION_CLASS_LABELS, attentionClassKey } from '@/lib/attention-class';
 import type { TAttentionClassKey } from '@/lib/attention-class';
@@ -10,9 +10,11 @@ import { isMissionHumanInboxItem } from '@/components/features/mission-control/m
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
 import type {
   IMissionAttentionItem,
+  IMissionAutoAnsweredItem,
   IMissionSnapshot,
   IMissionWorkspaceView,
 } from '@/types/mission-control';
+import { AUTO_ANSWERED_LIMIT } from '@/types/mission-control';
 
 export const SectionHeading = ({
   title,
@@ -20,7 +22,7 @@ export const SectionHeading = ({
   description,
 }: {
   title: string;
-  count?: number;
+  count?: number | string;
   description: string;
 }) => (
   <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
@@ -85,6 +87,39 @@ export const needsYouClassGroups = (
   }))
   .filter((group) => group.workspaces.length > 0);
 
+/**
+ * ADR-0031: what the bookkeeping rule answered in the last 7 days, newest first. Nothing renders
+ * when there is none, or when an older server does not send the list.
+ */
+export const AutoAnsweredSection = ({
+  entries,
+  workspaces,
+}: {
+  entries: IMissionAutoAnsweredItem[] | undefined;
+  workspaces: IMissionWorkspaceView[];
+}) => {
+  if (!entries?.length) return null;
+  const sorted = [...entries].sort((left, right) => right.at - left.at || left.itemId.localeCompare(right.itemId));
+  return (
+    <div className="min-w-0 space-y-3" data-auto-answered-section>
+      <SectionHeading
+        title="Auto-answered"
+        count={sorted.length >= AUTO_ANSWERED_LIMIT ? `${AUTO_ANSWERED_LIMIT}+` : sorted.length}
+        description="Bookkeeping items the fleet rule answered with their stated default in the last 7 days."
+      />
+      <div className="grid min-w-0 gap-3 xl:grid-cols-2">
+        {sorted.map((entry) => (
+          <MissionControlAutoAnswerCard
+            key={entry.itemId}
+            entry={entry}
+            workspaceName={workspaces.find((workspace) => workspace.workspaceId === entry.workspaceId)?.name ?? entry.workspaceId}
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
 interface INeedsYouHandlers {
   drafts: Record<string, IMissionDraft>;
   onDraftChange: (item: IMissionAttentionItem, patch: IMissionDraftPatch) => void;
@@ -140,6 +175,7 @@ const NeedsYouList = ({
           ))}
         </div>
       ))}
+      <AutoAnsweredSection entries={snapshot.autoAnswered} workspaces={snapshot.workspaces} />
     </>
   );
 };

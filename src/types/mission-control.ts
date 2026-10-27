@@ -73,6 +73,15 @@ export interface IMissionAttentionClassInput {
   defaultOptionId?: string;
 }
 
+/** What the bookkeeping rule applied, under which rule version, and when (ADR-0031 §7). */
+export interface IMissionAutoAnswer {
+  rule: string;
+  ruleVersion: number;
+  appliedOptionId: string;
+  at: number;
+  note: string;
+}
+
 export type TMissionHumanReviewInput =
   | {
       humanNeed: 'none';
@@ -111,6 +120,8 @@ export interface IMissionAttentionItem extends IMissionQuestion {
   candidateReason: TMissionCandidateReason | null;
   class: TAttentionClass | null;
   defaultOptionId: string | null;
+  /** The bookkeeping rule's record when the rule answered this item (ADR-0031 §7); null otherwise. */
+  autoAnswer: IMissionAutoAnswer | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -245,6 +256,23 @@ export interface IMissionAnswerClassCount {
   count: number;
 }
 
+/** The most `autoAnswered` rows a snapshot carries (ADR-0031 §7); a list this long may hold more. */
+export const AUTO_ANSWERED_LIMIT = 100;
+
+/** One `autoAnswered` row: an item the bookkeeping rule answered in the last 7 days (ADR-0031 §7). */
+export interface IMissionAutoAnsweredItem {
+  itemId: string;
+  workspaceId: string;
+  runId: string;
+  title: string;
+  class: TAttentionClass | null;
+  appliedOptionId: string;
+  appliedOptionLabel: string;
+  at: number;
+  note: string;
+  itemState: TMissionItemState;
+}
+
 export interface IMissionSnapshot {
   schemaVersion: 1;
   cursor: number;
@@ -263,6 +291,8 @@ export interface IMissionSnapshot {
   pendingBootstrapEntries?: Array<{ bootstrapId: string; entry: IMissionBootstrapEntry }>;
   /** ADR-0031: answers per UTC day, class and actor kind over the last 7 days; absent from an older server. */
   answersByClass?: IMissionAnswerClassCount[];
+  /** ADR-0031: the rule's answers of the last 7 days, newest first, at most 100; absent from an older server. */
+  autoAnswered?: IMissionAutoAnsweredItem[];
 }
 
 export interface IMissionEventsResponse {

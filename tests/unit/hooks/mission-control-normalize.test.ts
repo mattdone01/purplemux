@@ -8,27 +8,30 @@ const item = (over: Partial<IMissionAttentionItem> = {}): IMissionAttentionItem 
   id: 'q', workspaceId: 'ws', runId: 'run', revision: 1, state: 'open', kind: 'question', title: 'T', context: 'C',
   storyIds: [], options: [{ id: 'yes', label: 'Yes' }], recommendation: null, blockingScope: 'none', canContinue: true,
   evidence: { source: 'agent', sourceId: 'e', observedAt: 1, confidence: 'confirmed' }, answerId: null, resolution: null,
-  humanReview: null, candidateReason: null, class: null, defaultOptionId: null, createdAt: 1, updatedAt: 1, ...over,
+  humanReview: null, candidateReason: null, class: null, defaultOptionId: null, autoAnswer: null, createdAt: 1, updatedAt: 1, ...over,
 });
 
 const legacy = (): IMissionAttentionItem => {
-  const { class: ignoredClass, defaultOptionId: ignoredDefault, ...shaped } = item();
+  const { class: ignoredClass, defaultOptionId: ignoredDefault, autoAnswer: ignoredAutoAnswer, ...shaped } = item();
   void ignoredClass;
   void ignoredDefault;
+  void ignoredAutoAnswer;
   return shaped as IMissionAttentionItem;
 };
 
 describe('normalizeMissionItem', () => {
-  it('maps absent class and defaultOptionId to null', () => {
+  it('maps absent class, defaultOptionId and autoAnswer to null', () => {
     const normalized = normalizeMissionItem(legacy());
     expect(normalized.class).toBeNull();
     expect(normalized.defaultOptionId).toBeNull();
+    expect(normalized.autoAnswer).toBeNull();
     expect(normalized).toEqual(item());
   });
 
   it('keeps served values unchanged', () => {
-    expect(normalizeMissionItem(item({ class: 'money', defaultOptionId: 'yes' })))
-      .toMatchObject({ class: 'money', defaultOptionId: 'yes' });
+    const autoAnswer = { rule: 'attention.auto-answer.bookkeeping-minutes', ruleVersion: 2, appliedOptionId: 'yes', at: 5, note: 'N' };
+    expect(normalizeMissionItem(item({ class: 'bookkeeping', defaultOptionId: 'yes', autoAnswer })))
+      .toMatchObject({ class: 'bookkeeping', defaultOptionId: 'yes', autoAnswer });
   });
 });
 
@@ -41,5 +44,6 @@ describe('normalizeMissionSnapshot', () => {
     const normalized = normalizeMissionSnapshot(snapshot);
     expect(normalized.items.map((entry) => [entry.class, entry.defaultOptionId])).toEqual([[null, null], ['scope', null]]);
     expect(normalized).not.toHaveProperty('answersByClass');
+    expect(normalized).not.toHaveProperty('autoAnswered');
   });
 });

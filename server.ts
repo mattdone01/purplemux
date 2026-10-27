@@ -14,6 +14,7 @@ import { handleSyncConnection, gracefulSyncShutdown } from './src/lib/sync-serve
 import { handleStatusConnection, gracefulStatusShutdown } from './src/lib/status-server';
 import { getStatusManager } from './src/lib/status-manager';
 import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
+import { startAutoAnswerTick, stopAutoAnswerTick } from './src/lib/mission-control-auto-answer-tick';
 import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
 import { startNotes, stopNotes } from './src/lib/notes-service';
 import { startGrants, stopGrants } from './src/lib/grant-service';
@@ -114,6 +115,7 @@ const shutdownWs = async () => {
   // The inbox then waits for a paste in flight to be recorded, and Mission Control's stop
   // settles that paste in one last sync (story 12 review r1, N5). Notices enqueued after this wait
   // in inbox.json for the next boot.
+  await stopAutoAnswerTick();
   await stopInbox();
   await getMissionControlRuntime().stop();
   await stopSpend();
@@ -407,6 +409,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   // The Mission Control coordination panel's optional host signals (story 20).
   startHostSignals();
   await getMissionControlRuntime().start();
+  // The bookkeeping auto-answer rule: off until the admin sets its fleet-config key (ADR-0031).
+  startAutoAnswerTick();
   // The spend index starts its first pass 120 s after boot, one transcript at a time (ADR-0030).
   await startSpend();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most
