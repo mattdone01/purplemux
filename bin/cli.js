@@ -158,6 +158,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'caller-unresolved': EXIT.CONFLICT,
   'grant-password-invalid': EXIT.CONFLICT,
   'grant-locked': EXIT.CONFLICT,
+  'grant-owner-active': EXIT.CONFLICT,
   'tab-not-found': EXIT.GONE,
   'session-not-running': EXIT.GONE,
   'target-changed': EXIT.GONE,
@@ -1109,23 +1110,42 @@ const cmdWatch = async (args) => {
   }
 };
 
-// Portfolio drive grants (ADR-0014): read-only here. A grant is created and revoked only in the
-// web UI (a human session plus the purplemux password); no CLI token can do either.
+// Portfolio drive grants (ADR-0014) and the owner grant (ADR-0029): read-only here. A grant is
+// created and revoked only in the web UI (a human session plus the purplemux password); no CLI token can do either.
 const cmdGrant = async (args) => {
   if (args[0] !== 'list') die('usage: grant list [--json] (grants are created and revoked in the web UI only)');
   requireEnv();
   const { body } = await api('GET', '/api/cli/grants');
-  if (args.includes('--json')) return out(body);
+  // ADR-0029: one unreadable grant file still lists the other file's grants; the refused kind is
+  // unknown, never "no grants", and the command exits 1 so a script sees the damage.
+  const refused = Array.isArray(body.refused) ? body.refused : [];
+  const reportRefused = () => {
+    for (const r of refused) process.stderr.write(`error: grant-store-unreadable (${hintFor('grant-store-unreadable')}) — ${r.error}\n`);
+    if (refused.length) process.exitCode = exitFor('grant-store-unreadable');
+  };
+  if (args.includes('--json')) {
+    out(body);
+    reportRefused();
+    return;
+  }
   const now = Date.now();
   const grants = Array.isArray(body.grants) ? body.grants : [];
-  if (!grants.length) {
+  if (!grants.length && !refused.length) {
     process.stdout.write('no grants\n');
     return;
   }
+  if (refused.length) {
+    const refusedKinds = new Set(refused.map((r) => r.capability));
+    for (const kind of ['drive', 'owner']) {
+      if (!refusedKinds.has(kind) && !grants.some((g) => (g.capability ?? 'drive') === kind)) process.stdout.write(`no ${kind} grants\n`);
+    }
+  }
   for (const g of grants) {
     const state = g.revokedAt !== null ? `ended (${g.revokeReason})` : g.expiresAt <= now ? 'expired' : `active until ${new Date(g.expiresAt).toISOString()}`;
-    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} reads ${g.workspaces.join(',')}  ${state}  "${g.reason}"\n`);
+    const scope = g.capability === 'owner' ? `capability: owner workspaces: ${g.workspaces.join(',')}` : `reads ${g.workspaces.join(',')}`;
+    process.stdout.write(`${g.id}  ${g.grantee.workspaceId}/${g.grantee.tabId} ${scope}  ${state}  "${g.reason}"\n`);
   }
+  reportRefused();
 };
 
 // The inbox (ADR-0012): server notices queued for this workspace's tabs.
@@ -1874,9 +1894,11 @@ Commands:
   note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG]
                                            A local note to the live epic holder, or a cross-workspace note between
                                            verified current orchestrators; body <= 16 KiB (exit 2). Only a fixed line is typed
-                                           into the recipient; it pulls the body. --from-epic needs that epic lease (3)
+                                           into the recipient; it pulls the body. --from-epic needs that epic lease (3).
+                                           The owner-granted tab sends to any workspace as owner (to its orchestrator)
   note list [--open] [--to-me] [--from-me] [--epic SLUG]
-                                           Notes your workspace sent or receives (no bodies). Run --open --to-me at turn start
+                                           Notes your workspace sent or receives (no bodies; fromLabel names the sender,
+                                           e.g. "owner (WS/TAB)"). Run --open --to-me at turn start
   note show ID                             The note and its body (recipient or sender workspace, or admin; else exit 3; 7 unknown)
   note ack ID [--comment TEXT]             Acknowledge a local note in your workspace, or a cross-workspace note as
                                            its verified currently routed coordinator (else exit 3)
@@ -1889,7 +1911,11 @@ Commands:
   config unset KEY [--expect-version N]    Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who
   grant list [--json]                      Portfolio read grants held by or targeting your workspace (read-only; a human
-                                           creates and revokes them in the web UI with the purplemux password)
+                                           creates and revokes them in the web UI with the purplemux password).
+                                           An owner grant shows capability: owner workspaces: * (it reads every
+                                           workspace and sends notes as owner; the web dialog refuses a second
+                                           active owner grant). One unreadable grant file: the other file's grants
+                                           print, the refusal goes to stderr, exit 1
   deploy announce --in MINUTES --reason TEXT [--except-tab TAB_ID]... [--json]
                                            Tell every enabled orchestrator and tab-bound lease holder that purplemux
                                            restarts in 1-60 min (admin token or the deploy:purplemux holder; else

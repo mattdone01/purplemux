@@ -7,9 +7,14 @@ export type TNoteState = 'queued' | 'delivered' | 'acked' | 'undeliverable' | 'e
 export type TNoteRoutingStatus = 'pending' | 'routed' | 'undeliverable' | 'policyblocked';
 
 export interface INoteAdmission {
-  /** Human admission is bound to one target by the authenticated same-origin control. */
-  mode: 'local' | 'coordinator' | 'human';
+  /**
+   * Human admission is bound to one target by the authenticated same-origin control.
+   * Owner admission is a verified tab holding an active owner grant (ADR-0029); it routes like `coordinator`.
+   */
+  mode: 'local' | 'coordinator' | 'human' | 'owner';
   sender: { workspaceId: string | null; tabId: string | null };
+  /** The owner grant that admitted an `owner` note. */
+  grantId?: string;
   humanActor?: string;
   targetWorkspaceId?: string;
   authorizedAt: number;
@@ -97,6 +102,12 @@ export interface INoteReceipt {
 export type TNoteViewState = TNoteState | 'pending' | 'held';
 
 /** A note without its body: what `note list` returns. */
-export type INoteView = Omit<INote, 'body' | 'state'> & { state: TNoteViewState; bodyBytes: number; receipt?: INoteReceipt };
+export type INoteView = Omit<INote, 'body' | 'state'> & {
+  state: TNoteViewState;
+  bodyBytes: number;
+  /** Server-made: the words after "from" in the note's inbox line, e.g. `owner (<ws>/<tab>)` (ADR-0029). */
+  fromLabel: string;
+  receipt?: INoteReceipt;
+};
 
 export type TNoteErrorCode = 'note-not-found' | 'note-too-large' | 'note-target-missing' | 'forbidden' | 'note-invalid' | 'note-cap';

@@ -72,7 +72,7 @@ const requireWriter = async (caller: ICaller, authority: IFleetConfigAuthority, 
 };
 
 /** No broadcast, no nudge, no inbox notice (ADR-0019): tools read the value at call time. */
-const audit = (change: IFleetConfigChange, caller: ICaller): Promise<void> =>
+const audit = (change: IFleetConfigChange, caller: ICaller): Promise<boolean> =>
   appendCoordinationAudit({
     event: change.newValue === null ? 'fleet-config-unset' : 'fleet-config-set',
     key: change.key,

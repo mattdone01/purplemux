@@ -8,7 +8,9 @@ vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: () => state.token ===
 vi.mock('@/lib/auth', async (original) => ({ ...await original<typeof import('@/lib/auth')>(),
   verifySessionToken: vi.fn(async (token: string) => token === 'human' ? { sub: 'human' } : null),
 }));
-vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: vi.fn(() => ({})), findActiveDriveGrant: vi.fn(() => state.granted ? { id: 'g-active' } : null) }));
+vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: vi.fn(() => ({})), findActiveDriveGrant: vi.fn(() => state.granted ? { id: 'g-active' } : null),
+  // ADR-0029: the owner tab reads everywhere; it mutates nowhere but its own workspace.
+  findActiveOwnerGrant: vi.fn(() => state.token === 'owner' ? { id: 'g-owner', capability: 'owner', workspaces: ['*'] } : null) }));
 vi.mock('@/lib/workspace-store');
 vi.mock('@/lib/layout-store');
 vi.mock('@/lib/tmux');
@@ -112,7 +114,7 @@ describe('route mutation authority matrix', () => {
       if (vi.isMockFunction(value)) value.mockReset();
     }
   });
-  for (const token of ['foreign', 'grant', 'global']) {
+  for (const token of ['foreign', 'grant', 'owner', 'global']) {
     it.each(cliRoutes)(`${token} cannot mutate %s %s`, async (route, method) => {
       state.token = token; state.granted = token === 'grant';
       const { default: handler } = await handlers[route]();
@@ -124,7 +126,7 @@ describe('route mutation authority matrix', () => {
       }
     });
   }
-  for (const token of ['local', 'foreign', 'grant', 'global']) {
+  for (const token of ['local', 'foreign', 'grant', 'owner', 'global']) {
     it.each(uiRoutes)(`${token} is not a human at %s %s`, async (route, method) => {
       state.token = token; state.granted = token === 'grant';
       const { default: handler } = await handlers[route]();
@@ -137,7 +139,7 @@ describe('route mutation authority matrix', () => {
     });
   }
   // ADR-0024: creating a workspace is the one CLI mutation the global token holds, and only it.
-  it.each(['local', 'foreign', 'grant', 'human'])('%s cannot create a workspace', async (token) => {
+  it.each(['local', 'foreign', 'grant', 'owner', 'human'])('%s cannot create a workspace', async (token) => {
     state.token = token; state.granted = token === 'grant';
     const { default: handler } = await handlers['cli/workspaces']();
     const { state: result, res } = response();

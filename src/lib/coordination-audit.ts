@@ -39,9 +39,10 @@ const rotate = async (file: string): Promise<void> => {
 
 /**
  * One JSON line per coordination transition. An audit failure is logged, never
- * thrown: the transition it records has already happened.
+ * thrown: the transition it records has already happened. Resolves true when
+ * the line was written, false when the write failed (a caller may retry later).
  */
-export const appendCoordinationAudit = (entry: Record<string, unknown>): Promise<void> =>
+export const appendCoordinationAudit = (entry: Record<string, unknown>): Promise<boolean> =>
   withLock(async () => {
     const file = auditFile();
     try {
@@ -49,7 +50,9 @@ export const appendCoordinationAudit = (entry: Record<string, unknown>): Promise
       const size = await fs.stat(file).then((s) => s.size).catch(() => 0);
       if (size >= AUDIT_ROTATE_BYTES) await rotate(file);
       await fs.appendFile(file, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, { mode: 0o600 });
+      return true;
     } catch (err) {
       log.warn(`coordination audit write failed: ${err instanceof Error ? err.message : err}`);
+      return false;
     }
   });

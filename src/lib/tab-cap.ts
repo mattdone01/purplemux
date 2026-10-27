@@ -216,7 +216,7 @@ export const admitAgentCreate = async (
 
 export const auditOverCap = (
   entry: { workspaceId: string; tabId: string; wip: IFleetWip; reason: string; caller: ICaller },
-): Promise<void> =>
+): Promise<boolean> =>
   import('@/lib/coordination-audit').then(({ appendCoordinationAudit }) => appendCoordinationAudit({
     event: 'tab-over-cap',
     workspaceId: entry.workspaceId,

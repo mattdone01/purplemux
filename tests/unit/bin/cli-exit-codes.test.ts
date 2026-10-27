@@ -197,6 +197,19 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     expect(create.stderr).toContain('web UI only');
   });
 
+  it('grant list shows an owner grant as capability: owner workspaces: * (ADR-0029)', async () => {
+    const future = Date.now() + 3_600_000;
+    reply = json(200, { grants: [
+      { id: 'g-drive1', capability: 'drive', grantee: { workspaceId: 'ws-1', tabId: 'tab-a' }, workspaces: ['ws-2'], reason: 'portfolio', expiresAt: future, revokedAt: null, revokeReason: null },
+      { id: 'g-owner1', capability: 'owner', grantee: { workspaceId: 'ws-1', tabId: 'tab-o' }, workspaces: ['*'], reason: 'owner session', expiresAt: future, revokedAt: null, revokeReason: null },
+    ] });
+    const listed = await cli(['grant', 'list']);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toMatch(/^g-drive1 {2}ws-1\/tab-a reads ws-2 {2}active until /m);
+    expect(listed.stdout).toMatch(/^g-owner1 {2}ws-1\/tab-o capability: owner workspaces: \* {2}active until .+ {2}"owner session"$/m);
+    expect(JSON.parse((await cli(['grant', 'list', '--json'])).stdout).grants[1]).toMatchObject({ capability: 'owner', workspaces: ['*'] });
+  });
+
   it('exits 1 for a success that is not JSON: another server holds the port', async () => {
     reply = (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -268,6 +281,7 @@ describe('the code → exit table', () => {
     ['caller-unresolved', 3],
     ['grant-password-invalid', 3],
     ['grant-locked', 3],
+    ['grant-owner-active', 3],
     ['tab-not-found', 4],
     ['session-not-running', 4],
     ['target-changed', 4],

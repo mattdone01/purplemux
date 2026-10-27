@@ -1,5 +1,5 @@
 import type { ICaller } from '@/lib/caller';
-import type { ICoordinationSnapshot, INoteRow, TFleetSection, TSection } from '@/types/coordination';
+import type { ICoordinationSnapshot, INoteRow, TFleetSection, TGrantsSection, TSection } from '@/types/coordination';
 
 // The coordination panel's read (story 20): leases, open notes, watches, active
 // grants, held inbox deliveries, orchestrator coverage and host pressure, each
@@ -45,11 +45,12 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
         }));
     }),
     section(async () => (await getWatchManager()).list(PANEL_CALLER, null)),
-    section(async () => {
-      const refusal = grantStore.grantsRefusal();
-      if (refusal) throw new Error(refusal);
-      return grantStore.grantsSnapshot().grants.filter((g) => grantStore.isActive(g, now));
-    }),
+    // ADR-0029 §1: each grant file fails alone; a refused file is named, the readable one still listed.
+    (async (): Promise<TGrantsSection> => {
+      const listed = grantStore.listAllGrants();
+      if (!listed.ok) return { ok: false, error: listed.error };
+      return { ok: true, items: listed.grants.filter((g) => grantStore.isActive(g, now)), refused: listed.refused };
+    })().catch((err): TGrantsSection => ({ ok: false, error: err instanceof Error ? err.message : String(err) })),
     section(async () => (await readInboxState()).items.filter((i) => i.state === 'held')),
     readHostMetrics().catch((err) => ({ available: false as const, reason: err instanceof Error ? err.message : String(err) })),
     readFleetView(now).then(

@@ -6,8 +6,8 @@ import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import Spinner from '@/components/ui/spinner';
-import { canSubmitGrant, GRANT_EXPIRY_HOURS, isGrantActive } from '@/lib/grant-view';
-import type { IGrant, IGrantee } from '@/types/grant';
+import { activeOwnerGrant, canSubmitGrant, GRANT_EXPIRY_HOURS, isGrantActive } from '@/lib/grant-view';
+import type { IGrant, IGrantee, IGrantRefusal, TGrantCapability } from '@/types/grant';
 
 // The grant dialog's content, props only (story 28): every state is rendered
 // from what the container passes, so each is pinned by a static-render test.
@@ -21,9 +21,17 @@ export interface IPortfolioGrantsPanelProps {
   /** Workspaces whose tabs could not be read: listed as unknown, never as "no tabs". */
   unreadableWorkspaceIds: string[];
   grants: IGrant[];
+  /**
+   * Grant files the server could not read (ADR-0029 §1): that kind is unknown — its refusal is shown,
+   * its Create is disabled, and it is never shown as "no grants". The readable kind keeps its list.
+   */
+  refused?: IGrantRefusal[];
   /** Workspace names by id, for the lists. */
   workspaceNames: Record<string, string>;
   now: number;
+  /** A read grant over named workspaces, or the owner session (ADR-0029). Default: read grant. */
+  capability?: TGrantCapability;
+  onCapabilityChange?: (capability: TGrantCapability) => void;
   granteeKey: string | null;
   onGranteeChange: (key: string) => void;
   workspaces: string[];
@@ -42,23 +50,53 @@ export interface IPortfolioGrantsPanelProps {
   onRevoke: (id: string) => void;
 }
 
+const REFUSAL_KEY: Record<TGrantCapability, 'refusedDrive' | 'refusedOwner'> = { drive: 'refusedDrive', owner: 'refusedOwner' };
+
 export const granteeKeyOf = (g: { workspaceId: string; tabId: string }): string => `${g.workspaceId}/${g.tabId}`;
 
 const PortfolioGrantsPanel = (props: IPortfolioGrantsPanelProps) => {
   const t = useTranslations('grants');
   const format = useFormatter();
   const { grantees, grants, workspaceNames, now } = props;
+  const capability = props.capability ?? 'drive';
+  const owner = capability === 'owner';
   const grantee = grantees.find((g) => granteeKeyOf(g) === props.granteeKey) ?? null;
   const targets = Object.keys(workspaceNames).filter((id) => id !== grantee?.workspaceId);
   const active = grants.filter((g) => isGrantActive(g, now));
   const nameOf = (id: string) => workspaceNames[id] ?? id;
   const timeOf = (ms: number) => format.dateTime(new Date(ms), { dateStyle: 'medium', timeStyle: 'short' });
-  const canSubmit = canSubmitGrant(grantee, { workspaces: props.workspaces, reason: props.reason, password: props.password }, props.submitting);
+  const tabNameOf = (g: IGrant) => grantees.find((c) => granteeKeyOf(c) === granteeKeyOf(g.grantee))?.name || g.grantee.tabId;
+  const refused = props.available ? props.refused ?? [] : [];
+  const refusalOf = (kind: TGrantCapability) => refused.find((r) => r.capability === kind) ?? null;
+  const refusalText = (r: IGrantRefusal) => (Object.hasOwn(REFUSAL_KEY, r.capability)
+    ? t(REFUSAL_KEY[r.capability], { reason: r.error })
+    : `${t('errorStore')}: ${r.error}`);
+  // Only one owner grant may be active (409 grant-owner-active); while the owner grants are unknown, nothing is claimed.
+  const ownerActive = props.available && !refusalOf('owner') ? activeOwnerGrant(grants, now) : null;
+  const canSubmit = canSubmitGrant(grantee, { capability, workspaces: props.workspaces, reason: props.reason, password: props.password }, props.submitting)
+    && !(owner && ownerActive) && !refusalOf(capability);
   const granteesKnown = props.available && props.granteesError === null;
 
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-muted-foreground">{t('intro')}</p>
+      {refused.map((r) => (
+        <p key={r.capability} className="text-xs text-destructive" data-grant-refused={r.capability}>{refusalText(r)}</p>
+      ))}
+
+      <div className="flex flex-col gap-1.5">
+        <Label>{t('capabilityLabel')}</Label>
+        <RadioGroup value={capability} onValueChange={(v) => props.onCapabilityChange?.(v === 'owner' ? 'owner' : 'drive')} className="gap-1">
+          <label className="flex items-center gap-2 text-xs" data-capability="drive">
+            <RadioGroupItem value="drive" />
+            {t('capabilityDrive')}
+          </label>
+          <label className="flex items-center gap-2 text-xs" data-capability="owner">
+            <RadioGroupItem value="owner" />
+            {t('capabilityOwner')}
+          </label>
+        </RadioGroup>
+      </div>
 
       <div className="flex flex-col gap-1.5">
         <Label>{t('granteeLabel')}</Label>
@@ -95,7 +133,16 @@ const PortfolioGrantsPanel = (props: IPortfolioGrantsPanelProps) => {
 
       <div className="flex flex-col gap-1.5">
         <Label>{t('workspacesLabel')}</Label>
-        {targets.length === 0 ? (
+        {owner ? (
+          <>
+            <p className="text-xs text-muted-foreground" data-owner-scope="">{t('ownerScope')}</p>
+            {ownerActive && (
+              <p className="text-xs text-muted-foreground" data-owner-active={ownerActive.id}>
+                {t('ownerActive', { tab: tabNameOf(ownerActive), workspace: nameOf(ownerActive.grantee.workspaceId), time: timeOf(ownerActive.expiresAt) })}
+              </p>
+            )}
+          </>
+        ) : targets.length === 0 ? (
           <p className="text-xs text-muted-foreground">{t('noOtherWorkspaces')}</p>
         ) : targets.map((id) => (
           <label key={id} className="flex items-center gap-2 text-xs" data-target={id}>
@@ -149,13 +196,14 @@ const PortfolioGrantsPanel = (props: IPortfolioGrantsPanelProps) => {
         {!props.available ? (
           <p className="text-xs text-muted-foreground" data-unavailable="grants">—</p>
         ) : active.length === 0 ? (
-          <p className="text-xs text-muted-foreground">{t('noActive')}</p>
+          refused.length === 0 && <p className="text-xs text-muted-foreground">{t('noActive')}</p>
         ) : active.map((g) => {
-          const who = grantees.find((c) => granteeKeyOf(c) === granteeKeyOf(g.grantee));
           return (
-            <div key={g.id} className="flex items-center justify-between gap-2 text-xs" data-grant={g.id}>
+            <div key={g.id} className="flex items-center justify-between gap-2 text-xs" data-grant={g.id} data-grant-capability={g.capability}>
               <span className="min-w-0 truncate">
-                {who?.name || g.grantee.tabId} · {nameOf(g.grantee.workspaceId)} — {t('drives', { workspaces: g.workspaces.map(nameOf).join(', ') })}{' '}
+                {tabNameOf(g)} · {nameOf(g.grantee.workspaceId)} — {g.capability === 'owner'
+                  ? t('ownerReads')
+                  : t('drives', { workspaces: g.workspaces.map(nameOf).join(', ') })}{' '}
                 <span className="text-muted-foreground">{t('until', { time: timeOf(g.expiresAt) })}</span>
               </span>
               <Button variant="outline" size="sm" onClick={() => props.onRevoke(g.id)} disabled={props.revokingIds.includes(g.id)}>

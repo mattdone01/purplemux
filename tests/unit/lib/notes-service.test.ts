@@ -861,3 +861,98 @@ describe('notes runtime startup', () => {
     }
   });
 });
+
+describe('owner notes (ADR-0029)', () => {
+  const O = caller('ws-1', 'tab-o');
+  const OWNER_GRANT = {
+    id: 'g-owner1', capability: 'owner', grantee: { workspaceId: 'ws-1', tabId: 'tab-o' }, workspaces: ['*'], reason: 'r',
+    createdAt: T0, createdBy: 'human', expiresAt: T0 + 24 * 60 * MIN, revokedAt: null, revokedBy: null, revokeReason: null, expiryNotedAt: null,
+  } as const;
+  let f: Fakes;
+  let svc: NotesService;
+  let holder: { workspaceId: string; tabId: string } | null;
+  let audit: ReturnType<typeof vi.fn<(entry: Record<string, unknown>) => Promise<void>>>;
+
+  beforeEach(() => {
+    f = new Fakes();
+    f.live.add('ws-1/tab-o');
+    holder = { workspaceId: 'ws-1', tabId: 'tab-o' };
+    audit = vi.fn(async (_e: Record<string, unknown>) => {});
+    svc = new NotesService({
+      ...f.deps(),
+      ownerGrantOf: (tab) => (holder && tab.workspaceId === holder.workspaceId && tab.tabId === holder.tabId
+        ? { ...OWNER_GRANT, grantee: holder, workspaces: ['*'] } : null),
+      audit,
+    });
+  });
+
+  it('admits a cross-workspace note from the owner tab with admission owner and routes it to the target orchestrator', async () => {
+    const sent = await svc.send(O, { toWorkspace: 'ws-2', subject: 'from the owner', body: 'b' });
+    expect(sent).toMatchObject({
+      admission: { mode: 'owner', grantId: 'g-owner1', sender: { workspaceId: 'ws-1', tabId: 'tab-o' } },
+      deliveredTo: { workspaceId: 'ws-2', tabId: 'tab-b' },
+      fromLabel: 'owner (ws-1/tab-o)',
+      receipt: { routingStatus: 'routed' },
+    });
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0].fields).toMatchObject({ fromOwner: true, fromHuman: false });
+    expect(f.sent[0].line).toMatch(/^\[purplemux note n-note1\] from owner \(ws-1\/tab-o\) at \S+ — purplemux note show n-note1/);
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(audit).toHaveBeenCalledWith({
+      event: 'owner-note', grantId: 'g-owner1', noteId: sent.id,
+      from: { workspaceId: 'ws-1', tabId: 'tab-o' }, to: { epic: null, workspaceId: 'ws-2' },
+    });
+  });
+
+  it('routes an epic target like a coordinator note: to the orchestrator of the holder workspace, never the worker holder', async () => {
+    f.epics.set('pay', { workspaceId: 'ws-3', tabId: 'tab-worker3' });
+    f.live.add('ws-3/tab-worker3');
+    const sent = await svc.send(O, { toEpic: 'pay', subject: 's', body: 'b' });
+    expect(sent).toMatchObject({ admission: { mode: 'owner' }, deliveredTo: { workspaceId: 'ws-3', tabId: 'tab-c' } });
+  });
+
+  it('retains an unresolved epic note and routes it once a holder appears', async () => {
+    const sent = await svc.send(O, { toEpic: 'later', subject: 's', body: 'b' });
+    expect(sent).toMatchObject({ admission: { mode: 'owner' }, routingReason: 'target-epic-unowned' });
+    f.epics.set('later', { workspaceId: 'ws-9', tabId: 'tab-orch' });
+    await svc.tick();
+    expect(f.note(sent.id).deliveredTo).toEqual({ workspaceId: 'ws-9', tabId: 'tab-orch' });
+  });
+
+  it('tries coordinator, then local, then owner', async () => {
+    // The owner grant held by the orchestrator tab itself: coordinator wins.
+    holder = { workspaceId: 'ws-1', tabId: 'tab-a' };
+    expect((await svc.send(A, { toWorkspace: 'ws-2', subject: 's', body: 'b' })).admission).toMatchObject({ mode: 'coordinator' });
+    // A note into the owner tab's own workspace stays local.
+    holder = { workspaceId: 'ws-1', tabId: 'tab-o' };
+    expect((await svc.send(O, { toWorkspace: 'ws-1', subject: 's', body: 'b' })).admission).toMatchObject({ mode: 'local' });
+    expect((await svc.send(O, { toWorkspace: 'ws-3', subject: 's', body: 'b' })).admission).toMatchObject({ mode: 'owner' });
+    expect(audit).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a cross-workspace note without an active owner grant, from an unverified tab, or from another tab of the workspace', async () => {
+    await expectCode(svc.send(caller('ws-1', 'tab-o', false), { toWorkspace: 'ws-2', subject: 's', body: 'b' }), 'forbidden');
+    await expectCode(svc.send(caller('ws-1', 'tab-a2'), { toWorkspace: 'ws-2', subject: 's', body: 'b' }), 'forbidden');
+    holder = null;
+    await expectCode(svc.send(O, { toWorkspace: 'ws-2', subject: 's', body: 'b' }), 'forbidden');
+    expect(audit).not.toHaveBeenCalled();
+    expect(f.sent).toHaveLength(0);
+  });
+
+  it('keeps the stored admission after a revoke: the notice still pastes and the note still lists as from owner', async () => {
+    const sent = await svc.send(O, { toWorkspace: 'ws-2', subject: 's', body: 'b' });
+    holder = null;
+    const verdict = await svc.preflight(f.inbox.get(f.note(sent.id).inboxItemId!)!);
+    expect(verdict).toMatchObject({ ok: true });
+    if (verdict.ok) verdict.settle();
+    const [listed] = await svc.list(B, { open: true, toMe: true });
+    expect(listed).toMatchObject({ id: sent.id, fromLabel: 'owner (ws-1/tab-o)', admission: { mode: 'owner', grantId: 'g-owner1' } });
+    expect((await svc.show(O, sent.id)).note.fromLabel).toBe('owner (ws-1/tab-o)');
+  });
+
+  it('a failed owner-note audit never unsends the note', async () => {
+    audit.mockRejectedValueOnce(new Error('disk full'));
+    const sent = await svc.send(O, { toWorkspace: 'ws-2', subject: 's', body: 'b' });
+    expect(f.note(sent.id)).toMatchObject({ admission: { mode: 'owner' }, deliveredTo: { workspaceId: 'ws-2', tabId: 'tab-b' } });
+  });
+});

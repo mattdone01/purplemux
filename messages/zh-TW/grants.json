@@ -37,5 +37,16 @@
   "errorUnknown": "請求失敗（{status}）",
   "granteesUnreadable": "無法讀取 {workspaces} 的分頁",
   "granteesFailed": "無法讀取分頁列表：{error}",
-  "staleSuffix": "未重新整理：{reason}"
+  "staleSuffix": "未重新整理：{reason}",
+  "capabilityLabel": "類型",
+  "capabilityDrive": "讀取其他工作區",
+  "capabilityOwner": "擁有者工作階段",
+  "ownerScope": "所有工作區，包括之後建立的；可以以擁有者身分傳送筆記，但不能操作其他工作區",
+  "ownerActive": "{tab} · {workspace} 持有擁有者工作階段直到 {time}；請先撤銷",
+  "ownerReads": "擁有者工作階段 — 讀取所有工作區",
+  "ownerBadge": "擁有者",
+  "ownerBadgeTooltip": "擁有者工作階段：在 {time} 前讀取所有工作區並以擁有者身分傳送筆記",
+  "errorOwnerActive": "已有一個有效的擁有者工作階段",
+  "refusedDrive": "讀取授權未生效：無法讀取 grants.json — {reason}",
+  "refusedOwner": "擁有者工作階段未生效：無法讀取 owner-grants.json — {reason}"
 }

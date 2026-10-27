@@ -37,5 +37,16 @@
   "errorUnknown": "Запрос не выполнен ({status})",
   "granteesUnreadable": "Не удалось прочитать вкладки {workspaces}",
   "granteesFailed": "Не удалось прочитать список вкладок: {error}",
-  "staleSuffix": "не обновлено: {reason}"
+  "staleSuffix": "не обновлено: {reason}",
+  "capabilityLabel": "Тип",
+  "capabilityDrive": "Читать другие рабочие области",
+  "capabilityOwner": "Сеанс владельца",
+  "ownerScope": "Все рабочие области, включая созданные позже; может отправлять заметки от имени владельца, но не управлять другой областью",
+  "ownerActive": "{tab} · {workspace} держит сеанс владельца до {time}; сначала отзовите его",
+  "ownerReads": "сеанс владельца — читает все рабочие области",
+  "ownerBadge": "владелец",
+  "ownerBadgeTooltip": "Сеанс владельца: читает все рабочие области и отправляет заметки от имени владельца до {time}",
+  "errorOwnerActive": "Сеанс владельца уже активен",
+  "refusedDrive": "Права на чтение не действуют: не удаётся прочитать grants.json — {reason}",
+  "refusedOwner": "Сеансы владельца не действуют: не удаётся прочитать owner-grants.json — {reason}"
 }

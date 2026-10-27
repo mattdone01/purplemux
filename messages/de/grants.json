@@ -37,5 +37,16 @@
   "errorUnknown": "Die Anfrage ist fehlgeschlagen ({status})",
   "granteesUnreadable": "Tabs von {workspaces} konnten nicht gelesen werden",
   "granteesFailed": "Die Tab-Liste konnte nicht gelesen werden: {error}",
-  "staleSuffix": "nicht aktualisiert: {reason}"
+  "staleSuffix": "nicht aktualisiert: {reason}",
+  "capabilityLabel": "Art",
+  "capabilityDrive": "Andere Workspaces lesen",
+  "capabilityOwner": "Owner-Sitzung",
+  "ownerScope": "Jeder Workspace, auch später erstellte; sie kann Notizen als Owner senden, aber nie einen anderen Workspace steuern",
+  "ownerActive": "{tab} · {workspace} hält die Owner-Sitzung bis {time}; zuerst widerrufen",
+  "ownerReads": "Owner-Sitzung — liest jeden Workspace",
+  "ownerBadge": "Owner",
+  "ownerBadgeTooltip": "Owner-Sitzung: liest jeden Workspace und sendet Notizen als Owner bis {time}",
+  "errorOwnerActive": "Eine Owner-Sitzung ist bereits aktiv",
+  "refusedDrive": "Lese-Grants gelten nicht: grants.json kann nicht gelesen werden — {reason}",
+  "refusedOwner": "Owner-Sitzungen gelten nicht: owner-grants.json kann nicht gelesen werden — {reason}"
 }

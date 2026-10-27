@@ -132,6 +132,35 @@ describe('coordination panel', () => {
     expect(html).toContain(new Date(AT + 3_600_000).toLocaleString());
   });
 
+  it('grants: an owner grant reads "owner session — reads every workspace", never "reads *" or "No active grants" (ADR-0029)', () => {
+    const snap = empty();
+    snap.grants = { ok: true, refused: [], items: [
+      { id: 'g-own1', capability: 'owner', grantee: { workspaceId: 'ws-1', tabId: 'tab-o' }, workspaces: ['*'], expiresAt: AT + 3_600_000 },
+    ] } as unknown as ICoordinationSnapshot['grants'];
+    const html = sectionHtml(render(snap), 'Grants');
+    expect(html).toContain('data-grant="g-own1" data-grant-capability="owner"');
+    expect(html).toContain('ws-1/tab-o owner session — reads every workspace');
+    expect(html).not.toContain('reads *');
+    expect(html).not.toContain('No active grants');
+  });
+
+  it('grants: one refused file names itself with the served reason; the other file\'s grants still show; never "No active grants"', () => {
+    const snap = empty();
+    snap.grants = { ok: true, items: [
+      { id: 'g-drv1', capability: 'drive', grantee: { workspaceId: 'ws-1', tabId: 'tab-a' }, workspaces: ['ws-2'], expiresAt: AT + 3_600_000 },
+    ], refused: [{ capability: 'owner', file: 'owner-grants.json', error: '/h/.purplemux/owner-grants.json is malformed', code: 'grant-store-unreadable' }] } as unknown as ICoordinationSnapshot['grants'];
+    let html = sectionHtml(render(snap), 'Grants');
+    expect(html).toContain('data-state="partial"');
+    expect(html).toContain('Owner sessions are not honoured: owner-grants.json cannot be read — /h/.purplemux/owner-grants.json is malformed');
+    expect(html).toContain('data-grant="g-drv1"');
+
+    snap.grants = { ok: true, items: [], refused: [{ capability: 'drive', file: 'grants.json', error: 'bad', code: 'grant-store-unreadable' }] };
+    html = sectionHtml(render(snap), 'Grants');
+    expect(html).toContain('Read grants are not honoured: grants.json cannot be read — bad');
+    expect(html).not.toContain('No active grants');
+    expect(html).not.toContain('data-state="empty"');
+  });
+
   it('host signals: pending before the first run', () => {
     expect(render({ ...empty(), signals: { state: 'pending' } })).toContain('data-signals="pending"');
   });

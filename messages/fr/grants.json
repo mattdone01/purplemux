@@ -37,5 +37,16 @@
   "errorUnknown": "La requête a échoué ({status})",
   "granteesUnreadable": "Les onglets de {workspaces} sont illisibles",
   "granteesFailed": "La liste des onglets est illisible : {error}",
-  "staleSuffix": "non actualisé : {reason}"
+  "staleSuffix": "non actualisé : {reason}",
+  "capabilityLabel": "Type",
+  "capabilityDrive": "Lire d'autres espaces de travail",
+  "capabilityOwner": "Session propriétaire",
+  "ownerScope": "Tous les espaces de travail, y compris ceux créés plus tard ; elle peut envoyer des notes en tant que propriétaire, sans jamais piloter un autre espace",
+  "ownerActive": "{tab} · {workspace} détient la session propriétaire jusqu'à {time} ; révoquez-la d'abord",
+  "ownerReads": "session propriétaire — lit tous les espaces",
+  "ownerBadge": "propriétaire",
+  "ownerBadgeTooltip": "Session propriétaire : lit tous les espaces et envoie des notes en tant que propriétaire jusqu'à {time}",
+  "errorOwnerActive": "Une session propriétaire est déjà active",
+  "refusedDrive": "Les autorisations de lecture ne sont pas appliquées : grants.json est illisible — {reason}",
+  "refusedOwner": "Les sessions propriétaire ne sont pas appliquées : owner-grants.json est illisible — {reason}"
 }

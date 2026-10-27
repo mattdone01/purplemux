@@ -1,4 +1,4 @@
-import type { IGrant } from '@/types/grant';
+import type { IGrant, TGrantCapability } from '@/types/grant';
 
 // Pure view logic of the grant dialog and badge (story 28), tested without a DOM.
 
@@ -15,13 +15,25 @@ export interface IGrantBadge {
   expiresAt: number;
 }
 
-/** The badge of one tab, or null when it holds no active grant. */
+/** The read-grant badge of one tab, or null when it holds no active drive grant (an owner grant has its own badge). */
 export const grantBadgeOf = (grants: IGrant[], workspaceId: string, tabId: string, now: number): IGrantBadge | null => {
-  const mine = grants.filter((g) => isGrantActive(g, now) && g.grantee.workspaceId === workspaceId && g.grantee.tabId === tabId);
+  const mine = grants.filter((g) => g.capability !== 'owner' && isGrantActive(g, now)
+    && g.grantee.workspaceId === workspaceId && g.grantee.tabId === tabId);
   if (!mine.length) return null;
   const workspaces = [...new Set(mine.flatMap((g) => g.workspaces))].sort();
   return { count: workspaces.length, workspaces, expiresAt: Math.max(...mine.map((g) => g.expiresAt)) };
 };
+
+/** The owner badge of one tab (ADR-0029): the expiry of its active owner grant, or null. */
+export const ownerBadgeOf = (grants: IGrant[], workspaceId: string, tabId: string, now: number): { expiresAt: number } | null => {
+  const owner = grants.find((g) => g.capability === 'owner' && isGrantActive(g, now)
+    && g.grantee.workspaceId === workspaceId && g.grantee.tabId === tabId);
+  return owner ? { expiresAt: owner.expiresAt } : null;
+};
+
+/** The active owner grant, if any: only one may be active, so the dialog says so before a submit. */
+export const activeOwnerGrant = (grants: IGrant[], now: number): IGrant | null =>
+  grants.find((g) => g.capability === 'owner' && isGrantActive(g, now)) ?? null;
 
 /**
  * The label key for a refused request (never a raw code on the face): the
@@ -34,6 +46,7 @@ export type TGrantErrorKey =
   | 'errorSession'
   | 'errorOrigin'
   | 'errorUnverified'
+  | 'errorOwnerActive'
   | 'errorInvalid'
   | 'errorNotFound'
   | 'errorStore'
@@ -46,6 +59,7 @@ export const grantErrorKey = (status: number, code: string | null): TGrantErrorK
   if (code === 'grant-locked') return 'errorLocked';
   if (status === 401) return 'errorSession';
   if (code === 'grant-tab-unverified') return 'errorUnverified';
+  if (code === 'grant-owner-active') return 'errorOwnerActive';
   if (code === 'grant-invalid') return 'errorInvalid';
   if (code === 'grant-not-found') return 'errorNotFound';
   if (code === 'grant-store-unreadable') return 'errorStore';
@@ -80,12 +94,15 @@ export const runGrantAction = async <T>(deps: IGrantActionDeps<T>): Promise<{ ok
   return r.ok ? { ok: true, error: null } : { ok: false, error: deps.describe(r) };
 };
 
-/** Whether the dialog may submit: a launch-identity grantee, at least one workspace, a reason and a password. */
+/**
+ * Whether the dialog may submit: a launch-identity grantee, a reason and a password, and at least
+ * one workspace for a read grant (an owner grant reads every workspace, ADR-0029).
+ */
 export const canSubmitGrant = (
   grantee: { identity: string } | null,
-  form: { workspaces: string[]; reason: string; password: string },
+  form: { capability?: TGrantCapability; workspaces: string[]; reason: string; password: string },
   submitting: boolean,
-): boolean => !!grantee && grantee.identity === 'launch' && form.workspaces.length > 0
+): boolean => !!grantee && grantee.identity === 'launch' && (form.capability === 'owner' || form.workspaces.length > 0)
   && form.reason.trim().length > 0 && form.password.length > 0 && !submitting;
 
 /** A copy of `record` without `key`. */

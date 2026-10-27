@@ -42,7 +42,8 @@ vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => state.identity,
 vi.mock('@/lib/tmux', () => ({ hasSession: async () => state.live }));
 vi.mock('@/lib/grant-store', () => ({ grantsSnapshot: () => ({ grants: [] }),
   findActiveDriveGrant: (_grants: unknown, grantee: { tabId: string }, target: string) =>
-    state.grantTarget === target && grantee.tabId === 'tab-grantee' ? { id: 'g-legacy' } : null }));
+    state.grantTarget === target && grantee.tabId === 'tab-grantee' ? { id: 'g-legacy' } : null,
+  findActiveOwnerGrant: () => null }));
 vi.mock('@/lib/portfolio-service', () => ({ getPortfolioSnapshotForSelection: vi.fn(async (selection: unknown) => ({ selection })) }));
 vi.mock('@/lib/mission-control-runtime', () => ({ getMissionSnapshot: async () => ({ schemaVersion: 1, cursor: 0 }) }));
 vi.mock('@/lib/mission-control-store', () => ({ getMissionControlStore: () => ({ humanInboxPolicy: () => ({ version: 1 }) }) }));

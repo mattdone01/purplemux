@@ -4,7 +4,7 @@ import { FleetStatusView, type IFleetFilter } from '@/components/features/missio
 import useCoordination from '@/hooks/use-coordination';
 import { hostWarnings } from '@/lib/host-warnings';
 import { cn } from '@/lib/utils';
-import type { ICoordinationSnapshot, THostSignals, TSection } from '@/types/coordination';
+import type { ICoordinationSnapshot, TGrantsSection, THostSignals, TSection } from '@/types/coordination';
 
 // Mission Control coordination panel (story 20): leases, open notes, watches,
 // grants, held deliveries and host pressure — read only. A stale holder must
@@ -75,23 +75,36 @@ export const formatBytes = (bytes: number): string => {
   return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
 };
 
+const GRANT_REFUSAL_LABEL: Record<string, string> = {
+  drive: 'Read grants are not honoured: grants.json cannot be read',
+  owner: 'Owner sessions are not honoured: owner-grants.json cannot be read',
+};
+
+/** One sentence per grant file the server could not read (ADR-0029 §1), with the served reason. */
+export const grantRefusals = (section: TGrantsSection): string[] => (section.ok
+  ? (section.refused ?? []).map((r) => `${Object.hasOwn(GRANT_REFUSAL_LABEL, r.capability) ? GRANT_REFUSAL_LABEL[r.capability] : 'A grant file cannot be read'} — ${r.error}`)
+  : []);
+
 const WARN = 'text-ui-amber';
 
-const Section = <T,>({ title, section, empty, render }: {
+const Section = <T,>({ title, section, empty, render, refusals = [] }: {
   title: string;
   section: TSection<T>;
   empty: string;
   render: (item: T, i: number) => ReactNode;
+  /** Parts of the section the server could not read: named, and the section is then never "empty". */
+  refusals?: string[];
 }) => (
   <div className="min-w-0 space-y-1.5" data-section={title}>
     <h3 className="text-xs font-semibold">
       {title}
       {section.ok && <span className="ml-1.5 tabular-nums text-muted-foreground">{section.items.length}</span>}
     </h3>
+    {refusals.map((text) => <p key={text} className="text-xs text-destructive" data-state="partial">{text}</p>)}
     {!section.ok ? (
       <p className="text-xs text-destructive" data-state="error">Could not read: {section.error}</p>
     ) : section.items.length === 0 ? (
-      <p className="text-xs text-muted-foreground" data-state="empty">{empty}</p>
+      refusals.length === 0 && <p className="text-xs text-muted-foreground" data-state="empty">{empty}</p>
     ) : (
       <ul className="space-y-1 text-xs" data-state="populated">{section.items.map(render)}</ul>
     )}
@@ -161,9 +174,9 @@ export const CoordinationPanelView = ({ snapshot, error, loading }: { snapshot: 
             </span>
           </li>
         )} />
-        <Section title="Grants" section={snapshot.grants} empty="No active grants" render={(g) => (
-          <li key={g.id} className="flex min-w-0 justify-between gap-2" data-grant={g.id}>
-            <span className="truncate">{g.grantee.workspaceId}/{g.grantee.tabId} reads {g.workspaces.join(', ')}</span>
+        <Section title="Grants" section={snapshot.grants} empty="No active grants" refusals={grantRefusals(snapshot.grants)} render={(g) => (
+          <li key={g.id} className="flex min-w-0 justify-between gap-2" data-grant={g.id} data-grant-capability={g.capability}>
+            <span className="truncate">{g.grantee.workspaceId}/{g.grantee.tabId} {g.capability === 'owner' ? 'owner session — reads every workspace' : `reads ${g.workspaces.join(', ')}`}</span>
             <span className="shrink-0 text-muted-foreground">until {new Date(g.expiresAt).toLocaleString()}</span>
           </li>
         )} />

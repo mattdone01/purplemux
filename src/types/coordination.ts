@@ -1,5 +1,5 @@
 import type { IFleetView } from '@/types/fleet-status';
-import type { IGrant } from '@/types/grant';
+import type { IGrant, IGrantRefusal } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
 import type { ILeaseView } from '@/types/lease';
 import type { INoteView } from '@/types/note';
@@ -94,7 +94,7 @@ export interface ICoordinationSnapshot {
   leases: TSection<ILeaseView>;
   notes: TSection<INoteRow>;
   watches: TSection<IWatchView>;
-  grants: TSection<IGrant>;
+  grants: TGrantsSection;
   inboxHeld: TSection<IInboxItem>;
   orchestrators: TSection<IOrchestratorPresenceIssue>;
   host: THostMetrics;
@@ -102,5 +102,12 @@ export interface ICoordinationSnapshot {
   /** The fleet status panel (ADR-0023). Absent from a server older than it. */
   fleet?: TFleetSection;
 }
+
+/**
+ * The active grants of each readable grant file, drive then owner (`capability` shown), and the
+ * files the server could not read (ADR-0029 §1: each file fails alone). `ok: false` only when both
+ * files are refused. `refused` is absent from a server older than story 05.
+ */
+export type TGrantsSection = { ok: true; items: IGrant[]; refused?: IGrantRefusal[] } | { ok: false; error: string };
 
 export type TFleetSection = { ok: true; view: IFleetView } | { ok: false; error: string };

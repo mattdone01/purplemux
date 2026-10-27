@@ -317,7 +317,7 @@ export const reapTabProcesses = async (
 };
 
 export interface IReapAudit {
-  (entry: Record<string, unknown>): Promise<void>;
+  (entry: Record<string, unknown>): Promise<unknown>;
 }
 
 /**
