@@ -7,6 +7,8 @@ export type TMissionDeliveryState = 'queued' | 'dispatching' | 'submitted' | 'ac
 export type TMissionConfidence = 'confirmed' | 'provisional' | 'unknown';
 export type TMissionCandidateReason = 'workspace-issue' | 'legacy-review' | 'historical-context';
 export type TMissionHumanNeed = 'decision' | 'approval' | 'information' | 'external-action';
+/** Producer-set attention class (ADR-0031); the server never guesses one. */
+export type TAttentionClass = 'money' | 'irreversible' | 'scope' | 'bookkeeping';
 
 export interface IMissionBinding {
   tabId: string;
@@ -64,6 +66,13 @@ export interface IMissionQuestion {
   canContinue: boolean;
 }
 
+/** Optional producer fields of `attention.opened` / `attention.updated` (ADR-0031); stored inside `question_json`. */
+export interface IMissionAttentionClassInput {
+  class?: TAttentionClass;
+  /** One of `options[].id`; refused on an `action` item. */
+  defaultOptionId?: string;
+}
+
 export type TMissionHumanReviewInput =
   | {
       humanNeed: 'none';
@@ -100,6 +109,8 @@ export interface IMissionAttentionItem extends IMissionQuestion {
   resolution: string | null;
   humanReview: TMissionHumanReview | null;
   candidateReason: TMissionCandidateReason | null;
+  class: TAttentionClass | null;
+  defaultOptionId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -203,8 +214,8 @@ export type TMissionProducerEvent = IMissionEventBase & (
   | { type: 'run.resumed'; payload: { tabId: string; transferPendingAnswers: boolean } }
   | { type: 'progress.updated'; payload: { objective?: string; epic?: IMissionEpic | null; phase?: string | null; state?: 'running' | 'waiting'; nextStep?: string | null; storyCounts?: IMissionRun['storyCounts']; closeoutPending?: boolean } }
   | { type: 'run.finished'; payload: { state: 'completed' | 'cancelled'; summary: string; closeoutPending: boolean } }
-  | { type: 'attention.opened'; payload: IMissionQuestion & { itemId: string; humanReview?: TMissionHumanReviewInput } }
-  | { type: 'attention.updated'; payload: IMissionQuestion & { itemId: string; humanReview?: TMissionHumanReviewInput } }
+  | { type: 'attention.opened'; payload: IMissionQuestion & IMissionAttentionClassInput & { itemId: string; humanReview?: TMissionHumanReviewInput } }
+  | { type: 'attention.updated'; payload: IMissionQuestion & IMissionAttentionClassInput & { itemId: string; humanReview?: TMissionHumanReviewInput } }
   | { type: 'attention.resolved'; payload: { itemId: string; resolution: string } }
   | { type: 'attention.cancelled'; payload: { itemId: string; reason: string } }
   | { type: 'answer.acknowledged'; payload: { answerId: string } }
@@ -226,6 +237,14 @@ export interface IMissionBootstrap {
   entries: IMissionBootstrapEntry[];
 }
 
+/** One `answersByClass` row: answers recorded on one UTC day for one class, by a human or by a rule (ADR-0031 §3). */
+export interface IMissionAnswerClassCount {
+  day: string;
+  class: TAttentionClass | 'unclassified';
+  by: 'human' | 'rule';
+  count: number;
+}
+
 export interface IMissionSnapshot {
   schemaVersion: 1;
   cursor: number;
@@ -242,6 +261,8 @@ export interface IMissionSnapshot {
    * submitted), from ANY bootstrap — a notice typed late belongs to its own bootstrap, not the latest.
    */
   pendingBootstrapEntries?: Array<{ bootstrapId: string; entry: IMissionBootstrapEntry }>;
+  /** ADR-0031: answers per UTC day, class and actor kind over the last 7 days; absent from an older server. */
+  answersByClass?: IMissionAnswerClassCount[];
 }
 
 export interface IMissionEventsResponse {

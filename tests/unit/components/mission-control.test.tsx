@@ -52,6 +52,8 @@ const item = (over: Partial<IMissionAttentionItem> = {}): IMissionAttentionItem 
     reviewedAt: now - 10_000,
   },
   candidateReason: null,
+  class: null,
+  defaultOptionId: null,
   createdAt: now - 60_000,
   updatedAt: now - 10_000,
   ...over,

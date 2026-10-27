@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { IMissionAnswerRequest, TMissionProducerEvent } from '@/types/mission-control';
 import { MissionControlError } from '@/lib/mission-control-errors';
+import { ATTENTION_CLASSES } from '@/lib/attention-class';
 
 const id = z.string().trim().min(1).max(128);
 const timestamp = z.number().int().safe().nonnegative();
@@ -45,12 +46,23 @@ const question = z.object({
   recommendation: z.string().trim().max(8000).nullable(),
   blockingScope: z.enum(['none', 'story', 'run']),
   canContinue: z.boolean(),
+  class: z.enum(ATTENTION_CLASSES, { error: `class must be one of ${ATTENTION_CLASSES.join(', ')}` }).optional(),
+  defaultOptionId: z.string({ error: 'defaultOptionId must be an option ID' }).trim()
+    .min(1, { error: 'defaultOptionId must be a nonempty option ID' })
+    .max(128, { error: 'defaultOptionId must be at most 128 characters' })
+    .optional(),
 }).strict().superRefine((value, context) => {
   if (new Set(value.storyIds).size !== value.storyIds.length) {
     context.addIssue({ code: 'custom', message: 'duplicate story IDs' });
   }
   if (new Set(value.options.map((entry) => entry.id)).size !== value.options.length) {
     context.addIssue({ code: 'custom', message: 'duplicate option IDs' });
+  }
+  if (value.defaultOptionId === undefined) return;
+  if (value.kind === 'action') {
+    context.addIssue({ code: 'custom', path: ['defaultOptionId'], message: 'defaultOptionId is refused on an action item' });
+  } else if (!value.options.some((entry) => entry.id === value.defaultOptionId)) {
+    context.addIssue({ code: 'custom', path: ['defaultOptionId'], message: "defaultOptionId must name one of the item's options" });
   }
 });
 const base = {

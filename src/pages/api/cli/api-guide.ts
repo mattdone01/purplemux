@@ -682,6 +682,28 @@ POST /api/cli/mission-control/events?workspaceId=WS
       "storyIds":[],"options":[{"id":"gradual","label":"Gradual"}],"recommendation":"gradual",
       "blockingScope":"story","canContinue":true}}]}
 
+  Attention class and stated default (ADR-0031): attention.opened and attention.updated accept
+  two optional payload fields. "class" is one of "money", "irreversible", "scope" or
+  "bookkeeping". "defaultOptionId" names one of the item's options[].id; an action item has no
+  options, so a default on it is refused. An unknown class or a default that names no option
+  refuses the whole batch with 400, and the error names the field. A producer that cannot name
+  the class omits it; money, irreversible and scope are never auto-answered. Only the producer
+  sets the class: the server never guesses one, and an item without a class reads "class": null
+  (shown as Unclassified). The snapshot item carries "class" and "defaultOptionId" (null when
+  absent); attention.updated replaces both under the item revision rule, and a change of either
+  on an open item needs renewed review like any other question change. The snapshot also carries
+  "answersByClass": [{ "day": "YYYY-MM-DD", "class": "money"|...|"unclassified",
+  "by": "human"|"rule", "count": N }] for the last 7 UTC days: the days end on the UTC day of the
+  snapshot's "generatedAt", today included. Rows are sparse: when "answersByClass" is present, a
+  missing (day, class, by) row is a count of 0; when the field is absent, the counts are unknown.
+  {"events":[{"eventId":"evt-question-2","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
+    "expectedRevision":0,"producerAt":1700000000003,"bindingGeneration":1,"type":"attention.opened",
+    "payload":{"itemId":"question-2","kind":"question","title":"Record the release note",
+      "context":"Add the rollout to the release notes","storyIds":[],
+      "options":[{"id":"gradual","label":"Gradual"},{"id":"direct","label":"Direct"}],
+      "recommendation":"gradual","blockingScope":"none","canContinue":true,
+      "class":"bookkeeping","defaultOptionId":"gradual"}}]}
+
   Ordinary attention creates a durable candidate. Workers route blockers to the
   orchestrator. The configured orchestrator checks existing instructions, authority,
   evidence, and delegated handling. Routine setup, coordination, already-granted

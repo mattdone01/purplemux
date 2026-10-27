@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { RouterContext } from 'next/dist/shared/lib/router-context.shared-runtime';
 import type { NextRouter } from 'next/router';
-import MissionControlNeedsYou, { needsYouGroups } from '@/components/features/mission-control/mission-control-needs-you';
+import MissionControlNeedsYou, { needsYouClassGroups, needsYouGroups } from '@/components/features/mission-control/mission-control-needs-you';
 import { createMissionDraft } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft } from '@/components/features/mission-control/mission-control-utils';
 import MissionControlPage from '@/pages/mission-control';
@@ -41,6 +41,8 @@ const question = (over: Partial<IMissionAttentionItem> = {}): IMissionAttentionI
     reviewedAt: now,
   },
   candidateReason: null,
+  class: null,
+  defaultOptionId: null,
   createdAt: now - 60_000,
   updatedAt: now,
   ...over,
@@ -199,5 +201,125 @@ describe('needsYouGroups', () => {
       ['ws-unknown', undefined, ['c']],
       ['ws-pay', 'Payments', ['a', 'b']],
     ]);
+  });
+});
+
+describe('Needs you grouped by attention class (ADR-0031)', () => {
+  const day = 86_400_000;
+  const today = Date.UTC(2026, 9, 27, 12, 0, 0);
+  const classified = [
+    question({ id: 'book', title: 'Bookkeeping question', class: 'bookkeeping', defaultOptionId: 'all', createdAt: now - 90_000 }),
+    question({ id: 'plain', title: 'Unclassified question', createdAt: now - 80_000 }),
+    question({ id: 'scope', title: 'Scope question', class: 'scope', createdAt: now - 70_000 }),
+    question({ id: 'money', title: 'Money question', class: 'money', defaultOptionId: 'staged', createdAt: now - 10_000 }),
+    question({ id: 'irrev', title: 'Irreversible question', class: 'irreversible', createdAt: now - 20_000 }),
+  ];
+
+  it('orders the groups Money, Irreversible, Scope, Bookkeeping, Unclassified, money first', () => {
+    const html = render({ snapshot: snapshot(classified), drafts: draftsFor(classified) });
+    const headings = ['Money', 'Irreversible', 'Scope', 'Bookkeeping', 'Unclassified']
+      .map((label) => html.indexOf(`data-attention-class-group="${label.toLowerCase()}"`));
+    expect(headings.every((position) => position > -1)).toBe(true);
+    expect(headings).toEqual([...headings].sort((left, right) => left - right));
+    const titles = ['Money question', 'Irreversible question', 'Scope question', 'Bookkeeping question', 'Unclassified question']
+      .map((title) => html.indexOf(title));
+    expect(titles).toEqual([...titles].sort((left, right) => left - right));
+  });
+
+  it('shows each card its class and its stated default label, without pre-selecting the default', () => {
+    const items = [classified[0]];
+    const html = render({ snapshot: snapshot(items), drafts: draftsFor(items) });
+    expect(html).toContain('Default: All tenants');
+    expect(html).toMatch(/data-attention-class="bookkeeping"[^>]*>Bookkeeping</);
+    expect(html).not.toContain('aria-pressed="true"');
+  });
+
+  it('shows Unclassified, never a guessed class, and no default line for an item without them', () => {
+    const items = [classified[1]];
+    const html = render({ snapshot: snapshot(items), drafts: draftsFor(items) });
+    expect(html).toMatch(/data-attention-class="unclassified"[^>]*>Unclassified</);
+    expect(html).not.toContain('Default:');
+    for (const guess of ['>Money<', '>Scope<', '>Bookkeeping<', '>Irreversible<']) expect(html).not.toContain(guess);
+  });
+
+  it('labels an unknown served class neutrally and keeps the served value in detail, never on the face', () => {
+    const items = [question({ id: 'odd', class: 'urgent' as never })];
+    const html = render({ snapshot: snapshot(items), drafts: draftsFor(items) });
+    expect(html).toMatch(/data-attention-class="unclassified"[^>]*title="Served class: urgent"[^>]*>Unrecognised class</);
+    expect(html).not.toContain('>urgent<');
+    expect(html).toContain('data-attention-class-group="unclassified"');
+  });
+
+  it('labels a default that names no served option neutrally instead of showing the raw id', () => {
+    const items = [question({ id: 'stale-default', class: 'bookkeeping', defaultOptionId: 'gone' })];
+    const html = render({ snapshot: snapshot(items), drafts: draftsFor(items) });
+    expect(html).toContain('Default: an option no longer offered');
+    expect(html).not.toContain('Default: gone');
+  });
+
+  it('needsYouClassGroups keeps the workspace grouping inside each class and skips empty classes', () => {
+    const groups = needsYouClassGroups([
+      question({ id: 'm-pay', class: 'money', createdAt: 30 }),
+      question({ id: 'm-tre', workspaceId: 'ws-tre', class: 'money', createdAt: 10 }),
+      question({ id: 'u-pay', createdAt: 5 }),
+      question({ id: 'proto', class: 'constructor' as never, createdAt: 6 }),
+    ], [workspace('ws-pay', 'Payments'), workspace('ws-tre', 'Treasury')]);
+    expect(groups.map((group) => [group.attentionClass, group.workspaces.map((entry) => [entry.workspaceId, entry.items.map((item) => item.id)])])).toEqual([
+      ['money', [['ws-tre', ['m-tre']], ['ws-pay', ['m-pay']]]],
+      ['unclassified', [['ws-pay', ['u-pay', 'proto']]]],
+    ]);
+  });
+
+  it('shows a 7-day strip of answers per class, split by human and rule', () => {
+    const items = [classified[0]];
+    const html = render({
+      snapshot: {
+        ...snapshot(items),
+        generatedAt: today,
+        answersByClass: [
+          { day: '2026-10-21', class: 'money', by: 'human', count: 2 },
+          { day: '2026-10-27', class: 'bookkeeping', by: 'human', count: 1 },
+          { day: '2026-10-27', class: 'bookkeeping', by: 'rule', count: 3 },
+        ],
+      },
+      drafts: draftsFor(items),
+    });
+    expect(html).toContain('Answers per class, last 7 days');
+    for (const label of ['10-21', '10-27']) expect(html).toContain(label);
+    expect(html).not.toContain('10-20');
+    expect(html).toContain('data-strip-cell="2026-10-21:money">2<');
+    expect(html).toContain('data-strip-cell="2026-10-27:bookkeeping">4 (3 by rule)<');
+    expect(html).toContain('data-strip-cell="2026-10-24:scope">0<');
+    expect(today - 6 * day).toBe(Date.UTC(2026, 9, 21, 12, 0, 0));
+  });
+
+  it('says the strip is not available when the server does not send answersByClass', () => {
+    const items = [classified[0]];
+    const html = render({ snapshot: snapshot(items), drafts: draftsFor(items) });
+    expect(html).toContain('Answers per class are not available from this server.');
+    expect(html).not.toContain('data-strip-cell=');
+  });
+});
+
+describe('Needs you with an item from a server older than ADR-0031', () => {
+  const legacy = (): IMissionAttentionItem => {
+    const { class: ignoredClass, defaultOptionId: ignoredDefault, ...shaped } = question({ id: 'legacy', title: 'Legacy question' });
+    void ignoredClass;
+    void ignoredDefault;
+    return shaped as IMissionAttentionItem;
+  };
+
+  it('groups and labels an item without both keys Unclassified, with no badge detail and no Default line', () => {
+    const items = [legacy()];
+    expect(items[0]).not.toHaveProperty('class');
+    expect(items[0]).not.toHaveProperty('defaultOptionId');
+    const html = render({ snapshot: snapshot(items), drafts: draftsFor(items) });
+    expect(html).toContain('data-attention-class-group="unclassified"');
+    expect(html).toMatch(/data-attention-class="unclassified">Unclassified</);
+    expect(html).not.toContain('title=');
+    expect(html).not.toContain('Unrecognised class');
+    expect(html).not.toContain('Default:');
+    expect(html).not.toContain('undefined');
+    expect(html).toContain('Legacy question');
   });
 });
