@@ -35,6 +35,10 @@ const fakeProvider = (id: string): IAgentProvider => ({
   id,
   readSessionId: (tab: ITab) => (tab as ITab & { fakeSession?: string | null }).fakeSession ?? null,
   writeSessionId: (tab: ITab, sessionId: string | null | undefined) => { (tab as ITab & { fakeSession?: string | null }).fakeSession = sessionId ?? null; },
+  readJsonlPath: () => null,
+  writeJsonlPath: () => {},
+  readSummary: () => null,
+  writeSummary: () => {},
 } as unknown as IAgentProvider);
 
 describe('session-tabs store', () => {
@@ -149,6 +153,63 @@ describe('updateTabAgentSessionId records the binding', () => {
     const store = await seedLayout();
     await fs.writeFile(storeFile(), 'not json');
     await expect(store.updateTabAgentSessionId('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), 's-1')).resolves.toBeUndefined();
+    const layout = await store.readLayoutFile(store.resolveLayoutFile('ws-a'));
+    expect(layout?.root.type === 'pane' && (layout.root.tabs[0] as ITab & { fakeSession?: string }).fakeSession).toBe('s-1');
+    expect(await fs.readFile(storeFile(), 'utf-8')).toBe('not json');
+  });
+});
+
+describe('updateTabAgentState records the binding (the status manager hook, launch and poll writer)', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    delete (globalThis as { __ptSessionTabsSeen?: unknown }).__ptSessionTabsSeen;
+    mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-session-tabs-state-'));
+  });
+  afterEach(async () => {
+    await fs.rm(mockHome.value, { recursive: true, force: true });
+  });
+
+  const seedLayout = async () => {
+    const store = await import('@/lib/layout-store');
+    const layout: ILayoutData = {
+      root: { type: 'pane', id: 'pane-one', activeTabId: 'tab-adopted',
+        tabs: [{ id: 'tab-adopted', sessionName: 'pt-ws-a-pane-one-tab-orig', name: 'worker', order: 0, panelType: 'codex-cli' }] },
+      activePaneId: 'pane-one',
+      updatedAt: '2026-10-26T00:00:00.000Z',
+    };
+    await store.writeLayoutFile(layout, store.resolveLayoutFile('ws-a'));
+    return store;
+  };
+
+  it('binds a saved session id to the layout tab id', async () => {
+    const store = await seedLayout();
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('codex'), { sessionId: 'c-hook', jsonlPath: null });
+    expect((await stored()).bindings['codex:c-hook']).toMatchObject({ workspaceId: 'ws-a', tabId: 'tab-adopted' });
+  });
+
+  it('records nothing for a reset session, a save without a session id, or a tab no layout names', async () => {
+    const store = await seedLayout();
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: null, jsonlPath: null });
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { summary: 'a summary' });
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-gone', fakeProvider('claude'), { sessionId: 's-1' });
+    await expect(fs.access(storeFile())).rejects.toThrow();
+  });
+
+  it('binds each new session of a cleared tab to the same tab id', async () => {
+    const store = await seedLayout();
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: 's-old' });
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: null });
+    await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: 's-new' });
+    const { bindings } = await stored();
+    expect(bindings['claude:s-old']).toMatchObject({ workspaceId: 'ws-a', tabId: 'tab-adopted' });
+    expect(bindings['claude:s-new']).toMatchObject({ workspaceId: 'ws-a', tabId: 'tab-adopted' });
+  });
+
+  it('never fails the hook save when the binding store is damaged', async () => {
+    const store = await seedLayout();
+    await fs.mkdir(path.dirname(storeFile()), { recursive: true });
+    await fs.writeFile(storeFile(), 'not json');
+    await expect(store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: 's-1' })).resolves.toBeUndefined();
     const layout = await store.readLayoutFile(store.resolveLayoutFile('ws-a'));
     expect(layout?.root.type === 'pane' && (layout.root.tabs[0] as ITab & { fakeSession?: string }).fakeSession).toBe('s-1');
     expect(await fs.readFile(storeFile(), 'utf-8')).toBe('not json');

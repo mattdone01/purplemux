@@ -267,6 +267,9 @@ POST /api/cli/tabs
   keeps the old bare-shell behavior.
   Response: { "tabId", "workspaceId", "paneId", "sessionName", "name", "panelType", "agentProviderId", "agentSessionId", "launched", "host"?,
               "wip"?: { "count", "cap", "overCap" } } — wip on an agent tab: the count with the new tab; overCap = count > cap
+  A codex-cli tab whose launch fails after the create keeps its tab, and the tab counts against the
+  cap: 500 { "error", "reason", "tabId", "generation"?, "launchState", "wip" } when the launch
+  could not be prepared or submitted, 503 with the same fields when it was not confirmed.
 
 GET /api/cli/workspaces/<WS>/tab-count   (any scope that may read WS)
   The workspace's agent tabs against the WIP cap; \`purplemux tab count -w WS [--json]\` prints

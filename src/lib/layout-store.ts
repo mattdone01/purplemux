@@ -681,6 +681,22 @@ const mutateTab = async (
   });
 };
 
+/**
+ * The spend read model's tab attribution (ADR-0030 §3). Both session-id writers call it after their
+ * layout write; a failure is logged and never fails the hook path.
+ */
+const recordSpendBinding = async (
+  sessionName: string,
+  provider: IAgentProvider,
+  sessionId: string | null | undefined,
+  tabId: string | undefined,
+): Promise<void> => {
+  const wsId = parseSessionName(sessionName)?.wsId;
+  if (!sessionId || !tabId || !wsId) return;
+  await recordSessionTab({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: wsId, tabId })
+    .catch((err) => log.warn(`session-tabs binding not recorded for ${sessionName}: ${err instanceof Error ? err.message : err}`));
+};
+
 export const updateTabAgentSessionId = async (
   sessionName: string,
   provider: IAgentProvider,
@@ -693,12 +709,7 @@ export const updateTabAgentSessionId = async (
     provider.writeSessionId(tab, sessionId);
     return true;
   });
-  const wsId = parseSessionName(sessionName)?.wsId;
-  const { tabId } = found;
-  if (!sessionId || !tabId || !wsId) return;
-  // The spend read model's tab attribution (ADR-0030); it never fails the hook path.
-  await recordSessionTab({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: wsId, tabId })
-    .catch((err) => log.warn(`session-tabs binding not recorded for ${sessionName}: ${err instanceof Error ? err.message : err}`));
+  await recordSpendBinding(sessionName, provider, sessionId, found.tabId);
 };
 
 export const updateTabAgentSummary = (
@@ -712,7 +723,7 @@ export const updateTabAgentSummary = (
     return true;
   });
 
-export const updateTabAgentState = (
+export const updateTabAgentState = async (
   sessionName: string,
   provider: IAgentProvider,
   state: {
@@ -721,8 +732,10 @@ export const updateTabAgentState = (
     summary?: string | null;
     lastUserMessage?: string | null;
   },
-): Promise<void> =>
-  mutateTab(sessionName, (tab) => {
+): Promise<void> => {
+  const found: { tabId?: string } = {};
+  await mutateTab(sessionName, (tab) => {
+    found.tabId = tab.id;
     let changed = false;
     if (state.sessionId !== undefined && provider.readSessionId(tab) !== state.sessionId) {
       provider.writeSessionId(tab, state.sessionId);
@@ -742,6 +755,8 @@ export const updateTabAgentState = (
     }
     return changed;
   });
+  await recordSpendBinding(sessionName, provider, state.sessionId, found.tabId);
+};
 
 export const updateTabClaudeSessionId = (
   sessionName: string,

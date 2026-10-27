@@ -19,7 +19,34 @@ const STORES = [
 const missingStores = (doc: string): string =>
   `missing=[${STORES.filter((store) => !doc.includes(`\`${store}\``) && !doc.includes(`── ${store} `)).join(', ')}]`;
 
+// The coordination audit lines that epic purplemux-flow added (architecture §4.11), each with its source.
+const EPIC_AUDIT_EVENTS: Array<[event: string, source: string]> = [
+  ['tab-over-cap', 'src/lib/tab-cap.ts'],
+  ['tab-restart', 'src/lib/tab-restart.ts'],
+  ['owner-read', 'src/lib/grant-service.ts'],
+  ['owner-note', 'src/lib/notes-service.ts'],
+  ['attention-auto-answer', 'src/lib/mission-control-auto-answer-tick.ts'],
+];
+
+const auditSection = (doc: string): string => {
+  const start = doc.indexOf('### `audit/coordination.jsonl`');
+  const end = doc.indexOf('\n### ', start + 1);
+  return start < 0 ? '' : doc.slice(start, end < 0 ? undefined : end);
+};
+
 describe('docs/DATA-DIR.md', () => {
+  it('names every audit line the epic added, in the coordination audit section', () => {
+    const section = auditSection(DATA_DIR_DOC);
+    const notWritten = EPIC_AUDIT_EVENTS
+      .filter(([event, source]) => !fs.readFileSync(path.resolve(source), 'utf-8').includes(`event: '${event}'`))
+      .map(([event]) => event);
+    const undocumented = EPIC_AUDIT_EVENTS.filter(([event]) => !section.includes(`\`${event}\``)).map(([event]) => event);
+    expect(`notWritten=[${notWritten.join(', ')}] undocumented=[${undocumented.join(', ')}]`).toBe('notWritten=[] undocumented=[]');
+    expect(section).toContain('`breakReason`');
+    expect(section).toContain('{human: <session subject>}');
+  });
+
+
   it('names every store under ~/.purplemux in the tree or in a code span', () => {
     expect(missingStores(DATA_DIR_DOC)).toBe('missing=[]');
   });
