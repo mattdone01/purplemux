@@ -173,6 +173,10 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'config-not-found': EXIT.NOT_FOUND,
   'wip-cap': EXIT.CONFLICT,
   'config-store-unreadable': EXIT.CONFLICT,
+  'flow-invalid': EXIT.USAGE,
+  'flow-too-large': EXIT.USAGE,
+  'flow-unreadable': EXIT.UNEXPECTED,
+  'flow-not-found': EXIT.NOT_FOUND,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -531,6 +535,78 @@ const cmdBurndown = async (args) => {
     return out(body);
   }
   die('usage: burndown publish -w WS --json @burndown.json | burndown show -w WS');
+};
+
+// Mirrors MAX_FLOW_BYTES (src/lib/flow.ts): above it the route answers 413, and well above it
+// the body limit answers without a code, so the CLI refuses before sending.
+const FLOW_MAX_BYTES = 1024 * 1024;
+const FLOW_HISTORY_MODES = ['all', 'window', 'none'];
+const FLOW_USAGE = 'usage: flow publish -w WS --json @FILE | flow show -w WS [--json] [--history all|window|none]';
+
+const durationText = (ms) => {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
+};
+
+const flowSection = (title, entries, line) => (entries.length ? [title, ...entries.map((entry) => `  ${line(entry)}`)] : [`${title}  none`]);
+
+const flowText = (wsId, body, now) => {
+  const { snapshot, receivedAt } = body.flow;
+  const iso = (ms) => new Date(ms).toISOString();
+  const lines = [`flow ${wsId}  source ${snapshot.source}  generated ${iso(snapshot.generatedAt)}  received ${iso(receivedAt)} (${durationText(now - receivedAt)} ago)`];
+  if (body.stale) lines.push(`stale — last published ${durationText(now - receivedAt)} ago`);
+  lines.push(...flowSection('queues', snapshot.queues, (queue) => {
+    const length = queue.capacity === null ? `${queue.items.length}` : `${queue.items.length}/${queue.capacity}`;
+    const oldest = queue.items.length ? durationText(now - Math.min(...queue.items.map((item) => item.since))) : '—';
+    return `${queue.name}  ${length}  oldest ${oldest}`;
+  }));
+  lines.push(...flowSection('locks', snapshot.locks, (lock) => {
+    if (lock.heldBy === null) return `${lock.name}  free`;
+    return lock.since === null
+      ? `${lock.name}  held by ${lock.heldBy} (since unknown)`
+      : `${lock.name}  held by ${lock.heldBy} since ${iso(lock.since)} (${durationText(now - lock.since)})`;
+  }));
+  lines.push(...flowSection('meters', snapshot.meters, (meter) => [
+    `${meter.name}  ${meter.unit ? `${meter.value} ${meter.unit}` : meter.value}`,
+    ...(meter.limit === null ? [] : [`limit ${meter.limit}`]),
+    ...(meter.windowMinutes === null ? [] : [`window ${meter.windowMinutes}m`]),
+  ].join('  ')));
+  lines.push(...flowSection('flags', snapshot.flags, (flag) => `${flag.severity}  ${flag.text}`));
+  return `${lines.join('\n')}\n`;
+};
+
+const cmdFlow = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!['show', 'publish'].includes(sub)) die(FLOW_USAGE);
+  if (!wsId) die('--workspace is required');
+  if (sub === 'show') {
+    const history = flagValue(rest, '--history') || 'all';
+    if (!FLOW_HISTORY_MODES.includes(history)) die(`--history: saw ${history}, expected all, window or none`);
+    requireEnv();
+    const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/flow?history=${history}`);
+    // Like `config get` for an unset key: absence is its own exit, never an empty board.
+    if (!body.flow) return fail('flow-not-found', `no flow published for ${wsId}`);
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(flowText(wsId, body, Date.now()));
+    return;
+  }
+  const snapshot = await readJsonFlag(rest, 'flow');
+  const bytes = Buffer.byteLength(JSON.stringify(snapshot));
+  if (bytes > FLOW_MAX_BYTES) fail('flow-too-large', `saw ${bytes} bytes, expected at most ${FLOW_MAX_BYTES}; nothing was sent`);
+  requireEnv();
+  const { body } = await api('POST', `/api/cli/workspaces/${encodeURIComponent(wsId)}/flow`, snapshot);
+  if (body.historyReset) {
+    process.stderr.write('warning: history reset: the stored record did not validate and was moved aside (flow.json.corrupt-<receivedAt>)\n');
+  }
+  process.stdout.write(`ok ${body.receivedAt} ${body.historyRows}\n`);
 };
 
 // A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
@@ -1699,6 +1775,14 @@ Commands:
   burndown publish -w WS --json @FILE      Publish the Scrum Master burndown.json (or '{...}', or pipe JSON). Validated
                                            strictly; history keeps the newest 2000 rows. Shown on the portfolio board
   burndown show -w WS                      The latest published burndown for a workspace
+  flow publish -w WS --json @FILE          Publish the workspace's pipeline snapshot: queues, locks, meters, flags
+                                           (ADR-0026; or '{...}', or pipe JSON). Own workspace only. Prints
+                                           ok <receivedAt> <historyRows>; the server keeps the history. Exit 2
+                                           flow-invalid (names the field) or flow-too-large (over 1 MiB)
+  flow show -w WS [--json]                 The latest flow: queues (length, capacity, oldest age), locks (holder,
+            [--history all|window|none]    since), meters, producer flags, and "stale" after 10 min without a
+                                           publish. No record: "no flow published", exit 7 (flow-not-found);
+                                           a damaged record: exit 1 (flow-unreadable)
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
   mission bootstrap -w WS                  Read the reconcile steps for this workspace's pending Mission Control bootstrap, and
@@ -1826,6 +1910,8 @@ const main = async () => {
       return cmdStandup(args.slice(1));
     case 'burndown':
       return cmdBurndown(args.slice(1));
+    case 'flow':
+      return cmdFlow(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':

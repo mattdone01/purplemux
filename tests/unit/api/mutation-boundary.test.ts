@@ -34,6 +34,7 @@ const cliRoutes = [
   ['codex/launch-command', 'POST'], ['codex/launch-submit', 'POST'], ['codex/launch-args', 'POST'],
   ['codex/launch-confirm', 'POST'], ['claude/launch-command', 'POST'],
   ['cli/codex/launch-args', 'POST'], ['cli/codex/launch-confirm', 'POST'],
+  ['cli/workspaces/[workspaceId]/flow', 'POST'],
 ];
 const uiRoutes = [
   ['tabs/[tabId]/send', 'POST'], ['tmux/send-input', 'POST'], ['tmux/reset', 'POST'], ['tmux/recover-unknown', 'POST'],
@@ -89,6 +90,7 @@ const handlers: Record<string, () => Promise<{ default: (req: NextApiRequest, re
   'workspace/index': () => import('@/pages/api/workspace/index'),
   'workspace/reorder': () => import('@/pages/api/workspace/reorder'),
   'cli/workspaces': () => import('@/pages/api/cli/workspaces'),
+  'cli/workspaces/[workspaceId]/flow': () => import('@/pages/api/cli/workspaces/[workspaceId]/flow'),
 };
 
 const request = (method: string, cookie = false, origin = 'http://localhost:8022') => ({

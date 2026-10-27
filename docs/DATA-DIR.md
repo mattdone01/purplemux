@@ -19,6 +19,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── claude-prompt.md      # --append-system-prompt-file content
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       ├── burndown.json         # latest published epic burndown (Scrum Master)
+│       ├── flow.json             # latest published pipeline flow + server history (ADR-0026)
 │       ├── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
 │       └── grok-home/            # per-workspace GROK_HOME
 ├── hooks.json               # Claude Code hook + statusline config (generated)
@@ -278,6 +279,19 @@ snapshot is validated by `src/lib/burndown.ts`, history keeps the newest 2000 ro
 file is at most 1 MiB. The portfolio board reads the selected Scrum Master's workspace file
 through `GET /api/mission-control/burndown`. A file that does not validate is reported as a
 storage error, never read as "nothing published".
+
+### `flow.json` — `src/lib/flow-store.ts`
+
+The latest pipeline snapshot the workspace published with `purplemux flow publish`, plus the
+history the server keeps for it (`{ workspaceId, receivedAt, snapshot, history }`, mode 0600,
+ADR-0026). The snapshot is validated by `src/lib/flow.ts`. Each publish replaces the snapshot and
+appends one history row the server derives from it; history keeps the newest 2000 rows and the
+file at most 4 MiB, the oldest rows dropped first. Writes are serialized per workspace
+(`globalThis.__ptFlowLocks`); parsed records are cached by mtime and size
+(`globalThis.__ptFlowReadCache`). A file that does not parse or re-validate is reported as a
+storage error (`flow-unreadable`), never read as "no flow published". The next publish renames it
+to `flow.json.corrupt-<receivedAt>` (kept for inspection, never read again) and starts a fresh
+history. Read through `GET /api/cli/workspaces/{wsId}/flow` and `GET /api/mission-control/flow`.
 
 ### `claude-home/` — `src/lib/workspace-home.ts`
 
