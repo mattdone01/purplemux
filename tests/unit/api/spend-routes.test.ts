@@ -93,7 +93,7 @@ const seedTranscripts = async () => {
 
 const resetGlobals = () => {
   const g = globalThis as Record<string, unknown>;
-  for (const key of ['__ptSpendIndexer', '__ptSpendIndexWriteLock', '__ptCodexStatsCache', '__ptSessionTabsSeen']) delete g[key];
+  for (const key of ['__ptSpendIndexer', '__ptSpendIndexWriteLock', '__ptCodexStatsCache', '__ptSessionTabsSeen', '__ptSessionTabsRefusedAt']) delete g[key];
 };
 
 describe('spend routes', () => {

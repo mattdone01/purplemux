@@ -9,9 +9,10 @@ import type { ILayoutData, ITab } from '@/types/terminal';
 // updateTabAgentState; each non-null id it saves binds the session to its tab.
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
+const warn = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/logger', () => {
-  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
+  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn, error: () => {}, fatal: () => {}, child: () => logger };
   return { createLogger: () => logger };
 });
 vi.mock('os', async (importOriginal) => {
@@ -67,9 +68,12 @@ describe('status manager session saves record the spend binding (ADR-0030 §3)',
   beforeEach(async () => {
     vi.resetModules();
     delete (globalThis as { __ptSessionTabsSeen?: unknown }).__ptSessionTabsSeen;
+    delete (globalThis as { __ptSessionTabsRefusedAt?: unknown }).__ptSessionTabsRefusedAt;
+    warn.mockClear();
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-status-spend-'));
   });
   afterEach(async () => {
+    vi.restoreAllMocks();
     await fs.rm(mockHome.value, { recursive: true, force: true });
   });
 
@@ -122,6 +126,30 @@ describe('status manager session saves record the spend binding (ADR-0030 §3)',
         expect(layout && store.collectAllTabs(layout.root)[0].agentState?.sessionId).toBe('codex-d1');
       });
       expect(await fs.readFile(storeFile, 'utf-8')).toBe('not json');
+    } finally {
+      manager.shutdown();
+    }
+  });
+
+  it('reads a damaged binding store once and warns once across many hook saves', async () => {
+    await writeLayout([{ id: 'tab-n', sessionName: session('tab-n'), name: 'worker', order: 0, panelType: 'codex-cli' }]);
+    const storeFile = path.join(mockHome.value, '.purplemux', 'session-tabs.json');
+    await fs.writeFile(storeFile, 'not json');
+    const readFile = vi.spyOn(fs, 'readFile');
+    const manager = await newManager();
+    manager.registerTab('tab-n', entry('tab-n', 'codex-cli'));
+    try {
+      const store = await import('@/lib/layout-store');
+      for (let i = 0; i < 10; i += 1) {
+        manager.applyAgentHookMeta('codex', session('tab-n'), { sessionId: `codex-n${i}`, jsonlPath: null });
+        await vi.waitFor(async () => {
+          const layout = await store.readLayoutFile(store.resolveLayoutFile(WS));
+          expect(layout && store.collectAllTabs(layout.root)[0].agentState?.sessionId).toBe(`codex-n${i}`);
+        });
+      }
+      await vi.waitFor(() => expect(warn.mock.calls.filter(([message]) => String(message).includes(storeFile))).toHaveLength(1));
+      expect(readFile.mock.calls.filter(([target]) => target === storeFile)).toHaveLength(1);
+      expect(warn).toHaveBeenCalledTimes(1);
     } finally {
       manager.shutdown();
     }
