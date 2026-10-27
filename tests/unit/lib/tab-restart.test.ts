@@ -140,7 +140,7 @@ const lifecycleEvents = async () => {
 
 const resetGlobals = () => {
   const g = globalThis as Record<string, unknown>;
-  for (const key of ['__ptTabLifecycle', '__ptTabTokens', '__ptTabTokenLock', '__ptTabTokenRevokeInstalled', '__ptLayoutContentCache', '__ptLayoutLock', '__ptOrchestrationMappingGates', '__ptCoordinationAuditLock']) delete g[key];
+  for (const key of ['__ptTabLifecycle', '__ptTabTokens', '__ptTabTokenLock', '__ptTabTokenRevokeInstalled', '__ptLayoutContentCache', '__ptLayoutLock', '__ptOrchestrationMappingGates', '__ptCoordinationAuditLock', '__ptSessionTabsSeen']) delete g[key];
 };
 
 describe('restartTab (ADR-0028)', () => {
@@ -210,8 +210,9 @@ describe('restartTab (ADR-0028)', () => {
     const worker = claudeTab();
     const peer: ITab = { id: 'tab-peer', sessionName: session('tab-peer'), name: 'peer', order: 1, panelType: 'claude-code', reportsTo: 'tab-t' };
     await writeLayout([worker, peer]);
-    // The stores that the close events empty for a tab (leases, watches, probes and jobs, notes, grants, the
-    // Mission Control run binding). A restart neither emits those events nor writes these files.
+    // The stores that the close events empty for a tab (leases, watches, probes and jobs, notes, grants and owner
+    // grants, the Mission Control run binding), and the spend session-to-tab bindings. A restart neither emits those
+    // events nor writes these files; with a real launcher, a resume only refreshes the same tab's spend binding.
     const base = path.join(mockHome.value, '.purplemux');
     const stores: Record<string, string> = {
       'leases.json': JSON.stringify({ leases: [{ name: 'epic:flow', holder: { workspaceId: WS, tabId: 'tab-t' } }] }),
@@ -219,6 +220,8 @@ describe('restartTab (ADR-0028)', () => {
       [`workspaces/${WS}/liveness.json`]: JSON.stringify({ probes: [{ workspaceId: WS, tabId: 'tab-t', label: 'gate' }], jobs: [] }),
       'notes.json': JSON.stringify({ notes: [{ id: 'n-1', deliveredTo: { workspaceId: WS, tabId: 'tab-t' } }] }),
       'grants.json': JSON.stringify({ grants: [{ granteeTabId: 'tab-t' }] }),
+      'owner-grants.json': JSON.stringify({ grants: [{ id: 'g-owner', capability: 'owner', grantee: { workspaceId: WS, tabId: 'tab-t' }, workspaces: ['*'] }] }),
+      'session-tabs.json': JSON.stringify({ version: 1, bindings: { [`claude:${SESSION_ID}`]: { workspaceId: WS, tabId: 'tab-t', firstSeenAt: 1, lastSeenAt: 1 } } }),
     };
     for (const [rel, content] of Object.entries(stores)) {
       await fs.mkdir(path.dirname(path.join(base, rel)), { recursive: true });
@@ -281,6 +284,25 @@ describe('restartTab (ADR-0028)', () => {
     const result = await restartTab(input({ clear: true }));
     expect(result.body).toMatchObject({ resumed: false, resumeSkipped: 'clear' });
     expect(launcher.launchAgentInTab).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ resumeSessionId: null, resetAgentSession: true }));
+  });
+
+  it('--clear: the new session\'s hook binds it to the same tab id, beside the old session\'s binding (ADR-0030 §3)', async () => {
+    await writeLayout([claudeTab()]);
+    const store = await import('@/lib/layout-store');
+    const { claudeProvider } = await import('@/lib/providers/claude');
+    await store.updateTabAgentState(session('tab-t'), claudeProvider, { sessionId: SESSION_ID });
+    const { restartTab } = await import('@/lib/tab-restart');
+
+    expect((await restartTab(input({ clear: true }))).status).toBe(200);
+    const fresh = '7d1e2f3a-4b5c-4d6e-8f70-81a2b3c4d5e6';
+    await store.updateTabAgentState(session('tab-t'), claudeProvider, { sessionId: null, jsonlPath: null });
+    await store.updateTabAgentState(session('tab-t'), claudeProvider, { sessionId: fresh, jsonlPath: null });
+
+    const { readSessionTabs } = await import('@/lib/spend/session-tabs-store');
+    const bindings = await readSessionTabs();
+    expect(bindings[`claude:${fresh}`]).toMatchObject({ workspaceId: WS, tabId: 'tab-t' });
+    expect(bindings[`claude:${SESSION_ID}`]).toMatchObject({ workspaceId: WS, tabId: 'tab-t' });
+    expect((await readTabs())[0].id).toBe('tab-t');
   });
 
   it('a tab with no agent session starts fresh: resumeSkipped no-session', async () => {

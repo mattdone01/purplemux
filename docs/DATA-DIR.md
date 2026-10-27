@@ -191,8 +191,9 @@ Cross-workspace log of completed Claude sessions (max 200 entries, version 1). K
 
 Which tab ran which agent session, for the spend read model (ADR-0030). `{version: 1, bindings:
 {"<provider>:<sessionId>": {workspaceId, tabId, firstSeenAt, lastSeenAt}}}`, mode 0600, written by
-tmp + rename under one lock. `updateTabAgentSessionId` records each non-null session after its layout
-write (a failure is logged and never fails the hook path); the spend indexer seeds it once per boot
+tmp + rename under one lock. Both session-id writers in `src/lib/layout-store.ts`,
+`updateTabAgentSessionId` and `updateTabAgentState` (the status manager's hook, launch and poll saves),
+record each non-null session after their layout write (a failure is logged and never fails the hook path); the spend indexer seeds it once per boot
 from `session-history.json` and every layout's current session ids. A session moves to another tab
 only on a newer sighting. Bindings last seen before the spend floor (today − 91, UTC) are pruned. A malformed file is refused, never
 read as empty or overwritten: spend then attributes no usage to a tab and says why. Deleting it loses
@@ -320,6 +321,21 @@ A `lease-release` line names the lease, the `reason` (`released`, `broken`, `exp
 releasing tab or admin token (`{workspaceId, tabId, verified, identity, admin}`), `{human: <session subject>}` when a
 human session breaks the lease from Mission Control (ADR-0029 §8), or `null` for a server-made release. A break adds
 `breakReason` (at most 500 code points).
+
+The lines added by epic `purplemux-flow` (architecture §4.11):
+
+- `tab-over-cap` (ADR-0027): an orchestrator made an agent tab over the WIP cap. `workspaceId`, `tabId` (the new tab),
+  `count`, `cap`, the caller's `reason`, and `by` (`{workspaceId, tabId, verified, identity}`).
+- `tab-restart` (ADR-0028): one line per `tab restart`. `workspaceId`, `tabId`, `by` (`{kind: 'agent', workspaceId,
+  tabId, identity}` or `{kind: 'human', actor}`), `clear`, `interrupt`, `outcome` (`restarted`, `not-confirmed`,
+  `failed`), and when known `resumed`, `reaped`, `abandoned` and `error`.
+- `owner-read` (ADR-0029): an owner-grant tab read another workspace. `grantId`, `grantee`, `workspaceId`; at most one
+  line per grant and workspace per hour (`OWNER_READ_AUDIT_MS`).
+- `owner-note` (ADR-0029 §5): one line per note sent under an owner grant. `grantId`, `noteId`, `from`
+  (`{workspaceId, tabId}`), `to`.
+- `attention-auto-answer` (ADR-0031): one line per bookkeeping auto-answer. `itemId`, `workspaceId`, `rule`,
+  `ruleVersion`, `optionId`, `ageMs` (the item's age when the rule answered it).
+- `lease-release` with `by: {human: …}` and `breakReason`: a human lease break (ADR-0029 §8), above.
 
 ### `session-stats/{sessionId}.json` — `src/lib/session-stats.ts`
 

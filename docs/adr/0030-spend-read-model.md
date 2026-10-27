@@ -13,9 +13,10 @@ The owner asked where the tokens went. `GET /api/stats/overview` aggregates Clau
   2,669 files and 3,752 MB, against 389 main files and 3,059 MB. Each subagent line carries the parent `sessionId` and
   `isSidechain: true`. (Bytes measured; the token share is not measured.)
 - Tab attribution needs a session-to-tab binding. Session history keeps 200 entries fleet-wide
-  (`src/lib/session-history.ts:10`), a few hours of a 50-tab workspace. The server learns every binding in one function,
-  `updateTabAgentSessionId(sessionName, provider, sessionId)` (`src/lib/layout-store.ts:655`), and forgets it at the
-  next session.
+  (`src/lib/session-history.ts:10`), a few hours of a 50-tab workspace. The server learns every binding in two layout
+  writers, `updateTabAgentSessionId(sessionName, provider, sessionId)` (`src/lib/layout-store.ts:655`; the timeline
+  server and tab create) and `updateTabAgentState` (the status manager's hook, launch and poll saves), and forgets it
+  at the next session.
 - Codex sessions live in the global `~/.codex/sessions`, so even the Codex workspace needs the binding.
 - The transcripts total about 6.8 GB; one Node process serves every request, so a full parse per request is not possible.
 
@@ -38,8 +39,10 @@ Option 3.
    `subagents/workflows/<wf>/agent-*.jsonl`). The workspace is the one whose `claude-home/projects` holds
    the file; `~/.claude/projects` is the workspace key `global`. Codex and Grok files come from their existing readers.
 3. **Bindings.** `~/.purplemux/session-tabs.json` (new, 0600, tmp + rename, one lock): `{version: 1, bindings:
-   {"<provider>:<sessionId>": {workspaceId, tabId, firstSeenAt, lastSeenAt}}}`. `updateTabAgentSessionId` records each
-   non-null binding after its layout write; a failure is logged and never fails the hook path. At start the store is
+   {"<provider>:<sessionId>": {workspaceId, tabId, firstSeenAt, lastSeenAt}}}`. Both session-id writers,
+   `updateTabAgentSessionId` and `updateTabAgentState`, record each non-null session id they are given after their
+   layout write, so a tab made after boot and the new session of `tab restart --clear` bind at once; a known binding is
+   rewritten at most once an hour; a failure is logged and never fails the hook path. At start the store is
    seeded from session history and from every layout's current session ids. Bindings last seen before the spend floor (§4 Retention) are pruned.
 4. **Index.** `~/.purplemux/stats/spend-index.json` (new, version 1, 0600). Per file: `size, mtimeMs, ino, offset` (the
    end of the last complete line read) and buckets `{day, model, sessionId, sidechain, input, output, cacheRead,

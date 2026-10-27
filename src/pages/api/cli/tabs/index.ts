@@ -282,6 +282,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             reason: launched.reason,
             tabId: tab.id,
             launchState: 'held',
+            ...(wip ? { wip } : {}),
           });
         }
         if (!launched.ok && launched.step === 'submit') {
@@ -291,6 +292,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             tabId: tab.id,
             generation: launched.generation,
             launchState: launched.phase,
+            ...(wip ? { wip } : {}),
           });
         }
         if (!launched.ok) {
@@ -300,6 +302,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             tabId: tab.id,
             generation: launched.generation,
             launchState: launched.phase,
+            ...(wip ? { wip } : {}),
           });
         }
         codexLaunchState = 'active';

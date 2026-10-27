@@ -11,6 +11,7 @@ import type { ILayoutData, ITab, TPanelType } from '@/types/terminal';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 const tmux = vi.hoisted(() => ({ createSession: vi.fn(async (..._args: unknown[]) => {}) }));
+const launch = vi.hoisted(() => ({ codex: vi.fn() }));
 
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
@@ -36,6 +37,11 @@ vi.mock('@/lib/status-manager', () => ({
 vi.mock('@/lib/agent-availability', () => ({ checkAgentAvailabilityForPanelType: vi.fn(async () => ({ ok: true })), toAgentAvailabilityError: vi.fn() }));
 vi.mock('@/lib/agent-dispatch-policy', () => ({ checkAgentDispatchPolicy: vi.fn(async () => ({ ok: true })) }));
 vi.mock('@/lib/human-mutation', () => ({ authorizeHumanMutation: vi.fn(async () => true) }));
+vi.mock('@/lib/agent-launch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/agent-launch')>()),
+  buildFreshLaunchCommand: vi.fn(async () => undefined),
+  launchCodexManaged: launch.codex,
+}));
 
 type THandler = (req: NextApiRequest, res: NextApiResponse) => unknown;
 
@@ -162,6 +168,19 @@ describe('POST /api/cli/tabs: the WIP cap (ADR-0027)', () => {
     const terminal = await post(tokens.worker, { panelType: 'terminal' });
     expect(terminal.status).toBe(201);
     expect(terminal.body).not.toHaveProperty('wip');
+  });
+
+  it.each([
+    [500, { ok: false, step: 'prepare', reason: 'no shell' }, { error: 'Failed to prepare Codex launch', launchState: 'held' }],
+    [500, { ok: false, step: 'submit', reason: 'paste refused', generation: 'g-1', phase: 'held' }, { error: 'Failed to submit Codex launch', launchState: 'held' }],
+    [503, { ok: false, step: 'activate', reason: 'no session-start', generation: 'g-1', phase: 'submitted' }, { error: 'Codex launch was not confirmed', launchState: 'submitted' }],
+  ] as const)('a counted Codex create whose launch fails answers %i with the tab and its wip', async (status, outcome, body) => {
+    launch.codex.mockResolvedValueOnce(outcome);
+    await writeLayout(agents(5));
+    const r = await post(tokens.worker, { panelType: 'codex-cli' });
+    expect(r.status, JSON.stringify(r.body)).toBe(status);
+    expect(r.body).toMatchObject({ ...body, tabId: expect.any(String), wip: { count: 8, cap: 8, overCap: false } });
+    expect((await readTabs()).map((t) => t.id)).toContain(r.body.tabId);
   });
 
   it('two creates at cap − 1 at the same time: exactly one wins', async () => {
