@@ -1,8 +1,9 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace } from '@/lib/cli-utils';
 import { getWorkspaceById } from '@/lib/workspace-store';
-import { FLOW_WINDOW_MINUTES, MAX_FLOW_BYTES, isFlowStale, parseFlowHistoryMode, parseFlowSnapshot, selectFlowHistory } from '@/lib/flow';
-import { FlowStoreError, publishFlow, readFlow } from '@/lib/flow-store';
+import { MAX_FLOW_BYTES, parseFlowHistoryMode, parseFlowSnapshot } from '@/lib/flow';
+import { FlowStoreError, publishFlow } from '@/lib/flow-store';
+import { readFlowView } from '@/lib/flow-view';
 import type { IFlowPublishResponse, IFlowReadResponse } from '@/types/flow';
 
 // Above the snapshot ceiling, so an oversized snapshot is answered with flow-too-large and its size.
@@ -24,11 +25,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       return res.status(400).json({ error: `history: saw ${JSON.stringify(req.query.history)}, expected all, window or none`, code: 'invalid-request' });
     }
     try {
-      const now = Date.now();
-      const flow = await readFlow(workspaceId);
-      const body: IFlowReadResponse = flow
-        ? { flow: selectFlowHistory(flow, mode, now, FLOW_WINDOW_MINUTES), stale: isFlowStale(flow.receivedAt, now) }
-        : { flow: null, stale: null };
+      const body: IFlowReadResponse = await readFlowView(workspaceId, mode, Date.now());
       return res.status(200).json(body);
     } catch (error) {
       if (error instanceof FlowStoreError) return storeFailure(res, error);

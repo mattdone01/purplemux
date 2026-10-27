@@ -123,7 +123,7 @@ export interface IFlowPublishResponse {
   bytes: number;
 }
 
-/** `GET /api/cli/workspaces/{ws}/flow`. `derived` arrives with story 02. */
+/** `GET /api/cli/workspaces/{ws}/flow`. `derived` is absent with no record, and from a server before story 02. */
 export interface IFlowReadResponse {
   flow: IFlowRecord | null;
   stale: boolean | null;
@@ -138,8 +138,8 @@ export interface IMissionFlowSummary {
   source: string;
   stale: boolean;
   producerFlagCount: number;
-  /** `deriveFlowFlags(...).flags.length`; arrives with story 02. Absent means not computed, never 0 (consult C-01). */
-  derivedFlagCount?: number;
+  /** `deriveFlowFlags(...).flags.length` (story 02); an older server omits it, which means not computed, never 0 (consult C-01). */
+  derivedFlagCount: number;
 }
 
 export interface IMissionFlowError {
@@ -153,7 +153,7 @@ export interface IMissionFlowListResponse {
   errors: IMissionFlowError[];
 }
 
-/** `GET /api/mission-control/flow?workspaceId=WS`. `derived` arrives with story 02. */
+/** `GET /api/mission-control/flow?workspaceId=WS`. `derived` is absent with no record, and from a server before story 02. */
 export interface IMissionFlowDetailResponse {
   workspaceId: string;
   flow: IFlowRecord | null;

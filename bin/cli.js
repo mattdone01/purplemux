@@ -560,6 +560,28 @@ const durationText = (ms) => {
   return `${seconds}s`;
 };
 
+// Mirrors flowDurationText and lockBusyPhrase (src/lib/flow-flags.ts): the derived flag text, the
+// panel and this line say the same sentence; tests/unit/bin/cli-flow.test.ts pins the parity.
+const flowMinutesText = (ms) => {
+  const minutes = Math.max(0, Math.floor(ms / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`;
+};
+
+// Mirrors SHARE_EPSILON (src/lib/flow-flags.ts): the shown percent floors, so it never shows a threshold the flag missed.
+const FLOW_SHARE_EPSILON = 1e-9;
+
+const flowLockBusyPhrase = (share, knownMinutes, windowMinutes) => {
+  const window = flowMinutesText(windowMinutes * 60_000);
+  const known = flowMinutesText(knownMinutes * 60_000);
+  if (share === null) return `busy share unknown: ${known} known in the last ${window}`;
+  const shown = `${Math.floor(share * 100 + FLOW_SHARE_EPSILON)}%`;
+  return Math.round(knownMinutes * 60_000) >= Math.round(windowMinutes * 60_000)
+    ? `held ${shown} of the last ${window}`
+    : `held ${shown} of ${known} known in the last ${window}`;
+};
+
 const flowSection = (title, entries, line) => (entries.length ? [title, ...entries.map((entry) => `  ${line(entry)}`)] : [`${title}  none`]);
 
 const flowText = (wsId, body, now) => {
@@ -572,11 +594,17 @@ const flowText = (wsId, body, now) => {
     const oldest = queue.items.length ? durationText(now - Math.min(...queue.items.map((item) => item.since))) : '—';
     return `${queue.name}  ${length}  oldest ${oldest}`;
   }));
+  const { derived } = body;
+  // A server before story 02 sends no `derived`: the busy share is then left out, never shown as 0.
+  const busy = (name) => {
+    if (!derived || !Object.hasOwn(derived.lockBusyShare, name) || !Object.hasOwn(derived.lockKnownMinutes, name)) return '';
+    return `  (${flowLockBusyPhrase(derived.lockBusyShare[name], derived.lockKnownMinutes[name], derived.windowMinutes)})`;
+  };
   lines.push(...flowSection('locks', snapshot.locks, (lock) => {
-    if (lock.heldBy === null) return `${lock.name}  free`;
+    if (lock.heldBy === null) return `${lock.name}  free${busy(lock.name)}`;
     return lock.since === null
-      ? `${lock.name}  held by ${lock.heldBy} (since unknown)`
-      : `${lock.name}  held by ${lock.heldBy} since ${iso(lock.since)} (${durationText(now - lock.since)})`;
+      ? `${lock.name}  held by ${lock.heldBy} (since unknown)${busy(lock.name)}`
+      : `${lock.name}  held by ${lock.heldBy} since ${iso(lock.since)} (${durationText(now - lock.since)})${busy(lock.name)}`;
   }));
   lines.push(...flowSection('meters', snapshot.meters, (meter) => [
     `${meter.name}  ${meter.unit ? `${meter.value} ${meter.unit}` : meter.value}`,
@@ -584,6 +612,7 @@ const flowText = (wsId, body, now) => {
     ...(meter.windowMinutes === null ? [] : [`window ${meter.windowMinutes}m`]),
   ].join('  ')));
   lines.push(...flowSection('flags', snapshot.flags, (flag) => `${flag.severity}  ${flag.text}`));
+  if (derived) lines.push(...flowSection('derived flags', derived.flags, (flag) => `${flag.severity}  ${flag.rule}  ${flag.text}`));
   return `${lines.join('\n')}\n`;
 };
 

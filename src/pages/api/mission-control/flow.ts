@@ -1,13 +1,15 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { requireMissionHuman, sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
 import { MissionControlError, invalidMissionRequest, missionNotFound } from '@/lib/mission-control-errors';
-import { FLOW_WINDOW_MINUTES, isFlowStale, parseFlowHistoryMode, selectFlowHistory } from '@/lib/flow';
+import { isFlowStale, parseFlowHistoryMode } from '@/lib/flow';
+import { deriveFlowFlags } from '@/lib/flow-flags';
 import { FlowStoreError, readFlow } from '@/lib/flow-store';
+import { readFlowThresholds, readFlowView } from '@/lib/flow-view';
 import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
 import type { IMissionFlowDetailResponse, IMissionFlowListResponse } from '@/types/flow';
 
 const listFlows = async (now: number): Promise<IMissionFlowListResponse> => {
-  const { workspaces } = await getWorkspaces();
+  const [{ workspaces }, thresholds] = await Promise.all([getWorkspaces(), readFlowThresholds()]);
   const reads = await Promise.all(workspaces.map(async (ws) => {
     try {
       return { ws, ok: true as const, flow: await readFlow(ws.id) };
@@ -29,6 +31,7 @@ const listFlows = async (now: number): Promise<IMissionFlowListResponse> => {
         source: read.flow.snapshot.source,
         stale: isFlowStale(read.flow.receivedAt, now),
         producerFlagCount: read.flow.snapshot.flags.length,
+        derivedFlagCount: deriveFlowFlags(read.flow, thresholds, now).flags.length,
       });
     }
   }
@@ -40,15 +43,12 @@ const flowDetail = async (workspaceId: string, history: unknown, now: number): P
     ?? invalidMissionRequest(`history: saw ${JSON.stringify(history)}, expected window, none or all`);
   // The id reaches a file path, so only a known workspace is read.
   if (!(await getWorkspaceById(workspaceId))) missionNotFound(`Workspace ${workspaceId} not found`);
-  let flow;
   try {
-    flow = await readFlow(workspaceId);
+    return { workspaceId, ...(await readFlowView(workspaceId, mode, now)) };
   } catch (error) {
     if (error instanceof FlowStoreError) throw new MissionControlError(503, 'storage-unavailable', error.message);
     throw error;
   }
-  if (!flow) return { workspaceId, flow: null, stale: null };
-  return { workspaceId, flow: selectFlowHistory(flow, mode, now, FLOW_WINDOW_MINUTES), stale: isFlowStale(flow.receivedAt, now) };
 };
 
 /** Every workspace's published flow for the human, or one workspace's record with `?workspaceId=`. */

@@ -153,12 +153,53 @@ describe('purplemux flow — the installed CLI against the real route', () => {
     expect(lines).toContain('  landing  2/20  oldest 2d 19h');
     expect(lines).toContain('  review  0  oldest —');
     expect(lines).toContain('locks');
-    expect(lines.some((line) => /^ {2}landing {2}held by lane\/b1 since \S+Z \(30m\)$/.test(line))).toBe(true);
-    expect(lines).toContain('  deploy  free');
+    expect(lines.some((line) => /^ {2}landing {2}held by lane\/b1 since \S+Z \(30m\) {2}\(busy share unknown: 0 min known in the last 6 h\)$/.test(line)),
+      shown.stdout).toBe(true);
+    expect(lines).toContain('  deploy  free  (busy share unknown: 0 min known in the last 6 h)');
     expect(lines).toContain('meters');
     expect(lines).toContain('  gate-slots  4 slots  limit 5  window 60m');
     expect(lines).toContain('flags');
     expect(lines).toContain('  block  main is red');
+    expect(lines).toContain('derived flags');
+    expect(lines).toContain('  warn  queue-old  landing oldest item waits 67 h (threshold 4 h)');
+  });
+
+  it('prints the busy share and the derived flags the server derives', async () => {
+    const now = Date.now();
+    const history = Array.from({ length: 73 }, (_, index) => ({ at: now - (360 - index * 5) * MIN, queues: {}, oldest: {},
+      locks: { landing: true, deploy: false }, meters: {} }));
+    await fs.writeFile(flowFile(), JSON.stringify({ workspaceId: 'ws-a', receivedAt: now - MIN, snapshot: snapshot(), history }));
+    const shown = await cli(['flow', 'show', '-w', 'ws-a'], orchA);
+    expect(shown.code, shown.stderr).toBe(0);
+    const lines = shown.stdout.split('\n');
+    expect(lines.some((line) => /^ {2}landing {2}held by .* {2}\(held 100% of the last 6 h\)$/.test(line)), shown.stdout).toBe(true);
+    expect(lines).toContain('  deploy  free  (held 0% of the last 6 h)');
+    expect(lines).toContain('  warn  lock-busy  landing held 100% of the last 6 h (threshold 80%)');
+    const json = JSON.parse((await cli(['flow', 'show', '-w', 'ws-a', '--json'], orchA)).stdout);
+    expect(json.derived).toMatchObject({ lockBusyShare: { landing: 1, deploy: 0 }, windowMinutes: 360 });
+  });
+
+  it('says the busy sentence the server and the panel say (parity with lockBusyPhrase)', async () => {
+    const { lockBusyPhrase } = await import('@/lib/flow-flags');
+    const now = Date.now();
+    // 181 of the 360 window minutes known, 57 of them held: the sentence names the known time.
+    const history = Array.from({ length: 182 }, (_, index) => ({ at: now - (181 - index) * MIN, queues: {}, oldest: {},
+      locks: { landing: index >= 124, deploy: false }, meters: {} }));
+    await fs.writeFile(flowFile(), JSON.stringify({ workspaceId: 'ws-a', receivedAt: now - MIN, snapshot: snapshot(), history }));
+    const json = JSON.parse((await cli(['flow', 'show', '-w', 'ws-a', '--json'], orchA)).stdout);
+    const shown = await cli(['flow', 'show', '-w', 'ws-a'], orchA);
+    const { lockBusyShare, lockKnownMinutes, windowMinutes } = json.derived;
+    for (const name of ['landing', 'deploy']) {
+      const phrase = lockBusyPhrase(lockBusyShare[name], lockKnownMinutes[name], windowMinutes);
+      expect(phrase).toMatch(/ of 3 h 1 min known in the last 6 h$/);
+      expect(shown.stdout).toContain(`  (${phrase})\n`);
+    }
+    const thin = history.slice(-60);
+    await fs.writeFile(flowFile(), JSON.stringify({ workspaceId: 'ws-a', receivedAt: now - MIN, snapshot: snapshot(), history: thin }));
+    const thinJson = JSON.parse((await cli(['flow', 'show', '-w', 'ws-a', '--json'], orchA)).stdout);
+    const unknown = lockBusyPhrase(null, thinJson.derived.lockKnownMinutes.landing, 360);
+    expect(unknown).toBe('busy share unknown: 59 min known in the last 6 h');
+    expect((await cli(['flow', 'show', '-w', 'ws-a'], orchA)).stdout).toContain(`  (${unknown})\n`);
   });
 
   it('says stale when the record was received more than 10 minutes ago', async () => {
@@ -169,6 +210,7 @@ describe('purplemux flow — the installed CLI against the real route', () => {
     expect(shown.stdout).toMatch(/\nstale — last published 11m ago\n/);
     expect(shown.stdout).toContain('queues  none\n');
     expect(shown.stdout).toContain('flags  none\n');
+    expect(shown.stdout).toContain('derived flags\n  warn  stale  no publish for 11 min\n');
   });
 
   it('prints the record with --json and honours --history', async () => {

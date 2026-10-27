@@ -529,6 +529,12 @@ Keys in use:
                for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
                (capSource "default-invalid", the value logged). Admin token only (exit 3 forbidden
                for a tab): any one orchestrator could otherwise raise it for every workspace.
+  flow.window-minutes  flow.lock-busy-percent  flow.queue-length  flow.oldest-minutes
+               The flow-flag thresholds (ADR-0026): the busy-share window in minutes 10..10080
+               (default 360), the busy percent 1..100 (80), the queue length, a whole number
+               1..10000 (10), and the oldest-item age in minutes 1..10080 (240). Read on every flow
+               read; unset or invalid means the default, and the server logs why. Written by the
+               admin token or an enabled orchestrator (ADR-0019).
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
@@ -692,11 +698,28 @@ POST /api/cli/workspaces/<workspaceId>/flow            (purplemux flow publish -
 GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
                                                        (purplemux flow show -w WS [--json] [--history all|window|none])
   Read scope: the own token, a peer, a grant, the admin token. history defaults to all; window
-  keeps the rows of the last 360 min; none sends no rows. Response: { "flow": { "workspaceId",
-  "receivedAt", "snapshot", "history" } | null, "stale": bool | null }; stale is true more than
-  10 min after receivedAt. A stored record that does not validate answers 500 flow-unreadable
-  (exit 1), never "no flow published". For "flow": null the CLI prints "no flow published" and
-  exits 7 (flow-not-found, decided by the CLI).
+  keeps the rows of the last flow.window-minutes (360 by default); none sends no rows. Response:
+  { "flow": { "workspaceId", "receivedAt", "snapshot", "history" } | null, "stale": bool | null,
+  "derived"?: { "flags": [{ "rule", "subject", "text", "severity": "warn" | "block" }],
+  "lockBusyShare": { name: 0..1 | null }, "lockKnownMinutes": { name: minutes },
+  "insufficientHistory": [lock name], "windowMinutes", "thresholds": { "windowMinutes",
+  "lockBusyPercent", "queueLength", "oldestMinutes" } } }; stale is true more than 10 min after
+  receivedAt; derived is absent when flow is null. A stored record that does not validate
+  answers 500 flow-unreadable (exit 1), never "no flow published". For "flow": null the CLI
+  prints "no flow published" and exits 7 (flow-not-found, decided by the CLI). flow show prints
+  each lock's busy share and a "derived flags" section.
+  The derived flags come from the full record, whatever history the answer carries, sorted block,
+  warn, then rule and subject:
+    stale       no publish for 10 min. A stale record raises only this flag.
+    lock-busy   the lock's busy share over the window is at least flow.lock-busy-percent. The share
+                is time-weighted: each history row's state holds until the next row (the newest
+                until now); a gap over 10 min, a clock step back and a row without the lock are
+                unknown time. Known time under half the window: share null, the lock listed in
+                insufficientHistory, no flag.
+    queue-long  a queue holds at least flow.queue-length items.
+    queue-old   a queue's oldest item is older than flow.oldest-minutes.
+    queue-full  (block) a queue with a capacity holds at least that many items.
+    meter-over  a meter's value is above its limit.
 
 ## Spend (ADR-0030)
 

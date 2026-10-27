@@ -44,6 +44,13 @@ describe('coordination panel client import graph', () => {
     expect(nodeOnly).toEqual([]);
   });
 
+  it('the flow panel reaches no Node-only module (purplemux-flow story 02)', () => {
+    const { files, nodeOnly } = walk(path.join(SRC, 'components/features/mission-control/flow-panel.tsx'));
+    expect(files).toEqual(expect.arrayContaining(['lib/flow-flags.ts', 'lib/flow.ts']));
+    expect(files).not.toContain('lib/flow-view.ts');
+    expect(nodeOnly).toEqual([]);
+  });
+
   it('the walker sees a Node-only import (host-metrics is server-side)', () => {
     expect(walk(path.join(SRC, 'lib/host-metrics.ts')).nodeOnly).toEqual(expect.arrayContaining(['lib/host-metrics.ts imports fs/promises']));
   });
