@@ -16,10 +16,13 @@ const STATUS: Record<TNoteErrorCode, number> = {
   'note-cap': 409,
 };
 
-/** Every note refusal carries `code`, which the CLI maps to its exit (ADR-0016). */
-export const sendNoteError = (res: NextApiResponse, err: unknown): void => {
+/**
+ * Every note refusal carries `code`, which the CLI maps to its exit (ADR-0016). `overrides` lets a
+ * route answer the status its own contract names for a code.
+ */
+export const sendNoteError = (res: NextApiResponse, err: unknown, overrides: Partial<Record<TNoteErrorCode, number>> = {}): void => {
   if (isCodedError<NoteError>(err, 'NoteError', STATUS)) {
-    res.status(STATUS[err.code]).json({ error: err.message, code: err.code });
+    res.status(overrides[err.code] ?? STATUS[err.code]).json({ error: err.message, code: err.code });
     return;
   }
   log.error(`notes route failed: ${err instanceof Error ? err.message : err}`);

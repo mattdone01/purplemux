@@ -88,6 +88,44 @@ error }`, so an unreadable store shows its error and never blanks the others. It
   run) and validates it with zod. The panel shows the values and the run stamp, marks them stale after 15
   minutes, shows a failing command's or a validation error's text, and says "not configured" without one.
 
+- **Deploys** (ADR-0029 §9): the `deploys` section, `{ ok: true, items: IDeployRow[] } | { ok: false, error }`
+  (`src/types/coordination.ts`), absent from a server older than story 06. Each item is one announcement of the last
+  24 h, newest first: `{id, reason, createdAt, restartAt, phase: 'pending'|'past', by, recipients: {total, delivered,
+  queued, held, dropped}}`. A notice the inbox no longer has counts in `total` only. The section reads
+  `~/.purplemux/deploy-announcements.json` and the inbox; either one unreadable fails this section alone.
+
+### Human coordination actions (ADR-0029 §6-§10, story 06)
+
+Three cookie routes act on the coordination rows. Each needs the human session cookie and this server's Origin;
+a CLI token, no cookie or another Origin gets 401/403. None of them types into a tab. Each calls the same service
+function as its CLI route, and every route answers `Cache-Control: no-store`.
+
+| Route | Body | 2xx | Refusals |
+|---|---|---|---|
+| `POST /api/mission-control/notes` | `{toWorkspace?, toEpic? /*exactly one*/, subject /*≤120*/, body /*≤16 KiB*/}` | 200 `{note: INoteView}` | 400 `note-invalid` / `note-too-large` / `note-target-missing` · 409 `note-cap` |
+| `POST /api/mission-control/inbox/{id}/retry` | — | 200 `{item}` | 404 `inbox-not-found` · 409 `inbox-not-held` · 409 `inbox-not-retryable` with `reason` |
+| `POST /api/mission-control/leases/break` | `{name, reason /*1..500*/}` | 200 `{broken: ILeaseView}` | 400 `invalid-request` · 404 `lease-not-found` |
+
+- **Note as owner.** The note carries the existing `human` admission (`NotesService.sendHuman`); its recipient
+  sees it from "human" (`fromLabel`, `noteFromWords`), and it routes to the target workspace's enabled orchestrator. `toEpic` resolves now, at send time,
+  to the workspace of the live `epic:<slug>` holder; with no live holder the route answers `note-target-missing`.
+  On this route `note-too-large` is 400 (the CLI route answers 413). **A human never acknowledges a note:** a human
+  is never a note recipient (ADR-0013), so no human ack exists, on the web or the phone.
+- **Inbox retry.** It re-queues one held notice of any workspace once, with a fresh budget, as `inbox retry` does. A
+  refusal-budget hold (`… (N refusals)`) and a 24 h hold (`… (undelivered after 24 h)`) are retried: that is what retry
+  is for. `humanRetryRefusal(item)` refuses three holds by the leading token of `heldReason`, and the 409 body names it
+  as `reason`: `stranded-in-composer` and `transport-uncertain` (the line may already sit in the composer or be
+  submitted, so a retry can type it twice), and `target-not-agent` (it can never be delivered). The inbox has no ack
+  (ADR-0012).
+- **Lease break.** It runs the admin `lease break` transition. The coordination audit line `lease-release` (reason
+  `broken`) records `by: {human: <session subject>}` and `breakReason`. Only the holder releases a lease (ADR-0011);
+  a human breaks one, with a reason.
+
+The web panel offers "Retry" on a held row the predicate allows, "Break…" on each lease (a dialog with a required
+reason), and "Send note as owner" (a form). Each result shows as a sonner toast: the served refusal sentence for a
+body with a contract `code`, else the failed request. The fleet status view stays read only (ADR-0023). The phone
+(story 14) calls the same three routes.
+
 ## Fleet status (ADR-0023)
 
 `GET /api/mission-control/coordination` adds a `fleet` section, `{ ok: true, view: IFleetView } | { ok: false, error }`

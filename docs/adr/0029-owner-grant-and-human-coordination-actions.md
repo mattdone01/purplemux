@@ -63,10 +63,13 @@ Option 4.
    `note-target-missing`. ADR-0013 bounds hold (subject ≤ 120, body ≤ 16 KiB, 400 `note-too-large`, 409 `note-cap`).
    200 `{note: INoteView}`. A human is never a note recipient, so no human acknowledgement exists.
 7. **Human inbox retry.** `POST /api/mission-control/inbox/{id}/retry` runs `retryInState` as `inbox retry` does, for
-   any workspace's item. It refuses with 409 `inbox-not-retryable` and the hold reason when the reason is
-   `stranded-in-composer` (text may already sit in the composer, so a retry can type it twice) or `target-not-agent` (it
-   can never succeed). One exported predicate, `humanRetryRefusal(item)` in `src/lib/inbox-store.ts`, owns that list, and
-   a test pins it against every hold reason that `src/lib/inbox-dispatcher.ts` can write.
+   any workspace's item. It refuses with 409 `inbox-not-retryable` and the refusal token as `reason` when the leading
+   token of the hold reason (the text before the first `:`) is `stranded-in-composer` (text may already sit in the
+   composer), `transport-uncertain` (a paste or submit that threw may have left the line in the composer or submitted
+   it; consult Q1, 2026-10-27) — for both, a retry can type the line twice — or `target-not-agent` (it can never
+   succeed). One exported predicate, `humanRetryRefusal(item)`, owns that list: it is defined in
+   `src/lib/human-actions.ts` (no Node import, so the web panel uses the same list) and re-exported from
+   `src/lib/inbox-store.ts`, and a test pins it against every hold reason that `src/lib/inbox-dispatcher.ts` can write.
 8. **Human lease break.** `POST /api/mission-control/leases/break`, body `{name, reason}` (reason 1..500, else 400). It
    runs the same state transition as the admin `lease break` (`breakLease`), with the breaker recorded as
    `{human: <session subject>}` in the `released` effect and the audit line.

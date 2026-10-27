@@ -243,7 +243,7 @@ export const assignPortfolioAction = async (
     if (beforeRoute?.revision !== input.expectedRevision || beforeRoute.state === 'resolved') {
       throw new MissionControlError(409, 'conflict', 'blocker changed before note routing');
     }
-    const note = await (await getNotesService()).sendHumanPortfolio(
+    const note = await (await getNotesService()).sendHuman(
       actor, impact.workspaceId,
       { toWorkspace: impact.workspaceId, subject: `Portfolio clearing action: ${impact.resourceKey}`,
         body: noteBody,

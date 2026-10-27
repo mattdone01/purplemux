@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
 import { brandCodedError } from '@/lib/coded-error';
+import { NOTE_BODY_MAX_BYTES, NOTE_SUBJECT_MAX } from '@/lib/human-actions';
 import { EPIC_SLUG } from '@/lib/lease-policy';
 import { noteFromWords } from '@/lib/inbox-templates';
 import type { IInboxItem } from '@/types/inbox';
@@ -19,8 +20,7 @@ export class NoteError extends Error {
   }
 }
 
-export const NOTE_SUBJECT_MAX = 120;
-export const NOTE_BODY_MAX_BYTES = 16 * 1024;
+export { NOTE_BODY_MAX_BYTES, NOTE_SUBJECT_MAX };
 export const NOTE_COMMENT_MAX = 500;
 const MIN = 60_000;
 const DAY = 24 * 60 * MIN;

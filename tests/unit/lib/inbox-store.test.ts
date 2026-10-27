@@ -216,6 +216,63 @@ describe('inbox store — pure transitions', () => {
   });
 });
 
+describe('inbox store — human retry (ADR-0029 §7, consult Q1)', () => {
+  beforeEach(() => { seq = 0; });
+
+  const held = async (reason: string) => {
+    const { enqueueInState, holdInState } = await load();
+    const queued = enqueueInState({ items: [] }, req(), T0, ids);
+    const state = holdInState(queued.state, queued.item.id, reason, T0 + 1);
+    return { state, item: state.items[0] };
+  };
+
+  it('names every hold reason inbox-dispatcher.ts writes, so a new one fails here until it is classified', async () => {
+    const source = await fs.readFile(path.join(process.cwd(), 'src/lib/inbox-dispatcher.ts'), 'utf-8');
+    const written = [...source.matchAll(/outcome: 'held', reason: [`']([a-z-]+)/g)].map((m) => m[1]).sort();
+    expect(written).toEqual(['stranded-in-composer', 'target-not-agent', 'transport-uncertain']);
+  });
+
+  it('refuses the stranded, transport-uncertain and not-agent holds, and allows refusal-budget and 24 h holds', async () => {
+    const { humanRetryRefusal, refuseInState, sweepInState, enqueueInState, INBOX_MAX_AGE_MS } = await load();
+    expect(humanRetryRefusal((await held('stranded-in-composer')).item)).toBe('stranded-in-composer');
+    expect(humanRetryRefusal((await held('transport-uncertain:tmux paste failed')).item)).toBe('transport-uncertain');
+    expect(humanRetryRefusal((await held('target-not-agent')).item)).toBe('target-not-agent');
+
+    let budget = enqueueInState({ items: [] }, req(), T0, ids).state;
+    for (let i = 1; i <= 30; i++) budget = refuseInState(budget, budget.items[0].id, 'composer-not-ready:busy', T0 + i * MIN);
+    expect(budget.items[0].heldReason).toBe('composer-not-ready:busy (30 refusals)');
+    expect(humanRetryRefusal(budget.items[0])).toBeNull();
+
+    const fresh = enqueueInState({ items: [] }, req(), T0, ids);
+    const stale = refuseInState(fresh.state, fresh.item.id, 'composer-not-empty', T0 + INBOX_MAX_AGE_MS);
+    expect(stale.items[0].heldReason).toBe('composer-not-empty (undelivered after 24 h)');
+    expect(humanRetryRefusal(stale.items[0])).toBeNull();
+    const never = sweepInState(enqueueInState({ items: [] }, req(), T0, ids).state, T0 + INBOX_MAX_AGE_MS);
+    expect(never.items[0].heldReason).toBe('never ready (undelivered after 24 h)');
+    expect(humanRetryRefusal(never.items[0])).toBeNull();
+    expect(humanRetryRefusal({ ...never.items[0], heldReason: null })).toBeNull();
+  });
+
+  it('re-queues a retryable hold as retryInState does, and refuses the others with the token and no change', async () => {
+    const { retryHumanInState, InboxError } = await load();
+    const budget = await held('composer-not-empty (30 refusals)');
+    expect(retryHumanInState(budget.state, budget.item.id, T0 + 2).item).toMatchObject({ state: 'queued', attempts: 0, heldReason: null });
+
+    for (const [reason, token] of [['stranded-in-composer', 'stranded-in-composer'], ['transport-uncertain:x', 'transport-uncertain'], ['target-not-agent', 'target-not-agent']]) {
+      const h = await held(reason);
+      let err: unknown;
+      try {
+        retryHumanInState(h.state, h.item.id, T0 + 2);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(InboxError);
+      expect(err).toMatchObject({ code: 'inbox-not-retryable', reason: token });
+    }
+    expect(() => retryHumanInState({ items: [] }, 'i-none', T0)).toThrow(/not found/);
+  });
+});
+
 describe('inbox store — held recovery (ws-5TO0NJ, 2026-10-08)', () => {
   beforeEach(() => { seq = 0; });
 
