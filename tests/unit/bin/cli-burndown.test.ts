@@ -115,12 +115,13 @@ describe('purplemux burndown — the installed CLI against the real route', () =
     expect(shown.burndown.snapshot.history[0].at).toBe(minute(50));
   });
 
-  it('prints the refused field and exits non-zero', async () => {
+  it('prints the refused field and exits 2 (invalid-burndown)', async () => {
     const bad = snapshot();
     bad.epics[0].remaining = 4;
     await fs.writeFile(file, JSON.stringify(bad));
     const refused = await cli(['burndown', 'publish', '-w', 'ws-a', '--json', `@${file}`], orchA);
-    expect(refused.code).not.toBe(0);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('invalid-burndown');
     expect(refused.stderr).toContain('epics[0]: saw burned 2 + remaining 4 = 6, expected total 5');
   });
 

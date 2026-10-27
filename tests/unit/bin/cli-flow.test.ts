@@ -245,7 +245,7 @@ describe('purplemux flow — the installed CLI against the real route', () => {
     const published = await cli(['flow', 'publish', '-w', 'ws-a'], orchA, JSON.stringify(snapshot()));
     expect(published.code, published.stderr).toBe(0);
     expect(published.stdout).toMatch(/^ok \d+ 1\n$/);
-    expect(published.stderr).toMatch(/history reset: the stored record did not validate and was moved aside/);
+    expect(published.stderr).toMatch(/history reset: the stored record did not validate and was kept aside/);
   });
 
   it('names a usage error', async () => {

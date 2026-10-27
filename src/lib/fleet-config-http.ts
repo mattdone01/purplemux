@@ -46,7 +46,7 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * are sent (ADR-0022), and fleet-wide keys any one workspace's orchestrator must
  * not set for every other workspace (ADR-0027 ruling R2).
  */
-const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts)\./;
 
 /** Values the remote keys must hold, checked at write time so a bad one never reaches a create. */
 const checkRemoteValue = (key: string, value: string, state: IFleetConfigState): void => {

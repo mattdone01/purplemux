@@ -140,6 +140,8 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'note-too-large': EXIT.USAGE,
   'deploy-invalid': EXIT.USAGE,
   'config-invalid': EXIT.USAGE,
+  'invalid-burndown': EXIT.USAGE,
+  'burndown-too-large': EXIT.USAGE,
   'orchestration-precondition-required': EXIT.USAGE,
   'orchestration-invalid': EXIT.USAGE,
   'orchestration-conflict': EXIT.CONFLICT,
@@ -639,7 +641,7 @@ const cmdFlow = async (args) => {
   requireEnv();
   const { body } = await api('POST', `/api/cli/workspaces/${encodeURIComponent(wsId)}/flow`, snapshot);
   if (body.historyReset) {
-    process.stderr.write('warning: history reset: the stored record did not validate and was moved aside (flow.json.corrupt-<receivedAt>)\n');
+    process.stderr.write('warning: history reset: the stored record did not validate and was kept aside (flow.json.corrupt-<receivedAt>)\n');
   }
   process.stdout.write(`ok ${body.receivedAt} ${body.historyRows}\n`);
 };
@@ -1912,7 +1914,8 @@ Commands:
                                             "blockers":[{"what":"...","needs":"..."}],"needsHuman":false,"next":["..."]}
   standup show -w WS                       Latest standup + history for a workspace
   burndown publish -w WS --json @FILE      Publish the Scrum Master burndown.json (or '{...}', or pipe JSON). Validated
-                                           strictly; history keeps the newest 2000 rows. Shown on the portfolio board
+                                           strictly; history keeps the newest 2000 rows. Shown on the portfolio board.
+                                           Exit 2 invalid-burndown (names the field) or burndown-too-large (over 1 MiB)
   burndown show -w WS                      The latest published burndown for a workspace
   flow publish -w WS --json @FILE          Publish the workspace's pipeline snapshot: queues, locks, meters, flags
                                            (ADR-0026; or '{...}', or pipe JSON). Own workspace only. Prints
@@ -2116,6 +2119,12 @@ const main = async () => {
   }
 };
 
-main().catch((err) => {
+const run = () => main().catch((err) => {
   fail(null, err.message || String(err));
 });
+
+// bin/purplemux.js requires this file and calls run(); a remote tab's kit runs it directly
+// (ADR-0022). A test requires it for CODE_EXIT, so loading it alone runs nothing.
+if (require.main === module) run();
+
+module.exports = { CODE_EXIT, run };

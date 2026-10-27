@@ -47,36 +47,54 @@ is kept for compatibility; "code" is the machine-readable class. HTTP statuses a
 Branch on "code" (or on the CLI's exit code), never on the "error" text. The CLI maps each code
 to an exit code through one table:
 
-  exit  meaning                                  codes                                       retry?
-     0  success                                  —                                           —
+  exit  meaning                                  codes                                      retry?
+     0  success                                  —                                          —
      1  unexpected error                         unmapped code, 5xx, gh-unavailable,        investigate
                                                  outcome-unknown (a write lost its
-                                                 connection: check the state first)
+                                                 connection: check the state first),
+                                                 close-not-confirmed; unmapped server
+                                                 codes, for example: burndown-unreadable,
+                                                 workspace-create-failed,
+                                                 tab-count-unreadable
      2  usage error                              bad or missing argument; invalid-request,  fix the command
-                                                 lease-policy,
-                                                 watch-invalid, reports-to-invalid, report-on-invalid,
+                                                 lease-policy, watch-invalid,
+                                                 reports-to-invalid, report-on-invalid,
                                                  note-too-large, note-invalid,
                                                  config-invalid, note-target-missing,
-                                                 deploy-invalid
-     3  conflict / refused by state              conflict, forbidden, lease-held,           after the state changes
-                                                 lease-held-by-other,
-                                                 watch-cap, inbox-not-held, caller-unresolved,
-                                                 grant-tab-unverified, grant-password-invalid,
-                                                 grant-locked, config-version-conflict,
-                                                 note-cap,
-                                                 grant-owner-active
+                                                 deploy-invalid, invalid-burndown,
+                                                 burndown-too-large, remote-host-invalid,
+                                                 remote-type-unsupported, cwd-missing,
+                                                 orchestration-precondition-required,
+                                                 orchestration-invalid
+     3  conflict / refused by state              conflict, unauthorized, forbidden,         after the state changes
+                                                 lease-held, lease-held-by-other,
+                                                 watch-cap, inbox-not-held,
+                                                 caller-unresolved, grant-tab-unverified,
+                                                 grant-password-invalid, grant-locked,
+                                                 config-version-conflict, note-cap,
+                                                 grant-owner-active,
+                                                 orchestration-conflict,
+                                                 orchestrator-state-unknown,
+                                                 orchestrator-live,
+                                                 orchestrator-candidate-invalid,
+                                                 orchestration-work-remains,
+                                                 orchestration-recovery-required
      4  target gone (permanent)                  tab-not-found, session-not-running,        NEVER
                                                  target-changed
      5  not ready yet                            readiness-timeout                          yes, bounded
-     6  server unreachable                       connection refused, no port configured,    yes, bounded
-                                                 a read interrupted; routes-absent (404     (routes-absent:
-                                                 without JSON: no such route — an older     no, until the
-                                                 server, a foreign one, or a malformed id)  cause is fixed)
-     7  not found                                lease-not-found, note-not-found,           —
+     6  server unreachable                       server-unreachable: connection refused,    yes, bounded
+                                                 no port configured, a read interrupted;    (routes-absent:
+                                                 routes-absent (404 without JSON: no such   no, until the
+                                                 route — an older server, a foreign one,    cause is fixed)
+                                                 or a malformed id);
+                                                 remote-host-unreachable (a remote tab's
+                                                 host did not answer)
+     7  not found                                not-found (an unknown workspace or         —
+                                                 record), lease-not-found, note-not-found,
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found
      3  refused by state (ADR-0027)              wip-cap, config-store-unreadable           after the state changes
-     1  (flow, ADR-0026)                         flow-unreadable                            investigate
+     1  (flow, ADR-0026)                         flow-unreadable; flow-write-failed         investigate
      2  (flow, ADR-0026)                         flow-invalid, flow-too-large               fix the command
      7  (flow, ADR-0026)                         flow-not-found (client-side: flow show)    —
      1  unexpected error (tab restart, ADR-0028) restart-not-confirmed                      inspect the tab
@@ -524,6 +542,23 @@ Keys in use:
   watchdog.wait-backstop-hours
                Hours (0, 168], decimals allowed, a tab may wait on a live registered job or armed
                watch before its one "has been WAITING" nudge. Unset or invalid means 4.
+  fleet-status.stall-minutes  fleet-status.waiting-long-minutes  fleet-status.unanswered-minutes
+  fleet-status.composer-minutes
+               The fleet flag thresholds (ADR-0023), in minutes (0, 10080], decimals allowed:
+               STALL? after N quiet minutes (default 30), WAITING-LONG after M minutes waiting
+               (120), UNANSWERED after K minutes (30), and STALL? after C minutes of composer text
+               (2). Read on every fleet read; unset or invalid means the default. Written by the
+               admin token or an enabled orchestrator (ADR-0019).
+  remote.hosts The ssh aliases that remote tabs may use (ADR-0022), comma-separated; a name that is
+               not an ssh alias is 400 config-invalid. Unset means no remote host. Admin token only.
+  remote.callback-url
+               The URL a remote tab's hooks and CLI use to reach this server, http(s)://host[:port].
+               Plain http only to loopback, 100.64.0.0/10, a *.ts.net name or a bare name on
+               remote.callback-allow-hosts; else 400 config-invalid. Unset means
+               http://<this hostname>:<port>. Admin token only.
+  remote.callback-allow-hosts
+               Bare lower-case host names that remote.callback-url may name over plain http,
+               comma-separated. Admin token only.
   tabs.cap-per-workspace
                The WIP cap (ADR-0027): an integer 1..200 of agent tabs per workspace, one value
                for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
@@ -643,14 +678,17 @@ POST /api/cli/workspaces/<workspaceId>/burndown        (purplemux burndown publi
           "history": [{ "at", "slug", "total", "burned", "remaining", "pct", "stories", "unpointed" }] }
   Own workspace only. Counts and points are non-negative integers; pct is 0..100; burned +
   remaining = total; done_events points + undated_burned = burned; slugs are unique. A refusal
-  (400 invalid-burndown) names the field, what it saw and what it expected; nothing is stored.
+  (400 invalid-burndown, exit 2) names the field, what it saw and what it expected; nothing is
+  stored.
   Unknown fields are dropped. At most 100 epics; history keeps the newest 2000 rows by "at"
-  (the CLI trims before sending); the stored snapshot is at most 1 MiB (413 otherwise).
+  (the CLI trims before sending); the stored snapshot is at most 1 MiB (413 burndown-too-large, exit 2,
+  otherwise).
   Each publish replaces the previous one. The portfolio board renders the burndown of the
   selected Scrum Master's workspace and marks it stale 2 h after "generated_at".
 
 GET /api/cli/workspaces/<workspaceId>/burndown         (purplemux burndown show -w WS)
   Response: { "burndown": { "workspaceId", "receivedAt", "snapshot": { ... } } | null }
+  A stored file that does not validate is 500 burndown-unreadable (exit 1), never null.
 
 ## Flow (ADR-0026)
 
@@ -929,7 +967,8 @@ CLI equivalents:
 
 These endpoints only work when the tab's panelType is "web-browser" and the webview
 has attached (dom-ready has fired at least once). Electron runtime required;
-503 is returned in headless/remote mode.
+503 is returned in headless/remote mode. On a headless host, use the crawl container of the
+repository under test, never a host-wide Chrome on localhost:9222 (docs/cookbook/browser-evidence.md).
 
 GET /api/cli/tabs/<tabId>/browser/url?workspaceId=WS
   Current URL + title of the webview.

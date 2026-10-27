@@ -39,8 +39,8 @@ Option 3.
 4. **Store.** `workspaces/{wsId}/flow.json` (path from `resolveLayoutDir`), `IFlowRecord {workspaceId, receivedAt,
    snapshot, history}`, 0600, tmp + rename, one lock per workspace on `globalThis.__ptFlowLocks`, a parsed-record cache
    keyed by mtime and size on `globalThis.__ptFlowReadCache`. A file that does not parse or re-validate is never read as
-   empty: a reader gets `FlowStoreError` (`flow-unreadable`), and the next publish first renames it to
-   `flow.json.corrupt-<receivedAt>`, then writes a fresh record and answers `historyReset: true`.
+   empty: a reader gets `FlowStoreError` (`flow-unreadable`), and the next publish first keeps it aside as
+   `flow.json.corrupt-<receivedAt>` (a hard link), then writes a fresh record and answers `historyReset: true`.
 5. **Derivation** (story 02) is pure, in `src/lib/flow-flags.ts` (new): `deriveFlowFlags(record, thresholds, now)`.
    Thresholds come from fleet config (ADR-0019), read the `readThresholds` way: `flow.window-minutes` (default 360,
    10..10080), `flow.lock-busy-percent` (80, 1..100), `flow.queue-length` (10, 1..10000), `flow.oldest-minutes` (240,
