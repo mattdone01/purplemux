@@ -6,7 +6,8 @@ import os from 'os';
 import { nanoid } from 'nanoid';
 import { assertRemoteHostsAnswer, createSession, hasSession, hasSessionOrUnreachable, killSession, resolveExistingDir, sendKeys, workspaceSessionName } from '@/lib/tmux';
 import { broadcastSync } from '@/lib/sync-server';
-import { isAgentPanelType as isAgentPanel } from '@/lib/agent-panel-types';
+import { isAgentPanelType as isAgentPanel, toSessionHistoryProvider } from '@/lib/agent-panel-types';
+import { recordSessionTab } from '@/lib/spend/session-tabs-store';
 import { createLogger } from '@/lib/logger';
 import { emitTabClosing, hasKnownTabs, observeLayoutTabs, observeWorkspaceRemoved } from '@/lib/tab-lifecycle';
 import { findTabIdBySession, revokeTabToken } from '@/lib/tab-token';
@@ -661,16 +662,25 @@ const mutateTab = async (
   });
 };
 
-export const updateTabAgentSessionId = (
+export const updateTabAgentSessionId = async (
   sessionName: string,
   provider: IAgentProvider,
   sessionId: string | null,
-): Promise<void> =>
-  mutateTab(sessionName, (tab) => {
+): Promise<void> => {
+  const found: { tabId?: string } = {};
+  await mutateTab(sessionName, (tab) => {
+    found.tabId = tab.id;
     if (provider.readSessionId(tab) === sessionId) return false;
     provider.writeSessionId(tab, sessionId);
     return true;
   });
+  const wsId = parseSessionName(sessionName)?.wsId;
+  const { tabId } = found;
+  if (!sessionId || !tabId || !wsId) return;
+  // The spend read model's tab attribution (ADR-0030); it never fails the hook path.
+  await recordSessionTab({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: wsId, tabId })
+    .catch((err) => log.warn(`session-tabs binding not recorded for ${sessionName}: ${err instanceof Error ? err.message : err}`));
+};
 
 export const updateTabAgentSummary = (
   sessionName: string,

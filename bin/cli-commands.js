@@ -14,6 +14,7 @@ const CLI_COMMANDS = new Set([
   'standup',
   'burndown',
   'flow',
+  'spend',
   'mission',
   'portfolio',
   'lease',

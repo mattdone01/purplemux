@@ -1,3 +1,5 @@
+import type { ISpendTokensByDay } from '@/types/spend';
+
 export interface IBurndownDoneEvent {
   at: string;
   points: number;
@@ -45,4 +47,6 @@ export interface IBurndownRecord {
 export interface IMissionBurndownResponse {
   workspaceId: string | null;
   burndown: IBurndownRecord | null;
+  /** The burndown workspace's tokens per UTC day (ADR-0030); absent until the spend index is ready. */
+  tokensByDay?: ISpendTokensByDay[];
 }

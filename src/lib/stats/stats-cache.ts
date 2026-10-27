@@ -5,6 +5,7 @@ import os from 'os';
 import readline from 'readline';
 import dayjs from 'dayjs';
 import { listClaudeProjectsDirs } from '@/lib/workspace-home';
+import { readClaudeUsage } from '@/lib/stats/claude-usage-line';
 import type {
   IStatsCache,
   IStatsCacheDailyActivity,
@@ -140,30 +141,19 @@ const parseDaysFromFile = async (
             day.toolCallCount += toolUseCount;
           }
 
-          const model = String(message.model ?? '');
-          const usage = message.usage as Record<string, unknown> | undefined;
-          if (model && !model.startsWith('<') && usage) {
-            const messageId = typeof message.id === 'string' ? message.id : '';
-            const usageId = messageId || String(entry.uuid ?? '');
-            if (!usageId || !countedUsageIds.has(usageId)) {
-              if (usageId) countedUsageIds.add(usageId);
-              if (!day.modelTokens[model]) {
-                day.modelTokens[model] = emptyModelTokens();
-              }
-              const mt = day.modelTokens[model];
-              const cc = Number(usage.cache_creation_input_tokens ?? 0);
-              const cacheCreation = usage.cache_creation as Record<string, unknown> | undefined;
-              const cc1h = Number(cacheCreation?.ephemeral_1h_input_tokens ?? 0);
-              const cc5m = cacheCreation?.ephemeral_5m_input_tokens != null
-                ? Number(cacheCreation.ephemeral_5m_input_tokens)
-                : Math.max(0, cc - cc1h);
-              mt.input += Number(usage.input_tokens ?? 0);
-              mt.output += Number(usage.output_tokens ?? 0);
-              mt.cacheRead += Number(usage.cache_read_input_tokens ?? 0);
-              mt.cacheCreation += cc;
-              mt.cacheCreation5m += cc5m;
-              mt.cacheCreation1h += cc1h;
+          const usage = readClaudeUsage(entry);
+          if (usage && (!usage.messageId || !countedUsageIds.has(usage.messageId))) {
+            if (usage.messageId) countedUsageIds.add(usage.messageId);
+            if (!day.modelTokens[usage.model]) {
+              day.modelTokens[usage.model] = emptyModelTokens();
             }
+            const mt = day.modelTokens[usage.model];
+            mt.input += usage.input;
+            mt.output += usage.output;
+            mt.cacheRead += usage.cacheRead;
+            mt.cacheCreation += usage.cacheCreation;
+            mt.cacheCreation5m += usage.cacheCreation5m;
+            mt.cacheCreation1h += usage.cacheCreation1h;
           }
 
           if (sessionId) {
