@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { createLogger } from '@/lib/logger';
 import { spendFloor, utcDay } from '@/lib/spend/spend-model';
 import type { TSpendProvider } from '@/types/spend';
 
@@ -8,6 +9,11 @@ const STORE_FILE = path.join(os.homedir(), '.purplemux', 'session-tabs.json');
 // A hook reports the same session many times a turn; a binding that is already
 // known and fresh needs no write.
 const TOUCH_INTERVAL_MS = 60 * 60 * 1000;
+// A refused file stays refused until someone repairs it; without a back-off every
+// hook save would re-read it and warn.
+const REFUSED_RETRY_MS = 60 * 1000;
+
+const log = createLogger('session-tabs');
 
 export interface ISessionTabBinding {
   workspaceId: string;
@@ -39,6 +45,7 @@ export class SessionTabsStoreError extends Error {
 const g = globalThis as unknown as {
   __ptSessionTabsLock?: Promise<void>;
   __ptSessionTabsSeen?: Map<string, ISessionTabBinding>;
+  __ptSessionTabsRefusedAt?: number;
 };
 if (!g.__ptSessionTabsLock) g.__ptSessionTabsLock = Promise.resolve();
 if (!g.__ptSessionTabsSeen) g.__ptSessionTabsSeen = new Map();
@@ -137,14 +144,34 @@ const apply = (data: ISessionTabsData, sighting: ISessionTabSighting): boolean =
 /** Every binding, keyed `<provider>:<sessionId>`. A malformed file throws; it is never read as empty. */
 export const readSessionTabs = async (): Promise<Record<string, ISessionTabBinding>> => (await readData()).bindings;
 
-/** Record that a tab runs an agent session. Callers on the hook path must catch: a failure never fails them. */
+/** A clock moved back before the refusal ends the back-off. */
+const refusedRecently = (now: number): boolean => {
+  const refusedAt = g.__ptSessionTabsRefusedAt;
+  return refusedAt !== undefined && now >= refusedAt && now - refusedAt < REFUSED_RETRY_MS;
+};
+
+/**
+ * Record that a tab runs an agent session. A refused file is logged here and read again after
+ * REFUSED_RETRY_MS; callers on the hook path must still catch a write failure, which never fails them.
+ */
 export const recordSessionTab = async (sighting: Omit<ISessionTabSighting, 'seenAt'>, now = Date.now()): Promise<void> => {
   const key = bindingKey(sighting.providerId, sighting.sessionId);
   const known = seen.get(key);
   if (known && known.workspaceId === sighting.workspaceId && known.tabId === sighting.tabId
     && now - known.lastSeenAt < TOUCH_INTERVAL_MS) return;
+  if (refusedRecently(now)) return;
   await withLock(async () => {
-    const data = await readData();
+    if (refusedRecently(now)) return;
+    let data: ISessionTabsData;
+    try {
+      data = await readData();
+    } catch (error) {
+      if (!(error instanceof SessionTabsStoreError)) throw error;
+      g.__ptSessionTabsRefusedAt = now;
+      log.warn(`bindings not recorded for ${REFUSED_RETRY_MS / 1000} s: ${STORE_FILE}: ${error.message}`);
+      return;
+    }
+    delete g.__ptSessionTabsRefusedAt;
     const changed = apply(data, { ...sighting, seenAt: now });
     if (prune(data, now) || changed) await writeData(data);
     const stored = data.bindings[key];

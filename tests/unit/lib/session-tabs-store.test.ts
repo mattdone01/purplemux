@@ -6,9 +6,10 @@ import type { ILayoutData, ITab } from '@/types/terminal';
 import type { IAgentProvider } from '@/lib/providers/types';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
+const warn = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/logger', () => {
-  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
+  const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn, error: () => {}, fatal: () => {}, child: () => logger };
   return { createLogger: () => logger };
 });
 vi.mock('os', async (importOriginal) => {
@@ -30,6 +31,11 @@ const DAY = 86_400_000;
 const NOW = Date.parse('2026-10-26T12:00:00Z');
 const storeFile = () => path.join(mockHome.value, '.purplemux', 'session-tabs.json');
 const stored = async () => JSON.parse(await fs.readFile(storeFile(), 'utf-8'));
+const storeWarnings = () => warn.mock.calls.filter(([message]) => String(message).includes('session-tabs.json'));
+const countStoreReads = (fsModule: typeof fs) => {
+  const readFile = vi.spyOn(fsModule, 'readFile');
+  return () => readFile.mock.calls.filter(([target]) => target === storeFile()).length;
+};
 
 const fakeProvider = (id: string): IAgentProvider => ({
   id,
@@ -45,9 +51,12 @@ describe('session-tabs store', () => {
   beforeEach(async () => {
     vi.resetModules();
     delete (globalThis as { __ptSessionTabsSeen?: unknown }).__ptSessionTabsSeen;
+    delete (globalThis as { __ptSessionTabsRefusedAt?: unknown }).__ptSessionTabsRefusedAt;
+    warn.mockClear();
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-session-tabs-'));
   });
   afterEach(async () => {
+    vi.restoreAllMocks();
     await fs.rm(mockHome.value, { recursive: true, force: true });
   });
 
@@ -103,14 +112,120 @@ describe('session-tabs store', () => {
     ['not JSON', '{"version":1', 'the file is not JSON'],
     ['a wrong shape', '{"version":2,"bindings":{}}', 'expected {version: 1'],
     ['a malformed binding', '{"version":1,"bindings":{"claude:x":{"workspaceId":"ws"}}}', 'binding claude:x is malformed'],
+    // A directory at the path refuses the read as root too, where a mode-000 file would not.
+    ['an unreadable path (EISDIR)', null, 'session-tabs.json unreadable: EISDIR'],
   ])('refuses %s instead of reading it as empty, and never overwrites it', async (_name, content, message) => {
     const { readSessionTabs, recordSessionTab, SessionTabsStoreError } = await import('@/lib/spend/session-tabs-store');
     await fs.mkdir(path.dirname(storeFile()), { recursive: true });
-    await fs.writeFile(storeFile(), content);
+    if (content === null) await fs.mkdir(storeFile());
+    else await fs.writeFile(storeFile(), content);
+    const reads = countStoreReads(fs);
+    await expect(recordSessionTab({ providerId: 'claude', sessionId: 's', workspaceId: 'ws', tabId: 't' }, NOW)).resolves.toBeUndefined();
+    expect(reads()).toBe(1);
+    expect(storeWarnings()).toHaveLength(1);
+    expect(storeWarnings()[0][0]).toContain(storeFile());
+    expect(storeWarnings()[0][0]).toContain(message);
     await expect(readSessionTabs()).rejects.toBeInstanceOf(SessionTabsStoreError);
     await expect(readSessionTabs()).rejects.toThrow(message);
-    await expect(recordSessionTab({ providerId: 'claude', sessionId: 's', workspaceId: 'ws', tabId: 't' }, NOW)).rejects.toBeInstanceOf(SessionTabsStoreError);
-    expect(await fs.readFile(storeFile(), 'utf-8')).toBe(content);
+    if (content === null) expect((await fs.stat(storeFile())).isDirectory()).toBe(true);
+    else expect(await fs.readFile(storeFile(), 'utf-8')).toBe(content);
+  });
+
+  describe('a refused file backs off for 60 s', () => {
+    const sighting = (sessionId: string) => ({ providerId: 'claude' as const, sessionId, workspaceId: 'ws-a', tabId: 'tab-1' });
+    const damage = async () => {
+      await fs.mkdir(path.dirname(storeFile()), { recursive: true });
+      await fs.writeFile(storeFile(), 'not json');
+    };
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('reads and warns once for many concurrent and later sightings inside the interval', async () => {
+      await damage();
+      const reads = countStoreReads(fs);
+      const { recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await Promise.all(Array.from({ length: 20 }, (_, i) => recordSessionTab(sighting(`s-${i}`), NOW)));
+      await recordSessionTab(sighting('s-late'), NOW + 59_999);
+      expect(reads()).toBe(1);
+      expect(storeWarnings()).toHaveLength(1);
+      expect(storeWarnings()[0][0]).toContain(`${storeFile()}: session-tabs.json unreadable: the file is not JSON`);
+      expect(storeWarnings()[0][0]).toContain('60 s');
+      expect(await fs.readFile(storeFile(), 'utf-8')).toBe('not json');
+    });
+
+    it('never backs off the spend view: a read still names the damaged file', async () => {
+      await damage();
+      const { readSessionTabs, recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await recordSessionTab(sighting('s-1'), NOW);
+      await expect(readSessionTabs()).rejects.toThrow('session-tabs.json unreadable: the file is not JSON');
+    });
+
+    it('reads again once the interval ends and warns again while the file stays damaged', async () => {
+      await damage();
+      const reads = countStoreReads(fs);
+      const { recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await recordSessionTab(sighting('s-1'), NOW);
+      await recordSessionTab(sighting('s-2'), NOW + 60_000);
+      await recordSessionTab(sighting('s-3'), NOW + 60_001);
+      expect(reads()).toBe(2);
+      expect(storeWarnings()).toHaveLength(2);
+    });
+
+    it('records bindings again after the interval once the file is repaired, with no restart', async () => {
+      await damage();
+      const { readSessionTabs, recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await recordSessionTab(sighting('s-1'), NOW);
+      await fs.writeFile(storeFile(), JSON.stringify({ version: 1, bindings: {} }));
+      await recordSessionTab(sighting('s-early'), NOW + 30_000);
+      expect(await readSessionTabs()).toEqual({});
+      await recordSessionTab(sighting('s-2'), NOW + 60_000);
+      await recordSessionTab(sighting('s-3'), NOW + 60_001);
+      expect(Object.keys(await readSessionTabs()).sort()).toEqual(['claude:s-2', 'claude:s-3']);
+      expect(storeWarnings()).toHaveLength(1);
+    });
+
+    it('records bindings again after the interval once the file is moved aside', async () => {
+      await damage();
+      const { readSessionTabs, recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await recordSessionTab(sighting('s-1'), NOW);
+      await fs.rename(storeFile(), `${storeFile()}.damaged`);
+      await recordSessionTab(sighting('s-2'), NOW + 60_000);
+      expect(Object.keys(await readSessionTabs())).toEqual(['claude:s-2']);
+      expect((await fs.stat(storeFile())).mode & 0o777).toBe(0o600);
+    });
+
+    it('reads again when the clock moves back before the refusal, and a good read ends the back-off', async () => {
+      await damage();
+      const reads = countStoreReads(fs);
+      const { readSessionTabs, recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await recordSessionTab(sighting('s-1'), NOW);
+      await fs.writeFile(storeFile(), JSON.stringify({ version: 1, bindings: {} }));
+      await recordSessionTab(sighting('s-2'), NOW - 1);
+      await recordSessionTab(sighting('s-3'), NOW + 1);
+      expect(reads()).toBe(3);
+      expect(Object.keys(await readSessionTabs()).sort()).toEqual(['claude:s-2', 'claude:s-3']);
+    });
+
+    it('never backs off a healthy store: each new session is read and written at once', async () => {
+      const reads = countStoreReads(fs);
+      const { readSessionTabs, recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      await recordSessionTab(sighting('s-1'), NOW);
+      await recordSessionTab(sighting('s-2'), NOW + 1);
+      expect(reads()).toBe(2);
+      expect(Object.keys(await readSessionTabs()).sort()).toEqual(['claude:s-1', 'claude:s-2']);
+      expect(storeWarnings()).toHaveLength(0);
+    });
+
+    it('still fails a write to the caller, without a back-off', async () => {
+      const { recordSessionTab } = await import('@/lib/spend/session-tabs-store');
+      const rename = vi.spyOn(fs, 'rename').mockRejectedValueOnce(Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }));
+      await expect(recordSessionTab(sighting('s-1'), NOW)).rejects.toThrow('EIO');
+      rename.mockRestore();
+      await recordSessionTab(sighting('s-2'), NOW + 1);
+      expect((await stored()).bindings['claude:s-2']).toMatchObject({ tabId: 'tab-1' });
+      await expect(fs.access(`${storeFile()}.tmp`)).rejects.toThrow();
+    });
   });
 });
 
@@ -118,6 +233,8 @@ describe('updateTabAgentSessionId records the binding', () => {
   beforeEach(async () => {
     vi.resetModules();
     delete (globalThis as { __ptSessionTabsSeen?: unknown }).__ptSessionTabsSeen;
+    delete (globalThis as { __ptSessionTabsRefusedAt?: unknown }).__ptSessionTabsRefusedAt;
+    warn.mockClear();
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-session-tabs-hook-'));
   });
   afterEach(async () => {
@@ -163,6 +280,8 @@ describe('updateTabAgentState records the binding (the status manager hook, laun
   beforeEach(async () => {
     vi.resetModules();
     delete (globalThis as { __ptSessionTabsSeen?: unknown }).__ptSessionTabsSeen;
+    delete (globalThis as { __ptSessionTabsRefusedAt?: unknown }).__ptSessionTabsRefusedAt;
+    warn.mockClear();
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-session-tabs-state-'));
   });
   afterEach(async () => {
@@ -213,5 +332,32 @@ describe('updateTabAgentState records the binding (the status manager hook, laun
     const layout = await store.readLayoutFile(store.resolveLayoutFile('ws-a'));
     expect(layout?.root.type === 'pane' && (layout.root.tabs[0] as ITab & { fakeSession?: string }).fakeSession).toBe('s-1');
     expect(await fs.readFile(storeFile(), 'utf-8')).toBe('not json');
+  });
+
+  it('re-reads a damaged store and warns at most once a minute across many hook saves', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(NOW);
+      const store = await seedLayout();
+      await fs.mkdir(path.dirname(storeFile()), { recursive: true });
+      await fs.writeFile(storeFile(), 'not json');
+      const reads = countStoreReads(fs);
+      for (let i = 0; i < 30; i += 1) {
+        vi.setSystemTime(NOW + i * 1_000);
+        await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: `s-${i}` });
+      }
+      expect(reads()).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(storeWarnings()[0][0]).toContain(storeFile());
+      await fs.writeFile(storeFile(), JSON.stringify({ version: 1, bindings: {} }));
+      vi.setSystemTime(NOW + 60_000);
+      await store.updateTabAgentState('pt-ws-a-pane-one-tab-orig', fakeProvider('claude'), { sessionId: 's-repaired' });
+      expect(reads()).toBe(2);
+      expect((await stored()).bindings['claude:s-repaired']).toMatchObject({ workspaceId: 'ws-a', tabId: 'tab-adopted', firstSeenAt: NOW + 60_000 });
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 });

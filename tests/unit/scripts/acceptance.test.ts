@@ -474,6 +474,342 @@ describe('checks-burndown.cjs fixture', () => {
   });
 });
 
+describe('checks-wip-cap.cjs (story 20)', () => {
+  const wipCap = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-wip-cap.cjs'));
+  const helpers = { parseJson: checks.parseJson, brief: checks.brief, nonce: 'n0' };
+  const AGENT = new Set(['claude-code', 'codex-cli', 'grok-cli']);
+  const CAP = String(wipCap.FIXTURE_CAP);
+  const SCRATCH_PORT = 18123;
+  let root = '';
+  let scratchHome = '';
+  let liveHome = '';
+  const writePort = (home: string, port: string | number) => {
+    fs.mkdirSync(path.join(home, '.purplemux'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.purplemux', 'port'), `${port}\n`);
+  };
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-wip-cap-'));
+    scratchHome = path.join(root, 'pmxa.abc123', 'home');
+    liveHome = path.join(root, 'live');
+    writePort(scratchHome, SCRATCH_PORT);
+    writePort(liveHome, 8022);
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // The scratch server as the CLI sees it: the cap rule of src/lib/tab-cap.ts (1..200, default 8).
+  const fakeFleet = (opts: { setRc?: (value: string) => number; unsetRc?: number; countCap?: number; home?: string; agents?: Record<string, number> } = {}) => {
+    const fleet = { cap: null as string | null, tabs: {} as Record<string, { tabId: string; panelType: string }[]>, calls: [] as string[] };
+    for (const ws of ['ws-a', 'ws-b']) {
+      fleet.tabs[ws] = Array.from({ length: opts.agents?.[ws] ?? 0 }, (_, i) => ({ tabId: `${ws}-seed-${i}`, panelType: 'claude-code' }));
+    }
+    let next = 0;
+    const capOf = () => {
+      const n = fleet.cap === null ? NaN : Number(fleet.cap);
+      if (fleet.cap === null) return { cap: 8, capSource: 'default' };
+      return Number.isInteger(n) && n >= 1 && n <= 200 ? { cap: n, capSource: 'fleet-config' } : { cap: 8, capSource: 'default-invalid' };
+    };
+    const count = (ws: string) => fleet.tabs[ws].filter((t) => AGENT.has(t.panelType)).length;
+    const cli = vi.fn(async (args: string[]) => {
+      fleet.calls.push(args.join(' '));
+      const ok = (out = 'ok\n') => ({ rc: 0, out, err: '' });
+      if (args[0] === 'config' && args[1] === 'set') {
+        const rc = opts.setRc?.(args[3]) ?? 0;
+        if (rc !== 0) return { rc, out: '', err: 'error: forbidden — not the admin' };
+        fleet.cap = args[3];
+        return ok();
+      }
+      if (args[0] === 'config' && args[1] === 'unset') {
+        if (opts.unsetRc) return { rc: opts.unsetRc, out: '', err: 'error: config-not-found' };
+        fleet.cap = null;
+        return ok();
+      }
+      if (args[0] === 'tab' && args[1] === 'count') {
+        const ws = args[3];
+        const { cap, capSource } = capOf();
+        return ok(JSON.stringify({ workspaceId: ws, count: count(ws), cap: opts.countCap ?? cap, capSource, overCap: count(ws) > cap }));
+      }
+      if (args[0] === 'tab' && args[1] === 'create') {
+        const ws = args[3];
+        const type = args[args.indexOf('-t') + 1];
+        const { cap } = capOf();
+        if (AGENT.has(type) && count(ws) >= cap) {
+          return { rc: 3, out: '', err: `error: wip-cap (refused by state — close an agent tab first) — ${ws} holds ${count(ws)} of ${cap} agent tabs\n` };
+        }
+        const tab = { tabId: `tab-${next++}`, panelType: type };
+        fleet.tabs[ws].push(tab);
+        return ok(JSON.stringify({ ...tab, workspaceId: ws, sessionName: `pt-${ws}-p-${tab.tabId}` }));
+      }
+      if (args[0] === 'tab' && args[1] === 'close') {
+        const ws = args[3];
+        fleet.tabs[ws] = fleet.tabs[ws].filter((t) => t.tabId !== args[4]);
+        return ok();
+      }
+      throw new Error(`unexpected command ${args.join(' ')}`);
+    });
+    const inst = { cli, state: { home: opts.home ?? scratchHome, port: SCRATCH_PORT, workspaces: { a: 'ws-a', b: 'ws-b' } } };
+    return { fleet, inst };
+  };
+  const overCreate = (args: string[]) => args[0] === 'tab' && args[1] === 'create' && args[5].startsWith('acc-cap-over');
+
+  it('the fixture cap is a value the server reads from fleet config', async () => {
+    vi.doMock('@/lib/logger', () => ({ createLogger: () => ({ info: () => {}, warn: () => {} }) }));
+    const { parseTabCap } = await import('@/lib/tab-cap');
+    expect(parseTabCap(CAP)).toEqual({ cap: wipCap.FIXTURE_CAP, capSource: 'fleet-config', reason: null });
+    vi.doUnmock('@/lib/logger');
+  });
+
+  it('sets the scratch cap and reads it back from both workspaces', async () => {
+    const { fleet, inst } = fakeFleet();
+    expect(await wipCap.setFixtureCap(inst, helpers, liveHome)).toMatchObject({ ok: true });
+    expect(fleet.cap).toBe(CAP);
+    expect(fleet.calls).toEqual([`config set tabs.cap-per-workspace ${CAP}`, 'tab count -w ws-a --json', 'tab count -w ws-b --json']);
+  });
+
+  it.each([
+    ['the live HOME itself', () => liveHome, 'resolves to the live HOME'],
+    ['a symlink to the live HOME', () => {
+      const link = path.join(root, 'link-home');
+      fs.symlinkSync(liveHome, link);
+      return link;
+    }, 'resolves to the live HOME'],
+    ['a HOME whose .purplemux links to the live one', () => {
+      const home = path.join(root, 'linked-purplemux');
+      fs.mkdirSync(home);
+      fs.symlinkSync(path.join(liveHome, '.purplemux'), path.join(home, '.purplemux'));
+      return home;
+    }, '/.purplemux resolves to the live'],
+  ])('refuses %s and touches nothing', async (_name, home, reason) => {
+    const { fleet, inst } = fakeFleet({ home: home() });
+    const set = await wipCap.setFixtureCap(inst, helpers, liveHome);
+    expect(set).toMatchObject({ ok: false, measured: expect.stringContaining(reason) });
+    expect(fleet.calls).toEqual([]);
+  });
+
+  it.each([
+    ['no port file', () => fs.rmSync(path.join(scratchHome, '.purplemux', 'port')), 'reads nothing'],
+    ['a port other than the state port', () => writePort(scratchHome, 18124), 'reads 18124'],
+    ['the live port', () => {
+      writePort(scratchHome, 8022);
+      return 8022;
+    }, 'the live port'],
+  ])('refuses a scratch HOME with %s and touches nothing', async (_name, arrange, reason) => {
+    const statePort = arrange();
+    const { fleet, inst } = fakeFleet();
+    if (typeof statePort === 'number') inst.state.port = statePort;
+    const set = await wipCap.setFixtureCap(inst, helpers, liveHome);
+    expect(set).toMatchObject({ ok: false, measured: expect.stringContaining(reason) });
+    expect(fleet.calls).toEqual([]);
+  });
+
+  it('a .purplemux missing on the live side is not the same directory', () => {
+    fs.rmSync(path.join(liveHome, '.purplemux'), { recursive: true });
+    expect(wipCap.scratchHomeProblem({ home: scratchHome, port: SCRATCH_PORT }, liveHome)).toBeNull();
+  });
+
+  it('fails the setup on a refused set or a read-back that does not show the value from fleet config', async () => {
+    const refused = fakeFleet({ setRc: () => 3 });
+    expect(await wipCap.setFixtureCap(refused.inst, helpers, liveHome))
+      .toMatchObject({ ok: false, measured: expect.stringContaining('exit 3'), expected: expect.stringContaining(`cap ${CAP} from fleet-config`) });
+    const wrongCap = fakeFleet({ countCap: 8 });
+    expect((await wipCap.setFixtureCap(wrongCap.inst, helpers, liveHome)).ok).toBe(false);
+  });
+
+  it('the gate stops the run with one loud failure when the setup fails', async () => {
+    const { inst } = fakeFleet({ setRc: () => 1 });
+    const gate = await wipCap.fixtureCapGate(inst, helpers, { liveHome });
+    expect(gate.proceed).toBe(false);
+    expect(gate.results).toEqual([expect.objectContaining({ status: 'fail', id: 'fixture-cap', gate: true, what: expect.stringContaining('no check ran') })]);
+  });
+
+  it('SC-2: a create at the cap exits 3 wip-cap with the count and the cap, and the scratch cap is left as found', async () => {
+    const { fleet, inst } = fakeFleet();
+    const gate = await wipCap.fixtureCapGate(inst, helpers, { liveHome });
+    expect(gate.proceed).toBe(true);
+    expect(gate.results.map((r: { status: string; id: string; gate: boolean }) => `${r.status} ${r.id} ${r.gate}`))
+      .toEqual(['pass fixture-cap true', 'pass wip-cap-refusal true']);
+    expect(fleet.cap).toBe(CAP);
+    expect(fleet.tabs['ws-a']).toEqual([]);
+    expect(fleet.calls).toContain('config set tabs.cap-per-workspace 1');
+  });
+
+  it('SC-2 lowers the cap to the count it finds, and restores an unset cap by unsetting it', async () => {
+    const { fleet, inst } = fakeFleet({ agents: { 'ws-a': 2 } });
+    const refusal = await wipCap.wipCapRefusal(inst, helpers);
+    expect(refusal).toMatchObject({ restored: true, result: { status: 'pass', id: 'wip-cap-refusal' } });
+    expect(fleet.calls.indexOf('config unset tabs.cap-per-workspace')).toBeGreaterThan(fleet.calls.indexOf('config set tabs.cap-per-workspace 3'));
+    expect(fleet.cap).toBeNull();
+    expect(fleet.tabs['ws-a'].map((t) => t.tabId)).toEqual(['ws-a-seed-0', 'ws-a-seed-1']);
+  });
+
+  it('SC-2 accepts an unset that exits 7 when the read-back shows the default cap, and fails any other unset', async () => {
+    const notFound = fakeFleet({ unsetRc: 7 });
+    const real = notFound.inst.cli.getMockImplementation()!;
+    notFound.inst.cli.mockImplementation(async (args: string[]) => {
+      const result = await real(args);
+      if (args[0] === 'config' && args[1] === 'unset') notFound.fleet.cap = null;
+      return result;
+    });
+    expect(await wipCap.wipCapRefusal(notFound.inst, helpers)).toMatchObject({ restored: true, result: { status: 'pass' } });
+    // Exit 7 that leaves the lowered cap in place, and any other exit, are not a restore.
+    const left = fakeFleet({ unsetRc: 7 });
+    expect(await wipCap.wipCapRefusal(left.inst, helpers)).toMatchObject({ restored: false, result: { status: 'fail' } });
+    const broken = fakeFleet({ unsetRc: 3 });
+    expect((await wipCap.wipCapRefusal(broken.inst, helpers)).restored).toBe(false);
+  });
+
+  it('SC-2 fails, and closes the tab, when the create at the cap is not refused', async () => {
+    const { fleet, inst } = fakeFleet();
+    fleet.cap = CAP;
+    const real = inst.cli.getMockImplementation()!;
+    inst.cli.mockImplementation(async (args: string[]) => {
+      if (overCreate(args)) {
+        fleet.calls.push(args.join(' '));
+        fleet.tabs['ws-a'].push({ tabId: 'tab-leak', panelType: 'claude-code' });
+        return { rc: 0, out: JSON.stringify({ tabId: 'tab-leak' }), err: '' };
+      }
+      return real(args);
+    });
+    const refusal = await wipCap.wipCapRefusal(inst, helpers);
+    expect(refusal.result).toMatchObject({ status: 'fail', id: 'wip-cap-refusal', expected: expect.stringContaining('exits 3'), measured: expect.stringContaining('made tab-leak') });
+    expect(refusal.restored).toBe(true);
+    expect(fleet.tabs['ws-a']).toEqual([]);
+  });
+
+  it.each([
+    ['names no count', 'error: wip-cap\n'],
+    ['names another workspace', 'error: wip-cap (refused by state) — ws-b holds 1 of 1 agent tabs\n'],
+    ['names a different count', 'error: wip-cap (refused by state) — ws-a holds 2 of 1 agent tabs\n'],
+    ['is not the whole line', 'error: wip-cap (refused by state) — ws-a holds 1 of 1 agent tabs today\n'],
+    ['is another code', 'error: forbidden (refused) — ws-a holds 1 of 1 agent tabs\n'],
+  ])('SC-2 fails a refusal that %s', async (_name, err) => {
+    const { fleet, inst } = fakeFleet();
+    fleet.cap = CAP;
+    const real = inst.cli.getMockImplementation()!;
+    inst.cli.mockImplementation(async (args: string[]) => (overCreate(args) ? { rc: 3, out: '', err } : real(args)));
+    const refusal = await wipCap.wipCapRefusal(inst, helpers);
+    expect(refusal.result).toMatchObject({ status: 'fail', measured: expect.stringContaining(err.trim().split('\n')[0].slice(0, 40)) });
+  });
+
+  it('matches the refusal line the CLI printed in the measured run', () => {
+    const line = "error: wip-cap (refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason) — ws-ZnzDut holds 8 of 8 agent tabs";
+    expect(wipCap.refusalLine('ws-ZnzDut', 8).test(`${line}\n`)).toBe(true);
+    expect(wipCap.refusalLine('ws-Znz.ut', 8).test(line)).toBe(false);
+  });
+
+  it('a cap that cannot be restored stops every later check', async () => {
+    const { inst } = fakeFleet({ setRc: (value) => (value === CAP && inst.cli.mock.calls.length > 3 ? 1 : 0) });
+    const gate = await wipCap.fixtureCapGate(inst, helpers, { liveHome });
+    expect(gate.proceed).toBe(false);
+    expect(gate.results.map((r: { status: string; id: string }) => `${r.status} ${r.id}`))
+      .toEqual(['pass fixture-cap', 'fail wip-cap-refusal', 'fail fixture-cap-restore']);
+  });
+
+  it('SC-2 touches nothing when the cap it finds cannot be restored exactly', async () => {
+    const { fleet, inst } = fakeFleet();
+    fleet.cap = 'many';
+    const refusal = await wipCap.wipCapRefusal(inst, helpers);
+    expect(refusal).toMatchObject({ restored: true, result: { status: 'fail' } });
+    expect(fleet.calls).toEqual(['tab count -w ws-a --json']);
+  });
+
+  it('summarize: gate results alone never pass a run', () => {
+    expect(checks.summarize([{ status: 'pass', id: 'fixture-cap', what: 'w', gate: true }]).pass).toBe(false);
+    expect(checks.summarize([{ status: 'pass', id: 'fixture-cap', what: 'w', gate: true }, { status: 'pass', id: 'tab-create', what: 'w' }]).pass).toBe(true);
+  });
+
+  it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
+    expect(checks.WAVE_COUNT).toBe(7);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '7']).onlyWave).toBe(7);
+    for (const bad of ['0', '8', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..7, not ${JSON.stringify(bad)}`);
+    }
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..7, not null');
+  });
+
+  describe('checks.cjs runs the gate first (spawned against a fake candidate)', () => {
+    // The fake CLI answers config and tab count; every other command fails, so wave 1 stops at tab-create.
+    const FAKE_CLI = `const fs = require('fs'), path = require('path');
+const home = process.env.HOME;
+const mode = fs.readFileSync(path.join(home, 'mode'), 'utf8').trim();
+const a = process.argv.slice(2);
+fs.appendFileSync(path.join(home, 'calls'), a.join(' ') + '\\n');
+if (a[0] === 'config' && a[1] === 'set') {
+  if (mode === 'setfail' || (mode === 'norestore' && fs.existsSync(path.join(home, 'cap')))) { process.stderr.write('error: forbidden\\n'); process.exit(3); }
+  fs.writeFileSync(path.join(home, 'cap'), a[3]);
+  process.exit(0);
+}
+if (a[0] === 'tab' && a[1] === 'count') {
+  let c = null;
+  try { c = fs.readFileSync(path.join(home, 'cap'), 'utf8'); } catch {}
+  process.stdout.write(JSON.stringify({ workspaceId: a[3], count: 0, cap: c ? Number(c) : 8, capSource: c ? 'fleet-config' : 'default' }) + '\\n');
+  process.exit(0);
+}
+process.stderr.write('error: unexpected\\n');
+process.exit(1);
+`;
+    const runChecks = (mode: string, extra: string[] = []) => {
+      const candidate = path.join(root, 'cand');
+      fs.mkdirSync(path.join(candidate, 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(candidate, 'bin', 'purplemux.js'), FAKE_CLI);
+      fs.writeFileSync(path.join(scratchHome, 'mode'), mode);
+      const scratch = path.dirname(scratchHome);
+      const state = path.join(root, 'state.json');
+      fs.writeFileSync(state, JSON.stringify({ scratch, home: scratchHome, tmuxTmpdir: path.join(scratch, 'tmux'), candidate,
+        node: process.execPath, port: SCRATCH_PORT, workspaces: { a: 'ws-a', b: 'ws-b' } }));
+      const r = spawnSync(process.execPath, [path.join(ROOT, 'scripts/acceptance/checks.cjs'), '--state', state, ...extra], {
+        env: asEnv({ PATH: process.env.PATH, HOME: liveHome }), encoding: 'utf-8', timeout: 30_000,
+      });
+      const calls = fs.existsSync(path.join(scratchHome, 'calls')) ? fs.readFileSync(path.join(scratchHome, 'calls'), 'utf8').trim().split('\n') : [];
+      return { ...r, lines: r.stdout.trim().split('\n'), calls };
+    };
+
+    it('a refused cap set prints exactly one FAIL fixture-cap line, checks=1, exit 1, and runs no wave', () => {
+      const r = runChecks('setfail');
+      expect(r.status).toBe(1);
+      expect(r.lines).toHaveLength(2);
+      expect(r.lines[0]).toMatch(/^FAIL fixture-cap — .*no check ran — measured: set exit 3, stderr: error: forbidden/);
+      expect(r.lines[1]).toBe('ACCEPTANCE=FAIL checks=1 passed=0 failed=1 skipped=0');
+      expect(r.calls).toEqual([`config set tabs.cap-per-workspace ${CAP}`, 'tab count -w ws-a --json', 'tab count -w ws-b --json']);
+    });
+
+    it('--only-wave 1 sets the cap but runs no wip-cap-refusal check', () => {
+      const r = runChecks('ok', ['--only-wave', '1']);
+      expect(r.lines[0]).toBe(`PASS fixture-cap — the scratch fleet's tabs.cap-per-workspace is ${CAP}, read back, before any check runs`);
+      expect(r.stdout).not.toContain('wip-cap-refusal');
+      expect(r.stdout).toContain('FAIL tab-create');
+      expect(r.status).toBe(1);
+      expect(r.calls.filter((c) => c.startsWith('config set'))).toEqual([`config set tabs.cap-per-workspace ${CAP}`]);
+    });
+
+    it('a full run runs SC-2 before wave 1, and a cap it cannot restore stops the run there', () => {
+      const r = runChecks('norestore');
+      expect(r.lines.map((l) => l.split(' — ')[0])).toEqual(['PASS fixture-cap', 'FAIL wip-cap-refusal', 'FAIL fixture-cap-restore',
+        'ACCEPTANCE=FAIL checks=3 passed=1 failed=2 skipped=0']);
+      expect(r.status).toBe(1);
+      expect(r.calls).not.toContain('tab create -w ws-a -n acc-a1 -t terminal');
+    });
+
+    it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
+      const r = runChecks('ok', ['--only-wave', '9']);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('--only-wave takes an integer 1..7, not "9"');
+      expect(r.calls).toEqual([]);
+    });
+
+    it('a state whose port file is the live port is refused before any write', () => {
+      writePort(liveHome, SCRATCH_PORT);
+      const r = runChecks('ok');
+      // runChecks points HOME (the live side) at liveHome; a state whose port file is the live one is refused.
+      expect(r.lines[0]).toMatch(/^FAIL fixture-cap — .* the live port/);
+      expect(r.calls).toEqual([]);
+    });
+  });
+});
+
 describe('checks-mission-control-page.cjs', () => {
   const wave7 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-mission-control-page.cjs'));
 

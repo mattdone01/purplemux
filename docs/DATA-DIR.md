@@ -196,7 +196,10 @@ tmp + rename under one lock. Both session-id writers in `src/lib/layout-store.ts
 record each non-null session after their layout write (a failure is logged and never fails the hook path); the spend indexer seeds it once per boot
 from `session-history.json` and every layout's current session ids. A session moves to another tab
 only on a newer sighting. Bindings last seen before the spend floor (today − 91, UTC) are pruned. A malformed file is refused, never
-read as empty or overwritten: spend then attributes no usage to a tab and says why. Deleting it loses
+read as empty or overwritten: spend then attributes no usage to a tab and says why. While the file is
+refused, the hook path reads it at most once every 60 s and logs one warning per read, with the path
+and the reason. Once the 60 s pass, the next hook save after a repair (or after the file is moved
+aside) records again, with no restart. Deleting it loses
 the tab attribution of past sessions (their usage stays in its workspace, unattributed per tab).
 
 ### `quick-prompts.json`, `sidebar-items.json` — `src/lib/{quick-prompts,sidebar-items}-store.ts`
