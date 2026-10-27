@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { MissionControlStore, type IMissionDiscoveryInput } from '@/lib/mission-control-store';
 import type { IMissionBinding, IMissionQuestion, TMissionProducerEvent } from '@/types/mission-control';
@@ -1511,5 +1511,182 @@ describe('MissionControlStore orchestrator rebind', () => {
     expect(reopened.snapshot().runs[0].binding).toEqual({ ...successor, generation: 2 });
     expect(reopened.eventsAfter(0, 200).events.find((candidate) => candidate.type === 'run.rebound')).toEqual(event);
     reopened.close();
+  });
+});
+
+describe('MissionControlStore attention class and stated default (ADR-0031)', () => {
+  const DAY = 86_400_000;
+  const classifiedOpen = (
+    itemId: string,
+    over: Partial<{ class: 'money' | 'irreversible' | 'scope' | 'bookkeeping'; defaultOptionId: string }>,
+  ): Extract<TMissionProducerEvent, { type: 'attention.opened' }> => ({
+    ...openEvent(`event-open-${itemId}`),
+    payload: { itemId, ...question, ...over, humanReview },
+  });
+  const openClassified = (store: MissionControlStore, event: TMissionProducerEvent): void => {
+    store.applyEvents([event], new Map([[event.eventId, reviewAuthority]]));
+  };
+  const answer = (store: MissionControlStore, itemId: string, actor = 'user') => store.submitAnswer(itemId, {
+    submissionId: `submission-${itemId}`,
+    expectedRevision: 1,
+    optionIds: ['gradual'],
+    text: '',
+    actionCompleted: false,
+  }, actor);
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('stores class and default inside question_json and serves them on the snapshot item', () => {
+    const file = databasePath();
+    const store = new MissionControlStore(file);
+    seedRun(store);
+    openClassified(store, classifiedOpen('item-a', { class: 'bookkeeping', defaultOptionId: 'gradual' }));
+    expect(store.snapshot().items[0]).toMatchObject({
+      id: 'item-a', revision: 1, state: 'open', class: 'bookkeeping', defaultOptionId: 'gradual',
+    });
+    store.close();
+
+    const raw = new Database(file, { readonly: true });
+    const row = raw.prepare('SELECT question_json FROM attention_items WHERE id=?').get('item-a') as { question_json: string };
+    expect(JSON.parse(row.question_json)).toMatchObject({ class: 'bookkeeping', defaultOptionId: 'gradual' });
+    raw.close();
+
+    const reopened = new MissionControlStore(file);
+    expect(reopened.snapshot().items[0]).toMatchObject({ class: 'bookkeeping', defaultOptionId: 'gradual' });
+    reopened.close();
+  });
+
+  it('serves null for an item without a class or a default (absence, never a guessed class)', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const [item] = store.snapshot().items;
+    expect(item.class).toBeNull();
+    expect(item.defaultOptionId).toBeNull();
+    store.close();
+  });
+
+  it('lets attention.updated change both fields under the existing revision rule', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const opened = classifiedOpen('item-a', { class: 'scope' });
+    openClassified(store, opened);
+    const reclassifiedPayload = { ...opened.payload, class: 'bookkeeping' as const, defaultOptionId: 'direct' };
+    const reclassified: TMissionProducerEvent = {
+      ...opened, eventId: 'event-reclassify', type: 'attention.updated', expectedRevision: 1, payload: reclassifiedPayload,
+    };
+    store.applyEvents([reclassified], new Map([[reclassified.eventId, reviewAuthority]]));
+    expect(store.snapshot().items[0]).toMatchObject({ revision: 2, state: 'open', class: 'bookkeeping', defaultOptionId: 'direct' });
+
+    const stale: TMissionProducerEvent = { ...reclassified, eventId: 'event-reclassify-stale', expectedRevision: 1 };
+    expect(() => store.applyEvents([stale], new Map([[stale.eventId, reviewAuthority]]))).toThrowError(/stale attention revision/);
+
+    const { humanReview: ignored, ...withoutReview } = reclassifiedPayload;
+    void ignored;
+    const changedClassWithoutReview: TMissionProducerEvent = {
+      ...opened, eventId: 'event-reclassify-unreviewed', type: 'attention.updated', expectedRevision: 2,
+      payload: { ...withoutReview, class: 'money' },
+    };
+    expect(() => store.applyEvents([changedClassWithoutReview])).toThrowError(/renewed orchestrator review/);
+
+    const unchangedWithoutReview: TMissionProducerEvent = {
+      ...opened, eventId: 'event-reclassify-unchanged', type: 'attention.updated', expectedRevision: 2,
+      payload: withoutReview,
+    };
+    store.applyEvents([unchangedWithoutReview]);
+    expect(store.snapshot().items[0]).toMatchObject({ revision: 3, state: 'open', class: 'bookkeeping', defaultOptionId: 'direct' });
+
+    const declassified: TMissionProducerEvent = {
+      ...opened, eventId: 'event-declassify', type: 'attention.updated', expectedRevision: 3,
+      payload: { itemId: 'item-a', ...question, humanReview },
+    };
+    store.applyEvents([declassified], new Map([[declassified.eventId, reviewAuthority]]));
+    expect(store.snapshot().items[0]).toMatchObject({ revision: 4, class: null, defaultOptionId: null });
+    store.close();
+  });
+
+  it('keeps SCHEMA_VERSION 4 and the schema-4 DDL unchanged after classified items are written', () => {
+    const plainFile = databasePath();
+    const plain = new MissionControlStore(plainFile);
+    plain.close();
+    const classifiedFile = databasePath();
+    const store = new MissionControlStore(classifiedFile);
+    seedRun(store);
+    openClassified(store, classifiedOpen('item-a', { class: 'money', defaultOptionId: 'gradual' }));
+    answer(store, 'item-a');
+    store.snapshot();
+    store.close();
+
+    const ddl = (file: string) => {
+      const database = new Database(file, { readonly: true });
+      const version = database.pragma('user_version', { simple: true });
+      const schema = database.prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all();
+      database.close();
+      return { version, schema };
+    };
+    expect(ddl(classifiedFile)).toEqual(ddl(plainFile));
+    expect(ddl(classifiedFile).version).toBe(4);
+  });
+
+  it('opens a classified database with the pre-story read path: the plain question_json spread', () => {
+    const file = databasePath();
+    const store = new MissionControlStore(file);
+    seedRun(store);
+    openClassified(store, classifiedOpen('item-a', { class: 'bookkeeping', defaultOptionId: 'gradual' }));
+    store.close();
+    // The 882190ab release reads every attention_items row with SELECT * and spreads question_json;
+    // the release check itself runs at /dod against the built release.
+    const raw = new Database(file, { readonly: true });
+    const rows = raw.prepare('SELECT * FROM attention_items').all() as Array<{ question_json: string }>;
+    expect(rows.map((row) => ({ ...JSON.parse(row.question_json) }))[0]).toMatchObject({ ...question, class: 'bookkeeping' });
+    raw.close();
+  });
+
+  it('counts answers per UTC day, class and actor kind over the last 7 days', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const today = Date.UTC(2026, 9, 27, 12, 0, 0);
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const opens: Array<[string, Partial<{ class: 'money' | 'irreversible' | 'scope' | 'bookkeeping'; defaultOptionId: string }>]> = [
+      ['too-old', { class: 'money' }],
+      ['just-before-window', { class: 'money' }],
+      ['oldest-in-window', { class: 'money' }],
+      ['money-today', { class: 'money' }],
+      ['book-human', { class: 'bookkeeping', defaultOptionId: 'gradual' }],
+      ['book-rule', { class: 'bookkeeping', defaultOptionId: 'gradual' }],
+      ['plain', {}],
+      ['open-only', { class: 'scope' }],
+    ];
+    vi.setSystemTime(today - 8 * DAY);
+    for (const [itemId, over] of opens) openClassified(store, classifiedOpen(itemId, over));
+    answer(store, 'too-old');
+    vi.setSystemTime(Date.parse('2026-10-20T23:59:59.999Z'));
+    answer(store, 'just-before-window');
+    vi.setSystemTime(Date.parse('2026-10-21T00:00:00.000Z'));
+    answer(store, 'oldest-in-window');
+    vi.setSystemTime(today);
+    answer(store, 'money-today');
+    answer(store, 'book-human');
+    answer(store, 'book-rule', 'system:auto-answer');
+    answer(store, 'plain');
+
+    expect(store.snapshot().answersByClass).toEqual([
+      { day: '2026-10-21', class: 'money', by: 'human', count: 1 },
+      { day: '2026-10-27', class: 'money', by: 'human', count: 1 },
+      { day: '2026-10-27', class: 'bookkeeping', by: 'human', count: 1 },
+      { day: '2026-10-27', class: 'bookkeeping', by: 'rule', count: 1 },
+      { day: '2026-10-27', class: 'unclassified', by: 'human', count: 1 },
+    ]);
+    expect(store.snapshot([], 'ws-other').answersByClass).toEqual([]);
+    expect(store.snapshot([], 'ws-a').answersByClass).toHaveLength(5);
+    store.close();
+  });
+
+  it('serves an empty answersByClass, not an absent one, when nothing was answered', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    expect(store.snapshot().answersByClass).toEqual([]);
+    store.close();
   });
 });

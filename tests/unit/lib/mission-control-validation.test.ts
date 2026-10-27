@@ -92,3 +92,60 @@ describe('Mission Control human review validation', () => {
       .toThrowError(/reserved namespace/);
   });
 });
+
+describe('Mission Control attention class and stated default (ADR-0031)', () => {
+  const classified = (type: 'attention.opened' | 'attention.updated', over: Record<string, unknown>) => {
+    const base = event(undefined);
+    return {
+      ...base,
+      type,
+      payload: { ...base.payload, options: [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }], ...over },
+    };
+  };
+
+  it.each(['attention.opened', 'attention.updated'] as const)('accepts a class and a default that names an option on %s', (type) => {
+    const [parsed] = parseMissionEvents([classified(type, { class: 'bookkeeping', defaultOptionId: 'yes' })]);
+    expect(parsed.payload).toMatchObject({ class: 'bookkeeping', defaultOptionId: 'yes' });
+  });
+
+  it.each(['money', 'irreversible', 'scope', 'bookkeeping'] as const)('accepts the class %s without a default', (attentionClass) => {
+    const [parsed] = parseMissionEvents([classified('attention.opened', { class: attentionClass })]);
+    expect(parsed.payload).toMatchObject({ class: attentionClass });
+    expect(parsed.payload).not.toHaveProperty('defaultOptionId');
+  });
+
+  it('keeps both fields optional: an item without them still parses unchanged', () => {
+    const [parsed] = parseMissionEvents([classified('attention.opened', {})]);
+    expect(parsed.payload).not.toHaveProperty('class');
+    expect(parsed.payload).not.toHaveProperty('defaultOptionId');
+  });
+
+  it.each([
+    ['an unknown class', { class: 'urgent' }, /class must be one of money, irreversible, scope, bookkeeping/],
+    ['a null class', { class: null }, /class must be one of money, irreversible, scope, bookkeeping/],
+    ['a default that names no option', { defaultOptionId: 'maybe' }, /defaultOptionId must name one of the item's options/],
+    ['a blank default', { defaultOptionId: ' ' }, /defaultOptionId/],
+  ])('refuses %s with a message that names the field', (_case, over, message) => {
+    expect(() => parseMissionEvents([classified('attention.updated', over)])).toThrowError(message);
+  });
+
+  it('refuses a default on an action item, which has no options to choose', () => {
+    const action = classified('attention.opened', { kind: 'action', options: [], class: 'bookkeeping', defaultOptionId: 'yes' });
+    expect(() => parseMissionEvents([action])).toThrowError(/defaultOptionId is refused on an action item/);
+    const actionWithOptions = classified('attention.opened', { kind: 'action', defaultOptionId: 'yes' });
+    expect(() => parseMissionEvents([actionWithOptions])).toThrowError(/defaultOptionId is refused on an action item/);
+  });
+
+  it('refuses the whole batch when one event carries an invalid class (atomic batch)', () => {
+    const good = classified('attention.opened', { class: 'money' });
+    const bad = { ...classified('attention.opened', { class: 'urgent' }), eventId: 'event-bad' };
+    let thrown: unknown;
+    try {
+      parseMissionEvents([good, bad]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(MissionControlError);
+    expect((thrown as MissionControlError).status).toBe(400);
+  });
+});

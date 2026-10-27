@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+import { AttentionClassBadge, statedDefaultLabel } from '@/components/features/mission-control/attention-class-view';
 import {
   deliveryStatus,
   formatMissionAge,
@@ -40,6 +41,7 @@ const MissionControlAnswerCard = ({
   onSubmit,
 }: IMissionAnswerCardProps) => {
   const { item } = draft;
+  const defaultLabel = statedDefaultLabel(item);
   const submitting = draft.status === 'submitting';
   const toggleOption = (optionId: string) => {
     const selected = draft.optionIds.includes(optionId);
@@ -55,6 +57,7 @@ const MissionControlAnswerCard = ({
       <CardHeader className="gap-3 px-4 pt-4 pb-3 sm:px-5 sm:pt-5">
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span className="rounded bg-muted px-2 py-1 font-medium text-foreground">{workspaceName}</span>
+          <AttentionClassBadge value={item.class} />
           <span>{item.kind === 'action' ? 'Action' : 'Decision'}</span>
           <span>·</span>
           <span>{formatMissionAge(item.createdAt)}</span>
@@ -91,6 +94,13 @@ const MissionControlAnswerCard = ({
             <span className="font-medium text-ui-blue">Recommendation: </span>
             <span className="break-words text-foreground/80">{item.recommendation}</span>
           </div>
+        )}
+
+        {defaultLabel !== null && (
+          <p className="break-words text-sm">
+            <span className="font-medium">Default: {defaultLabel}</span>
+            <span className="text-muted-foreground"> · not selected; choose it below if it is your answer</span>
+          </p>
         )}
 
         <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">

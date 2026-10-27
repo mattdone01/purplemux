@@ -21,7 +21,7 @@ import {
 } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
 import useBrowserTitle from '@/hooks/use-browser-title';
-import useMissionControl from '@/hooks/use-mission-control';
+import useMissionControl, { normalizeMissionItem } from '@/hooks/use-mission-control';
 import { useSelectWorkspace } from '@/hooks/use-sidebar-actions';
 import type {
   IMissionAnswerResponse,
@@ -117,7 +117,7 @@ const MissionControlPage = () => {
         const responseBody = await parseError(response);
         if (response.status === 409) {
           const latest = isAttentionItem(responseBody.current)
-            ? responseBody.current
+            ? normalizeMissionItem(responseBody.current)
             : snapshot?.items.find((candidate) => candidate.id === item.id) ?? submittingDraft.item;
           setDrafts((current) => ({
             ...current,

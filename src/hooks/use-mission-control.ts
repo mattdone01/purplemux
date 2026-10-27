@@ -2,11 +2,24 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { mergeMissionRefreshSnapshot } from '@/components/features/mission-control/mission-control-utils';
 import type {
   IMissionAnswerResponse,
+  IMissionAttentionItem,
   IMissionBootstrap,
   IMissionSnapshot,
 } from '@/types/mission-control';
 
 const POLL_INTERVAL_MS = 5_000;
+
+/** A server older than ADR-0031 omits `class` and `defaultOptionId`; every consumer reads one absence value, null. */
+export const normalizeMissionItem = (item: IMissionAttentionItem): IMissionAttentionItem => ({
+  ...item,
+  class: item.class ?? null,
+  defaultOptionId: item.defaultOptionId ?? null,
+});
+
+export const normalizeMissionSnapshot = (snapshot: IMissionSnapshot): IMissionSnapshot => ({
+  ...snapshot,
+  items: snapshot.items.map(normalizeMissionItem),
+});
 
 export interface IMissionPollScheduler {
   start: () => void;
@@ -107,7 +120,7 @@ const useMissionControl = (enabled = true): IMissionControlState => {
         }
         if (!response.ok) throw new Error(await responseError(response));
 
-        const incoming = await response.json() as IMissionSnapshot;
+        const incoming = normalizeMissionSnapshot(await response.json() as IMissionSnapshot);
         setSnapshot((current) => mergeMissionRefreshSnapshot(
           current,
           incoming,
@@ -159,7 +172,7 @@ const useMissionControl = (enabled = true): IMissionControlState => {
       const items = current.items.some((item) =>
         item.id === response.item.id && item.revision > response.item.revision)
         ? current.items
-        : replaceById(current.items, response.item);
+        : replaceById(current.items, normalizeMissionItem(response.item));
       const deliveries = current.deliveries.some((delivery) =>
         delivery.id === response.delivery.id && delivery.updatedAt > response.delivery.updatedAt)
         ? current.deliveries

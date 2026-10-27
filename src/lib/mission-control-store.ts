@@ -5,8 +5,10 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import type {
   IMissionAnswer,
+  IMissionAnswerClassCount,
   IMissionAnswerRequest,
   IMissionAnswerResponse,
+  IMissionAttentionClassInput,
   IMissionAttentionItem,
   IMissionBinding,
   IMissionBootstrap,
@@ -32,9 +34,12 @@ import {
   invalidMissionRequest,
   missionConflict,
 } from '@/lib/mission-control-errors';
+import { ATTENTION_CLASS_KEYS, MISSION_AUTO_ANSWER_ACTOR, attentionClassKey } from '@/lib/attention-class';
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.purplemux', 'mission-control.sqlite');
 const SCHEMA_VERSION = 4;
+const DAY_MS = 86_400_000;
+const ANSWER_CLASS_WINDOW_DAYS = 7;
 const HUMAN_INBOX_POLICY_GUIDANCE = 'On your next ordinary turn, the configured orchestrator should review legacy candidates: record workspace handling or explicitly identify the human-exclusive need. Reuse item IDs. Do not rerun bootstrap.';
 
 type TMissionIdentity = Omit<IMissionBinding, 'generation'>;
@@ -288,21 +293,26 @@ const runFromRow = (row: IRunRow): IMissionRun => ({
   updatedAt: row.updated_at,
 });
 
-const itemFromRow = (row: IItemRow): IMissionAttentionItem => ({
-  id: row.id,
-  workspaceId: row.workspace_id,
-  runId: row.run_id,
-  revision: row.revision,
-  state: row.state,
-  ...(JSON.parse(row.question_json) as IMissionQuestion),
-  evidence: JSON.parse(row.evidence_json) as IMissionEvidence,
-  answerId: row.answer_id,
-  resolution: row.resolution,
-  humanReview: parseJson<TMissionHumanReview>(row.human_review_json),
-  candidateReason: row.candidate_reason,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at,
-});
+const itemFromRow = (row: IItemRow): IMissionAttentionItem => {
+  const question = JSON.parse(row.question_json) as IMissionQuestion & IMissionAttentionClassInput;
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    runId: row.run_id,
+    revision: row.revision,
+    state: row.state,
+    ...question,
+    evidence: JSON.parse(row.evidence_json) as IMissionEvidence,
+    answerId: row.answer_id,
+    resolution: row.resolution,
+    humanReview: parseJson<TMissionHumanReview>(row.human_review_json),
+    candidateReason: row.candidate_reason,
+    class: question.class ?? null,
+    defaultOptionId: question.defaultOptionId ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
 
 const answerFromRow = (row: IAnswerRow): IMissionAnswer => ({
   id: row.id,
@@ -540,7 +550,9 @@ export class MissionControlStore {
       const where = workspaceId ? ' WHERE workspace_id = ?' : '';
       const args = workspaceId ? [workspaceId] : [];
       const runs = (this.database.prepare(`SELECT * FROM runs${where} ORDER BY updated_at DESC`).all(...args) as IRunRow[]).map(runFromRow);
+      const generatedAt = Date.now();
       const items = (this.database.prepare(`SELECT * FROM attention_items${where} ORDER BY updated_at DESC`).all(...args) as IItemRow[]).map(itemFromRow);
+      const answersByClass = this.answersByClass(generatedAt, workspaceId);
       const answers = (this.database.prepare(`SELECT * FROM answers${where} ORDER BY created_at DESC`).all(...args) as IAnswerRow[]).map(answerFromRow);
       const deliveries = (this.database.prepare(`SELECT * FROM deliveries${where} ORDER BY updated_at DESC`).all(...args) as IDeliveryRow[]).map(deliveryFromRow);
       const eventWhere = workspaceId ? 'WHERE workspace_id = ?' : '';
@@ -631,7 +643,7 @@ export class MissionControlStore {
       return {
         schemaVersion: 1,
         cursor,
-        generatedAt: Date.now(),
+        generatedAt,
         workspaces: merged,
         runs,
         items,
@@ -640,9 +652,40 @@ export class MissionControlStore {
         recentEvents,
         bootstrap,
         pendingBootstrapEntries,
+        answersByClass,
       };
     });
     return read();
+  };
+
+  /** ADR-0031 §3: answers of the last 7 UTC days (today included) per day, item class and actor kind. */
+  private answersByClass = (now: number, workspaceId?: string): IMissionAnswerClassCount[] => {
+    const tomorrow = (Math.floor(now / DAY_MS) + 1) * DAY_MS;
+    const since = tomorrow - ANSWER_CLASS_WINDOW_DAYS * DAY_MS;
+    const rows = this.database.prepare(`SELECT strftime('%Y-%m-%d', answer.created_at / 1000, 'unixepoch') AS day,
+        json_extract(item.question_json, '$.class') AS class, answer.actor = ? AS rule, COUNT(*) AS count
+      FROM answers answer JOIN attention_items item ON item.id = answer.item_id
+      WHERE answer.created_at >= ? AND answer.created_at < ?${workspaceId ? ' AND answer.workspace_id = ?' : ''}
+      GROUP BY day, class, rule`)
+      .all(MISSION_AUTO_ANSWER_ACTOR, since, tomorrow, ...(workspaceId ? [workspaceId] : [])) as Array<{
+        day: string; class: unknown; rule: number; count: number;
+      }>;
+    const counts = new Map<string, IMissionAnswerClassCount>();
+    for (const row of rows) {
+      const entry: IMissionAnswerClassCount = {
+        day: row.day,
+        class: attentionClassKey(row.class),
+        by: row.rule ? 'rule' : 'human',
+        count: 0,
+      };
+      const key = `${entry.day}|${entry.class}|${entry.by}`;
+      const current = counts.get(key) ?? entry;
+      current.count += row.count;
+      counts.set(key, current);
+    }
+    return [...counts.values()].sort((left, right) => left.day.localeCompare(right.day)
+      || ATTENTION_CLASS_KEYS.indexOf(left.class) - ATTENTION_CLASS_KEYS.indexOf(right.class)
+      || (left.by === right.by ? 0 : left.by === 'human' ? -1 : 1));
   };
 
   eventsAfter = (after: number, limit: number, workspaceId?: string): IMissionEventsResponse => {
@@ -1014,7 +1057,7 @@ export class MissionControlStore {
       WHERE run_id=? AND state IN ('queued','dispatching','submitted','held')`).run(now, runId);
   };
 
-  private questionFromItem = (item: IMissionAttentionItem): IMissionQuestion => ({
+  private questionFromItem = (item: IMissionAttentionItem): IMissionQuestion & IMissionAttentionClassInput => ({
     kind: item.kind,
     title: item.title,
     context: item.context,
@@ -1023,6 +1066,8 @@ export class MissionControlStore {
     recommendation: item.recommendation,
     blockingScope: item.blockingScope,
     canContinue: item.canContinue,
+    ...(item.class === null ? {} : { class: item.class }),
+    ...(item.defaultOptionId === null ? {} : { defaultOptionId: item.defaultOptionId }),
   });
 
   private stampHumanReview = (
