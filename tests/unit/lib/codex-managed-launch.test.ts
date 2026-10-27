@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const lifecycle = vi.hoisted(() => ({
   beginCodexLaunch: vi.fn(),
+  beginCodexLaunchLocked: vi.fn(),
   holdCodexLaunch: vi.fn(),
   holdCodexLaunchLocked: vi.fn(),
   markCodexLaunchSubmittedLocked: vi.fn(),
@@ -53,6 +54,33 @@ describe('managed Codex launch callers', () => {
     expect(provider.buildManagedCodexLaunchCommand).toHaveBeenCalledWith(intent);
     expect(status.markCodexLaunchPending).toHaveBeenCalledWith('tab-pins', 'codex-generation');
     expect(result).toEqual({ ok: true, launch: { ...intent, command: 'managed-command' } });
+  });
+
+  it('the locked prepare (a caller already holding the target lock) begins and holds without taking it again', async () => {
+    lifecycle.beginCodexLaunchLocked.mockResolvedValue({ ok: true, state: 'prepared', intent });
+    provider.buildManagedCodexLaunchCommand.mockRejectedValueOnce(new Error('build failed'));
+    const { prepareCodexManagedLaunchLocked } = await import('@/lib/providers/codex/managed-launch');
+    const result = await prepareCodexManagedLaunchLocked('ws-pins', 'tab-pins', null);
+    expect(lifecycle.beginCodexLaunchLocked).toHaveBeenCalledWith('ws-pins', 'tab-pins', { resumeSessionId: null, transitionToCodexPanel: true });
+    expect(lifecycle.holdCodexLaunchLocked).toHaveBeenCalledWith('ws-pins', 'tab-pins', intent.generation, 'build failed');
+    expect(lifecycle.beginCodexLaunch).not.toHaveBeenCalled();
+    expect(lifecycle.holdCodexLaunch).not.toHaveBeenCalled();
+    expect(lifecycle.withCodexTargetLock).not.toHaveBeenCalled();
+    expect(result).toEqual({ ok: false, reason: 'build failed' });
+  });
+
+  it('the locked submit sends and marks submitted without taking the target lock', async () => {
+    const { submitCodexManagedLaunchLocked } = await import('@/lib/providers/codex/managed-launch');
+    const result = await submitCodexManagedLaunchLocked('ws-pins', 'tab-pins', intent.generation);
+    expect(tmux.sendKeys).toHaveBeenCalledWith(intent.sessionName, 'managed-command');
+    expect(lifecycle.withCodexTargetLock).not.toHaveBeenCalled();
+    expect(result).toEqual({ ok: true, generation: intent.generation, phase: 'submitted' });
+  });
+
+  it('the unlocked submit takes the target lock', async () => {
+    const { submitCodexManagedLaunch } = await import('@/lib/providers/codex/managed-launch');
+    await submitCodexManagedLaunch('ws-pins', 'tab-pins', intent.generation);
+    expect(lifecycle.withCodexTargetLock).toHaveBeenCalledWith('ws-pins', 'tab-pins', expect.any(Function));
   });
 
   it('holds an unsafe replacement without sending or binding the new session', async () => {

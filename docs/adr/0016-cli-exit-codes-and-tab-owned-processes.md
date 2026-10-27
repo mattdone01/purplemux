@@ -24,6 +24,9 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 5 | not ready yet | `readiness-timeout` | yes, bounded |
 | 6 | server unreachable | `server-unreachable`: connection refused, no port or token configured, a read interrupted; `routes-absent`: a 404 without a JSON body on a `/api/cli/` route — no such route: an older server (the common case), a foreign server on the port, or a malformed id (story 27) | yes, bounded; `routes-absent` not until its cause is fixed |
 | 7 | not found | `lease-not-found`, `note-not-found`, `watch-not-found`, `inbox-not-found`, `deploy-not-found`, `config-not-found` | — |
+| 1 | unexpected error (ADR-0028, `tab restart`) | `restart-not-confirmed`: a process or the session outlived the reap; nothing was relaunched | inspect the tab first |
+| 2 | usage error (ADR-0028) | `restart-unsupported`: a web-browser, diff or agent-sessions tab | fix the command |
+| 3 | conflict (ADR-0028) | `tab-busy`: the tab is mid-turn or holds a pending launch or turn | when it is idle, or with `--interrupt` |
 
 3. stderr names the code and its class, e.g. `error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found`. A `readiness-timeout` names the waited milliseconds.
 4. A write that loses its connection after it connected exits 1 with `outcome-unknown`, not 6. The server may have acted on it, so a blind retry of `tab send` could type the prompt twice. A read, or a request that never connected, exits 6. Only undici's network failures (`fetch failed` / `terminated` with a coded cause) count as network failures; a request that could not be built is never sent and exits 1.

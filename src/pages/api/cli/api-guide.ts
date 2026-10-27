@@ -72,6 +72,9 @@ to an exit code through one table:
      7  not found                                lease-not-found, note-not-found,           —
                                                  watch-not-found, inbox-not-found,
                                                  deploy-not-found, config-not-found
+     1  unexpected error (tab restart, ADR-0028) restart-not-confirmed                      inspect the tab
+     2  usage error (tab restart, ADR-0028)      restart-unsupported                        fix the command
+     3  conflict (tab restart, ADR-0028)         tab-busy                                   when idle, or --interrupt
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -236,6 +239,35 @@ DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
               "killed": [{ "pid", "comm", "args" }], "survivors": [...] } — ok false means the layout kept
   the tab; the CLI then exits 1 (close-not-confirmed) instead of printing ok. Every kill is audited
   in ~/.purplemux/audit/coordination.jsonl.
+
+POST /api/cli/tabs/<tabId>/restart?workspaceId=WS
+  Body: { "clear"?: boolean, "interrupt"?: boolean }   (ADR-0028; own workspace only)
+  A fresh agent process under the SAME tab id: the tab's processes are reaped (as for a close),
+  its tmux session is recreated with the same name, and the server relaunches the agent with the
+  tab's own agentLaunchConfig (model, effort), cwd, scope, reportsTo and host. No tab-closing or
+  tab-closed fires, so the tab's token, leases, watches, probes, notes, grants, reports-to links
+  and Mission Control run binding stay. A hook-time token is replaced by a fresh launch token.
+  The agent resumes its last session where the provider can; clear starts a new one; a remote tab
+  restarts fresh. A terminal tab restarts its shell. The tab's registered background jobs die with
+  the reap and raise no failure; probes stay.
+  Response: { "ok": true, "workspaceId", "tabId", "resumed": boolean,
+              "resumeSkipped"?: "clear" | "no-session" | "remote" | "cwd-lost", "identity": "launch" | "hook" | "none",
+              "reaped": { "killed": N, "survivors": N }, "launchState"?: "active" | "held" }
+  400 { "code": "restart-unsupported" } (exit 2) for a web-browser, diff or agent-sessions tab.
+  404 { "code": "tab-not-found" } (exit 4). 409 { "code": "tab-busy", "cliState" } (exit 3) while
+  the tab is mid-turn or holds a pending launch or turn; interrupt: true abandons the turn, and the
+  audit line records it. 503 { "code": "remote-host-unreachable" } (exit 6): nothing was killed.
+  500 { "code": "restart-not-confirmed", "reaped" } (exit 1): a process or the session outlived the
+  reap, or the restart failed after the kill (a remote host that stops answering, the tab gone),
+  and nothing was relaunched. cwd-lost: the tab's cwd was gone, so the agent started fresh in the
+  nearest existing parent. An attached terminal is closed with 4002 "Tab restarting" (never 1000)
+  and re-attaches; a connect during the restart gets 4002. 403 forbidden (exit 3) for the admin token or another
+  workspace. Each restart appends one "tab-restart" line to ~/.purplemux/audit/coordination.jsonl.
+  The tab gains lastRestartAt in layout.json; the fleet row shows restartedAt.
+  The web UI and the phone use the cookie twin POST /api/tabs/<tabId>/restart?workspaceId=WS
+  (a human session and this server's Origin).
+  CLI: purplemux tab restart -w WS TAB_ID [--clear] [--interrupt] [--json]
+       prints "ok TAB_ID restarted (resumed)" or "(fresh)".
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000 }

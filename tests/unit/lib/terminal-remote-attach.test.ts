@@ -105,11 +105,20 @@ describe('remote attach (ADR-0022 §10, review r1 B1)', () => {
     expect(gone.close).toHaveBeenCalledWith(1011, 'Session not found');
   });
 
-  it('a local pty exit keeps today\'s 1000 without asking tmux', async () => {
+  it('a local pty exit asks tmux too (ADR-0028 §12): absent → 1000, present → 4001', async () => {
     const ws = await connect(LOCAL);
     fx.presence.mockClear();
+    fx.presence.mockResolvedValue('absent');
     fx.exit!({ exitCode: 0 });
+    await settle();
+    expect(fx.presence).toHaveBeenCalledWith(LOCAL);
     expect(ws.close).toHaveBeenCalledWith(1000, 'Session exited');
-    expect(fx.presence).not.toHaveBeenCalled();
+
+    fx.presence.mockResolvedValue('present');
+    const alive = await connect(LOCAL);
+    fx.exit!({ exitCode: 0, signal: 9 });
+    await settle();
+    expect(alive.close).toHaveBeenCalledWith(4001, 'Attach lost');
+    expect(alive.close).not.toHaveBeenCalledWith(1000, expect.anything());
   });
 });

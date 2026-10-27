@@ -137,6 +137,8 @@ export interface ITab {
   host?: string;
   cliState?: TCliState;
   dismissedAt?: number | null;
+  /** When `tab restart` last relaunched the tab under this id (ADR-0028), Unix ms. */
+  lastRestartAt?: number;
   /**
    * The watchdog's record of the last markerless stop (ADR-0018, L49): the poll
    * derives the idle nudge from it, so a server restart keeps a pending nudge

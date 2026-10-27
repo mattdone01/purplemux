@@ -172,6 +172,7 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
             .filter((item) => item.workspaceId === workspace.id && item.opener?.tabId === tab.id)
             .map((item) => ({ createdAt: item.createdAt, reviewed: item.reviewed }))
           : null,
+        restartedAt: tab.lastRestartAt ?? null,
       });
     }));
   }));

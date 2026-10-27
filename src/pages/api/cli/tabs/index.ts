@@ -8,8 +8,8 @@ import { resolveCliScope } from '@/lib/workspace-token';
 import { getProviderByPanelType } from '@/lib/providers';
 import { checkAgentAvailabilityForPanelType, toAgentAvailabilityError } from '@/lib/agent-availability';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
-import { buildClaudeFlags, buildRemoteClaudeLaunch, isValidModelName } from '@/lib/claude-command';
-import { grokProvider } from '@/lib/providers/grok';
+import { isValidModelName } from '@/lib/claude-command';
+import { buildFreshLaunchCommand, launchCodexManaged } from '@/lib/agent-launch';
 import { getStatusManager } from '@/lib/status-manager';
 import { createLogger } from '@/lib/logger';
 import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
@@ -19,11 +19,6 @@ import { tabIdentityOf } from '@/lib/tab-token';
 import { RemoteHostError, isValidRemoteHostName, readRemoteHosts, remoteDirExists } from '@/lib/remote-host';
 import fs from 'fs/promises';
 import path from 'path';
-import {
-  prepareCodexManagedLaunch,
-  submitCodexManagedLaunch,
-  waitForCodexManagedLaunch,
-} from '@/lib/providers/codex/managed-launch';
 import type { TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ILastEvent } from '@/types/status';
@@ -235,23 +230,15 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     // Agent tabs launch their CLI by default (mirrors UI tab creation) —
     // a bare shell made `tab send` briefs land in bash, not the agent.
     const shouldLaunch = launch !== false && isAgentPanelType(resolvedType);
-    let command: string | undefined;
-    if (shouldLaunch) {
-      if (resolvedType === 'claude-code') {
-        command = remoteHost
-          ? await buildRemoteClaudeLaunch(workspaceId, { model, effort: reasoning })
-          : `claude ${await buildClaudeFlags(workspaceId, { model, effort: reasoning })}`;
-      } else if (resolvedType === 'grok-cli') {
-        // Catch-all else is codex; routing grok through it launched codex
-        // inside a grok tab. Pin model/effort at launch the same as the others.
-        command = await grokProvider.buildLaunchCommand({ workspaceId, model, effort: reasoning });
-      }
-    }
+    const agentLaunchConfig = agentLaunchConfigFromOptions(model, reasoning);
+    const command = shouldLaunch
+      ? await buildFreshLaunchCommand(workspaceId, { panelType: resolvedType, host: remoteHost, agentLaunchConfig })
+      : undefined;
 
     try {
       const tab = await addTabToPane(workspaceId, paneId, name, typeof cwd === 'string' ? cwd : ws.directories[0], resolvedType, command, {
         scope: scope as string[] | undefined,
-        agentLaunchConfig: agentLaunchConfigFromOptions(model, reasoning),
+        agentLaunchConfig,
         reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
         reportOn: reportOnChecked.markers ?? undefined,
         host: remoteHost,
@@ -278,36 +265,34 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
       let codexLaunchState: 'active' | 'held' | undefined;
       if (shouldLaunch && resolvedType === 'codex-cli') {
-        const prepared = await prepareCodexManagedLaunch(workspaceId, tab.id);
-        if (!prepared.ok) {
+        const launched = await launchCodexManaged(workspaceId, tab.id);
+        if (!launched.ok && launched.step === 'prepare') {
           return res.status(500).json({
             error: 'Failed to prepare Codex launch',
-            reason: prepared.reason,
+            reason: launched.reason,
             tabId: tab.id,
             launchState: 'held',
           });
         }
-        const submitted = await submitCodexManagedLaunch(workspaceId, tab.id, prepared.launch.generation);
-        if (!submitted.ok) {
+        if (!launched.ok && launched.step === 'submit') {
           return res.status(500).json({
             error: 'Failed to submit Codex launch',
-            reason: submitted.reason,
+            reason: launched.reason,
             tabId: tab.id,
-            generation: submitted.generation,
-            launchState: submitted.phase,
+            generation: launched.generation,
+            launchState: launched.phase,
           });
         }
-        const activated = await waitForCodexManagedLaunch(workspaceId, tab.id, submitted.generation);
-        codexLaunchState = activated.ok ? activated.phase : 'held';
-        if (!activated.ok) {
+        if (!launched.ok) {
           return res.status(503).json({
             error: 'Codex launch was not confirmed',
-            reason: activated.reason,
+            reason: launched.reason,
             tabId: tab.id,
-            generation: activated.generation,
-            launchState: activated.phase,
+            generation: launched.generation,
+            launchState: launched.phase,
           });
         }
+        codexLaunchState = 'active';
       }
 
       return res.status(201).json({

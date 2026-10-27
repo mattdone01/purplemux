@@ -31,6 +31,33 @@ export interface ITabClosingEvent {
 
 export type TTabClosingListener = (event: ITabClosingEvent) => void;
 
+/**
+ * A restart (ADR-0028) kills and relaunches a tab's processes under the same
+ * tab id. `restarting` comes before the reap, so a watcher retires what would
+ * read the reap as a death, as for `closing`; `restarted` or `failed` follows.
+ * A restart never emits `tab-closing` or `tab-closed`: nothing keyed on the tab
+ * id is dropped.
+ */
+export interface ITabRestartEvent {
+  workspaceId: string;
+  tabId: string;
+  sessionName: string;
+  /** Pairs a `restarting` with its one `restarted` or `failed`. */
+  restartId: string;
+  phase: 'restarting' | 'restarted' | 'failed';
+}
+
+/** An open restart stops counting after this long: a backstop for an end event that never came. */
+export const RESTART_WINDOW_MS = 120_000;
+
+interface IOpenRestart {
+  tabId: string;
+  sessionName: string;
+  startedAt: number;
+}
+
+export type TTabRestartListener = (event: ITabRestartEvent) => void;
+
 export interface ILiveTab {
   workspaceId: string;
   tabId: string;
@@ -45,6 +72,9 @@ export interface ITabRef {
 interface ITabLifecycleState {
   listeners: Set<TTabClosedListener>;
   closingListeners?: Set<TTabClosingListener>;
+  restartListeners?: Set<TTabRestartListener>;
+  /** The restarts whose end event has not come yet, by restart id. */
+  openRestarts?: Map<string, IOpenRestart>;
   /** Per workspace, the tabs of the last layout written. Removals are computed from this, not from the layout's own reconciler slot. */
   known: Map<string, Map<string, string>>;
 }
@@ -55,6 +85,10 @@ const state = g.__ptTabLifecycle;
 // A state object made by an older module instance (a hot reload) has no closing set yet.
 if (!state.closingListeners) state.closingListeners = new Set();
 const closingListeners = state.closingListeners;
+if (!state.restartListeners) state.restartListeners = new Set();
+const restartListeners = state.restartListeners;
+if (!state.openRestarts) state.openRestarts = new Map();
+const openRestarts = state.openRestarts;
 
 export const onTabClosed = (listener: TTabClosedListener): (() => void) => {
   state.listeners.add(listener);
@@ -89,6 +123,43 @@ export const emitTabClosing = (event: ITabClosingEvent): void => {
     }
   }
 };
+
+export const onTabRestart = (listener: TTabRestartListener): (() => void) => {
+  restartListeners.add(listener);
+  return () => {
+    restartListeners.delete(listener);
+  };
+};
+
+export const emitTabRestart = (event: ITabRestartEvent): void => {
+  if (event.phase === 'restarting') {
+    openRestarts.set(event.restartId, { tabId: event.tabId, sessionName: event.sessionName, startedAt: Date.now() });
+  } else {
+    openRestarts.delete(event.restartId);
+  }
+  for (const listener of [...restartListeners]) {
+    try {
+      listener(event);
+    } catch (err) {
+      log.warn(`tab-restart listener failed for ${event.tabId}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+};
+
+const isOpen = (match: (restart: IOpenRestart) => boolean): boolean => {
+  const now = Date.now();
+  let open = false;
+  for (const [restartId, restart] of openRestarts) {
+    if (now - restart.startedAt >= RESTART_WINDOW_MS) openRestarts.delete(restartId);
+    else if (match(restart)) open = true;
+  }
+  return open;
+};
+
+/** A restart of the tab that owns this session is open (ADR-0028 §12): its attach end is not a session end. */
+export const isSessionRestarting = (sessionName: string): boolean => isOpen((restart) => restart.sessionName === sessionName);
+
+export const isTabRestarting = (tabId: string): boolean => isOpen((restart) => restart.tabId === tabId);
 
 const toMap = (tabs: readonly ITabRef[]): Map<string, string> =>
   new Map(tabs.map((t) => [t.id, t.sessionName]));

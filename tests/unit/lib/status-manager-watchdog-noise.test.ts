@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '@/lib/automated-prompt-dispatcher';
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
-import type { TLivenessEvent } from '@/types/liveness';
+import type { IBackgroundJob, TLivenessEvent } from '@/types/liveness';
 
 // Watchdog noise (h-selfimprove item 3; L38, L49, L37):
 //  - L38: a tab closed through the API raises no INACTIVE; a tab whose agent dies unclosed still does.
@@ -20,6 +20,9 @@ const state = vi.hoisted(() => ({
 const liveness = vi.hoisted(() => ({
   tick: vi.fn(async () => {}),
   removeTab: vi.fn(),
+  takeJobs: vi.fn(async (_workspaceId: string, _tabId: string): Promise<IBackgroundJob[]> => []),
+  registerJob: vi.fn(async (_job: IBackgroundJob) => {}),
+  isJobAlive: vi.fn((_job: IBackgroundJob) => true),
   statusForTab: vi.fn(async () => ({ probes: [], backgroundJobs: [] as Array<{ pid: number; alive: boolean }> })),
   reconcileJobs: vi.fn(async (_tabId: string, _emit: (e: TLivenessEvent) => void) => ({ reported: 0, pendingDead: 0 })),
 }));
@@ -118,6 +121,7 @@ beforeEach(async () => {
   state.home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-watchdog-noise-'));
   liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [] });
   liveness.reconcileJobs.mockResolvedValue({ reported: 0, pendingDead: 0 });
+  liveness.takeJobs.mockResolvedValue([]);
 });
 
 afterEach(async () => {
@@ -200,6 +204,152 @@ describe('no INACTIVE after tab close (behaviour 3, L38)', () => {
     getStatusManager().shutdown();
     delete (globalThis as { __ptStatusManager?: unknown }).__ptStatusManager;
     closing.mockRestore();
+  });
+});
+
+describe('no INACTIVE and no job failure across a restart (ADR-0028)', () => {
+  const restart = (phase: 'restarting' | 'restarted' | 'failed', restartId = 'r-1') => ({ workspaceId: 'ws-1', tabId: 'w', restartId, phase });
+  const RESTART_JOB = { workspaceId: 'ws-1', tabId: 'w', pid: 42, label: 'resilience-gate', registeredAt: 0 };
+
+  it('a restarting tab is not judged while its processes are reaped, and its entry stays', async () => {
+    const { manager, entry, internals, paste } = await setup();
+    manager.handleTabRestart(restart('restarting'));
+    await manager.poll();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(entry.cliState).toBe('ready-for-review');
+    expect(internals.tabs.get('w')).toBe(entry);
+    expect(paste).not.toHaveBeenCalled();
+    expect(liveness.removeTab).not.toHaveBeenCalled();
+  });
+
+  it('takes the tab\'s registered background jobs with reason tab-restart; their exit raises nothing', async () => {
+    const { manager, internals, paste, alerts } = await setup();
+    liveness.takeJobs.mockResolvedValueOnce([RESTART_JOB]);
+    manager.handleTabRestart(restart('restarting'));
+    expect(liveness.takeJobs).toHaveBeenCalledWith('ws-1', 'w');
+    await internals.handleLivenessEvent(bg('bg-failed'));
+    expect(paste).not.toHaveBeenCalled();
+    expect(alerts).not.toHaveBeenCalled();
+  });
+
+  it.each(['restarted', 'failed'] as const)('%s restores the checks: a dead agent then raises INACTIVE', async (phase) => {
+    const { manager, entry, sent } = await setup();
+    manager.handleTabRestart(restart('restarting'));
+    await manager.poll();
+    manager.handleTabRestart(restart(phase));
+    await manager.poll();
+    expect(entry.cliState).toBe('inactive');
+    await vi.waitFor(() => expect(sent().map((s) => s.message)).toEqual([expect.stringContaining('INACTIVE')]));
+  });
+
+  it('failed gives the taken jobs back (a process may have survived); restarted does not', async () => {
+    const { manager } = await setup();
+    liveness.takeJobs.mockResolvedValueOnce([RESTART_JOB]);
+    manager.handleTabRestart(restart('restarting', 'r-fail'));
+    manager.handleTabRestart(restart('failed', 'r-fail'));
+    await vi.waitFor(() => expect(liveness.registerJob).toHaveBeenCalledWith(RESTART_JOB));
+
+    liveness.takeJobs.mockResolvedValueOnce([RESTART_JOB]);
+    liveness.registerJob.mockClear();
+    manager.handleTabRestart(restart('restarting', 'r-ok'));
+    manager.handleTabRestart(restart('restarted', 'r-ok'));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(liveness.registerJob).not.toHaveBeenCalled();
+  });
+
+  it('a failed restart gives back only the jobs that survived the reap', async () => {
+    const { manager } = await setup();
+    const killed = { ...RESTART_JOB, pid: RESTART_JOB.pid + 1 };
+    liveness.takeJobs.mockResolvedValueOnce([RESTART_JOB, killed]);
+    liveness.isJobAlive.mockImplementation((job: IBackgroundJob) => job.pid !== killed.pid);
+    manager.handleTabRestart(restart('restarting', 'r-part'));
+    manager.handleTabRestart(restart('failed', 'r-part'));
+    await vi.waitFor(() => expect(liveness.registerJob).toHaveBeenCalledWith(RESTART_JOB));
+    expect(liveness.registerJob).not.toHaveBeenCalledWith(killed);
+    liveness.isJobAlive.mockImplementation(() => true);
+  });
+
+  it('a failed restart of a tab closed meanwhile gives no job back', async () => {
+    const { manager } = await setup();
+    liveness.takeJobs.mockResolvedValueOnce([RESTART_JOB]);
+    manager.handleTabRestart(restart('restarting'));
+    manager.removeTab('w');
+    manager.handleTabRestart(restart('failed'));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(liveness.registerJob).not.toHaveBeenCalled();
+  });
+
+  it('restarting → closing → restarted leaves the tab retired', async () => {
+    const { manager, entry, paste } = await setup();
+    manager.handleTabRestart(restart('restarting'));
+    manager.handleTabClosing('w', 'closing');
+    manager.handleTabRestart(restart('restarted'));
+    await manager.poll();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(entry.cliState).toBe('ready-for-review');
+    expect(paste).not.toHaveBeenCalled();
+  });
+
+  it('removeTab → restarted leaves the tab retired: a poll does not bring the closed tab back', async () => {
+    const { manager, internals, paste } = await setup();
+    manager.handleTabRestart(restart('restarting'));
+    manager.removeTab('w');
+    manager.handleTabRestart(restart('restarted'));
+    await manager.poll();
+    expect(internals.tabs.has('w')).toBe(false);
+    expect(paste).not.toHaveBeenCalled();
+  });
+
+  it('overlapping restarts restore the checks only after the last end', async () => {
+    const { manager, entry, sent } = await setup();
+    manager.handleTabRestart(restart('restarting', 'r-1'));
+    manager.handleTabRestart(restart('restarting', 'r-2'));
+    manager.handleTabRestart(restart('restarted', 'r-1'));
+    await manager.poll();
+    expect(entry.cliState).toBe('ready-for-review');
+    manager.handleTabRestart(restart('restarted', 'r-2'));
+    await manager.poll();
+    expect(entry.cliState).toBe('inactive');
+    await vi.waitFor(() => expect(sent()).toHaveLength(1));
+  });
+
+  it('an aborted close during an open restart keeps the tab retired until the restart ends', async () => {
+    const { manager, entry } = await setup();
+    manager.handleTabRestart(restart('restarting'));
+    manager.handleTabClosing('w', 'closing');
+    manager.handleTabClosing('w', 'aborted');
+    await manager.poll();
+    expect(entry.cliState).toBe('ready-for-review');
+    manager.handleTabRestart(restart('restarted'));
+    await manager.poll();
+    expect(entry.cliState).toBe('inactive');
+  });
+
+  it('a job store that refuses the retirement is logged, never thrown', async () => {
+    const { manager } = await setup();
+    liveness.takeJobs.mockRejectedValueOnce(new Error('store unreadable'));
+    expect(() => manager.handleTabRestart(restart('restarting'))).not.toThrow();
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
+  it('wires tab-restart into the production StatusManager, and never as a close', async () => {
+    const { StatusManager, getStatusManager } = await import('@/lib/status-manager');
+    const restarted = vi.spyOn(StatusManager.prototype, 'handleTabRestart').mockImplementation(() => {});
+    const closing = vi.spyOn(StatusManager.prototype, 'handleTabClosing');
+    const removed = vi.spyOn(StatusManager.prototype, 'removeTab');
+    delete (globalThis as { __ptStatusManager?: unknown }).__ptStatusManager;
+    getStatusManager();
+    const { emitTabRestart } = await import('@/lib/tab-lifecycle');
+    emitTabRestart({ workspaceId: 'ws-1', tabId: 'tab-x', sessionName: 's-x', restartId: 'r-x', phase: 'restarting' });
+    emitTabRestart({ workspaceId: 'ws-1', tabId: 'tab-x', sessionName: 's-x', restartId: 'r-x', phase: 'restarted' });
+    expect(restarted.mock.calls.map(([event]) => [event.restartId, event.phase])).toEqual([['r-x', 'restarting'], ['r-x', 'restarted']]);
+    expect(closing).not.toHaveBeenCalled();
+    expect(removed).not.toHaveBeenCalled();
+    getStatusManager().shutdown();
+    delete (globalThis as { __ptStatusManager?: unknown }).__ptStatusManager;
+    restarted.mockRestore();
+    closing.mockRestore();
+    removed.mockRestore();
   });
 });
 

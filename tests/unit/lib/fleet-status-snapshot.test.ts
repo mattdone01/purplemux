@@ -68,6 +68,13 @@ describe('buildFleetView', () => {
     expect(view.errors).toEqual([]);
   });
 
+  it('reads each tab\'s lastRestartAt from the layout as restartedAt (ADR-0028)', async () => {
+    deps.agentTabs = async () => [tab('tab-busy', { lastRestartAt: NOW - 7 * MIN }), tab('tab-idle')];
+    const view = await buildFleetView(deps, NOW);
+    expect(row(view, 'tab-busy').restartedAt).toBe(NOW - 7 * MIN);
+    expect(row(view, 'tab-idle').restartedAt).toBeNull();
+  });
+
   it('also captures a tab WAITING at its prompt, never a tab mid-turn', async () => {
     deps.agentTabs = async () => [tab('tab-waiting'), tab('tab-busy')];
     deps.statuses = () => ({

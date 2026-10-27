@@ -537,21 +537,33 @@ export const renameTabInPane = async (wsId: string, paneId: string, tabId: strin
   });
 
 export const restartTabSession = async (wsId: string, paneId: string, tabId: string, command?: string): Promise<boolean> =>
-  withOrchestrationMappingRead(wsId, () => withLock(async () => {
+  withOrchestrationMappingRead(wsId, async () => (await restartTabSessionUnguarded(wsId, paneId, tabId, command)).found);
+
+/** `cwdLost`: the tab's cwd was gone, so the session started in the nearest existing parent and no command was typed. */
+export type TRestartSessionResult = { found: false } | { found: true; cwdLost: boolean };
+
+/**
+ * `restartTabSession` without the workspace mapping read guard, for a caller
+ * that already holds it (`tab restart` inside `withAgentDispatchLock`). The
+ * mapping lease is not re-entrant and a queued writer blocks later readers, so
+ * a second read under the first deadlocks (ADR-0028 §2).
+ */
+export const restartTabSessionUnguarded = async (wsId: string, paneId: string, tabId: string, command?: string): Promise<TRestartSessionResult> =>
+  withLock(async (): Promise<TRestartSessionResult> => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
-    if (!layout) return false;
+    if (!layout) return { found: false };
 
     const pane = collectPanes(layout.root).find((p) => p.id === paneId);
-    if (!pane) return false;
+    if (!pane) return { found: false };
 
     const tab = pane.tabs.find((t) => t.id === tabId);
-    if (!tab) return false;
+    if (!tab) return { found: false };
 
     if (tab.host) registerSessionHost(tab.sessionName, tab.host);
     // A remote host that does not answer is no proof the session is gone: never recreate over it (B2).
     const exists = tab.host ? await hasSessionOrUnreachable(tab.sessionName) : await hasSession(tab.sessionName);
-    if (exists) return true;
+    if (exists) return { found: true, cwdLost: false };
 
     // A remote cwd is checked by the remote tmux, which starts a missing one in HOME (ADR-0022 §8).
     const effectiveCwd = tab.host ? tab.cwd : await resolveExistingDir(tab.cwd);
@@ -572,8 +584,15 @@ export const restartTabSession = async (wsId: string, paneId: string, tabId: str
       layout.updatedAt = new Date().toISOString();
       await writeLayoutFile(layout, filePath);
     }
-    return true;
-  }));
+    return { found: true, cwdLost };
+  });
+
+/** Stamp a tab's last restart (ADR-0028); older releases ignore the field. */
+export const markTabRestarted = async (wsId: string, tabId: string, at: number): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    tab.lastRestartAt = at;
+    return { changed: true, value: undefined };
+  })).found;
 
 export const reconcileTabCwd = async (sessionName: string): Promise<void> =>
   withLock(async () => {

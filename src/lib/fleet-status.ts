@@ -216,6 +216,7 @@ export const deriveFleetRow = (facts: IFleetTabFacts, now: number, thresholds: I
     endLineUnknown: (result.state === 'idle' || result.state === 'ready-for-review') && endLineUnknown(facts),
     inbox,
     flags: flagsOf(facts, result, lastLine, waits, inbox, lastActivityAt, now, thresholds),
+    restartedAt: facts.restartedAt ?? null,
   };
 };
 

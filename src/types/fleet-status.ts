@@ -62,6 +62,8 @@ export interface IFleetRow {
   /** null when the SM inbox could not be read. */
   inbox: IFleetInbox | null;
   flags: IFleetFlag[];
+  /** When `tab restart` last relaunched the tab (ADR-0028); null when it never did. */
+  restartedAt?: number | null;
 }
 
 export interface IFleetUnattributed {
@@ -115,4 +117,6 @@ export interface IFleetTabFacts {
   composer: { reading: TComposerReading; since: number | null } | null;
   /** Open SM-inbox items this tab opened; null when the SM inbox could not be read. */
   inbox: Array<{ createdAt: number; reviewed: boolean }> | null;
+  /** The layout's `lastRestartAt` (ADR-0028); null when the tab was never restarted. */
+  restartedAt?: number | null;
 }

@@ -40,17 +40,29 @@ Option 3. `src/lib/tab-restart.ts` (new) exports `restartTab({workspaceId, tabId
 4. **Remote tab** (ADR-0022). The host is probed first (`hasSessionOrUnreachable`); an unreachable host → 503
    `remote-host-unreachable` (exit 6), and nothing is killed. A remote agent restarts fresh only: the resume path is local
    only (`auto-resume.ts`), so the answer says `resumed: false, resumeSkipped: 'remote'`.
-5. **Lifecycle signal.** Before the reap, `emitTabRestart({workspaceId, tabId, sessionName, phase: 'restarting'})`
-   (new, `src/lib/tab-lifecycle.ts`). The StatusManager retires the tab's watchdog checks as it does for `closing`, and
-   retires the tab's registered background jobs with reason `tab-restart` (the reap kills them). Probes and watches stay.
-   After the launch, `phase: 'restarted'` (or `'failed'`) restores the checks. **No `tab-closing` and no `tab-closed`
-   event fires**, so leases, watches, probes, notes, grants, `reportsTo` and the run binding stay as they are.
+5. **Lifecycle signal.** Before the reap, `emitTabRestart({workspaceId, tabId, sessionName, restartId, phase:
+   'restarting'})` (`src/lib/tab-lifecycle.ts`). The StatusManager retires the tab's watchdog checks as it does for
+   `closing`, and retires the tab's registered background jobs with reason `tab-restart`. Probes and watches stay. Every
+   `restarting` is followed by exactly one `restarted` or `failed` with the same `restartId`, sent from a `finally` in
+   `restartTab` after the Codex confirmation; a refusal before `restarting` sends nothing. `tab-lifecycle.ts` keeps the
+   open restarts (`isSessionRestarting`, `isTabRestarting`); one older than 120 s no longer counts. The StatusManager's end
+   event restores only the retirement its own `restarting` set; it never clears a `closing` or closed-tab retirement.
+   **No `tab-closing` and no `tab-closed` event fires**, so leases, watches, probes, notes, grants, `reportsTo` and the
+   run binding stay as they are. For the run binding, "stay" means the tab's binding rows are kept and stay keyed to the
+   tab; its identity `(tabId, providerId, sessionId, runtimeGeneration)` advances on a Codex restart and on `--clear`,
+   exactly as auto-resume does. A `failed` restart gives the retired background jobs back (a process may have survived).
 6. **Kill.** `killSession(sessionName, {tabId})`. If a survivor remains or the session is still present, the service
-   stops: 500 `restart-not-confirmed` (exit 1), and nothing is relaunched.
+   stops: 500 `restart-not-confirmed` (exit 1), and nothing is relaunched. A failure after the kill (a remote host that
+   stops answering, the tab gone from the layout) answers the same code with the reap counts; 503
+   `remote-host-unreachable` stays reserved for "nothing was killed" (§4).
 7. **Recreate.** `restartTabSession(wsId, paneId, tabId)` with no command. The tab token follows `ensureTabToken`: a
    launch token is kept; a hook token is replaced by a fresh launch token, so the tab reads `identity: launch` after it.
+   If the tab's cwd is gone, the session starts in the nearest existing parent and the agent starts fresh
+   (`resumeSkipped: 'cwd-lost'`): its session belongs to the directory it ran in.
 8. **Launch.** One launcher, `launchAgentInTab(tab, {resumeSessionId})` in `src/lib/agent-launch.ts` (new), extracted
-   from `sendResumeKeys` and from the create route's builders; auto-resume and `POST /api/cli/tabs` call it too. It uses
+   from `sendResumeKeys` and from the create route's builders; auto-resume calls it. `POST /api/cli/tabs` calls the
+   launcher's builders (`buildFreshLaunchCommand`, `launchCodexManaged`) inside `addTabToPane`'s layout write, because a
+   create types its command in that one atomic write (ratified at the story 04 CONFIRM). It uses
    the persisted `agentLaunchConfig` (model, effort), `cwd`, `scope` and `host`. Resume when not `clear`, the provider
    reads a session id from the tab, and the tab is local; otherwise a fresh launch. Codex uses its managed launch
    (prepare, submit, wait). No caller text reaches the session.
@@ -60,14 +72,25 @@ Option 3. `src/lib/tab-restart.ts` (new) exports `restartTab({workspaceId, tabId
 10. **Routes.** `POST /api/cli/tabs/{tabId}/restart?workspaceId=WS` (`authorizeWorkspaceMutation`: own workspace only;
     the admin token and every other workspace get `forbidden`, ADR-0021) and `POST /api/tabs/{tabId}/restart?workspaceId=WS`
     (`requireMissionHumanMutation`: cookie and this server's Origin). Body `{clear?: boolean, interrupt?: boolean}`.
-    200 `{ok: true, workspaceId, tabId, resumed, resumeSkipped?: 'clear'|'no-session'|'remote', identity:
+    200 `{ok: true, workspaceId, tabId, resumed, resumeSkipped?: 'clear'|'no-session'|'remote'|'cwd-lost', identity:
     'launch'|'hook'|'none', reaped: {killed, survivors}, launchState?: 'active'|'held'}`; 404 `tab-not-found` (exit 4).
-    The existing dead-session route is unchanged.
+    The existing dead-session route keeps its behaviour; it takes the tab's target lock (§12).
 11. **CLI.** `purplemux tab restart -w WS TAB [--clear] [--interrupt] [--json]` prints `ok <TAB> restarted (resumed)` or
     `(fresh)`. The web tab menu gains "Restart" and "Restart fresh"; the phone gains the same (story 15).
+12. **Attached terminals.** A restart is never a session end for an attached client. The terminal server closes an
+    attach with 1000 only when no restart of the tab is open (checked at the exit and again after the presence probe) and
+    tmux says the session is absent, for local and remote tabs alike. An attach that ends while the tab restarts closes
+    with 4002 `Tab restarting`. A connect while it restarts gets 4002 before any probe or attach, so no keystroke reaches
+    the session while the launch is typed. Any other attach end is 4001. The web client retries 4002 every second, up to
+    120 times, without spending its backoff budget; 1000 is still the only code that closes a tab. A close during a
+    restart is not refused: it waits behind the restart's mapping read guard and closes the restarted tab with the normal
+    close events. The dead-session route takes the tab's target lock, so it cannot recreate the session between the reap
+    and its confirmation.
 
 ## Consequences
 - A tab keeps every binding across a restart; an orchestrator can roll a hook change through its workers by id.
 - Create, auto-resume and restart build launch commands in one place; a launch flag change has one site.
 - A restart kills the tab's background jobs (they are tab-owned, ADR-0016) without a "background job failed" nudge.
 - The restart of a busy tab needs an explicit `--interrupt`; an unattended loop cannot kill a turn by accident.
+- A desktop browser, the phone web surface and the phone app stay on a restarting tab and re-attach to the new session. A
+  client built before this change reads 4002 as a disconnect and retries with backoff.

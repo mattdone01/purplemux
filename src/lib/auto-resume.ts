@@ -1,26 +1,23 @@
-import { recordOrchestrationLaunch } from '@/lib/orchestration-activity';
 import { withOrchestrationMappingsRead } from '@/lib/orchestration-mapping-lock';
 import { readLayoutFile, resolveLayoutFile, collectAllTabs } from '@/lib/layout-store';
-import { hasSession, createSession, getPaneCurrentCommand, getSessionPanePid, sendKeysSeparated } from '@/lib/tmux';
+import { hasSession, createSession, getPaneCurrentCommand, getSessionPanePid } from '@/lib/tmux';
 import { getWorkspaces } from '@/lib/workspace-store';
 import { getProviderByPanelType, getProviderByProcessName } from '@/lib/providers';
 import type { IAgentPreflight, IAgentProvider } from '@/lib/providers/types';
-import { getStatusManager } from '@/lib/status-manager';
 import { getChildPids, getProcessArgs } from '@/lib/process-utils';
 import { createLogger } from '@/lib/logger';
-import { agentLaunchOptionsForTab } from '@/lib/agent-launch-policy';
+import { launchAgentInTab } from '@/lib/agent-launch';
 import type { IAgentLaunchConfig } from '@/types/terminal';
-import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
-import {
-  prepareCodexManagedLaunch,
-  submitCodexManagedLaunch,
-  waitForCodexManagedLaunch,
-} from '@/lib/providers/codex/managed-launch';
 
 const log = createLogger('auto-resume');
 
 const SHELL_READY_DELAY_MS = 500;
 const SAFE_SHELLS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash']);
+const CODEX_RESUME_FAILURE = {
+  prepare: 'Cannot prepare managed Codex resume',
+  submit: 'Cannot submit managed Codex resume',
+  activate: 'Managed Codex resume not confirmed',
+} as const;
 
 interface IAutoResumeTarget {
   workspaceId: string;
@@ -112,41 +109,17 @@ const sendResumeKeys = async (target: IAutoResumeTarget): Promise<boolean> => {
       return false;
     }
 
-    if (target.provider.id === CODEX_PROVIDER_ID) {
-      const prepared = await prepareCodexManagedLaunch(target.workspaceId, target.tabId, target.sessionId);
-      if (!prepared.ok) {
-        log.warn(`Cannot prepare managed Codex resume: ${target.tmuxSession} — ${prepared.reason}`);
-        return false;
-      }
-      const submitted = await submitCodexManagedLaunch(
-        target.workspaceId,
-        target.tabId,
-        prepared.launch.generation,
-      );
-      if (!submitted.ok) {
-        log.warn(`Cannot submit managed Codex resume: ${target.tmuxSession} — ${submitted.reason}`);
-        return false;
-      }
-      const activated = await waitForCodexManagedLaunch(
-        target.workspaceId,
-        target.tabId,
-        submitted.generation,
-      );
-      if (!activated.ok) {
-        log.warn(`Managed Codex resume not confirmed: ${target.tmuxSession} — ${activated.reason}`);
-        return false;
-      }
-      return true;
-    }
-
-    const resumeCmd = await target.provider.buildResumeCommand(target.sessionId, {
-      workspaceId: target.workspaceId,
-      ...agentLaunchOptionsForTab(target),
-    });
     log.debug(`Sending resume: ${target.tmuxSession} → ${target.sessionId}`);
-    await recordOrchestrationLaunch(target.workspaceId, target.tabId, target.tmuxSession);
-    getStatusManager().markAgentLaunch(target.tabId);
-    await sendKeysSeparated(target.tmuxSession, resumeCmd);
+    const launched = await launchAgentInTab({
+      workspaceId: target.workspaceId,
+      tabId: target.tabId,
+      sessionName: target.tmuxSession,
+      agentLaunchConfig: target.agentLaunchConfig,
+    }, { provider: target.provider, resumeSessionId: target.sessionId });
+    if (launched.kind === 'codex' && !launched.outcome.ok) {
+      log.warn(`${CODEX_RESUME_FAILURE[launched.outcome.step]}: ${target.tmuxSession} — ${launched.outcome.reason}`);
+      return false;
+    }
 
     return true;
   } catch (err) {
