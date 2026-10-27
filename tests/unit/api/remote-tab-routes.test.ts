@@ -14,7 +14,7 @@ const fx = vi.hoisted(() => ({
   findTab: vi.fn(),
   hasSessionOrUnreachable: vi.fn(async (_name: string) => true),
   patchTab: vi.fn(async () => ({ ok: true })),
-  restartTabSession: vi.fn(async () => true),
+  restartTabSessionUnguarded: vi.fn(async () => ({ found: true, cwdLost: false })),
   removeTabFromPane: vi.fn(async () => true),
   closePaneInLayout: vi.fn(async () => ({ root: {} })),
   deletePane: vi.fn(async () => {}),
@@ -35,7 +35,7 @@ vi.mock('@/lib/tmux', () => ({
 vi.mock('@/lib/human-mutation', () => ({ authorizeHumanMutation: vi.fn(async () => true) }));
 vi.mock('@/lib/layout-store', () => ({
   patchTab: fx.patchTab,
-  restartTabSession: fx.restartTabSession,
+  restartTabSessionUnguarded: fx.restartTabSessionUnguarded,
   removeTabFromPane: fx.removeTabFromPane,
   closePaneInLayout: fx.closePaneInLayout,
   deletePane: fx.deletePane,
@@ -56,6 +56,7 @@ vi.mock('@/lib/status-manager', () => ({
 }));
 vi.mock('@/lib/orchestration-activity', () => ({ recordOrchestrationLaunch: fx.recordOrchestrationLaunch }));
 vi.mock('@/lib/orchestration-mapping-lock', () => ({ withOrchestrationMappingRead: async (_ws: string, work: () => Promise<unknown>) => work() }));
+vi.mock('@/lib/providers/codex/launch-lifecycle', () => ({ withCodexTargetLock: async (_ws: string, _tab: string, work: () => Promise<unknown>) => work() }));
 vi.mock('@/lib/providers', () => ({ getProviderByPanelType: () => null }));
 vi.mock('@/lib/liveness-manager', () => ({ getLivenessManager: () => ({ statusForTab: async () => ({ probes: [], backgroundJobs: [] }) }) }));
 vi.mock('@/lib/tab-token', () => ({ tabIdentityOf: () => 'launch' }));
@@ -120,7 +121,7 @@ describe('routes a remote tab reaches (ADR-0022, review r1)', () => {
   });
 
   it.each([
-    ['UI restart', '@/pages/api/layout/pane/[paneId]/tabs/[tabId]', 'POST', { paneId: 'pane-p', tabId: 'tab-r', workspace: 'ws-a' }, 'restartTabSession'],
+    ['UI restart', '@/pages/api/layout/pane/[paneId]/tabs/[tabId]', 'POST', { paneId: 'pane-p', tabId: 'tab-r', workspace: 'ws-a' }, 'restartTabSessionUnguarded'],
     ['UI tab close', '@/pages/api/layout/pane/[paneId]/tabs/[tabId]', 'DELETE', { paneId: 'pane-p', tabId: 'tab-r', workspace: 'ws-a' }, 'removeTabFromPane'],
     ['pane close', '@/pages/api/layout/pane/[paneId]', 'DELETE', { paneId: 'pane-p', workspace: 'ws-a' }, 'closePaneInLayout'],
     ['workspace delete', '@/pages/api/workspace/[workspaceId]', 'DELETE', { workspaceId: 'ws-a' }, 'deleteWorkspace'],

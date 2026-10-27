@@ -2,7 +2,7 @@ import { toast } from 'sonner';
 import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/components/ui/alert-dialog';
 import { useState, useRef, useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { X, Globe, GitCompareArrows, History, Crown } from 'lucide-react';
+import { X, Globe, GitCompareArrows, History, Crown, RotateCcw, Loader2 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import ClaudeCodeIcon from '@/components/icons/claude-code-icon';
 import OpenAIIcon from '@/components/icons/openai-icon';
@@ -22,6 +22,7 @@ import { useLayoutStore } from '@/hooks/use-layout';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { patchWorkspaceOrchestration } from '@/lib/orchestration-client';
 import GrantBadge from '@/components/features/workspace/grant-badge';
+import { requestTabRestart } from '@/lib/tab-restart-client';
 
 interface IPaneTabItemProps {
   tab: ITab;
@@ -67,6 +68,9 @@ const PaneTabItem = ({
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState('');
   const [replacement, setReplacement] = useState<{ incumbent: string; revision: number } | null>(null);
+  const [restarting, setRestarting] = useState(false);
+  const [busyRestart, setBusyRestart] = useState<{ clear: boolean } | null>(null);
+  const canRestart = isAgentTab || !tab.panelType || tab.panelType === 'terminal';
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -106,11 +110,26 @@ const PaneTabItem = ({
     } else void applyDesignation(revision, false);
   };
 
+  const runRestart = async (clear: boolean, interrupt = false) => {
+    if (!wsId || restarting) return;
+    setRestarting(true);
+    const outcome = await requestTabRestart(wsId, tab.id, { clear, interrupt });
+    setRestarting(false);
+    if (outcome.ok) {
+      toast.success(outcome.answer.resumed ? t('tabRestarted') : t('tabRestartedFresh'));
+    } else if (outcome.code === 'tab-busy') {
+      setBusyRestart({ clear });
+    } else {
+      toast.error(outcome.message);
+    }
+  };
+
   const tabEl = (
     <div
       data-tab-id={tab.id}
       role="tab"
       aria-selected={isActive}
+      aria-busy={restarting}
       tabIndex={isActive ? 0 : -1}
       className={cn(
         'group relative flex min-w-[104px] max-w-[170px] cursor-pointer items-center gap-1 border-b-2 px-2 text-xs select-none',
@@ -150,7 +169,11 @@ const PaneTabItem = ({
         />
       ) : (
         <>
-          <TabStatusIndicator tabId={tab.id} panelType={tab.panelType} />
+          {restarting ? (
+            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" aria-label={t('restartingTab')} />
+          ) : (
+            <TabStatusIndicator tabId={tab.id} panelType={tab.panelType} />
+          )}
           {isOrchestrator && (
             <Crown className="h-3 w-3 shrink-0 text-ui-amber" aria-label={to('orchestratorBadge')} />
           )}
@@ -205,17 +228,29 @@ const PaneTabItem = ({
     </div>
   );
 
-  if (!isAgentTab) return tabEl;
+  if (!canRestart) return tabEl;
 
   return (
     <>
     <ContextMenu>
       <ContextMenuTrigger render={tabEl} />
       <ContextMenuContent>
-        <ContextMenuItem onClick={handleToggleOrchestrator}>
-          <Crown className="mr-2 h-3.5 w-3.5" />
-          {isOrchestrator ? to('unsetOrchestrator') : to('setAsOrchestrator')}
+        {isAgentTab && (
+          <ContextMenuItem onClick={handleToggleOrchestrator}>
+            <Crown className="mr-2 h-3.5 w-3.5" />
+            {isOrchestrator ? to('unsetOrchestrator') : to('setAsOrchestrator')}
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem disabled={restarting} onClick={() => void runRestart(false)}>
+          <RotateCcw className="mr-2 h-3.5 w-3.5" />
+          {t('restartTab')}
         </ContextMenuItem>
+        {isAgentTab && (
+          <ContextMenuItem disabled={restarting} onClick={() => void runRestart(true)}>
+            <RotateCcw className="mr-2 h-3.5 w-3.5" />
+            {t('restartTabFresh')}
+          </ContextMenuItem>
+        )}
       </ContextMenuContent>
     </ContextMenu>
     <AlertDialog open={replacement !== null} onOpenChange={(open) => { if (!open) setReplacement(null); }}>
@@ -227,6 +262,18 @@ const PaneTabItem = ({
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction onClick={() => { if (replacement) void applyDesignation(replacement.revision, true); setReplacement(null); }}>Replace coordinator</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    <AlertDialog open={busyRestart !== null} onOpenChange={(open) => { if (!open) setBusyRestart(null); }}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>The tab is mid-turn</AlertDialogTitle>
+          <AlertDialogDescription>Restarting it now abandons the current turn. The audit log records the abandoned turn.</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={() => { if (busyRestart) void runRestart(busyRestart.clear, true); setBusyRestart(null); }}>Interrupt and restart</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

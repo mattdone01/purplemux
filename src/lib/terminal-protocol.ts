@@ -6,6 +6,15 @@ export const MSG_KILL_SESSION = 0x04;
 export const MSG_WEB_STDIN = 0x05;
 export const MSG_INPUT_ERROR = 0x06;
 
+/**
+ * The terminal socket's close code while the tab restarts (ADR-0028 §12): the
+ * attach ended because the server is replacing the tab's process, not because
+ * the session ended. Never 1000, which makes the web client close the tab;
+ * the client re-attaches.
+ */
+export const TAB_RESTARTING_CODE = 4002;
+export const TAB_RESTARTING_REASON = 'Tab restarting';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 

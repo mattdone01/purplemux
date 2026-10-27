@@ -11,7 +11,8 @@ import {
 import { buildShellEnv } from '@/lib/shell-env';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
 import { withRecordedTerminalInput } from '@/lib/terminal-input';
-import { encodeStdout, encodeInputError } from '@/lib/terminal-protocol';
+import { encodeStdout, encodeInputError, TAB_RESTARTING_CODE, TAB_RESTARTING_REASON } from '@/lib/terminal-protocol';
+import { isSessionRestarting } from '@/lib/tab-lifecycle';
 import { reconcileTabCwd } from '@/lib/layout-store';
 import { createLogger } from '@/lib/logger';
 import { sessionUsesTypedDelivery } from '@/lib/agent-prompt-delivery';
@@ -37,11 +38,11 @@ const THROTTLE_FLUSH_INTERVAL_MS = 250;
 
 const TMUX_SOCKET = 'purple';
 /**
- * A remote attach (ssh) ended or could not start while the remote session may
- * still run (ADR-0022, review r1 B1). Not 1000: the client reads 1000 as the
- * session's end and closes the tab, which reaps the remote work. Not 1011: the
- * client reads that as "not found" and restarts the session. Any other code is
- * a disconnect the client retries with backoff.
+ * An attach (ssh, or a local tmux client) ended or could not start while the
+ * session may still run (ADR-0022, review r1 B1; ADR-0028 §12). Not 1000: the
+ * client reads 1000 as the session's end and closes the tab, which reaps the
+ * work. Not 1011: the client reads that as "not found" and restarts the
+ * session. Any other code is a disconnect the client retries with backoff.
  */
 export const REMOTE_ATTACH_LOST_CODE = 4001;
 const textDecoder = new TextDecoder();
@@ -134,21 +135,39 @@ const cleanup = (conn: IActiveConnection, sessionExited = false) => {
 
 
 /**
- * A remote attach's ssh exited (review r1 B1). That proves nothing about the
- * session: ssh also exits when the connection drops, sshd refuses it or the
- * process is killed. Only tmux on the host saying the session is gone is the
- * session's end (1000, and the client closes the tab); anything else is a lost
- * attach the client retries.
+ * An attach ended (review r1 B1; ADR-0028 §12). The attach's exit proves
+ * nothing about the session: ssh exits when the connection drops, a tmux
+ * client is killed, and `tab restart` kills the session it is about to
+ * recreate. 1000 makes the web client close the tab, so it goes out only when
+ * tmux says the session is gone and no restart of the tab is open, asked at the
+ * exit and again after the presence probe. A restart is 4002; anything else is
+ * a lost attach the client retries (4001).
  */
-const endRemoteAttach = async (conn: IActiveConnection, exitCode: number, signal?: number): Promise<void> => {
+const endAttach = async (conn: IActiveConnection, exitCode: number, signal?: number): Promise<void> => {
+  if (conn.detaching) {
+    cleanup(conn);
+    return;
+  }
+  const closeRestarting = () => {
+    if (conn.ws.readyState === WebSocket.OPEN) conn.ws.close(TAB_RESTARTING_CODE, TAB_RESTARTING_REASON);
+    cleanup(conn);
+  };
+  if (isSessionRestarting(conn.sessionName)) {
+    closeRestarting();
+    return;
+  }
   const presence = await sessionPresence(conn.sessionName).catch(() => 'unknown' as const);
   if (conn.cleaned) return;
+  if (isSessionRestarting(conn.sessionName)) {
+    closeRestarting();
+    return;
+  }
   if (presence === 'absent') {
     cleanup(conn, true);
     return;
   }
-  log.warn({ session: conn.sessionName, host: conn.remoteHost, exitCode, signal, presence }, 'remote attach ended while the session may still run; the client will retry');
-  if (conn.ws.readyState === WebSocket.OPEN) conn.ws.close(REMOTE_ATTACH_LOST_CODE, 'Remote attach lost');
+  log.warn({ session: conn.sessionName, host: conn.remoteHost, exitCode, signal, presence }, 'attach ended while the session may still run; the client will retry');
+  if (conn.ws.readyState === WebSocket.OPEN) conn.ws.close(REMOTE_ATTACH_LOST_CODE, conn.remoteHost ? 'Remote attach lost' : 'Attach lost');
   cleanup(conn);
 };
 
@@ -398,6 +417,12 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
   let remoteHost: string | null = null;
   if (sessionId) {
     sessionName = sessionId;
+    // No probe, no attach and no cwd reconcile while the tab restarts: no keystroke may reach the session
+    // while the server types its launch, and no recreate may race the restart's reap (ADR-0028 §12).
+    if (isSessionRestarting(sessionId)) {
+      ws.close(TAB_RESTARTING_CODE, TAB_RESTARTING_REASON);
+      return;
+    }
     remoteHost = await sessionHostOf(sessionId);
     const presence = await sessionPresence(sessionId);
     if (presence === 'unknown') {
@@ -538,11 +563,7 @@ export const handleConnection = async (ws: WebSocket, request: IncomingMessage, 
       log.debug(
         `pty exited (pid: ${ptyProcess!.pid}, code: ${exitCode}, signal: ${signal}, detaching: ${conn.detaching})`,
       );
-      if (conn.remoteHost && !conn.detaching) {
-        void endRemoteAttach(conn, exitCode, signal);
-        return;
-      }
-      cleanup(conn, !conn.detaching);
+      void endAttach(conn, exitCode, signal);
     }),
   );
 };

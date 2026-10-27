@@ -318,3 +318,14 @@ describe('fleet status: helpers', () => {
     expect(inboxOf([], NOW, DEFAULT_FLEET_THRESHOLDS)).toEqual({ open: 0, unanswered: 0, oldestAt: null });
   });
 });
+
+describe('restartedAt (ADR-0028)', () => {
+  it('carries the tab\'s last restart onto its row', () => {
+    expect(deriveFleetRow(facts({ restartedAt: NOW - 3 * MIN }), NOW).restartedAt).toBe(NOW - 3 * MIN);
+  });
+
+  it('is null for a tab that was never restarted, never 0', () => {
+    expect(deriveFleetRow(facts(), NOW).restartedAt).toBeNull();
+    expect(deriveFleetRow(facts({ restartedAt: null }), NOW).restartedAt).toBeNull();
+  });
+});

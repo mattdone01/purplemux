@@ -4,7 +4,7 @@ import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/li
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
 import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR, type IHookSpoolDrainResult } from '@/lib/hook-spool';
 import { HookFloorStore } from '@/lib/hook-floors';
-import { onTabClosed, onTabClosing } from '@/lib/tab-lifecycle';
+import { onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
 import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
 import { sessionHostOf } from '@/lib/session-host';
 import { getChildPids } from '@/lib/process-utils';
@@ -59,7 +59,7 @@ import { getLivenessManager } from '@/lib/liveness-manager';
 import { readLivenessEvidence } from '@/lib/liveness-store';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
 import { readLeaseEvidence } from '@/lib/lease-store';
-import type { TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
+import type { IBackgroundJob, TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
@@ -203,8 +203,15 @@ export class StatusManager {
   private reportOnFiltered = 0;
   /** When each tab's last registered job reported its exit: a sign of life for the stall check. */
   private jobEventAt = new Map<string, number>();
-  /** Tabs being closed, or just closed, with the time their retirement ends (L38). */
-  private retiredTabs = new Map<string, number>();
+  /**
+   * Tabs being closed or restarted, or just closed, with the time their retirement ends (L38) and what
+   * set it: a restart's end restores only a retirement its own `restarting` set (ADR-0028 §5).
+   */
+  private retiredTabs = new Map<string, { until: number; by: 'close' | 'restart' }>();
+  /** Per tab, the restarts whose end event has not come yet (ADR-0028 §5). */
+  private openRestarts = new Map<string, Set<string>>();
+  /** Per restart, the registered jobs its `restarting` took, given back on `failed`. */
+  private restartJobs = new Map<string, Promise<IBackgroundJob[]>>();
   private modelWatch = new AgentModelWatch();
   private automatedPrompts: AutomatedPromptDispatcher;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
@@ -670,8 +677,8 @@ export class StatusManager {
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
     const now = Date.now();
-    for (const [tabId, until] of this.retiredTabs) {
-      if (until <= now) this.retiredTabs.delete(tabId);
+    for (const [tabId, retirement] of this.retiredTabs) {
+      if (retirement.until <= now) this.retiredTabs.delete(tabId);
     }
 
     for (const ws of workspaces) {
@@ -1906,8 +1913,8 @@ export class StatusManager {
 
   /** Whether the tab is being closed, or was closed less than CLOSED_RETIRE_MS ago (L38). */
   private isRetired(tabId: string): boolean {
-    const until = this.retiredTabs.get(tabId);
-    return until !== undefined && until > Date.now();
+    const retirement = this.retiredTabs.get(tabId);
+    return retirement !== undefined && retirement.until > Date.now();
   }
 
   /**
@@ -1919,13 +1926,66 @@ export class StatusManager {
    */
   handleTabClosing(tabId: string, phase: 'closing' | 'aborted'): void {
     if (phase === 'aborted') {
-      this.retiredTabs.delete(tabId);
+      if (this.retiredTabs.get(tabId)?.by === 'close') this.retiredTabs.delete(tabId);
+      // A restart still open keeps the tab retired until its own end.
+      if (this.openRestarts.has(tabId)) this.retiredTabs.set(tabId, { until: Date.now() + RESTART_WINDOW_MS, by: 'restart' });
       log.info({ tabId }, 'tab close aborted: watchdog checks restored');
       return;
     }
-    this.retiredTabs.set(tabId, Date.now() + CLOSING_RETIRE_MS);
+    this.retiredTabs.set(tabId, { until: Date.now() + CLOSING_RETIRE_MS, by: 'close' });
     this.stuckNudgedTabs.delete(tabId);
     log.info({ tabId }, 'tab closing: watchdog checks retired');
+  }
+
+  /**
+   * `tab-restart` (ADR-0028 §5): the restart reaps the tab's processes as a close
+   * does, so `restarting` retires the same checks and takes the tab's registered
+   * background jobs (the reap kills them; their exit is no failure). Probes,
+   * watches and the status entry stay: the tab id lives on. Each end event is
+   * paired with its `restarting` by `restartId`; the checks come back after the
+   * last open restart ends, and never over a close's retirement. `failed` gives
+   * the jobs back: a process may have outlived the failed reap.
+   */
+  handleTabRestart(event: Pick<ITabRestartEvent, 'workspaceId' | 'tabId' | 'restartId' | 'phase'>): void {
+    const { workspaceId, tabId, restartId, phase } = event;
+    if (phase === 'restarting') {
+      const open = this.openRestarts.get(tabId) ?? new Set<string>();
+      open.add(restartId);
+      this.openRestarts.set(tabId, open);
+      if (this.retiredTabs.get(tabId)?.by !== 'close') {
+        this.retiredTabs.set(tabId, { until: Date.now() + RESTART_WINDOW_MS, by: 'restart' });
+      }
+      this.stuckNudgedTabs.delete(tabId);
+      this.restartJobs.set(restartId, getLivenessManager().takeJobs(workspaceId, tabId).then((jobs) => {
+        if (jobs.length > 0) log.info({ tabId, retired: jobs.length, reason: 'tab-restart' }, 'registered background jobs retired');
+        return jobs;
+      }).catch((err) => {
+        log.warn({ tabId, reason: 'tab-restart', err: String(err) }, 'registered background jobs could not be retired');
+        return [];
+      }));
+      log.info({ tabId, restartId }, 'tab restarting: watchdog checks retired');
+      return;
+    }
+    const open = this.openRestarts.get(tabId);
+    open?.delete(restartId);
+    if (open?.size === 0) this.openRestarts.delete(tabId);
+    const jobs = this.restartJobs.get(restartId);
+    this.restartJobs.delete(restartId);
+    // A tab closed meanwhile has no jobs to watch any more.
+    if (phase === 'failed' && jobs && this.tabs.has(tabId)) {
+      void jobs.then(async (taken) => {
+        // Only a survivor of the reap is given back: a job the restart killed would report a death it caused.
+        const survivors = taken.filter((job) => getLivenessManager().isJobAlive(job));
+        for (const job of survivors) await getLivenessManager().registerJob(job);
+        if (survivors.length > 0) log.info({ tabId, restored: survivors.length }, 'restart failed: registered background jobs restored');
+      }).catch((err) => {
+        log.warn({ tabId, err: String(err) }, 'restart failed: registered background jobs could not be restored');
+      });
+    }
+    if (!this.openRestarts.has(tabId) && this.retiredTabs.get(tabId)?.by === 'restart') {
+      this.retiredTabs.delete(tabId);
+      log.info({ tabId, restartId, phase }, 'tab restart finished: watchdog checks restored');
+    }
   }
 
   /** A fleet-config duration (ADR-0019), read at each pass; the default on any problem. */
@@ -2687,7 +2747,7 @@ export class StatusManager {
     this.inactiveSince.delete(tabId);
     this.jobEventAt.delete(tabId);
     // A poll that read the layout before the close must not bring the tab back (L38).
-    this.retiredTabs.set(tabId, Date.now() + CLOSED_RETIRE_MS);
+    this.retiredTabs.set(tabId, { until: Date.now() + CLOSED_RETIRE_MS, by: 'close' });
     this.tabs.delete(tabId);
     this.orchestrationPendingLaunches.delete(tabId);
     this.codexLifecycleEpoch.delete(tabId);
@@ -3100,6 +3160,7 @@ export const getStatusManager = (): StatusManager => {
     dispatcher.register(createWebPushChannel());
     registerFcmChannel(dispatcher);
     onTabClosing(({ tabId, phase }) => manager.handleTabClosing(tabId, phase));
+    onTabRestart((event) => manager.handleTabRestart(event));
     onTabClosed(({ tabId, workspaceId }) => {
       manager.removeTab(tabId);
       manager.forgetReportsTo(workspaceId, tabId);

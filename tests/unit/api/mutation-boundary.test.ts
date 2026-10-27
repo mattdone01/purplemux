@@ -37,6 +37,7 @@ const cliRoutes = [
   ['codex/launch-confirm', 'POST'], ['claude/launch-command', 'POST'],
   ['cli/codex/launch-args', 'POST'], ['cli/codex/launch-confirm', 'POST'],
   ['cli/workspaces/[workspaceId]/flow', 'POST'],
+  ['cli/tabs/[tabId]/restart', 'POST'],
 ];
 const uiRoutes = [
   ['tabs/[tabId]/send', 'POST'], ['tmux/send-input', 'POST'], ['tmux/reset', 'POST'], ['tmux/recover-unknown', 'POST'],
@@ -49,6 +50,7 @@ const uiRoutes = [
   ['workspace/[workspaceId]/orchestrate', 'POST'], ['workspace/active', 'PATCH'], ['workspace/reorder', 'PATCH'],
   ['workspace/group/index', 'POST'], ['workspace/group/[groupId]', 'PATCH'], ['workspace/group/[groupId]', 'DELETE'],
   ['workspace/group/reorder', 'PATCH'], ['cli/workspaces/[workspaceId]/peers', 'PATCH'],
+  ['tabs/[tabId]/restart', 'POST'],
 ];
 
 const handlers: Record<string, () => Promise<{ default: (req: NextApiRequest, res: NextApiResponse) => Promise<unknown> }>> = {
@@ -93,6 +95,8 @@ const handlers: Record<string, () => Promise<{ default: (req: NextApiRequest, re
   'workspace/reorder': () => import('@/pages/api/workspace/reorder'),
   'cli/workspaces': () => import('@/pages/api/cli/workspaces'),
   'cli/workspaces/[workspaceId]/flow': () => import('@/pages/api/cli/workspaces/[workspaceId]/flow'),
+  'cli/tabs/[tabId]/restart': () => import('@/pages/api/cli/tabs/[tabId]/restart'),
+  'tabs/[tabId]/restart': () => import('@/pages/api/tabs/[tabId]/restart'),
 };
 
 const request = (method: string, cookie = false, origin = 'http://localhost:8022') => ({

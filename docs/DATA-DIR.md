@@ -285,6 +285,8 @@ Released on `process.on('exit')`.
 
 Recursive pane/tab tree. Leaf `pane` nodes hold `tabs[]`; `split` nodes hold `children[]` with `ratio`. Each tab carries its `sessionName` (`pt-{wsId}-{paneId}-{tabId}`), cached `cliState`, `claudeSessionId`, and the last resume command.
 
+A tab that `tab restart` relaunched carries `lastRestartAt` (Unix ms, ADR-0028); the fleet row reads it as `restartedAt`. Older releases ignore the field. Each restart also appends one `tab-restart` line to `~/.purplemux/audit/coordination.jsonl`.
+
 See [TMUX.md](./TMUX.md) for how tabs map to tmux sessions and [STATUS.md](./STATUS.md) for the state fields.
 
 ### `message-history.json` — `src/lib/message-history-store.ts`

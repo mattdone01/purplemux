@@ -28,6 +28,9 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 1 | unexpected error (flow, ADR-0026) | `flow-unreadable` | investigate |
 | 2 | usage error (flow, ADR-0026) | `flow-invalid`, `flow-too-large` | fix the command |
 | 7 | not found (flow, ADR-0026) | `flow-not-found` (client-side: `flow show` with no record) | — |
+| 1 | unexpected error (ADR-0028, `tab restart`) | `restart-not-confirmed`: a process or the session outlived the reap; nothing was relaunched | inspect the tab first |
+| 2 | usage error (ADR-0028) | `restart-unsupported`: a web-browser, diff or agent-sessions tab | fix the command |
+| 3 | conflict (ADR-0028) | `tab-busy`: the tab is mid-turn or holds a pending launch or turn | when it is idle, or with `--interrupt` |
 
 3. stderr names the code and its class, e.g. `error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found`. A `readiness-timeout` names the waited milliseconds.
 4. A write that loses its connection after it connected exits 1 with `outcome-unknown`, not 6. The server may have acted on it, so a blind retry of `tab send` could type the prompt twice. A read, or a request that never connected, exits 6. Only undici's network failures (`fetch failed` / `terminated` with a coded cause) count as network failures; a request that could not be built is never sent and exits 1.

@@ -127,6 +127,9 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'gh-unavailable': EXIT.UNEXPECTED,
   'outcome-unknown': EXIT.UNEXPECTED,
   'close-not-confirmed': EXIT.UNEXPECTED,
+  'restart-unsupported': EXIT.USAGE,
+  'tab-busy': EXIT.CONFLICT,
+  'restart-not-confirmed': EXIT.UNEXPECTED,
   'lease-policy': EXIT.USAGE,
   'watch-invalid': EXIT.USAGE,
   'reports-to-invalid': EXIT.USAGE,
@@ -188,6 +191,8 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'routes-absent': 'no such route on this server (an older server, a foreign server, or a malformed id) — retrying cannot help',
   'remote-host-unreachable': 'the remote host did not answer over ssh — retry, bounded, once it answers',
   'wip-cap': "refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason",
+  'tab-busy': 'the tab is mid-turn — retry when it is idle, or restart with --interrupt to abandon the turn',
+  'restart-not-confirmed': 'a process or the session outlived the reap; nothing was relaunched — inspect the tab before a retry',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -1540,6 +1545,33 @@ const cmdTabClose = async (args) => {
   process.stdout.write(`${lines.join('\n')}\n`);
 };
 
+// A fresh agent process under the same tab id (ADR-0028): the server reaps the
+// tab's processes, recreates its session and relaunches the agent with the
+// tab's own launch settings. Leases, watches, probes and notes stay.
+const cmdTabRestart = async (args) => {
+  requireEnv();
+  const clear = args.includes('--clear');
+  const interrupt = args.includes('--interrupt');
+  const asJson = args.includes('--json');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w']), ['--clear', '--interrupt', '--json']);
+  const tabId = rest[0];
+  if (!tabId) die('tab ID is required');
+  const wsId = resolveWsForTab(args);
+  const { body } = await api(
+    'POST',
+    `/api/cli/tabs/${encodeURIComponent(tabId)}/restart?workspaceId=${encodeURIComponent(wsId)}`,
+    { clear, interrupt },
+  );
+  if (body?.ok !== true) return fail('restart-not-confirmed', `the server answered ${JSON.stringify(body)}`);
+  if (asJson) return out(body);
+  const lines = [`ok ${tabId} restarted (${body.resumed ? 'resumed' : 'fresh'})`];
+  if (body.resumeSkipped) lines.push(`resume skipped: ${body.resumeSkipped}`);
+  if (body.reaped) lines.push(`reaped: ${body.reaped.killed} killed, ${body.reaped.survivors} survivors`);
+  if (body.identity) lines.push(`identity: ${body.identity}`);
+  if (body.launchState === 'held') lines.push('launch: held (the Codex launch was not confirmed; see tab status)');
+  process.stdout.write(`${lines.join('\n')}\n`);
+};
+
 // Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
 // stdout line must be a numeric seconds-since-last-progress value. Above --stale-after, the orchestrator
 // gets a STALLED nudge and the human gets a push alert.
@@ -1802,6 +1834,15 @@ Commands:
              [--keep-processes]            every process it reaped: the pane's descendants and every process whose
                                            environment carries PMUX_TAB_ID=TAB_ID (SIGTERM, 3 s, SIGKILL).
                                            --keep-processes signals only the pane group, as before
+  tab restart -w WS TAB_ID                 Restart the tab's agent as a fresh process under the SAME tab id (ADR-0028):
+             [--clear] [--interrupt]       reap its processes, recreate its session, relaunch with its own model,
+             [--json]                      effort, cwd, scope, reports-to and host. Leases, watches, probes, notes and
+                                           its token stay. Resumes the agent's last session where the provider can
+                                           (a remote tab restarts fresh); --clear starts a new session. A tab
+                                           mid-turn exits 3 (tab-busy) unless --interrupt abandons the turn.
+                                           Prints "ok TAB_ID restarted (resumed|fresh)". web-browser, diff and
+                                           agent-sessions tabs exit 2 (restart-unsupported); a process or session
+                                           left after the reap exits 1 (restart-not-confirmed), nothing relaunched
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
@@ -2027,6 +2068,7 @@ const main = async () => {
         case 'status': return cmdTabStatus(rest);
         case 'result': return cmdTabResult(rest);
         case 'close': return cmdTabClose(rest);
+        case 'restart': return cmdTabRestart(rest);
         case 'probe': return cmdTabProbe(rest);
         case 'bg': return cmdTabBg(rest);
         case 'reports-to': return cmdTabReportsTo(rest);

@@ -156,6 +156,20 @@ export class LivenessManager {
     return removeJobs(workspaceId, tabId, pid);
   }
 
+  isJobAlive(job: IBackgroundJob): boolean {
+    return this.deps.isPidAlive(job.pid);
+  }
+
+  /** Unregister the tab's jobs and return them, so a caller can register them again (a failed `tab restart`). */
+  async takeJobs(workspaceId: string, tabId: string): Promise<IBackgroundJob[]> {
+    await this.ensureHydrated();
+    const taken = [...this.jobs.values()]
+      .map(({ job }) => job)
+      .filter((job) => job.workspaceId === workspaceId && job.tabId === tabId);
+    await this.unregisterJobs(workspaceId, tabId);
+    return taken;
+  }
+
   removeTab(workspaceId: string, tabId: string): void {
     void this.ensureHydrated().then(() => {
       let had = false;
