@@ -37,5 +37,16 @@
   "errorUnknown": "İstek başarısız oldu ({status})",
   "granteesUnreadable": "{workspaces} sekmeleri okunamadı",
   "granteesFailed": "Sekme listesi okunamadı: {error}",
-  "staleSuffix": "yenilenmedi: {reason}"
+  "staleSuffix": "yenilenmedi: {reason}",
+  "capabilityLabel": "Tür",
+  "capabilityDrive": "Diğer çalışma alanlarını oku",
+  "capabilityOwner": "Sahip oturumu",
+  "ownerScope": "Sonradan oluşturulanlar dahil tüm çalışma alanları; sahip olarak not gönderebilir ama başka bir çalışma alanını asla yönetemez",
+  "ownerActive": "{tab} · {workspace} sahip oturumunu {time} tarihine kadar tutuyor; önce iptal edin",
+  "ownerReads": "sahip oturumu — tüm çalışma alanlarını okur",
+  "ownerBadge": "sahip",
+  "ownerBadgeTooltip": "Sahip oturumu: {time} tarihine kadar tüm çalışma alanlarını okur ve sahip olarak not gönderir",
+  "errorOwnerActive": "Bir sahip oturumu zaten etkin",
+  "refusedDrive": "Okuma izinleri uygulanmıyor: grants.json okunamıyor — {reason}",
+  "refusedOwner": "Sahip oturumları uygulanmıyor: owner-grants.json okunamıyor — {reason}"
 }

@@ -33,6 +33,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── vapid-keys.json          # Web Push VAPID keypair (generated)
 ├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
 ├── orchestrator-presence.json # durable missing-owner notification episode latches
+├── owner-grants.json        # the owner grant (ADR-0029; 0600; never written to grants.json)
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
 ├── hook-spool/              # hook events no server answered (0700; ADR-0020)
@@ -224,6 +225,22 @@ confirmed completion does. The file is strict-read and atomically replaced, so
 damage pauses notification transitions instead of becoming an empty state.
 Lease and liveness files are also read through strict diagnostic views for this
 monitor; their normal mutation/API compatibility paths are unchanged.
+
+### `owner-grants.json` — `src/lib/grant-store.ts`
+
+Owner grants (ADR-0029): one launch-verified tab reads every workspace and sends notes with
+admission `owner`. Same record shape as the drive grants in `grants.json` (`capability: "owner"`,
+`workspaces: ["*"]`), read by the same store module with the file as a parameter, but its own
+cache and its own lock. Written only by `POST /api/grants` (web session, this server's Origin and
+the purplemux password), mode 0600, tmp + rename. At most one grant is active at a time. A release
+that predates owner grants never reads this file, and an owner grant never touches `grants.json`,
+whose older parser refuses the whole file on one non-`drive` record. A malformed or unreadable
+file is refused, never read as empty: no owner grant is honoured, owner grant changes answer 500
+`grant-store-unreadable` naming the file, and drive grants keep working. The grant listings
+(`GET /api/grants`, `GET /api/cli/grants`, the coordination `grants` section) still list the
+readable file's grants and name the refused file in `refused`; an unreadable `grants.json` is
+treated the same way. Only both files refused fails the listing (500). Ended grants stay listed 7
+days, then the minute sweep prunes them, as in `grants.json`.
 
 ### FCM service account (outside `~/.purplemux`)
 

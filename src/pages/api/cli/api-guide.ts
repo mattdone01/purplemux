@@ -15,6 +15,8 @@ workspaces. The global CLI token
 is not human identity and cannot mutate these surfaces. Foreign requests go through
 coordinator notes; use authenticated local human controls for human actions. Creating a
 workspace is the one exception: only the global token may (POST /api/cli/workspaces, ADR-0024).
+The owner grant (ADR-0029) gives its one verified tab reads of every workspace and notes with
+admission "owner" ("send a note as owner"); it never permits a foreign mutation.
 An unscoped \`GET /api/cli/tabs\` lists only workspaces the caller may read.
 
 ## Caller identity
@@ -61,7 +63,8 @@ to an exit code through one table:
                                                  watch-cap, inbox-not-held, caller-unresolved,
                                                  grant-tab-unverified, grant-password-invalid,
                                                  grant-locked, config-version-conflict,
-                                                 note-cap
+                                                 note-cap,
+                                                 grant-owner-active
      4  target gone (permanent)                  tab-not-found, session-not-running,        NEVER
                                                  target-changed
      5  not ready yet                            readiness-timeout                          yes, bounded
@@ -163,6 +166,17 @@ GET /api/cli/grants
   Legacy portfolio grants retain read access for their verified grantee tab until expiry or revocation.
   They never authorize foreign input, tab creation/closure, browser evaluation, or settings changes.
   Grant administration remains in the authenticated human UI. No CLI token proves human identity.
+  An owner grant (ADR-0029; capability "owner", workspaces ["*"]) lets its one verified grantee tab
+  read every workspace, including one created later, and send notes with admission "owner"; it
+  confers no mutation right either. Every token sees it in this list. Only the web UI creates one
+  (POST /api/grants with the purplemux password); a second while one is active answers 409
+  grant-owner-active (exit 3). Reads under it are audited as owner-read, at most once per
+  (grant, workspace) per hour.
+  Response: { "grants": [...], "refused": [{ "capability", "file", "error", "code": "grant-store-unreadable" }] }.
+  Each grant file fails alone: grants holds the records of each readable file (the grants in force),
+  refused names an unreadable one (always present, [] when both read; not filtered by scope). Only
+  both files refused answers 500 grant-store-unreadable naming both. grant list then prints the
+  readable grants and exits 1 with the refusal on stderr.
 
 POST /api/cli/tab-identity  { session }
   Story 36: the Claude SessionStart hook of a tab created before tab tokens asks for a hook-time
@@ -365,11 +379,14 @@ POST /api/cli/inbox/<id>/retry
 A note is a body the recipient pulls. A same-workspace --to-epic note routes directly to the live
 epic holder. A cross-workspace note routes to the enabled, live orchestrator of the holder's
 workspace; --to-workspace uses that workspace's orchestrator too. Cross-workspace and unresolved
-epic sends require the verified current source orchestrator. Admission is persisted across source
-orchestrator handover. With no target orchestrator the note is "undeliverable" with a reason and
+epic sends require the verified current source orchestrator, or the verified tab holding the active
+owner grant (admission "owner", with its grantId; it routes like an orchestrator's note, and each
+send is audited as owner-note). Admission is persisted across source orchestrator handover and
+survives a later revoke of the owner grant. With no target orchestrator the note is "undeliverable" with a reason and
 never falls back to a worker. The recipient's tab
 receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
-show n-…, then purplemux note ack n-…"; the subject and body are never typed. If that tab closes
+show n-…, then purplemux note ack n-…" (from "owner (<ws>/<tab>)" for an owner note); the subject and
+body are never typed. Every note view carries fromLabel, the same server-made words after "from". If that tab closes
 before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
 the line reached its composer, and one notice reaches the sender's tab (if live) at 60 min; no
 more. A note unacked or undeliverable for 14 days expires (one notice to a live sender); acked and
@@ -388,12 +405,12 @@ POST /api/cli/notes
   characters removed), "body" (≤ 16 KiB UTF-8), "fromEpic"? (only the holder of epic:<slug>) }.
   Response: { "note": INoteView }. 413 note-too-large (exit 2), 400 note-target-missing / note-invalid
   (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold or a cross-workspace
-  sender that is not the verified current source orchestrator.
+  sender that is neither the verified current source orchestrator nor the owner-granted tab.
 
 GET /api/cli/notes[?open=1][&toMe=1][&fromMe=1][&epic=SLUG]
   Notes the caller's workspace sent or receives (admin: all), without bodies.
   Response: { "notes": [{ "id", "from", "to", "subject", "state", "deliveredTo", "routedAt",
-    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", "receipt", ... }] }
+    "deliveredAt", "ackedAt", "ackedBy", "ackComment", "bodyBytes", "fromLabel", "receipt", ... }] }
 
 GET /api/cli/notes/<id>
   The recipient workspace, the sender workspace, or admin. Response: { "note", "body" }.

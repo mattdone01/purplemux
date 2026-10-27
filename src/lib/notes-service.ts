@@ -37,6 +37,7 @@ import {
   undeliverable,
   viewOf,
 } from '@/lib/notes-store';
+import type { IGrant } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
 import type { INote, INoteAdmission, INoteReceipt, INotesState, INoteView, TNoteRoutingStatus } from '@/types/note';
 
@@ -67,6 +68,10 @@ export interface INotesDeps {
   inboxItems: () => Promise<IInboxItem[]>;
   /** Recheck a persisted portfolio action against its current blocker before routing or delivery. */
   portfolioActionDeliverable?: (actionId: string, noteId: string, workspaceId: string) => Promise<boolean>;
+  /** The active owner grant held by this exact tab (ADR-0029), or null. */
+  ownerGrantOf?: (tab: { workspaceId: string; tabId: string }) => IGrant | null;
+  /** One coordination audit line (`owner-note`). */
+  audit?: (entry: Record<string, unknown>) => Promise<unknown>;
 }
 
 export interface ILiveTabs {
@@ -200,7 +205,7 @@ export class NotesService {
         ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
         : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
     }
-    if (note.admission?.mode !== 'coordinator') {
+    if (note.admission?.mode !== 'coordinator' && note.admission?.mode !== 'owner') {
       return {
         status: 'policyblocked',
         reason: note.admission ? 'cross-workspace-admission-required' : 'legacy-cross-workspace-admission-missing',
@@ -219,7 +224,7 @@ export class NotesService {
       targetTabId: to.tabId,
       dedupeKey: `note:${note.id}:${event}:${to.tabId}`,
       fields: { noteId: note.id, fromWorkspaceId: note.from.workspaceId, fromTabId: note.from.tabId,
-        fromHuman: note.admission?.mode === 'human', sentAt: note.createdAt, event },
+        fromHuman: note.admission?.mode === 'human', fromOwner: note.admission?.mode === 'owner', sentAt: note.createdAt, event },
     };
   }
 
@@ -236,11 +241,23 @@ export class NotesService {
     if (caller.workspaceId && targetWorkspaceId === caller.workspaceId) {
       return { mode: 'local', sender: { workspaceId: caller.workspaceId, tabId: caller.tabId }, authorizedAt: now };
     }
+    // ADR-0029: the owner's verified tab sends anywhere, and routes like a coordinator.
+    const ownerGrant = caller.verified && caller.workspaceId && caller.tabId
+      ? this.deps.ownerGrantOf?.({ workspaceId: caller.workspaceId, tabId: caller.tabId }) ?? null
+      : null;
+    if (ownerGrant && caller.workspaceId && caller.tabId) {
+      return {
+        mode: 'owner',
+        sender: { workspaceId: caller.workspaceId, tabId: caller.tabId },
+        grantId: ownerGrant.id,
+        authorizedAt: now,
+      };
+    }
     throw new NoteError(
       'forbidden',
       targetWorkspaceId
-        ? 'cross-workspace notes require the verified, currently designated source coordinator'
-        : 'an unresolved epic may be retained only by the verified, currently designated source coordinator',
+        ? 'cross-workspace notes require the verified, currently designated source coordinator or the owner-granted tab'
+        : 'an unresolved epic may be retained only by the verified, currently designated source coordinator or the owner-granted tab',
     );
   }
 
@@ -590,6 +607,7 @@ export class NotesService {
       externalKey ? `n-${createHash('sha256').update(externalKey).digest('hex').slice(0, 24)}` : this.deps.newId(),
     );
     if (externalKey) note.externalKey = externalKey;
+    let created = false;
     const sent = await this.withOperation(() => this.deps.mutate(async (state) => {
       const existing = externalKey ? state.notes.find((n) => n.id === note.id) : null;
       if (existing) {
@@ -608,9 +626,23 @@ export class NotesService {
         throw new NoteError('note-cap', `this sender already has ${mine} open notes (the limit is ${NOTE_OPEN_PER_SENDER}); wait for acks or expiry`);
       }
       const routedNote = await this.route(note, now, reads);
+      created = true;
       return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
     }));
+    if (admission.mode === 'owner' && created) await this.auditOwnerNote(sent);
     return (await this.views([sent]))[0];
+  }
+
+  /** One `owner-note` line per note sent under an owner grant (ADR-0029 §5); a failed write never unsends it. */
+  private async auditOwnerNote(note: INote): Promise<void> {
+    try {
+      await this.deps.audit?.({
+        event: 'owner-note', grantId: note.admission?.grantId, noteId: note.id,
+        from: { workspaceId: note.from.workspaceId, tabId: note.from.tabId }, to: note.to,
+      });
+    } catch (err) {
+      log.warn(`owner-note audit failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   /** Only the authenticated human control route calls this with its session subject. */
@@ -704,13 +736,15 @@ export class NotesService {
 export const NOTES_TICK_MS = 15_000;
 
 const defaultDeps = async (): Promise<INotesDeps> => {
-  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock] = await Promise.all([
+  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock, grantStore, coordinationAudit] = await Promise.all([
     import('@/lib/lease-store'),
     import('@/lib/lease-http'),
     import('@/lib/workspace-store'),
     import('@/lib/tab-lifecycle'),
     import('@/lib/inbox-store'),
     import('@/lib/orchestration-mapping-lock'),
+    import('@/lib/grant-store'),
+    import('@/lib/coordination-audit'),
   ]);
   const epicLease = async (slug: string) => {
     const now = Date.now();
@@ -746,6 +780,8 @@ const defaultDeps = async (): Promise<INotesDeps> => {
       const { getPortfolioStore } = await import('@/lib/portfolio-store');
       return getPortfolioStore().actionNoteDeliverable(actionId, noteId, workspaceId);
     },
+    ownerGrantOf: (tab) => grantStore.findActiveOwnerGrant(grantStore.grantsSnapshot('owner'), tab, Date.now()),
+    audit: coordinationAudit.appendCoordinationAudit,
   };
 };
 

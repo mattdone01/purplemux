@@ -31,12 +31,14 @@ Option 4.
 
 1. **Capability and store.** `IGrant.capability: 'drive' | 'owner'`. An `owner` grant has `workspaces: ['*']`; the
    service refuses `'*'` on a `drive` grant and any other list on an `owner` grant (`grant-invalid`). Owner grants live
-   in their own file, `~/.purplemux/owner-grants.json` (same record shape, same lock and tmp + rename, 0600), read by the
+   in their own file, `~/.purplemux/owner-grants.json` (same record shape, tmp + rename, 0600, and its own lock and cache), read by the
    same store module with the file as a parameter. Reason: the live release's parser (`isGrant`,
    `src/lib/grant-store.ts:150`) accepts only `capability: 'drive'` and refuses the WHOLE `grants.json` when one record
    differs, so a rollback would honour no drive grant for up to 7 days (ended records are kept that long). An older
    release never reads the new file. `GET /api/grants` and `GET /api/cli/grants` list both files; an unreadable owner
-   file refuses owner grants only (`grant-store-unreadable`), never drive grants.
+   file refuses owner grants only (`grant-store-unreadable`), never drive grants. The listing answers 200 with each
+   readable file's grants and `refused` naming the other; an unreadable drive file likewise refuses drive grants only;
+   500 only when both are refused.
 2. **Creation.** Only `POST /api/grants` (cookie, this server's Origin, the purplemux password; ADR-0014), body
    `{capability: 'owner', granteeWorkspaceId, granteeTabId, reason, expiresInHours, password}` (`workspaces` is not
    sent; default 24 h, maximum 168 h). The grantee must hold a `launch` identity, else 409 `grant-tab-unverified`. While

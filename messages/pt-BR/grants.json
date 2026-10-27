@@ -37,5 +37,16 @@
   "errorUnknown": "A solicitação falhou ({status})",
   "granteesUnreadable": "Não foi possível ler as abas de {workspaces}",
   "granteesFailed": "Não foi possível ler a lista de abas: {error}",
-  "staleSuffix": "não atualizado: {reason}"
+  "staleSuffix": "não atualizado: {reason}",
+  "capabilityLabel": "Tipo",
+  "capabilityDrive": "Ler outros workspaces",
+  "capabilityOwner": "Sessão do proprietário",
+  "ownerScope": "Todos os workspaces, inclusive os criados depois; pode enviar notas como proprietário, mas nunca controlar outro workspace",
+  "ownerActive": "{tab} · {workspace} mantém a sessão do proprietário até {time}; revogue-a primeiro",
+  "ownerReads": "sessão do proprietário — lê todos os workspaces",
+  "ownerBadge": "proprietário",
+  "ownerBadgeTooltip": "Sessão do proprietário: lê todos os workspaces e envia notas como proprietário até {time}",
+  "errorOwnerActive": "Já existe uma sessão do proprietário ativa",
+  "refusedDrive": "Permissões de leitura não são aplicadas: não foi possível ler grants.json — {reason}",
+  "refusedOwner": "Sessões do proprietário não são aplicadas: não foi possível ler owner-grants.json — {reason}"
 }

@@ -1,4 +1,4 @@
-import type { IGrant, IGrantee } from '@/types/grant';
+import type { IGrant, IGrantee, IGrantRefusal } from '@/types/grant';
 
 // The web client of the grant routes (story 28; ADR-0014). Same-origin fetch:
 // the session cookie goes with it; the server checks the Origin on create and
@@ -6,7 +6,10 @@ import type { IGrant, IGrantee } from '@/types/grant';
 // keeps the SERVED reason and code, so the dialog never shows a generic error.
 
 export interface IGrantsView {
+  /** The records of each readable grant file (ADR-0029 §1). */
   grants: IGrant[];
+  /** Unreadable grant files: that kind is unknown, never "no grants". The fetch always sets it. */
+  refused?: IGrantRefusal[];
   grantees: IGrantee[];
   /** Workspaces whose tabs could not be read: unknown, never "no tabs". */
   unreadableWorkspaceIds: string[];
@@ -40,6 +43,7 @@ const call = async <T>(url: string, init: RequestInit, pick: (body: Record<strin
 export const fetchGrantsView = (): Promise<TGrantCall<IGrantsView>> =>
   call('/api/grants', { method: 'GET' }, (b) => ({
     grants: Array.isArray(b.grants) ? (b.grants as IGrant[]) : [],
+    refused: Array.isArray(b.refused) ? (b.refused as IGrantRefusal[]) : [],
     grantees: Array.isArray(b.grantees) ? (b.grantees as IGrantee[]) : [],
     unreadableWorkspaceIds: Array.isArray(b.unreadableWorkspaceIds) ? (b.unreadableWorkspaceIds as string[]) : [],
     granteesError: typeof b.granteesError === 'string' ? b.granteesError : null,
@@ -58,16 +62,20 @@ export class GrantsReadError extends Error {
   }
 }
 
-export interface ICreateGrantForm {
+interface ICreateGrantFields {
   granteeWorkspaceId: string;
   granteeTabId: string;
-  workspaces: string[];
   reason: string;
   expiresInHours: number;
   password: string;
 }
 
-export const createGrantRequest = (form: ICreateGrantForm): Promise<TGrantCall<IGrant>> =>
+/** A read grant names its workspaces; an owner grant (ADR-0029) sends none — the server sets `['*']`. */
+export type TCreateGrantForm =
+  | (ICreateGrantFields & { capability?: 'drive'; workspaces: string[] })
+  | (ICreateGrantFields & { capability: 'owner' });
+
+export const createGrantRequest = (form: TCreateGrantForm): Promise<TGrantCall<IGrant>> =>
   call('/api/grants', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) }, (b) => b.grant as IGrant);
 
 export const revokeGrantRequest = (id: string): Promise<TGrantCall<IGrant>> =>

@@ -56,12 +56,30 @@ export type TNoteEvent = 'delivered' | 'reminder' | 'unacked' | 'expired';
 const NOTE_EVENTS: readonly TNoteEvent[] = ['delivered', 'reminder', 'unacked', 'expired'];
 
 /**
+ * The words after "from" in a note line, and the note view's `fromLabel` (ADR-0013, ADR-0029): one
+ * owner of the vocabulary. The inputs are server-made: the stored sender ids and the admission mode.
+ * It checks no grammar; the inbox template checks its fields before it calls this.
+ */
+export const noteFromWords = (from: {
+  workspaceId: string | null;
+  tabId: string | null;
+  human: boolean;
+  owner: boolean;
+}): string => {
+  if (from.human) return 'human';
+  if (from.workspaceId === null) return 'admin';
+  const party = `${from.workspaceId}/${from.tabId === null ? 'workspace' : from.tabId}`;
+  return from.owner ? `owner (${party})` : party;
+};
+
+/**
  * `fromWorkspaceId: null` is an admin-token or human sender; `fromHuman` disambiguates them.
+ * `fromOwner` marks a note sent under an owner grant (ADR-0029); it needs a sender workspace.
  * `fromTabId: null` is a workspace token with no tab.
  * `event` defaults to `delivered`; `reminder` goes to the recipient, `unacked` and `expired` to the sender.
  */
 export interface INoteFields { noteId: string; fromWorkspaceId: string | null; fromTabId: string | null;
-  fromHuman?: boolean; sentAt: number; event?: TNoteEvent }
+  fromHuman?: boolean; fromOwner?: boolean; sentAt: number; event?: TNoteEvent }
 /** What a watch notice reports (ADR-0015). Every value is a server enum or a grammar-checked id. */
 export type TWatchNotice = 'merged' | 'closed' | 'head-moved' | 'checks-settled' | 'moved' | 'free' | 'failing' | 'expired';
 const WATCH_NOTICES: readonly TWatchNotice[] = ['merged', 'closed', 'head-moved', 'checks-settled', 'moved', 'free', 'failing', 'expired'];
@@ -112,8 +130,19 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
     if (f.fromHuman !== undefined && typeof f.fromHuman !== 'boolean') {
       throw new InboxFieldError('inbox field fromHuman must be boolean');
     }
-    const from = f.fromHuman ? 'human' : f.fromWorkspaceId === null ? 'admin'
-      : `${field('fromWorkspaceId', f.fromWorkspaceId, 'workspaceId')}/${f.fromTabId === null ? 'workspace' : field('fromTabId', f.fromTabId, 'tabId')}`;
+    if (f.fromOwner !== undefined && typeof f.fromOwner !== 'boolean') {
+      throw new InboxFieldError('inbox field fromOwner must be boolean');
+    }
+    const human = f.fromHuman === true;
+    const owner = !human && f.fromOwner === true;
+    if (owner && f.fromWorkspaceId === null) throw new InboxFieldError('inbox field fromOwner needs fromWorkspaceId');
+    const checked = human || f.fromWorkspaceId === null
+      ? { workspaceId: f.fromWorkspaceId, tabId: f.fromTabId }
+      : {
+        workspaceId: field('fromWorkspaceId', f.fromWorkspaceId, 'workspaceId'),
+        tabId: f.fromTabId === null ? null : field('fromTabId', f.fromTabId, 'tabId'),
+      };
+    const from = noteFromWords({ ...checked, human, owner });
     const event = f.event ?? 'delivered';
     if (!NOTE_EVENTS.includes(event)) throw new InboxFieldError('inbox field event is not a note event');
     const at = time('sentAt', f.sentAt);

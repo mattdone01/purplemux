@@ -151,11 +151,13 @@ describe('grant routes', () => {
     expect(r).toMatchObject({ status: 200, body: { grant: { id, revokeReason: 'revoked', revokedBy: 'human' } } });
   });
 
-  it('the human list answers 500 for a malformed store, never an empty list', async () => {
+  it('the human list names a malformed store in refused, never a silent empty list', async () => {
     const { grantsFile, reloadGrants } = await import('@/lib/grant-store');
     fs.writeFileSync(grantsFile(), '{nope');
     reloadGrants();
-    expect(await call('@/pages/api/grants', 'GET')).toMatchObject({ status: 500, body: { code: 'grant-store-unreadable' } });
+    expect(await call('@/pages/api/grants', 'GET')).toMatchObject({ status: 200, body: {
+      grants: [], refused: [{ capability: 'drive', file: 'grants.json', code: 'grant-store-unreadable', error: expect.stringContaining('grants.json is malformed') }],
+    } });
     const managers = await call('@/pages/api/mission-control/portfolio-managers', 'GET');
     expect(managers.status).toBe(200);
     expect(managers.body).toMatchObject({ grantees: [
@@ -179,12 +181,14 @@ describe('grant routes', () => {
     expect((await call('@/pages/api/cli/grants', 'POST')).status).toBe(405);
   });
 
-  it('a malformed grants.json answers 500 on the CLI list rather than an empty list', async () => {
+  it('a malformed grants.json is named in refused on the CLI list, never a silent empty list', async () => {
     const { grantsFile, reloadGrants } = await import('@/lib/grant-store');
     fs.writeFileSync(grantsFile(), '{nope');
     reloadGrants();
     scopeHolder.scope = { type: 'admin' };
-    expect(await call('@/pages/api/cli/grants', 'GET')).toMatchObject({ status: 500, body: { code: 'grant-store-unreadable' } });
+    expect(await call('@/pages/api/cli/grants', 'GET')).toMatchObject({ status: 200, body: {
+      grants: [], refused: [{ capability: 'drive', file: 'grants.json', code: 'grant-store-unreadable' }],
+    } });
   });
 
   it('Mission Control producer events stay own-workspace: a grant holder is refused for ws-2 (403)', async () => {
