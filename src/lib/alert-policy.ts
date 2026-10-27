@@ -2,7 +2,7 @@
 // consults, plus the alert builder. No node-only imports — the server dispatches
 // from status-manager and the Electron/toast hooks apply the same rule client-side.
 import type { IWorkspace } from '@/types/terminal';
-import type { IAlert, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
+import type { IAlert, IAlertFlag, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 
 export const ALERTS_ORCHESTRATOR_ONLY_DEFAULT = true;
 
@@ -89,9 +89,17 @@ export interface IAlertSource {
   lastUserMessage?: string | null;
   headline?: string | null;
   detail?: string | null;
+  /** Kind `flag` only: the raised flag, carried on the alert as served (ADR-0032). */
+  flag?: IAlertFlag;
 }
 
 export type TAlertDraft = Omit<IAlert, 'id' | 'seq'>;
+
+/** Cut by code points, so a cut never splits a surrogate pair. */
+const cutBody = (text: string): string => {
+  const points = Array.from(text);
+  return points.length <= MAX_BODY ? text : points.slice(0, MAX_BODY).join('');
+};
 
 const STALL_BODY = 'Idle with no worker activity — the orchestrator stopped driving the epic.';
 
@@ -105,6 +113,7 @@ const titleFor = (kind: TAlertKind): string => {
     case 'work-stalled': return 'Work Stalled';
     case 'bg-job-died': return 'Background Job Died';
     case 'bg-job-unknown': return 'Background Job Status Unknown';
+    case 'flag': return 'Flag Raised';
   }
 };
 
@@ -123,6 +132,8 @@ const bodyFor = (source: IAlertSource): string => {
     case 'bg-job-died':
     case 'bg-job-unknown':
       return source.detail?.slice(0, MAX_BODY) || source.tabName || source.tabId;
+    case 'flag':
+      return cutBody(source.detail || source.flag?.text || source.tabName || source.tabId);
   }
 };
 
@@ -137,4 +148,5 @@ export const alertFor = (source: IAlertSource): TAlertDraft => ({
   title: titleFor(source.kind),
   body: bodyFor(source),
   at: source.at,
+  ...(source.kind === 'flag' && source.flag ? { flag: { ...source.flag } } : {}),
 });

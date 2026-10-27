@@ -21,6 +21,7 @@ import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio-runtime';
 import { startSpend, stopSpend } from './src/lib/spend/spend-service';
+import { startFlagAlerts, stopFlagAlerts } from './src/lib/flag-alerts';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { dispatchHook } from './src/lib/hook-dispatch';
 import { drainHookSpoolsWithRemotePull } from './src/lib/remote-spool';
@@ -115,6 +116,7 @@ const shutdownWs = async () => {
   // settles that paste in one last sync (story 12 review r1, N5). Notices enqueued after this wait
   // in inbox.json for the next boot.
   await stopInbox();
+  await stopFlagAlerts();
   await getMissionControlRuntime().stop();
   await stopSpend();
   await stopWatches();
@@ -407,6 +409,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   // The Mission Control coordination panel's optional host signals (story 20).
   startHostSignals();
   await getMissionControlRuntime().start();
+  // One raise-edge flag tick per process; its first tick, 60 s on, is the no-replay baseline (ADR-0032).
+  startFlagAlerts();
   // The spend index starts its first pass 120 s after boot, one transcript at a time (ADR-0030).
   await startSpend();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most

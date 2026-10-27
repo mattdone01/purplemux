@@ -126,10 +126,10 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
 
   await Promise.all(workspaces.map(async (workspace) => {
     const tabs = await deps.agentTabs(workspace.id).catch((err) => {
-      errors.push({ scope: workspace.name, error: errorText(err) });
+      errors.push({ scope: workspace.name, error: errorText(err), workspaceId: workspace.id });
       return undefined;
     });
-    if (tabs === null) errors.push({ scope: workspace.name, error: 'workspace layout could not be read' });
+    if (tabs === null) errors.push({ scope: workspace.name, error: 'workspace layout could not be read', workspaceId: workspace.id });
     if (!tabs) {
       layoutFailed = true;
       return;

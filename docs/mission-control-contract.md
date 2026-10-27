@@ -93,7 +93,14 @@ error }`, so an unreadable store shows its error and never blanks the others. It
 waits, the last end line, the SM-inbox items the tab opened, and the STALL? / WAITING-LONG / UNANSWERED flags (UNANSWERED
 also marks a tab still stopped on a `BLOCKED:` or `NEEDS-DECISION:` line). Thresholds
 are fleet config minutes: `fleet-status.stall-minutes` (30), `fleet-status.waiting-long-minutes` (120),
-`fleet-status.unanswered-minutes` (30), `fleet-status.composer-minutes` (2). The panel is read only.
+`fleet-status.unanswered-minutes` (30), `fleet-status.composer-minutes` (2). The panel is read only. `view.errors`
+entries are `{scope, error}`; a workspace's layout error also carries `workspaceId` (additive, purplemux-flow story 10),
+because a workspace name can equal a scope name.
+
+**Flag alerts (ADR-0032).** A flag that is raised also reaches the human with no poll: the server's 60 s flag tick sends
+one status-socket `notification:alert` of kind `flag`, `flag: {source: 'fleet', rule, subject, text}`, to the flagged
+tab (or to the enabled orchestrator for a workspace's unattributed UNANSWERED). Rules, baseline and switch:
+`docs/STATUS.md` § Flag alerts.
 
 **Opener attribution (advisory).** The CLI events route records who opened each new `attention.opened` in the unversioned
 side table `mission_item_openers`, inside the same transaction. The opener comes from the server-resolved caller
@@ -130,6 +137,12 @@ newest row holds until now. A gap longer than 10 min, a negative interval (the c
 the lock are unknown time, on neither side; no instant counts twice. If the known time is less than half the window,
 `lockBusyShare` is `null`, the lock is in `insufficientHistory`, and no flag is raised. `lockKnownMinutes` gives the
 known time. The shares are served on a stale record too; there, the time since the last publish is unknown time.
+
+**Flag alerts (ADR-0032).** Each derived flag also raises one `notification:alert` of kind `flag`,
+`flag: {source: 'flow', rule, subject, text}`, from the server's 60 s flag tick, addressed to the workspace's enabled
+orchestrator tab; with no orchestrator, nothing is sent. The tick derives from the stored record, never from a served
+answer. Fleet config `alerts.flags` (`off` disables) and `alerts.flag-repeat-minutes` (60) are admin-written only.
+Rules: `docs/STATUS.md` § Flag alerts.
 
 **Fleet config keys** (ADR-0019; the admin token or the workspace's enabled orchestrator writes them). An unset or
 invalid value reads as the default, and the server logs why. The served `thresholds` state the values in use.

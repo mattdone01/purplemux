@@ -803,9 +803,15 @@ shouldAlert({ id: tabId }, workspace, config)
 
 `alertsOrchestratorOnly` is a `config.json` key (`ALERTS_ORCHESTRATOR_ONLY_DEFAULT`), toggled in Settings → Notifications.
 
-The status-socket `notification:alert` consumer is intentionally limited to
-`orchestrator-missing`, which has no tab-state transition to drive an existing
-subscriber. Completion toasts remain owned by `use-toast-notification.ts`, so
+Kind `flag` (ADR-0032) does not go through `shouldAlert`: a flag is a fleet-level fact the owner asked to see, and its
+alert already names the orchestrator wherever the flag is workspace-level. Every other kind keeps the predicate.
+
+The status-socket `notification:alert` consumer (`showNotificationAlert` in
+`use-agent-status.ts`) is intentionally limited to `orchestrator-missing` and
+`flag`, which have no tab-state transition to drive an existing subscriber. A
+`flag` alert is a warning toast titled `Flag Raised · <workspace>` with the
+alert body (the flag text) and a **Mission Control** action; it applies no
+orchestrator filter. Any other or unknown kind is ignored. Completion toasts remain owned by `use-toast-notification.ts`, so
 their enable flag, focused-tab suppression, duration, action, and deduplication
 remain unchanged and no second warning toast is created.
 
@@ -818,6 +824,10 @@ remain unchanged and no second warning toast is created.
 | `standup-needs-human` | Standup Needs You | `reportStandup` when `needsHuman` (or state `blocked`/`awaiting-human`); addressed to the orchestrator tab, body is the headline |
 | `orchestrator-stalled` | Orchestrator Stalled | `runOrchestratorKeeper` on the `ORCH_MAX_HEARTBEATS` beat, once per stall episode |
 | `orchestrator-missing` | Orchestrator Missing | the coverage monitor finds confirmed remaining work with a missing, disabled, closed, or inactive designation; once per episode |
+| `work-stalled` | Work Stalled | a liveness probe reports a stall or keeps failing (`handleLivenessEvent`); outside the alert policy |
+| `bg-job-died` | Background Job Died | a registered background job failed (`handleLivenessEvent`), except a `--notify self` failure its own tab carries on |
+| `bg-job-unknown` | Background Job Status Unknown | a registered background job vanished with no exit status (`handleLivenessEvent`) |
+| `flag` | Flag Raised | the flag tick (`src/lib/flag-alerts.ts`), below |
 
 The idempotent guard at the top of `applyCliState` (`prevState === newState`) blocks duplicate calls, so callers don't have to track state.
 
@@ -830,11 +840,34 @@ The idempotent guard at the top of `applyCliState` (`prevState === newState`) bl
 - **`status-socket`** — broadcasts `{ type: 'notification:alert', alert }` to every `/api/status` client. Always broadcast; clients decide what to show. The web client ignores unknown frame types, so this is safe for older clients.
 - **`web-push`** — sends the VAPID payload. Visibility is checked **per subscription**: a subscription bound to a `deviceId` is muted only when that device reports visible (`POST /api/push/visibility`), so a focused desktop no longer mutes the phone. Unbound legacy rows keep the old global gate. `404`/`410` reap the subscription.
 
-- **`fcm`** — POSTs a **data-only** FCM HTTP v1 message per registration (`src/lib/fcm-channel.ts`), so the app renders the alert itself and keeps its kinds, actions and deep link; an FCM `notification` block would be rendered by Play services instead and is never sent. `data` carries the whole `notification:alert` payload as strings, plus `agentSessionId` / `workspaceDir` when the dispatch had them. `android.priority` is `high` for `needs-input` and `normal` otherwise. The visibility gate is the Web Push gate. An `UNREGISTERED` or `INVALID_ARGUMENT` response reaps the token, as `404`/`410` reap a Web Push endpoint — **except** when the error carries a `google.rpc.BadRequest` detail (`fieldViolations`). FCM answers `INVALID_ARGUMENT` both for a dead registration and for a message it cannot parse, and only the second carries field violations; reaping on our own malformed message would unsubscribe every device on the first dispatch. That case reaps nothing and logs at `error` with the offending field paths. Registered only when `FCM_SERVICE_ACCOUNT_PATH` names a readable service-account key file — otherwise one log line and no channel (ADR-011). Access tokens are minted from that key with a JWT-bearer grant (`src/lib/fcm-auth.ts`, `jose`) and cached until expiry.
+- **`fcm`** — POSTs a **data-only** FCM HTTP v1 message per registration (`src/lib/fcm-channel.ts`), so the app renders the alert itself and keeps its kinds, actions and deep link; an FCM `notification` block would be rendered by Play services instead and is never sent. `data` carries the `notification:alert` payload as strings, plus `agentSessionId` / `workspaceDir` when the dispatch had them. For kind `flag`, `data.flag` is the JSON string of `{source, rule, subject}` (no `text`) and `data.body` holds the alert body (`<tabName>: <text>` for a tab flag, the text alone for a flow or unattributed flag), cut to 100 code points, so the text is sent once. `android.priority` is `high` for `needs-input` and `normal` otherwise. The visibility gate is the Web Push gate. An `UNREGISTERED` or `INVALID_ARGUMENT` response reaps the token, as `404`/`410` reap a Web Push endpoint — **except** when the error carries a `google.rpc.BadRequest` detail (`fieldViolations`). FCM answers `INVALID_ARGUMENT` both for a dead registration and for a message it cannot parse, and only the second carries field violations; reaping on our own malformed message would unsubscribe every device on the first dispatch. That case reaps nothing and logs at `error` with the offending field paths. Registered only when `FCM_SERVICE_ACCOUNT_PATH` names a readable service-account key file — otherwise one log line and no channel (ADR-011). Access tokens are minted from that key with a JWT-bearer grant (`src/lib/fcm-auth.ts`, `jose`) and cached until expiry.
 
 The socket `notification:alert` broadcast is untouched by the FCM channel: foreground banners still come from `status-socket`, and `fcm` covers the backgrounded phone.
 
-The push payload keeps its existing shape and adds `kind`, `isOrchestrator`, `alertId`, and `agentSessionId`. `claudeSessionId` stays as-is for `public/sw.js` back-compat.
+The push payload keeps its existing shape and adds `kind`, `isOrchestrator`, `alertId`, and `agentSessionId`. `claudeSessionId` stays as-is for `public/sw.js` back-compat. A `flag` alert also carries `flag`: the whole object `{source, rule, subject, text}` in the push payload. In FCM it is the `{source, rule, subject}` projection above, with the text as `body`.
+
+### Flag alerts (`src/lib/flag-alerts.ts`, ADR-0032)
+
+A 60 s interval (`globalThis.__ptFlagAlertTick`), started beside the Mission Control runtime and stopped in `shutdownWs`, reads two flag sets:
+
+- **Fleet flags** from `readFleetView(now)` (ADR-0023, the 5 s cache): STALL?, WAITING-LONG and UNANSWERED per agent tab (subject: the tab id), and a workspace's unattributed UNANSWERED (subject: the workspace id).
+- **Flow flags**: `deriveFlowFlags(readFlow(ws), readFlowThresholds(), now)` over every workspace's record (ADR-0026). A stale record raises only `stale`.
+
+The raise-edge state is on `globalThis.__ptFlagAlertState`, keyed `source:workspaceId:rule:subject`. A key present now and absent in the previous read is a raise, and sends one `flag` alert unless that key alerted within fleet config `alerts.flag-repeat-minutes` (default 60). A flag that stays raised sends nothing more.
+
+Each flag names its **sources**, the reads its rule can depend on: `fleet-view`, `layout:<ws>`, `tab:<ws>/<tab>` (a row not in state `unknown`), `sm-inbox` (UNANSWERED), `waits` (STALL?: watches and jobs), and `flow:<ws>` (a record read, or no record). Any of them failing keeps a raised flag from clearing. Its **raise sources** are the narrower set whose failure could make the flag false, and only they block a raise: `waits` only for the idle STALL? (the fleet view refuses that one without watches and jobs), and `sm-inbox` only for an UNANSWERED whose row counts unanswered inbox items, or an unattributed line. A busy, needs-input, inactive or composer STALL? and a question-line UNANSWERED raise while those stores fail. A fleet view error names its source by its structured field: a layout error carries `workspaceId`, so a workspace named like a scope (`leases`) is still that workspace.
+
+| Case | Behaviour |
+| --- | --- |
+| baseline, per source | a key first seen in a source with no good read since the start (or since the switch came back on) is recorded and sends nothing, whatever the tick count. The first tick after a start therefore sends nothing, and a source first read late (a fleet view down at boot) does not replay its standing flags. A closed tab's and a closed workspace's sources are forgotten |
+| a source fails this tick | a raised flag resting on it is not cleared; a new flag whose raise source failed is not raised. When the read recovers, a flag that stood does not alert again; a flag new since then alerts once |
+| `alerts.flags` is `off` | the tick reads nothing and sends nothing; switching on starts a new baseline |
+| fleet config unreadable, or the workspace list unreadable | the tick is skipped; the state is kept |
+| target | a tab flag names the flagged tab. A workspace-level flag names the workspace's enabled orchestrator tab. No orchestrator, a disabled one, or an `orchestratorTabId` a readable layout no longer shows: nothing is sent and `flag-alert-no-target` is logged with the reason |
+| target cannot be checked | the fleet view or the workspace's layout is unreadable, or the orchestrator's row is in state `unknown`: the raise stays pending, is retried on each tick while the flag stays raised, and `flag-alert-target-unknown` is logged with the reason |
+| a tick still runs at the next interval | the next tick is skipped; a tick over 5 s logs its duration |
+
+The tick calls `getNotificationDispatcher().dispatch` directly (status socket, web push, FCM) and never sends an inbox notice. `alerts.flags` and `alerts.flag-repeat-minutes` are written by the admin token only (`ADMIN_ONLY_KEYS`).
 
 
 ## Codex launch policy and observed model

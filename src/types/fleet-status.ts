@@ -93,8 +93,11 @@ export interface IFleetView {
   rows: IFleetRow[];
   /** SM-inbox items whose posting tab is not known, per workspace (never hidden). */
   unattributed: IFleetUnattributed[];
-  /** Read errors by scope (a workspace name, or `watches`, `jobs`, `leases`, `SM inbox`); the rest still renders. */
-  errors: Array<{ scope: string; error: string }>;
+  /**
+   * Read errors by scope (a workspace name, or `watches`, `jobs`, `leases`, `SM inbox`, `WIP cap`); the rest still
+   * renders. A workspace's error also names its `workspaceId`, since a workspace may share a name with a scope.
+   */
+  errors: Array<{ scope: string; error: string; workspaceId?: string }>;
   /** Per workspace id (ADR-0027); absent from a server older than it, or when the cap could not be read. */
   wip?: Record<string, IFleetWip>;
 }

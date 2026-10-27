@@ -105,6 +105,7 @@ const buildPushPayload = (alert: IAlert, ctx: IAlertContext): string =>
     kind: alert.kind,
     isOrchestrator: alert.isOrchestrator,
     alertId: alert.id,
+    ...(alert.flag ? { flag: alert.flag } : {}),
   });
 
 export const createWebPushChannel = (overrides: Partial<IWebPushChannelDeps> = {}): INotificationChannel => {
