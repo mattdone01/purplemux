@@ -3,7 +3,8 @@
 _Epic decision id: ADR-005 (see `_output/purplemux-mobile/architecture.md`)._
 
 ## Status
-Accepted (2026-08-16, epic `purplemux-mobile`)
+Accepted (2026-08-16, epic `purplemux-mobile`). Amended by [ADR-0032](0032-flag-alerts.md): kind `flag`, which the
+orchestrator-only predicate does not filter.
 
 ## Context
  research §1.5; FR-7/FR-8; research Q3/Q9. Today the predicate lives inside the Web Push method only, is *suppress workers when an orchestrator exists* (every tab alerts in a non-orchestrated workspace), and `isAnyDeviceVisible()` is global. Standup `needsHuman` and keeper exhaustion push nothing.

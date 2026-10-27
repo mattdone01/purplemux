@@ -163,6 +163,18 @@ describe('buildFcmMessage', () => {
     expect(message.message.data).not.toHaveProperty('workspaceDir');
   });
 
+  it('carries a flag alert\'s flag as one JSON string without its text, which the body already holds (ADR-0032)', () => {
+    const flag = { source: 'fleet' as const, rule: 'stall', subject: 'T1', text: 'busy with no activity for 37 min' };
+    const message = buildFcmMessage({ ...alert('flag'), body: 'worker: busy with no activity for 37 min', flag }, {}, 't');
+
+    expect(message.message.data.kind).toBe('flag');
+    expect(JSON.parse(message.message.data.flag)).toEqual({ source: 'fleet', rule: 'stall', subject: 'T1' });
+    expect(message.message.data.body).toBe('worker: busy with no activity for 37 min');
+    expect(Object.values(message.message.data).filter((v) => v.includes('busy with no activity'))).toHaveLength(1);
+    expect(message.message.android.priority).toBe('normal');
+    expect(buildFcmMessage(alert('review'), {}, 't').message.data).not.toHaveProperty('flag');
+  });
+
   it('asks for high priority only when the alert needs input', () => {
     expect(buildFcmMessage(alert('needs-input'), {}, 't').message.android.priority).toBe('high');
     expect(buildFcmMessage(alert('review'), {}, 't').message.android.priority).toBe('normal');

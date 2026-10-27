@@ -115,6 +115,44 @@ describe('createStatusSocketChannel', () => {
   });
 });
 
+describe('kind flag (ADR-0032)', () => {
+  const flagDraft = () => draft({
+    kind: 'flag',
+    tabId: 'T2',
+    tabName: 'worker',
+    isOrchestrator: false,
+    detail: 'worker: busy with no activity for 37 min',
+    flag: { source: 'fleet', rule: 'stall', subject: 'T2', text: 'busy with no activity for 37 min' },
+  });
+
+  it('fans a flag alert out to every channel with its flag object, title and body', async () => {
+    const dispatcher = new NotificationDispatcher();
+    const a = fakeChannel('status-socket');
+    const b = fakeChannel('web-push');
+    dispatcher.register(a.channel);
+    dispatcher.register(b.channel);
+
+    const alert = await dispatcher.dispatch(flagDraft());
+
+    expect(a.delivered).toEqual([alert]);
+    expect(b.delivered).toEqual([alert]);
+    expect(alert).toMatchObject({
+      kind: 'flag',
+      tabId: 'T2',
+      isOrchestrator: false,
+      title: 'Flag Raised',
+      body: 'worker: busy with no activity for 37 min',
+      flag: { source: 'fleet', rule: 'stall', subject: 'T2', text: 'busy with no activity for 37 min' },
+    });
+  });
+
+  it('puts the flag on a flag alert only: another kind given one carries none', () => {
+    expect(draft({ kind: 'review', flag: { source: 'flow', rule: 'stale', subject: 'ws-1', text: 'x' } })).not.toHaveProperty('flag');
+    expect(draft({ kind: 'flag', flag: { source: 'flow', rule: 'stale', subject: 'ws-1', text: 'no publish for 11 min' } }).body)
+      .toBe('no publish for 11 min');
+  });
+});
+
 describe('createWebPushChannel', () => {
   const setup = (records: IPushSubscriptionRecord[], visible: string[] = []) => {
     const sent: { endpoint: string; payload: Record<string, unknown> }[] = [];
@@ -179,6 +217,17 @@ describe('createWebPushChannel', () => {
       isOrchestrator: true,
       alertId: 'alert-1',
     });
+  });
+
+  it('adds the flag object to a flag alert\'s payload, and nothing to other kinds', async () => {
+    const { channel, sent } = setup([record('https://push/phone', 'D2')]);
+    const flag = { source: 'flow' as const, rule: 'queue-long', subject: 'landing', text: 'landing holds 12 items (threshold 10)' };
+
+    await channel.deliver({ ...draft({ kind: 'flag', flag }), id: 'alert-2', seq: 8 }, {});
+    await channel.deliver(dispatched(), {});
+
+    expect(sent[0].payload).toMatchObject({ kind: 'flag', flag, body: 'landing holds 12 items (threshold 10)' });
+    expect(sent[1].payload).not.toHaveProperty('flag');
   });
 
   it('reaps subscriptions the push service reports as gone', async () => {

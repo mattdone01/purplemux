@@ -574,6 +574,11 @@ Keys in use:
                The bookkeeping auto-answer rule (ADR-0031): an integer 1..10080 of minutes. Unset
                (the default) or any invalid value is off (an invalid value is logged). Admin token
                only (exit 3 forbidden for a tab): the rule answers items in every workspace.
+  alerts.flags  alerts.flag-repeat-minutes
+               Flag alerts (ADR-0032). alerts.flags "off" stops every flag alert; any other value,
+               or unset, is on. alerts.flag-repeat-minutes, 1..10080 (default 60, decimals allowed),
+               is the least time between two alerts for one flag. Admin token only (exit 3
+               forbidden for a tab): they decide what reaches the owner's phone.
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
@@ -762,6 +767,16 @@ GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
     queue-old   a queue's oldest item is older than flow.oldest-minutes.
     queue-full  (block) a queue with a capacity holds at least that many items.
     meter-over  a meter's value is above its limit.
+  Flag alerts (ADR-0032): every 60 s the server reads the fleet flags (STALL?, WAITING-LONG,
+  UNANSWERED) and these derived flags. A flag raised since the previous read sends the human one
+  status-socket notification:alert of kind "flag" with "flag": { "source": "fleet" | "flow",
+  "rule", "subject", "text" }. tabId is the flagged tab, or the workspace's enabled orchestrator
+  for a flow flag and a workspace-level UNANSWERED; with no orchestrator nothing is sent. A flag
+  that stays raised sends nothing more, and one raised again alerts only after
+  alerts.flag-repeat-minutes. The first read after a server start sends nothing, and so does the
+  first good read of any source read late; an unreadable store raises nothing and clears nothing;
+  a target that cannot be checked is retried next tick. The orchestrator-only alert setting does
+  not apply. No inbox notice is sent: the alert is for the human, not for an agent.
 
 ## Spend (ADR-0030)
 

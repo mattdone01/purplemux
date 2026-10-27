@@ -22,6 +22,7 @@ import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio-runtime';
 import { startSpend, stopSpend } from './src/lib/spend/spend-service';
+import { startFlagAlerts, stopFlagAlerts } from './src/lib/flag-alerts';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { dispatchHook } from './src/lib/hook-dispatch';
 import { drainHookSpoolsWithRemotePull } from './src/lib/remote-spool';
@@ -117,6 +118,7 @@ const shutdownWs = async () => {
   // in inbox.json for the next boot.
   await stopAutoAnswerTick();
   await stopInbox();
+  await stopFlagAlerts();
   await getMissionControlRuntime().stop();
   await stopSpend();
   await stopWatches();
@@ -411,6 +413,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await getMissionControlRuntime().start();
   // The bookkeeping auto-answer rule: off until the admin sets its fleet-config key (ADR-0031).
   startAutoAnswerTick();
+  // One raise-edge flag tick per process; its first tick, 60 s on, is the no-replay baseline (ADR-0032).
+  startFlagAlerts();
   // The spend index starts its first pass 120 s after boot, one transcript at a time (ADR-0030).
   await startSpend();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most

@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { describe, expect, it, vi } from 'vitest';
 import { ADMIN_ONLY_KEYS } from '@/lib/fleet-config-http';
 import { FLEET_CONFIG_KEYS } from '@/lib/fleet-status-snapshot';
+import { FLAG_ALERT_CONFIG_KEYS } from '@/lib/flag-alerts';
 import { FLOW_CONFIG_KEYS } from '@/lib/flow-flags';
 import { AUTO_ANSWER_KEY } from '@/lib/mission-control-auto-answer';
 import { REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_KEY } from '@/lib/remote-host';
@@ -22,6 +23,7 @@ const SERVER_KEYS = [
   TAB_CAP_KEY,
   ...Object.values(FLOW_CONFIG_KEYS),
   AUTO_ANSWER_KEY,
+  ...Object.values(FLAG_ALERT_CONFIG_KEYS),
 ];
 
 const keysInUse = async (): Promise<string> => {

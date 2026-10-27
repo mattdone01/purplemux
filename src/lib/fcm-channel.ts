@@ -55,6 +55,8 @@ export const buildFcmMessage = (alert: IAlert, ctx: IAlertContext, token: string
     body: alert.body,
     at: String(alert.at),
   };
+  // The flag text is already the body; the structured field carries what routes the tap.
+  if (alert.flag) data.flag = JSON.stringify({ source: alert.flag.source, rule: alert.flag.rule, subject: alert.flag.subject });
   if (ctx.agentSessionId) data.agentSessionId = ctx.agentSessionId;
   if (ctx.workspaceDir) data.workspaceDir = ctx.workspaceDir;
 

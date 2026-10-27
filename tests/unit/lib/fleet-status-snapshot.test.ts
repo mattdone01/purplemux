@@ -143,7 +143,17 @@ describe('buildFleetView', () => {
     deps.agentTabs = async (id) => (id === 'ws-2' ? null : [tab('tab-busy')]);
     const view = await buildFleetView(deps, NOW);
     expect(view.rows.map((r) => r.tabId)).toEqual(['tab-busy']);
-    expect(view.errors).toEqual([{ scope: 'Broken', error: 'workspace layout could not be read' }]);
+    expect(view.errors).toEqual([{ scope: 'Broken', error: 'workspace layout could not be read', workspaceId: 'ws-2' }]);
+  });
+
+  it('a layout that throws names its workspace by id too, so a workspace named like a scope stays a workspace', async () => {
+    deps.workspaces = async () => [{ id: 'ws-1', name: 'Portfolio' }, { id: 'ws-2', name: 'leases' }];
+    deps.agentTabs = async (id) => {
+      if (id === 'ws-2') throw new Error('EACCES');
+      return [tab('tab-busy')];
+    };
+    const view = await buildFleetView(deps, NOW);
+    expect(view.errors).toEqual([{ scope: 'leases', error: 'EACCES', workspaceId: 'ws-2' }]);
   });
 
   it('a status entry of another workspace is not this tab\'s status', async () => {

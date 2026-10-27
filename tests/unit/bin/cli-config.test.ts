@@ -97,7 +97,8 @@ describe('purplemux config — the installed CLI against the real fleet-config r
         req.query.key = 'constructor';
         return (await import('@/pages/api/cli/fleet-config/[key]')).default(req, res);
       },
-      ...Object.fromEntries(['flow.window-minutes', 'flow.lock-busy-percent', 'flow.queue-length', 'flow.oldest-minutes'].map((key) => [
+      ...Object.fromEntries(['flow.window-minutes', 'flow.lock-busy-percent', 'flow.queue-length', 'flow.oldest-minutes',
+        'alerts.flags', 'alerts.flag-repeat-minutes'].map((key) => [
         `/api/cli/fleet-config/${key}`,
         async (req: NextApiRequest, res: NextApiResponse) => {
           req.query.key = key;
@@ -145,6 +146,19 @@ describe('purplemux config — the installed CLI against the real fleet-config r
       expect(byWorker.code).toBe(3);
       expect(byWorker.stderr).toContain('forbidden');
       expect((await cli(['config', 'get', key], worker)).stdout).toBe('40\n');
+    }
+  });
+
+  it('alerts.* keys are the admin token\'s only (ADR-0032, ruling R2)', async () => {
+    for (const [key, value] of [['alerts.flags', 'off'], ['alerts.flag-repeat-minutes', '30']]) {
+      for (const env of [orch, worker]) {
+        const refused = await cli(['config', 'set', key, value], env);
+        expect(refused.code, key).toBe(3);
+        expect(refused.stderr).toContain('admin token only');
+      }
+      expect((await cli(['config', 'set', key, value], admin)).code, key).toBe(0);
+      expect((await cli(['config', 'get', key], worker)).stdout).toBe(`${value}\n`);
+      expect((await cli(['config', 'unset', key], orch)).code, key).toBe(3);
     }
   });
 

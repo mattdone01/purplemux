@@ -47,6 +47,15 @@ describe('GET /api/cli/api-guide', () => {
     expect(guide).toContain('"derived"?:');
   });
 
+  it('documents flag alerts and their admin-only keys (ADR-0032)', async () => {
+    scope.resolveCliScope.mockReturnValue({ type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-1', tabVerified: true });
+    const guide = String((await call()).body);
+    const keys = guide.slice(guide.indexOf('Keys in use:'), guide.indexOf('GET /api/cli/fleet-config'));
+    for (const key of ['alerts.flags', 'alerts.flag-repeat-minutes']) expect(keys).toContain(key);
+    expect(keys).toContain('Admin token only (exit 3\n               forbidden for a tab): they decide what reaches the owner\'s phone.');
+    expect(guide).toContain('notification:alert of kind "flag" with "flag": { "source": "fleet" | "flow",');
+  });
+
   it('refuses a caller no token resolves', async () => {
     scope.resolveCliScope.mockReturnValue(null);
     expect((await call()).status).toBe(403);

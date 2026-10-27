@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import Router from 'next/router';
 import { toast } from 'sonner';
 import useTabStore from '@/hooks/use-tab-store';
 import useTabMetadataStore from '@/hooks/use-tab-metadata-store';
@@ -36,7 +37,21 @@ export const ackNotificationInput = (tabId: string, seq: number) => {
   }
 };
 
+const MISSION_CONTROL_PATH = '/mission-control';
+
+/**
+ * A `flag` alert is a fleet-level fact (ADR-0032): it is shown whatever the tab's orchestrator role,
+ * with a link to the panel that holds the flag.
+ */
 export const showNotificationAlert = ({ alert }: INotificationAlertMessage): void => {
+  if (alert.kind === 'flag') {
+    toast.warning(alert.workspaceName ? `${alert.title} · ${alert.workspaceName}` : alert.title, {
+      id: alert.id,
+      description: alert.body,
+      action: { label: 'Mission Control', onClick: () => void Router.push(MISSION_CONTROL_PATH) },
+    });
+    return;
+  }
   if (alert.kind !== 'orchestrator-missing') return;
   toast.warning(alert.title, { id: alert.id, description: alert.body });
 };
