@@ -21,7 +21,7 @@ import('update-notifier')
 const cmd = process.argv[2];
 
 if (cmd && CLI_COMMANDS.has(cmd)) {
-  require('./cli.js');
+  require('./cli.js').run();
 } else if (!cmd || cmd === 'start') {
   process.env.NODE_ENV = process.env.NODE_ENV || 'production';
   process.env.__PMUX_APP_DIR = path.resolve(__dirname, '..');

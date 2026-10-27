@@ -285,6 +285,29 @@ The existing route `POST /api/layout/pane/{p}/tabs/{t}` still recreates only a d
 
 ---
 
+## Counting tabs from a repo hook
+
+A repository hook that limits parallel agents must count the tabs of its workspace. Obey three rules:
+
+1. **purplemux runs tmux on its own socket, `-L purple`** (`TMUX_SOCKET` in `src/lib/tmux.ts`). A hook that runs `tmux ls` without `-L purple` reads the user's own tmux server. That server does not hold the purplemux tabs, so the count is wrong. A count of `tmux -L purple ls` is also wrong: it holds the sessions of every workspace and of every tab type.
+2. **Use `purplemux tab count -w WS`** (ADR-0027). It prints `<count> <cap>`: the agent tabs (`claude-code`, `codex-cli`, `grok-cli`) of workspace `WS`, and the WIP cap. `--json` adds `capSource` and `overCap`. Inside a tab, `WS` is `$PMUX_WORKSPACE_ID`. The server counts under the layout lock, the same count that refuses a create at the cap. The exit codes are in the api-guide (`GET /api/cli/workspaces/<WS>/tab-count`).
+3. **A remote tab does not run on this host** (ADR-0022). Its session is on `ssh <host> tmux -L pmux-<origin>`. `<origin>` is the host name of the purplemux server, made safe by `originName` in `src/lib/remote-host.ts`: lower case, each run of characters outside `[a-z0-9-]` replaced by one `-`, leading and trailing `-` removed, at most 40 characters, and `origin` when nothing is left. No local tmux command sees the session. `tab count` counts it.
+
+```bash
+out=$(purplemux tab count -w "$PMUX_WORKSPACE_ID")
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "tab count failed (exit $status); not limiting" >&2
+  exit 0
+fi
+read -r count cap <<< "$out"
+[ "$count" -lt "$cap" ] || { echo "WIP cap: $count of $cap agent tabs" >&2; exit 2; }
+```
+
+If the CLI fails, the hook decides its own policy from the exit code (ADR-0016). The example reports the exit code and lets the action continue, because a hook that blocks on a server outage stops every tab.
+
+---
+
 ## Related Files
 
 | File | Description |

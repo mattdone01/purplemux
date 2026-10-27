@@ -117,7 +117,7 @@ export interface IFlowPublishResponse {
   receivedAt: number;
   generatedAt: number;
   historyRows: number;
-  /** True when a damaged record was moved aside and this publish started a fresh history. */
+  /** True when a damaged record was kept aside (a hard link) and this publish started a fresh history. */
   historyReset: boolean;
   /** The stored record, serialized. */
   bytes: number;

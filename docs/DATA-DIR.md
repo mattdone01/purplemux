@@ -20,6 +20,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       ├── burndown.json         # latest published epic burndown (Scrum Master)
 │       ├── flow.json             # latest published pipeline flow + server history (ADR-0026)
+│       ├── liveness.json         # the tabs' liveness probes and background jobs (0600)
+│       ├── codex-prompt.md       # Codex developer_instructions content
 │       ├── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
 │       └── grok-home/            # per-workspace GROK_HOME
 ├── hooks.json               # Claude Code hook + statusline config (generated)
@@ -36,10 +38,19 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── push-subscriptions.json  # Web Push endpoints + FCM device registrations
 ├── orchestrator-presence.json # durable missing-owner notification episode latches
 ├── owner-grants.json        # the owner grant (ADR-0029; 0600; never written to grants.json)
-├── mission-control.sqlite   # Mission Control runs, items, answers, deliveries, events (0600)
-├── deploy-announcements.json # deploy announcements, 7 days (ADR-0017; 0600; coordination `deploys` reads the last 24 h)
+├── grants.json              # drive grants (ADR-0014; 0600)
+├── leases.json              # held leases (ADR-0011; 0600)
+├── notes.json               # coordinator notes (ADR-0013; 0600)
+├── watches.json             # harness watches (ADR-0015; 0600)
+├── inbox.json               # server notices queued or held for tabs (ADR-0012; 0600)
+├── fleet-config.json        # fleet config keys, versions and history (ADR-0019; 0600)
+├── deploy-announcements.json # deploy announcements and their recipients, 7 days (ADR-0017; 0600; coordination `deploys` reads the last 24 h)
+├── tab-tokens.json          # per-tab CLI tokens (0600)
+├── workspace-tokens.json    # per-workspace CLI tokens (0600)
+├── mission-control.sqlite   # Mission Control and portfolio database: runs, items, answers, deliveries, events (0600; WAL)
 ├── audit/
-│   └── coordination.jsonl   # coordination audit lines (leases, notes, grants, deploys; rotated at 10 MiB, 3 kept)
+│   └── coordination.jsonl   # coordination audit lines: leases, notes, grants, deploys, restarts (0600; rotated at 10 MiB, 3 kept)
+├── session-stats/           # per-session statusline usage {sessionId}.json (0600)
 ├── cli-token                # CLI auth token (generated)
 ├── port                     # current server port (hook scripts read it)
 ├── hook-spool/              # hook events no server answered (0700; ADR-0020)
@@ -260,29 +271,62 @@ readable file's grants and name the refused file in `refused`; an unreadable `gr
 treated the same way. Only both files refused fails the listing (500). Ended grants stay listed 7
 days, then the minute sweep prunes them, as in `grants.json`.
 
-### `mission-control.sqlite` — `src/lib/mission-control-store.ts`
+### Coordination stores
 
-The Mission Control record (`docs/mission-control-contract.md`), SQLite in WAL mode, `0600`. The
-versioned tables (`runs`, `attention_items`, `answers`, `deliveries`, `events`, `bootstrap`,
-`bootstrap_entries`) are at `user_version` 4; a newer version is refused, never read. Two
-unversioned side tables are created with `CREATE TABLE IF NOT EXISTS` and carry no foreign key, so
-a schema-4 release rolled back onto the file still opens it and ignores them:
+Each store below is one JSON file, written whole: a tmp file at mode 0600, then a rename. Except for
+`workspace-tokens.json`, one promise-chain lock on `globalThis` serializes the writes of each store. If the file is absent, the store is empty. Unless the table says
+otherwise, a malformed file is refused, never read as empty: the feature answers an error that names the file until
+someone repairs the file or moves it aside.
+
+| File | Owner module | Shape | Retention, and a malformed file |
+| --- | --- | --- | --- |
+| `grants.json` | `src/lib/grant-store.ts` | `{ grants: IGrant[] }`, drive grants (ADR-0014) | ended grants kept 7 days; malformed: no drive grant is honoured |
+| `leases.json` | `src/lib/lease-store.ts` | `{ leases: ILease[] }` (ADR-0011) | a lease ends with its tab, its TTL or a release; malformed: every lease call refused |
+| `notes.json` | `src/lib/notes-store.ts` | `{ notes: INote[] }` (ADR-0013) | an open note expires after 14 days; an acked or expired note is pruned 14 days after its last state change |
+| `watches.json` | `src/lib/watch-store.ts` | `{ watches: IWatch[] }` (ADR-0015) | a watch ends by its TTL (default 24 h, at most 7 days) |
+| `inbox.json` | `src/lib/inbox-store.ts` | `{ items: IInboxItem[] }` (ADR-0012) | an item that is not `queued` is pruned 7 days after its last state change |
+| `fleet-config.json` | `src/lib/fleet-config-store.ts` | `{ values: {key: {value, version, setAt, setBy}}, versions: {key: n}, history: change[] }` (ADR-0019) | history keeps the last 200 changes; malformed: every key read refused |
+| `deploy-announcements.json` | `src/lib/deploy-announce.ts` | `{ announcements: IDeployAnnouncement[] }` (ADR-0017) | kept 7 days |
+| `tab-tokens.json` | `src/lib/tab-token.ts` | `{ [tabId]: { token, workspaceId, sessionName, createdAt, origin?, injectedAt?, presentedAt? } }` | a token ends with its tab; malformed: moved to `tab-tokens.json.unreadable-<ms>` and the server starts empty |
+| `workspace-tokens.json` | `src/lib/workspace-token.ts` | `{ [workspaceId]: token }` | written synchronously (tmp + rename) with no lock; read once per process (`globalThis.__ptWorkspaceTokens`); malformed or unreadable: read as empty, and a workspace gets a new token |
+
+The types are in `src/types/{grant,lease,note,watch,inbox,fleet-config,deploy}.ts`. The fleet config keys in use are
+listed in the api-guide ("Keys in use").
+
+### `mission-control.sqlite` — `src/lib/mission-control-store.ts`, `src/lib/portfolio-store.ts`
+
+The Mission Control database (better-sqlite3, WAL, so `-wal` and `-shm` files sit beside it). `mission-control-store.ts`
+sets the file to 0600 when it opens it and owns the versioned schema (`SCHEMA_VERSION` 4): `runs`, `attention_items`,
+`answers`, `deliveries`, `events`, `bootstrap`, `bootstrap_entries`. A newer schema version is refused, never read.
+Unversioned side tables are created with `CREATE TABLE IF NOT EXISTS` and carry no foreign key, so a schema-4 release
+rolled back onto the file still opens it and ignores them:
 
 - `mission_item_openers` — the tab that opened each item (ADR-0023).
-- `mission_auto_answers` — one row per bookkeeping auto-answer (ADR-0031): `answer_id` (primary
-  key), `item_id`, `workspace_id`, `rule`, `rule_version`, `applied_option_id`, `at`, `note`.
-  Written in the answer's transaction. The rule's answers are also audit lines
-  (`attention-auto-answer`) in `audit/coordination.jsonl`.
+- `mission_auto_answers` — one row per bookkeeping auto-answer (ADR-0031): `answer_id` (primary key), `item_id`,
+  `workspace_id`, `rule`, `rule_version`, `applied_option_id`, `at`, `note`. Written in the answer's transaction. The
+  rule's answers are also audit lines (`attention-auto-answer`) in `audit/coordination.jsonl`.
+- the `portfolio_*` tables, added by `portfolio-store.ts`, which opens the same file (selection, impacts, events, watch
+  uses, watch history unknown, actions, wakes, escalations, milestones).
 
-Not regeneratable: deleting the file drops every run, open question and answer history.
+Not regeneratable: deleting the file loses every run, attention item, answer history and portfolio selection.
 
 ### `audit/coordination.jsonl` — `src/lib/coordination-audit.ts`
 
-One JSON line per coordination event, appended under one lock, rotated to `.1`…`.3` at 10 MiB. A failed append
-never fails the operation it records. A `lease-release` line names the lease, the `reason` (`released`, `broken`,
-`expired`, …), the `holder`, and `by`: the releasing tab or admin token (`{workspaceId, tabId, verified, identity,
-admin}`), `{human: <session subject>}` when a human session breaks the lease from Mission Control (ADR-0029 §8), or
-`null` for a server-made release. A break adds `breakReason` (at most 500 code points).
+The coordination audit log: one JSON line per transition, `{ at: ISO-8601, event, … }` (for example `lease-acquire`,
+`tab-reap`, `tab-restart`, `tab-over-cap`). The directory is 0700 and the file 0600. Lines are appended under one lock
+(`globalThis.__ptCoordinationAuditLock`). At 10 MiB the file rotates to `coordination.jsonl.1`, and the server keeps 3
+old files. An audit write that fails is logged and never fails the action it records.
+A `lease-release` line names the lease, the `reason` (`released`, `broken`, `expired`, …), the `holder`, and `by`: the
+releasing tab or admin token (`{workspaceId, tabId, verified, identity, admin}`), `{human: <session subject>}` when a
+human session breaks the lease from Mission Control (ADR-0029 §8), or `null` for a server-made release. A break adds
+`breakReason` (at most 500 code points).
+
+### `session-stats/{sessionId}.json` — `src/lib/session-stats.ts`
+
+The latest statusline figures of one Claude session (`ISessionStats` in `src/types/timeline.ts`: tokens, cost,
+context window, model). `POST /api/status/statusline` merges each statusline into the file, at mode 0600, tmp + rename.
+The timeline reads it. At boot the server deletes the files whose session transcript no longer exists. These files are
+regeneratable.
 
 ### FCM service account (outside `~/.purplemux`)
 
@@ -349,9 +393,22 @@ appends one history row the server derives from it; history keeps the newest 200
 file at most 4 MiB, the oldest rows dropped first. Writes are serialized per workspace
 (`globalThis.__ptFlowLocks`); parsed records are cached by mtime and size
 (`globalThis.__ptFlowReadCache`). A file that does not parse or re-validate is reported as a
-storage error (`flow-unreadable`), never read as "no flow published". The next publish renames it
-to `flow.json.corrupt-<receivedAt>` (kept for inspection, never read again) and starts a fresh
-history. Read through `GET /api/cli/workspaces/{wsId}/flow` and `GET /api/mission-control/flow`.
+storage error (`flow-unreadable`), never read as "no flow published". The next publish keeps it aside
+as `flow.json.corrupt-<receivedAt>` (a hard link, kept for inspection, never read again), then
+replaces `flow.json` and starts a fresh history. Read through `GET /api/cli/workspaces/{wsId}/flow` and `GET /api/mission-control/flow`.
+
+### `liveness.json` — `src/lib/liveness-store.ts`
+
+The workspace's liveness probes and background jobs: `{ probes: ILivenessProbe[], jobs: IBackgroundJob[] }`
+(`src/types/liveness.ts`), mode 0600, tmp + rename, one lock per workspace (`globalThis.__ptLivenessLocks`).
+`purplemux tab probe set` and `tab bg add` write it; the watchdog reads it. The orchestrator-presence monitor and the orchestration
+work-state check read it strictly: a malformed file is unknown evidence, never "no jobs". The other readers log the
+error and read it as empty.
+
+### `codex-prompt.md` — `src/lib/providers/codex/prompt.ts`
+
+The Codex counterpart of `claude-prompt.md`: the workspace ID and the CLI quick reference. A Codex launch passes the
+content as `-c developer_instructions=…`. Rewritten only when the content changes; written with the default mode.
 
 ### `claude-home/` — `src/lib/workspace-home.ts`
 
