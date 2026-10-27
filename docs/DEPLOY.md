@@ -83,6 +83,8 @@ and each prints `PASS`/`FAIL` with what it measured and expected:
 
 | Check | Proves |
 |---|---|
+| `fixture-cap` | first, before any other check (`checks-wip-cap.cjs`). It writes nothing unless the state is provably the scratch instance: neither its HOME nor its `.purplemux` resolves (realpath) to the live one, and its `.purplemux/port` names the state's port and not the live port. Then the scratch fleet's `tabs.cap-per-workspace` is set to 200, the key's maximum, and read back from both workspaces through `tab count` (`capSource: fleet-config`). The fixtures stay open across checks and outgrow the default 8, so a failed set or read-back runs no other check. Only the scratch HOME is written; the live fleet keeps its own cap |
+| `wip-cap-refusal` | SC-2 (ADR-0027): with one probe agent tab in workspace A, the cap is lowered to A's count, and an agent tab create exits 3 `wip-cap` naming the count and the cap and makes no tab; the cap is restored and read back, and the probe closed. A cap that is not restored (`fixture-cap-restore`) runs no later check. These gate results alone never pass a run; `--only-wave` takes an integer from 1 to the number of waves only |
 | `tab-create`, `tab-list`, `tab-send-result`, `tab-status` | tab create/list/send/result/status in two workspaces |
 | `identity-env` | a tab carries `PMUX_TAB_ID` and `PMUX_TAB_TOKEN` (ADR-0010) |
 | `legacy-tab-identity` | a tab without `PMUX_TAB_TOKEN` (every tab created before story 01) still takes a lease, as an unverified holder named by its session |

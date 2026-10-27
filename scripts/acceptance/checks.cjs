@@ -6,6 +6,8 @@
 // Control delivery through the inbox) live in checks-wave4.cjs; the wave-5 recovery checks in
 // checks-wave5.cjs; the wave-6 epic burndown publish and board read in checks-burndown.cjs; the wave-7
 // default Mission Control page (Needs you before the portfolio board) in checks-mission-control-page.cjs, run last.
+// Before wave 1, checks-wip-cap.cjs sets the scratch fleet's WIP cap that the fixtures need and proves
+// the refusal at the cap (story 20; ADR-0027).
 //
 //   checks.cjs --state <state.json> [--bash-guard <bash-guard.py>] [--require-bash-guard]
 //
@@ -50,6 +52,7 @@ const { wave4, request, humanSession, liveStandIn, standInRecord } = require('./
 const { wave5 } = require('./checks-wave5.cjs');
 const { wave6 } = require('./checks-burndown.cjs');
 const { wave7 } = require('./checks-mission-control-page.cjs');
+const { fixtureCapGate } = require('./checks-wip-cap.cjs');
 
 const POLL_MS = 200;
 /** The idle window the run sets (fleet config, minutes): 3 s. */
@@ -103,7 +106,8 @@ const summarize = (results, { requireBashGuard = false } = {}) => {
   const failed = count('fail');
   const skipped = count('skip');
   const guardSkipped = results.some((r) => r.status === 'skip' && r.id === 'bash-guard');
-  const pass = failed === 0 && results.length > 0 && !(requireBashGuard && guardSkipped);
+  // The WIP cap gate's own results (`gate: true`) never make a run pass: a run that ran no wave did not run.
+  const pass = failed === 0 && results.some((r) => !r.gate) && !(requireBashGuard && guardSkipped);
   lines.push(`ACCEPTANCE=${pass ? 'PASS' : 'FAIL'} checks=${results.length} passed=${count('pass')} failed=${failed} skipped=${skipped}`);
   return { lines, pass };
 };
@@ -1566,12 +1570,21 @@ const freePort = () =>
     });
   });
 
+/** The waves in run order; `--only-wave N` selects the Nth. Building the list calls no wave. */
+const wavesFor = (inst, opts, helpers) => [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers),
+  () => wave5(inst, helpers), () => wave6(inst, helpers), () => wave7(inst)];
+const WAVE_COUNT = wavesFor(null, {}, {}).length;
+
 const parseArgs = (argv) => {
   const opts = { state: null, bashGuard: null, requireBashGuard: false, onlyWave: null, targetedFixture: false, evidenceDir: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--state') opts.state = argv[++i];
     // Debugging one wave against a kept instance; run.sh and the deploy gate never pass it.
-    else if (argv[i] === '--only-wave') opts.onlyWave = Number(argv[++i]);
+    else if (argv[i] === '--only-wave') {
+      const raw = argv[++i];
+      opts.onlyWave = /^\d+$/.test(raw ?? '') ? Number(raw) : NaN;
+      if (!(opts.onlyWave >= 1 && opts.onlyWave <= WAVE_COUNT)) throw new Error(`--only-wave takes an integer 1..${WAVE_COUNT}, not ${JSON.stringify(raw ?? null)}`);
+    }
     else if (argv[i] === '--targeted-fixture') opts.targetedFixture = true;
     else if (argv[i] === '--evidence-dir') opts.evidenceDir = argv[++i];
     else if (argv[i] === '--bash-guard') opts.bashGuard = argv[++i];
@@ -1603,12 +1616,12 @@ const main = async (argv) => {
   if (opts.evidenceDir) state.evidenceDir = path.resolve(opts.evidenceDir);
   const inst = new Instance(state);
   const helpers = { parseJson, within, sleep, brief, shellQuote, readIf, retainDesignatedFixture };
-  const waves = opts.targetedFixture
-    ? [() => targetedFixtureWithNotes(inst)]
-    : [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers), () => wave5(inst, helpers),
-      () => wave6(inst, helpers), () => wave7(inst)];
-  const results = [];
-  for (const [i, wave] of waves.entries()) {
+  const waves = opts.targetedFixture ? [() => targetedFixtureWithNotes(inst)] : wavesFor(inst, opts, helpers);
+  // The WIP cap gate runs first: a run whose scratch cap is not set (or not restored) runs no check.
+  const fullRun = !opts.targetedFixture && opts.onlyWave === null;
+  const gate = await fixtureCapGate(inst, { ...helpers, nonce: crypto.randomBytes(3).toString('hex') }, { refusalCheck: fullRun });
+  const results = [...gate.results];
+  for (const [i, wave] of (gate.proceed ? waves : []).entries()) {
     if (opts.targetedFixture || opts.onlyWave === null || opts.onlyWave === i + 1) results.push(...(await wave()));
   }
   const { lines, pass } = summarize(results, opts);
@@ -1619,8 +1632,8 @@ const main = async (argv) => {
 module.exports = {
   Instance, notes, judgeRace, judgeNoteDelivery, summarize, shellQuote, parseArgs,
   retainDesignatedFixture, assessFixtureAgent, assessShellControl, fixturePhysicalObservation,
-  pollObservation, processIdentity, processDescendsFrom, completeResult, brief,
-  appendTargetedPrerequisiteFailures, targetedFixtureProof, notesOnly, targetedFixtureWithNotes,
+  pollObservation, processIdentity, processDescendsFrom, completeResult, brief, parseJson,
+  appendTargetedPrerequisiteFailures, targetedFixtureProof, notesOnly, targetedFixtureWithNotes, WAVE_COUNT,
 };
 
 if (require.main === module) {
