@@ -175,8 +175,17 @@ describe('buildFcmMessage', () => {
     expect(buildFcmMessage(alert('review'), {}, 't').message.data).not.toHaveProperty('flag');
   });
 
-  it('asks for high priority only when the alert needs input', () => {
+  it('carries an attention-opened alert\'s itemId, and no itemId on another kind', () => {
+    const message = buildFcmMessage({ ...alert('attention-opened'), itemId: 'item-7' }, {}, 't');
+
+    expect(message.message.data.kind).toBe('attention-opened');
+    expect(message.message.data.itemId).toBe('item-7');
+    expect(buildFcmMessage(alert('review'), {}, 't').message.data).not.toHaveProperty('itemId');
+  });
+
+  it('asks for high priority only when the alert needs the human\'s input', () => {
     expect(buildFcmMessage(alert('needs-input'), {}, 't').message.android.priority).toBe('high');
+    expect(buildFcmMessage(alert('attention-opened'), {}, 't').message.android.priority).toBe('high');
     expect(buildFcmMessage(alert('review'), {}, 't').message.android.priority).toBe('normal');
     expect(buildFcmMessage(alert('work-stalled'), {}, 't').message.android.priority).toBe('normal');
   });

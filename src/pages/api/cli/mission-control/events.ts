@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import { alertOpenedAttention } from '@/lib/attention-alerts';
 import { resolveCaller } from '@/lib/caller';
 import { FOREIGN_MUTATION_HINT } from '@/lib/cli-error';
 import { isOwnWorkspace } from '@/lib/cli-utils';
@@ -66,8 +67,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         opener: event.type === 'attention.opened' ? opener : null,
       });
     }
+    const applied = store.applyEvents(events, authorities);
+    // An item opened for the human alerts once (ADR-0032 channels); a replayed event never does.
+    void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null });
     return res.status(200).json({
-      ...store.applyEvents(events, authorities),
+      ...applied,
       humanInboxPolicy: store.humanInboxPolicy(workspaceId),
     });
   } catch (error) {
