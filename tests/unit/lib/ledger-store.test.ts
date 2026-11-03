@@ -79,7 +79,14 @@ describe('ledger.sqlite (AC 1)', () => {
     const raw = new Database(path.join(dir, 'ledger.sqlite'));
     raw.pragma('user_version = 2');
     raw.close();
-    const open = () => fs.readdirSync('/proc/self/fd').length;
+    // Only descriptors on this ledger file: a count of every fd moves with whatever else the worker opens.
+    const open = () => fs.readdirSync('/proc/self/fd').filter((fd) => {
+      try {
+        return fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(path.join(dir, 'ledger.sqlite'));
+      } catch {
+        return false;
+      }
+    }).length;
     const before = open();
     for (let attempt = 0; attempt < 5; attempt++) {
       expect(() => new LedgerStore(path.join(dir, 'ledger.sqlite'))).toThrow('unsupported ledger schema 2');

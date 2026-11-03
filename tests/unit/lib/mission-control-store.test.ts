@@ -297,6 +297,15 @@ describe('MissionControlStore', () => {
     store.close();
   });
 
+  it('lists a workspace\'s open items, id and title, for the board (ADR-0034)', () => {
+    const store = new MissionControlStore(databasePath());
+    expect(store.openItemTitles('ws-a')).toEqual([]);
+    seed(store);
+    expect(store.openItemTitles('ws-a')).toEqual([{ id: 'item-a', title: 'Choose a rollout' }]);
+    expect(store.openItemTitles('ws-b')).toEqual([]);
+    store.close();
+  });
+
   it('persists open attention and replays events after reopen without cursor gaps', () => {
     const file = databasePath();
     const first = new MissionControlStore(file);

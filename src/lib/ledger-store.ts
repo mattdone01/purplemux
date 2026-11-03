@@ -18,6 +18,7 @@ import {
   percentile,
   stageOfReason,
 } from '@/lib/ledger';
+import type { IFinderLedgerInput } from '@/types/constraint';
 import type {
   ILedgerAppendResult,
   ILedgerEventInput,
@@ -555,6 +556,36 @@ export class LedgerStore {
     return { rows, totals: summarize(total) };
   };
 
+  /**
+   * What the constraint finder reads for one workspace (ADR-0034): finished waits overlapping
+   * [since, now), open items and items closed since `since`, the producer of each open item's last
+   * event, where the workspace's history starts, and deliveries per tab since `wakesSince`.
+   */
+  finderSnapshot = (workspaceId: string, window: { since: number; wakesSince: number }, now: number): IFinderLedgerInput => {
+    const intervals = (this.database.prepare(`SELECT item_key, item_type, reason, holder, start, "end" FROM intervals
+      WHERE workspace_id = ? AND "end" > ? AND "end" <= ? AND start < ?`).raw()
+      .all(workspaceId, window.since, now + (this.meta(`longest-interval-ms:${workspaceId}`) ?? 0), now) as Array<
+      [string, TLedgerItemType, TLedgerIntervalReason, string | null, number, number]>)
+      .map(([itemKey, itemType, reason, holder, start, end]) => ({ itemKey, itemType, reason, holder, start, end }));
+    const items = (this.database.prepare('SELECT * FROM items WHERE workspace_id = ? AND (closed_at IS NULL OR closed_at > ?)')
+      .all(workspaceId, window.since) as IItemRow[]).map((row) => itemFromRow(row, now));
+    const lastProducer = Object.fromEntries(this.database.prepare(`SELECT i.item_key, e.producer FROM items AS i INDEXED BY items_open_idx
+      JOIN events e ON e.seq = i.last_seq WHERE i.workspace_id = ? AND i.closed_at IS NULL`).raw()
+      .all(workspaceId) as Array<[string, string]>);
+    const firstEventAt = (this.database.prepare('SELECT MIN(opened_at) AS first FROM items WHERE workspace_id = ?')
+      .get(workspaceId) as { first: number | null }).first;
+    const anyTabEvent = this.database.prepare('SELECT 1 FROM tab_events WHERE workspace_id = ? LIMIT 1').get(workspaceId) !== undefined;
+    // A delivery follows its event, so `at` (indexed) bounds the scan; a digest holds events for at most a day.
+    const tabWakes = anyTabEvent
+      ? (this.database.prepare(`SELECT tab_id, COUNT(DISTINCT COALESCE(digest_id, 'seq:' || seq)) FROM tab_events
+        WHERE workspace_id = ? AND at > ? AND at <= ? AND delivered_at > ? AND delivered_at <= ? AND class != 'log'
+        GROUP BY tab_id ORDER BY tab_id`).raw()
+        .all(workspaceId, window.wakesSince - DAY_MS, now, window.wakesSince, now) as Array<[string, number]>)
+        .map(([tabId, wakes]) => ({ tabId, wakes }))
+      : null;
+    return { intervals, items, lastProducer, firstEventAt, tabWakes };
+  };
+
   experiments = (workspaceId: string): ILedgerExperiment[] =>
     (this.database.prepare('SELECT * FROM experiments WHERE workspace_id = ? ORDER BY seq')
       .all(workspaceId) as IExperimentRow[]).map(experimentFromRow);
@@ -729,10 +760,12 @@ export class LedgerStore {
     };
   };
 
-  /** For the retention test and the AC 1 schema test; not a route. */
-  insertTabEvent = (row: { workspaceId: string; tabId: string; at: number; class: string; kind: string; text: string }): void => {
-    this.database.prepare('INSERT INTO tab_events (workspace_id, tab_id, at, class, kind, text) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(row.workspaceId, row.tabId, row.at, row.class, row.kind, row.text);
+  /** For the retention, schema and finder tests until story 09's writer lands; not a route. */
+  insertTabEvent = (row: {
+    workspaceId: string; tabId: string; at: number; class: string; kind: string; text: string; deliveredAt?: number | null; digestId?: string | null;
+  }): void => {
+    this.database.prepare(`INSERT INTO tab_events (workspace_id, tab_id, at, class, kind, text, delivered_at, digest_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(row.workspaceId, row.tabId, row.at, row.class, row.kind, row.text, row.deliveredAt ?? null, row.digestId ?? null);
   };
 
   counts = (): Record<'events' | 'items' | 'intervals' | 'rollups_daily' | 'tab_events' | 'experiments', number> => {

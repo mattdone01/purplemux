@@ -2110,6 +2110,79 @@ const printTable = (columns, rows) => {
   for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
 };
 
+// ── board (ADR-0034) ─────────────────────────────────────────────────────────
+const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine]';
+
+// The owner reads times in AEDT/AEST (ADR-HFL-02); Intl names the offset that applies on the day.
+const boardTime = (ms) => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-AU', {
+    timeZone: 'Australia/Sydney', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    hourCycle: 'h23', timeZoneName: 'short',
+  }).formatToParts(new Date(ms)).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${parts.timeZoneName}`;
+};
+
+// A finder answer older than two ticks says so on every face: a hung tick is not a fresh board.
+const boardLineText = (board) => (board.staleSince === null || board.staleSince === undefined
+  ? board.line
+  : `${board.line} · stale since ${boardTime(board.staleSince)}`);
+
+const boardInput = (name, input) => `${name} ${input.state}${input.reason ? ` (${input.reason})` : ''}`;
+
+const boardMeasures = (board) => {
+  const now = board.generatedAt + board.ageMs;
+  const shown = board.stuck.length < board.stuckTotal ? `${board.stuck.length} of ${board.stuckTotal}` : String(board.stuckTotal);
+  process.stdout.write(`stuck, oldest first: ${shown}\n`);
+  if (board.stuck.length) {
+    printTable(['ITEM', 'REASON', 'AGE', 'HOLDER', 'CLEARS'], board.stuck.map((item) => [
+      `${item.critical ? '* ' : ''}${item.key}`, item.reasonLabel, ledgerDuration(now - item.since), dash(item.holder), dash(item.clearInput),
+    ]));
+  }
+  const breached = board.anomalies.filter((a) => a.breached);
+  process.stdout.write(`anomalies over threshold: ${breached.length}\n`);
+  for (const a of breached) process.stdout.write(`  ${a.text}\n`);
+};
+
+const boardText = (board) => {
+  const lines = [`board ${board.workspaceId} · finder ran ${ledgerDuration(board.ageMs)} ago`, boardLineText(board)];
+  const c = board.constraint;
+  lines.push(c
+    ? `constraint: ${c.labels.reason} (${c.labels.stage}), ${c.waitingHours.toFixed(1)} h in 24 h on ${c.items} item(s), `
+      + `${c.basis === 'critical' ? 'critical items' : 'all items'}, ${c.labels.trend}; owner ${dash(c.ownerSeat)}; clears: ${c.clearInput ?? 'not recorded'}`
+    : `constraint: ${board.inputs.ledger.state === 'ok' ? 'none measured in 24 h' : 'unknown'}`);
+  lines.push(board.needsYou === null ? 'needs you: unknown (Mission Control unreadable)' : `needs you: ${board.needsYou.length} open in Mission Control`);
+  for (const item of board.needsYou ?? []) lines.push(`  ${item.id}  ${item.title}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+  const ledgerUnknown = board.inputs.ledger.state === 'ok' ? null : (board.inputs.ledger.reason || board.inputs.ledger.state);
+  if (ledgerUnknown) {
+    // Not measured is not none: an unread ledger never prints as "0 stuck".
+    process.stdout.write(`stuck: unknown (${ledgerUnknown})\nanomalies: unknown (${ledgerUnknown})\n`);
+  } else {
+    boardMeasures(board);
+  }
+  const { ledger, flow, spend, pool } = board.inputs;
+  process.stdout.write(`inputs: ${[boardInput('ledger', ledger), boardInput('flow', flow), boardInput('spend', spend), boardInput('pool', pool)].join(' · ')}\n`);
+};
+
+const cmdBoard = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub !== 'show') die(BOARD_USAGE);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const modes = ['--json', '--line', '--mine'].filter((flag) => rest.includes(flag));
+  if (rest.includes('--json') && rest.includes('--line')) die('--json and --line are exclusive');
+  requireEnv();
+  const query = modes.includes('--mine') ? '?mine=1' : '';
+  const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/board${query}`);
+  if (modes.includes('--json')) return out(body);
+  if (modes.includes('--line')) {
+    process.stdout.write(`${boardLineText(body)}\n`);
+    return;
+  }
+  boardText(body);
+};
+
 const cmdLedgerShow = async (rest) => {
   const wsId = ledgerWorkspace(rest);
   const qs = new URLSearchParams();
@@ -2377,6 +2450,12 @@ Commands:
                                            days by tab; at most 92 days, none before today - 91 (exit 2). Role uses
                                            the current orchestrator. An unreadable spend index exits 1.
                                            Read scope on WS (ADR-0030)
+  board show -w WS [--json|--line|--mine]  The constraint finder's board (ADR-0034, refreshed every 60 s): the
+                                           constraint (24 h, critical items first), its trend, owner and clear
+                                           input; Mission Control's open items; stuck items oldest first; anomalies
+                                           over threshold; each input's state. --line: goal, items left,
+                                           constraint, trend on one line. --mine: only the items the calling tab
+                                           holds (needs PMUX_TAB_TOKEN). Read scope on WS
   ledger token issue -w WS --producer NAME [--out FILE]
                                            Issue a producer token (scope ledger:emit on WS only) into a 0600 file,
                                            default ~/.purplemux/ledger-tokens/WS/NAME.json; rotates NAME's token
@@ -2536,6 +2615,8 @@ const main = async () => {
       return cmdFlow(args.slice(1));
     case 'spend':
       return cmdSpend(args.slice(1));
+    case 'board':
+      return cmdBoard(args.slice(1));
     case 'ledger':
       return cmdLedger(args.slice(1));
     case 'lease':

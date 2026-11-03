@@ -250,7 +250,7 @@ export interface IAlert {
   flag?: IAlertFlag;
 }
 
-export type TAlertFlagSource = 'fleet' | 'flow';
+export type TAlertFlagSource = 'fleet' | 'flow' | 'ledger';
 
 export interface IAlertFlag {
   source: TAlertFlagSource;
