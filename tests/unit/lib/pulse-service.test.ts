@@ -25,7 +25,7 @@ const deps = (over: Partial<IPulseDeps> = {}): IPulseDeps => ({
   openItems: async () => [],
   answerTimes: async () => [],
   agentTabs: async () => [],
-  finder: async () => deriveConstraint({ intervals: [], items: [], lastProducer: {}, firstEventAt: null, tabWakes: null }, null, null, null, NOW - 10_000),
+  finder: async () => deriveConstraint({ intervals: [], items: [], lastProducer: {}, firstEventAt: null, tabWakes: null, ownerIssueSource: null }, null, null, null, NOW - 10_000),
   ...over,
 });
 

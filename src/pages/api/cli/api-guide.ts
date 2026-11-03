@@ -1370,7 +1370,13 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   min (threshold <t> min)"; threshold max(10
   min, 2 x the type's 7-day p90 lifetime), unknown under 20 closed), cost-per-landed-item (spend over
   the last 7 UTC days / ranges closed landed over the same days, from close events; never flagged),
-  cache-read-per-landed-item (cache-read tokens / the same landed ranges, 7 d; never flagged).
+  cache-read-per-landed-item (cache-read tokens / the same landed ranges, 7 d; never flagged),
+  owner-found-defects (owner-issue items raised in 7 d / 7, unit "a day"; raised = attrs.raisedAt in
+  epoch ms, never openedAt; null with "no owner-issue item in the ledger", "owner-issue producer
+  silent" (no event received from the newest item's producer in 24 h), "window not covered" (that
+  producer first received under 7 d ago and no item raised or opened before the window), "owner-issue
+  raised time missing" (an item opened in the window, or still open, has no raisedAt, or no owner-issue
+  item in the workspace carries one) or "owner-issue raised time unreadable"; never flagged).
   labels and reasonLabel are the owner's words for the tokens (src/lib/constraint-labels.ts); line and
   the text form use only them. stuck is the 50 oldest waits, capped after the mine filter;
   stuckTotal is how many matched (the text form prints "50 of N").

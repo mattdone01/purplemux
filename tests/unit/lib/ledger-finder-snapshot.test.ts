@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -79,5 +80,63 @@ describe('LedgerStore.finderSnapshot', () => {
     row('tab-k', NOW - 8 * HOUR, { class: 'digest', deliveredAt: NOW - 5 * HOUR, digestId: 'd2' });
     expect(snapshot().tabWakes).toEqual([{ tabId: 'tab-k', wakes: 1 }, { tabId: 'tab-o', wakes: 3 }]);
     expect(snapshot('ws-b').tabWakes).toBeNull();
+  });
+});
+
+describe('LedgerStore.finderSnapshot owner-issue source (story 35)', () => {
+  const at = (producer: string, events: ILedgerEventInput[], receivedAt: number) => store.append(WS, producer, events, receivedAt);
+
+  it('is null when the ledger holds no owner-issue item', () => {
+    append('landchain', [ev('o1', NOW - HOUR, 'range:a:1', 'open')]);
+    expect(snapshot().ownerIssueSource).toBeNull();
+  });
+
+  it('names each item\'s producer, the producer of the item opened last, and every first and last receipt, any item type', () => {
+    at('backfill', [ev('b1', NOW - 12 * DAY, 'owner-issue:W1-1', 'open')], NOW - 2 * DAY);
+    at('backfill', [ev('b2', NOW - 11 * DAY, 'owner-issue:W1-1', 'close', { state: 'closed' })], NOW - 2 * DAY);
+    at('v2', [ev('v1', NOW - 3 * DAY, 'range:a:1', 'open')], NOW - 30 * HOUR);
+    at('v2', [ev('v2', NOW - 2 * DAY, 'owner-issue:30-I10', 'open')], NOW - 5 * HOUR);
+    at('v2', [ev('v3', NOW - 2 * DAY, 'owner-issue:30-I10', 'close', { state: 'closed' })], NOW - 4 * HOUR);
+    at('v2', [ev('v4', NOW - 3 * DAY, 'range:a:1', 'close', { state: 'landed' })], NOW - 2 * HOUR);
+    at('v2', [ev('v5', NOW - 3 * HOUR, 'gate:t:1', 'open')], NOW - HOUR);
+    at('other', [ev('x1', NOW - 4 * DAY, 'owner-issue:01-I4', 'open')], NOW - 10 * MIN);
+    store.append('ws-b', 'v2', [ev('y1', NOW - MIN, 'owner-issue:9-I1', 'open')], NOW);
+
+    at('backfill', [ev('b3', NOW - 20 * DAY, 'owner-issue:W0-1', 'open')], NOW - 2 * DAY);
+    at('backfill', [ev('b4', NOW - 19 * DAY, 'owner-issue:W0-1', 'close', { state: 'closed' })], NOW - 2 * DAY);
+
+    expect(snapshot().ownerIssueSource).toEqual({
+      producerOf: new Map([['owner-issue:W1-1', 'backfill'], ['owner-issue:30-I10', 'v2'], ['owner-issue:01-I4', 'other']]),
+      newestProducer: 'v2',
+      receipts: new Map([
+        ['v2', { firstReceivedAt: NOW - 30 * HOUR, lastReceivedAt: NOW - HOUR }],
+        ['backfill', { firstReceivedAt: NOW - 2 * DAY, lastReceivedAt: NOW - 2 * DAY }],
+        ['other', { firstReceivedAt: NOW - 10 * MIN, lastReceivedAt: NOW - 10 * MIN }],
+      ]),
+      earliestOpenedAt: NOW - 20 * DAY,
+      anyRaisedAt: false,
+    });
+  });
+
+  it('says whether any owner-issue item, open or closed, of any age, carries an integer raisedAt (architect R1)', () => {
+    at('v2', [ev('o1', NOW - HOUR, 'owner-issue:01-I4', 'open')], NOW - HOUR);
+    expect(snapshot().ownerIssueSource?.anyRaisedAt).toBe(false);
+    at('v2', [ev('o2', NOW - 20 * DAY, 'owner-issue:W1-1', 'open', { attrs: { raisedAt: NOW - 21 * DAY } })], NOW - 20 * DAY);
+    at('v2', [ev('c2', NOW - 19 * DAY, 'owner-issue:W1-1', 'close', { state: 'closed' })], NOW - 19 * DAY);
+    expect(snapshot().ownerIssueSource?.anyRaisedAt).toBe(true);
+  });
+
+  it('adds the producer receipt index to a ledger written without it; user_version stays 1', () => {
+    const file = path.join(dir, 'ledger.sqlite');
+    store.close();
+    const raw = new Database(file);
+    raw.exec('DROP INDEX events_ws_producer_received_idx');
+    raw.close();
+    store = new LedgerStore(file);
+    const check = new Database(file, { readonly: true });
+    expect(check.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'events_ws_producer_received_idx'").get())
+      .toEqual({ name: 'events_ws_producer_received_idx' });
+    expect(check.pragma('user_version', { simple: true })).toBe(1);
+    check.close();
   });
 });

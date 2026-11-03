@@ -33,7 +33,7 @@ const snapshot = (now: number, open: ILedgerItem[]): IFinderLedgerInput => ({
   items: [...closedReviews(now), item('slice:E2', { attrs: { critical: true }, lastEventAt: now - 3 * DAY }), ...open],
   lastProducer: Object.fromEntries(['slice:E2', ...open.map((o) => o.itemKey)].map((key) => [key, 'ledger-feed'])),
   firstEventAt: T0 - 30 * DAY,
-  tabWakes: null,
+  tabWakes: null, ownerIssueSource: null,
 });
 
 describe('producer silence is judged per (producer, item type) (CONCERN 03-C1)', () => {

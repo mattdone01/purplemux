@@ -182,7 +182,7 @@ describe('pulse WIP (consult 12 Q1)', () => {
 describe('pulse priority (AC 10)', () => {
   it('the constraint with owner and clear input, and the needs-you count', () => {
     const finder = deriveConstraint({
-      intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null,
+      intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null,
       items: [item('range:a:1', { waitReason: 'not-armed', waitSince: NOW - 2 * HOUR, holder: 'lane-a', clearInput: 'arm the receipt' })],
     }, null, null, null, NOW);
     expect(pulsePriority(finder, 2)).toEqual({

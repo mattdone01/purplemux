@@ -20,7 +20,7 @@ const { readBoard } = await import('@/lib/board');
 beforeEach(() => {
   mc.titles.mockReset();
   finder.result = deriveConstraint({
-    intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null,
+    intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null,
     items: [
       { workspaceId: 'ws-a', itemKey: 'range:a:1', itemType: 'range', openedAt: NOW - 2 * HOUR, closedAt: null, state: null, stateSince: null,
         waitReason: 'not-armed', waitSince: NOW - 2 * HOUR, holder: 'lane-a', clearInput: null, parentKey: null, attrs: {}, lastEventAt: NOW - 2 * HOUR, lastSeq: 1 },
@@ -64,7 +64,7 @@ describe('readBoard', () => {
       closedAt: null, state: null, stateSince: null, waitReason: 'not-armed' as const, waitSince: NOW - (100 - i) * HOUR,
       holder: i >= 50 ? 'tab-me' : 'lane-x', clearInput: null, parentKey: null, attrs: {}, lastEventAt: NOW - HOUR, lastSeq: i,
     }));
-    finder.result = deriveConstraint({ intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, items }, null, null, null, NOW);
+    finder.result = deriveConstraint({ intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null, items }, null, null, null, NOW);
     const all = await readBoard('ws-a', NOW);
     expect([all.stuck.length, all.stuckTotal]).toEqual([50, 60]);
     expect(all.stuck[0].key).toBe('range:a:000000000000');
@@ -86,7 +86,7 @@ describe('readBoard', () => {
       lastEventAt: since, lastSeq: 1,
     });
     finder.result = deriveConstraint({
-      intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null,
+      intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null,
       items: [
         owner('range:a:1', 'mc-1', NOW - 3 * HOUR), owner('range:b:1', 'mc-1', NOW - 90 * 60_000, { critical: true }),
         owner('range:c:1', 'mc-2', NOW - HOUR), { ...owner('range:d:1', 'mc-1', NOW - HOUR), closedAt: NOW - 1 },
