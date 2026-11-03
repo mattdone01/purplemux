@@ -132,6 +132,11 @@ export class TabEventRouter {
   private readonly staleReported = new Map<string, number>();
   /** When a paste to each tab last started or ended: the ledger records a delivery only after its paste. */
   private readonly lastPaste = new Map<string, number>();
+  /**
+   * Urgent rows whose paste still runs. The history leaves them out until the paste settles: a row read
+   * mid-paste would report a nudge being typed as undelivered (09-fix, release acceptance self-failure-*).
+   */
+  private readonly inFlight = new Set<number>();
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly deps: ITabEventRouterDeps) {}
@@ -216,9 +221,14 @@ export class TabEventRouter {
     if (cls === 'urgent') {
       const { whenReady } = event;
       const ready = whenReady ? () => whenReady() && this.settled(table, event.workspaceId, event.tabId) : undefined;
-      const delivered = await this.paste(event.workspaceId, event.tabId, event.text, ready);
-      if (delivered) this.markDelivered(table, [seq], null);
-      return { class: cls, delivered, seq, duplicate };
+      this.inFlight.add(seq);
+      try {
+        const delivered = await this.paste(event.workspaceId, event.tabId, event.text, ready);
+        if (delivered) this.markDelivered(table, [seq], null);
+        return { class: cls, delivered, seq, duplicate };
+      } finally {
+        this.inFlight.delete(seq);
+      }
     }
     // A tab at its prompt with a digest due gets it now; `delivered` says this event went out in it.
     const delivered = cls === 'digest' && await this.flush(event.workspaceId, event.tabId);
@@ -227,7 +237,8 @@ export class TabEventRouter {
 
   /**
    * Type the urgent events the tab's hold kept since `since`, oldest first (ADR-0036): every undelivered urgent row
-   * but a ROTATE (a refused ROTATE is retried by its own owner). Returns how many were typed.
+   * but a ROTATE (a refused ROTATE is retried by its own owner). Each is in flight while typed, as any urgent paste,
+   * so it enters the nudge history with its outcome. Returns how many were typed.
    */
   async releaseHeldUrgent(workspaceId: string, tabId: string, since: number): Promise<number> {
     const table = this.tableOrNull();
@@ -236,17 +247,25 @@ export class TabEventRouter {
       .filter((row) => row.class === 'urgent' && row.deliveredAt === null && row.kind !== 'rotate' && !this.unrecorded.has(row.seq));
     let typed = 0;
     for (const row of held) {
-      if (!(await this.paste(workspaceId, tabId, row.text))) break;
-      this.markDelivered(table, [row.seq], null);
-      typed += 1;
+      this.inFlight.add(row.seq);
+      try {
+        if (!(await this.paste(workspaceId, tabId, row.text))) break;
+        this.markDelivered(table, [row.seq], null);
+        typed += 1;
+      } finally {
+        this.inFlight.delete(row.seq);
+      }
     }
     if (held.length) log.info({ workspaceId, tabId, held: held.length, typed }, 'held urgent events released');
     return typed;
   }
 
-  /** The workspace's newest watchdog nudges, newest last (a row with a source tab is a nudge); throws when the log is unreadable. */
+  /**
+   * The workspace's newest watchdog nudges, newest last (a row with a source tab is a nudge), without an urgent
+   * one still being typed: it enters with its outcome, as before ADR-0035. Throws when the log is unreadable.
+   */
   history(workspaceId: string, limit: number): ITabEvent[] {
-    return this.deps.table().list(workspaceId, { since: 0, limit, sourced: true });
+    return this.deps.table().list(workspaceId, { since: 0, limit, sourced: true }).filter((row) => !this.inFlight.has(row.seq));
   }
 
   /** Send the tab its digest when one is due and the tab is at its prompt; true when one went out. */

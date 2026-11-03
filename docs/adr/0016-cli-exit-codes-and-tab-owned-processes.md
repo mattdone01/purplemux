@@ -36,6 +36,9 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 3 | refused by state (ledger, ADR-0033) | `ledger-experiment-cap`, `ledger-experiment-closed`, `ledger-event-conflict` | after the state changes |
 | 7 | not found (ledger, ADR-0033) | `ledger-experiment-not-found` | — |
 | 1 | unexpected error (ledger, ADR-0033) | `ledger-store-failed` (unmapped) | investigate |
+| 2 | usage error (pool, ADR-0039) | `pool-invalid` | fix the command |
+| 3 | refused by state (pool, ADR-0039) | `pool-full`: no host has a free slot, the memory or the disk; `pool-unreadable` | after the state changes, or fall back to a local slot; never for a `gate.no-local-fallback` repository (ADR-0039 §6) |
+| 6 | no answer (pool, ADR-0039) | `pool-timeout`: `pool acquire` had no answer in 2 s | fall back to a local slot and log it; never for a `gate.no-local-fallback` repository (ADR-0039 §6) |
 
 3. stderr names the code and its class, e.g. `error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found`. A `readiness-timeout` names the waited milliseconds.
 4. A write that loses its connection after it connected exits 1 with `outcome-unknown`, not 6. The server may have acted on it, so a blind retry of `tab send` could type the prompt twice. A read, or a request that never connected, exits 6. Only undici's network failures (`fetch failed` / `terminated` with a coded cause) count as network failures; a request that could not be built is never sent and exits 1.

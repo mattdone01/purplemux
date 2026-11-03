@@ -195,6 +195,10 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'ledger-experiment-cap': EXIT.CONFLICT,
   'ledger-experiment-closed': EXIT.CONFLICT,
   'ledger-experiment-not-found': EXIT.NOT_FOUND,
+  'pool-invalid': EXIT.USAGE,
+  'pool-full': EXIT.CONFLICT,
+  'pool-unreadable': EXIT.CONFLICT,
+  'pool-timeout': EXIT.UNREACHABLE,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -207,6 +211,8 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'wip-cap': "refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason",
   'tab-busy': 'the tab is mid-turn — retry when it is idle, or restart with --interrupt to abandon the turn',
   'restart-not-confirmed': 'a process or the session outlived the reap; nothing was relaunched — inspect the tab before a retry',
+  'pool-timeout': 'the pool did not answer in 2 s — do what you do without the pool and log it (a repository in gate.no-local-fallback queues on the gate host or is REFUSED-REMOTE, never runs here); a lease the late answer took expires at its TTL',
+  'pool-full': 'no host has a free slot, the memory or the disk — wait for a release; a repository in gate.no-local-fallback queues on the gate host or is REFUSED-REMOTE, never runs here',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -661,8 +667,9 @@ const cmdFlow = async (args) => {
   process.stdout.write(`ok ${body.receivedAt} ${body.historyRows}\n`);
 };
 
-const SPEND_USAGE = 'usage: spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]';
-const SPEND_VALUE_FLAGS = ['-w', '--workspace', '--since', '--until', '--by'];
+const SPEND_USAGE = 'usage: spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role|seat|phase|item] [--json]'
+  + ' | spend phases -w WS [--day YYYY-MM-DD] [--json]';
+const SPEND_VALUE_FLAGS = { show: ['-w', '--workspace', '--since', '--until', '--by'], phases: ['-w', '--workspace', '--day'] };
 const SPEND_BOOL_FLAGS = ['--json'];
 
 // A cost the server could not price is null: it prints as "—", never as $0.
@@ -671,14 +678,39 @@ const spendCost = (row) => {
   return row.unpricedTokens > 0 && row.costUsd !== null ? `${cost} (+${row.unpricedTokens} unpriced)` : cost;
 };
 
-const printSpend = (view) => {
-  const columns = ['KEY', 'LABEL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'SUBAGENTS', 'COST'];
-  const line = (row) => [row.key, row.label, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheCreationTokens,
-    row.totalTokens, row.sidechainTokens, spendCost(row)].map(String);
-  const table = [columns, ...view.rows.map(line), ...(view.unattributed ? [line(view.unattributed)] : []), line(view.totals)];
-  const widths = columns.map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
-  process.stdout.write(`spend ${view.workspaceId} ${view.from}..${view.to} UTC by ${view.by} (cost is an estimate)\n`);
+// A row with no tokens has no share: "—", never 0%.
+const cacheReadShare = (row) => (row.totalTokens > 0 ? `${Math.round((row.cacheReadTokens / row.totalTokens) * 100)}%` : '—');
+// The cache reads' part of the estimated cost; "—" when the cost or its cache-read part is not known.
+const cacheReadCostShare = (row) => (row.cacheReadCostUsd !== null && row.cacheReadCostUsd !== undefined && row.costUsd
+  ? `est. ${Math.round((row.cacheReadCostUsd / row.costUsd) * 100)}%` : '—');
+
+const writeTable = (table) => {
+  const widths = table[0].map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
   for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
+};
+
+// The unattributed row, then (phase and item) one indented row per reason, which sum to it.
+const unattributedRows = (view, line) => (view.unattributed
+  ? [line(view.unattributed), ...(view.unattributedReasons || []).map((row) => line({ ...row, key: `  ${row.key}` }))] : []);
+
+const phaseNote = (view) => {
+  if (!view.phaseBasis) return;
+  const { ledgerHorizon: horizon, ledgerReadable } = view.phaseBasis;
+  const ledger = ledgerReadable === false ? 'the ledger could not be read, so no phase is known (see the error note)'
+    : horizon === null ? 'the ledger holds no items for this workspace yet' : `no history before ${new Date(horizon).toISOString()}`;
+  process.stdout.write(`note: phase is the ledger item the tab held at each message's 5-min slot; ${ledger}\n`);
+};
+
+const printSpend = (view) => {
+  const columns = ['KEY', 'LABEL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'CACHE-READ-SHARE', 'SUBAGENTS', 'COST',
+    'CACHE-READ-COST-SHARE'];
+  const line = (row) => [row.key, row.label, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheCreationTokens,
+    row.totalTokens, cacheReadShare(row), row.sidechainTokens, spendCost(row), cacheReadCostShare(row)].map(String);
+  process.stdout.write(`spend ${view.workspaceId} ${view.from}..${view.to} UTC by ${view.by} (cost is an estimate)\n`);
+  writeTable([columns, ...view.rows.map(line), ...unattributedRows(view, line), line(view.totals)]);
+  process.stdout.write(`cache reads: ${view.totals.cacheReadTokens} of ${view.totals.totalTokens} tokens (${cacheReadShare(view.totals)}); `
+    + `${cacheReadCostShare(view.totals)} of the est. cost\n`);
+  phaseNote(view);
   if (view.roleBasis === 'current-orchestrator') process.stdout.write('note: role uses the current orchestrator mapping, not the one at the time of use\n');
   process.stdout.write('note: Codex and Grok usage counts on the session start day\n');
   const index = view.index || {};
@@ -687,27 +719,57 @@ const printSpend = (view) => {
   if (index.error) process.stdout.write(`note: ${index.error}\n`);
 };
 
+// Distinct 5-min slots with usage, as "1h 05m"; null (no message time) prints "—".
+const wallTime = (ms) => {
+  if (ms === null || ms === undefined) return '—';
+  const minutes = Math.round(ms / 60_000);
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m` : `${minutes}m`;
+};
+
+const landingLine = (metric) => {
+  const window = metric.window === 'day' ? 'day' : `7d (${metric.from}..${metric.to})`;
+  const value = metric.value === null
+    ? `— (${metric.reason}; ${metric.cacheReadTokens} cache reads)`
+    : `${Math.round(metric.value)} (${metric.cacheReadTokens} cache reads / ${metric.landedItems} landed)`;
+  return `cache_read_tokens_per_landed_item ${window}: ${value}\n`;
+};
+
+const printSpendPhases = (view) => {
+  const columns = ['PHASE', 'LABEL', 'WALL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'CACHE-READ-SHARE', 'COST',
+    'CACHE-READ-COST-SHARE'];
+  const line = (row) => [row.key, row.label, wallTime(row.wallMs), row.inputTokens, row.outputTokens, row.cacheReadTokens,
+    row.cacheCreationTokens, row.totalTokens, cacheReadShare(row), spendCost(row), cacheReadCostShare(row)].map(String);
+  process.stdout.write(`spend phases ${view.workspaceId} ${view.day} UTC (cost is an estimate)\n`);
+  writeTable([columns, ...view.rows.map(line), ...unattributedRows(view, line), line(view.totals)]);
+  process.stdout.write(landingLine(view.cacheReadPerLandedItem.day));
+  process.stdout.write(landingLine(view.cacheReadPerLandedItem['7d']));
+  phaseNote(view);
+  process.stdout.write('note: wall = distinct 5-min slots with usage in the row; phases overlap, so the rows may sum above the total\n');
+};
+
 const cmdSpend = async (args) => {
   const sub = args[0];
   const rest = args.slice(1);
-  if (sub !== 'show') die(SPEND_USAGE);
-  const positional = stripBooleanFlags(stripFlags(rest, SPEND_VALUE_FLAGS), SPEND_BOOL_FLAGS);
+  if (sub !== 'show' && sub !== 'phases') die(SPEND_USAGE);
+  const positional = stripBooleanFlags(stripFlags(rest, SPEND_VALUE_FLAGS[sub]), SPEND_BOOL_FLAGS);
   if (positional.length) die(`unexpected argument: ${positional[0]} — ${SPEND_USAGE}`);
   const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
   if (!wsId) die('--workspace is required');
   const qs = new URLSearchParams({ workspaceId: wsId });
-  for (const name of ['since', 'until', 'by']) {
+  for (const name of SPEND_VALUE_FLAGS[sub].filter((flag) => flag.startsWith('--') && flag !== '--workspace').map((flag) => flag.slice(2))) {
     const value = flagValue(rest, `--${name}`);
     if (value !== null) qs.set(name, value);
   }
   requireEnv();
-  const { body } = await api('GET', `/api/cli/spend?${qs}`);
+  const { body } = await api('GET', `/api/cli/spend${sub === 'phases' ? '/phases' : ''}?${qs}`);
   if (rest.includes('--json')) out(body);
   // An index that cannot be read has no numbers: its totals are zeros that mean nothing.
   if (body.index && body.index.state === 'unavailable') {
     return fail(null, `spend not available: ${body.index.error || 'the spend index cannot be read'}`);
   }
-  if (!rest.includes('--json')) printSpend(body);
+  if (rest.includes('--json')) return;
+  if (sub === 'phases') printSpendPhases(body);
+  else printSpend(body);
 };
 
 // A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
@@ -971,7 +1033,7 @@ const leaseName = (args, what = 'NAME') => {
 // Fleet config (ADR-0019): versioned values tools read at call time. A change
 // is audited and sent to nobody.
 const CONFIG_USAGE = 'usage: config get KEY | list [--json] | set KEY VALUE [--expect-version N] | unset KEY [--expect-version N] | history [KEY] [--json]';
-const CONFIG_KEY = /^[a-z][a-z0-9.-]{1,63}$/;
+const CONFIG_KEY = /^[a-z][A-Za-z0-9._-]{1,63}$/;
 
 const configKey = (key) => {
   if (!key || !CONFIG_KEY.test(key)) die(`KEY must match ${CONFIG_KEY.source}, got ${JSON.stringify(key ?? '')}`);
@@ -1400,6 +1462,109 @@ const cmdLease = async (args) => {
   }
 };
 
+// ---- pool (ADR-0039) ----
+
+const POOL_USAGE = 'usage: pool show [--json] | acquire --kind gate|build|tab [--mem GB] [--ttl 60m] [--panel-type T] [--role R] | release LEASE';
+// The client rule: no answer in 2 s exits 6 (pool-timeout), and the caller falls back to its local slots and logs it.
+const POOL_ACQUIRE_TIMEOUT_MS = 2000;
+
+const poolRequest = async (method, requestPath, data) => {
+  const opts = {
+    method,
+    headers: headersFor(requestPath, { 'Content-Type': 'application/json' }, data, method),
+    signal: AbortSignal.timeout(POOL_ACQUIRE_TIMEOUT_MS),
+  };
+  if (data !== undefined) opts.body = JSON.stringify(data);
+  const timedOut = (err) => err?.name === 'TimeoutError' || err?.name === 'AbortError';
+  const late = () => fail('pool-timeout', `no answer from ${BASE} in ${POOL_ACQUIRE_TIMEOUT_MS} ms`);
+  let resp;
+  try {
+    resp = await fetch(`${BASE}${requestPath}`, opts);
+  } catch (err) {
+    if (timedOut(err)) return late();
+    return networkFailure(method, requestPath, err);
+  }
+  failIfRouteAbsent(resp, requestPath);
+  let body = null;
+  if (isJson(resp)) {
+    try {
+      body = await resp.json();
+    } catch (err) {
+      if (timedOut(err)) return late();
+      if (!(err instanceof SyntaxError)) return networkFailure(method, requestPath, err);
+    }
+  }
+  if (!resp.ok) failFromResponse(resp, body);
+  if (!body) fail(null, `HTTP ${resp.status} without a JSON body — is purplemux the server ${SERVER_LABEL}?`);
+  return body;
+};
+
+const GIB = 1024 ** 3;
+const gib = (bytes) => (bytes === null || bytes === undefined ? '-' : `${(bytes / GIB).toFixed(1)}`);
+const slotText = (s) => `${s.used}/${s.cap}`;
+
+const printPool = (view) => {
+  const t = view.totals;
+  process.stdout.write(`pool ${t.knownHosts} known, ${t.unknownHosts} unknown: ${t.threads} threads, ${gib(t.memAvailableBytes)}/${gib(t.memTotalBytes)} GiB free, gate ${slotText(t.slots.gate)} build ${slotText(t.slots.build)} tab ${slotText(t.slots.tab)}\n`);
+  for (const h of view.hosts) {
+    const name = `${h.host}${h.local ? ' (this host)' : ''}`;
+    if (!h.metrics) {
+      process.stdout.write(`  ${name}: unknown — ${h.reason}; slots held gate ${h.slots.gate.used} build ${h.slots.build.used} tab ${h.slots.tab.used}\n`);
+      continue;
+    }
+    const m = h.metrics;
+    const disks = m.disks.map((d) => `${d.path} ${d.usedPct === null ? '-' : `${d.usedPct}%`}`).join(' ');
+    const gpu = m.gpus ? ` gpu ${m.gpus.map((g) => `${g.name} ${g.utilPct ?? '-'}%`).join(', ') || 'none'}` : '';
+    const sweep = m.sccacheSweep ? ` sccache-sweep ${m.sccacheSweep.state}` : '';
+    const notPlaceable = h.placeable === false ? `; not placeable: ${h.reason}` : '';
+    process.stdout.write(`  ${name}: ${m.threads} threads, load ${m.load1}/${m.load5} (${h.loadPerThread}/thread), ${gib(m.memAvailableBytes)}/${gib(m.memTotalBytes)} GiB free, ${disks}${gpu}${sweep}; gate ${slotText(h.slots.gate)} build ${slotText(h.slots.build)} tab ${slotText(h.slots.tab)}${h.via && h.via !== h.host ? ` via ${h.via}` : ''}${notPlaceable}\n`);
+  }
+};
+
+const cmdPool = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'show': {
+      requireEnv();
+      const { body } = await api('GET', '/api/cli/pool');
+      if (rest.includes('--json')) return out(body);
+      return printPool(body);
+    }
+    case 'acquire': {
+      const kind = flagValue(rest, '--kind');
+      if (!['gate', 'build', 'tab'].includes(kind)) die(`--kind must be gate, build or tab — ${POOL_USAGE}`);
+      const data = { kind };
+      const mem = flagValue(rest, '--mem');
+      if (mem !== null) {
+        if (!/^\d+(\.\d+)?$/.test(mem)) die(`--mem must be a number of GiB, got "${mem}"`);
+        data.memGb = Number(mem);
+      }
+      const ttl = flagValue(rest, '--ttl');
+      if (ttl !== null) {
+        const seconds = parseTtl(ttl);
+        if (seconds === null) die('--ttl none is not allowed: a pool slot must expire');
+        data.ttlSeconds = seconds;
+      }
+      const panelType = flagValue(rest, '--panel-type');
+      if (panelType !== null) data.panelType = panelType;
+      const role = flagValue(rest, '--role');
+      if (role !== null) data.role = role;
+      requireEnv();
+      return out(await poolRequest('POST', '/api/cli/pool/acquire', data));
+    }
+    case 'release': {
+      const lease = rest.find((a) => !a.startsWith('-'));
+      if (!lease) die(`release needs a LEASE (pool:<host>/<kind>-<n>) — ${POOL_USAGE}`);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/pool/release', { lease });
+      return out(body);
+    }
+    default:
+      die(POOL_USAGE);
+  }
+};
+
 const OVER_CAP_REASON_MAX = 500;
 
 const cmdTabCreate = async (args) => {
@@ -1418,7 +1583,7 @@ const cmdTabCreate = async (args) => {
   const reportsTo = flagValue(args, '--reports-to');
   // The end-line markers whose nudges the target receives (ADR-0025); the server validates the names.
   const reportOn = flagValue(args, '--report-on');
-  // The ssh alias of a registered remote host (ADR-0022); the tab's tmux runs there.
+  // The ssh alias of a registered remote host (ADR-0022), or `auto`: the pool places it (ADR-0039).
   const host = flagValue(args, '--host');
   // The tab's start directory: it must exist on the host the tab runs on.
   const cwd = flagValue(args, '--cwd');
@@ -1437,7 +1602,7 @@ const cmdTabCreate = async (args) => {
   if (args.includes('--preview-url') && !previewUrl) die('--preview-url needs the http(s) URL of the preview the evaluator may browse');
   if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
   if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
-  if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
+  if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts, or auto (the pool places it)');
   if (args.includes('--cwd') && !cwd) die('--cwd needs an absolute directory on the tab\'s host');
   // Past the WIP cap (ADR-0027): only the workspace's enabled orchestrator, with a reason that is audited.
   const overCap = args.includes('--over-cap');
@@ -2150,7 +2315,8 @@ const printTable = (columns, rows) => {
 };
 
 // ── board (ADR-0034) ─────────────────────────────────────────────────────────
-const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine]';
+const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine] | board pulse -w WS [--json]'
+  + ' | board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS';
 
 // The owner reads times in AEDT/AEST (ADR-HFL-02); Intl names the offset that applies on the day.
 const boardTime = (ms) => {
@@ -2183,16 +2349,23 @@ const boardMeasures = (board) => {
 };
 
 const boardText = (board) => {
-  const lines = [`board ${board.workspaceId} · finder ran ${ledgerDuration(board.ageMs)} ago`, boardLineText(board)];
+  const lines = [`board ${board.workspaceId} · finder ran ${ledgerDuration(board.ageMs)} ago`, boardLineText(board), goalText(board)];
   const c = board.constraint;
   lines.push(c
     ? `constraint: ${c.labels.reason} (${c.labels.stage}), ${c.waitingHours.toFixed(1)} h in 24 h on ${c.items} item(s), `
       + `${c.basis === 'critical' ? 'critical items' : 'all items'}, ${c.labels.trend}; owner ${dash(c.ownerSeat)}; clears: ${c.clearInput ?? 'not recorded'}`
     : `constraint: ${board.inputs.ledger.state === 'ok' ? 'none measured in 24 h' : 'unknown'}`);
   lines.push(board.needsYou === null ? 'needs you: unknown (Mission Control unreadable)' : `needs you: ${board.needsYou.length} open in Mission Control`);
-  for (const item of board.needsYou ?? []) lines.push(`  ${item.id}  ${item.title}`);
-  process.stdout.write(`${lines.join('\n')}\n`);
   const ledgerUnknown = board.inputs.ledger.state === 'ok' ? null : (board.inputs.ledger.reason || board.inputs.ledger.state);
+  for (const item of board.needsYou ?? []) {
+    let blocked = 'no ledger item links to this item';
+    if (ledgerUnknown) blocked = `blocked cost not measured: ${ledgerUnknown}`;
+    else if (item.blocked) {
+      blocked = `blocks ${item.blocked.items} item(s), ${item.blocked.hours.toFixed(1)} h waiting${item.blocked.critical ? ', critical path' : ''}`;
+    }
+    lines.push(`  ${item.id}  ${item.title} · ${blocked}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
   if (ledgerUnknown) {
     // Not measured is not none: an unread ledger never prints as "0 stuck".
     process.stdout.write(`stuck: unknown (${ledgerUnknown})\nanomalies: unknown (${ledgerUnknown})\n`);
@@ -2203,12 +2376,93 @@ const boardText = (board) => {
   process.stdout.write(`inputs: ${[boardInput('ledger', ledger), boardInput('flow', flow), boardInput('spend', spend), boardInput('pool', pool)].join(' · ')}\n`);
 };
 
+// ── board pulse (ADR-0034 §9) ────────────────────────────────────────────────
+const PULSE_BLOCKS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const PULSE_STATE_WORDS = { stalled: 'STALLED', moving: 'moving', steady: 'steady', idle: 'idle', 'not-measured': 'not measured' };
+
+// One character per clock hour, oldest left; a measured zero is '·', never a blank.
+const pulseStrip = (hours) => {
+  const max = Math.max(...hours.map((hour) => hour.total));
+  return hours.map((hour) => (hour.total === 0 ? '·' : PULSE_BLOCKS[Math.min(7, Math.ceil((hour.total / max) * 8) - 1)])).join('');
+};
+
+const pulseText = (pulse) => {
+  const scope = pulse.scope && pulse.scope.basis === 'epic' ? `epic ${pulse.scope.epics.join(', ')}` : 'its own directories';
+  const lines = [`pulse ${pulse.workspaceId} (counts ${scope}) · read ${ledgerDuration(Date.now() - pulse.generatedAt)} ago`];
+  lines.push(pulse.hours
+    ? `last 48 h, one mark per hour, oldest left: ${pulseStrip(pulse.hours)}`
+    : 'last 48 h: not measured (no movement source could be read)');
+  if (pulse.hours) {
+    const failed = pulse.hours.reduce((sum, hour) => sum + hour.gatesFailed, 0);
+    const passed = pulse.hours.reduce((sum, hour) => sum + hour.gatesPassed, 0);
+    lines.push(`gates in 48 h: ${passed} passed, ${failed} failed`);
+  }
+  const stateWord = Object.hasOwn(PULSE_STATE_WORDS, pulse.stall.state) ? PULSE_STATE_WORDS[pulse.stall.state] : 'state not in the label map';
+  lines.push(pulse.stall.state === 'not-measured' ? pulse.stall.reason : `${stateWord}: ${pulse.stall.reason}`);
+  lines.push(`priority now: ${pulse.priority.text}${pulse.staleSince === null ? '' : ` · stale since ${boardTime(pulse.staleSince)}`}`);
+  lines.push(`work in progress: ${pulse.wip.basisReason}`);
+  lines.push('sources:');
+  process.stdout.write(`${lines.join('\n')}\n`);
+  printTable(['  SOURCE', '48 H', 'LAST'], pulse.sources.map((source) => [
+    `  ${source.label}${source.sharedWith ? ` (shared with ${source.sharedWith.join(', ')}; not counted)` : ''}`,
+    source.state === 'ok' ? String(source.count) : `not measured (${source.reason})`,
+    source.lastAt === null ? '—' : boardTime(source.lastAt),
+  ]));
+};
+
+const goalText = (body) => {
+  const t = body.onTrack;
+  if (t && t.goalState === 'unknown') return `goal: ${t.reason || 'goal not measured'}`;
+  if (!t || t.goal === null) return 'goal: no goal set';
+  const forecast = t.p50At === null ? `no forecast (${t.reason})` : `p50 ${boardTime(t.p50At)}, p90 ${boardTime(t.p90At)}`;
+  const rate = t.throughputPerDay ? ` · closed per day, last 3 days: ${t.throughputPerDay.join(', ')}` : '';
+  return `goal: ${t.goal} · ${t.itemsLeft === null ? 'items left unknown' : `${t.itemsLeft} items left`} · ${forecast}${rate} · ${t.state}`;
+};
+
+const cmdBoardGoal = async (rest) => {
+  const action = rest[0];
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const path = `/api/cli/workspaces/${encodeURIComponent(wsId)}/board-goal`;
+  requireEnv();
+  if (action === 'show') {
+    const { body } = await api('GET', path);
+    if (rest.includes('--json')) return out(body);
+    const board = (await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/board`)).body;
+    process.stdout.write(`${goalText(board)}\n`);
+    if (body.goal) process.stdout.write(`items: ${body.goal.items.join(', ')}\nset by ${body.goal.setBy} at ${boardTime(body.goal.setAt)}\n`);
+    return;
+  }
+  if (action === 'clear') {
+    const { body } = await api('DELETE', path);
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(body.cleared ? 'goal cleared\n' : 'no goal was set\n');
+    return;
+  }
+  if (action !== 'set') die(BOARD_USAGE);
+  const items = flagValue(rest, '--items');
+  const label = flagValue(rest, '--label');
+  if (!items) die('--items is required: ledger item keys, comma-separated (range:<lane>:<key12>, slice:<lane>, ...)');
+  if (!label) die('--label is required');
+  const { body } = await api('PUT', path, { label, items: items.split(',').map((key) => key.trim()).filter(Boolean) });
+  if (rest.includes('--json')) return out(body);
+  process.stdout.write(`${goalText(body)}\n`);
+};
+
 const cmdBoard = async (args) => {
   const sub = args[0];
   const rest = args.slice(1);
-  if (sub !== 'show') die(BOARD_USAGE);
+  if (sub === 'goal') return cmdBoardGoal(rest);
+  if (sub !== 'show' && sub !== 'pulse') die(BOARD_USAGE);
   const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
   if (!wsId) die('--workspace is required');
+  if (sub === 'pulse') {
+    requireEnv();
+    const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/pulse`);
+    if (rest.includes('--json')) return out(body);
+    pulseText(body);
+    return;
+  }
   const modes = ['--json', '--line', '--mine'].filter((flag) => rest.includes(flag));
   if (rest.includes('--json') && rest.includes('--line')) die('--json and --line are exclusive');
   requireEnv();
@@ -2444,7 +2698,11 @@ Commands:
              [--host HOST]                 Run the tab's tmux on HOST over ssh (ADR-0022): an ssh alias listed in
                                            fleet config remote.hosts. terminal and claude-code only; exit 2
                                            otherwise, exit 6 when HOST does not answer. The pane's purplemux
-                                           reaches this server through PMUX_URL with the tab's own token
+                                           reaches this server through PMUX_URL with the tab's own token.
+                                           --host auto: the pool places it (ADR-0039): a claude-code tab with no
+                                           role may go to the known host with the most free memory; every other
+                                           tab, and any pool refusal, no answer in 2 s or a --cwd missing there,
+                                           stays here. The answer's "placement" says where and why
              [--cwd DIR]                   Start the tab in DIR, an absolute directory that must exist on the
                                            tab's host (cwd-missing, exit 2). A remote worker works in its own
                                            checkout or worktree on that host
@@ -2478,7 +2736,8 @@ Commands:
                                            that is audited; any other caller exits 3 forbidden. The answer's
                                            "wip" is { count, cap, overCap } after the create
   tab count -w WS [--json]                 Print "<count> <cap>": WS's agent tabs (claude-code, codex-cli, grok-cli)
-                                           and the WIP cap; --json adds workspaceId, capSource, overCap. Hooks use it
+                                           and the WIP cap (tabs.cap-per-workspace.<WS> wins over the fleet value);
+                                           --json adds workspaceId, capSource, overCap. Hooks use it
                                            instead of counting tmux sessions
   tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
                   [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
@@ -2560,19 +2819,35 @@ Commands:
             [--history all|window|none]    since), meters, producer flags, and "stale" after 10 min without a
                                            publish. No record: "no flow published", exit 7 (flow-not-found);
                                            a damaged record: exit 1 (flow-unreadable)
-  spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]
-                                           Tokens (input, output, cache read, cache creation, subagents) and the
-                                           estimated cost ("est."; "—" when no price is known) per tab, UTC day, model
-                                           or role, plus the unattributed row and the total. Default: the last 7 UTC
-                                           days by tab; at most 92 days, none before today - 91 (exit 2). Role uses
-                                           the current orchestrator. An unreadable spend index exits 1.
-                                           Read scope on WS (ADR-0030)
+  spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role|seat|phase|item] [--json]
+                                           Tokens (input, output, cache read and its share, cache creation, subagents)
+                                           and the estimated cost ("est."; "—" when no price is known) per tab, UTC
+                                           day, model, role, seat (tab name), phase or held ledger item, plus the
+                                           unattributed row (by phase/item: one row per reason) and the total, with
+                                           the cache reads' share of tokens and of the est. cost. Default: the last 7
+                                           UTC days by tab; at most 92 days (7 by phase or item), none before
+                                           today - 91 (exit 2). Role uses the current orchestrator. An unreadable
+                                           spend index exits 1. Read scope on WS (ADR-0030)
+  spend phases -w WS [--day YYYY-MM-DD] [--json]
+                                           One UTC day (default today) by phase: wall time (distinct 5-min slots),
+                                           tokens by kind, est. cost, and cache_read_tokens_per_landed_item (landed
+                                           ranges) for the day and the 7 days ending on it ("—" with the reason when
+                                           it is not measured).
+                                           Read scope on WS (ADR-0030 amendment, harness-flow-loop 04)
   board show -w WS [--json|--line|--mine]  The constraint finder's board (ADR-0034, refreshed every 60 s): the
                                            constraint (24 h, critical items first), its trend, owner and clear
                                            input; Mission Control's open items; stuck items oldest first; anomalies
                                            over threshold; each input's state. --line: goal, items left,
                                            constraint, trend on one line. --mine: only the items the calling tab
                                            holds (needs PMUX_TAB_TOKEN). Read scope on WS
+  board pulse -w WS [--json]               Hourly movement, last 48 h (ADR-0034 §9): one mark per hour from
+                                           ledger changes, commits, gates (pass/fail), review rounds, v2 LANDED
+                                           lines and Mission Control answers; stalled / moving / steady / idle;
+                                           priority now; each source's own state ("not measured", never 0).
+                                           Read scope on WS
+  board goal set -w WS --items KEY,KEY --label TEXT
+                                           Set the goal the on-track line forecasts (p50/p90 from 3-day
+                                           throughput, AEDT). Own workspace only. board goal show|clear -w WS
   ledger token issue -w WS --producer NAME [--out FILE]
                                            Issue a producer token (scope ledger:emit on WS only) into a 0600 file,
                                            default ~/.purplemux/ledger-tokens/WS/NAME.json; rotates NAME's token
@@ -2631,6 +2906,17 @@ Commands:
   lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
   lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
                                            epic:SLUG; a tab of a claiming workspace releases its own claims)
+  pool show [--json]                       The compute pool (ADR-0039): per host threads, load, free memory, disk,
+                                           GPU and slots used/cap; an unknown host shows no figures, never 0
+  pool acquire --kind gate|build|tab [--mem GB] [--ttl 60m] [--panel-type T] [--role R]
+                                           Place the work and take a slot lease: prints {host, local, slot, lease,
+                                           expiresAt, reason, gateHost}. Gates and builds go by load per thread,
+                                           then memory; tabs by memory and never refused. Exit 3 pool-full; exit 6
+                                           when no answer comes in 2 s: do what you do without the pool and log it
+                                           (gate.no-local-fallback repositories never run here). A gate passes --ttl
+                                           of at least its gate timeout
+  pool release LEASE                       Release a slot you hold (pool:<host>/<kind>-<n>); a slot also ends
+                                           with its TTL (default 60m, at most 24h) or its holder tab
   inbox list -w WS [--all]                 Server notices (notes, watches, deploys, Mission Control) queued or held
                                            for WS's tabs; --all adds delivered and dropped (kept 7 days)
   inbox retry ID                           Re-queue a held notice once (the target workspace, the note's sender, or admin).
@@ -2751,6 +3037,8 @@ const main = async () => {
       return cmdEvents(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
+    case 'pool':
+      return cmdPool(args.slice(1));
     case 'mission':
     case 'mc':
       return cmdMission(args.slice(1));

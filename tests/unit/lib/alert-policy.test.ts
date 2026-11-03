@@ -229,3 +229,49 @@ describe('isStallEpisodeEnd', () => {
     expect(isStallEpisodeEnd(2, 3, false)).toBe(false);
   });
 });
+
+describe('alertFor kind attention-opened', () => {
+  const source = (overrides: Partial<Parameters<typeof alertFor>[0]> = {}) => ({
+    kind: 'attention-opened' as const,
+    tabId: ORCH_TAB,
+    workspaceId: 'ws-1',
+    workspaceName: 'Epic',
+    tabName: 'orchestrator',
+    providerId: 'claude' as const,
+    isOrchestrator: true,
+    at: AT,
+    itemId: 'item-1',
+    itemTitle: '  Approve the go-live?  ',
+    ...overrides,
+  });
+
+  it('titles the alert for Mission Control, uses the trimmed item title as body and carries the itemId', () => {
+    expect(alertFor(source())).toEqual({
+      kind: 'attention-opened',
+      tabId: ORCH_TAB,
+      workspaceId: 'ws-1',
+      workspaceName: 'Epic',
+      tabName: 'orchestrator',
+      providerId: 'claude',
+      isOrchestrator: true,
+      title: 'Mission Control: answer needed',
+      body: 'Approve the go-live?',
+      at: AT,
+      itemId: 'item-1',
+    });
+  });
+
+  it('cuts a long title to 100 code points', () => {
+    expect(alertFor(source({ itemTitle: 'x'.repeat(150) })).body).toBe('x'.repeat(100));
+  });
+
+  it('falls back to the workspace name when the item has no title', () => {
+    expect(alertFor(source({ itemTitle: '   ' })).body).toBe('Epic');
+    expect(alertFor(source({ itemTitle: null, workspaceName: '' })).body).toBe('orchestrator');
+    expect(alertFor(source({ itemTitle: null, workspaceName: '', tabName: '' })).body).toBe(ORCH_TAB);
+  });
+
+  it('carries no itemId when none is given', () => {
+    expect(alertFor(source({ itemId: undefined }))).not.toHaveProperty('itemId');
+  });
+});

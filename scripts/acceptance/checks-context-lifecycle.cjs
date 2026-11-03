@@ -1,12 +1,12 @@
 'use strict';
-// Wave-10 acceptance checks: the context lifecycle (ADR-0036, story 10 AC 7) through the candidate's production
+// Wave-11 acceptance checks: the context lifecycle (ADR-0036, story 10 AC 7) through the candidate's production
 // build. A scratch seat (a claude-code tab created with --handoff and --rotate-at 50000, run by the live stand-in)
 // gets a statusline reading over its threshold at its prompt and is sent ROTATE; it writes a real handoff file and
 // ends its turn with HANDOFF-READY; the server checks the file, restarts the tab --clear under the same id, and
 // types "Read <path>, then continue: <resume command>" into the fresh session. Never a live seat: the instance has
 // its own port, HOME and tmux socket.
 //
-// `wave10(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
+// `wave11(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -23,12 +23,12 @@ const hookAt = (inst, token, event, session) => request(inst.state.port, 'POST',
 
 const IDS = ['rotate-request', 'rotate-handoff-check', 'rotate-restart', 'rotate-first-message', 'rotate-seat-item'];
 
-const wave10 = async (inst, helpers) => {
+const wave11 = async (inst, helpers) => {
   const results = [];
   try {
     await checks(inst, helpers, results);
   } catch (e) {
-    results.push({ status: 'fail', id: 'wave10-error', what: 'the context lifecycle checks ran to the end', measured: e instanceof Error ? e.stack : String(e), expected: 'no exception' });
+    results.push({ status: 'fail', id: 'wave11-error', what: 'the context lifecycle checks ran to the end', measured: e instanceof Error ? e.stack : String(e), expected: 'no exception' });
   }
   return results;
 };
@@ -180,4 +180,4 @@ const checks = async (inst, { parseJson, within, sleep, brief, readIf }, results
   }
 };
 
-module.exports = { wave10 };
+module.exports = { wave11 };

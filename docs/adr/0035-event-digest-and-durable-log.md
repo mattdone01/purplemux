@@ -106,3 +106,12 @@ above 20% (ADR-HFL-05: above 40% is the failure line), an urgent kind above 50% 
 first turn after a digest that carried that tab's event, or a worker idle more than 2 min behind a held event. Then
 the class table is wrong for that kind. Urgent same-text deliveries from different episodes above 5% of urgent
 deliveries and rated trivial would make the duplicate rule worth extending to urgent events.
+
+## Amendment (2026-11-03, regression fix after release acceptance)
+The nudge history (`getOrchestrationNudges`, the watchdog view and `orchestration status`) leaves out an urgent row while
+its paste is still running, so a nudge enters the history with its final outcome; the history can therefore return fewer
+than 200 rows. The page decision never read the history: it uses the paste result. A server restart in the middle of a
+paste leaves that row `delivered: false` in the table and the history, although the paste may have landed: read it as
+"outcome unknown after a restart". `purplemux events show` reads the table directly and can show an urgent row as not
+delivered while its paste runs.
+

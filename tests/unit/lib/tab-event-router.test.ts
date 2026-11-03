@@ -86,6 +86,27 @@ describe('urgent events (AC 2)', () => {
     expect(store.tabEvents.list(WS, { since: 0, limit: 5 })[0].deliveredAt).toBeNull();
   });
 
+  it('stay out of the history while their paste runs: an in-flight nudge never reads undelivered (09-fix)', async () => {
+    let release!: (ok: boolean) => void;
+    deliver.mockImplementationOnce(() => new Promise<boolean>((resolve) => { release = resolve; }));
+    const r = router();
+    const routing = r.route(checkpoint(1, { class: 'urgent', text: 'BACKGROUND JOB FAILED' }));
+    await vi.waitFor(() => expect(deliver).toHaveBeenCalledTimes(1));
+    expect(r.history(WS, 10)).toEqual([]);
+    release(true);
+    await expect(routing).resolves.toMatchObject({ delivered: true });
+    expect(r.history(WS, 10)).toEqual([expect.objectContaining({ kind: 'turn-marker', deliveredAt: T0 })]);
+  });
+
+  it('enter the history undelivered when their paste fails, and when it throws', async () => {
+    const r = router();
+    deliver.mockResolvedValueOnce(false);
+    await r.route(checkpoint(1, { class: 'urgent', text: 'first' }));
+    deliver.mockRejectedValueOnce(new Error('tmux gone'));
+    await expect(r.route(checkpoint(2, { class: 'urgent', text: 'second' }))).rejects.toThrow('tmux gone');
+    expect(r.history(WS, 10).map((row) => [row.text, row.deliveredAt])).toEqual([['first', null], ['second', null]]);
+  });
+
   it('carry their own readiness into the dispatch lock: a ROTATE for a tab that started a turn is not typed (ADR-0036 §2)', async () => {
     const rotate = { workspaceId: WS, tabId: TAB, kind: 'rotate', class: 'urgent' as const, text: 'ROTATE: bring /h.md up to date, then end your turn with HANDOFF-READY.' };
     const refused = await router().route({ ...rotate, whenReady: () => false });

@@ -23,6 +23,8 @@ const entry = (id: string, extra: Partial<ITabStatusEntry> = {}): ITabStatusEntr
 
 const setup = async (opts: {
   beforePaste?: () => void;
+  /** Held inside the dispatch lock: the paste is in flight until it resolves. */
+  pasteGate?: () => Promise<void>;
   tabEvents?: ReturnType<typeof memoryTabEvents>;
 } = {}) => {
   const ws = { id: 'ws-1', name: 'ws', directories: ['/tmp'], orchestration: { enabled: true, orchestratorTabId: 'o' } };
@@ -33,6 +35,7 @@ const setup = async (opts: {
     findTarget: vi.fn(async (_ws, id) => tab(id)),
     withPolicyLock: (async (_ws, _target, deliver) => {
       opts.beforePaste?.();
+      await opts.pasteGate?.();
       return deliver(async () => ({ ok: true }));
     }) as IAutomatedPromptDispatcherDeps['withPolicyLock'],
     hasSession: vi.fn(async () => true),
@@ -145,6 +148,75 @@ describe('watchdog nudges through the wake classes (ADR-0035)', () => {
     await internals.tabEvents.tick();
     const nudges = sent.filter((m) => m.type === 'orchestration:nudge').map((m) => m.nudge!);
     expect(nudges.map((n) => [n.id, n.delivered])).toEqual([[nudges[0].id, false], [nudges[0].id, true]]);
+  });
+
+  // Release acceptance on accd20c5 (checks self-failure-*): the history showed a `--notify self` bg-* nudge as
+  // undelivered while its paste ran, and the checks read it at its first appearance (09-fix).
+  describe('a --notify self background job report while its paste runs', () => {
+    const job = { workspaceId: 'ws-1', tabId: 'w', pid: 42, label: 'gate', registeredAt: 0, notify: 'self' as const };
+    const events: Record<string, TLivenessEvent> = {
+      'bg-failed': { kind: 'bg-failed', job, exitCode: 3, stderrTail: null },
+      'bg-exited-unknown': { kind: 'bg-exited-unknown', job, stderrTail: null },
+      'bg-completed': { kind: 'bg-completed', job, exitCode: 0, stderrTail: null },
+    };
+    const gated = async (worker: Partial<ITabStatusEntry>, opts: { orchestration?: boolean } = {}) => {
+      let release!: () => void;
+      let entered = false;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ctx = await setup({ pasteGate: () => { entered = true; return gate; } });
+      if (opts.orchestration === false) {
+        const ws = { id: 'ws-1', name: 'ws', directories: ['/tmp'] };
+        workspaceStore.getWorkspaceByIdCached.mockResolvedValue(ws);
+        workspaceStore.getWorkspacesCached.mockResolvedValue({ workspaces: [ws] });
+        ctx.manager.removeTab('o');
+      }
+      ctx.manager.registerTab('lead', entry('lead', { cliState: 'busy' }));
+      ctx.manager.registerTab('w', entry('w', { cliState: 'busy', ...worker }));
+      const alerts: string[] = [];
+      ctx.internals.dispatchAlert = async (params) => { alerts.push(params.kind); };
+      const run = async (event: TLivenessEvent) => {
+        const handled = ctx.internals.handleLivenessEvent(event);
+        await vi.waitFor(() => expect(entered).toBe(true));
+        const inFlight = ctx.manager.getOrchestrationNudges('ws-1').filter((n) => n.tabId === 'w');
+        release();
+        await handled;
+        return { inFlight, settled: ctx.manager.getOrchestrationNudges('ws-1').filter((n) => n.tabId === 'w') };
+      };
+      return { ...ctx, alerts, run };
+    };
+
+    it('heard: a busy agent whose reportsTo is a live agent reads delivered, urgent, and pages no one', async () => {
+      const { run, alerts, typed } = await gated({ reportsTo: 'lead' });
+      const { inFlight, settled } = await run(events['bg-failed']);
+      expect(inFlight.filter((n) => !n.delivered)).toEqual([]);
+      expect(settled).toEqual([expect.objectContaining({ kind: 'bg-failed', delivered: true, wakeClass: 'urgent' })]);
+      expect(typed()).toEqual([expect.stringContaining('BACKGROUND JOB FAILED')]);
+      expect(alerts).toEqual([]);
+    });
+
+    it('shell: an inactive shell tab with a live reportsTo reads delivered and still pages the human', async () => {
+      const { run, alerts } = await gated({ panelType: 'terminal', cliState: 'inactive', reportsTo: 'lead' });
+      const { inFlight, settled } = await run(events['bg-failed']);
+      expect(inFlight.filter((n) => !n.delivered)).toEqual([]);
+      expect(settled).toEqual([expect.objectContaining({ kind: 'bg-failed', delivered: true, wakeClass: 'urgent' })]);
+      expect(alerts).toEqual(['bg-job-died']);
+    });
+
+    it('alone: a busy agent with no escalation target reads delivered and still pages the human', async () => {
+      const { run, alerts } = await gated({}, { orchestration: false });
+      const { inFlight, settled } = await run(events['bg-failed']);
+      expect(inFlight.filter((n) => !n.delivered)).toEqual([]);
+      expect(settled).toEqual([expect.objectContaining({ kind: 'bg-failed', delivered: true, wakeClass: 'urgent' })]);
+      expect(alerts).toEqual(['bg-job-died']);
+    });
+
+    it.each(['bg-exited-unknown', 'bg-completed'])('%s to a busy waiting tab is urgent and reads delivered only once typed', async (kind) => {
+      const { run, typed } = await gated({ reportsTo: 'lead' });
+      const { inFlight, settled } = await run(events[kind]);
+      expect(inFlight.filter((n) => !n.delivered)).toEqual([]);
+      expect(settled).toEqual([expect.objectContaining({ kind, delivered: true, wakeClass: 'urgent' })]);
+      expect(typed()).toHaveLength(1);
+    });
   });
 
   describe('a ledger that cannot be written (review r2, F1)', () => {

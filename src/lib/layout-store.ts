@@ -690,11 +690,12 @@ const recordSpendBinding = async (
   sessionName: string,
   provider: IAgentProvider,
   sessionId: string | null | undefined,
-  tabId: string | undefined,
+  tab: { tabId?: string; tabName?: string },
 ): Promise<void> => {
   const wsId = parseSessionName(sessionName)?.wsId;
+  const { tabId, tabName } = tab;
   if (!sessionId || !tabId || !wsId) return;
-  await recordSessionTab({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: wsId, tabId })
+  await recordSessionTab({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: wsId, tabId, ...(tabName ? { tabName } : {}) })
     .catch((err) => log.warn(`session-tabs binding not recorded for ${sessionName}: ${err instanceof Error ? err.message : err}`));
 };
 
@@ -703,14 +704,15 @@ export const updateTabAgentSessionId = async (
   provider: IAgentProvider,
   sessionId: string | null,
 ): Promise<void> => {
-  const found: { tabId?: string } = {};
+  const found: { tabId?: string; tabName?: string } = {};
   await mutateTab(sessionName, (tab) => {
     found.tabId = tab.id;
+    found.tabName = tab.name;
     if (provider.readSessionId(tab) === sessionId) return false;
     provider.writeSessionId(tab, sessionId);
     return true;
   });
-  await recordSpendBinding(sessionName, provider, sessionId, found.tabId);
+  await recordSpendBinding(sessionName, provider, sessionId, found);
 };
 
 export const updateTabAgentSummary = (
@@ -734,9 +736,10 @@ export const updateTabAgentState = async (
     lastUserMessage?: string | null;
   },
 ): Promise<void> => {
-  const found: { tabId?: string } = {};
+  const found: { tabId?: string; tabName?: string } = {};
   await mutateTab(sessionName, (tab) => {
     found.tabId = tab.id;
+    found.tabName = tab.name;
     let changed = false;
     if (state.sessionId !== undefined && provider.readSessionId(tab) !== state.sessionId) {
       provider.writeSessionId(tab, state.sessionId);
@@ -756,7 +759,7 @@ export const updateTabAgentState = async (
     }
     return changed;
   });
-  await recordSpendBinding(sessionName, provider, state.sessionId, found.tabId);
+  await recordSpendBinding(sessionName, provider, state.sessionId, found);
 };
 
 export const updateTabClaudeSessionId = (

@@ -236,7 +236,7 @@ export interface IOrchestrationNudgeMessage {
   nudge: IOrchestrationNudge;
 }
 
-export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'orchestrator-missing' | 'work-stalled' | 'bg-job-died' | 'bg-job-unknown' | 'flag';
+export type TAlertKind = 'needs-input' | 'review' | 'standup-needs-human' | 'orchestrator-stalled' | 'orchestrator-missing' | 'work-stalled' | 'bg-job-died' | 'bg-job-unknown' | 'flag' | 'attention-opened';
 
 export type TAlertProviderId = 'claude' | 'codex' | 'grok';
 
@@ -255,6 +255,8 @@ export interface IAlert {
   at: number;
   /** Kind `flag` only (ADR-0032): the raised fleet or flow flag. */
   flag?: IAlertFlag;
+  /** Kind `attention-opened` only: the Mission Control item that was opened for the human. */
+  itemId?: string;
 }
 
 export type TAlertFlagSource = 'fleet' | 'flow' | 'ledger';

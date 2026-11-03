@@ -22,6 +22,7 @@ const CLI_COMMANDS = new Set([
   'mc',
   'portfolio',
   'lease',
+  'pool',
   'inbox',
   'note',
   'config',

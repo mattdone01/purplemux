@@ -16,7 +16,7 @@ import { agentLaunchConfigFromOptions } from '@/lib/agent-launch-policy';
 import { checkAgentDispatchPolicy } from '@/lib/agent-dispatch-policy';
 import { checkReportOn, checkReportsTo, isReportOnInvalid } from '@/lib/reports-to';
 import { tabIdentityOf } from '@/lib/tab-token';
-import { RemoteHostError, isValidRemoteHostName, readRemoteHosts, remoteDirExists } from '@/lib/remote-host';
+import { RemoteHostError, isValidRemoteHostName, originName, readRemoteHosts, remoteDirExists } from '@/lib/remote-host';
 import fs from 'fs/promises';
 import path from 'path';
 import type { TPanelType, TTabRole } from '@/types/terminal';
@@ -25,6 +25,8 @@ import type { ILastEvent } from '@/types/status';
 import { remoteHostUnreachableBody } from '@/lib/cli-error';
 import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
 import { checkEvaluatorBrowser, checkTabRole } from '@/lib/tab-role';
+import { AUTO_HOST, resolveAutoHost, type IAutoPlacement } from '@/lib/pool-tab-placement';
+import { placeOnPool } from '@/lib/pool-service';
 import { checkSeatOptions } from '@/lib/context-lifecycle';
 import type { TRotateAt } from '@/types/context-lifecycle';
 
@@ -65,11 +67,14 @@ type TCwdCheck = { ok: true } | { ok: false; status: number; body: Record<string
  * remote worker works in its own checkout there; this host's tree says nothing
  * about it (ADR-0022).
  */
+const isCwdShape = (cwd: unknown): cwd is string => typeof cwd === 'string' && path.isAbsolute(cwd) && !/[\0\n\r]/.test(cwd);
+
+const CWD_SHAPE_REFUSAL = (cwd: unknown): TCwdCheck =>
+  ({ ok: false, status: 400, body: { error: 'cwd must be an absolute directory path', code: 'cwd-missing', cwd: typeof cwd === 'string' ? cwd : null } });
+
 const checkCwd = async (cwd: unknown, host: string | undefined): Promise<TCwdCheck> => {
   const where = host ?? 'this host';
-  if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || /[\0\n\r]/.test(cwd)) {
-    return { ok: false, status: 400, body: { error: 'cwd must be an absolute directory path', code: 'cwd-missing', cwd: typeof cwd === 'string' ? cwd : null } };
-  }
+  if (!isCwdShape(cwd)) return CWD_SHAPE_REFUSAL(cwd);
   let exists: boolean;
   if (host) {
     try {
@@ -225,7 +230,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         validPanelTypes: VALID_PANEL_TYPES,
       });
     }
-    const roleCheck = checkTabRole(role, panelType as TPanelType | undefined, host, previewUrl, pgService);
+    // `--host auto` (ADR-0039 §4): a role tab is placed here, so its role check sees no host.
+    const roleCheck = checkTabRole(role, panelType as TPanelType | undefined, host === AUTO_HOST ? undefined : host, previewUrl, pgService);
     if (!roleCheck.ok) return res.status(400).json(roleCheck.body);
     if (roleCheck.role === 'evaluator') {
       const browser = await checkEvaluatorBrowser();
@@ -233,12 +239,28 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     }
     const resolvedType: TPanelType = panelType ? (panelType as TPanelType) : roleCheck.role ? 'claude-code' : 'terminal';
     let remoteHost: string | undefined;
-    if (host !== undefined) {
-      const checked = await checkRemoteHost(host, resolvedType);
+    let autoPlacement: IAutoPlacement | null = null;
+    let requestedHost: unknown = host;
+    let cwdCheckedOnHost = false;
+    if (host === AUTO_HOST) {
+      if (cwd !== undefined && !isCwdShape(cwd)) {
+        const refused = CWD_SHAPE_REFUSAL(cwd);
+        if (!refused.ok) return res.status(refused.status).json(refused.body);
+      }
+      const auto = await resolveAutoHost(
+        { panelType: resolvedType, role: roleCheck.role ?? undefined, cwd: isCwdShape(cwd) ? cwd : undefined },
+        { place: placeOnPool, cwdOnHost: remoteDirExists, localName: originName },
+      );
+      autoPlacement = auto.placement;
+      requestedHost = auto.host;
+      cwdCheckedOnHost = !!auto.cwdChecked;
+    }
+    if (requestedHost !== undefined) {
+      const checked = await checkRemoteHost(requestedHost, resolvedType);
       if (!checked.ok) return res.status(checked.status).json(checked.body);
       remoteHost = checked.host;
     }
-    if (cwd !== undefined) {
+    if (cwd !== undefined && !cwdCheckedOnHost) {
       const checkedCwd = await checkCwd(cwd, remoteHost);
       if (!checkedCwd.ok) return res.status(checkedCwd.status).json(checkedCwd.body);
     }
@@ -364,6 +386,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         ...(tab.handoffPath ? { handoffPath: tab.handoffPath } : {}),
         ...(tab.rotateAt !== undefined ? { rotateAt: tab.rotateAt } : {}),
         ...(wip ? { wip } : {}),
+        ...(autoPlacement ? { placement: autoPlacement } : {}),
       });
     } catch (err) {
       if (err instanceof WipCapError) return res.status(409).json(err.body);

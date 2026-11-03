@@ -111,6 +111,13 @@ to an exit code through one table:
                                                  ledger-event-conflict
      7  not found (ledger, ADR-0033)             ledger-experiment-not-found                —
      1  unexpected error (ledger, ADR-0033)      ledger-store-failed                        investigate
+     2  usage error (pool, ADR-0039)             pool-invalid                               fix the command
+     3  refused by state (pool, ADR-0039)        pool-full, pool-unreadable                 after the state changes, or a local
+                                                                                            slot; never for a gate.no-local-
+                                                                                            fallback repository (ADR-0039 §6)
+     6  no answer (pool, ADR-0039)               pool-timeout                               fall back to a local slot, log it;
+                                                                                            never for a gate.no-local-
+                                                                                            fallback repository (ADR-0039 §6)
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -158,6 +165,79 @@ POST /api/cli/leases/release-epic { "epic", "kind"? }     → { "released": [nam
 
 An unreadable lease store answers 500 \`lease-store-unreadable\`: nothing is known about who holds
 what, so treat it as a refusal.
+
+## Pool (ADR-0039)
+
+One scheduler places gates, builds and agent tabs on this host and the remote.hosts hosts from
+live headroom. This host is read through host-metrics on every call; each remote host by one ssh
+read (\`sh -s\`, 5 s hard timeout, then pool.fallback.<alias> once) every 30 s. A failed read
+makes the host unknown for 30 s: it shows no figures, never 0, takes nothing new, and keeps its
+leases. A read older than 90 s is unknown too. A host that answered only through its fallback
+alias shows its figures and "via", but "placeable" is false and "reason" says
+"answers only through <fallback>; <alias> failed (...)": it takes nothing new.
+
+GET /api/cli/pool   (any valid scope)
+  \`purplemux pool show [--json]\`. The board's pool section reads the same model.
+  Response: { "at", "totals": { "threads", "memTotalBytes", "memAvailableBytes", "knownHosts",
+  "unknownHosts", "slots": { "gate"|"build"|"tab": { "used", "cap", "free" } } }, "hosts": [{   (totals' "free"
+  counts placeable hosts only; "used" and "cap" count every known host)
+  "host", "local", "state": "known"|"unknown", "placeable", "readAt", "via", "reason", "loadPerThread",
+  "agentTabs", "slots", "metrics": null | { "threads", "load1", "load5", "memTotalBytes",
+  "memAvailableBytes", "disks": [{ "path", "usedPct", "freeBytes" }], "gpus": null | [{ "index",
+  "name", "utilPct", "memUsedMiB", "memTotalMiB" }], "sccacheSweep": null | { "state":
+  "active"|"stopped"|"failed"|"not-installed", "failed", "timer": { "loadState", "activeState",
+  "unitFileState", "result" }, "service": null | { ...the same } } } }] }. "stopped" is an
+  installed timer that is stopped or disabled; null is not read. Totals count known hosts only.
+  A tab slot in use is an agent tab on that host (from the layouts) or a tab-kind lease.
+  503 pool-unreadable (exit 3) when the fleet config or the lease store cannot be read.
+
+POST /api/cli/pool/acquire   (a tab token, or the admin token)
+  Body: { "kind": "gate"|"build"|"tab", "memGb"?: 0..1024, "ttlSeconds"?: n,
+          "panelType"?: "claude-code", "role"?: "evaluator" }   (panelType and role: kind tab only)
+  \`purplemux pool acquire --kind K [--mem GB] [--ttl 60m] [--panel-type T] [--role R]\`.
+  Placement: unknown and fallback-only hosts are skipped. Gates and builds need a free slot, / under 85% and
+  memGb + 4 GiB free; they go to the lowest load per thread (load1 plus 8 threads for each gate
+  or build leased within 60 s of the read), then the most free memory. The pool never refuses a
+  tab: tab admission is the WIP cap (ADR-0027). Only a claude-code tab with no role may leave this
+  host (codex-cli and grok-cli cannot run remote, ADR-0022 §13; a coordinator is never remote,
+  §20); it goes to the placeable host with a free tab slot, the memory and the most free memory,
+  else here. Every other tab is placed here. A tie stays on this host. Memory leased within 60 s of a read counts against the host.
+  The slot is a lease "pool:<host>/<kind>-<n>" on the lease store (ADR-0011): the lowest free n,
+  held by the caller's tab, default TTL 60m, at most 24h, note "pool mem=<GB>". It ends with
+  \`pool release\`, its TTL, or its holder tab (the lease sweeper). Placement and the slot number
+  are taken inside the lease lock: two callers never get one slot.
+  Response: { "host", "local", "slot": "gate-1", "lease": "pool:ai-lan/gate-1", "expiresAt",
+  "reason", "gateHost": null | "<pool.gate-host.<host>>" }
+  Errors (gate and build only): 409 pool-full { "refusal": "no-known-host"|"no-free-slot"|"no-memory"|"disk-full" }
+  (exit 3); 400 pool-invalid (exit 2); 400 lease-policy (a TTL over 24h, exit 2); 403
+  caller-unresolved (no tab, exit 3).
+  Client rule: the CLI waits 2 s. No answer exits 6 (pool-timeout); the caller does what it does
+  without the pool and logs it: a lane uses its local slots, but a repository in
+  gate.no-local-fallback never runs here (below). A lease a late answer took expires at its TTL.
+  A gate passes --ttl of at least its gate timeout, or renews the lease while it runs.
+
+POST /api/cli/pool/release   Body: { "lease": "pool:<host>/<kind>-<n>" }
+  \`purplemux pool release LEASE\`. The holder only (409 lease-held-by-other, exit 3); 404
+  lease-not-found (exit 7); a name that is not a pool slot is 400 pool-invalid.
+  Response: { "released": <lease view> }
+
+The engineering gate's keys map onto the pool (migration, ADR-0039 §6; gate.sh and remote-gate.sh
+do not change until they read the pool, and every key keeps working until then):
+  gate.route=remote           gate.sh asks \`pool acquire --kind gate\` for a repository in
+                              gate.remote-repos; local, or a repository outside it, stays here.
+  gate.remote-repos           unchanged: the repositories whose gates the pool places.
+  gate.no-local-fallback      (default treasury-api treasury-event-consumer) never runs here: a
+                              local answer, pool-timeout or pool-full is handled as today (queue on
+                              the gate host, or REFUSED-REMOTE).
+  a remote answer             remote-gate.sh with ORCH_GATEHOST_HOST=<gateHost>: the pin needs no
+                              gate.remote-hosts entry (GATE_HOST resolves only against the list).
+  gate.remote-hosts entries   stay until gate.sh reads the pool. alias:slots:api-slots on a pool
+                              host maps to pool.gate-host.<host>=<alias> and
+                              pool.slots.<host>.gate=<slots> (gatehost-replica:6:2 ->
+                              pool.gate-host.ai-lan=gatehost-replica, pool.slots.ai-lan.gate=6);
+                              api slots stay in remote-gate.sh's host queue. gatehost-runner2
+                              (lfr-runner2, outside the pool, OD-7) has no pool host.
+  gate.slots                  pool.slots.<this host>.gate.
 
 ## Workspaces
 
@@ -257,6 +337,11 @@ POST /api/cli/tabs
   PMUX_TAB_ID, PMUX_WORKSPACE_ID, PMUX_URL (this server) and its own tab token, never the
   workspace token. A remote claude-code tab's hooks, transcript and CLI reach this server, so
   status, result, send, close and the watchdog work as for a local tab; status serves "host".
+  "host": "auto" asks the pool (ADR-0039): only a claude-code tab with no role may go to a known
+  remote host (the most free memory; a tie stays here), then passes the same checks as an
+  explicit host. Every other tab, a pool refusal, no pool answer in 2 s, or a "cwd" missing on
+  the chosen host creates the tab here. The answer adds "placement": { "host", "local",
+  "reason", "fallback" }; "fallback" is true when the pool's own answer was not used.
   "cwd" is the tab's start directory, an absolute path that must exist on the tab's host,
   else 400 { "code": "cwd-missing" } (exit 2).
   "reportsTo" names a live tab of the SAME workspace that receives this tab's watchdog nudges
@@ -285,7 +370,8 @@ POST /api/cli/tabs
 GET /api/cli/workspaces/<WS>/tab-count   (any scope that may read WS)
   The workspace's agent tabs against the WIP cap; \`purplemux tab count -w WS [--json]\` prints
   "<count> <cap>". Repository hooks read it instead of counting tmux sessions.
-  Response: { "workspaceId", "count", "cap", "capSource": "fleet-config" | "default" | "default-invalid", "overCap" }
+  Response: { "workspaceId", "count", "cap", "capSource": "workspace-config" | "workspace-config-invalid" | "fleet-config" | "default" | "default-invalid", "overCap", "capReason"? }
+  "capReason" is present with workspace-config-invalid: why the workspace's stored value was not used.
   404 not-found (exit 7) for an unknown workspace; 503 config-store-unreadable (exit 3); 500 tab-count-unreadable (exit 1).
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
@@ -605,7 +691,7 @@ DELETE /api/cli/watches/<id>
 
 Versioned string values that tools read at call time, so changing one needs no message to
 anyone: no broadcast, no nudge, no inbox notice. Every change is audited to
-~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][a-z0-9.-]{1,63}$; values are one
+~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][A-Za-z0-9._-]{1,63}$; values are one
 line of text, at most 256 characters, parsed by the reader. Writes need the admin token or the
 tab that is its workspace's enabled orchestrator (cooperative authority, not a boundary).
 
@@ -628,7 +714,8 @@ Keys in use:
                (2). Read on every fleet read; unset or invalid means the default. Written by the
                admin token or an enabled orchestrator (ADR-0019).
   remote.hosts The ssh aliases that remote tabs may use (ADR-0022), comma-separated; a name that is
-               not an ssh alias is 400 config-invalid. Unset means no remote host. Admin token only.
+               not an ssh alias, or "auto", is 400 config-invalid. Unset means no remote host. They
+               are also the pool's remote hosts (ADR-0039). Admin token only.
   remote.callback-url
                The URL a remote tab's hooks and CLI use to reach this server, http(s)://host[:port].
                Plain http only to loopback, 100.64.0.0/10, a *.ts.net name or a bare name on
@@ -646,6 +733,25 @@ Keys in use:
                for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
                (capSource "default-invalid", the value logged). Admin token only (exit 3 forbidden
                for a tab): any one orchestrator could otherwise raise it for every workspace.
+  tabs.cap-per-workspace.<workspaceId>
+               One workspace's WIP cap (ADR-0039), the id as written (case kept): it wins over the
+               fleet value for that workspace (capSource "workspace-config"). Both cap keys must be an
+               integer 1..200 when written (else 400 config-invalid). A stored value that is invalid
+               anyway serves the fleet cap with capSource "workspace-config-invalid" and "capReason",
+               and is logged. Admin token only, as above.
+  pool.slots.<host>.<gate|build|tab>
+               A pool host's slot cap for the kind (ADR-0039), a whole number 0..64 (0: none there);
+               <host> is the lower-case pool host (this host's name or a remote.hosts alias).
+               Unset means threads / 8 for gate and build, total memory / 8 GiB for tab. Read
+               on every pool read. Admin token only.
+  pool.fallback.<alias>
+               The ssh alias the pool read tries once when <alias> fails (the tailnet alias
+               behind a LAN alias, e.g. ai-server behind ai-lan). Unset means one try. Admin
+               token only.
+  pool.gate-host.<host>
+               The gate-host container on <host> that a remote gate pins (its ssh alias, e.g.
+               gatehost-replica); \`pool acquire --kind gate\` returns it as "gateHost". Admin
+               token only.
   flow.window-minutes  flow.lock-busy-percent  flow.queue-length  flow.oldest-minutes
                The flow-flag thresholds (ADR-0026): the busy-share window in minutes 10..10080
                (default 360), the busy percent 1..100 (80), the queue length, a whole number
@@ -864,10 +970,15 @@ GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
   first good read of any source read late; an unreadable store raises nothing and clears nothing;
   a target that cannot be checked is retried next tick. The orchestrator-only alert setting does
   not apply. No inbox notice is sent: the alert is for the human, not for an agent.
+  Attention alerts: an attention.opened that opens an item for the human (humanReview.humanNeed is
+  not "none", so the item state is "open") sends one notification:alert of kind
+  "attention-opened", title "Mission Control: answer needed", body the item title, and "itemId".
+  tabId is the opening tab, else the workspace's orchestrator. A candidate item, a replayed event,
+  attention.updated, an answer, a resolve and a cancel send nothing; an item alerts once.
 
 ## Spend (ADR-0030)
 
-GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role]
+GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role|seat|phase|item]
                                                        (purplemux spend show -w WS [--since D] [--until D] [--by ...] [--json])
   Read scope on WS. since/until are UTC days, both inclusive; the default is the last 7 UTC days
   and by=tab. Spend keeps the last 92 UTC days (today − 91 … today), including usage whose
@@ -893,6 +1004,33 @@ GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|
   workspace's enabled orchestrator NOW) and "other". Transcripts are read by a background
   index; while index.state is "indexing" the numbers are partial. A request never parses a
   transcript.
+  by=seat rows are tab names (the open tab's name, else the name recorded with the binding).
+  by=phase and by=item read the work-item ledger: each Claude message counts at its UTC 5-min
+  slot, for the ledger item its tab held (holder = the tab's id or name) at the slot's midpoint;
+  of several, the one with the latest event. Phases: plan, build, review, evaluate, land,
+  coordinate, and "other" (the tab held no item). The wait reason decides first (review-queue,
+  review-findings: review; rework: build; receipt-rekey and every land and deploy reason: land;
+  owner: coordinate), else the item type (slice: build; review: review; gate, experiment:
+  evaluate; range, landing, deploy: land; owner-issue: plan; mc-item: coordinate); seat items
+  never count. by=phase|item serve at most 7 UTC days (else 400 invalid-request naming the cap).
+  Their answers add "unattributedReasons": [ISpendRow] (keys no-binding, no-message-time for
+  Codex, Grok and pre-slot usage, ledger-unreadable, no-ledger-history before the ledger's
+  horizon, no-held-item for by=item; they sum to "unattributed") and "phaseBasis": { "slotMs":
+  300000, "ledgerHorizon": <ms>|null (null: no item yet), "ledgerReadable" }. Mission Control
+  refuses by=phase|item with workspaceId=all. Every ISpendRow also carries "cacheReadCostUsd":
+  the cache reads' part of costUsd, null when not priced or a Codex/Grok session cost cannot be
+  split.
+
+GET /api/cli/spend/phases?workspaceId=WS[&day=YYYY-MM-DD]   (purplemux spend phases -w WS [--day D] [--json])
+  Read scope on WS. One UTC day (default today; from today − 91 to today, else 400
+  invalid-request) as the by=phase ISpendView, each row with "wallMs" (distinct 5-min slots
+  with usage x 5 min; null for usage with no message time), plus "day" and
+  "cacheReadPerLandedItem": { "day": M, "7d": M }, M = { "metric":
+  "cache_read_tokens_per_landed_item", "window", "from", "to", "cacheReadTokens", "landedItems"
+  (range landings the store's projection applied in the window, one per applied close with state
+  landed: a repeat, orphan or re-sent close counts none; null when the ledger cannot be read or holds
+  no item for the workspace), "value" (null when not measured), "reason" (why not
+  measured, else null) }.
 
 ## Ledger (ADR-0033)
 
@@ -1081,10 +1219,13 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   mine=1 keeps the stuck items the calling tab holds (by tab name or id); it needs a tab token
   (400 invalid-request otherwise). Response (times Unix ms):
   { "workspaceId", "generatedAt", "ageMs", "staleSince" | null, "stuckTotal",
-    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "itemsLeft" | null, "p50At" | null, "p90At" | null },
+    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "goalState": "set" | "none" | "unknown",
+                 "itemsLeft" | null, "p50At" | null, "p90At" | null, "throughputPerDay": null | [n, n, n], "reason" | null },
     "constraint": null | { "reason", "stage", "waitingHours", "trend", "ownerSeat" | null, "clearInput" | null,
                            "basis": "critical" | "all", "items", "labels": { "reason", "stage", "trend" } },
-    "needsYou": null | [{ "id", "title" }],
+    "needsYou": null | [{ "id", "title", "createdAt", "blocked": null | { "items", "hours", "critical" } }],
+    "experiments": null | [<ledger experiment with no verdict>],
+    "ownerBlocks": null | { <mc item id>: { "items", "hours", "critical" } },
     "stuck": [{ "key", "itemType", "holder" | null, "reason", "since", "clearInput" | null, "critical", "reasonLabel" }],
     "windows": [{ "window": "6h" | "24h" | "7d", "since", "until", "byReason": [row], "byStage": [row], "closed": { <type>: n } }],
     "anomalies": [{ "id", "subject", "value" | null, "unit", "threshold" | null, "judged", "breached", "window", "text", "reason" | null }],
@@ -1095,7 +1236,14 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   (reason "ledger unreadable" or "the ledger holds no event for this workspace") means constraint,
   stuck and windows were not measured and every anomaly is null: an empty list then is not "nothing
   stuck". spend is "partial" when the index is ready but reports an error (the reason).
-  onTrack.goal is null until a goal is set (story 12); onTrack.state is then "at-risk".
+  onTrack.goal is null until a goal is set (board goal set); onTrack.state is then "at-risk", reason
+  "no goal set". With a goal: itemsLeft = goal keys the ledger does not hold closed; throughputPerDay
+  = closes of the goal keys' item types in each of the last 3 days; p50At / p90At from an exact
+  bootstrap over those days; no close in 3 days is no forecast (reason says so), never a date.
+  needsYou[].blocked: open ledger items waiting "owner" whose link (parent) is mc-item:<id>, their
+  summed waiting hours and whether any is critical; null when nothing links, or when the ledger is
+  not measured (then inputs.ledger.reason says why). goalState "unknown": the goal file could not be
+  read (reason "goal not measured: ..."), never "no goal set".
   staleSince is generatedAt when the answer is older than 120 s (two ticks); treat it as stale.
   --line then ends with "stale since <time>" (AEDT/AEST).
   The constraint is the reason with the most waiting hours in the last 24 h (finished waits clipped
@@ -1113,7 +1261,8 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   one per (producer of the last event, item type), subject "<producer>/<type>", "<item> silent for <n>
   min (threshold <t> min)"; threshold max(10
   min, 2 x the type's 7-day p90 lifetime), unknown under 20 closed), cost-per-landed-item (spend over
-  the last 7 UTC days / ranges closed landed over the same days; never flagged).
+  the last 7 UTC days / ranges closed landed over the same days, from close events; never flagged),
+  cache-read-per-landed-item (cache-read tokens / the same landed ranges, 7 d; never flagged).
   labels and reasonLabel are the owner's words for the tokens (src/lib/constraint-labels.ts); line and
   the text form use only them. stuck is the 50 oldest waits, capped after the mine filter;
   stuckTotal is how many matched (the text form prints "50 of N").
@@ -1121,6 +1270,61 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   workspace's orchestrator. An answer older than 120 s, or with the ledger unknown, neither raises
   nor clears. judged is false when the value or threshold is null or the measure never flags; an
   anomaly that cannot be judged keeps its raised flag.
+
+## Board goal (ADR-0034 §10)
+
+GET|PUT|DELETE /api/cli/workspaces/<workspaceId>/board-goal
+  (purplemux board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS)
+  GET: read scope; { "workspaceId", "goal": null | { "label", "items", "setAt", "setBy" } }.
+  PUT { "label": "<1..120>", "items": ["<type>:<key>", ... 1..500] }: the workspace's own token only
+  (403 otherwise; an admin token is not a workspace). 400 invalid-request lists every defect
+  ("items[0]: saw \"story-3\", expected <type>:<key> ..."). DELETE clears. PUT and DELETE drop the
+  finder's cached answer and answer { "workspaceId", "goal" | "cleared", "onTrack" } derived at once.
+
+## Pulse (ADR-0034 §9)
+
+GET /api/cli/workspaces/<workspaceId>/pulse          (purplemux board pulse -w WS [--json])
+GET /api/mission-control/pulse[?workspaceId=all|WS]  (human session; all answers { "pulses": [...] })
+  Read scope on WS. Hourly movement over the last 48 h, cached 60 s per workspace. Response:
+  { "workspaceId", "generatedAt", "staleSince" | null, "scope": { "basis": "epic" | "directories", "epics": [...] },
+    "hours": null | [{ "start", "total", "bySource": { <source>: n }, "gatesPassed", "gatesFailed" } x 48],
+    "sources": [{ "id", "label", "state": "ok" | "unknown", "reason" | null, "count" | null, "lastAt" | null, "from": [...],
+                  "sharedWith": null | [<workspace name>] }],
+    "stall": { "state": "stalled" | "moving" | "steady" | "idle" | "not-measured", "reason", "lastMovementAt" | null,
+               "hoursSinceMovement" | null, "lastHour" | null, "medianPerHour" | null,
+               "oldestStuck": null | { "kind": "ledger-item" | "agent-tab" | "mc-item", "id", "label", "since" } },
+    "wip": { "count" | null, "basis": "ledger" | "agent-tabs" | "none", "basisReason",
+             "sources": { "ledger": "measured" | "no-events" | "unreadable", "agentTabs" | "missionControl": "measured" | "unreadable" | "not-used" } },
+    "priority": { "text", "basis": "constraint" | "stuck-critical" | "none" | "unknown", "needsYou" | null } }
+  Scope: every event belongs to one workspace. A workspace holding an epic:<slug> lease counts that
+  epic's _output/<slug> gate logs and review records, the repositories its status.yaml names with an
+  integration_branch (that exact branch and each story's branch, stories[].branch else story/<key>),
+  and every directory whose .v2/status.yaml names the epic (main, gate logs, receipts, landings).
+  Where two leased epics share a repository, a commit counts for one epic only: the one whose story
+  branches alone hold it; any other commit both reach is a commits source with sharedWith set. Without a lease: its own directories, minus what
+  another workspace's epic covers; a directory another workspace lists too is a source with
+  sharedWith set, shown after the six and never counted in hours or stall.
+  Sources (in order): ledger (open, clear, close on range, slice, gate, review, landing, deploy),
+  commits (the scope's refs), gates (gate.sh logs: VERDICT word VALID with EXIT=0 passes, RED fails,
+  VOID/REFUSED/KILLED/STOPPED are not finished; v2 logs: the GATE PASS|FAIL line naming the file),
+  reviews (v2 receipts and every _output/<epic>/reviews/*-out.md), landed (.v2/landings.log LANDED
+  lines), answers (Mission Control answers). Each read has a 10 s deadline ("read timed out"). Reads
+  on an sshfs mount (_output) run at most 2 at a time; a mount that does not answer within 5 s reads
+  "<mount> not answering since <time>" until a probe stat of it returns. A
+  source that cannot be read is "unknown" with count null, never 0, and adds nothing to the bars;
+  hours is null when no source is read.
+  stall: stalled when wip.count > 0 and nothing moved for 2 h (names the oldest counted item: an
+  MC item, a tab waiting for input, or a ledger item); moving when the last 60 min is above 0 and
+  at or above the median of the active hours (any event) among the 168 complete hours before the
+  current one (stall.medianPerHour, stall.activeHours); idle when wip.count is
+  0; steady otherwise; not-measured with no basis or when no file-born source (commits, gates,
+  reviews, landed) was read. The reason names every source not measured.
+  wip: the ledger's open range, slice, gate, review, landing and deploy items once the ledger holds
+  an event on one of those types for the workspace in 7 days; else busy or needs-input agent tabs (the orchestrator
+  only while it waits for the owner: a pane prompt or a NEEDS-DECISION/BLOCKED turn end) plus open Mission Control
+  items; else none.
+  priority: the constraint with its owner and clear input; else the oldest stuck critical item;
+  with the needs-you count. staleSince: the finder answer it rests on is older than 120 s.
 
 ## Context lifecycle (ADR-0036)
 
