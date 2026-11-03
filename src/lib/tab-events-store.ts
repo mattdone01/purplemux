@@ -159,6 +159,11 @@ export class TabEventsTable {
     this.database.prepare(`SELECT text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ? AND workspace_id = ?
       AND class = 'log' AND kind = 'curator' ORDER BY seq`).pluck().all(since, workspaceId) as string[];
 
+  /** Every workspace's routing decisions since `since` (story 23), oldest first: their JSON text only. */
+  curatorRoutesSince = (since: number): string[] =>
+    this.database.prepare(`SELECT text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ? AND class = 'log' AND kind = 'curator-route'
+      ORDER BY seq`).pluck().all(since) as string[];
+
   /** Every workspace's curator call records since `since`, but the evaluation's: the label queue reads them. */
   curatorCallsSince = (since: number, excludeWorkspace: string): Array<{ workspaceId: string; at: number; text: string }> =>
     (this.database.prepare(`SELECT workspace_id, at, text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ?
@@ -179,7 +184,7 @@ export class TabEventsTable {
    */
   recordedCounts = (workspaceId: string, since: number, until: number): ITabEventCount[] =>
     this.database.prepare(`SELECT kind, rule, COUNT(*) AS count FROM tab_events INDEXED BY tab_events_at_idx
-      WHERE at >= ? AND at < ? AND workspace_id = ? AND NOT (class = 'log' AND kind = 'curator')
+      WHERE at >= ? AND at < ? AND workspace_id = ? AND NOT (class = 'log' AND kind IN ('curator', 'curator-route'))
       GROUP BY kind, rule ORDER BY kind, rule`)
       .all(since, until, workspaceId) as ITabEventCount[];
 
@@ -219,9 +224,9 @@ export class TabEventsTable {
         target.wakes += 1;
       }
     }
-    // A curator call is a log row about a tab, never an event sent to it (ADR-0038 §2).
+    // A curator call or routing decision is a log row about a tab, never an event sent to it (ADR-0038 §2, story 23).
     const logged = this.database.prepare(`SELECT tab_id, at FROM tab_events INDEXED BY tab_events_at_idx
-      WHERE at >= ? AND at < ? AND workspace_id = ? AND class = 'log' AND kind != 'curator'`).raw().all(query.since, query.until, workspaceId) as Array<[string, number]>;
+      WHERE at >= ? AND at < ? AND workspace_id = ? AND class = 'log' AND kind NOT IN ('curator', 'curator-route')`).raw().all(query.since, query.until, workspaceId) as Array<[string, number]>;
     for (const [tabId, at] of logged) row(tabId, at).logged += 1;
     return [...rows.values()].sort((a, b) => a.tabId.localeCompare(b.tabId) || (a.day ?? '').localeCompare(b.day ?? ''));
   };

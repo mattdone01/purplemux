@@ -64,6 +64,7 @@ const { wave11 } = require('./checks-context-lifecycle.cjs');
 const { waveAttentionAlert } = require('./checks-attention-alert.cjs');
 const { wave13 } = require('./checks-effects.cjs');
 const { wave14 } = require('./checks-curator.cjs');
+const { wave15 } = require('./checks-curator-routing.cjs');
 const { fixtureCapGate } = require('./checks-wip-cap.cjs');
 
 const POLL_MS = 200;
@@ -1592,7 +1593,8 @@ const freePort = () =>
 const wavesFor = (inst, opts, helpers) => [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers),
   () => wave5(inst, helpers), () => wave6(inst, helpers), () => wave7(inst), () => wave8(inst),
   () => wave9(inst, helpers), () => wave10(inst, helpers), () => wave11(inst, helpers), () => waveAttentionAlert(inst, helpers),
-  () => wave13(inst, helpers), () => wave14(inst, helpers)];
+  () => wave13(inst, helpers), () => wave14(inst, helpers),
+  () => wave15(inst, helpers)];
 const WAVE_COUNT = wavesFor(null, {}, {}).length;
 
 const parseArgs = (argv) => {

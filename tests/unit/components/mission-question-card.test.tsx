@@ -396,3 +396,19 @@ describe('a stale snapshot after a 409 (31-C1)', () => {
     expect(mergeMissionItem(newer, before)).toBe(newer);
   });
 });
+
+describe('a suggested answer from an owner message (story 23 AC 2)', () => {
+  it('shows each suggestion as a pointer with the quoted span, never as a chosen option', () => {
+    const question = { ...item('single.json'), suggestedAnswers: [{ entryId: 'm9', span: 'go with the pre-flight gate', at: Date.now() - 120_000 }] };
+    const html = render(draftOf(question));
+    expect(html).toContain('data-suggested-answers');
+    expect(html).toContain('Your message 2m ago may answer this');
+    expect(html).toContain('<q class="text-foreground">go with the pre-flight gate</q>');
+    expect(html).toContain('It is not an answer: choose below.');
+    expect(count(html, 'aria-checked="true"')).toBe(0);
+  });
+
+  it('an item without suggestions shows none', () => {
+    expect(render(draftOf(item('single.json')))).not.toContain('data-suggested-answers');
+  });
+});

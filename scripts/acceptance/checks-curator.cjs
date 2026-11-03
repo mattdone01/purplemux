@@ -6,7 +6,7 @@
 //
 // `wave14(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
 
-const TASKS = ['classify-owner-message', 'flag-owner-question', 'match-standing-order'];
+const TASKS = ['classify-owner-message', 'flag-owner-question', 'match-standing-order', 'reshape-question'];
 
 const wave14 = async (inst, helpers) => {
   const results = [];
@@ -29,7 +29,7 @@ const checks = async (inst, { parseJson, brief }, results) => {
   const states = (body?.tasks ?? []).map((t) => `${t.task}:${t.state}`);
   push(status.rc === 0 && body?.model === 'gemma4:26b' && JSON.stringify(states) === JSON.stringify(TASKS.map((t) => `${t}:shadow`))
     && Number.isFinite(body?.liveSince) && ['up', 'down', 'unknown'].includes(body?.health?.state),
-  'curator-status', 'curator status: gemma4:26b, the three tasks in shadow, the shadow clock started at server start',
+  'curator-status', 'curator status: gemma4:26b, the four tasks in shadow, the shadow clock started at server start',
   `rc ${status.rc} model ${body?.model} tasks ${states.join(',')} liveSince ${body?.liveSince} health ${body?.health?.state} ${brief(status.err)}`,
   'rc 0, gemma4:26b, every task shadow, liveSince a time, health up|down|unknown');
 

@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { sendCuratorError, taskOf } from '@/lib/curator-http';
+import { labelTaskOf, sendCuratorError } from '@/lib/curator-http';
 import { curatorLabelImport } from '@/lib/curator-service';
 import { requireCaller, requireMethod } from '@/lib/lease-http';
 
@@ -11,7 +11,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const caller = await requireCaller(req, res);
   if (!caller) return;
   if (!caller.admin) return res.status(403).json({ error: 'curator label-import takes the admin token', code: 'forbidden' });
-  const task = taskOf(req, res);
+  const task = labelTaskOf(req, res);
   if (!task) return;
   try {
     return res.status(200).json(await curatorLabelImport(task, (req.body as { labels?: unknown } | null)?.labels));

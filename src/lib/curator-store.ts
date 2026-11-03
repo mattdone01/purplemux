@@ -4,7 +4,8 @@ import os from 'os';
 import path from 'path';
 import { isHeldOut } from '@/lib/curator';
 import { isCuratorTask } from '@/lib/curator-tasks';
-import type { ICuratorEvalResult, ICuratorState, ISpotCheckFile, TCuratorTask } from '@/types/curator';
+import type { IReshapeEvalResult, IReshapeJudgeFile } from '@/lib/curator-reshape-gate';
+import type { ICuratorEvalResult, ICuratorState, ISpotCheckFile, TCuratorLabelTask, TCuratorTask } from '@/types/curator';
 
 // `~/.purplemux/curator/` (ADR-0038): the task states, the labelled sets (ids and labels only, AC 4), the
 // latest evaluation per task and the spot check's number map. No file here holds message text.
@@ -12,13 +13,13 @@ import type { ICuratorEvalResult, ICuratorState, ISpotCheckFile, TCuratorTask } 
 export const curatorDir = (): string => path.join(os.homedir(), '.purplemux', 'curator');
 export const evalDir = (): string => path.join(curatorDir(), 'eval');
 const stateFile = (): string => path.join(curatorDir(), 'state.json');
-export const labelledSetFile = (task: TCuratorTask): string => path.join(evalDir(), `${task}.json`);
+export const labelledSetFile = (task: TCuratorLabelTask): string => path.join(evalDir(), `${task}.json`);
 /** The held-out run's counts at `<task>.json`; a train or whole-set run, with its per-id rows, beside it (review r1 F7). */
-export const resultFile = (task: TCuratorTask, split: ICuratorEvalResult['split'] = 'holdout'): string =>
+export const resultFile = (task: TCuratorLabelTask, split: ICuratorEvalResult['split'] = 'holdout'): string =>
   path.join(evalDir(), 'results', split === 'holdout' ? `${task}.json` : `${task}.${split}.json`);
-const spotCheckFile = (task: TCuratorTask): string => path.join(evalDir(), `spot-check.${task}.json`);
-const shadowFile = (task: TCuratorTask): string => path.join(evalDir(), `${task}.shadow.json`);
-const queueFile = (task: TCuratorTask): string => path.join(evalDir(), `${task}.queue.json`);
+const spotCheckFile = (task: TCuratorLabelTask): string => path.join(evalDir(), `spot-check.${task}.json`);
+const shadowFile = (task: TCuratorLabelTask): string => path.join(evalDir(), `${task}.shadow.json`);
+const queueFile = (task: TCuratorLabelTask): string => path.join(evalDir(), `${task}.queue.json`);
 
 /** Where an owner message occurs in a transcript: offsets into the raw or whitespace-collapsed user text, and a hash. */
 export interface ITwinLocator {
@@ -46,7 +47,7 @@ export const labelledItemOf = ({ id, label, at, alt }: ILabelledItem): ILabelled
 });
 
 export interface ILabelledSet {
-  task: TCuratorTask;
+  task: TCuratorLabelTask;
   labelledBy: string;
   labelledAt: string;
   items: ILabelledItem[];
@@ -119,7 +120,7 @@ export const ensureShadowSince = (task: TCuratorTask, promptVersion: string, at:
     return entry.shadowSince[promptVersion];
   });
 
-export const readLabelledSet = async (task: TCuratorTask): Promise<ILabelledSet | null> => {
+export const readLabelledSet = async (task: TCuratorLabelTask): Promise<ILabelledSet | null> => {
   const raw = await readJson<ILabelledSet>(labelledSetFile(task));
   if (!raw) return null;
   return { ...raw, items: (raw.items ?? []).map(labelledItemOf) };
@@ -131,7 +132,7 @@ export const writeLabelledSet = (set: ILabelledSet): Promise<void> =>
     task: set.task, labelledBy: set.labelledBy, labelledAt: set.labelledAt, items: set.items.map(labelledItemOf),
   });
 
-export const readEvalResult = (task: TCuratorTask, split: ICuratorEvalResult['split'] = 'holdout'): Promise<ICuratorEvalResult | null> =>
+export const readEvalResult = (task: TCuratorLabelTask, split: ICuratorEvalResult['split'] = 'holdout'): Promise<ICuratorEvalResult | null> =>
   readJson<ICuratorEvalResult>(resultFile(task, split));
 
 /**
@@ -144,7 +145,7 @@ export const writeEvalResult = (result: ICuratorEvalResult): Promise<void> => {
   return writeJson(resultFile(result.task, result.split), { ...rest, rows: (rows ?? []).filter((row) => !isHeldOut(row.id)) });
 };
 
-export const readSpotCheckFile = (task: TCuratorTask): Promise<ISpotCheckFile | null> => readJson<ISpotCheckFile>(spotCheckFile(task));
+export const readSpotCheckFile = (task: TCuratorLabelTask): Promise<ISpotCheckFile | null> => readJson<ISpotCheckFile>(spotCheckFile(task));
 
 export const writeSpotCheckFile = (file: ISpotCheckFile): Promise<void> => writeJson(spotCheckFile(file.task), file);
 
@@ -157,10 +158,10 @@ export interface IShadowEvidence {
   at: number;
 }
 
-export const readShadowEvidence = async (task: TCuratorTask): Promise<IShadowEvidence[]> =>
+export const readShadowEvidence = async (task: TCuratorLabelTask): Promise<IShadowEvidence[]> =>
   (await readJson<{ rows?: IShadowEvidence[] }>(shadowFile(task)))?.rows ?? [];
 
-export const appendShadowEvidence = async (task: TCuratorTask, rows: readonly IShadowEvidence[]): Promise<void> => {
+export const appendShadowEvidence = async (task: TCuratorLabelTask, rows: readonly IShadowEvidence[]): Promise<void> => {
   const known = await readShadowEvidence(task);
   const seen = new Set(known.map((r) => `${r.promptVersion}\0${r.id}`));
   const fresh = rows.filter((r) => !seen.has(`${r.promptVersion}\0${r.id}`))
@@ -170,13 +171,52 @@ export const appendShadowEvidence = async (task: TCuratorTask, rows: readonly IS
 
 /** The blind label queue: the shadow calls a label pass may label, with the prediction kept here and never shown. */
 export interface ILabelQueue {
-  task: TCuratorTask;
+  task: TCuratorLabelTask;
   promptVersion: string;
   items: Array<{ id: string; predicted: string | null; outcome: string; at: number }>;
   /** Ids a pass labelled `exclude` (no permission ask): ids only, kept known so they never return. */
   excluded?: string[];
 }
 
-export const readLabelQueue = (task: TCuratorTask): Promise<ILabelQueue | null> => readJson<ILabelQueue>(queueFile(task));
+export const readLabelQueue = (task: TCuratorLabelTask): Promise<ILabelQueue | null> => readJson<ILabelQueue>(queueFile(task));
 
 export const writeLabelQueue = (queue: ILabelQueue): Promise<void> => writeJson(queueFile(queue.task), queue);
+
+/** The reshape set (story 23 AC 4): historical Mission Control item ids, `<ws>/mc/<itemId>`, never their text. */
+export interface IReshapeSet {
+  task: 'reshape-question';
+  builtBy: string;
+  builtAt: string;
+  items: Array<{ id: string; at?: number }>;
+}
+
+const reshapeSetFile = (): string => path.join(evalDir(), 'reshape-question.json');
+const reshapeResultFile = (): string => path.join(evalDir(), 'results', 'reshape-question.json');
+const reshapeJudgeFile = (): string => path.join(evalDir(), 'results', 'reshape-question.judge.json');
+
+export const readReshapeSet = (): Promise<IReshapeSet | null> => readJson<IReshapeSet>(reshapeSetFile());
+export const writeReshapeSet = (set: IReshapeSet): Promise<void> =>
+  writeJson(reshapeSetFile(), { ...set, items: set.items.map(({ id, at }) => ({ id, ...(typeof at === 'number' ? { at } : {}) })) });
+export const readReshapeResult = (): Promise<IReshapeEvalResult | null> => readJson<IReshapeEvalResult>(reshapeResultFile());
+export const writeReshapeResult = (result: IReshapeEvalResult): Promise<void> => writeJson(reshapeResultFile(), result);
+export const readReshapeJudge = (): Promise<IReshapeJudgeFile | null> => readJson<IReshapeJudgeFile>(reshapeJudgeFile());
+export const writeReshapeJudge = (file: IReshapeJudgeFile): Promise<void> => writeJson(reshapeJudgeFile(), file);
+
+/** Candidate lines already sent, by `<ws>/<entryId>` (review r1 F8): the last 500, so a restart never sends one twice. */
+export const CANDIDATES_SENT_MAX = 500;
+const candidatesSentFile = (): string => path.join(curatorDir(), 'candidates-sent.json');
+const gc = globalThis as unknown as { __ptCuratorCandidatesLock?: Promise<unknown> };
+
+export const candidateSent = async (key: string): Promise<boolean> =>
+  ((await readJson<{ keys?: string[] }>(candidatesSentFile()))?.keys ?? []).includes(key);
+
+export const markCandidateSent = (key: string): Promise<void> => {
+  const run = async () => {
+    const keys = (await readJson<{ keys?: string[] }>(candidatesSentFile()))?.keys ?? [];
+    if (keys.includes(key)) return;
+    await writeJson(candidatesSentFile(), { keys: [...keys, key].slice(-CANDIDATES_SENT_MAX) });
+  };
+  const next = (gc.__ptCuratorCandidatesLock ?? Promise.resolve()).then(run, run);
+  gc.__ptCuratorCandidatesLock = next.catch(() => undefined);
+  return next;
+};

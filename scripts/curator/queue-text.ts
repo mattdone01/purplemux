@@ -2,11 +2,11 @@
 // array on stdout for the Opus 5.5 labeller. It writes no file (review r2 F3): there is nothing to delete afterwards.
 //   tsx scripts/curator/queue-text.ts <task>
 import { curatorQueueTexts } from '@/lib/curator-service';
-import { isCuratorTask } from '@/lib/curator-tasks';
+import { isCuratorTask, isLabelTask } from '@/lib/curator-tasks';
 
 const main = async (): Promise<void> => {
   const [task] = process.argv.slice(2);
-  if (!isCuratorTask(task)) throw new Error('usage: queue-text.ts <task>');
+  if (!isCuratorTask(task) || !isLabelTask(task)) throw new Error('usage: queue-text.ts <classifier task>');
   process.stdout.write(`${JSON.stringify(await curatorQueueTexts(task))}\n`);
 };
 

@@ -52,7 +52,7 @@ describe('curator routes', () => {
   it('status: any CLI token reads every task in shadow before anything is promoted', async () => {
     const res = await callRoute(await route('index'), { method: 'GET', headers: { 'x-pmux-token': tabA } });
     expect(res.status).toBe(200);
-    expect((res.body as { tasks: Array<{ state: string }> }).tasks.map((t) => t.state)).toEqual(['shadow', 'shadow', 'shadow']);
+    expect((res.body as { tasks: Array<{ state: string }> }).tasks.map((t) => t.state)).toEqual(['shadow', 'shadow', 'shadow', 'shadow']);
     expect((await callRoute(await route('index'), { method: 'GET', headers: {} })).status).toBe(403);
   });
 
@@ -73,10 +73,16 @@ describe('curator routes', () => {
     ]);
   });
 
-  it('a task outside the three is a 400 that lists them', async () => {
-    const res = await callRoute(await route('eval'), { method: 'GET', headers: { 'x-pmux-token': tabA }, query: { task: 'reshape-question' } });
+  it('a task outside the four is a 400 that lists them', async () => {
+    const res = await callRoute(await route('eval'), { method: 'GET', headers: { 'x-pmux-token': tabA }, query: { task: 'summarise-board' } });
     expect(res).toMatchObject({ status: 400, body: { code: 'curator-task-invalid' } });
-    expect((res.body as { error: string }).error).toContain('classify-owner-message, flag-owner-question, match-standing-order');
+    expect((res.body as { error: string }).error).toContain('classify-owner-message, flag-owner-question, match-standing-order, reshape-question');
+  });
+
+  it('a classifier-only route refuses reshape-question, which has no labelled set (story 23)', async () => {
+    const res = await callRoute(await route('label-queue'), { method: 'POST', headers: { 'x-pmux-token': tabA }, body: { task: 'reshape-question' } });
+    expect(res).toMatchObject({ status: 400, body: { code: 'curator-task-invalid' } });
+    expect((res.body as { error: string }).error).toContain('reshape-question has no labelled set');
   });
 
   it('eval with no labelled set answers 503 with the reason; GET reads no result yet', async () => {
@@ -111,5 +117,42 @@ describe('curator routes', () => {
       .toMatchObject({ status: 409, body: { code: 'curator-refused' } });
     const queue = await callRoute(await route('label-queue'), { method: 'POST', headers: { 'x-pmux-token': tabA }, body: { task: 'flag-owner-question' } });
     expect(queue).toMatchObject({ status: 409, body: { code: 'curator-refused', error: expect.stringMatching(/^served model digest unknown/) } });
+  });
+
+  it('reshape-pairs and judge-import are the admin token\'s alone, and refuse with no reshape evaluation (story 23 AC 4)', async () => {
+    expect(await callRoute(await route('reshape-pairs'), { method: 'GET', headers: { 'x-pmux-token': tabA } })).toMatchObject({ status: 403 });
+    expect(await callRoute(await route('reshape-pairs'), { method: 'GET', headers: { 'x-pmux-token': admin } }))
+      .toMatchObject({ status: 409, body: { code: 'curator-refused', error: expect.stringMatching(/^no reshape evaluation/) } });
+    expect(await callRoute(await route('judge-import'), { method: 'POST', headers: { 'x-pmux-token': tabA }, body: { runId: 'r', verdicts: [] } })).toMatchObject({ status: 403 });
+    expect(await callRoute(await route('judge-import'), { method: 'POST', headers: { 'x-pmux-token': admin }, body: { runId: 'r', verdicts: [] } }))
+      .toMatchObject({ status: 409, body: { code: 'curator-refused', error: expect.stringMatching(/^no reshape evaluation to judge/) } });
+  });
+
+  it('judge-import writes the verdicts bound to the run; pairs need the drafts this server holds', async () => {
+    const { writeReshapeResult, readReshapeJudge } = await import('@/lib/curator-store');
+    await writeReshapeResult({
+      task: 'reshape-question', runId: 'run-1', promptVersion: 'v', model: 'm', startedAt: 1, finishedAt: 2, target: 100, candidates: 1, replied: 1, clean: 1,
+      nonReplies: 0, unresolved: 0, unreshapable: 0, labels: {}, outcomes: {}, latency: { p50: null, p90: null }, refused: null,
+      rows: [{ id: 'ws-a/mc/q', outcome: 'labelled', label: 'reshaped', draftSha: 'abc', defects: [], latencyMs: 1 }],
+    });
+    const res = await callRoute(await route('judge-import'), { method: 'POST', headers: { 'x-pmux-token': admin }, body: { runId: 'run-1', verdicts: [{ id: 'ws-a/mc/q', sha: 'abc', verdict: 'same' }] } });
+    expect(res).toMatchObject({ status: 200, body: { runId: 'run-1', imported: 1, same: 1 } });
+    expect(await readReshapeJudge()).toMatchObject({ runId: 'run-1', promptVersion: 'v', judge: 'claude-opus-5-5 at high', verdicts: [{ id: 'ws-a/mc/q', sha: 'abc', verdict: 'same' }] });
+    expect(await callRoute(await route('reshape-pairs'), { method: 'GET', headers: { 'x-pmux-token': admin } }))
+      .toMatchObject({ status: 409, body: { error: expect.stringContaining('the drafts of run run-1 are not held by this server') } });
+  });
+
+  it('message: a tab reads its own workspace\'s owner message by id, never another workspace\'s', async () => {
+    const { addMessageHistory } = await import('@/lib/message-history-store');
+    const entry = await addMessageHistory('ws-a', 'From now on use AEDT');
+    const msg = await route('message');
+    expect(await callRoute(msg, { method: 'GET', headers: { 'x-pmux-token': tabA }, query: { workspaceId: 'ws-a', entryId: entry.id } }))
+      .toMatchObject({ status: 200, body: { workspaceId: 'ws-a', entryId: entry.id, message: 'From now on use AEDT' } });
+    expect(await callRoute(msg, { method: 'GET', headers: { 'x-pmux-token': tabA }, query: { workspaceId: 'ws-b', entryId: entry.id } })).toMatchObject({ status: 403 });
+    expect(await callRoute(msg, { method: 'GET', headers: { 'x-pmux-token': tabA }, query: { workspaceId: 'ws-a', entryId: 'nope' } })).toMatchObject({ status: 404 });
+    const secret = await addMessageHistory('ws-a', 'use token=ghp_abcdefghijklmnopqrstuvwxyz0123 for the push');
+    const refused = await callRoute(msg, { method: 'GET', headers: { 'x-pmux-token': tabA }, query: { workspaceId: 'ws-a', entryId: secret.id } });
+    expect(refused).toMatchObject({ status: 409, body: { code: 'curator-refused' } });
+    expect(JSON.stringify(refused.body)).not.toContain('ghp_');
   });
 });

@@ -4,7 +4,7 @@ import {
 import type { ICuratorJob } from '@/lib/curator-client';
 import type { ILabelledItem, ILabelledSet } from '@/lib/curator-store';
 import { COVERED, CURATOR_TASKS, NOT_COVERED, type ICuratorStandingOrderRef } from '@/lib/curator-tasks';
-import type { ICuratorEvalResult, ICuratorEvalRow, ICuratorResult, TCuratorTask } from '@/types/curator';
+import type { ICuratorEvalResult, ICuratorEvalRow, ICuratorResult, TCuratorLabelTask } from '@/types/curator';
 
 /** Evaluation calls are logged like live ones, under a workspace key no real workspace can take. */
 export const CURATOR_EVAL_WORKSPACE = '_curator-eval';
@@ -26,11 +26,11 @@ export interface ICuratorEvalDeps {
   onProgress?: (done: number, total: number) => void;
 }
 
-export const scoreLabels = (task: TCuratorTask): readonly string[] =>
+export const scoreLabels = (task: TCuratorLabelTask): readonly string[] =>
   task === 'match-standing-order' ? [COVERED, NOT_COVERED] : CURATOR_TASKS[task].labels;
 
 /** The class a gold label is scored in: an order id is `covered` for match-standing-order. */
-const scoredClass = (task: TCuratorTask, gold: string): string =>
+const scoredClass = (task: TCuratorLabelTask, gold: string): string =>
   (task === 'match-standing-order' ? (gold === NOT_COVERED ? NOT_COVERED : COVERED) : gold);
 
 export const inSplit = (split: TCuratorSplit, id: string): boolean =>
@@ -40,7 +40,7 @@ export const inSplit = (split: TCuratorSplit, id: string): boolean =>
  * Ruling 3.4 of consult 16-promote-gate: more than 10% of the split unresolved inside the source horizon, or more than
  * 10% of any gated class's gold, and the run does not score: its sample would be the readable part, not the set.
  */
-const refusalOf = (task: TCuratorTask, inHorizon: number, unresolved: number, goldByClass: Record<string, number>, unresolvedByClass: Record<string, number>): string | null => {
+const refusalOf = (task: TCuratorLabelTask, inHorizon: number, unresolved: number, goldByClass: Record<string, number>, unresolvedByClass: Record<string, number>): string | null => {
   const share = (a: number, b: number) => (b === 0 ? 0 : a / b);
   const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
   const limit = pct(CURATOR_MAX_UNRESOLVED_SHARE);
@@ -57,7 +57,7 @@ const refusalOf = (task: TCuratorTask, inHorizon: number, unresolved: number, go
  * read first (history, transcript twin, transcript, MC). An unreadable item older than 30 days has aged out and leaves
  * every denominator; above 10% unresolved the run refuses before any model call. The held-out run keeps counts only.
  */
-export const runCuratorEval = async (task: TCuratorTask, set: ILabelledSet, split: TCuratorSplit, deps: ICuratorEvalDeps): Promise<ICuratorEvalResult> => {
+export const runCuratorEval = async (task: TCuratorLabelTask, set: ILabelledSet, split: TCuratorSplit, deps: ICuratorEvalDeps): Promise<ICuratorEvalResult> => {
   const spec = CURATOR_TASKS[task];
   const startedAt = deps.now();
   const excluded = { shadow: 0, disputed: 0 };

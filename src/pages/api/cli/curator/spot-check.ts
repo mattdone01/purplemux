@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { sendCuratorError, taskOf } from '@/lib/curator-http';
+import { labelTaskOf, sendCuratorError } from '@/lib/curator-http';
 import { commitSpotCheck, draftSpotCheck, readSpotCheck } from '@/lib/curator-service';
 import { requireCaller } from '@/lib/lease-http';
 
@@ -15,7 +15,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
   const caller = await requireCaller(req, res);
   if (!caller) return;
-  const task = taskOf(req, res);
+  const task = labelTaskOf(req, res);
   if (!task) return;
   try {
     if (req.method === 'GET') return res.status(200).json(await readSpotCheck(task));

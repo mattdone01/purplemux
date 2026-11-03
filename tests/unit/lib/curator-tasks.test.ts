@@ -7,15 +7,21 @@ const rules = (task: keyof typeof CURATOR_TASKS, text: string, orders?: Array<{ 
   CURATOR_TASKS[task].rules({ text, ...(orders ? { orders } : {}) });
 
 describe('the curator tasks (AC 3)', () => {
-  it('has the three tasks of this story, each with a versioned prompt', () => {
-    expect(CURATOR_TASK_IDS).toEqual(['classify-owner-message', 'flag-owner-question', 'match-standing-order']);
+  it('has the three classifiers of story 16 and the reshape of story 23, each with a versioned prompt', () => {
+    expect(CURATOR_TASK_IDS).toEqual(['classify-owner-message', 'flag-owner-question', 'match-standing-order', 'reshape-question']);
     for (const task of CURATOR_TASK_IDS) {
       const spec = CURATOR_TASKS[task];
       expect(spec.promptVersion).toMatch(/^[a-z]+-v\d+-[0-9a-f]{8}$/);
-      expect(spec.promptVersion.endsWith(`-${promptHash(spec.prompt, spec.labels)}`)).toBe(true);
+      expect(spec.promptVersion.endsWith(`-${promptHash(spec.prompt, spec.labels, undefined, undefined, spec.schema)}`)).toBe(true);
     }
-    expect(isCuratorTask('reshape-question')).toBe(false);
+    expect(isCuratorTask('reshape-question')).toBe(true);
     expect(isCuratorTask('__proto__')).toBe(false);
+  });
+
+  it('story 23 leaves the classifiers\' prompt versions as story 16 hashed them, so their clocks and evidence carry over', () => {
+    expect(CURATOR_TASKS['classify-owner-message'].promptVersion).toBe('com-v1-6eec31d7');
+    expect(CURATOR_TASKS['flag-owner-question'].promptVersion).toBe('foq-v1-6d70d230');
+    expect(CURATOR_TASKS['match-standing-order'].promptVersion).toBe('mso-v1-f36d389b');
   });
 
   it('classify-owner-message offers the five classes and quotes the message', () => {

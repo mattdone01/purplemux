@@ -5,6 +5,7 @@ import {
   type IPromoteVerdict,
 } from '@/lib/curator';
 import { CuratorClient, type ICuratorJob } from '@/lib/curator-client';
+import { isFiledOrderItem } from '@/lib/curator-filed-order';
 import { CURATOR_EVAL_WORKSPACE, runCuratorEval, scoreLabels, type TCuratorSplit } from '@/lib/curator-eval';
 import { KODIT_LOG_HOST, KODIT_LOG_PATH, KODIT_WINDOW_MS, koditDrop, koditNeedsRateLimit, koditRate, parseKoditLog } from '@/lib/curator-kodit';
 import { queueAdditions, queueView, validateImport, type IShadowCall } from '@/lib/curator-labels';
@@ -15,13 +16,15 @@ import {
   readShadowEvidence, readSpotCheckFile, updateCuratorState, writeEvalResult, writeLabelQueue, writeLabelledSet, writeSpotCheckFile,
   type ILabelledItem,
 } from '@/lib/curator-store';
-import { CURATOR_TASKS, CURATOR_TASK_IDS, NOT_COVERED, endingAsksSomething, servedVersion, type ICuratorStandingOrderRef } from '@/lib/curator-tasks';
+import {
+  CURATOR_LABEL_TASK_IDS, CURATOR_TASKS, CURATOR_TASK_IDS, NOT_COVERED, endingAsksSomething, isLabelTask, servedVersion, type ICuratorStandingOrderRef,
+} from '@/lib/curator-tasks';
 import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { createLogger } from '@/lib/logger';
 import { readMessageHistory } from '@/lib/message-history-store';
 import type {
-  ICuratorAgreement, ICuratorBoard, ICuratorCallRecord, ICuratorEvalProgress, ICuratorEvalResult, ICuratorTaskStatus, ISpotCheckFile, TCuratorTask,
-  TSpotCheckVerdict,
+  ICuratorAgreement, ICuratorBoard, ICuratorCallRecord, ICuratorEvalProgress, ICuratorEvalResult, ICuratorTaskStatus, ISpotCheckFile, TCuratorLabelTask,
+  TCuratorTask, TSpotCheckVerdict,
 } from '@/types/curator';
 
 const log = createLogger('curator');
@@ -43,7 +46,7 @@ const g = globalThis as unknown as {
   /** The order set `readOrders` last read: the matcher's version key needs it synchronously (confirm R2). */
   __ptCuratorOrders?: ICuratorStandingOrderRef[];
   __ptCuratorAsksSeen?: Set<string>;
-  __ptCuratorSpotDrafts?: Map<TCuratorTask, { file: ISpotCheckFile; question: ReturnType<typeof buildSpotCheckQuestion> }>;
+  __ptCuratorSpotDrafts?: Map<TCuratorLabelTask, { file: ISpotCheckFile; question: ReturnType<typeof buildSpotCheckQuestion> }>;
   __ptCuratorClient?: CuratorClient;
   __ptCuratorTimers?: NodeJS.Timeout[];
   __ptCuratorEvals?: Map<TCuratorTask, ICuratorEvalProgress>;
@@ -100,7 +103,7 @@ export const getCuratorClient = (): CuratorClient => {
   return g.__ptCuratorClient;
 };
 
-const isEnabled = async (): Promise<boolean> => (await fleetValue(CURATOR_KEYS.enabled))?.trim() !== 'off';
+export const curatorEnabled = async (): Promise<boolean> => (await fleetValue(CURATOR_KEYS.enabled))?.trim() !== 'off';
 
 const readOrders = async (): Promise<ICuratorStandingOrderRef[]> => {
   let orders: ICuratorStandingOrderRef[];
@@ -124,9 +127,9 @@ const liveVersion = (task: TCuratorTask): string | null =>
   servedVersion(task, getCuratorClient().digest(), task === 'match-standing-order' ? g.__ptCuratorOrders ?? null : null);
 
 /** The same, after reading the order file and, when no digest is known yet, probing the model once. */
-const liveVersionNow = async (task: TCuratorTask): Promise<string | null> => {
+export const liveVersionNow = async (task: TCuratorTask): Promise<string | null> => {
   if (task === 'match-standing-order') await readOrders();
-  if (getCuratorClient().digest() === null && (await isEnabled())) await getCuratorClient().probe();
+  if (getCuratorClient().digest() === null && (await curatorEnabled())) await getCuratorClient().probe();
   return liveVersion(task);
 };
 
@@ -154,7 +157,7 @@ export const startCurator = async (): Promise<void> => {
   if (g.__ptCuratorTimers) return;
   const client = getCuratorClient();
   await ensureLiveSince(Date.now()).catch((err: unknown) => log.warn(`curator: state unwritable (${err instanceof Error ? err.message : String(err)})`));
-  const probe = () => { void isEnabled().then((on) => (on ? client.probe() : null)); };
+  const probe = () => { void curatorEnabled().then((on) => (on ? client.probe() : null)); };
   const kodit = () => { void checkKodit(Date.now()).catch((err: unknown) => log.warn(`curator: kodit check failed (${err instanceof Error ? err.message : String(err)})`)); };
   probe();
   kodit();
@@ -168,18 +171,29 @@ export const stopCurator = (): void => {
 };
 
 /** Shadow calls run only in a started server: a test or a script that imports a hook never reaches the GPU. */
-const isLive = (): boolean => g.__ptCuratorTimers !== undefined;
+export const isLive = (): boolean => g.__ptCuratorTimers !== undefined;
 
 const warn = (what: string) => (err: unknown) => log.warn(`curator: ${what} (${err instanceof Error ? err.message : String(err)})`);
 
 const shadow = (job: ICuratorJob): void => {
   if (!isLive()) return;
-  void isEnabled().then((on) => (on ? getCuratorClient().classify(job) : null)).catch(warn(`shadow call ${job.task} failed`));
+  void curatorEnabled().then((on) => (on ? getCuratorClient().classify(job) : null)).catch(warn(`shadow call ${job.task} failed`));
 };
 
-/** An owner message typed in purplemux (ADR-0038 §2): classified in shadow, with its history id for the label pass. */
-export const curatorOnOwnerMessage = (workspaceId: string, entryId: string, text: string): void => {
-  if (text.trim()) shadow({ task: 'classify-owner-message', workspaceId, tabId: OWNER_MESSAGE_TAB, sourceId: `${workspaceId}/${entryId}`, input: { text } });
+/**
+ * An owner message typed in purplemux (ADR-0038 §2; story 23 AC 1-2): classified after it is saved, with its history id
+ * for the label pass, then routed where the label acts. Nothing here is awaited: delivery never waits on the curator.
+ */
+export const curatorOnOwnerMessage = (workspaceId: string, entryId: string, text: string, at: number = Date.now()): void => {
+  if (!text.trim() || !isLive()) return;
+  void curatorEnabled().then(async (on) => {
+    if (!on) return;
+    const result = await getCuratorClient().classify({
+      task: 'classify-owner-message', workspaceId, tabId: OWNER_MESSAGE_TAB, sourceId: `${workspaceId}/${entryId}`, input: { text },
+    });
+    const [{ routeOwnerMessage }, { ownerRoutingDeps }] = await Promise.all([import('@/lib/curator-routing'), import('@/lib/curator-routing-service')]);
+    await routeOwnerMessage(ownerRoutingDeps(), { workspaceId, entryId, text, at }, result);
+  }).catch(warn(`owner message ${workspaceId}/${entryId} not classified`));
 };
 
 /**
@@ -188,7 +202,7 @@ export const curatorOnOwnerMessage = (workspaceId: string, entryId: string, text
  */
 export const curatorOnUnmarkedTurnEnd = (workspaceId: string, tabId: string, tail: string | null | undefined, sourceId: string | null = null): void => {
   if (!isLive() || !tail || !endingAsksSomething(tail)) return;
-  void isEnabled().then(async (on) => {
+  void curatorEnabled().then(async (on) => {
     if (!on) return;
     const flagged = await getCuratorClient().classify({ task: 'flag-owner-question', workspaceId, tabId, sourceId, input: { text: tail } });
     if (flagged.routed !== 'question-to-owner') return;
@@ -220,7 +234,9 @@ export const curatorOnMissionEvents = (events: ReadonlyArray<{ type: string; wor
     if (event.type !== 'attention.opened' && event.type !== 'attention.updated') continue;
     const payload = event.payload as { itemId?: unknown; humanReview?: { humanNeed?: unknown } } | undefined;
     const need = payload?.humanReview?.humanNeed;
-    if (typeof payload?.itemId === 'string' && !isSpotCheckItem(payload.itemId) && (need === 'approval' || need === 'decision')) {
+    // The curator's own items (a spot check, a keep-or-strike of an order it filed) are never matched against the orders.
+    if (typeof payload?.itemId === 'string' && !isSpotCheckItem(payload.itemId) && !isFiledOrderItem(payload.itemId)
+      && (need === 'approval' || need === 'decision')) {
       curatorOnMissionAsk(event.workspaceId, payload.itemId);
     }
   }
@@ -247,6 +263,13 @@ export const curatorRoutesIn = async (task: TCuratorTask, workspaceId: string): 
   return taskStatus(task, state).state === 'routing' && parseRoutingWorkspaces(workspaces).includes(workspaceId);
 };
 
+/** The same, and the served version the routing checks is exactly `version` (a reply's own; review r1 F6). */
+export const curatorRoutesOnVersion = async (task: TCuratorTask, workspaceId: string, version: string): Promise<boolean> => {
+  const [state, workspaces] = await Promise.all([readCuratorState(), fleetValue(CURATOR_KEYS.routingWorkspaces)]);
+  const entry = state.tasks[task];
+  return entry?.state === 'routing' && entry.promotedPromptVersion === version && parseRoutingWorkspaces(workspaces).includes(workspaceId);
+};
+
 const parseRecord = (text: string): Partial<ICuratorCallRecord> | null => {
   try {
     return JSON.parse(text) as Partial<ICuratorCallRecord>;
@@ -262,7 +285,7 @@ const readAgreement = async (workspaceId: string, now: number): Promise<ICurator
   try {
     const { getLedgerStore } = await import('@/lib/ledger-store');
     const rows = getLedgerStore().tabEvents.curatorCalls(workspaceId, now - CURATOR_SHADOW_MS);
-    value = CURATOR_TASK_IDS.map((task) => ({ task, calls: 0, compared: 0, agreed: 0 }));
+    value = CURATOR_LABEL_TASK_IDS.map((task) => ({ task, calls: 0, compared: 0, agreed: 0 }));
     for (const text of rows) {
       const record = parseRecord(text);
       const row = record && value.find((a) => a.task === record.task);
@@ -283,7 +306,7 @@ const readAgreement = async (workspaceId: string, now: number): Promise<ICurator
 /** The board's curator line (AC 8): up or down, each task's state here, and the shadow agreement over 72 h. */
 export const readCuratorBoard = async (workspaceId: string, now: number): Promise<ICuratorBoard> => {
   const [state, workspaces, agreement, enabled] = await Promise.all([
-    readCuratorState(), fleetValue(CURATOR_KEYS.routingWorkspaces), readAgreement(workspaceId, now), isEnabled(),
+    readCuratorState(), fleetValue(CURATOR_KEYS.routingWorkspaces), readAgreement(workspaceId, now), curatorEnabled(),
   ]);
   const routingHere = parseRoutingWorkspaces(workspaces).includes(workspaceId);
   const health = enabled
@@ -301,10 +324,10 @@ export const readCuratorBoard = async (workspaceId: string, now: number): Promis
 
 // ── the owner's spot check (AC 6; consult of 2026-11-03; consult 16-promote-gate ruling 1 for the matcher) ──
 
-const SPOT_TASKS: readonly TCuratorTask[] = ['classify-owner-message', 'match-standing-order'];
+const SPOT_TASKS: readonly TCuratorLabelTask[] = ['classify-owner-message', 'match-standing-order'];
 
 /** The owner's spot-check answer for a task, as promote reads it. */
-export const readSpotCheck = async (task: TCuratorTask = 'classify-owner-message'): Promise<{ itemId: string | null; workspaceId: string | null; verdict: TSpotCheckVerdict }> => {
+export const readSpotCheck = async (task: TCuratorLabelTask = 'classify-owner-message'): Promise<{ itemId: string | null; workspaceId: string | null; verdict: TSpotCheckVerdict }> => {
   const file = await readSpotCheckFile(task);
   if (!file) return { itemId: null, workspaceId: null, verdict: { state: 'unanswered' } };
   const { getMissionControlStore } = await import('@/lib/mission-control-store');
@@ -317,14 +340,13 @@ export const readSpotCheck = async (task: TCuratorTask = 'classify-owner-message
 
 // ── the gate ──
 
-const shadowRowsOf = async (task: TCuratorTask, version: string, set: Awaited<ReturnType<typeof readLabelledSet>>): Promise<ICuratorShadowRow[]> => {
+const shadowRowsOf = async (task: TCuratorLabelTask, version: string, set: Awaited<ReturnType<typeof readLabelledSet>>): Promise<ICuratorShadowRow[]> => {
   const gold = new Map((set?.items ?? []).map((item) => [item.id, item.label]));
   return (await readShadowEvidence(task)).filter((row) => row.promptVersion === version && gold.has(row.id))
     .map((row) => ({ id: row.id, gold: gold.get(row.id)!, predicted: row.predicted }));
 };
 
-/** The promote verdict without writing anything: `curator status` shows it, `curator promote` acts on it. */
-export const curatorGate = async (task: TCuratorTask, now: number): Promise<IPromoteVerdict> => {
+const labelGate = async (task: TCuratorLabelTask, now: number): Promise<IPromoteVerdict> => {
   const version = await liveVersionNow(task);
   const [state, result, set, spot] = await Promise.all([
     readCuratorState(), readEvalResult(task), readLabelledSet(task), SPOT_TASKS.includes(task) ? readSpotCheck(task) : Promise.resolve(null),
@@ -339,6 +361,13 @@ export const curatorGate = async (task: TCuratorTask, now: number): Promise<IPro
     ...(spot ? { spotCheck: spot.verdict, spotCheckApplied } : {}),
   });
   return version === null ? { ...gate, ok: false, refusals: [DIGEST_UNKNOWN, ...gate.refusals] } : gate;
+};
+
+/** The promote verdict without writing anything: `curator status` shows it, `curator promote` acts on it. */
+export const curatorGate = async (task: TCuratorTask, now: number): Promise<IPromoteVerdict> => {
+  if (isLabelTask(task)) return labelGate(task, now);
+  const { reshapeGate } = await import('@/lib/curator-reshape-service');
+  return reshapeGate(now);
 };
 
 /** `curator promote` (AC 5, amended): every condition of `curatorGate`, refused with every reason. */
@@ -364,7 +393,7 @@ export const readCuratorStatus = async () => {
   const state = await readCuratorState();
   const now = Date.now();
   const tasks = await Promise.all(CURATOR_TASK_IDS.map(async (task) => {
-    const [gate, queue] = await Promise.all([curatorGate(task, now), readLabelQueue(task)]);
+    const [gate, queue] = await Promise.all([curatorGate(task, now), isLabelTask(task) ? readLabelQueue(task) : Promise.resolve(null)]);
     return {
       ...taskStatus(task, state),
       gate: { checks: gate.score?.checks ?? null, shadow: gate.shadow, refusals: gate.refusals },
@@ -389,7 +418,7 @@ export const readCuratorStatus = async () => {
  * What an evaluation leaves out: every id with shadow evidence of ANY prompt version (its prediction was seen by a label
  * pass, so it is no longer out-of-sample; review r2 F2), and (owner messages) the gold the owner disputed.
  */
-export const curatorEvalExclusions = async (task: TCuratorTask) => {
+export const curatorEvalExclusions = async (task: TCuratorLabelTask) => {
   const shadow = new Set((await readShadowEvidence(task)).map((row) => row.id));
   const spot = task === 'classify-owner-message' ? await readSpotCheck(task) : null;
   const answered = spot?.verdict.state === 'answered' ? spot.verdict : null;
@@ -401,6 +430,12 @@ export const curatorEvalExclusions = async (task: TCuratorTask) => {
 
 /** Start (or report) one task's evaluation, in the server through the same one-at-a-time queue. */
 export const startCuratorEval = async (task: TCuratorTask, split: TCuratorSplit): Promise<ICuratorEvalProgress> => {
+  if (isLabelTask(task)) return startLabelEval(task, split);
+  const { startReshapeEval } = await import('@/lib/curator-reshape-service');
+  return startReshapeEval();
+};
+
+const startLabelEval = async (task: TCuratorLabelTask, split: TCuratorSplit): Promise<ICuratorEvalProgress> => {
   const running = g.__ptCuratorEvals!.get(task);
   if (running?.running) return running;
   const set = await readLabelledSet(task);
@@ -429,13 +464,13 @@ export const startCuratorEval = async (task: TCuratorTask, split: TCuratorSplit)
   return progress;
 };
 
-export const readCuratorEval = async (task: TCuratorTask, split: TCuratorSplit = 'holdout'): Promise<{ progress: ICuratorEvalProgress | null; result: ICuratorEvalResult | null }> =>
+export const readCuratorEval = async (task: TCuratorLabelTask, split: TCuratorSplit = 'holdout'): Promise<{ progress: ICuratorEvalProgress | null; result: ICuratorEvalResult | null }> =>
   ({ progress: g.__ptCuratorEvals!.get(task) ?? null, result: await readEvalResult(task, split) });
 
 // ── the blind label pass (consult 16-promote-gate, ruling 1) ──
 
 /** `curator label-queue`: the live version's unlabelled shadow calls of the last 30 days join the queue; ids only out. */
-export const curatorLabelQueue = async (task: TCuratorTask, now: number) => {
+export const curatorLabelQueue = async (task: TCuratorLabelTask, now: number) => {
   const version = await liveVersionNow(task);
   if (version === null) throw new CuratorRefusal(DIGEST_UNKNOWN);
   const { getLedgerStore } = await import('@/lib/ledger-store');
@@ -463,7 +498,7 @@ export const curatorLabelQueue = async (task: TCuratorTask, now: number) => {
  * The label pass's input: each queued id with its text, sorted by id, never its prediction. Returned, never written: the
  * caller streams it (review r2 F3), so no raw text is left on disk to delete.
  */
-export const curatorQueueTexts = async (task: TCuratorTask): Promise<Array<{ id: string; text: string }>> => {
+export const curatorQueueTexts = async (task: TCuratorLabelTask): Promise<Array<{ id: string; text: string }>> => {
   const queue = await readLabelQueue(task);
   if (!queue) throw new CuratorRefusal(`no label queue for ${task}: run \`purplemux curator label-queue --task ${task}\``);
   const cache = new Map<string, Map<string, string>>();
@@ -484,7 +519,7 @@ const ownerItem = async (id: string, label: string, transcripts: Map<string, Awa
 };
 
 /** `curator label-import` (admin): the labels join the set, the queued predictions become shadow evidence. */
-export const curatorLabelImport = async (task: TCuratorTask, entries: unknown) => {
+export const curatorLabelImport = async (task: TCuratorLabelTask, entries: unknown) => {
   const [queue, orders] = await Promise.all([readLabelQueue(task), readOrders()]);
   const verdict = validateImport(task, queue, entries, orders.map((o) => o.id));
   if (!verdict.ok) throw new CuratorRefusal(verdict.error);
@@ -516,7 +551,7 @@ export class CuratorRefusal extends Error {}
  * redraw is refused while the task's last item stands (anything but cancelled). For the matcher it opens only when the
  * pool passes every other condition (consult 16-promote-gate, ruling 1).
  */
-export const draftSpotCheck = async (task: TCuratorTask, workspaceId: string, now: number) => {
+export const draftSpotCheck = async (task: TCuratorLabelTask, workspaceId: string, now: number) => {
   if (!SPOT_TASKS.includes(task)) throw new CuratorRefusal(`${task} has no spot check`);
   const prior = await readSpotCheckFile(task);
   if (prior) {
@@ -576,7 +611,7 @@ const questionDiff = (draft: ReturnType<typeof buildSpotCheckQuestion>, question
  * After the caller posted the item: the number map is written only if Mission Control holds that item and it carries the
  * drafted question — the same decision, options and numbered lines (review r1 F1, r2 F6).
  */
-export const commitSpotCheck = async (task: TCuratorTask, workspaceId: string, itemId: string) => {
+export const commitSpotCheck = async (task: TCuratorLabelTask, workspaceId: string, itemId: string) => {
   const pending = g.__ptCuratorSpotDrafts!.get(task);
   if (!pending || pending.file.itemId !== itemId || pending.file.workspaceId !== workspaceId) throw new CuratorRefusal(`no drafted spot check ${itemId} for ${task} in ${workspaceId}`);
   const { getMissionControlStore } = await import('@/lib/mission-control-store');

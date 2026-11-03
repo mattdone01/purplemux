@@ -18,6 +18,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── message-history.json  # per-workspace input history
 │       ├── claude-prompt.md      # --append-system-prompt-file content, with the active standing orders
 │       ├── standing-orders.md    # the workspace's standing orders SO-<n> (ADR-0041; 0600)
+│       ├── spec-queue.md         # product rules the curator filed from owner messages, by message id (ADR-0042; 0600)
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       ├── burndown.json         # latest published epic burndown (Scrum Master)
 │       ├── flow.json             # latest published pipeline flow + server history (ADR-0026)
@@ -61,7 +62,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── curator/                 # the local curator (ADR-0038; 0700): state.json (kodit anchor, per-version shadow clocks, task states),
 │   └── eval/                #   labelled sets {task}.json (ids, labels, times, twin locators; no text), {task}.shadow.json,
 │                            #   {task}.queue.json, match-standing-order.orders.json, spot-check.{task}.json (N -> id),
-│                            #   results/{task}.json (held-out counts) and results/{task}.{train|all}.json (0600)
+│                            #   results/{task}.json (held-out counts) and results/{task}.{train|all}.json,
+│                            #   reshape-question.json (MC item ids), results/reshape-question{,.judge}.json (0600)
 ├── ledger-tokens.json       # SHA-256 of each ledger producer token: scope ledger:emit on one workspace (ADR-0033; 0600)
 ├── ledger-tokens/           # producer token files the CLI writes: {wsId}/{producer}.json (0700 dir, 0600 files)
 ├── ledger-spool/            # events `ledger emit` could not deliver: {producer}.jsonl, {producer}.rejected.jsonl, lock dirs (0700)
@@ -335,6 +337,9 @@ rolled back onto the file still opens it and ignores them:
 - `mission_item_changes` — one row per `attention.updated` (ADR-0037): `item_id` and `revision` (primary key),
   `workspace_id`, `changes_json` (what the revision changed and whether it is compatible), `at`. The answer route reads
   it to accept an answer made on an older compatible revision.
+- `mission_answer_suggestions` — an owner message the curator read as an answer (ADR-0042): `item_id` and `entry_id`
+  (primary key), `workspace_id`, `span` (the curator's quote, null when withheld), `at`. Served on the item as
+  `suggestedAnswers`; never an answer, and the item's revision does not move.
 - the `portfolio_*` tables, added by `portfolio-store.ts`, which opens the same file (selection, impacts, events, watch
   uses, watch history unknown, actions, wakes, escalations, milestones).
 
@@ -379,8 +384,13 @@ promptVersion, predicted, outcome, at }] }`, the predictions of labelled shadow 
 label queue (ids and predictions, plus `excluded`: ids a pass marked no permission ask; the CLI shows ids only). `eval/results/<task>.json` is the latest held-out
 evaluation (per-class counts, no per-id prediction); `results/<task>.train.json` and `.all.json` keep the rows of training ids only.
 `eval/spot-check.<task>.json` maps the owner's spot-check numbers to ids, written only after the item exists. Every
-curator call is also a `tab_events` row (class `log`, kind `curator`) in `ledger.sqlite`. Regeneratable except the
-labelled sets and the shadow evidence, which are labelling passes' output.
+curator call is also a `tab_events` row (class `log`, kind `curator`) in `ledger.sqlite`; each routing decision once a
+task routes is one more (kind `curator-route`, ids and actions only, ADR-0042). `eval/reshape-question.json` holds `{
+task, builtBy, builtAt, items: [{ id: <wsId>/mc/<itemId>, at }] }` (`scripts/curator/reshape-set.ts`, read-only on
+`mission-control.sqlite`); `results/reshape-question.json` the last reshape evaluation (ids, labels, defect field
+names, each draft's sha256, never its text) and `results/reshape-question.judge.json` the judge's verdicts bound to that
+run, written only by `curator judge-import`. Regeneratable except the labelled sets and the shadow evidence, which are
+labelling passes' output.
 
 ### `audit/coordination.jsonl` — `src/lib/coordination-audit.ts`
 
@@ -455,6 +465,13 @@ Per-workspace input history for Claude tabs. Capped at 500 entries. Locks are ke
 ### `claude-prompt.md` — `src/lib/claude-prompt.ts`
 
 The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change, before every Claude launch (tab create, restart, resume), and when a standing order changes. Contains workspace ID + CLI quick-reference + the active standing orders (ADR-0041).
+
+### `workspaces/{wsId}/spec-queue.md` — `src/lib/spec-queue.ts`
+
+Product rules the owner stated in chat, filed by the curator once `classify-owner-message` routes in that workspace
+(ADR-0042; ADR-HFL-05 decision 7). A header, then one block per message: `## <historyEntryId>`, `- at: <UTC>`,
+`- source: owner message <ws>/<id>`, and the message as a blockquote. Appends go through one host lock; a repeated id is
+left as it is. Read by hand and by the next slice contract (ADR-HFL-07). Not regeneratable.
 
 ### `standing-orders.md` — `src/lib/standing-orders-store.ts`
 

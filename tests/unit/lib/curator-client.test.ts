@@ -273,3 +273,45 @@ describe('curator down (AC 8)', () => {
   });
 ;
 });
+
+describe('the reshape through the client (story 23 AC 3)', () => {
+  const v1 = {
+    kind: 'question', title: 'Which window?', context: 'Friday is quiet; tonight has a rollback.', storyIds: [], recommendation: null,
+    options: [{ id: 'a', label: 'Friday quiet window' }, { id: 'b', label: 'Tonight' }], blockingScope: 'story', canContinue: true,
+  };
+  const reshapeJob = async (over: Partial<ICuratorJob> = {}): Promise<ICuratorJob> => {
+    const { liftDraft } = await import('@/lib/curator-reshape');
+    return { task: 'reshape-question', workspaceId: 'ws-a', tabId: 'tab-1', input: { text: JSON.stringify(v1), draft: liftDraft(v1)!, source: v1 }, ...over };
+  };
+  const reply = {
+    title: 'Deploy window', decision: 'Pick the deploy window', whyNow: 'The change is ready.',
+    options: { a: { label: 'Friday', consequence: 'Ships Friday.' }, b: { label: 'Tonight', consequence: 'Ships tonight.' } },
+  };
+
+  it('sends the task\'s own schema (one keyed entry per option id), returns the verdict, records the label and the draft sha256, never its text', async () => {
+    const f = fake(() => json({ message: { content: JSON.stringify(reply) }, prompt_eval_count: 300 }));
+    const result = await f.client.classify(await reshapeJob());
+    expect((f.bodies[0].format as { properties: { options: { required: string[] } } }).properties.options.required).toEqual(['a', 'b']);
+    expect(result.record).toMatchObject({ task: 'reshape-question', outcome: 'labelled', label: 'reshaped', span: null, source: 'curator', rulesLabel: 'not-reshaped' });
+    expect(result.record.draftSha).toMatch(/^[0-9a-f]{64}$/);
+    expect((result.payload as { candidate: { decision: string } }).candidate.decision).toBe('Pick the deploy window');
+    expect(JSON.stringify(f.records[0].record)).not.toContain('Ships Friday');
+    expect(JSON.stringify(f.records[0].record)).not.toContain('Friday quiet window');
+  });
+
+  it('a draft over 6,000 tokens is refused whole before any model call, never cut', async () => {
+    const f = fake(() => json({ message: { content: JSON.stringify(reply) } }));
+    const result = await f.client.classify(await reshapeJob({ input: { text: 'x'.repeat(20_000) } }));
+    expect(result.record).toMatchObject({ outcome: 'error', cutTokens: 0 });
+    expect(result.record.error).toMatch(/is over 6000 and is not cut$/);
+    expect(f.bodies).toHaveLength(0);
+    expect(result).not.toHaveProperty('payload');
+  });
+
+  it('a call with its own queue limit drops after it, and the record names that limit', async () => {
+    const f = fake(() => refused(), { ownTags: true });
+    const result = await f.client.classify(await reshapeJob({ maxWaitMs: 60_000 }));
+    expect(result.record).toMatchObject({ outcome: 'dropped', error: 'queued over 1 min' });
+    expect(result.record.waitedMs).toBeLessThan(CURATOR_QUEUE_MAX_WAIT_MS);
+  });
+});

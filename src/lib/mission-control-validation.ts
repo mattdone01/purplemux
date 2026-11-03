@@ -97,7 +97,17 @@ const parse = <T>(schema: z.ZodType<T>, input: unknown): T => {
 // predictable, so a producer must not take the event ID first.
 // `system:needs-decision:` is the server's NEEDS-DECISION opener (ADR-0041): only it may take one.
 export const NEEDS_DECISION_EVENT_PREFIX = 'system:needs-decision:';
-const RESERVED_EVENT_ID_PREFIXES = ['system:migration:', 'system:rebind:', 'answer:auto:', NEEDS_DECISION_EVENT_PREFIX];
+/** The server's keep-or-strike item for an order the curator filed (story 23): only it may take one. */
+export const CURATOR_ORDER_EVENT_PREFIX = 'system:curator-so:';
+const RESERVED_EVENT_ID_PREFIXES = ['system:migration:', 'system:rebind:', 'answer:auto:', NEEDS_DECISION_EVENT_PREFIX, CURATOR_ORDER_EVENT_PREFIX];
+/**
+ * Item ids only a server producer opens or revises, by the producer's event prefix: a `strike` answer on a
+ * `curator-so-<n>` item strikes an order, so no tab or token may open one (story 23 review r1 F1).
+ */
+export const CURATOR_ORDER_ITEM_PREFIX = 'curator-so-';
+const RESERVED_ITEM_ID_PREFIXES: ReadonlyArray<{ itemPrefix: string; serverPrefix: string }> = [
+  { itemPrefix: CURATOR_ORDER_ITEM_PREFIX, serverPrefix: CURATOR_ORDER_EVENT_PREFIX },
+];
 const RESERVED_SUBMISSION_ID_PREFIX = 'auto:';
 
 export interface IMissionEventBatch {
@@ -145,6 +155,13 @@ export const parseMissionEventBatch = (
   const reserved = RESERVED_EVENT_ID_PREFIXES.filter((prefix) => prefix !== options.serverPrefix);
   if (events.some((event) => reserved.some((prefix) => event.eventId.startsWith(prefix)))) {
     throw new MissionControlError(400, 'invalid-request', 'event ID uses a reserved namespace');
+  }
+  for (const event of events) {
+    if (event.type !== 'attention.opened' && event.type !== 'attention.updated') continue;
+    const owner = RESERVED_ITEM_ID_PREFIXES.find((r) => event.payload.itemId.startsWith(r.itemPrefix));
+    if (owner && owner.serverPrefix !== options.serverPrefix) {
+      throw new MissionControlError(400, 'invalid-request', `item ID ${event.payload.itemId} uses a namespace only the server opens or revises`);
+    }
   }
   const eventIds = events.map((event) => event.eventId);
   if (new Set(eventIds).size !== eventIds.length) {

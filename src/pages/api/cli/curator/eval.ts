@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { sendCuratorError, taskOf } from '@/lib/curator-http';
 import { readCuratorEval, startCuratorEval } from '@/lib/curator-service';
+import { isLabelTask } from '@/lib/curator-tasks';
 import type { TCuratorSplit } from '@/lib/curator-eval';
 import { requireCaller } from '@/lib/lease-http';
 
@@ -19,7 +20,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   const split = splitOf(req.method === 'GET' ? req.query.split : (req.body as { split?: unknown } | null)?.split);
   if (!split) return res.status(400).json({ error: `split must be one of ${SPLITS.join(', ')}`, code: 'curator-task-invalid' });
   try {
-    if (req.method === 'GET') return res.status(200).json(await readCuratorEval(task, split));
+    if (req.method === 'GET') {
+      if (isLabelTask(task)) return res.status(200).json(await readCuratorEval(task, split));
+      const { readReshapeEval } = await import('@/lib/curator-reshape-service');
+      return res.status(200).json(await readReshapeEval());
+    }
     return res.status(202).json({ progress: await startCuratorEval(task, split) });
   } catch (err) {
     return sendCuratorError(res, err);

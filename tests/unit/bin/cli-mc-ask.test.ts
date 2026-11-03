@@ -6,8 +6,8 @@ import path from 'path';
 import { promisify } from 'util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// ADR-0037 §3: `mc ask` checks the question before it posts; defects exit 2 with nothing posted,
-// and --fix prints them too while the curator reshape (story 23) is not enabled.
+// ADR-0037 §3: `mc ask` checks the question before it posts; defects exit 2 with nothing posted. --fix (story 23) asks
+// the curator: a reshape that routes is checked again and posted with the original kept; anything else exits 2.
 
 const ENTRY = path.resolve('bin/purplemux.js');
 const run = promisify(execFile);
@@ -23,9 +23,12 @@ describe('purplemux mc ask (ADR-0037)', { timeout: 30_000 }, () => {
   let home = '';
   let requests: IRequest[] = [];
   let checkAnswer: Record<string, unknown> = {};
+  let checkAfterFix: Record<string, unknown> | null = null;
+  let reshapeAnswer: Record<string, unknown> = {};
 
   beforeEach(async () => {
     requests = [];
+    checkAfterFix = null;
     home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-mc-ask-'));
     server = http.createServer((req, res) => {
       let raw = '';
@@ -33,9 +36,12 @@ describe('purplemux mc ask (ADR-0037)', { timeout: 30_000 }, () => {
       req.on('end', () => {
         requests.push({ url: req.url ?? '', body: raw ? JSON.parse(raw) : null });
         res.writeHead(200, { 'content-type': 'application/json' });
+        const checks = requests.filter((r) => r.url.startsWith('/api/cli/mission-control/questions/check')).length;
         res.end(JSON.stringify(req.url?.startsWith('/api/cli/mission-control/questions/check')
-          ? checkAnswer
-          : { events: [{ id: 'e-1' }], cursor: 1, replayed: false, lint: [] }));
+          ? (checks > 1 && checkAfterFix ? checkAfterFix : checkAnswer)
+          : req.url?.startsWith('/api/cli/mission-control/questions/reshape')
+            ? reshapeAnswer
+            : { events: [{ id: 'e-1' }], cursor: 1, replayed: false, lint: [] }));
       });
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -97,13 +103,50 @@ describe('purplemux mc ask (ADR-0037)', { timeout: 30_000 }, () => {
     expect(requests).toHaveLength(1);
   });
 
-  it('--fix prints the defects and the reshape reason, then exits 2, while the reshape is not enabled', async () => {
+  it('--fix where the reshape is in shadow: the defects and the reason print, nothing is posted, exit 2', async () => {
     checkAnswer = refused;
+    reshapeAnswer = { outcome: 'shadow', reason: 'the curator reshape is in shadow here: it was logged, not returned; fix the defects in the draft' };
     const result = await cli(['mission', 'ask', '-w', 'ws-a', '--fix', '--json', `@${await draftFile(event)}`]);
     expect(result.code).toBe(2);
     expect(result.stderr).toContain('options: 1 option on answerType single, needs 2-4');
-    expect(result.stderr).toContain('--fix: the curator reshape is not enabled on this server (harness-flow-loop story 23)');
-    expect(requests).toHaveLength(1);
+    expect(result.stderr).toContain('--fix: the curator reshape is in shadow here');
+    expect(requests.map((r) => r.url)).toEqual([
+      '/api/cli/mission-control/questions/check?workspaceId=ws-a',
+      '/api/cli/mission-control/questions/reshape?workspaceId=ws-a',
+    ]);
+    const { itemId: _itemId, humanReview: _review, ...question } = event.payload;
+    expect(requests[1].body).toEqual({ question });
+  });
+
+  it('--fix where the reshape routes: the reshaped draft is checked again and posted in the same command, the original in source', async () => {
+    checkAnswer = refused;
+    const { itemId: _itemId, humanReview: _review, ...question } = event.payload;
+    const reshaped = { ...question, options: [{ id: 'a', label: 'A', consequence: 'c', recommended: false, needsText: false }], source: question };
+    reshapeAnswer = { outcome: 'reshaped', promptVersion: 'rsq-v1-0000~1111', question: reshaped };
+    checkAfterFix = { ok: true, formatVersion: 2, minVersion: 1, defects: [], lint: [], question: reshaped, reshape: refused.reshape };
+    const result = await cli(['mc', 'ask', '-w', 'ws-a', '--fix', '--json', `@${await draftFile(event)}`]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('--fix: the curator reshaped the draft (prompt rsq-v1-0000~1111); the original is kept in question_json.source');
+    expect(requests.map((r) => r.url)).toEqual([
+      '/api/cli/mission-control/questions/check?workspaceId=ws-a',
+      '/api/cli/mission-control/questions/reshape?workspaceId=ws-a',
+      '/api/cli/mission-control/questions/check?workspaceId=ws-a',
+      '/api/cli/mission-control/events?workspaceId=ws-a',
+    ]);
+    expect(requests[2].body).toEqual({ question: reshaped });
+    expect(requests[3].body).toEqual({ events: [{ ...event, payload: { itemId: 'q-1', humanReview: event.payload.humanReview, ...reshaped } }] });
+  });
+
+  it('--fix whose reshape the preservation check refused prints what moved and posts nothing', async () => {
+    checkAnswer = refused;
+    reshapeAnswer = { outcome: 'refused', label: 'not-preserved', promptVersion: 'v', defects: [
+      { field: 'options.ids', measured: 'became ["b"]', limit: 'unchanged: was ["a"]', message: 'options.ids: became ["b"], unchanged: was ["a"]' },
+    ] };
+    const result = await cli(['mc', 'ask', '-w', 'ws-a', '--fix', '--json', `@${await draftFile(event)}`]);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("--fix: the curator's reshape was refused (it moved a fixed field)");
+    expect(result.stderr).toContain('options.ids: became ["b"], unchanged: was ["a"]');
+    expect(requests).toHaveLength(2);
   });
 
   it('prints the lint of an accepted v1 question and posts it', async () => {

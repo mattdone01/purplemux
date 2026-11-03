@@ -1,7 +1,7 @@
 'use strict';
 // Wave-8 acceptance checks: Mission Control question format v2 (ADR-0037) through the candidate's
 // production build. `mc ask` refuses an unreadable question with every defect and exits 2 before it
-// posts, `--fix` says the curator reshape is not enabled, a readable question passes the check and
+// posts, `--fix` says a one-option draft needs a structural fix no reshape makes (story 23), a readable question passes the check and
 // reaches the events route, and the events route itself answers 400 question-invalid.
 //
 // `wave8(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
@@ -9,7 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const RESHAPE_REASON = 'the curator reshape is not enabled on this server (harness-flow-loop story 23)';
+const RESHAPE_REASON = 'not reshaped: a reshape changes wording only, and these need a structural fix';
 const ONE_OPTION_DEFECT = 'options: 1 option on answerType single, needs 2-4';
 
 /** One attention.opened event for `mc ask`; `options` decides whether the question is readable. */
@@ -56,7 +56,7 @@ const checks = async (inst, results) => {
     `rc ${refused.rc}; stderr ${String(refused.err).slice(0, 300)}`, `rc 2; stderr names "${ONE_OPTION_DEFECT}"`);
 
   const fix = await inst.cli(['mc', 'ask', '-w', wsA, '--fix', '--json', `@${write('unreadable-fix.json', askDraft(wsA, runId, UNREADABLE))}`]);
-  check('mc-ask-fix-unavailable', 'mc ask --fix prints the defects and the reshape reason and exits 2 while story 23 is not built',
+  check('mc-ask-fix-unavailable', 'mc ask --fix prints the defects and why no reshape can fix them, and exits 2 with nothing posted',
     fix.rc === 2 && String(fix.err).includes(ONE_OPTION_DEFECT) && String(fix.err).includes(RESHAPE_REASON),
     `rc ${fix.rc}; stderr ${String(fix.err).slice(0, 300)}`, `rc 2; stderr names the defect and "${RESHAPE_REASON}"`);
 

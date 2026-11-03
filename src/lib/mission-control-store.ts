@@ -9,6 +9,7 @@ import type {
   IMissionAnswerRequest,
   IMissionAnswerResponse,
   IMissionAttentionClassInput,
+  IMissionAnswerSuggestion,
   IMissionAttentionItem,
   IMissionAutoAnswer,
   IMissionAutoAnsweredItem,
@@ -341,10 +342,20 @@ interface IChangesRow {
   at: number;
 }
 
+interface ISuggestionRow {
+  item_id: string;
+  entry_id: string;
+  span: string | null;
+  at: number;
+}
+
+const suggestionFromRow = (row: ISuggestionRow): IMissionAnswerSuggestion => ({ entryId: row.entry_id, span: row.span, at: row.at });
+
 const itemFromRow = (
   row: IItemRow,
   autoAnswer: IMissionAutoAnswer | null = null,
   changes: IMissionQuestionChanges | null = null,
+  suggestions: IMissionAnswerSuggestion[] = [],
 ): IMissionAttentionItem => {
   const { evidence: evidenceLinks, ...question } = JSON.parse(row.question_json) as TMissionStoredQuestion;
   return {
@@ -362,6 +373,7 @@ const itemFromRow = (
     resolution: row.resolution,
     humanReview: parseJson<TMissionHumanReview>(row.human_review_json),
     candidateReason: row.candidate_reason,
+    ...(suggestions.length ? { suggestedAnswers: suggestions } : {}),
     class: question.class ?? null,
     defaultOptionId: question.defaultOptionId ?? null,
     autoAnswer,
@@ -452,6 +464,7 @@ export class MissionControlStore {
     this.ensureOpenerTable();
     this.ensureAutoAnswerTable();
     this.ensureChangesTable();
+    this.ensureSuggestionTable();
   }
 
   /**
@@ -494,6 +507,19 @@ export class MissionControlStore {
       );
       CREATE INDEX IF NOT EXISTS mission_auto_answers_at_idx ON mission_auto_answers(at DESC);
       CREATE INDEX IF NOT EXISTS mission_auto_answers_item_idx ON mission_auto_answers(item_id);
+    `);
+  };
+
+  /**
+   * An owner message the curator read as an answer (story 23 AC 2): a suggested link on the item it may answer, never
+   * an answer. An unversioned side table like the others; the item's revision does not move.
+   */
+  private ensureSuggestionTable = (): void => {
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS mission_answer_suggestions (
+        item_id TEXT NOT NULL, workspace_id TEXT NOT NULL, entry_id TEXT NOT NULL, span TEXT, at INTEGER NOT NULL,
+        PRIMARY KEY (item_id, entry_id)
+      );
     `);
   };
 
@@ -631,7 +657,12 @@ export class MissionControlStore {
     return row ? JSON.parse(row.changes_json) as IMissionQuestionChanges : null;
   };
 
-  private item = (row: IItemRow): IMissionAttentionItem => itemFromRow(row, this.autoAnswerOf(row.id), this.changesOf(row.id));
+  private suggestionsOf = (itemId: string): IMissionAnswerSuggestion[] =>
+    (this.database.prepare('SELECT * FROM mission_answer_suggestions WHERE item_id = ? ORDER BY at, entry_id').all(itemId) as ISuggestionRow[])
+      .map(suggestionFromRow);
+
+  private item = (row: IItemRow): IMissionAttentionItem =>
+    itemFromRow(row, this.autoAnswerOf(row.id), this.changesOf(row.id), this.suggestionsOf(row.id));
 
   private insertEvent = (
     event: TMissionProducerEvent,
@@ -671,8 +702,12 @@ export class MissionControlStore {
         .all(...args) as IAutoAnswerRow[]).map((row) => [row.item_id, autoAnswerFromRow(row)]));
       const changesByItem = new Map((this.database.prepare(`SELECT * FROM mission_item_changes${where} ORDER BY item_id, revision`)
         .all(...args) as IChangesRow[]).map((row) => [row.item_id, JSON.parse(row.changes_json) as IMissionQuestionChanges]));
+      const suggestionsByItem = new Map<string, IMissionAnswerSuggestion[]>();
+      for (const row of this.database.prepare(`SELECT * FROM mission_answer_suggestions${where} ORDER BY at, entry_id`).all(...args) as ISuggestionRow[]) {
+        suggestionsByItem.set(row.item_id, [...(suggestionsByItem.get(row.item_id) ?? []), suggestionFromRow(row)]);
+      }
       const items = (this.database.prepare(`SELECT * FROM attention_items${where} ORDER BY updated_at DESC`).all(...args) as IItemRow[])
-        .map((row) => itemFromRow(row, autoAnswerByItem.get(row.id) ?? null, changesByItem.get(row.id) ?? null));
+        .map((row) => itemFromRow(row, autoAnswerByItem.get(row.id) ?? null, changesByItem.get(row.id) ?? null, suggestionsByItem.get(row.id) ?? []));
       const answersByClass = this.answersByClass(generatedAt, workspaceId);
       const autoAnswered = this.autoAnswered(generatedAt, workspaceId);
       const answers = (this.database.prepare(`SELECT * FROM answers${where} ORDER BY created_at DESC`).all(...args) as IAnswerRow[]).map(answerFromRow);
@@ -875,6 +910,26 @@ export class MissionControlStore {
     const row = this.database.prepare('SELECT state, question_json FROM attention_items WHERE workspace_id = ? AND id = ?')
       .get(workspaceId, itemId) as { state: string; question_json: string } | undefined;
     return row ? { state: row.state, questionJson: row.question_json } : null;
+  };
+
+  /**
+   * The open item an owner message most likely answers (story 23 AC 2): the latest one awaiting the owner, opened or
+   * revised at or before the message. Null when none awaits the owner.
+   */
+  latestOwnerItemBefore = (workspaceId: string, at: number): string | null => {
+    const rows = this.database.prepare(`SELECT id, human_review_json FROM attention_items WHERE workspace_id = ? AND state = 'open'
+      AND updated_at <= ? ORDER BY updated_at DESC, id DESC LIMIT 50`).all(workspaceId, at) as Array<{ id: string; human_review_json: string | null }>;
+    const awaiting = rows.find((row) => {
+      const review = parseJson<TMissionHumanReview>(row.human_review_json);
+      return review !== null && review.humanNeed !== 'none';
+    });
+    return awaiting?.id ?? null;
+  };
+
+  /** Record a suggested answer link; a repeat of the same message on the same item is a no-op. */
+  suggestAnswer = (workspaceId: string, itemId: string, entryId: string, span: string | null, at: number): void => {
+    this.database.prepare('INSERT OR IGNORE INTO mission_answer_suggestions (item_id,workspace_id,entry_id,span,at) VALUES (?,?,?,?,?)')
+      .run(itemId, workspaceId, entryId, span, at);
   };
 
   /** The latest answer to one item, or null: the curator's spot check reads the owner's (ADR-0038 §5). */

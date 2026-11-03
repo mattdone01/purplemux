@@ -113,7 +113,17 @@ const checkCuratorValue = (key: string, value: string): void => {
     if (text !== 'on' && text !== 'off') throw new FleetConfigError('config-invalid', `${key} must be on or off, got ${JSON.stringify(value)}`);
     return;
   }
-  throw new FleetConfigError('config-invalid', `${key} is not a curator key: curator.routing.workspaces, curator.min-interval-ms or curator.enabled`);
+  if (key === 'curator.standing-order.candidates') {
+    if (text === 'none') return;
+    const bad = text.split(',').map((pair) => pair.trim()).filter((pair) => pair && !/^ws-[A-Za-z0-9_-]+=\S(?:.*\S)?$/.test(pair));
+    if (bad.length) {
+      throw new FleetConfigError('config-invalid', `${key} takes ws-...=<tab name> pairs, comma-separated, or none: ${bad.join(', ')}. `
+        + 'A value replaces the default ws-ldhziO=v2-scrum-master: keep that pair in it, or treasury-v2 files SO-n');
+    }
+    return;
+  }
+  throw new FleetConfigError('config-invalid',
+    `${key} is not a curator key: curator.routing.workspaces, curator.min-interval-ms, curator.enabled or curator.standing-order.candidates`);
 };
 
 /** The alarm keys (ADR-HFL-03 decision 1): a route table parses whole; a threshold names a producer reason and holds minutes or `off`. */
