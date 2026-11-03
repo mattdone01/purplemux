@@ -555,6 +555,47 @@ describe('experiments (ADR-HFL-03)', () => {
     expect(store.experiments(WS).map((experiment) => experiment.id)).toEqual(['EXP-1', 'EXP-2', 'EXP-3']);
     expect(store.experiments('ws-b')).toEqual([]);
   });
+
+  it('extends an active experiment once, keeps max_days at most 90, and records a state event (story 22)', () => {
+    store.openExperiment(WS, input({ min_days: 3, max_days: 7 }), T0);
+    expect(store.experiments(WS)[0]).toMatchObject({ extendedAt: null, extensionDays: null, extensionEvidence: null });
+    const extended = store.extendExperiment(WS, 'EXP-1', 3, 're-gates still noisy', T0 + 7 * DAY_MS);
+    expect(extended).toMatchObject({ maxDays: 10, extendedAt: T0 + 7 * DAY_MS, extensionDays: 3, extensionEvidence: 're-gates still noisy' });
+    expect(store.items(WS, { type: 'experiment' }, T0 + 7 * DAY_MS).items[0]).toMatchObject({ state: 'extended', closedAt: null });
+    let again: unknown;
+    try { store.extendExperiment(WS, 'EXP-1', 1, 'more', T0 + 8 * DAY_MS); } catch (error) { again = error; }
+    expect(again).toMatchObject({ code: 'ledger-experiment-extended', message: expect.stringContaining('extended once already, by 3 days') });
+    expect(store.experiments(WS)[0].maxDays).toBe(10);
+
+    store.openExperiment(WS, input({ stage: 'deploy', min_days: 30, max_days: 85 }), T0);
+    let capped: unknown;
+    try { store.extendExperiment(WS, 'EXP-2', 6, 'long', T0); } catch (error) { capped = error; }
+    expect(capped).toMatchObject({ code: 'ledger-experiment-cap', field: 'days', message: 'max_days 85 + 6 = 91, at most 90' });
+    expect(store.extendExperiment(WS, 'EXP-2', 5, 'to the cap', T0).maxDays).toBe(90);
+
+    store.closeExperiment(WS, 'EXP-1', 'keep', 'met', T0 + 9 * DAY_MS);
+    expect(() => store.extendExperiment(WS, 'EXP-1', 1, 'x', T0)).toThrow(/already has the verdict keep/);
+    expect(() => store.extendExperiment(WS, 'EXP-9', 1, 'x', T0)).toThrow(/no experiment EXP-9/);
+  });
+
+  it('adds the extension columns to a ledger written before them', () => {
+    const file = path.join(dir, 'pre-22.sqlite');
+    const first = new LedgerStore(file);
+    first.openExperiment(WS, input(), T0);
+    first.close();
+    const raw = new Database(file);
+    for (const column of ['extended_at', 'extension_days', 'extension_evidence']) raw.exec(`ALTER TABLE experiments DROP COLUMN ${column}`);
+    expect((raw.prepare('SELECT name FROM pragma_table_info(?)').all('experiments') as Array<{ name: string }>).map((row) => row.name))
+      .not.toContain('extended_at');
+    raw.close();
+    const reopened = new LedgerStore(file);
+    try {
+      expect(reopened.experiments(WS)[0]).toMatchObject({ id: 'EXP-1', extendedAt: null, extensionDays: null });
+      expect(reopened.extendExperiment(WS, 'EXP-1', 2, 'noisy', T0 + DAY_MS).maxDays).toBe(9);
+    } finally {
+      reopened.close();
+    }
+  });
 });
 
 describe('retention and rollups (AC 8)', () => {

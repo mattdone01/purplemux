@@ -10,6 +10,7 @@ const STORE_STATUS: Readonly<Record<TLedgerStoreErrorCode, number>> = {
   'ledger-event-conflict': 409,
   'ledger-experiment-cap': 409,
   'ledger-experiment-closed': 409,
+  'ledger-experiment-extended': 409,
   'ledger-experiment-not-found': 404,
 };
 

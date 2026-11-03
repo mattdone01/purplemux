@@ -137,6 +137,11 @@ export interface ILedgerExperiment {
   verdict: TLedgerExperimentVerdict | null;
   verdictAt: number | null;
   evidence: string | null;
+  /** When the one extension was recorded (ADR-HFL-03 "extend once"); null when never extended. */
+  extendedAt: number | null;
+  /** The days the extension added to `maxDays` (already included in it). */
+  extensionDays: number | null;
+  extensionEvidence: string | null;
 }
 
 export interface ILedgerExperimentsResponse {

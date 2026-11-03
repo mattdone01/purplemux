@@ -72,6 +72,7 @@ describe('ledger routes', () => {
     routes.waits = (await import(`${base}/waits`)).default as THandler;
     routes.experiments = (await import(`${base}/experiments/index`)).default as THandler;
     routes.experiment = (await import(`${base}/experiments/[id]`)).default as THandler;
+    routes.extend = (await import(`${base}/experiments/[id]/extend`)).default as THandler;
     routes.tokens = (await import(`${base}/tokens`)).default as THandler;
     const issued = await call('tokens', 'POST', 'ws-a', tabA, { body: { producer: 'v2' } });
     expect(issued.status).toBe(200);
@@ -294,6 +295,23 @@ describe('ledger routes', () => {
         .toMatchObject({ code: 'ledger-experiment-closed' });
       expect((await call('experiment', 'POST', 'ws-a', tabA, { query: { id: 'EXP-7' }, body: { verdict: 'keep', evidence: 'x' } })).status).toBe(404);
       expect((await call('experiment', 'POST', 'ws-a', tabB, { query: { id: 'EXP-1' }, body: { verdict: 'keep', evidence: 'x' } })).status).toBe(403);
+    });
+
+    it('extends an active experiment once, within 90 days, and refuses the rest (story 22)', async () => {
+      await call('experiments', 'POST', 'ws-a', tabA, { body: { hypothesis: 'h', stage: 'land', metric: 'm', min_days: 3, max_days: 80 } });
+      const ext = (body: unknown, token = tabA, id = 'EXP-1') => call('extend', 'POST', 'ws-a', token, { query: { id }, body });
+      expect((await ext({ days: 3, evidence: 'x', why: 'y' })).body).toMatchObject({ code: 'ledger-experiment-invalid', field: 'body.why' });
+      expect((await ext({ days: 0, evidence: 'x' })).body).toMatchObject({ code: 'ledger-experiment-invalid', field: 'days' });
+      expect((await ext({ days: 2.5, evidence: 'x' })).body).toMatchObject({ field: 'days' });
+      expect((await ext({ days: 3, evidence: ' ' })).body).toMatchObject({ field: 'evidence' });
+      expect(await ext({ days: 11, evidence: 'x' })).toMatchObject({ status: 409, body: { code: 'ledger-experiment-cap', field: 'days' } });
+      expect((await ext({ days: 3, evidence: 'x' }, tabB)).status).toBe(403);
+      expect((await ext({ days: 3, evidence: 'x' }, tabA, 'EXP-7')).status).toBe(404);
+      const extended = await ext({ days: 10, evidence: 're-gates still noisy' });
+      expect(extended).toMatchObject({ status: 200, body: { experiment: { id: 'EXP-1', maxDays: 90, extensionDays: 10 } } });
+      expect(extended.headers['Cache-Control']).toBe('no-store');
+      expect(await ext({ days: 1, evidence: 'x' })).toMatchObject({ status: 409, body: { code: 'ledger-experiment-extended' } });
+      expect((await call('extend', 'GET', 'ws-a', tabA, { query: { id: 'EXP-1' } })).status).toBe(405);
     });
   });
 });

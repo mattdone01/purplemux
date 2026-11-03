@@ -220,6 +220,7 @@ const ExperimentsSection = ({ board, age, now }: { board: IBoard; age: ISectionA
               <p className="text-xs text-muted-foreground">
                 {stageLabel(experiment.stage)} · metric {experiment.metric} · started {ageText(now - experiment.startedAt)} ago
                 · ends by day {experiment.maxDays} ({Math.max(0, Math.ceil(experiment.maxDays - (now - experiment.startedAt) / DAY_MS))} days left)
+                {experiment.extendedAt != null ? ` · extended once, by ${experiment.extensionDays} days` : ''}
               </p>
             </li>
           ))}
