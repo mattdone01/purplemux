@@ -55,7 +55,9 @@ describe('ledger.sqlite (AC 1)', () => {
       'state_since', 'wait_reason', 'wait_since', 'holder', 'clear_input', 'parent_key', 'attrs_json', 'last_seq', 'last_event_at']);
     expect(store.columns('intervals')).toEqual(['id', 'workspace_id', 'item_key', 'item_type', 'reason', 'holder', 'start', 'end']);
     expect(store.columns('rollups_daily')).toEqual(['workspace_id', 'day', 'item_type', 'reason', 'waited_ms', 'items', 'p50_ms', 'p90_ms']);
-    expect(store.columns('tab_events')).toEqual(['seq', 'workspace_id', 'tab_id', 'at', 'class', 'kind', 'text', 'delivered_at', 'digest_id']);
+    // ADR-0035 adds the event's source tab to ADR-0033's columns.
+    expect(store.columns('tab_events')).toEqual(['seq', 'workspace_id', 'tab_id', 'at', 'class', 'kind', 'text', 'delivered_at', 'digest_id',
+      'source_tab_id', 'source_tab_name']);
     expect(store.columns('experiments')).toEqual(expect.arrayContaining(['workspace_id', 'id', 'hypothesis', 'change_ref', 'stage',
       'reason', 'metric', 'baseline_json', 'target', 'guards_json', 'revert_if', 'min_days', 'max_days', 'started_at', 'verdict',
       'verdict_at', 'evidence']));
@@ -555,20 +557,24 @@ describe('experiments (ADR-HFL-03)', () => {
 });
 
 describe('retention and rollups (AC 8)', () => {
-  it('deletes events, intervals and tab events older than 92 days and rollups older than 400 days', async () => {
+  it('deletes events and intervals older than 92 days, tab events older than 30 days, rollups older than 400 days', async () => {
     const now = T0 + 500 * DAY_MS;
     const old = now - 93 * DAY_MS;
     const kept = now - 91 * DAY_MS;
+    const tabEvent = (at: number, text: string) =>
+      store.tabEvents.append({ workspaceId: WS, tabId: 't1', at, class: 'log', kind: 'x', text });
     append([op('range:a:1', old), wait('o1', old, 'range:a:1', 'not-armed'), ev('o2', old + MIN, 'range:a:1', 'close')]);
     append([op('range:b:1', kept), wait('k1', kept, 'range:b:1', 'not-armed'), ev('k2', kept + MIN, 'range:b:1', 'close')]);
-    store.insertTabEvent({ workspaceId: WS, tabId: 't1', at: old, class: 'log', kind: 'x', text: 'old' });
-    store.insertTabEvent({ workspaceId: WS, tabId: 't1', at: kept, class: 'log', kind: 'x', text: 'kept' });
+    // ADR-HFL-05 decision 3: a month of tab events, against the 92 days of the work-item record.
+    tabEvent(old, 'old');
+    tabEvent(now - 31 * DAY_MS, 'past a month');
+    tabEvent(now - 29 * DAY_MS, 'kept');
     store.rollUp(now - 401 * DAY_MS, now - 401 * DAY_MS);
     store.rollUp(old, old);
     store.rollUp(kept, kept);
     const before = store.counts();
     const result = await store.runRetention(now);
-    expect(result).toMatchObject({ events: 3, intervals: 1, tabEvents: 1, items: 1 });
+    expect(result).toMatchObject({ events: 3, intervals: 1, tabEvents: 2, items: 1 });
     // The first pass rolls up from the earliest day a finished wait touches, clamped to the 92-day window.
     // N3: the cutoff day is never re-rolled (a second pass on one UTC day would replace it with a partial rollup).
     expect(result.rolledUpDays[0]).toBe(new Date(Math.floor((now - 92 * DAY_MS) / DAY_MS) * DAY_MS + DAY_MS).toISOString().slice(0, 10));

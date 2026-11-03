@@ -336,11 +336,12 @@ The work-item ledger (ADR-0033; better-sqlite3, WAL, 0600, `user_version` 1; a n
 file from `mission-control.sqlite`, so the high-volume feed never couples to the attention store's schema version.
 Tables: `events` (append-only; `event_key`, 12 bytes of SHA-256 over the workspace, the producer and its `event_id`, is unique, so a replayed batch or spool is skipped), `items`
 (the projection per `(workspace_id, item_key)`), `intervals` (one row per finished wait, written in the transaction of
-the event that ends it), `rollups_daily` (per UTC day, item type and reason), `tab_events` (ADR-HFL-05; written by a
-later story), `experiments` (ADR-HFL-03) and `ledger_meta` (rollup progress, each workspace's longest interval). A
-daily job, 10 min after boot and then every 24 h, rolls up every day not yet rolled and every day a newly finished wait
-covers, then deletes events, intervals and tab events older than 92 days, items closed before then, and rollups older
-than 400 days, in chunks of 5,000 rows. Not regeneratable: the events are the record.
+the event that ends it), `rollups_daily` (per UTC day, item type and reason), `tab_events` (ADR-0035: every nudge, notice, tab send and digest
+a tab was sent, with its wake class, its source tab and when and in which digest it was delivered; read with
+`purplemux events show`), `experiments` (ADR-HFL-03) and `ledger_meta` (rollup progress, each workspace's longest
+interval). A daily job, 10 min after boot and then every 24 h, rolls up every day not yet rolled and every day a newly
+finished wait covers, then deletes events and intervals older than 92 days, tab events older than 30 days, items closed
+before then, and rollups older than 400 days, in chunks of 5,000 rows. Not regeneratable: the events are the record.
 
 `ledger-tokens.json` (`src/lib/ledger-token.ts`) keeps `{ version: 1, tokens: [{ hash, workspaceId, producer,
 issuedAt }] }`; the token itself is never stored. Issuing a producer again replaces its entry. The CLI writes the token

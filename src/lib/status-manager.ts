@@ -62,6 +62,11 @@ import { readLeaseEvidence } from '@/lib/lease-store';
 import type { IBackgroundJob, TBackgroundJobNotify, TLivenessEvent } from '@/types/liveness';
 import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
+import { getLedgerStore } from '@/lib/ledger-store';
+import type { TabEventsTable } from '@/lib/tab-events-store';
+import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
+import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
+import type { IPendingDigest, ITabEvent } from '@/types/tab-events';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
 import type { ISessionHistoryEntry } from '@/types/session-history';
 import { addSessionHistoryEntry, updateSessionHistoryDismissedAt } from '@/lib/session-history';
@@ -102,6 +107,19 @@ const agentRunningIn = async (
 };
 
 const log = createLogger('status');
+
+/** A `tab_events` row with a source tab is a watchdog nudge (ADR-0035 §4). */
+const nudgeFromEvent = (row: ITabEvent): IOrchestrationNudge => ({
+  id: `te-${row.seq}`,
+  workspaceId: row.workspaceId,
+  tabId: row.sourceTabId ?? row.tabId,
+  tabName: row.sourceTabName ?? '',
+  kind: row.kind as TOrchestrationNudgeKind,
+  message: row.text,
+  at: row.at,
+  delivered: row.deliveredAt !== null,
+  wakeClass: row.class,
+});
 const hookLog = createLogger('hooks');
 
 const entryAgentFields = (
@@ -190,7 +208,6 @@ export class StatusManager {
   private lastRateLimits: IRateLimitsCache | null = null;
   private jsonlWatchers = new Map<string, { watcher: FSWatcher; jsonlPath: string; debounceTimer: ReturnType<typeof setTimeout> | null }>();
   private compactStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private orchestrationNudges: IOrchestrationNudge[] = [];
   private standups = new Map<string, IWorkspaceStandup>();
 
   // Scope/cwd are read from the layout file, which is far too slow to touch per
@@ -214,6 +231,8 @@ export class StatusManager {
   private restartJobs = new Map<string, Promise<IBackgroundJob[]>>();
   private modelWatch = new AgentModelWatch();
   private automatedPrompts: AutomatedPromptDispatcher;
+  /** Every event bound for a tab goes through its wake class and into `tab_events` (ADR-0035). */
+  private tabEvents: TabEventRouter;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
   private updateAgentState: typeof updateTabAgentState;
   /** Tab → when its once-per-busy-stretch `stuck` nudge went out (the fleet panel reads the time, ADR-0023). */
@@ -264,8 +283,27 @@ export class StatusManager {
     automatedPrompts = new AutomatedPromptDispatcher(),
     cacheCodexRateLimits = cacheCodexRateLimitsFromJsonl,
     updateAgentState = updateTabAgentState,
+    tabEventTable: () => TabEventsTable = () => getLedgerStore().tabEvents,
   ) {
     this.automatedPrompts = automatedPrompts;
+    this.tabEvents = new TabEventRouter({
+      table: tabEventTable,
+      now: () => Date.now(),
+      deliver: (workspaceId, tabId, message, whenReady) => this.deliverAutomatedPrompt(workspaceId, tabId, message, 'tab event', whenReady),
+      atPrompt: (tabId) => this.isAtPrompt(tabId),
+      // The client holds these nudges as "held for digest": the same ids again, now delivered (review r2, F9).
+      onDigestDelivered: (events) => {
+        for (const event of events) {
+          if (event.sourceTabId !== null) this.broadcast({ type: 'orchestration:nudge', nudge: nudgeFromEvent(event) });
+        }
+      },
+      isKnownTab: (tabId) => this.tabs.has(tabId),
+      onStale: (stale) => {
+        void this.alertStaleDigest(stale).catch((err) => {
+          log.warn(`held-digest alert failed: ${err instanceof Error ? err.message : err}`);
+        });
+      },
+    });
     this.cacheCodexRateLimits = cacheCodexRateLimits;
     this.updateAgentState = updateAgentState;
   }
@@ -291,6 +329,7 @@ export class StatusManager {
     this.hookFloors.retain(new Set(this.tabs.keys()));
     this.hookScanReady = true;
     this.startPolling();
+    this.tabEvents.start();
 
     this.rateLimitsWatcher = createRateLimitsWatcher((data) => {
       this.lastRateLimits = data;
@@ -985,6 +1024,27 @@ export class StatusManager {
     return (entry.lastResumeOrStartedAt ?? 0) < stop.at;
   }
 
+  /**
+   * The tab sits at its prompt (ADR-0035): an agent idle or ready for review, or busy only because its
+   * ended turn waits on its own background work; not halted by a usage limit, not being closed. The
+   * state half of the inbox's readiness: a digest is never typed mid-turn.
+   */
+  isAtPrompt(tabId: string): boolean {
+    const entry = this.tabs.get(tabId);
+    if (!entry || !isAgentPanelType(entry.panelType) || this.isRetired(tabId) || this.isHaltedByUsageLimit(tabId)) return false;
+    return entry.cliState === 'idle' || entry.cliState === 'ready-for-review' || this.isWaitingAtPrompt(tabId);
+  }
+
+  /** A closed tab's held events will never be typed (ADR-0035; review F12). */
+  retireTabEvents(workspaceId: string, tabId: string): void {
+    this.tabEvents.retire(workspaceId, tabId);
+  }
+
+  /** Route one event to a tab by its class (ADR-0035): urgent typed now, digest held, log recorded. */
+  routeTabEvent(event: ITabEventRoute): Promise<ITabEventRouteResult> {
+    return this.tabEvents.route(event);
+  }
+
   getTabAgentState(tabId: string): ITabAgentState | null {
     const entry = this.tabs.get(tabId);
     return entry ? { cliState: entry.cliState, isAgent: isAgentPanelType(entry.panelType) } : null;
@@ -1141,25 +1201,10 @@ export class StatusManager {
         ?? (orch?.enabled && orch.orchestratorTabId ? orch.orchestratorTabId : tabId);
     if (!this.admitNudge(tabId, targetTabId, kind, episode, now)) return true;
     const message = buildNudgeMessage(kind, tabId, tabName, workspaceId, detail);
-    const delivered = await this.deliverAutomatedPrompt(workspaceId, targetTabId, message, 'liveness nudge');
-
-    const nudge: IOrchestrationNudge = {
-      id: nanoid(8),
-      workspaceId,
-      tabId,
-      tabName,
-      kind,
-      message,
-      at: now,
-      delivered,
-    };
-    this.orchestrationNudges.push(nudge);
-    if (this.orchestrationNudges.length > MAX_NUDGE_HISTORY) {
-      this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
-    }
-    this.broadcast({ type: 'orchestration:nudge', nudge });
-    log.info({ tabId, kind, targetTabId, delivered }, 'liveness nudge');
-    return delivered;
+    // A job's report to the tab that registered it is what that tab waits on (consult ruling 1).
+    const nudge = await this.sendNudge(workspaceId, targetTabId, tabId, tabName, kind, message, { toWaitingTab: targetTabId === tabId });
+    log.info({ tabId, kind, targetTabId, delivered: nudge.delivered, wakeClass: nudge.wakeClass }, 'liveness nudge');
+    return nudge.delivered;
   }
 
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
@@ -1218,13 +1263,8 @@ export class StatusManager {
 
       const idleMinutes = Math.round((now - state.idleSince) / 60_000);
       const message = buildHeartbeatMessage(idleMinutes, ws.id);
-      const delivered = await this.deliverAutomatedPrompt(
-        ws.id,
-        orch.orchestratorTabId,
-        message,
-        'orchestrator heartbeat',
-      );
       const beats = state.beats + 1;
+      const { delivered } = await this.sendNudge(ws.id, orch.orchestratorTabId, orch.orchestratorTabId, entry.tabName, 'heartbeat', message, { beat: beats });
       // Last heartbeat of the episode: the orchestrator slept through every
       // nudge purplemux can send, so the human is the only one left to ask.
       const stalled = isStallEpisodeEnd(beats, ORCH_MAX_HEARTBEATS, state.stallAlerted);
@@ -1234,21 +1274,6 @@ export class StatusManager {
           log.warn(`orchestrator stall alert failed: ${err instanceof Error ? err.message : err}`);
         });
       }
-      const nudge: IOrchestrationNudge = {
-        id: nanoid(8),
-        workspaceId: ws.id,
-        tabId: orch.orchestratorTabId,
-        tabName: entry.tabName,
-        kind: 'heartbeat',
-        message,
-        at: now,
-        delivered,
-      };
-      this.orchestrationNudges.push(nudge);
-      if (this.orchestrationNudges.length > MAX_NUDGE_HISTORY) {
-        this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
-      }
-      this.broadcast({ type: 'orchestration:nudge', nudge });
       log.info({ workspaceId: ws.id, beats, delivered }, 'orchestrator heartbeat');
     }
   }
@@ -1576,24 +1601,9 @@ export class StatusManager {
     const now = Date.now();
     if (!this.admitNudge(tabId, targetTabId, kind, episode, now)) return true;
     const message = buildNudgeMessage(kind, tabId, entry.tabName, ws.id, detail);
-    const delivered = await this.deliverAutomatedPrompt(ws.id, targetTabId, message, 'orchestrator nudge');
-
-    const nudge: IOrchestrationNudge = {
-      id: nanoid(8),
-      workspaceId: ws.id,
-      tabId,
-      tabName: entry.tabName,
-      kind,
-      message,
-      at: now,
-      delivered,
-    };
-    this.orchestrationNudges.push(nudge);
-    if (this.orchestrationNudges.length > MAX_NUDGE_HISTORY) {
-      this.orchestrationNudges.splice(0, this.orchestrationNudges.length - MAX_NUDGE_HISTORY);
-    }
-    this.broadcast({ type: 'orchestration:nudge', nudge });
-    log.info({ tabId, kind, targetTabId, delivered }, 'orchestrator nudge');
+    const nudge = await this.sendNudge(ws.id, targetTabId, tabId, entry.tabName, kind, message,
+      { markerLines: kind === 'turn-marker' && detail ? detail.split('\n') : undefined });
+    log.info({ tabId, kind, targetTabId, delivered: nudge.delivered, wakeClass: nudge.wakeClass }, 'orchestrator nudge');
     return true;
   }
 
@@ -1618,8 +1628,67 @@ export class StatusManager {
     return this.reportOnFiltered;
   }
 
+  /**
+   * One watchdog nudge through its wake class (ADR-0035). The recipient is `targetTabId`; the nudge is
+   * about `tabId`, which `tab_events` keeps as its source, so the history survives a restart.
+   */
+  private async sendNudge(
+    workspaceId: string,
+    targetTabId: string,
+    tabId: string,
+    tabName: string,
+    kind: TOrchestrationNudgeKind,
+    message: string,
+    wake: IWakeDetail,
+  ): Promise<IOrchestrationNudge> {
+    const routed = await this.tabEvents.route({
+      workspaceId, tabId: targetTabId, kind, text: message, class: classifyWake(kind, wake), sourceTabId: tabId, sourceTabName: tabName,
+    });
+    const nudge: IOrchestrationNudge = {
+      id: routed.seq === null ? nanoid(8) : `te-${routed.seq}`,
+      workspaceId,
+      tabId,
+      tabName,
+      kind,
+      message,
+      at: Date.now(),
+      delivered: routed.delivered,
+      wakeClass: routed.class,
+    };
+    this.broadcast({ type: 'orchestration:nudge', nudge });
+    return nudge;
+  }
+
+  /** The workspace's last MAX_NUDGE_HISTORY watchdog nudges, from `tab_events` (ADR-0035): a restart keeps them. */
   getOrchestrationNudges(workspaceId: string): IOrchestrationNudge[] {
-    return this.orchestrationNudges.filter((n) => n.workspaceId === workspaceId);
+    let rows: ReturnType<TabEventsTable['list']>;
+    try {
+      rows = this.tabEvents.history(workspaceId, MAX_NUDGE_HISTORY);
+    } catch (err) {
+      log.warn(`nudge history unreadable: ${err instanceof Error ? err.message : err}`);
+      return [];
+    }
+    return rows.map(nudgeFromEvent);
+  }
+
+  /**
+   * A tab's oldest held event has waited an hour (review r2, F6): its digest never found it at its prompt
+   * (a dead or always-busy tab). The human hears once per backlog, through the flag alert path (ADR-0032).
+   */
+  private async alertStaleDigest(stale: IPendingDigest): Promise<void> {
+    const ws = await getWorkspaceByIdCached(stale.workspaceId);
+    const entry = this.tabs.get(stale.tabId);
+    const minutes = Math.round((Date.now() - stale.oldestAt) / 60_000);
+    await this.dispatchAlert({
+      kind: 'flag',
+      tabId: stale.tabId,
+      workspace: ws,
+      workspaceId: stale.workspaceId,
+      tabName: entry?.tabName ?? '',
+      providerId: toAlertProvider(entry?.agentProviderId),
+      agentSessionId: entry?.agentSessionId,
+      detail: `${stale.count} event(s) held for ${entry?.tabName || stale.tabId}'s digest, the oldest ${minutes} min: the tab has not been at its prompt. Read them: purplemux events show -w ${stale.workspaceId} ${stale.tabId} --since ${new Date(stale.oldestAt).toISOString()}`,
+    });
   }
 
   async reportStandup(standup: IWorkspaceStandup): Promise<void> {
@@ -1697,13 +1766,14 @@ export class StatusManager {
     targetTabId: string,
     message: string,
     context: string,
+    whenReady?: () => boolean,
   ): Promise<boolean> {
     // A usage-limit halt is never typed into, by any automated path (story 26).
     if (this.isHaltedByUsageLimit(targetTabId)) {
       log.info({ targetTabId, context }, 'automated prompt withheld: target halted by a usage limit');
       return false;
     }
-    const result = await this.automatedPrompts.dispatch({ workspaceId, targetTabId, message });
+    const result = await this.automatedPrompts.dispatch({ workspaceId, targetTabId, message, whenReady });
     if (!result.delivered && result.error) {
       log.warn(`${context} delivery failed: ${result.error instanceof Error ? result.error.message : result.error}`);
     }
@@ -3115,6 +3185,7 @@ export class StatusManager {
   shutdown(): Promise<void> {
     const floorsSaved = this.hookFloors.flush();
     this.stopPolling();
+    this.tabEvents.stop();
     this.rateLimitsWatcher?.stop();
     this.claudeUsagePoller?.stop();
     for (const tabId of [...this.jsonlWatchers.keys()]) {
@@ -3162,6 +3233,7 @@ export const getStatusManager = (): StatusManager => {
     onTabClosing(({ tabId, phase }) => manager.handleTabClosing(tabId, phase));
     onTabRestart((event) => manager.handleTabRestart(event));
     onTabClosed(({ tabId, workspaceId }) => {
+      manager.retireTabEvents(workspaceId, tabId);
       manager.removeTab(tabId);
       manager.forgetReportsTo(workspaceId, tabId);
     });

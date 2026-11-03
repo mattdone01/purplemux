@@ -70,6 +70,8 @@ export const LEDGER_SILENT_MS = 10 * 60_000;
 export const MAX_LEDGER_EVENTS = 500;
 export const MAX_LEDGER_BYTES = 1024 * 1024;
 export const LEDGER_RETENTION_DAYS = 92;
+/** `tab_events` (ADR-HFL-05 decision 3): a month of what each tab was sent. */
+export const LEDGER_TAB_EVENTS_RETENTION_DAYS = 30;
 export const LEDGER_ROLLUP_RETENTION_DAYS = 400;
 export const DAY_MS = 24 * 60 * 60_000;
 

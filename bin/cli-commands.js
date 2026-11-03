@@ -17,6 +17,7 @@ const CLI_COMMANDS = new Set([
   'spend',
   'board',
   'ledger',
+  'events',
   'mission',
   'mc',
   'portfolio',

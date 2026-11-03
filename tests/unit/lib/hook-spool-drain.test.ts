@@ -8,6 +8,7 @@ import type { IHookSpoolDrainResult } from '@/lib/hook-spool';
 import type { StatusManager } from '@/lib/status-manager';
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
+import { memoryTabEvents } from './tab-events-harness';
 
 // ADR-0020: the server replays what hooks spooled while no server answered —
 // once it listens and on every poll, oldest first, through the hook route's own
@@ -125,7 +126,7 @@ const managerWithPaste = async (afterReplay?: () => Promise<void>) => {
   });
   await import('@/lib/providers');
   const { StatusManager } = await import('@/lib/status-manager');
-  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}));
+  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), memoryTabEvents());
   // The route's dispatcher reaches the manager through the singleton.
   g.__ptStatusManager = manager;
   const { dispatchHook } = await import('@/lib/hook-dispatch');

@@ -38,8 +38,8 @@ Option 3.
    - `intervals(id, workspace_id, item_key, item_type, reason, holder, start, end)`: one row per finished wait,
      written in the transaction of the event that ends it, so a read is a sum, never a replay.
    - `rollups_daily(workspace_id, day, item_type, reason, waited_ms, items, p50_ms, p90_ms)`.
-   - `tab_events(seq, workspace_id, tab_id, at, class, kind, text, delivered_at, digest_id)` (ADR-HFL-05; its writer is
-     a later story) and `experiments` (ADR-HFL-03). `ledger_meta` keeps the rollup progress and each workspace's
+   - `tab_events(seq, workspace_id, tab_id, at, class, kind, text, delivered_at, digest_id)` (ADR-HFL-05; its writer,
+     and the two columns it adds, are ADR-0035) and `experiments` (ADR-HFL-03). `ledger_meta` keeps the rollup progress and each workspace's
      longest interval, which bounds every window read on both sides of the `(workspace_id, end, start)` index.
 2. **Vocabulary** (`src/lib/ledger.ts`, closed; a change is an amendment of this ADR, never a producer decision).
    - Item types: `slice`, `range`, `gate`, `review`, `landing`, `deploy`, `owner-issue`, `mc-item`, `seat`,
@@ -124,10 +124,16 @@ Option 3.
    `rollups_daily` every whole UTC day from the day after the last rolled-up day, or from the earliest day a wait
    finished since the last pass covers, whichever is earlier, to yesterday (never before the cutoff). A wait longer
    than a day thus re-rolls each day it covers once it finishes, every day is rolled with its finished waits before it
-   leaves the window, and a server down for days leaves no gap. It then deletes events, intervals and tab events older
-   than 92 days (the ADR-0030 spend floor), items closed before then, and rollups older than 400 days. Each day's
-   rollup is one transaction and each delete runs in chunks of 5,000 rows, yielding to the event loop between them.
-   ADR-HFL-05 gave `tab_events` 30 days; the story's acceptance criterion sets 92, and its writer may shorten it.
+   leaves the window, and a server down for days leaves no gap. It then deletes events and intervals older than 92 days
+   (the ADR-0030 spend floor), tab events older than 30 days (ADR-HFL-05 decision 3; amended by ADR-0035), items
+   closed before then, and rollups older than 400 days. Each day's rollup is one transaction and each delete runs in
+   chunks of 5,000 rows, yielding to the event loop between them.
+
+   | Table | Kept |
+   |---|---|
+   | `events`, `intervals`, closed `items` | 92 days |
+   | `tab_events` | 30 days |
+   | `rollups_daily` | 400 days |
 
 ## Measured (story 01)
 A synthetic load of 15,000 events a day for 92 days (1,380,000 events; ranges, gates, landings and seat events with

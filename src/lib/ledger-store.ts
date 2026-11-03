@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { brandCodedError } from '@/lib/coded-error';
+import { TabEventsTable } from '@/lib/tab-events-store';
 import {
   DAY_MS,
   LAND_QUEUE_HEAD_BLOCKED,
@@ -12,6 +13,7 @@ import {
   LEDGER_ROLLUP_RETENTION_DAYS,
   LEDGER_SERVER_PRODUCER,
   LEDGER_SILENT_MS,
+  LEDGER_TAB_EVENTS_RETENTION_DAYS,
   LEDGER_UNKNOWN_ITEM_TYPES,
   UNKNOWN_REASON,
   clippedMs,
@@ -256,6 +258,8 @@ const summarize = (acc: IWaitAccumulator): Omit<ILedgerWaitRow, 'key'> => {
  */
 export class LedgerStore {
   private readonly database: Database.Database;
+  /** The durable tab event log (ADR-0035) over this handle. */
+  readonly tabEvents: TabEventsTable;
 
   constructor(databasePath = defaultDbPath()) {
     if (databasePath !== ':memory:') fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -266,6 +270,8 @@ export class LedgerStore {
       this.database.pragma('busy_timeout = 5000');
       this.database.pragma('synchronous = FULL');
       this.migrate();
+      this.tabEvents = new TabEventsTable(this.database);
+      this.tabEvents.ensureShape();
     } catch (error) {
       // A refused file (a newer schema) must not leave a handle open for every request that tries it.
       this.database.close();
@@ -727,8 +733,8 @@ export class LedgerStore {
   };
 
   /**
-   * The daily job: roll up (see rollUpRange), then delete events, intervals and tab events older
-   * than 92 days, items closed before then, and rollups older than 400 days. Each day's rollup is one
+   * The daily job: roll up (see rollUpRange), then delete events and intervals older than 92 days,
+   * tab events older than 30 days, items closed before then, and rollups older than 400 days. Each day's rollup is one
    * transaction and each delete runs in chunks of RETENTION_CHUNK rows, yielding to the event loop
    * between them, so the server keeps answering while it runs.
    */
@@ -750,7 +756,8 @@ export class LedgerStore {
     return {
       events: await this.deleteInChunks('DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at < ? LIMIT ?)', [cutoff]),
       intervals,
-      tabEvents: await this.deleteInChunks('DELETE FROM tab_events WHERE seq IN (SELECT seq FROM tab_events WHERE at < ? LIMIT ?)', [cutoff]),
+      tabEvents: await this.deleteInChunks('DELETE FROM tab_events WHERE seq IN (SELECT seq FROM tab_events WHERE at < ? LIMIT ?)',
+        [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
       items: await this.deleteInChunks(`DELETE FROM items WHERE (workspace_id, item_key) IN (SELECT workspace_id, item_key FROM items
         WHERE closed_at IS NOT NULL AND closed_at < ? LIMIT ?)`, [cutoff]),
       rollups: await this.deleteInChunks(`DELETE FROM rollups_daily WHERE (workspace_id, day, item_type, reason) IN
@@ -760,7 +767,7 @@ export class LedgerStore {
     };
   };
 
-  /** For the retention, schema and finder tests until story 09's writer lands; not a route. */
+  /** A test helper for the retention, schema and finder tests; the writer is TabEventsTable (ADR-0035). Not a route. */
   insertTabEvent = (row: {
     workspaceId: string; tabId: string; at: number; class: string; kind: string; text: string; deliveredAt?: number | null; digestId?: string | null;
   }): void => {

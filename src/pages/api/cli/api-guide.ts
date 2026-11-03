@@ -1013,9 +1013,60 @@ POST /api/cli/workspaces/<workspaceId>/ledger/experiments/<id>
   { "workspaceId", "experiments": [...] } for the list.
 
 Retention: a daily job (10 min after boot, then every 24 h) rolls up into rollups_daily every day
-not yet rolled and every day a newly finished wait covers, then deletes events, intervals and tab
-events older than 92 days, items closed before then, and rollups older than 400 days, in chunks of
-5,000 rows. A store failure answers 500 ledger-store-failed (exit 1).
+not yet rolled and every day a newly finished wait covers, then deletes events and intervals older
+than 92 days, tab events older than 30 days (ADR-0035), items closed before then, and rollups older
+than 400 days, in chunks of 5,000 rows. A store failure answers 500 ledger-store-failed (exit 1).
+
+## Event digest (ADR-0035)
+
+Every event bound for a tab gets one wake class and a row in tab_events (ledger.sqlite, 30 days):
+  urgent  typed at once: DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE and any other end line but
+          CHECKPOINTED; needs-input, off-scope, thrash, api-error, usage-limit, inactive, stalled,
+          model-drift; a background job's report to the tab that registered it; Mission Control,
+          resume, watch and deploy notices; red main, ROTATE, block-severity flags and alarms; a tab
+          send that is not a copy.
+  digest  held for the tab's next digest: CHECKPOINTED, turn-ended, ready-for-review,
+          idle-no-end-line, long-wait, stuck, probe-failed, a job's report to another tab, the first
+          idle heartbeat, notes, warn flags and ledger alarms, and a tab send to a tab that is only a
+          copy (on the header's cc list, "X -> Y (cc ORCH): ...", and not a "->" recipient) or that
+          says "no reply needed"; it stays urgent when a line or the text after the header starts
+          with DONE:, BLOCKED:, NEEDS-DECISION: or READY-TO-MERGE:, or it relays an owner answer
+          verbatim.
+  log     recorded only: heartbeats after the first of an idle episode, and a duplicate (the same tab,
+          kind and text as an event of the last 15 min that is still undelivered; a delivered copy
+          never suppresses a later one). Urgent events keep only the 60 s episode filter: an
+          identical end line after a fix round is a new decision.
+A digest is one message, "DIGEST <n> since <time>", a line per event while it fits in 2 KB, then
+the pointer to "purplemux events show". It is typed only while the tab sits at its prompt (idle,
+ready for review, or waiting on its own background work; never halted, never mid-turn, re-checked
+inside the dispatch lock), only when 15 min have passed since its last digest or 20 events wait, and
+never within 5 s of another delivery to the tab. A tab whose oldest held event is an hour old is
+reported to the human once (a flag alert). Delivery never depends on a ledger write: a ledger that
+cannot be opened or written types every non-log event at once, as before.
+Inbox notices keep their own delivery (ADR-0012) and are recorded when typed.
+
+POST /api/cli/tabs/<tabId>/send for a digest-class message holds it instead of typing it and answers
+  { "status": "queued" | "sent" (in a digest that went out at once) | "logged" (a duplicate),
+    "submitted": boolean, "wakeClass", "duplicate" }; a tab with no live session answers 409
+  agent-not-ready / session-not-running as any send does. Any other message is typed as before.
+
+GET /api/cli/workspaces/<workspaceId>/events?tab=&since=&limit=   (purplemux events show -w WS [TAB] [--since T] [--limit N] [--json])
+  Read scope. since: an age (90s, 15m, 1h, 7d), Unix ms or ISO-8601, default 1h; limit 1..5000,
+  default 500 (the newest kept). Response: { "workspaceId", "tabId" | null, "since", "now", "truncated",
+  "events": [{ "seq", "workspaceId", "tabId" (the recipient), "at", "class", "kind", "text",
+  "sourceTabId" | null (the worker a nudge is about), "sourceTabName" | null, "deliveredAt" | null,
+  "digestId" | null }] }, oldest first. A digest event's deliveredAt is its digest's. The log
+  survives a restart: a rotated or restarted tab reads what it was sent here. The CLI prints each
+  event whole for one TAB (the digest's pointer) and one line each for the workspace.
+
+GET /api/cli/workspaces/<workspaceId>/events/wakes?since=&until=&by=window|day
+                                                       (purplemux events wakes -w WS [--since T] [--until T] [--by-day] [--json])
+  Read scope; default the last 24 h. A wake is one delivery in the window: an event delivered on
+  its own (urgent, a recorded inbox notice or tab send) or a digest, counted once. Response:
+  { "workspaceId", "since", "until", "by", "hasEvents", "rows": [{ "tabId", "day" | null, "wakes",
+  "digests", "urgent" (delivered on their own), "logged" }] }. hasEvents false: the workspace has no
+  tab event at all, so zero wakes is no record, not a quiet seat. 400 ledger-query-invalid names a bad
+  since, until or by.
 
 ## Board: the constraint finder (ADR-0034)
 

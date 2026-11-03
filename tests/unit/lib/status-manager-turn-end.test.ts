@@ -6,6 +6,7 @@ import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab, TPanelType } from '@/types/terminal';
 import type { TTurnMarkerName } from '@/lib/turn-end';
+import { memoryTabEvents } from './tab-events-harness';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 const workspaceStore = vi.hoisted(() => ({
@@ -57,7 +58,7 @@ const managerWithPaste = async () => {
   });
   await import('@/lib/providers');
   const { StatusManager } = await import('@/lib/status-manager');
-  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}));
+  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), memoryTabEvents());
   manager.registerTab('root', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'root', tmuxSession: 'tmux-root', panelType: 'claude-code' });
   return { manager, paste };
 };
@@ -321,9 +322,13 @@ describe('stop classification (ADR-0018)', () => {
 
     await runTimers(manager, at + 15 * MIN);
     const { buildNudgeMessage } = await import('@/lib/orchestration');
-    expect(paste.mock.calls).toEqual([['tmux-root', buildNudgeMessage('idle-no-end-line', 'worker', 'w1', 'ws-1', '15 min ago')]]);
+    // A digest-class nudge (ADR-0035): the orchestrator sat at its prompt with no digest yet, so it went at once.
+    expect(paste.mock.calls).toEqual([['tmux-root', expect.stringMatching(/^DIGEST 1 since /)]]);
     expect(paste.mock.calls[0][1]).toContain('idle without an end line');
-    expect(manager.getOrchestrationNudges('ws-1')).toEqual([expect.objectContaining({ kind: 'idle-no-end-line', tabId: 'worker' })]);
+    expect(manager.getOrchestrationNudges('ws-1')).toEqual([expect.objectContaining({
+      kind: 'idle-no-end-line', tabId: 'worker', wakeClass: 'digest', delivered: true,
+      message: buildNudgeMessage('idle-no-end-line', 'worker', 'w1', 'ws-1', '15 min ago'),
+    })]);
     expect(entry.turnEnd).toMatchObject({ idleNudgeSentSeq: entry.turnEnd!.seq });
 
     // One nudge per stop, never a stream.

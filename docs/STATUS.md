@@ -667,6 +667,9 @@ With `hooks=debug` you see, for example:
 | `src/pages/api/check-claude.ts` | Claude process detection API |
 | `src/lib/layout-store.ts` | `updateTabCliStatus`, etc. (layout JSON writes) |
 | `src/lib/logger.ts` | `LOG_LEVELS` parsing + per-group pino child |
+| `src/lib/wake-class.ts` | `WAKE_CLASS_TABLE`, `classifyWake`: every tab-bound event's class (ADR-0035) |
+| `src/lib/tab-event-router.ts` | `TabEventRouter`: urgent typed, digest held, log recorded; `renderDigest` |
+| `src/lib/tab-events-store.ts` | `tab_events` in `ledger.sqlite`: the durable log, pending digests, wakes per seat |
 
 ### Client
 
@@ -690,6 +693,27 @@ With `hooks=debug` you see, for example:
 | `src/components/features/timeline/permission-prompt-item.tsx` | Permission prompt UI (`lastEvent.seq` subscriber) |
 | `src/components/features/workspace/notification-sheet.tsx` | Notification sheet + `useNotificationCount` |
 | `src/components/features/workspace/workspace-standup.tsx` | Sidebar standup chip + popover panel |
+
+---
+
+## Wake classes and the event digest (ADR-0035)
+
+Every watchdog nudge goes through `StatusManager.sendNudge` → `TabEventRouter.route` with the class
+`classifyWake(kind, detail)` gives it, and is written to `tab_events` (ledger.sqlite, 30 days) before anything is
+typed. `urgent` goes through `deliverAutomatedPrompt` at once, as every nudge did before. `digest` waits: the router's
+5 s tick, and every new digest event, send the tab one `DIGEST <n> since <time>` message when
+`StatusManager.isAtPrompt(tab)` (idle, ready-for-review, or busy only because its stop waits on its own background
+work; not halted, not being closed; re-checked inside the dispatch lock) and 15 min have passed since its last digest
+or 20 events wait, and no other delivery reached the tab in the last 5 s. `log` is recorded only: later heartbeats of
+one idle episode, and a digest or log event whose tab, kind and text match one still undelivered inside 15 min. The 60 s episode filter (`nudge-dedupe.ts`) still runs first for every
+class. A `turn-marker` takes its marker's class (CHECKPOINTED digest, every other end line urgent); a `bg-*` report is
+urgent to the tab that registered the job and digest to anyone else. `getOrchestrationNudges` reads the last 200
+nudges (rows with a source tab) from `tab_events`, so the history survives a restart; `IOrchestrationNudge.wakeClass`
+lets the notification sheet say "held for digest" instead of "not delivered". Inbox notices keep their own delivery and
+are recorded when typed; a `tab send` to a tab that is only on its header's `cc` list (not a `->` recipient), or that
+says "no reply needed", is held for the digest unless it carries a verdict marker or relays an owner answer.
+A ledger that cannot be opened or written holds nothing: the router types every non-log event at once. A digest's
+delivery is broadcast again under the nudges' ids; an hour-old held backlog raises one flag alert.
 
 ---
 
