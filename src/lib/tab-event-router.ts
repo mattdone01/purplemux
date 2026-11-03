@@ -120,6 +120,11 @@ export class TabEventRouter {
   private readonly staleReported = new Map<string, number>();
   /** When a paste to each tab last started or ended: the ledger records a delivery only after its paste. */
   private readonly lastPaste = new Map<string, number>();
+  /**
+   * Urgent rows whose paste still runs. The history leaves them out until the paste settles: a row read
+   * mid-paste would report a nudge being typed as undelivered (09-fix, release acceptance self-failure-*).
+   */
+  private readonly inFlight = new Set<number>();
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly deps: ITabEventRouterDeps) {}
@@ -192,18 +197,26 @@ export class TabEventRouter {
       return this.deliverUnlogged(event);
     }
     if (cls === 'urgent') {
-      const delivered = await this.paste(event.workspaceId, event.tabId, event.text);
-      if (delivered) this.markDelivered(table, [seq], null);
-      return { class: cls, delivered, seq, duplicate };
+      this.inFlight.add(seq);
+      try {
+        const delivered = await this.paste(event.workspaceId, event.tabId, event.text);
+        if (delivered) this.markDelivered(table, [seq], null);
+        return { class: cls, delivered, seq, duplicate };
+      } finally {
+        this.inFlight.delete(seq);
+      }
     }
     // A tab at its prompt with a digest due gets it now; `delivered` says this event went out in it.
     const delivered = cls === 'digest' && await this.flush(event.workspaceId, event.tabId);
     return { class: cls, delivered, seq, duplicate };
   }
 
-  /** The workspace's newest watchdog nudges, newest last (a row with a source tab is a nudge); throws when the log is unreadable. */
+  /**
+   * The workspace's newest watchdog nudges, newest last (a row with a source tab is a nudge), without an urgent
+   * one still being typed: it enters with its outcome, as before ADR-0035. Throws when the log is unreadable.
+   */
   history(workspaceId: string, limit: number): ITabEvent[] {
-    return this.deps.table().list(workspaceId, { since: 0, limit, sourced: true });
+    return this.deps.table().list(workspaceId, { since: 0, limit, sourced: true }).filter((row) => !this.inFlight.has(row.seq));
   }
 
   /** Send the tab its digest when one is due and the tab is at its prompt; true when one went out. */
