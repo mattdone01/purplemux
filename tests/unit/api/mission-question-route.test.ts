@@ -6,7 +6,8 @@ import type { ICaller } from '@/lib/caller';
 // of an accepted v1 question, and refuses with every defect; the check route answers the same
 // without the write; the min-version key is the admin's.
 
-const store = vi.hoisted(() => ({ applyEvents: vi.fn(), unreplayedEventIds: vi.fn(), humanInboxPolicy: vi.fn() }));
+// `itemStates`: the events route reads the touched items' states before applying (story 33 R2).
+const store = vi.hoisted(() => ({ applyEvents: vi.fn(), unreplayedEventIds: vi.fn(), humanInboxPolicy: vi.fn(), itemStates: vi.fn(() => new Map()) }));
 const scope = vi.hoisted(() => ({ resolveCliScope: vi.fn() }));
 const fleet = vi.hoisted(() => ({ value: null as string | null, unreadable: false }));
 

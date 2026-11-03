@@ -69,9 +69,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         opener: event.type === 'attention.opened' ? opener : null,
       });
     }
+    // The alert rule needs each touched item's state before this batch (story 33: candidate -> open alerts too).
+    const previousStates = store.itemStates(events.flatMap((event) =>
+      (event.type === 'attention.updated' && unreplayed.has(event.eventId) ? [event.payload.itemId] : [])));
     const applied = store.applyEvents(events, authorities, { questionMinVersion });
-    // An item opened for the human alerts once (ADR-0032 channels); a replayed event never does.
-    void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null });
+    // An item that first becomes owner-visible alerts once (ADR-0032 channels); a replayed event never does.
+    void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null, previousStates });
     return res.status(200).json({
       ...applied,
       humanInboxPolicy: store.humanInboxPolicy(workspaceId),

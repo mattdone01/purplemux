@@ -74,6 +74,8 @@ const answerSchema = z.object({
   optionIds: z.array(id).max(20),
   text: z.string().trim().max(8000),
   actionCompleted: z.boolean(),
+  /** Where the owner answered (story 33): recorded, outside the content hash; absent from older clients. */
+  source: z.enum(['web', 'phone', 'notification']).optional(),
 }).strict().superRefine((value, context) => {
   if (new Set(value.optionIds).size !== value.optionIds.length) {
     context.addIssue({ code: 'custom', message: 'duplicate option selections' });

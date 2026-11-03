@@ -2,7 +2,7 @@
 // consults, plus the alert builder. No node-only imports — the server dispatches
 // from status-manager and the Electron/toast hooks apply the same rule client-side.
 import type { IWorkspace } from '@/types/terminal';
-import type { IAlert, IAlertFlag, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
+import type { IAlert, IAlertFlag, IAlertQuestion, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 
 export const ALERTS_ORCHESTRATOR_ONLY_DEFAULT = true;
 
@@ -95,6 +95,8 @@ export interface IAlertSource {
   itemId?: string;
   /** Kind `attention-opened` only: the item's title, the alert body. */
   itemTitle?: string | null;
+  /** Kind `attention-opened` only: the question summary a notification answers from (story 33). */
+  question?: IAlertQuestion | null;
 }
 
 export type TAlertDraft = Omit<IAlert, 'id' | 'seq'>;
@@ -157,4 +159,5 @@ export const alertFor = (source: IAlertSource): TAlertDraft => ({
   at: source.at,
   ...(source.kind === 'flag' && source.flag ? { flag: { ...source.flag } } : {}),
   ...(source.kind === 'attention-opened' && source.itemId ? { itemId: source.itemId } : {}),
+  ...(source.kind === 'attention-opened' && source.question ? { question: source.question } : {}),
 });

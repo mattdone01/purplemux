@@ -492,6 +492,55 @@ describe('MissionControlStore', () => {
     migrated.close();
   });
 
+  // Story 33 R3 (consult ruling B): the source rides in request_json, outside the content hash.
+  it('records an answer\'s source; an answer without one reads null; the hash ignores it', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const request = { submissionId: 'submission-src', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false };
+    const created = store.submitAnswer('item-a', { ...request, source: 'notification' }, 'user');
+    expect(created.answer.source).toBe('notification');
+    // A resend that differs only in its source is a replay, and the first source stands.
+    const replay = store.submitAnswer('item-a', { ...request, source: 'phone' }, 'user');
+    expect(replay).toMatchObject({ replayed: true, answer: { id: created.answer.id, source: 'notification' } });
+    expect(store.submitAnswer('item-a', request, 'user').replayed).toBe(true);
+    store.close();
+  });
+
+  it('keeps every request_hash byte-identical: the same answer hashes the same with or without a source', () => {
+    const hashOf = (source?: 'web') => {
+      const file = databasePath();
+      const store = new MissionControlStore(file);
+      seed(store);
+      const answered = store.submitAnswer('item-a', {
+        submissionId: 'submission-plain', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false, ...(source ? { source } : {}),
+      }, 'user');
+      store.close();
+      const raw = new Database(file, { readonly: true });
+      const row = raw.prepare('SELECT request_hash, request_json FROM answers').get() as { request_hash: string; request_json: string };
+      raw.close();
+      return { hash: row.request_hash, stored: JSON.parse(row.request_json) as Record<string, unknown>, source: answered.answer.source };
+    };
+    const plain = hashOf();
+    const web = hashOf('web');
+    expect(web.hash).toBe(plain.hash);
+    expect(plain.stored).not.toHaveProperty('source');
+    expect(plain.source).toBeNull();
+    expect(web.stored.source).toBe('web');
+  });
+
+  it('the Measure query counts owner answers by source, a row with none as "not recorded"', () => {
+    const file = databasePath();
+    const store = new MissionControlStore(file);
+    seed(store);
+    store.submitAnswer('item-a', { submissionId: 's-1', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false }, 'user');
+    store.close();
+    const raw = new Database(file, { readonly: true });
+    const rows = raw.prepare(`SELECT COALESCE(json_extract(request_json,'$.source'),'not recorded') AS source, COUNT(*) AS n
+      FROM answers WHERE actor NOT LIKE 'system:%' GROUP BY 1`).all();
+    raw.close();
+    expect(rows).toEqual([{ source: 'not recorded', n: 1 }]);
+  });
+
   it('returns original answer results for identical retries and conflicts on changed reuse', () => {
     const store = new MissionControlStore(databasePath());
     seed(store);

@@ -721,14 +721,15 @@ describe('checks-wip-cap.cjs (story 20)', () => {
   });
 
   it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
-    expect(checks.WAVE_COUNT).toBe(10);
+    expect(checks.WAVE_COUNT).toBe(11);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '9']).onlyWave).toBe(9);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '10']).onlyWave).toBe(10);
-    for (const bad of ['0', '11', '1.5', '-1', 'x', '']) {
-      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..10, not ${JSON.stringify(bad)}`);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '11']).onlyWave).toBe(11);
+    for (const bad of ['0', '12', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..11, not ${JSON.stringify(bad)}`);
     }
-    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..10, not null');
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..11, not null');
   });
 
   describe('checks.cjs runs the gate first (spawned against a fake candidate)', () => {
@@ -795,9 +796,9 @@ process.exit(1);
     });
 
     it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
-      const r = runChecks('ok', ['--only-wave', '11']);
+      const r = runChecks('ok', ['--only-wave', '12']);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('--only-wave takes an integer 1..10, not "11"');
+      expect(r.stderr).toContain('--only-wave takes an integer 1..11, not "12"');
       expect(r.calls).toEqual([]);
     });
 
@@ -1409,4 +1410,35 @@ it('isolated intentional ownership changes send one human CAS replacement with t
   expect(await inst.designate('ws-a', 'next')).toMatchObject({ rc: 1 });
   expect(inst.cli).toHaveBeenCalledOnce(); expect(inst.human).toHaveBeenCalledOnce();
   expect(inst.human).toHaveBeenCalledWith('PATCH', '/api/workspace/ws-a', { orchestration: { enabled: true, orchestratorTabId: 'next' }, expectedRevision: 7, mode: 'replace' });
+});
+
+describe('wave 11: one attention alert per item that becomes owner-visible (story 33 round 2)', () => {
+  const alertWave = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-attention-alert.cjs'));
+  const frame = (itemId: string, revision: number) => ({ type: 'notification:alert', alert: { kind: 'attention-opened', itemId, question: { revision } } });
+  const base = {
+    socketOpen: true, sends: { started: 0, opened: 0, candidate: 0, promoted: 0 }, states: { opened: 'open', promoted: 'open' },
+    openedId: 'acc-alert-x-opened', promotedId: 'acc-alert-x-promoted', runPrefix: 'acc-alert-x',
+  };
+
+  it('passes on exactly one alert for each item at revisions 1 and 2', () => {
+    const judged = alertWave.judgeAttentionAlerts({ ...base, frames: [{ type: 'status:sync' }, frame('acc-alert-x-opened', 1), frame('acc-alert-x-promoted', 2), frame('other-ws-item', 1)] });
+    expect(judged).toMatchObject({ ok: true });
+    expect(judged.measured).toContain('opened x1 (revision 1), promoted x1 (revision 2), other items of this run x0');
+  });
+
+  it('fails on a missing promotion alert, a duplicate, a wrong revision, a stray item, a closed socket or a refused send', () => {
+    const ok = [frame('acc-alert-x-opened', 1), frame('acc-alert-x-promoted', 2)];
+    expect(alertWave.judgeAttentionAlerts({ ...base, frames: [frame('acc-alert-x-opened', 1)] }).ok).toBe(false);
+    expect(alertWave.judgeAttentionAlerts({ ...base, frames: [...ok, frame('acc-alert-x-opened', 1)] }).ok).toBe(false);
+    expect(alertWave.judgeAttentionAlerts({ ...base, frames: [frame('acc-alert-x-opened', 1), frame('acc-alert-x-promoted', 3)] }).ok).toBe(false);
+    expect(alertWave.judgeAttentionAlerts({ ...base, frames: [...ok, frame('acc-alert-x-cancel', 1)] }).ok).toBe(false);
+    expect(alertWave.judgeAttentionAlerts({ ...base, socketOpen: false, frames: ok }).ok).toBe(false);
+    expect(alertWave.judgeAttentionAlerts({ ...base, sends: { ...base.sends, promoted: 3 }, frames: ok }).ok).toBe(false);
+    expect(alertWave.judgeAttentionAlerts({ ...base, states: { opened: 'open', promoted: 'candidate' }, frames: ok }).ok).toBe(false);
+  });
+
+  it('runs last, after the owner board wave', () => {
+    expect(fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks.cjs'), 'utf8'))
+      .toMatch(/\(\) => wave10\(inst, helpers\), \(\) => waveAttentionAlert\(inst, helpers\)\];/);
+  });
 });
