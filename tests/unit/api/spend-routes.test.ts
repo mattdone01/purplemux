@@ -333,9 +333,15 @@ describe('spend routes', () => {
       expect(view.cacheReadPerLandedItem.day).toMatchObject({ cacheReadTokens: 40_000_000, landedItems: 1, value: 40_000_000 });
       expect(view.cacheReadPerLandedItem['7d']).toMatchObject({ cacheReadTokens: 60_000_000, landedItems: 2, value: 30_000_000 });
       const { getFinderSpend } = await import('@/lib/spend/spend-service');
-      const finder = await getFinderSpend('ws-a');
-      expect(finder).toMatchObject({ cacheReadTokens: 60_000_000, index: { state: 'ready' }, since: Date.parse(`${utc(Date.now() - 6 * DAY)}T00:00:00Z`) });
-      expect(finder.cacheReadTokensPerLandedItem['7d'].value).toBe(30_000_000);
+      const finder = await getFinderSpend(['ws-a', 'ws-b']);
+      expect(finder).toMatchObject({ index: { state: 'ready' }, since: Date.parse(`${utc(Date.now() - 6 * DAY)}T00:00:00Z`) });
+      expect(finder.byWorkspace.get('ws-a')).toMatchObject({
+        cacheReadTokens: 60_000_000, landedRanges: 2, cacheReadTokensPerLandedItem: { window: '7d', value: 30_000_000, landedItems: 2 },
+      });
+      expect(finder.byWorkspace.get('ws-b')).toMatchObject({
+        costUsd: 0, cacheReadTokens: 0, landedRanges: null,
+        cacheReadTokensPerLandedItem: { value: null, reason: 'the ledger holds no items for this workspace yet' },
+      });
     });
 
     it.each([

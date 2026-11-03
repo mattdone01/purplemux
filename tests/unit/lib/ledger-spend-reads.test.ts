@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -30,6 +31,37 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+const agreeOverRandomStreams = (store: LedgerStore): void => {
+  let seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  for (let stream = 0; stream < 40; stream++) {
+    const ws = `ws-p${stream}`;
+    const keys = ['range:p:1', 'range:p:2', 'range:p:3', 'slice:p'];
+    const sent: ILedgerEventInput[] = [];
+    const lastSeq = new Map<string, number>();
+    const oracle: number[] = [];
+    for (let n = 0; n < 40; n++) {
+      const key = keys[Math.floor(rand() * keys.length)];
+      const at = T0 + Math.floor(rand() * 40) * 60 * MIN;
+      const pick = rand();
+      const event = sent.length && pick < 0.12 ? { ...sent[Math.floor(rand() * sent.length)], event_id: `re-${n}` }
+        : pick < 0.4 ? ev(`e${n}`, at, key, 'open')
+          : pick < 0.75 ? ev(`e${n}`, at, key, 'close', { state: rand() < 0.75 ? 'landed' : (rand() < 0.5 ? 'dropped' : null) })
+            : ev(`e${n}`, at, key, 'wait', { wait_reason: 'not-armed', holder: 'tab-1' });
+      sent.push(event);
+      store.append(ws, rand() < 0.5 ? 'v2' : 'backfill', [event], T0 + 2 * DAY_MS);
+      const row = store.items(ws, {}, T0 + 2 * DAY_MS).items.find((item) => item.itemKey === event.item_key);
+      const applied = row !== undefined && row.lastSeq !== lastSeq.get(event.item_key);
+      if (row) lastSeq.set(event.item_key, row.lastSeq);
+      if (applied && event.kind === 'close' && event.item_type === 'range' && event.state === 'landed') oracle.push(row!.closedAt!);
+    }
+    expect(store.landedRanges(ws, 0, T0 + 3 * DAY_MS), ws).toBe(oracle.length);
+    for (const [from, to] of [[T0, T0 + 10 * 60 * MIN], [T0 + 10 * 60 * MIN, T0 + DAY_MS]]) {
+      expect(store.landedRanges(ws, from, to), `${ws} ${from}`).toBe(oracle.filter((at) => at >= from && at < to).length);
+    }
+  }
+};
+
 describe('landedRanges (harness-flow-loop 04 AC 4, 04-F5)', () => {
   it('counts close events with state landed on ranges inside [since, until), one workspace only', () => {
     append([
@@ -57,10 +89,76 @@ describe('landedRanges (harness-flow-loop 04 AC 4, 04-F5)', () => {
     expect(store.items(WS, {}, T0 + DAY_MS).items.find((item) => item.itemKey === 'range:a:2')?.state).toBe('landed');
   });
 
+  it('counts only a close that landed the item: not a second close under a new id, not a close for an item never opened (04-F7)', () => {
+    append([
+      ev('o1', T0, 'range:a:1', 'open'), ev('c1', T0 + MIN, 'range:a:1', 'close', { state: 'landed' }),
+      ev('c1-again', T0 + 2 * MIN, 'range:a:1', 'close', { state: 'landed' }),
+      ev('ghost', T0 + MIN, 'range:a:9', 'close', { state: 'landed' }),
+    ]);
+    expect(store.landedRanges(WS, T0, T0 + DAY_MS)).toBe(1);
+  });
+
+  it('counts a range that a backfill re-sends after live producers landed it once (04-C1, the architect\'s case)', () => {
+    const result = (events: ILedgerEventInput[], producer: string) => store.append(WS, producer, events, events.at(-1)!.at);
+    result([ev('o', T0, 'range:a:1', 'open'), ev('c', T0 + 2 * 60 * MIN, 'range:a:1', 'close', { state: 'landed' })], 'v2');
+    const resent = result([ev('o', T0, 'range:a:1', 'open'), ev('c', T0 + 2 * 60 * MIN, 'range:a:1', 'close', { state: 'landed' })], 'backfill');
+    expect(resent).toMatchObject({ accepted: 2, closedItem: 2 });
+    expect(store.landedRanges(WS, T0, T0 + DAY_MS)).toBe(1);
+  });
+
+  it('agrees with the store\'s own projection over random streams with late, repeated and re-sent events (04-C1)', () => {
+    const memory = new LedgerStore(':memory:');
+    try {
+      agreeOverRandomStreams(memory);
+    } finally {
+      memory.close();
+    }
+    // 1,600 append-and-read round trips: about 0.3 s on a quiet host, several times that under a loaded full-suite gate.
+  }, 20_000);
+
+  it('counts a landing whose open is older than the scan, and not a repeat close of a range closed before it (04-F7)', () => {
+    const since = T0 + 10 * DAY_MS;
+    append([ev('o1', T0, 'range:a:1', 'open'), ev('o2', T0, 'range:a:2', 'open'), ev('c2', T0 + MIN, 'range:a:2', 'close', { state: 'landed' })]);
+    append([ev('c1', since + MIN, 'range:a:1', 'close', { state: 'landed' }), ev('c2-late', since + MIN, 'range:a:2', 'close', { state: 'landed' })]);
+    expect(store.landedRanges(WS, since, since + DAY_MS)).toBe(1);
+    expect(store.landedRanges(WS, T0, since + DAY_MS)).toBe(2);
+  });
+
   it('reads the first item\'s open time, null for a workspace with none', () => {
     append([ev('o1', T0 + MIN, 'range:a:1', 'open'), ev('o2', T0, 'slice:a', 'open')]);
     expect(store.firstOpenedAt(WS)).toBe(T0);
     expect(store.firstOpenedAt('ws-none')).toBeNull();
+    expect(store.holdsItems(WS)).toBe(true);
+    expect(store.holdsItems('ws-none')).toBe(false);
+  });
+});
+
+describe('the landings table (04-C1)', () => {
+  it('is filled once from the stored events when a ledger written before it is opened, and never again', () => {
+    const file = path.join(dir, 'ledger.sqlite');
+    append([
+      ev('o1', T0, 'range:a:1', 'open'), ev('c1', T0 + MIN, 'range:a:1', 'close', { state: 'landed' }),
+      ev('c1-again', T0 + 2 * MIN, 'range:a:1', 'close', { state: 'landed' }),
+      ev('r1', T0 + 3 * MIN, 'range:a:1', 'open'), ev('c1b', T0 + 4 * MIN, 'range:a:1', 'close', { state: 'landed' }),
+      ev('ghost', T0, 'range:a:9', 'close', { state: 'landed' }),
+    ]);
+    store.close();
+    const raw = new Database(file);
+    raw.exec('DROP TABLE landings');
+    raw.close();
+    store = new LedgerStore(file);
+    expect(store.landedRanges(WS, T0, T0 + DAY_MS)).toBe(2);
+    store.close();
+    store = new LedgerStore(file);
+    expect(store.landedRanges(WS, T0, T0 + DAY_MS)).toBe(2);
+    expect(store.pragma('user_version')).toBe(1);
+  });
+
+  it('leaves the landings with the events past retention', async () => {
+    append([ev('o1', T0, 'range:a:1', 'open'), ev('c1', T0 + MIN, 'range:a:1', 'close', { state: 'landed' })]);
+    const result = await store.runRetention(T0 + 93 * DAY_MS);
+    expect(result.landings).toBe(1);
+    expect(store.landedRanges(WS, 0, T0 + DAY_MS)).toBe(0);
   });
 });
 

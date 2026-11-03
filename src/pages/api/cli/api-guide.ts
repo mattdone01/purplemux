@@ -912,8 +912,9 @@ GET /api/cli/spend/phases?workspaceId=WS[&day=YYYY-MM-DD]   (purplemux spend pha
   with usage x 5 min; null for usage with no message time), plus "day" and
   "cacheReadPerLandedItem": { "day": M, "7d": M }, M = { "metric":
   "cache_read_tokens_per_landed_item", "window", "from", "to", "cacheReadTokens", "landedItems"
-  (close events with state landed on range items in the window; null when the ledger cannot be
-  read or holds no item for the workspace), "value" (null when not measured), "reason" (why not
+  (range landings the store's projection applied in the window, one per applied close with state
+  landed: a repeat, orphan or re-sent close counts none; null when the ledger cannot be read or holds
+  no item for the workspace), "value" (null when not measured), "reason" (why not
   measured, else null) }.
 
 ## Ledger (ADR-0033)
@@ -1084,7 +1085,8 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   one per (producer of the last event, item type), subject "<producer>/<type>", "<item> silent for <n>
   min (threshold <t> min)"; threshold max(10
   min, 2 x the type's 7-day p90 lifetime), unknown under 20 closed), cost-per-landed-item (spend over
-  the last 7 UTC days / ranges closed landed over the same days; never flagged).
+  the last 7 UTC days / ranges closed landed over the same days, from close events; never flagged),
+  cache-read-per-landed-item (cache-read tokens / the same landed ranges, 7 d; never flagged).
   labels and reasonLabel are the owner's words for the tokens (src/lib/constraint-labels.ts); line and
   the text form use only them. stuck is the 50 oldest waits, capped after the mine filter;
   stuckTotal is how many matched (the text form prints "50 of N").

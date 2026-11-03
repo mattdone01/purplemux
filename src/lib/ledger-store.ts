@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { brandCodedError } from '@/lib/coded-error';
-import { foldLedgerEvent, parseAttrs, PHASE_REPLAY_LOOKBACK_MS, silentFor } from '@/lib/ledger-fold';
+import { foldLedgerEvent, isLanding, parseAttrs, PHASE_REPLAY_LOOKBACK_MS, silentFor } from '@/lib/ledger-fold';
 import type { ILedgerItemRow } from '@/lib/ledger-fold';
 import {
   DAY_MS,
@@ -79,6 +79,7 @@ export interface ILedgerPhaseReplay {
 
 const CARRIED_CHUNK = 500;
 
+
 interface IIntervalRow {
   item_key: string;
   item_type: TLedgerItemType;
@@ -126,6 +127,7 @@ export interface ILedgerWaitsQuery {
 export interface ILedgerRetentionResult {
   events: number;
   intervals: number;
+  landings: number;
   tabEvents: number;
   items: number;
   rollups: number;
@@ -248,6 +250,7 @@ export class LedgerStore {
       this.database.pragma('busy_timeout = 5000');
       this.database.pragma('synchronous = FULL');
       this.migrate();
+      this.ensureLandings();
     } catch (error) {
       // A refused file (a newer schema) must not leave a handle open for every request that tries it.
       this.database.close();
@@ -304,6 +307,41 @@ export class LedgerStore {
       CREATE TABLE ledger_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
       PRAGMA user_version = ${SCHEMA_VERSION};
     `))();
+  };
+
+  private recordLanding = (workspaceId: string, itemKey: string, at: number, seq: number): void => {
+    this.database.prepare('INSERT OR IGNORE INTO landings (event_seq, workspace_id, item_key, at) VALUES (?, ?, ?, ?)')
+      .run(seq, workspaceId, itemKey, at);
+  };
+
+  /**
+   * The `landings` table (04-C1), additive like `tab_events`' columns (ADR-0035): created on the first
+   * open of a ledger that lacks it, and filled once in the same transaction by folding the stored range
+   * events with the store's own fold, so a ledger written before it counts its landings. `user_version`
+   * stays 1. The fold runs on range events alone: a landing's open or close can move a range's clock
+   * (the land-queue split), which only a full replay would mirror, so a backfilled landing time can sit
+   * up to that split later than the live one; new landings are written by `project` itself.
+   */
+  private ensureLandings = (): void => {
+    if (this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'landings'").get()) return;
+    this.database.transaction(() => {
+      this.database.exec(`CREATE TABLE landings (event_seq INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL, item_key TEXT NOT NULL,
+          at INTEGER NOT NULL);
+        CREATE INDEX landings_ws_at_idx ON landings(workspace_id, at);`);
+      const rows = new Map<string, IItemRow>();
+      const found: Array<[string, string, number, number]> = [];
+      const events = this.database.prepare(`SELECT seq, workspace_id, at, item_type, item_key, kind, state, wait_reason, holder,
+          clear_input, parent_key FROM events WHERE item_type = 'range' ORDER BY seq`)
+        .iterate() as IterableIterator<TLedgerReplayEvent & { workspace_id: string }>;
+      for (const { workspace_id: workspaceId, ...event } of events) {
+        const key = `${workspaceId}\u0000${event.item_key}`;
+        const fold = foldLedgerEvent(workspaceId, rows.get(key), { ...event, event_id: '' }, event.seq, () => LAND_QUEUE_HEAD_BLOCKED);
+        if (!fold.applied) continue;
+        rows.set(key, fold.item);
+        if (isLanding(fold, event)) found.push([workspaceId, event.item_key, fold.at, event.seq]);
+      }
+      for (const [workspaceId, itemKey, at, seq] of found) this.recordLanding(workspaceId, itemKey, at, seq);
+    })();
   };
 
   private getItem = (workspaceId: string, itemKey: string): IItemRow | undefined =>
@@ -379,6 +417,7 @@ export class LedgerStore {
         clear_input = excluded.clear_input, parent_key = excluded.parent_key, attrs_json = excluded.attrs_json,
         last_seq = excluded.last_seq, last_event_at = excluded.last_event_at`).run(item);
     if (item.item_type === 'landing' && (reopened || closing)) intervals += this.resplitLandQueue(workspaceId, at);
+    if (isLanding(fold, event)) this.recordLanding(workspaceId, item.item_key, at, seq);
     return { intervals, closedItem: false, orphan: false };
   };
 
@@ -450,13 +489,18 @@ export class LedgerStore {
       WHERE workspace_id = ? AND "end" > ? AND start < ? ORDER BY start, id`).all(workspaceId, since, until) as IIntervalRow[];
 
   /**
-   * Landings in [since, until): `close` events with state `landed` on `range` items, read on the `at`
-   * index. Each close counts, so a range reopened and landed again counts twice; a close with no state
-   * counts none. The one landed count of cache reads per landed item and the constraint finder.
+   * Landings in [since, until): the rows `project` wrote when it applied a `close` with state `landed` to a
+   * `range` (04-C1), so the count is the store's own. A re-sent, repeated or orphan close counts none; a
+   * range reopened and landed again counts each landing. The one landed count of cache reads per landed
+   * item and the constraint finder.
    */
   landedRanges = (workspaceId: string, since: number, until: number): number =>
-    (this.database.prepare(`SELECT COUNT(*) AS n FROM events WHERE at >= ? AND at < ? AND workspace_id = ?
-      AND item_type = 'range' AND kind = 'close' AND state = 'landed'`).get(since, until, workspaceId) as { n: number }).n;
+    (this.database.prepare('SELECT COUNT(*) AS n FROM landings WHERE workspace_id = ? AND at >= ? AND at < ?')
+      .get(workspaceId, since, until) as { n: number }).n;
+
+  /** Whether the ledger holds any item for the workspace (a seek on the items primary key). */
+  holdsItems = (workspaceId: string): boolean =>
+    (this.database.prepare('SELECT EXISTS (SELECT 1 FROM items WHERE workspace_id = ?) AS held').get(workspaceId) as { held: number }).held === 1;
 
   /** The earliest `opened_at` of the workspace's items; null when the ledger holds none for it. */
   firstOpenedAt = (workspaceId: string): number | null =>
@@ -732,6 +776,7 @@ export class LedgerStore {
     return {
       events: await this.deleteInChunks('DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at < ? LIMIT ?)', [cutoff]),
       intervals,
+      landings: await this.deleteInChunks('DELETE FROM landings WHERE event_seq IN (SELECT event_seq FROM landings WHERE at < ? LIMIT ?)', [cutoff]),
       tabEvents: await this.deleteInChunks('DELETE FROM tab_events WHERE seq IN (SELECT seq FROM tab_events WHERE at < ? LIMIT ?)', [cutoff]),
       items: await this.deleteInChunks(`DELETE FROM items WHERE (workspace_id, item_key) IN (SELECT workspace_id, item_key FROM items
         WHERE closed_at IS NOT NULL AND closed_at < ? LIMIT ?)`, [cutoff]),

@@ -283,18 +283,19 @@ const LABELS: Record<TFinderAnomalyId, string> = {
   'unknown-share': 'unknown share',
   'producer-silence': 'producer silence',
   'cost-per-landed-item': 'cost per landed item',
+  'cache-read-per-landed-item': 'cache reads per landed item',
 };
 
 const WORKSPACE_SUBJECT = 'workspace';
 
 const ANOMALY_WINDOWS: Record<TFinderAnomalyId, IFinderAnomaly['window']> = {
   're-gates': '24h', 'rework-rate': '24h', 'context-per-call': 'now', 'wakes-per-hour': '6h',
-  'unknown-share': '24h', 'producer-silence': 'now', 'cost-per-landed-item': '7d',
+  'unknown-share': '24h', 'producer-silence': 'now', 'cost-per-landed-item': '7d', 'cache-read-per-landed-item': '7d',
 };
 
 const ANOMALY_UNITS: Record<TFinderAnomalyId, string> = {
   're-gates': 'gates', 'rework-rate': 'share', 'context-per-call': 'tokens', 'wakes-per-hour': 'per hour',
-  'unknown-share': 'share', 'producer-silence': 'min', 'cost-per-landed-item': 'USD',
+  'unknown-share': 'share', 'producer-silence': 'min', 'cost-per-landed-item': 'USD', 'cache-read-per-landed-item': 'tokens',
 };
 
 const formatValue = (value: number, unit: string): string => {
@@ -454,14 +455,14 @@ const producerSilence = ({ ledger, now }: IAnomalyContext): IFinderAnomaly[] => 
   });
 };
 
-const costPerLandedItem = ({ ledger, spend, now }: IAnomalyContext): IFinderAnomaly[] => {
+const costPerLandedItem = ({ spend }: IAnomalyContext): IFinderAnomaly[] => {
   const unknown = (reason: string) => [anomaly('cost-per-landed-item', '7d', 'USD', { value: null, threshold: null, reason })];
   if (!spend) return unknown('spend not read');
   if (spend.index.state !== 'ready') return unknown(`spend index ${spend.index.state}`);
   if (spend.costUsd === null) return unknown('a model in the window has no known price');
-  // The spend view counts whole UTC days, so the landings are counted over the same days.
-  const landed = ledger.items.filter((item) => item.itemType === 'range' && item.state === 'landed'
-    && item.closedAt !== null && item.closedAt >= spend.since && item.closedAt <= now).length;
+  // One landed count (ledger-store.landedRanges) over the spend's own UTC days serves this and the cache-read metric.
+  const landed = spend.landedRanges;
+  if (landed === null) return unknown(spend.cacheReadTokensPerLandedItem.reason ?? 'landed ranges not read from the ledger');
   if (!landed) return unknown('no range landed');
   return [anomaly('cost-per-landed-item', '7d', 'USD', {
     value: spend.costUsd / landed, threshold: null, detail: `over ${landed} landed ranges`,
@@ -469,8 +470,18 @@ const costPerLandedItem = ({ ledger, spend, now }: IAnomalyContext): IFinderAnom
   })];
 };
 
+/** Story 04's `cache_read_tokens_per_landed_item` (7 d), reported and never flagged; not measured carries its reason. */
+const cacheReadPerLandedItem = ({ spend }: IAnomalyContext): IFinderAnomaly[] => {
+  const metric = spend?.cacheReadTokensPerLandedItem;
+  return [anomaly('cache-read-per-landed-item', '7d', 'tokens', {
+    value: metric ? metric.value : null, threshold: null, flaggable: false,
+    reason: metric ? metric.reason : 'spend not read',
+    ...(metric && metric.value !== null ? { detail: `over ${metric.landedItems} landed ranges` } : {}),
+  })];
+};
+
 const ANOMALY_RULES: ReadonlyArray<(ctx: IAnomalyContext) => IFinderAnomaly[]> = [
-  reGates, reworkRate, contextPerCall, wakesPerHour, unknownShareAnomaly, producerSilence, costPerLandedItem,
+  reGates, reworkRate, contextPerCall, wakesPerHour, unknownShareAnomaly, producerSilence, costPerLandedItem, cacheReadPerLandedItem,
 ];
 
 const status = (state: IFinderInputStatus['state'], reason: string | null, at: number | null): IFinderInputStatus => ({ state, reason, at });
@@ -511,6 +522,7 @@ const CONSTANT_THRESHOLDS: Record<TFinderAnomalyId, number | null> = {
   'unknown-share': ANOMALY_THRESHOLDS.unknownShare,
   'producer-silence': null,
   'cost-per-landed-item': null,
+  'cache-read-per-landed-item': null,
 };
 
 /** Every anomaly, unknown for the one reason the ledger measures were not taken. */

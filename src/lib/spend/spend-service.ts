@@ -15,8 +15,9 @@ import type { ISpendBindingRef, ISpendWorkspaceRef, TSpendLandedRead } from '@/l
 import { buildSpendHoldings, ledgerHorizon } from '@/lib/spend/spend-phase';
 import type { ISpendHoldings } from '@/lib/spend/spend-phase';
 import { getLedgerStore } from '@/lib/ledger-store';
+import type { IFinderSpendAll } from '@/types/constraint';
 import type {
-  ISpendIndexStatus, ISpendLandingMetric, ISpendPhasesView, ISpendTokensByDay, ISpendView, TSpendBy, TSpendPeriod,
+  ISpendLandingMetric, ISpendPhasesView, ISpendTokensByDay, ISpendView, TSpendBy, TSpendPeriod,
 } from '@/types/spend';
 
 const log = createLogger('spend');
@@ -132,7 +133,7 @@ const loadHoldings = (workspaceId: string, from: string, to: string, now: number
 const landedIn = (workspaceId: string, from: string, to: string, now: number): TSpendLandedRead => {
   try {
     const store = getLedgerStore();
-    if (store.firstOpenedAt(workspaceId) === null) return { state: 'empty' };
+    if (!store.holdsItems(workspaceId)) return { state: 'empty' };
     return { state: 'read', landed: store.landedRanges(workspaceId, dayStart(from), Math.min(now + 1, dayStart(to) + DAY_MS)) };
   } catch (error) {
     log.warn(`spend: landed ranges not read for ${workspaceId}: ${(error as Error).message}`);
@@ -208,17 +209,30 @@ export const getSpendPhases = async (workspaceId: string, day: string, now = Dat
 };
 
 /**
- * The spend the constraint finder joins (ADR-HFL-02; story 03's `IFinderSpendInput` plus the
- * per-landing metric): the last 7 UTC days ending today.
+ * The finder's one spend read per tick (ADR-0034; story 04 owns the join): one by-workspace view of the
+ * last 7 UTC days, and per workspace its landed ranges and `cache_read_tokens_per_landed_item` over
+ * the same days, from the one landed count (`ledger-store.landedRanges`).
  */
-export const getFinderSpend = async (workspaceId: string, now = Date.now()): Promise<{
-  index: ISpendIndexStatus; since: number; costUsd: number | null; cacheReadTokens: number;
-  cacheReadTokensPerLandedItem: { day: ISpendLandingMetric; '7d': ISpendLandingMetric };
-}> => {
-  const { week, ...metric } = await getCacheReadPerLandedItem(workspaceId, utcDay(now), now);
+export const getFinderSpend = async (workspaceIds: readonly string[], now = Date.now()): Promise<IFinderSpendAll> => {
+  const to = utcDay(now);
+  const from = addUtcDays(to, -6);
+  const view = await getSpendView({ workspaceId: 'all', from, to, by: 'workspace' }, now);
+  const rows = new Map(view.rows.map((row) => [row.key, row]));
   return {
-    index: week.index, since: dayStart(week.from), costUsd: week.totals.costUsd, cacheReadTokens: week.totals.cacheReadTokens,
-    cacheReadTokensPerLandedItem: metric,
+    index: view.index,
+    since: dayStart(from),
+    byWorkspace: new Map(workspaceIds.map((workspaceId) => {
+      // A workspace with no row in the by-workspace view used no tokens in these days.
+      const row = rows.get(workspaceId);
+      const cacheReadTokens = row?.cacheReadTokens ?? 0;
+      const landed = landedIn(workspaceId, from, to, now);
+      return [workspaceId, {
+        costUsd: row ? row.costUsd : 0,
+        cacheReadTokens,
+        landedRanges: landed.state === 'read' ? landed.landed : null,
+        cacheReadTokensPerLandedItem: landingMetric('7d', from, to, cacheReadTokens, landed, view.index.state),
+      }];
+    })),
   };
 };
 

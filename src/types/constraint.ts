@@ -1,6 +1,6 @@
 import type { ILedgerItem, TLedgerIntervalReason, TLedgerItemType, TLedgerStage } from '@/types/ledger';
 import type { IFlowRecord } from '@/types/flow';
-import type { ISpendIndexStatus } from '@/types/spend';
+import type { ISpendIndexStatus, ISpendLandingMetric } from '@/types/spend';
 
 // The constraint finder (ADR-0034): inputs the 60 s tick reads, and the answer it caches per
 // workspace. Every measure that rests on a missing input is `null` with a reason, never 0.
@@ -50,6 +50,17 @@ export interface IFinderSpendInput {
   /** Over the UTC days from `since` to today; null when a model has no known price. */
   costUsd: number | null;
   cacheReadTokens: number;
+  /** Ranges closed `landed` from `since` to now (`ledger-store.landedRanges`); null when the ledger cannot say. */
+  landedRanges: number | null;
+  /** `cache_read_tokens_per_landed_item` over the same days (story 04 AC 4), with its reason when not measured. */
+  cacheReadTokensPerLandedItem: ISpendLandingMetric;
+}
+
+/** One spend read for every workspace (`getFinderSpend`): the index state, the first UTC day's start, each workspace's input. */
+export interface IFinderSpendAll {
+  index: IFinderSpendInput['index'];
+  since: number;
+  byWorkspace: Map<string, Omit<IFinderSpendInput, 'index' | 'since'>>;
 }
 
 export interface IFinderPoolHost {
@@ -112,7 +123,8 @@ export type TFinderAnomalyId =
   | 'wakes-per-hour'
   | 'unknown-share'
   | 'producer-silence'
-  | 'cost-per-landed-item';
+  | 'cost-per-landed-item'
+  | 'cache-read-per-landed-item';
 
 export interface IFinderAnomaly {
   id: TFinderAnomalyId;

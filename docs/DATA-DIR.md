@@ -339,9 +339,11 @@ file from `mission-control.sqlite`, so the high-volume feed never couples to the
 Tables: `events` (append-only; `event_key`, 12 bytes of SHA-256 over the workspace, the producer and its `event_id`, is unique, so a replayed batch or spool is skipped), `items`
 (the projection per `(workspace_id, item_key)`), `intervals` (one row per finished wait, written in the transaction of
 the event that ends it), `rollups_daily` (per UTC day, item type and reason), `tab_events` (ADR-HFL-05; written by a
-later story), `experiments` (ADR-HFL-03) and `ledger_meta` (rollup progress, each workspace's longest interval). A
+later story), `experiments` (ADR-HFL-03), `landings` (one row per range landing the projection applied, written in
+the event's transaction; created and filled once from the stored events on the first open of a ledger without it;
+harness-flow-loop 04) and `ledger_meta` (rollup progress, each workspace's longest interval). A
 daily job, 10 min after boot and then every 24 h, rolls up every day not yet rolled and every day a newly finished wait
-covers, then deletes events, intervals and tab events older than 92 days, items closed before then, and rollups older
+covers, then deletes events, intervals, landings and tab events older than 92 days, items closed before then, and rollups older
 than 400 days, in chunks of 5,000 rows. Not regeneratable: the events are the record.
 
 `ledger-tokens.json` (`src/lib/ledger-token.ts`) keeps `{ version: 1, tokens: [{ hash, workspaceId, producer,

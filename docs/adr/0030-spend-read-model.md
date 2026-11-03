@@ -114,9 +114,12 @@ day only, so no message could be placed in time; the work-item ledger (ADR-0033)
      sighting under a new name is written even inside the hourly touch interval), else `tab:<id>` labelled "closed,
      name not recorded". With `all`, keys are `<ws>/<name>`.
    - `phase` and `item` serve at most 7 UTC days (400 `invalid-request` naming the cap, on both routes): the replay
-     below runs synchronously and reads up to 14 days of events. Measured (review, synthetic peak ledger): a 7-day
-     window is about 105,000 rows of the window itself, read in 179 ms, about 74 MB; an uncapped 99-day window was about
-     8-9 s and over 1 GB.
+     below runs synchronously from `since − 7 d`, so a capped window scans 14 days of events. Measured (review,
+     synthetic peak ledger, 15,000 events a day, host load 46-71): 210,001 rows, read in 431-666 ms, +147 MB heap, and
+     about 1.3-1.5 s of event-loop stall with the fold; an uncapped 99-day window was about 8-9 s and over 1 GB. That
+     is the bound the cap buys. It applies only on demand (an explicit `by=phase|item` request or `spend phases`); no
+     face polls it. Any face that would poll `by=phase|item` must first move the replay to a yielding read (`.iterate()`
+     with yields) or a per-day phase rollup: the cap alone does not make a polled read safe.
    - `phase` = the ledger item the tab held at the message's time, mapped by one fixed table; `item` = that item's key.
 2. **Message time.** Claude buckets gain `slot`, the UTC 5-minute start (ms); the bucket key is `(day, model,
    sessionId, slot)`. A live entry without `slotted: true` is read again from 0 once (its day totals are unchanged;
@@ -129,7 +132,13 @@ day only, so no message could be placed in time; the work-item ledger (ADR-0033)
    `until` on the `at` index, in arrival order. The replay folds them with `foldLedgerEvent` (`src/lib/ledger-fold.ts`),
    the same pure fold `project` now calls, so the store and the replay derive one projection. Each state is kept at
    the item's last move (`last_event_at`): a `link` does not move the clock, so a link that arrives before an earlier
-   move cannot unsort the item's timeline. A tab holds an item when
+   move cannot unsort the item's timeline. History more than 7 days before the window is not read, and every gap it
+   leaves resolves to "nothing held" (`other`, `no-held-item`), never to a wrong item (architect property probe:
+   164,486 checks, 0 mismatches with full history). Three cases: an item open at the scan start is held only from its
+   first scanned event; an item open at the scan start that later closed and reopened is not carried (its row's
+   `opened_at` is now inside the scan), so it is invisible until its reopen; an item closed before the scan and
+   reopened inside it loses the holder the fold would carry across the reopen, and is held by nobody until an event
+   names one. A tab holds an item when
    the item is open and its holder equals the tab's id or its name. Usage is evaluated at its slot's midpoint; of
    several held items the one with the latest event at or before then wins, the lowest key on a tie. Seat items never
    count.
@@ -152,10 +161,27 @@ day only, so no message could be placed in time; the work-item ledger (ADR-0033)
    `ISpendTokensByDay` gains `cacheReadTokens`.
 7. **`cache_read_tokens_per_landed_item`**, for a UTC day and the 7 UTC days ending on it (clipped to the spend floor):
    the workspace's cache-read tokens over the landed ranges in the window. One count serves it and the constraint
-   finder: `ledger-store.landedRanges` = `close` events with state `landed` on `range` items, on the `at` index (a
-   range reopened and landed again counts each landing; a close with no state counts none). Not measured (value null,
+   finder: `ledger-store.landedRanges`, a COUNT on the additive table `landings(event_seq PK, workspace_id, item_key,
+   at)` indexed on `(workspace_id, at)`. `project` writes a row in the append transaction exactly when the store's
+   fold applies a `close` with state `landed` to a `range` (`isLanding`, `src/lib/ledger-fold.ts`), stamped with the
+   item's `closed_at`; so a close the projection refuses counts none: a repeat close, a close for an item never opened,
+   and a backfill that re-sends the open and close of a range live producers already landed (the open is refused
+   because its `at` is not after `closed_at`, and so is its close). A range reopened and landed again counts each
+   landing; a close with no state counts none. A ledger that lacks the table gets it on its first open, filled once in
+   the same transaction by folding the stored range events with the same fold (`user_version` stays 1, the additive
+   pattern of ADR-0035; a backfilled landing time can sit up to a land-queue split later than the live one, since the
+   backfill folds range events alone). Measured on the synthetic peak ledger: the one-time fill of 92 days (91,000
+   landings) 5.1 s on first open, reopen 1 ms; `landedRanges` over 7 days 0.4-0.5 ms (7,000 landings). The ledger's
+   retention job deletes landings older than 92 days with the events. Not measured (value null,
    with the reason) when the ledger cannot be read, holds no item for the workspace yet, the index is not ready, or no
-   range landed. Served by `GET /api/cli/spend/phases` and read by the constraint finder through `getFinderSpend`.
+   range landed. Served by `GET /api/cli/spend/phases`. The constraint finder (ADR-0034) reads it through
+   `getFinderSpend(workspaceIds, now)`: its one spend read per tick, a by-workspace view of the last 7 UTC days plus,
+   per workspace, `landedRanges` and the metric; both `cost-per-landed-item` and the reported
+   `cache-read-per-landed-item` anomaly divide by that one count. The ledger part of the finder's tick: the architect
+   measured about 0.1 s per tick at the synthetic peak with the earlier events scan (`firstOpenedAt` 43-101 ms warm,
+   the 7-day scan 54-59 ms for the loaded workspace, about 21 ms for each other workspace), growing with the number of
+   workspaces; with the `landings` count and the `holdsItems` primary-key seek for "holds no item" it is under 1 ms
+   per workspace (0.4-0.5 ms and 0.02-0.09 ms). The by-workspace spend view is the tick's other spend cost.
 8. **`purplemux spend phases -w WS [--day D]`** (`GET /api/cli/spend/phases`): one UTC day by phase with wall time =
    distinct 5-minute slots in which usage resolved to the row × 5 min (a union per row; rows overlap, so they may sum
    above the total; null for usage with no message time), tokens by kind, est. cost, and the metric for the day and 7 d.

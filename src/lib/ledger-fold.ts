@@ -40,6 +40,13 @@ export type TLedgerFold =
   | { applied: false; orphan: boolean; closedItem: boolean }
   | { applied: true; item: ILedgerItemRow; intervals: ILedgerFoldInterval[]; reopened: boolean; closing: boolean; at: number };
 
+/**
+ * The store's one landing rule (04-C1): an applied `close` with state `landed` that closes a `range`. A
+ * close the projection refused (a repeat, an item never opened, a late re-sent open's close) is none.
+ */
+export const isLanding = (fold: TLedgerFold, event: Pick<ILedgerEventInput, 'state'>): boolean =>
+  fold.applied && fold.closing && fold.item.item_type === 'range' && event.state === 'landed';
+
 export const isLandQueue = (reason: string | null): boolean =>
   reason === LAND_QUEUE_LOCK_BUSY || reason === LAND_QUEUE_HEAD_BLOCKED;
 

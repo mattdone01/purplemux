@@ -1,6 +1,6 @@
 import { FINDER_LOOKBACK_MS, FINDER_WAKES_WINDOW_MS, deriveConstraint } from '@/lib/constraint';
 import { createLogger } from '@/lib/logger';
-import type { IFinderLedgerInput, IFinderPoolInput, IFinderResult, IFinderSpendInput } from '@/types/constraint';
+import type { IFinderLedgerInput, IFinderPoolInput, IFinderResult, IFinderSpendAll, IFinderSpendInput } from '@/types/constraint';
 import type { IFlowRecord } from '@/types/flow';
 
 // The finder's tick (ADR-0034, the ADR-0032 pattern): every 60 s, per process, derive each
@@ -15,20 +15,13 @@ export const FINDER_SLOW_WORKSPACE_MS = 1_000;
 /** An answer older than two ticks is stale: the tick that should have replaced it did not run. */
 export const FINDER_STALE_MS = 2 * FINDER_TICK_MS;
 
-/** One spend read for every workspace: the index state, the first UTC day's start, and each workspace's totals. */
-export interface IFinderSpendAll {
-  index: IFinderSpendInput['index'];
-  since: number;
-  byWorkspace: Map<string, Pick<IFinderSpendInput, 'costUsd' | 'cacheReadTokens'>>;
-}
-
 export interface IFinderDeps {
   workspaces: () => Promise<Array<{ id: string }>>;
   /** Throws when the ledger cannot be read. */
   ledger: (workspaceId: string, now: number) => Promise<IFinderLedgerInput>;
   flow: (workspaceId: string) => Promise<IFlowRecord | null>;
-  /** Read once per tick, not once per workspace. */
-  spend: (now: number) => Promise<IFinderSpendAll | null>;
+  /** Read once per tick for the tick's workspaces, not once per workspace. */
+  spend: (workspaceIds: readonly string[], now: number) => Promise<IFinderSpendAll | null>;
   /** No pool scheduler yet (ADR-HFL-09, story 17): null is an unknown pool. */
   pool: () => Promise<IFinderPoolInput | null>;
 }
@@ -60,17 +53,21 @@ const orNull = async <T>(read: () => Promise<T | null>, what: string, workspaceI
   }
 };
 
-/** A workspace with no row in a ready spend view spent nothing in its days. */
-export const spendFor = (all: IFinderSpendAll | null, workspaceId: string): IFinderSpendInput | null =>
-  all ? { index: all.index, since: all.since, ...(all.byWorkspace.get(workspaceId) ?? { costUsd: 0, cacheReadTokens: 0 }) } : null;
+/** The workspace's part of the tick's spend read; unknown (null) for a workspace the read did not cover. */
+export const spendFor = (all: IFinderSpendAll | null, workspaceId: string): IFinderSpendInput | null => {
+  const own = all?.byWorkspace.get(workspaceId);
+  return all && own ? { index: all.index, since: all.since, ...own } : null;
+};
 
 interface IShared {
   spend: IFinderSpendAll | null;
   pool: IFinderPoolInput | null;
 }
 
-const readShared = async (deps: IFinderDeps, now: number): Promise<IShared> => {
-  const [spend, pool] = await Promise.all([orNull(() => deps.spend(now), 'spend', 'all'), orNull(() => deps.pool(), 'pool', 'all')]);
+const readShared = async (deps: IFinderDeps, workspaceIds: readonly string[], now: number): Promise<IShared> => {
+  const [spend, pool] = await Promise.all([
+    orNull(() => deps.spend(workspaceIds, now), 'spend', 'all'), orNull(() => deps.pool(), 'pool', 'all'),
+  ]);
   return { spend, pool };
 };
 
@@ -95,7 +92,7 @@ export const runConstraintTick = async (deps: IFinderDeps, now: number, clock: (
   const workspaces = await deps.workspaces();
   const ids = new Set(workspaces.map((w) => w.id));
   for (const key of cache().keys()) if (!ids.has(key)) cache().delete(key);
-  const shared = await readShared(deps, now);
+  const shared = await readShared(deps, workspaces.map((w) => w.id), now);
   for (const { id } of workspaces) await deriveForWorkspace(deps, id, now, shared, clock);
   return workspaces.length;
 };
@@ -105,17 +102,7 @@ const realDeps = (): IFinderDeps => ({
   ledger: async (workspaceId, now) => (await import('@/lib/ledger-store')).getLedgerStore()
     .finderSnapshot(workspaceId, { since: now - FINDER_LOOKBACK_MS, wakesSince: now - FINDER_WAKES_WINDOW_MS }, now),
   flow: async (workspaceId) => (await import('@/lib/flow-store')).readFlow(workspaceId),
-  spend: async (now) => {
-    const { getSpendView } = await import('@/lib/spend/spend-service');
-    const { addUtcDays, utcDay } = await import('@/lib/spend/spend-model');
-    const from = addUtcDays(utcDay(now), -6);
-    const view = await getSpendView({ workspaceId: 'all', from, to: utcDay(now), by: 'workspace' }, now);
-    return {
-      index: view.index,
-      since: Date.parse(`${from}T00:00:00Z`),
-      byWorkspace: new Map(view.rows.map((row) => [row.key, { costUsd: row.costUsd, cacheReadTokens: row.cacheReadTokens }])),
-    };
-  },
+  spend: async (workspaceIds, now) => (await import('@/lib/spend/spend-service')).getFinderSpend(workspaceIds, now),
   pool: async () => null,
 });
 
@@ -156,7 +143,7 @@ export const readFinderResult = async (
   const inflight = g.__ptConstraintInflight!;
   const running = inflight.get(workspaceId);
   if (running) return running;
-  const derive = readShared(deps, now)
+  const derive = readShared(deps, [workspaceId], now)
     .then((shared) => deriveForWorkspace(deps, workspaceId, now, shared, clock))
     .finally(() => inflight.delete(workspaceId));
   inflight.set(workspaceId, derive);
