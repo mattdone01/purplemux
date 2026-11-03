@@ -1,3 +1,4 @@
+import type { TWakeClass } from '@/types/tab-events';
 import type { TCliState, TToolName } from '@/types/timeline';
 import type { TPanelType } from '@/types/terminal';
 import type { ISessionHistoryEntry } from '@/types/session-history';
@@ -222,6 +223,8 @@ export interface IOrchestrationNudge {
   message: string;
   at: number;
   delivered: boolean;
+  /** How it reaches the tab (ADR-0035): a digest nudge is undelivered until the tab's next digest. */
+  wakeClass?: TWakeClass;
 }
 
 export interface IOrchestrationNudgeMessage {

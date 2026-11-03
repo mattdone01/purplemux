@@ -2185,6 +2185,78 @@ const cmdLedger = async (args) => {
   }
 };
 
+// ── events (ADR-0035) ────────────────────────────────────────────────────────
+const EVENTS_USAGE = [
+  'usage: events show -w WS [TAB] [--since T] [--limit N] [--json]',
+  '       events wakes -w WS [--since T] [--until T] [--by-day] [--json]',
+  'T is an age (90s, 15m, 1h, 7d), Unix ms or ISO-8601',
+].join('\n');
+
+const eventsPath = (wsId, route, qs) => `/api/cli/workspaces/${encodeURIComponent(wsId)}/events${route ? `/${route}` : ''}?${qs}`;
+
+const EVENT_TEXT_CHARS = 120;
+const firstLine = (text) => {
+  const line = text.replace(/\s+/g, ' ').trim();
+  return line.length > EVENT_TEXT_CHARS ? `${line.slice(0, EVENT_TEXT_CHARS - 1)}…` : line;
+};
+
+const eventDelivery = (event) => {
+  if (event.deliveredAt === null) return event.class === 'digest' ? 'waiting' : event.class === 'log' ? 'logged' : 'not delivered';
+  return `${new Date(event.deliveredAt).toISOString().slice(11, 19)}Z${event.digestId ? ` ${event.digestId}` : ''}`;
+};
+
+const cmdEventsShow = async (rest) => {
+  const wsId = ledgerWorkspace(rest);
+  const positional = stripFlags(rest, ['-w', '--workspace', '--since', '--limit']).filter((arg) => arg !== '--json');
+  if (positional.length > 1) die(EVENTS_USAGE);
+  const qs = new URLSearchParams({ since: flagValue(rest, '--since') ?? '1h' });
+  if (positional[0]) qs.set('tab', positional[0]);
+  const limit = flagValue(rest, '--limit');
+  if (limit !== null) qs.set('limit', limit);
+  requireEnv();
+  const { body } = await api('GET', eventsPath(wsId, '', qs));
+  if (rest.includes('--json')) return out(body);
+  process.stdout.write(`events ${wsId}${body.tabId ? ` ${body.tabId}` : ''} since ${new Date(body.since).toISOString()}: ${body.events.length}`
+    + `${body.truncated ? ' (newest shown; older ones match: narrow --since or raise --limit)' : ''}\n`);
+  const at = (event) => new Date(event.at).toISOString().slice(0, 19) + 'Z';
+  if (body.tabId) {
+    // One tab: every event whole, the text a digest points to (ADR-0035 §3).
+    for (const event of body.events) {
+      process.stdout.write(`\n${at(event)}  ${event.class}  ${event.kind}  ${eventDelivery(event)}\n`);
+      process.stdout.write(`${event.text.split('\n').map((line) => `  ${line}`).join('\n')}\n`);
+    }
+    return;
+  }
+  printTable(['AT', 'TAB', 'CLASS', 'KIND', 'DELIVERED', 'TEXT'], body.events.map((event) => [
+    at(event), event.tabId, event.class, event.kind, eventDelivery(event), firstLine(event.text),
+  ]));
+};
+
+const cmdEventsWakes = async (rest) => {
+  const wsId = ledgerWorkspace(rest);
+  const qs = new URLSearchParams({ since: flagValue(rest, '--since') ?? '24h', by: rest.includes('--by-day') ? 'day' : 'window' });
+  const until = flagValue(rest, '--until');
+  if (until !== null) qs.set('until', until);
+  requireEnv();
+  const { body } = await api('GET', eventsPath(wsId, 'wakes', qs));
+  if (rest.includes('--json')) return out(body);
+  process.stdout.write(`wakes ${wsId} ${new Date(body.since).toISOString()}..${new Date(body.until).toISOString()}`
+    + `${body.hasEvents ? '' : ' (no tab events recorded for this workspace)'}\n`);
+  printTable(['TAB', ...(body.by === 'day' ? ['DAY'] : []), 'WAKES', 'DIGESTS', 'URGENT', 'LOGGED'], body.rows.map((row) => [
+    row.tabId, ...(body.by === 'day' ? [row.day] : []), String(row.wakes), String(row.digests), String(row.urgent), String(row.logged),
+  ]));
+};
+
+const cmdEvents = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'show': return cmdEventsShow(rest);
+    case 'wakes': return cmdEventsWakes(rest);
+    default: die(EVENTS_USAGE);
+  }
+};
+
 const cmdApiGuide = async () => {
   requireEnv();
   const guidePath = '/api/cli/api-guide';
@@ -2368,6 +2440,14 @@ Commands:
                                            Default: the last 7 days by reason. T is Unix ms or ISO-8601
   ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT
   ledger experiment list -w WS [--json]    Improvement experiments (ADR-HFL-03): one active per stage, two in all
+  events show -w WS [TAB] [--since T] [--limit N] [--json]
+                                           What each tab was sent (ADR-0035), whole for one TAB, one line each for
+                                           the workspace: urgent typed at once, digest held for
+                                           the tab's next DIGEST, log recorded only. Default: the last hour.
+                                           T is an age (15m, 1h, 7d), Unix ms or ISO-8601; kept 30 days
+  events wakes -w WS [--since T] [--until T] [--by-day] [--json]
+                                           Wakes and digests per tab: one delivery is one wake, a digest counts once.
+                                           Default: the last 24 h
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
                                            attention.opened/updated accept class (money|irreversible|scope|bookkeeping) and defaultOptionId
@@ -2515,6 +2595,8 @@ const main = async () => {
       return cmdSpend(args.slice(1));
     case 'ledger':
       return cmdLedger(args.slice(1));
+    case 'events':
+      return cmdEvents(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':
