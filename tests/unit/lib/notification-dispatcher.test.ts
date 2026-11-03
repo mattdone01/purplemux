@@ -153,6 +153,24 @@ describe('kind flag (ADR-0032)', () => {
   });
 });
 
+describe('kind attention-opened', () => {
+  it('fans the alert out with its itemId, the fixed title and the item title as body', async () => {
+    const dispatcher = new NotificationDispatcher();
+    const a = fakeChannel('status-socket');
+    dispatcher.register(a.channel);
+
+    const alert = await dispatcher.dispatch(draft({ kind: 'attention-opened', itemId: 'item-7', itemTitle: ' Approve the BC go-live? ' }));
+
+    expect(a.delivered).toEqual([alert]);
+    expect(alert).toMatchObject({ kind: 'attention-opened', itemId: 'item-7', title: 'Mission Control: answer needed', body: 'Approve the BC go-live?' });
+  });
+
+  it('puts the itemId on an attention-opened alert only', () => {
+    expect(draft({ kind: 'review', itemId: 'item-7' })).not.toHaveProperty('itemId');
+    expect(draft({ kind: 'attention-opened' })).not.toHaveProperty('itemId');
+  });
+});
+
 describe('createWebPushChannel', () => {
   const setup = (records: IPushSubscriptionRecord[], visible: string[] = []) => {
     const sent: { endpoint: string; payload: Record<string, unknown> }[] = [];
@@ -228,6 +246,16 @@ describe('createWebPushChannel', () => {
 
     expect(sent[0].payload).toMatchObject({ kind: 'flag', flag, body: 'landing holds 12 items (threshold 10)' });
     expect(sent[1].payload).not.toHaveProperty('flag');
+  });
+
+  it('adds the itemId to an attention-opened alert\'s payload, and nothing to other kinds', async () => {
+    const { channel, sent } = setup([record('https://push/phone', 'D2')]);
+
+    await channel.deliver({ ...draft({ kind: 'attention-opened', itemId: 'item-7', itemTitle: 'Approve?' }), id: 'alert-3', seq: 9 }, {});
+    await channel.deliver(dispatched(), {});
+
+    expect(sent[0].payload).toMatchObject({ kind: 'attention-opened', itemId: 'item-7', title: 'Mission Control: answer needed', body: 'Approve?' });
+    expect(sent[1].payload).not.toHaveProperty('itemId');
   });
 
   it('reaps subscriptions the push service reports as gone', async () => {

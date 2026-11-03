@@ -93,6 +93,21 @@ export class TabEventsTable {
       AND delivered_at IS NULL) AS hit`)
       .get(workspaceId, tabId, since, kind, text) as { hit: number }).hit === 1;
 
+  /**
+   * The copies of one event sent to the tab since `since`, matched on the text's fixed opening: whether one still
+   * waits for a digest, and the latest delivery of any. Read from the log, so it holds across a restart. SQLite
+   * measures `length` and `substr` in characters, so the opening's length is SQLite's, never JavaScript's UTF-16 count.
+   */
+  copies = (workspaceId: string, tabId: string, kind: string, opening: string, since: number): { held: boolean; lastDeliveredAt: number | null } => {
+    const row = this.database.prepare(`SELECT
+        COALESCE(MAX(class = 'digest' AND delivered_at IS NULL AND digest_id IS NULL), 0) AS held, MAX(delivered_at) AS delivered
+      FROM tab_events INDEXED BY tab_events_tab_idx
+      WHERE workspace_id = @workspaceId AND tab_id = @tabId AND at >= @since AND kind = @kind
+        AND substr(text, 1, length(@opening)) = @opening`)
+      .get({ workspaceId, tabId, since, kind, opening }) as { held: number; delivered: number | null };
+    return { held: row.held === 1, lastDeliveredAt: row.delivered };
+  };
+
   /** Digest events waiting for the tab's next digest, oldest first. */
   pending = (workspaceId: string, tabId: string): ITabEvent[] =>
     (this.database.prepare(`SELECT * FROM tab_events INDEXED BY tab_events_pending_idx WHERE workspace_id = ? AND tab_id = ?

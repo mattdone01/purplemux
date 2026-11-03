@@ -22,6 +22,8 @@ vi.mock('@/lib/workspace-store', () => ({
   getWorkspaceById: vi.fn(async (id: string) => ({ id, orchestration: live.orchestratorTabId ? { orchestratorTabId: live.orchestratorTabId } : null })),
 }));
 vi.mock('@/lib/mission-question-config', () => ({ readQuestionMinVersion: vi.fn(async () => 2) }));
+const attention = vi.hoisted(() => ({ alert: vi.fn(async (_input: unknown) => []) }));
+vi.mock('@/lib/attention-alerts', () => ({ alertOpenedAttention: attention.alert }));
 
 import { MissionControlStore } from '@/lib/mission-control-store';
 import { validateMissionQuestion } from '@/lib/mission-question-format';
@@ -109,7 +111,7 @@ describe('the server opens the item (story 14 AC 4)', () => {
   };
   const stop = (extra: Partial<INeedsDecisionStop> = {}): INeedsDecisionStop => ({
     workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'hfl-14', line: 'NEEDS-DECISION: [scope] Is the export in scope? (a) yes (b) no',
-    stopSeq: 7, turnStartedAt: 0, ...extra,
+    stopSeq: 7, stopAt: 1_000, turnStartedAt: 0, ...extra,
   });
   const items = () => store.snapshot([], 'ws-a').items;
 
@@ -119,6 +121,7 @@ describe('the server opens the item (story 14 AC 4)', () => {
     live.store = store;
     live.identity = ORCH;
     live.orchestratorTabId = 'tab-orch';
+    attention.alert.mockClear();
   });
   afterEach(() => {
     store.close();
@@ -157,7 +160,7 @@ describe('the server opens the item (story 14 AC 4)', () => {
     const first = await openNeedsDecisionItem(deps, stop({ line, stopSeq: 1, turnStartedAt: 0 }));
     expect(first).toMatchObject({ opened: true });
     const itemId = (first as { itemId: string }).itemId;
-    expect(itemId).toBe(needsDecisionItemId({ workspaceId: 'ws-a', tabId: 'tab-w', line, stopSeq: 1 }).itemId);
+    expect(itemId).toBe(needsDecisionItemId({ workspaceId: 'ws-a', tabId: 'tab-w', line, stopSeq: 1, stopAt: 1_000 }).itemId);
     for (const seq of [2, 3]) {
       // A later turn, the same question with other spacing: no second item.
       expect(await openNeedsDecisionItem(deps, stop({ line: line.replace(' now?', '  now?'), stopSeq: seq, turnStartedAt: Date.now() + seq })))
@@ -186,15 +189,69 @@ describe('the server opens the item (story 14 AC 4)', () => {
 
   it('says why when no item can open: no orchestrator, no run of it, or a review the store refuses', async () => {
     const deps = await needsDecisionDeps();
+    const { itemId } = needsDecisionItemId(stop());
     live.orchestratorTabId = null;
-    expect(await openNeedsDecisionItem(deps, stop())).toEqual({ opened: false, reason: 'no-orchestrator' });
+    expect(await openNeedsDecisionItem(deps, stop())).toEqual({ opened: false, reason: 'no-orchestrator', itemId });
     live.orchestratorTabId = 'tab-orch';
-    expect(await openNeedsDecisionItem(deps, stop())).toEqual({ opened: false, reason: 'no-orchestrator-run', detail: 'tab-orch' });
+    expect(await openNeedsDecisionItem(deps, stop())).toEqual({ opened: false, reason: 'no-orchestrator-run', itemId, detail: 'tab-orch' });
     startRun();
     live.identity = { ...ORCH, sessionId: 'sess-new' };
-    expect(await openNeedsDecisionItem(deps, stop())).toMatchObject({ opened: false, reason: 'refused', detail: expect.stringMatching(/target agent binding|current orchestrator session/) });
+    expect(await openNeedsDecisionItem(deps, stop())).toMatchObject({ opened: false, reason: 'refused', itemId, detail: expect.stringMatching(/target agent binding|current orchestrator session/) });
     expect(items()).toEqual([]);
     expect(await openNeedsDecisionItem(deps, stop({ line: 'DONE: fine' }))).toEqual({ opened: false, reason: 'not-needs-decision' });
+  });
+
+  it('an answered question reopens after a restart resets the stop seq (confirm D1)', async () => {
+    startRun();
+    const deps = await needsDecisionDeps();
+    const line = 'NEEDS-DECISION: Ship the export now? (a) yes (b) no';
+    const first = await openNeedsDecisionItem(deps, stop({ line, stopSeq: 3, stopAt: 1_000 }));
+    expect(first).toMatchObject({ opened: true });
+    const itemId = (first as { itemId: string }).itemId;
+    store.submitAnswer(itemId, { submissionId: 'sub-d1', expectedRevision: items()[0].revision, optionIds: ['b'], text: '', actionCompleted: false }, 'owner');
+    // The server restarted: the tab's stop seq is 3 again; only the stop's time differs.
+    const again = await openNeedsDecisionItem(deps, stop({ line, stopSeq: 3, stopAt: 2_000, turnStartedAt: Date.now() + 1 }));
+    expect(again).toMatchObject({ opened: true });
+    expect((again as { itemId: string }).itemId).not.toBe(itemId);
+    expect(items()).toHaveLength(2);
+  });
+
+  it('an item the orchestrator opened from the note dedupes the worker\'s repeat (confirm C3)', async () => {
+    startRun();
+    const deps = await needsDecisionDeps();
+    const line = 'NEEDS-DECISION: Ship the export now? (a) yes (b) no';
+    // The id the server would have used, as the (i) note names it.
+    const { itemId } = needsDecisionItemId(stop({ line, stopSeq: 5, stopAt: 5_000 }));
+    const { applyMissionEventBatch } = await import('@/lib/mission-control-events');
+    await applyMissionEventBatch('ws-a', [{
+      eventId: 'orch-open-1', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
+      type: 'attention.opened', payload: {
+        itemId, ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line }),
+        humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
+      },
+    }], { tabId: 'tab-orch', identity: 'launch' });
+    expect(await openNeedsDecisionItem(deps, stop({ line, stopSeq: 6, stopAt: 6_000, turnStartedAt: Date.now() + 1 })))
+      .toEqual({ opened: false, reason: 'already-open', itemId });
+    expect(items()).toHaveLength(1);
+  });
+
+  it('never throws: a failing dependency is the error outcome, with the id (confirm D2)', async () => {
+    const deps = { ...(await needsDecisionDeps()), openRuns: () => { throw new Error('SQLITE_BUSY'); } };
+    const outcome = await openNeedsDecisionItem(deps, stop());
+    expect(outcome).toEqual({ opened: false, reason: 'error', itemId: needsDecisionItemId(stop()).itemId, detail: 'SQLITE_BUSY' });
+  });
+
+  it('a server-opened NEEDS-DECISION item sends one attention-opened alert naming the item, with the tab as opener (confirm C1)', async () => {
+    startRun();
+    const deps = await needsDecisionDeps();
+    const first = await openNeedsDecisionItem(deps, stop());
+    expect(await openNeedsDecisionItem(deps, stop({ stopSeq: 8, stopAt: 8_000, turnStartedAt: Date.now() + 1 }))).toMatchObject({ reason: 'already-open' });
+    expect(attention.alert).toHaveBeenCalledTimes(1);
+    const input = attention.alert.mock.calls[0][0] as { events: Array<{ id: string; entityId: string }>; fresh: Set<string>; openerTabId: string | null };
+    const eventId = `system:needs-decision:${(first as { itemId: string }).itemId.slice(3)}`;
+    expect(input.openerTabId).toBe('tab-w');
+    expect([...input.fresh]).toEqual([eventId]);
+    expect(input.events.map((e) => [e.id, e.entityId])).toEqual([[eventId, (first as { itemId: string }).itemId]]);
   });
 
   it('a producer cannot take the server opener\'s event namespace', async () => {

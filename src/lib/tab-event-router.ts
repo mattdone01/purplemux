@@ -38,6 +38,11 @@ export interface ITabEventRoute {
   class: TWakeClass;
   sourceTabId?: string | null;
   sourceTabName?: string | null;
+  /**
+   * An urgent event that must not land mid-turn (ROTATE): re-checked inside the tab's dispatch lock before the
+   * paste, together with the settle window, so it never follows another delivery into the turn it started.
+   */
+  whenReady?: () => boolean;
 }
 
 export interface ITabEventRouteResult {
@@ -66,6 +71,13 @@ export interface ITabEventRouterDeps {
   onStale?: (stale: IPendingDigest) => void;
   /** The tab still exists. A held backlog of a tab that does not is retired, never reported (review F12). */
   isKnownTab?: (tabId: string) => boolean;
+  /** The tab takes no digest now: a seat mid-rotation (ADR-0036). Its events stay held for a later digest. */
+  holdDigest?: (tabId: string) => boolean;
+  /**
+   * The tab takes no urgent event now either: a rotated seat before its first message (ADR-0036). The event is
+   * recorded undelivered and typed by `releaseHeldUrgent`.
+   */
+  holdUrgent?: (tabId: string) => boolean;
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -140,18 +152,24 @@ export class TabEventRouter {
 
   /** No log: every non-log event is typed at once, as before this story. Delivery never depends on a ledger write. */
   private async deliverUnlogged(event: ITabEventRoute): Promise<ITabEventRouteResult> {
-    const delivered = event.class === 'log' ? false : await this.paste(event.workspaceId, event.tabId, event.text);
+    const delivered = event.class === 'log' ? false : await this.paste(event.workspaceId, event.tabId, event.text, event.whenReady);
     return { class: event.class, delivered, seq: null, duplicate: false };
   }
 
-  /** Every paste the router makes, stamped at its start and its end for the settle window. */
+  /**
+   * Every paste the router makes, stamped at its start and its end for the settle window. A paste its own
+   * `whenReady` refused typed nothing and stamps nothing: a ROTATE retried every 3 s would otherwise hold its own
+   * window open for good (ADR-0036).
+   */
   private async paste(workspaceId: string, tabId: string, message: string, whenReady?: () => boolean): Promise<boolean> {
     const key = `${workspaceId}/${tabId}`;
     if (!whenReady) this.lastPaste.set(key, this.deps.now());
+    let delivered = false;
     try {
-      return await this.deps.deliver(workspaceId, tabId, message, whenReady);
+      delivered = await this.deps.deliver(workspaceId, tabId, message, whenReady);
+      return delivered;
     } finally {
-      this.lastPaste.set(key, this.deps.now());
+      if (delivered || !whenReady) this.lastPaste.set(key, this.deps.now());
     }
   }
 
@@ -196,10 +214,16 @@ export class TabEventRouter {
       log.warn(`tab event for ${event.tabId} not written; delivering at once: ${err instanceof Error ? err.message : err}`);
       return this.deliverUnlogged(event);
     }
+    if (cls === 'urgent' && this.deps.holdUrgent?.(event.tabId)) {
+      log.info({ workspaceId: event.workspaceId, tabId: event.tabId, kind: event.kind, seq }, 'urgent event held: the seat reads its handoff first');
+      return { class: cls, delivered: false, seq, duplicate };
+    }
     if (cls === 'urgent') {
+      const { whenReady } = event;
+      const ready = whenReady ? () => whenReady() && this.settled(table, event.workspaceId, event.tabId) : undefined;
       this.inFlight.add(seq);
       try {
-        const delivered = await this.paste(event.workspaceId, event.tabId, event.text);
+        const delivered = await this.paste(event.workspaceId, event.tabId, event.text, ready);
         if (delivered) this.markDelivered(table, [seq], null);
         return { class: cls, delivered, seq, duplicate };
       } finally {
@@ -209,6 +233,31 @@ export class TabEventRouter {
     // A tab at its prompt with a digest due gets it now; `delivered` says this event went out in it.
     const delivered = cls === 'digest' && await this.flush(event.workspaceId, event.tabId);
     return { class: cls, delivered, seq, duplicate };
+  }
+
+  /**
+   * Type the urgent events the tab's hold kept since `since`, oldest first (ADR-0036): every undelivered urgent row
+   * but a ROTATE (a refused ROTATE is retried by its own owner). Each is in flight while typed, as any urgent paste,
+   * so it enters the nudge history with its outcome. Returns how many were typed.
+   */
+  async releaseHeldUrgent(workspaceId: string, tabId: string, since: number): Promise<number> {
+    const table = this.tableOrNull();
+    if (!table) return 0;
+    const held = table.list(workspaceId, { tabId, since, limit: 500 })
+      .filter((row) => row.class === 'urgent' && row.deliveredAt === null && row.kind !== 'rotate' && !this.unrecorded.has(row.seq));
+    let typed = 0;
+    for (const row of held) {
+      this.inFlight.add(row.seq);
+      try {
+        if (!(await this.paste(workspaceId, tabId, row.text))) break;
+        this.markDelivered(table, [row.seq], null);
+        typed += 1;
+      } finally {
+        this.inFlight.delete(row.seq);
+      }
+    }
+    if (held.length) log.info({ workspaceId, tabId, held: held.length, typed }, 'held urgent events released');
+    return typed;
   }
 
   /**
@@ -232,10 +281,10 @@ export class TabEventRouter {
       const now = this.deps.now();
       const last = table.lastDigestAt(workspaceId, tabId);
       const due = pending.length >= DIGEST_MAX_WAITING || last === null || now - last >= DIGEST_INTERVAL_MS;
-      if (!due || !this.deps.atPrompt(tabId) || !this.settled(table, workspaceId, tabId)) return false;
+      if (!due || this.deps.holdDigest?.(tabId) || !this.deps.atPrompt(tabId) || !this.settled(table, workspaceId, tabId)) return false;
       const message = renderDigest(pending, workspaceId, tabId);
       const delivered = await this.paste(workspaceId, tabId, message,
-        () => this.deps.atPrompt(tabId) && this.settled(table, workspaceId, tabId));
+        () => !this.deps.holdDigest?.(tabId) && this.deps.atPrompt(tabId) && this.settled(table, workspaceId, tabId));
       if (!delivered) return false;
       const digestId = this.deps.newDigestId?.() ?? `dg-${nanoid(10)}`;
       this.markDelivered(table, pending.map((event) => event.seq), digestId);

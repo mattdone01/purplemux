@@ -13,6 +13,8 @@ import {
   unsetValue,
   valueOf,
 } from '@/lib/fleet-config-store';
+import { LEDGER_ALARM_KEYS, parseRouteTable, parseThresholdValue } from '@/lib/ledger-alarms';
+import { LEDGER_WAIT_REASONS } from '@/lib/ledger';
 import { leaseAuthority } from '@/lib/lease-http';
 import { createLogger } from '@/lib/logger';
 import type { IFleetConfigChange, IFleetConfigSetter, IFleetConfigState, IFleetConfigValue } from '@/types/fleet-config';
@@ -94,6 +96,26 @@ const checkRemoteValue = (key: string, value: string, state: IFleetConfigState):
   }
 };
 
+/** The alarm keys (ADR-HFL-03 decision 1): a route table parses whole; a threshold names a producer reason and holds minutes or `off`. */
+const checkLedgerValue = (key: string, value: string): void => {
+  if (key.startsWith(LEDGER_ALARM_KEYS.routePrefix)) {
+    if (!/^[A-Za-z0-9_-]+$/.test(key.slice(LEDGER_ALARM_KEYS.routePrefix.length))) {
+      throw new FleetConfigError('config-invalid', `${key} names no workspace: ledger.route.<workspaceId>`);
+    }
+    const { error } = parseRouteTable(value);
+    if (error) throw new FleetConfigError('config-invalid', `${key}: ${error}`);
+    return;
+  }
+  if (key.startsWith(LEDGER_ALARM_KEYS.thresholdPrefix)) {
+    const reason = key.slice(LEDGER_ALARM_KEYS.thresholdPrefix.length);
+    if (!(LEDGER_WAIT_REASONS as readonly string[]).includes(reason)) {
+      throw new FleetConfigError('config-invalid', `${key} names no wait reason: ledger.threshold.<${LEDGER_WAIT_REASONS.join('|')}>`);
+    }
+    const parsed = parseThresholdValue(value);
+    if ('error' in parsed) throw new FleetConfigError('config-invalid', `${key} ${parsed.error}`);
+  }
+};
+
 const requireWriter = async (caller: ICaller, authority: IFleetConfigAuthority, key: string): Promise<void> => {
   if (caller.admin) return;
   if (ADMIN_ONLY_KEYS.test(key)) throw new FleetConfigError('forbidden', `${key} is written by the admin token only (ADR-0022, ADR-0027, ADR-0037)`);
@@ -126,6 +148,7 @@ export const putValue = async (
     checkRemoteValue(key, value, s);
     checkPoolValue(key, value);
     checkTabCapValue(key, value);
+    checkLedgerValue(key, value);
     return setValue(s, { key, value, expectedVersion }, setterOf(caller), authority.now());
   });
   if (change) await audit(change, caller);

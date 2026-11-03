@@ -51,8 +51,11 @@ export interface IWatchDeps {
   ssoToken: (profile: string, now: number) => Promise<TSsoTokenState>;
   /** Refuses a profile the AWS config does not define as SSO, at creation. */
   ssoProfile: (profile: string) => Promise<unknown>;
-  /** The remote host a tab runs on, or null for a local tab: an auth watch reads only this server's ~/.aws. */
-  tabHost: (workspaceId: string, tabId: string) => Promise<string | null>;
+  /**
+   * The remote host a tab runs on (null: a local tab): an auth watch reads only this server's ~/.aws. `known: false`
+   * when the layout cannot be read or does not hold the tab: never taken for a local tab (confirm NIT 4).
+   */
+  tabHost: (workspaceId: string, tabId: string) => Promise<{ known: false } | { known: true; host: string | null }>;
   /** This server's host name, for the refusal of a remote tab's auth watch. */
   hostName: () => string;
   /** Live tabs, and the workspaces whose layout could not be read (their tabs are unknown, not closed). */
@@ -395,9 +398,12 @@ export class WatchManager {
     const spec = checkSpec(input);
     const owner = { workspaceId: caller.workspaceId, tabId: caller.tabId, verified: caller.verified, identity: caller.identity };
     if (spec.kind === 'auth') {
-      const host = await this.deps.tabHost(owner.workspaceId, owner.tabId);
-      if (host) {
-        throw new WatchError('watch-invalid', `an auth watch reads the SSO cache of this server's host (${this.deps.hostName()}); tab ${owner.tabId} runs on ${host}, whose sign-in it cannot see`);
+      const where = await this.deps.tabHost(owner.workspaceId, owner.tabId);
+      if (!where.known) {
+        throw new WatchError('caller-unresolved', `the host of tab ${owner.tabId} could not be read from the layout of ${owner.workspaceId}; an auth watch reads only this server's SSO cache: retry`);
+      }
+      if (where.host) {
+        throw new WatchError('watch-invalid', `an auth watch reads the SSO cache of this server's host (${this.deps.hostName()}); tab ${owner.tabId} runs on ${where.host}, whose sign-in it cannot see`);
       }
     }
     // A cheap cap check before the GitHub read, then the binding one under the lock.
@@ -473,7 +479,8 @@ export const defaultWatchDeps = async (): Promise<IWatchDeps> => {
     tabHost: async (workspaceId, tabId) => {
       const { collectAllTabs, readLayoutFile, resolveLayoutFile } = await import('@/lib/layout-store');
       const layout = await readLayoutFile(resolveLayoutFile(workspaceId));
-      return (layout ? collectAllTabs(layout.root).find((tab) => tab.id === tabId)?.host : null) ?? null;
+      const tab = layout ? collectAllTabs(layout.root).find((t) => t.id === tabId) : undefined;
+      return tab ? { known: true, host: tab.host ?? null } : { known: false };
     },
     hostName: () => os.hostname(),
     onFired: async (watch, fields) => {

@@ -115,7 +115,14 @@ const readHighWater = async (): Promise<number> => {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
     throw new StandingOrderError('so-unreadable', `${orderSeqPath()}: ${(err as NodeJS.ErrnoException).code ?? String(err)}`);
   }
-  const high = (JSON.parse(raw) as { high?: unknown } | null)?.high;
+  let parsed: { high?: unknown } | null;
+  try {
+    parsed = JSON.parse(raw) as { high?: unknown } | null;
+  } catch {
+    // No self-repair: the ids on disk alone could hand out a number again (confirm NIT 3).
+    throw new StandingOrderError('so-unreadable', `${orderSeqPath()}: not JSON; repair or restore it before adding an order`);
+  }
+  const high = parsed?.high;
   if (!Number.isSafeInteger(high) || (high as number) < 0) throw new StandingOrderError('so-unreadable', `${orderSeqPath()}: no whole "high"`);
   return high as number;
 };

@@ -1,6 +1,6 @@
-import type { ILedgerItem, TLedgerIntervalReason, TLedgerItemType, TLedgerStage } from '@/types/ledger';
+import type { ILedgerExperiment, ILedgerItem, TLedgerIntervalReason, TLedgerItemType, TLedgerStage } from '@/types/ledger';
 import type { IFlowRecord } from '@/types/flow';
-import type { ISpendIndexStatus } from '@/types/spend';
+import type { ISpendIndexStatus, ISpendLandingMetric } from '@/types/spend';
 
 // The constraint finder (ADR-0034): inputs the 60 s tick reads, and the answer it caches per
 // workspace. Every measure that rests on a missing input is `null` with a reason, never 0.
@@ -50,6 +50,17 @@ export interface IFinderSpendInput {
   /** Over the UTC days from `since` to today; null when a model has no known price. */
   costUsd: number | null;
   cacheReadTokens: number;
+  /** Ranges closed `landed` from `since` to now (`ledger-store.landedRanges`); null when the ledger cannot say. */
+  landedRanges: number | null;
+  /** `cache_read_tokens_per_landed_item` over the same days (story 04 AC 4), with its reason when not measured. */
+  cacheReadTokensPerLandedItem: ISpendLandingMetric;
+}
+
+/** One spend read for every workspace (`getFinderSpend`): the index state, the first UTC day's start, each workspace's input. */
+export interface IFinderSpendAll {
+  index: IFinderSpendInput['index'];
+  since: number;
+  byWorkspace: Map<string, Omit<IFinderSpendInput, 'index' | 'since'>>;
 }
 
 export interface IFinderPoolHost {
@@ -112,7 +123,11 @@ export type TFinderAnomalyId =
   | 'wakes-per-hour'
   | 'unknown-share'
   | 'producer-silence'
-  | 'cost-per-landed-item';
+  | 'cost-per-landed-item'
+  | 'cache-read-per-landed-item'
+  | 'seat-compactions'
+  | 'rotation-alarm'
+  | 'handoff-undelivered';
 
 export interface IFinderAnomaly {
   id: TFinderAnomalyId;
@@ -157,9 +172,25 @@ export interface IBoardOnTrack {
   /** `at-risk` whenever no goal is set: there is nothing to be on track against. */
   state: 'on-track' | 'at-risk';
   goal: string | null;
+  /** `none`: no goal set; `unknown`: the goal file could not be read (`reason`), never shown as "no goal set". */
+  goalState: 'set' | 'none' | 'unknown';
   itemsLeft: number | null;
   p50At: number | null;
   p90At: number | null;
+  /** Items of the goal's types closed in each of the last 3 days, oldest first; null with no goal or no ledger. */
+  throughputPerDay: number[] | null;
+  /** Why the line is at risk (`no goal set`, `no range item closed in 3 days`, `ledger not measured`); null on track. */
+  reason: string | null;
+}
+
+/** `purplemux board goal set` (story 12 AC 5): what the workspace works toward. */
+export interface IBoardGoal {
+  label: string;
+  /** Ledger item keys. */
+  items: string[];
+  setAt: number;
+  /** The tab name or id that set it, or `cli` for an admin token. */
+  setBy: string;
 }
 
 export interface IBoardFlowLock {
@@ -174,12 +205,21 @@ export interface IBoardPool {
   slotsTotal: number;
 }
 
+/** What waiting on one Mission Control item costs (ADR-HFL-11 §1): the same shape as the item's `blocked`. */
+export interface IBoardBlocked {
+  items: number;
+  hours: number;
+  critical: boolean;
+}
+
 /** The finder's answer for one workspace, cached by the tick. */
 export interface IFinderResult {
   generatedAt: number;
   onTrack: IBoardOnTrack;
   constraint: IBoardConstraint | null;
   stuck: IBoardStuckItem[];
+  /** Per MC item id, what links to it waiting `owner`; null when the ledger is not measured. */
+  ownerBlocks: Record<string, IBoardBlocked> | null;
   windows: IFinderWindowView[];
   anomalies: IFinderAnomaly[];
   /** `unknown` waiting hours / all waiting hours on the wait-life types over 24 h; null when nothing waited. */
@@ -194,6 +234,9 @@ export interface IFinderResult {
 export interface IBoardNeedsYou {
   id: string;
   title: string;
+  createdAt: number;
+  /** What waiting on it costs, from the ledger; null when no ledger item links to it ("not measured"). */
+  blocked: IBoardBlocked | null;
 }
 
 /** `GET .../board`: the finder's cached answer plus Mission Control's open items. */
@@ -202,6 +245,8 @@ export interface IBoard extends IFinderResult {
   /** Stuck items after any holder filter, before the cap of 50 that `stuck` carries. */
   stuckTotal: number;
   needsYou: IBoardNeedsYou[] | null;
+  /** Experiments with no verdict yet (ADR-HFL-03); null when the ledger cannot be read. */
+  experiments: ILedgerExperiment[] | null;
   /** How long ago the finder computed this answer (`generatedAt`). */
   ageMs: number;
   /** `generatedAt` when the answer is older than two ticks (120 s): a hung tick, not a fresh board. Null when fresh. */

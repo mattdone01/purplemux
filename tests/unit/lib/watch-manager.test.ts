@@ -52,7 +52,7 @@ class Fakes {
       leaseFree: async (name) => this.freeLeases.has(name),
       ssoToken: async () => ({ state: 'absent' }),
       ssoProfile: async () => null,
-      tabHost: async () => null,
+      tabHost: async () => ({ known: true, host: null }),
       hostName: () => 'mdserver1',
       liveTabs: async () => ({
         tabs: [...this.live].map((k) => ({ workspaceId: k.split('/')[0], tabId: k.split('/')[1] })),

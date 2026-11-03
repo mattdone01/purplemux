@@ -31,6 +31,10 @@ const clipAtWord = (text: string, max: number): string => {
 
 export const isNeedsDecisionLine = (line: string | undefined): line is string => !!line && line.trim().startsWith(MARKER);
 
+/** The line without its marker and class tag, whitespace collapsed: the owner push's text (ADR-0041 §2). */
+export const needsDecisionText = (line: string): string =>
+  line.trim().slice(MARKER.length).trim().replace(TAG, '').replace(/\s+/g, ' ').trim();
+
 /** The marks must run a, b, c… (or 1, 2, 3…) from the first; anything else is prose, not options. */
 const splitOptions = (body: string): { question: string; options: Array<{ id: string; label: string }> } => {
   const marks = [...body.matchAll(OPTION_MARK)];

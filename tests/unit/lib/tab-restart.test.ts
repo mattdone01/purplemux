@@ -367,6 +367,24 @@ describe('restartTab (ADR-0028)', () => {
     expect((await readTabs())[0].orchestrationActivity).toBeUndefined();
   });
 
+  it('interruptIf is read inside the lock on a busy tab: its answer decides, and the audit records it (ADR-0036)', async () => {
+    status.states.set('tab-t', 'busy');
+    await writeLayout([claudeTab()]);
+    const { restartTab } = await import('@/lib/tab-restart');
+    const seen: string[] = [];
+    const refused = await restartTab(input({ interruptIf: (tab) => { seen.push(tab.id); return false; } }));
+    expect(refused).toMatchObject({ status: 409, body: { code: 'tab-busy' } });
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    const allowed = await restartTab(input({ interruptIf: (tab) => { seen.push(tab.id); return true; } }));
+    expect(allowed.status).toBe(200);
+    expect(seen).toEqual(['tab-t', 'tab-t']);
+    expect(await auditLines()).toEqual([expect.objectContaining({ interrupt: true, abandoned: expect.objectContaining({ cliState: 'busy' }) })]);
+    status.states.set('tab-t', 'idle');
+    seen.length = 0;
+    expect((await restartTab(input({ interruptIf: (tab) => { seen.push(tab.id); return true; } }))).status).toBe(200);
+    expect(seen).toEqual([]);
+  });
+
   it('abandoned work needs a proven reaper: a reap without /proc is not confirmed', async () => {
     status.states.set('tab-t', 'busy');
     tmux.killSession.mockResolvedValue({ ...REAP, reaper: 'unavailable' });

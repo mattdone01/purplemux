@@ -71,6 +71,23 @@ describe('the write and read path', () => {
     expect(store.tabEvents.hasSame(WS, 'tab-o', 'turn-marker', 'logged', 0)).toBe(false);
   });
 
+  it("reads an event's copies by the text's opening: one held, and the latest delivery (story 13)", () => {
+    const opening = 'range:h1:abc not-armed for ';
+    const copies = () => store.tabEvents.copies(WS, 'tab-o', 'alarm', opening, T0);
+    expect(copies()).toEqual({ held: false, lastDeliveredAt: null });
+    const first = store.tabEvents.append(ev({ at: T0, kind: 'alarm', text: `${opening}21 min` }));
+    store.tabEvents.append(ev({ at: T0, kind: 'alarm', text: 'range:h1:abc rework for 30 min' }));
+    store.tabEvents.append(ev({ at: T0, kind: 'stuck', text: `${opening}40 min` }));
+    store.tabEvents.append(ev({ at: T0, tabId: 'tab-p', kind: 'alarm', text: `${opening}40 min` }));
+    store.tabEvents.append(ev({ at: T0 - 1, kind: 'alarm', text: `${opening}9 h` }));
+    expect(copies()).toEqual({ held: true, lastDeliveredAt: null });
+    store.tabEvents.markDelivered([first], T0 + 5 * MIN, 'dg-1');
+    expect(copies()).toEqual({ held: false, lastDeliveredAt: T0 + 5 * MIN });
+    store.tabEvents.append(ev({ at: T0 + 80 * MIN, kind: 'alarm', class: 'log', text: `${opening}80 min` }));
+    store.tabEvents.append(ev({ at: T0 + 81 * MIN, kind: 'alarm', class: 'urgent', text: `${opening}81 min`, deliveredAt: T0 + 81 * MIN }));
+    expect(copies()).toEqual({ held: false, lastDeliveredAt: T0 + 81 * MIN });
+  });
+
   it('keeps digest events pending until marked, per tab, oldest first', () => {
     const a = store.tabEvents.append(ev({ at: T0, text: 'a' }));
     const b = store.tabEvents.append(ev({ at: T0 + MIN, text: 'b' }));
@@ -89,7 +106,9 @@ describe('the write and read path', () => {
     expect(store.tabEvents.pendingTabs().map((row) => row.tabId)).toEqual(['tab-p']);
   });
 
-  it('marks more rows than one statement may bind', () => {
+  // Measured 430-579 ms alone at load 64 and 7.5 s in the full suite under host load (gates 10-r5): 30 s is four times
+  // the worst seen. The checks count rows in SQL rather than reading 33,000 rows twice (about 45% of the run).
+  it('marks more rows than one statement may bind', { timeout: 30_000 }, () => {
     // SQLite refuses a statement with more than 32,766 parameters (measured on the bundled 3.53): one row
     // past that proves the chunking. The rows are seeded in one transaction on a second handle (WAL), so the
     // test measures markDelivered, not 33,000 fsync'd commits (it timed out under disk load at 1,200).
@@ -103,10 +122,17 @@ describe('the write and read path', () => {
     } finally {
       raw.close();
     }
-    expect(store.tabEvents.pending(WS, 'tab-o')).toHaveLength(rows);
+    expect(store.tabEvents.pendingTabs()).toEqual([{ workspaceId: WS, tabId: 'tab-o', count: rows, oldestAt: T0 }]);
     store.tabEvents.markDelivered(seqs, T0 + DAY_MS, 'dg-big');
+    expect(store.tabEvents.pendingTabs()).toEqual([]);
     expect(store.tabEvents.pending(WS, 'tab-o')).toEqual([]);
-    expect(store.tabEvents.list(WS, { since: 0, limit: rows }).every((row) => row.deliveredAt === T0 + DAY_MS && row.digestId === 'dg-big')).toBe(true);
+    const check = new Database(file, { readonly: true });
+    try {
+      expect(check.prepare(`SELECT COUNT(*) AS total, SUM(delivered_at = ? AND digest_id = 'dg-big') AS marked FROM tab_events
+        WHERE workspace_id = ?`).get(T0 + DAY_MS, WS)).toEqual({ total: rows, marked: rows });
+    } finally {
+      check.close();
+    }
   });
 
   it('knows whether a workspace has any tab event', () => {

@@ -77,6 +77,13 @@ describe('the seed fleet file (story 14 AC 3)', () => {
   });
 });
 
+describe('seed SO-6 says exactly what the harness does with a NEEDS-DECISION line (confirm NIT 2, C8)', () => {
+  it('is the architect\'s text, character for character', async () => {
+    const { seed } = await lib();
+    expect(seed.find((o) => o.id === 'SO-6')?.text).toBe("Questions for the owner go to Mission Control, never only into chat. End the turn on one line: NEEDS-DECISION: [money|irreversible|scope|bookkeeping] <question> (a) <option> (b) <option>. The tag and the options are optional. The harness opens the Mission Control item from that line: do not open a second item for it. While you wait, repeat the same line without changes. If no item can open, the harness tells the orchestrator to open it; a workspace with no orchestrator gets a push to the owner's devices instead.");
+  });
+});
+
 describe('standing orders: files, ids and the 8 KB budget (story 14 AC 1)', () => {
   it('adds a workspace order SO-<n> after every id on the host, with text, source, scope, check and state', async () => {
     const { addOrder, readOrderFile, orderFilePath, parseOrderFile } = await lib();
@@ -166,6 +173,19 @@ describe('standing orders: files, ids and the 8 KB budget (story 14 AC 1)', () =
     await fs.rm(path.dirname(orderFilePath('ws-p9')), { recursive: true, force: true });
     expect((await addOrder('ws-p4', { text: 'later', source: 's' }, [], T0)).order.id).toBe('SO-9');
     expect(JSON.parse(await fs.readFile(orderSeqPath(), 'utf-8'))).toEqual({ high: 9 });
+  });
+
+  it('a corrupt seq file refuses the add as so-unreadable, naming the path, and changes no file (confirm NIT 3)', async () => {
+    const { addOrder, orderFilePath, orderSeqPath, readOrderFile } = await lib();
+    await readOrderFile('fleet');
+    await addOrder('ws-a', { text: 'first', source: 's' }, [], T0);
+    await fs.writeFile(orderSeqPath(), '{');
+    const before = await Promise.all([orderFilePath('fleet'), orderFilePath('ws-a'), orderSeqPath()].map((f) => fs.readFile(f)));
+    const err = await addOrder('ws-a', { text: 'second', source: 's' }, [], T0).catch((e: { code?: string; message?: string }) => e);
+    expect(err).toMatchObject({ code: 'so-unreadable' });
+    expect((err as Error).message).toContain(orderSeqPath());
+    const after = await Promise.all([orderFilePath('fleet'), orderFilePath('ws-a'), orderSeqPath()].map((f) => fs.readFile(f)));
+    after.forEach((buf, i) => expect(buf.equals(before[i])).toBe(true));
   });
 
   it('12 parallel adds get 12 unique ids (R7)', async () => {

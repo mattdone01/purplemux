@@ -1,3 +1,4 @@
+import { alertOpenedAttention } from '@/lib/attention-alerts';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { resolveMissionTargetIdentity } from '@/lib/mission-control-runtime';
 import { getMissionControlStore, type IMissionEventAuthority, type IMissionItemOpener } from '@/lib/mission-control-store';
@@ -49,9 +50,8 @@ export const applyMissionEventBatch = async (
       opener: event.type === 'attention.opened' ? opener : null,
     });
   }
-  return {
-    ...store.applyEvents(events, authorities, { questionMinVersion }),
-    humanInboxPolicy: store.humanInboxPolicy(workspaceId),
-    lint,
-  };
+  const applied = store.applyEvents(events, authorities, { questionMinVersion });
+  // An item opened for the human alerts once (ADR-0032 channels), a server-opened one too; a replayed event never does.
+  void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null });
+  return { ...applied, humanInboxPolicy: store.humanInboxPolicy(workspaceId), lint };
 };

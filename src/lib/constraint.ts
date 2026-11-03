@@ -1,10 +1,13 @@
 // The constraint finder (ADR-0034, ADR-HFL-02 decision 1). One pure function: no Node import, no
 // I/O, no clock. The tick (`constraint-tick.ts`) reads the inputs and caches the answer.
+import { onTrackFor } from '@/lib/board-forecast';
 import { reasonLabel, stageLabel, trendLabel } from '@/lib/constraint-labels';
 import { isFlowStale } from '@/lib/flow';
 import { LEDGER_UNKNOWN_ITEM_TYPES, UNKNOWN_REASON, clippedMs, percentile, stageOfReason } from '@/lib/ledger';
 import type {
+  IBoardBlocked,
   IBoardConstraint,
+  IBoardGoal,
   IBoardOnTrack,
   IBoardStuckItem,
   IFinderAnomaly,
@@ -53,6 +56,12 @@ export const ANOMALY_THRESHOLDS = {
   silenceFloorMs: 10 * MINUTE_MS,
   silenceP90Factor: 2,
   silenceMinClosed: 20,
+  /** ADR-0036 §3: any compaction since the last rotation. */
+  seatCompactions: 0,
+  /** ADR-0036 §2: the second failed handoff check of one rotation. */
+  rotationFailures: 1,
+  /** ADR-0036 §2: a rotated seat whose first message was dropped never read its handoff. */
+  handoffUndelivered: 0,
 } as const;
 
 /** Open items of these types with no wait are mid-work: their silence is a producer's, not a wait (ADR-0033 §3.3). */
@@ -253,6 +262,25 @@ export const stuckItems = (ledger: IFinderLedgerInput, critical: ReadonlySet<str
     }))
     .sort((a, b) => a.since - b.since || a.key.localeCompare(b.key));
 
+const MC_ITEM_PREFIX = 'mc-item:';
+
+/**
+ * What each open Mission Control item blocks (ADR-HFL-11 §1): the open items waiting `owner` whose
+ * link names `mc-item:<id>`, their summed waiting hours and whether any is critical. An MC item
+ * that no ledger item links to has no entry: "not measured", never 0.
+ */
+export const ownerBlocks = (ledger: IFinderLedgerInput, critical: ReadonlySet<string>, now: number): Record<string, IBoardBlocked> => {
+  const waited = new Map<string, { items: number; ms: number; critical: boolean }>();
+  for (const item of ledger.items) {
+    if (item.closedAt !== null || item.waitReason !== 'owner' || item.waitSince === null) continue;
+    if (!item.parentKey?.startsWith(MC_ITEM_PREFIX)) continue;
+    const id = item.parentKey.slice(MC_ITEM_PREFIX.length);
+    const entry = waited.get(id) ?? { items: 0, ms: 0, critical: false };
+    waited.set(id, { items: entry.items + 1, ms: entry.ms + Math.max(0, now - item.waitSince), critical: entry.critical || critical.has(item.itemKey) });
+  }
+  return Object.fromEntries([...waited].map(([id, entry]) => [id, { items: entry.items, hours: hours(entry.ms), critical: entry.critical }]));
+};
+
 /** `unknown` waiting time over all waiting time on the wait-life types, last 24 h; null when nothing waited. */
 export const unknownShareOf = (spans: readonly IWaitSpan[], now: number): number | null => {
   const since = now - DAY_MS;
@@ -283,18 +311,26 @@ const LABELS: Record<TFinderAnomalyId, string> = {
   'unknown-share': 'unknown share',
   'producer-silence': 'producer silence',
   'cost-per-landed-item': 'cost per landed item',
+  'cache-read-per-landed-item': 'cache reads per landed item',
+  'seat-compactions': 'seat compactions',
+  'rotation-alarm': 'rotation alarm',
+  'handoff-undelivered': 'handoff not delivered',
 };
+
+export const FINDER_ANOMALY_IDS = Object.keys(LABELS) as readonly TFinderAnomalyId[];
 
 const WORKSPACE_SUBJECT = 'workspace';
 
 const ANOMALY_WINDOWS: Record<TFinderAnomalyId, IFinderAnomaly['window']> = {
   're-gates': '24h', 'rework-rate': '24h', 'context-per-call': 'now', 'wakes-per-hour': '6h',
-  'unknown-share': '24h', 'producer-silence': 'now', 'cost-per-landed-item': '7d',
+  'unknown-share': '24h', 'producer-silence': 'now', 'cost-per-landed-item': '7d', 'cache-read-per-landed-item': '7d',
+  'seat-compactions': 'now', 'rotation-alarm': 'now', 'handoff-undelivered': 'now',
 };
 
 const ANOMALY_UNITS: Record<TFinderAnomalyId, string> = {
   're-gates': 'gates', 'rework-rate': 'share', 'context-per-call': 'tokens', 'wakes-per-hour': 'per hour',
-  'unknown-share': 'share', 'producer-silence': 'min', 'cost-per-landed-item': 'USD',
+  'unknown-share': 'share', 'producer-silence': 'min', 'cost-per-landed-item': 'USD', 'cache-read-per-landed-item': 'tokens',
+  'seat-compactions': 'compactions', 'rotation-alarm': 'failed checks', 'handoff-undelivered': 'rotations',
 };
 
 const formatValue = (value: number, unit: string): string => {
@@ -378,7 +414,7 @@ const numberAttr = (item: ILedgerItem, key: string): number | null => {
 };
 
 const contextPerCall = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
-  const seats = ledger.items.filter((item) => item.itemType === 'seat' && item.closedAt === null);
+  const seats = openSeats(ledger);
   if (!seats.length) {
     return [anomaly('context-per-call', 'now', 'tokens', { value: null, threshold: DEFAULT_ROTATE_AT_TOKENS, reason: 'no seat item in the ledger' })];
   }
@@ -387,6 +423,54 @@ const contextPerCall = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
     return anomaly('context-per-call', 'now', 'tokens', {
       subject: seat.itemKey, value, threshold: numberAttr(seat, 'rotateAtTokens') ?? DEFAULT_ROTATE_AT_TOKENS,
       reason: value === null ? 'no context reading on the seat' : null,
+    });
+  });
+};
+
+const openSeats = (ledger: IFinderLedgerInput): ILedgerItem[] => ledger.items.filter((item) => item.itemType === 'seat' && item.closedAt === null);
+
+/** ADR-0036 §3: a compaction is a missed rotation; the count since the seat's last rotation is flagged above 0. */
+const seatCompactions = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
+  const threshold = ANOMALY_THRESHOLDS.seatCompactions;
+  const seats = openSeats(ledger);
+  if (!seats.length) return [anomaly('seat-compactions', 'now', 'compactions', { value: null, threshold, reason: 'no seat item in the ledger' })];
+  return seats.map((seat) => {
+    const value = numberAttr(seat, 'compactionsSinceRotation');
+    const total = numberAttr(seat, 'compactions');
+    return anomaly('seat-compactions', 'now', 'compactions', {
+      subject: seat.itemKey, value, threshold,
+      detail: `since the last rotation${total === null ? '' : ` (${total} in all)`}`,
+      reason: value === null ? 'no compaction count on the seat' : null,
+    });
+  });
+};
+
+/** ADR-0036 §2: the second failed handoff check of one rotation leaves the session and raises this alarm. */
+const rotationAlarm = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
+  const threshold = ANOMALY_THRESHOLDS.rotationFailures;
+  const seats = openSeats(ledger);
+  if (!seats.length) return [anomaly('rotation-alarm', 'now', 'failed checks', { value: null, threshold, reason: 'no seat item in the ledger' })];
+  return seats.map((seat) => {
+    const value = numberAttr(seat, 'rotationFailures');
+    const why = typeof seat.attrs.rotationAlarm === 'string' ? seat.attrs.rotationAlarm : null;
+    return anomaly('rotation-alarm', 'now', 'failed checks', {
+      subject: seat.itemKey, value, threshold,
+      reason: value === null ? 'no rotation record on the seat' : null,
+      sentence: value !== null && value > threshold ? `${value} failed handoff checks, the session left as it is${why ? `: ${why}` : ''}` : undefined,
+    });
+  });
+};
+
+/** ADR-0036 §2: a seat restarted whose first message was dropped: rotated, but the handoff was not delivered. */
+const handoffUndelivered = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
+  const threshold = ANOMALY_THRESHOLDS.handoffUndelivered;
+  const seats = openSeats(ledger);
+  if (!seats.length) return [anomaly('handoff-undelivered', 'now', 'rotations', { value: null, threshold, reason: 'no seat item in the ledger' })];
+  return seats.map((seat) => {
+    const at = numberAttr(seat, 'handoffUndeliveredAt');
+    return anomaly('handoff-undelivered', 'now', 'rotations', {
+      subject: seat.itemKey, value: at === null ? 0 : 1, threshold,
+      sentence: at === null ? undefined : `rotated but the handoff was not delivered (first message dropped ${new Date(at).toISOString().replace(/\.\d{3}Z$/, 'Z')})`,
     });
   });
 };
@@ -454,14 +538,14 @@ const producerSilence = ({ ledger, now }: IAnomalyContext): IFinderAnomaly[] => 
   });
 };
 
-const costPerLandedItem = ({ ledger, spend, now }: IAnomalyContext): IFinderAnomaly[] => {
+const costPerLandedItem = ({ spend }: IAnomalyContext): IFinderAnomaly[] => {
   const unknown = (reason: string) => [anomaly('cost-per-landed-item', '7d', 'USD', { value: null, threshold: null, reason })];
   if (!spend) return unknown('spend not read');
   if (spend.index.state !== 'ready') return unknown(`spend index ${spend.index.state}`);
   if (spend.costUsd === null) return unknown('a model in the window has no known price');
-  // The spend view counts whole UTC days, so the landings are counted over the same days.
-  const landed = ledger.items.filter((item) => item.itemType === 'range' && item.state === 'landed'
-    && item.closedAt !== null && item.closedAt >= spend.since && item.closedAt <= now).length;
+  // One landed count (ledger-store.landedRanges) over the spend's own UTC days serves this and the cache-read metric.
+  const landed = spend.landedRanges;
+  if (landed === null) return unknown(spend.cacheReadTokensPerLandedItem.reason ?? 'landed ranges not read from the ledger');
   if (!landed) return unknown('no range landed');
   return [anomaly('cost-per-landed-item', '7d', 'USD', {
     value: spend.costUsd / landed, threshold: null, detail: `over ${landed} landed ranges`,
@@ -469,8 +553,19 @@ const costPerLandedItem = ({ ledger, spend, now }: IAnomalyContext): IFinderAnom
   })];
 };
 
+/** Story 04's `cache_read_tokens_per_landed_item` (7 d), reported and never flagged; not measured carries its reason. */
+const cacheReadPerLandedItem = ({ spend }: IAnomalyContext): IFinderAnomaly[] => {
+  const metric = spend?.cacheReadTokensPerLandedItem;
+  return [anomaly('cache-read-per-landed-item', '7d', 'tokens', {
+    value: metric ? metric.value : null, threshold: null, flaggable: false,
+    reason: metric ? metric.reason : 'spend not read',
+    ...(metric && metric.value !== null ? { detail: `over ${metric.landedItems} landed ranges` } : {}),
+  })];
+};
+
 const ANOMALY_RULES: ReadonlyArray<(ctx: IAnomalyContext) => IFinderAnomaly[]> = [
-  reGates, reworkRate, contextPerCall, wakesPerHour, unknownShareAnomaly, producerSilence, costPerLandedItem,
+  reGates, reworkRate, contextPerCall, wakesPerHour, unknownShareAnomaly, producerSilence, costPerLandedItem, cacheReadPerLandedItem,
+  seatCompactions, rotationAlarm, handoffUndelivered,
 ];
 
 const status = (state: IFinderInputStatus['state'], reason: string | null, at: number | null): IFinderInputStatus => ({ state, reason, at });
@@ -488,11 +583,9 @@ const spendStatus = (spend: IFinderSpendInput | null): IFinderInputStatus => {
   return status('ok', null, spend.index.indexedThrough);
 };
 
-const NO_GOAL: IBoardOnTrack = { state: 'at-risk', goal: null, itemsLeft: null, p50At: null, p90At: null };
-
 /** `ledgerUnknown` is the reason the ledger measures were not taken; null when they were. */
 export const boardLine = (onTrack: IBoardOnTrack, constraint: IBoardConstraint | null, ledgerUnknown: string | null): string => {
-  const goal = onTrack.goal ?? 'no goal set';
+  const goal = onTrack.goal ?? (onTrack.goalState === 'unknown' ? onTrack.reason ?? 'goal not measured' : 'no goal set');
   const left = onTrack.itemsLeft === null ? 'items left —' : `${onTrack.itemsLeft} items left`;
   if (ledgerUnknown) return `${goal} · ${left} · constraint unknown (${ledgerUnknown})`;
   if (!constraint) return `${goal} · ${left} · no constraint: nothing waited in 24 h`;
@@ -511,11 +604,15 @@ const CONSTANT_THRESHOLDS: Record<TFinderAnomalyId, number | null> = {
   'unknown-share': ANOMALY_THRESHOLDS.unknownShare,
   'producer-silence': null,
   'cost-per-landed-item': null,
+  'cache-read-per-landed-item': null,
+  'seat-compactions': ANOMALY_THRESHOLDS.seatCompactions,
+  'rotation-alarm': ANOMALY_THRESHOLDS.rotationFailures,
+  'handoff-undelivered': ANOMALY_THRESHOLDS.handoffUndelivered,
 };
 
 /** Every anomaly, unknown for the one reason the ledger measures were not taken. */
 const unknownAnomalies = (reason: string): IFinderAnomaly[] =>
-  (Object.keys(LABELS) as TFinderAnomalyId[]).map((id) =>
+  FINDER_ANOMALY_IDS.map((id) =>
     anomaly(id, ANOMALY_WINDOWS[id], ANOMALY_UNITS[id], { value: null, threshold: CONSTANT_THRESHOLDS[id], reason }));
 
 /**
@@ -528,6 +625,8 @@ export const deriveConstraint = (
   spend: IFinderSpendInput | null,
   pool: IFinderPoolInput | null,
   now: number,
+  goal: IBoardGoal | null = null,
+  goalError: string | null = null,
 ): IFinderResult => {
   // An empty ledger is not "nothing waited": no producer has spoken for this workspace yet.
   const ledgerUnknown = !ledger ? LEDGER_UNREADABLE : ledger.firstEventAt === null ? LEDGER_EMPTY : null;
@@ -544,9 +643,10 @@ export const deriveConstraint = (
     slotsTotal: pool.hosts.reduce((sum, host) => sum + host.slotsTotal, 0),
   } : null;
   if (!ledger || ledgerUnknown) {
+    const onTrack = onTrackFor(goal, null, now, goalError);
     return {
-      generatedAt: now, onTrack: NO_GOAL, constraint: null, stuck: [], windows: [], anomalies: unknownAnomalies(ledgerUnknown!),
-      unknownShare: null, inputs, flowLocks, pool: poolView, line: boardLine(NO_GOAL, null, ledgerUnknown),
+      generatedAt: now, onTrack, constraint: null, stuck: [], ownerBlocks: null, windows: [], anomalies: unknownAnomalies(ledgerUnknown!),
+      unknownShare: null, inputs, flowLocks, pool: poolView, line: boardLine(onTrack, null, ledgerUnknown),
     };
   }
   const spans = waitSpans(ledger, now);
@@ -554,17 +654,19 @@ export const deriveConstraint = (
   const constraint = pickConstraint(spans, critical, now, ledger.firstEventAt);
   const unknownShare = unknownShareOf(spans, now);
   const ctx: IAnomalyContext = { ledger, spans, spend, unknownShare, now };
+  const onTrack = onTrackFor(goal, ledger.items, now, goalError);
   return {
     generatedAt: now,
-    onTrack: NO_GOAL,
+    onTrack,
     constraint,
     stuck: stuckItems(ledger, critical),
+    ownerBlocks: ownerBlocks(ledger, critical, now),
     windows: FINDER_WINDOWS.map(({ window, ms }) => windowView(spans, ledger, window, ms, now)),
     anomalies: ANOMALY_RULES.flatMap((rule) => rule(ctx)),
     unknownShare,
     inputs,
     flowLocks,
     pool: poolView,
-    line: boardLine(NO_GOAL, constraint, null),
+    line: boardLine(onTrack, constraint, null),
   };
 };

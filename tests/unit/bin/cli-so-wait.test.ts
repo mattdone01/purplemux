@@ -129,6 +129,11 @@ describe('purplemux so and wait — the installed CLI against the real routes (s
     const again = await cli(['so', 'strike', 'SO-8', '--reason', 'again'], tabA);
     expect(again.code).toBe(3);
     expect(again.stderr).toMatch(/^error: so-struck \(conflict/);
+    // A corrupt id high-water file is refused by state (confirm NIT 3): exit 3, nothing written.
+    await fs.writeFile(path.join(mockHome.value, '.purplemux', 'standing-orders-seq.json'), '{');
+    const corrupt = await cli(['so', 'add', '-w', 'ws-a', '--text', 'next', '--source', 's'], tabA);
+    expect(corrupt.code).toBe(3);
+    expect(corrupt.stderr).toMatch(/^error: so-unreadable .*standing-orders-seq\.json: not JSON/);
   });
 
   it('so add over 8 KB exits 2 with the measured size; a bad field exits 2 naming it', async () => {

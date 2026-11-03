@@ -841,11 +841,18 @@ export class MissionControlStore {
     return { schemaVersion: 1, events, cursor: events.at(-1)?.seq ?? after, hasMore };
   };
 
-  /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first, id and title only. */
-  openItemTitles = (workspaceId: string): Array<{ id: string; title: string }> =>
-    (this.database.prepare(`SELECT id, question_json FROM attention_items WHERE workspace_id = ? AND state = 'open'
-      ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string }>)
-      .map((row) => ({ id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? '') }));
+  /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first: id, title and when it opened. */
+  openItemTitles = (workspaceId: string): Array<{ id: string; title: string; createdAt: number }> =>
+    (this.database.prepare(`SELECT id, question_json, created_at FROM attention_items WHERE workspace_id = ? AND state = 'open'
+      ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string; created_at: number }>)
+      .map((row) => ({
+        id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? ''), createdAt: row.created_at,
+      }));
+
+  /** The pulse (ADR-0034 §9): when each answer to a workspace's items was recorded, since `since`. */
+  answerTimes = (workspaceId: string, since: number): number[] =>
+    this.database.prepare('SELECT created_at FROM answers WHERE workspace_id = ? AND created_at >= ? ORDER BY created_at')
+      .pluck().all(workspaceId, since) as number[];
 
   /** Items the tab opened at or after `since`, any state: a NEEDS-DECISION turn that already asked opens none (ADR-0041). */
   itemsOpenedByTab = (workspaceId: string, tabId: string, since: number): string[] =>
@@ -853,11 +860,11 @@ export class MissionControlStore {
       WHERE workspace_id = ? AND tab_id = ? AND opened_at >= ? ORDER BY opened_at, item_id`).all(workspaceId, tabId, since) as Array<{ item_id: string }>)
       .map((row) => row.item_id);
 
-  /** Items the tab opened that are still candidate or open: not answered, resolved or cancelled (ADR-0041). */
-  openItemsOfTab = (workspaceId: string, tabId: string): string[] =>
-    (this.database.prepare(`SELECT o.item_id FROM mission_item_openers o JOIN attention_items a ON a.id = o.item_id
-      WHERE o.workspace_id = ? AND o.tab_id = ? AND a.state IN ('candidate','open') ORDER BY o.opened_at, o.item_id`)
-      .all(workspaceId, tabId) as Array<{ item_id: string }>).map((row) => row.item_id);
+  /** Still-open items (candidate or open) whose id starts with the prefix, whoever opened them (ADR-0041 §2). */
+  openItemsWithIdPrefix = (workspaceId: string, prefix: string): string[] =>
+    (this.database.prepare(`SELECT id FROM attention_items WHERE workspace_id = ? AND substr(id, 1, length(?)) = ?
+      AND state IN ('candidate','open') ORDER BY created_at, id`).all(workspaceId, prefix, prefix) as Array<{ id: string }>)
+      .map((row) => row.id);
 
   /** Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). */
   openItemOpeners = (): IMissionOpenItemOpener[] => {

@@ -48,13 +48,22 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   `POST /api/cli/standing-orders/<SO-n>/strike`.
 
 ### 2. NEEDS-DECISION opens a Mission Control item
-- A classified stop whose last line starts `NEEDS-DECISION:` opens one item, whatever the tab's `reportOn`, unless the
-  tab still has an open item for the same line (any turn: a worker repeats its line while it waits), or the tab opened
-  an item since its previous stop (the turn's start; `mission_item_openers.opened_at`). The item id is
-  `nd-<16 hex of workspace, tab and the whitespace-normalized line><16 hex of the stop>`, so the first half finds the
-  open item of the same question; once that item is answered, resolved or cancelled, the same line opens a new one.
-- The item opens before the orchestrator's nudge, and the nudge's end line carries `[MC item nd-… opened]` or
-  `[MC item nd-… already open]`; the orchestrator contract says not to copy such a question into Mission Control again.
+- A classified stop whose last line starts `NEEDS-DECISION:` opens one item, whatever the tab's `reportOn`, unless an
+  item for the same line is still open (candidate or open), whoever opened it: the worker repeating its line while it
+  waits, or the orchestrator that opened the item from the note below; or the tab opened an item since its previous stop
+  (the turn's start; `mission_item_openers.opened_at`). The item id is
+  `nd-<16 hex of workspace, tab and the whitespace-normalized line><16 hex of the stop's time and seq>`: the first half
+  names the question, and the store finds an open item by that id prefix (`openItemsWithIdPrefix`), from any opener;
+  the second half takes the stop's time as well as its seq, which restarts at 0 with the server, so an answered question
+  opens a new item after a restart too. Once the item is answered, resolved or cancelled, the same line opens a new one.
+- The opener never throws: a failing dependency (an SQLite read, the workspace read, the module load) is the outcome
+  `error`. Every outcome that opens no item (`no-orchestrator`, `no-orchestrator-run`, `refused`, `error`) carries the
+  id the server would have used.
+- The item opens before the orchestrator's nudge, and the nudge's end line carries one note:
+  `[MC item <id> opened for the owner by the server: do not open another]`,
+  `[MC item <id> already open for the owner: do not open another]`,
+  `[MC item <id> opened by the tab this turn: handle it as any worker item]`, or a fallback note below. The
+  orchestrator contract names each note and what it asks; it says never to copy such a question into Mission Control.
 - The question is built from the whole last line of the turn's tail, not the marker line clipped at 300 characters for
   the nudge. The tail is the end of the message, so a line that starts inside it is whole; a line that runs from the
   first character of a tail cut at 600 characters may lack its start, and is then an `answerType: text` question whose
@@ -66,13 +75,26 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
 - The item is format 2 (ADR-0037) and opens human-visible in one `attention.opened` event that carries the human
   review (`humanNeed: decision`) of the workspace's configured orchestrator, on that orchestrator's open run. The
   event goes through the events route's own batch function (`applyMissionEventBatch`): the same validator at the fleet
-  minimum version, the server-resolved orchestrator identity, and the store's review authority check. The opener is
-  the tab (`identity: hook`). Event ids `system:needs-decision:*` are reserved: no request may use them.
-- No item opens when the workspace has no orchestrator, the orchestrator has no open run, or the store refuses the
-  review (a stale binding). The owner is then alerted through the flag alert path (ADR-0032; web push and the phone)
-  with `<tab> needs your decision: <question>` (the body is 100 characters), the reason is logged, and the nudge ends
-  `[no MC item: <reason>; the owner was alerted]`. Not the inbox: an inbox line carries no caller text (ADR-0012) and
-  addresses a tab, and with no orchestrator there is no tab to address. Seed SO-6 says exactly this.
+  minimum version, the server-resolved orchestrator identity, the store's review authority check, and the owner's
+  attention-opened push (title "Mission Control: answer needed"; a tap opens the item), which a server-opened item
+  sends like any other. The opener is the tab (`identity: hook`). Event ids `system:needs-decision:*` are reserved: no
+  request may use them.
+- Fallback when no item opens. Questions are answered in Mission Control; a push is a last resort.
+  (i) An orchestrator can receive it: the reason is `no-orchestrator-run`, `refused` or `error`; the workspace has a
+  configured orchestrator that is not the asking tab; the tab's escalation target is that orchestrator; and the
+  orchestrator is a live agent tab (not retired, not inactive). Then the server sends no owner push, the nudge goes to
+  the orchestrator even when the worker's `reportOn` withholds `NEEDS-DECISION`, and the note is
+  `[no MC item (<reason>): open it yourself: resume or start your Mission Control run, then open item <id> from this line with your human review. The owner has not been told.]`.
+  The id-prefix dedupe then turns the worker's repeat into `already-open`.
+  (ii) No orchestrator can receive it (`no-orchestrator`, the asker is the orchestrator, or (i) fails): one push of
+  alert kind `needs-decision`, title `Decision needed: no Mission Control item`, body
+  `<tab name or id> · <workspace name or id>: <the line without the marker and the class tag, whitespace collapsed>`
+  cut at 100 code points; it carries the tab and workspace, so a tap opens the tab. One push per workspace, tab and
+  normalized line in 24 h, kept in memory (at most 2,000 keys, oldest evicted; a restart may send one more). The
+  dispatch is never awaited. The note says what the server did, never what the owner received:
+  `[no MC item (<reason>): owner push dispatched, delivery not confirmed]`, or
+  `[no MC item (<reason>): owner push for this line already dispatched at <UTC ISO time>]`. Not the inbox: an inbox
+  line carries no caller text (ADR-0012) and addresses a tab. Seed SO-6 says exactly this.
 
 ### 3. Auth waits
 - Watch kind `auth`, target `aws-sso:<profile>`, until `signed-in`, interval 60 s by default; CLI
@@ -85,7 +107,8 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   raised on a missing, expired or nearly expired token fires on the first valid one; a watch raised while a token is
   valid fires only when a different valid token appears (the owner signed in again), never at once.
 - The cache read is this server host's `~/.aws`: an auth wait from a remote tab is refused (`watch-invalid`) with a
-  message naming both hosts. A profile that is not SSO is refused at creation (`watch-invalid`). An unreadable
+  message naming both hosts. The check fails closed: when the layout cannot be read or does not hold the calling tab,
+  the wait is refused (`caller-unresolved`, exit 3) and never taken for a local tab. A profile that is not SSO is refused at creation (`watch-invalid`). An unreadable
   config or cache file is the failing token `sso-config`.
 - No process is started and no AWS endpoint is called: DEC-261 forbids an agent run through the owner's SSO unless the
   owner asks. A test records every `child_process` entry point while a watch is created, read and fired.
@@ -102,6 +125,7 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   restart. The kit's copy goes stale only between launches: no path launches Claude on a remote host without a create
   first (auto-resume skips remote tabs; the launch-command route refuses them).
 - The orchestrator receives the answer to a NEEDS-DECISION item, because it owns the run; it relays it to the tab.
+- The nudge goes to the tab's escalation target; the item and its answer belong to the configured orchestrator.
 
 ## What proves it wrong
 Owner repeats of the top clusters stay above 1 a week each after 14 days, or the owner still relays manual steps more

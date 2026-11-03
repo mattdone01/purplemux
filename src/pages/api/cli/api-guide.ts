@@ -694,7 +694,10 @@ Auth waits (ADR-0041): kind "auth", target an AWS profile (stored as "aws-sso:<p
 "signed-in", optional "ledgerItem" (a ledger item key). The server reads only that profile's AWS
 SSO cache file (~/.aws/sso/cache/<sha1 of its sso-session, or of a legacy sso_start_url>.json)
 every 60 s by default and starts no aws process (DEC-261); a profile ~/.aws/config does not define
-as SSO is 400 watch-invalid. A valid token (accessToken present, expiresAt in the future) sends
+as SSO is 400 watch-invalid; so is a wait from a remote tab (the cache read is this server's host),
+and a tab whose host the layout cannot tell is 403 caller-unresolved (exit 3; never taken for a local
+tab). It fires on a sign-in: a token valid (accessToken present, expiresAt at least 5 min ahead) and
+different from the one valid at creation, if any. It then sends
 "[purplemux watch w-…] aws-sso:<profile> is signed in: its SSO token is valid until <UTC>; retry
 the step that needed it — watch cleared", and the server clears, with a ledger "clear" event, the
 open "deploy-auth" wait of ledgerItem and of every item of the workspace whose clear input names
@@ -763,6 +766,10 @@ Keys in use:
   remote.callback-allow-hosts
                Bare lower-case host names that remote.callback-url may name over plain http,
                comma-separated. Admin token only.
+  context.rotate-at-tokens
+               The context a seat rotates at (ADR-0036): a whole number of tokens 50000..900000.
+               Read every 30 s; unset or invalid means 300000 (an invalid value is logged). A tab's
+               own --rotate-at wins. Written by the admin token or an enabled orchestrator (ADR-0019).
   tabs.cap-per-workspace
                The WIP cap (ADR-0027): an integer 1..200 of agent tabs per workspace, one value
                for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
@@ -1005,10 +1012,15 @@ GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
   first good read of any source read late; an unreadable store raises nothing and clears nothing;
   a target that cannot be checked is retried next tick. The orchestrator-only alert setting does
   not apply. No inbox notice is sent: the alert is for the human, not for an agent.
+  Attention alerts: an attention.opened that opens an item for the human (humanReview.humanNeed is
+  not "none", so the item state is "open") sends one notification:alert of kind
+  "attention-opened", title "Mission Control: answer needed", body the item title, and "itemId".
+  tabId is the opening tab, else the workspace's orchestrator. A candidate item, a replayed event,
+  attention.updated, an answer, a resolve and a cancel send nothing; an item alerts once.
 
 ## Spend (ADR-0030)
 
-GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role]
+GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role|seat|phase|item]
                                                        (purplemux spend show -w WS [--since D] [--until D] [--by ...] [--json])
   Read scope on WS. since/until are UTC days, both inclusive; the default is the last 7 UTC days
   and by=tab. Spend keeps the last 92 UTC days (today − 91 … today), including usage whose
@@ -1034,6 +1046,33 @@ GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|
   workspace's enabled orchestrator NOW) and "other". Transcripts are read by a background
   index; while index.state is "indexing" the numbers are partial. A request never parses a
   transcript.
+  by=seat rows are tab names (the open tab's name, else the name recorded with the binding).
+  by=phase and by=item read the work-item ledger: each Claude message counts at its UTC 5-min
+  slot, for the ledger item its tab held (holder = the tab's id or name) at the slot's midpoint;
+  of several, the one with the latest event. Phases: plan, build, review, evaluate, land,
+  coordinate, and "other" (the tab held no item). The wait reason decides first (review-queue,
+  review-findings: review; rework: build; receipt-rekey and every land and deploy reason: land;
+  owner: coordinate), else the item type (slice: build; review: review; gate, experiment:
+  evaluate; range, landing, deploy: land; owner-issue: plan; mc-item: coordinate); seat items
+  never count. by=phase|item serve at most 7 UTC days (else 400 invalid-request naming the cap).
+  Their answers add "unattributedReasons": [ISpendRow] (keys no-binding, no-message-time for
+  Codex, Grok and pre-slot usage, ledger-unreadable, no-ledger-history before the ledger's
+  horizon, no-held-item for by=item; they sum to "unattributed") and "phaseBasis": { "slotMs":
+  300000, "ledgerHorizon": <ms>|null (null: no item yet), "ledgerReadable" }. Mission Control
+  refuses by=phase|item with workspaceId=all. Every ISpendRow also carries "cacheReadCostUsd":
+  the cache reads' part of costUsd, null when not priced or a Codex/Grok session cost cannot be
+  split.
+
+GET /api/cli/spend/phases?workspaceId=WS[&day=YYYY-MM-DD]   (purplemux spend phases -w WS [--day D] [--json])
+  Read scope on WS. One UTC day (default today; from today − 91 to today, else 400
+  invalid-request) as the by=phase ISpendView, each row with "wallMs" (distinct 5-min slots
+  with usage x 5 min; null for usage with no message time), plus "day" and
+  "cacheReadPerLandedItem": { "day": M, "7d": M }, M = { "metric":
+  "cache_read_tokens_per_landed_item", "window", "from", "to", "cacheReadTokens", "landedItems"
+  (range landings the store's projection applied in the window, one per applied close with state
+  landed: a repeat, orphan or re-sent close counts none; null when the ledger cannot be read or holds
+  no item for the workspace), "value" (null when not measured), "reason" (why not
+  measured, else null) }.
 
 ## Ledger (ADR-0033)
 
@@ -1222,10 +1261,13 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   mine=1 keeps the stuck items the calling tab holds (by tab name or id); it needs a tab token
   (400 invalid-request otherwise). Response (times Unix ms):
   { "workspaceId", "generatedAt", "ageMs", "staleSince" | null, "stuckTotal",
-    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "itemsLeft" | null, "p50At" | null, "p90At" | null },
+    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "goalState": "set" | "none" | "unknown",
+                 "itemsLeft" | null, "p50At" | null, "p90At" | null, "throughputPerDay": null | [n, n, n], "reason" | null },
     "constraint": null | { "reason", "stage", "waitingHours", "trend", "ownerSeat" | null, "clearInput" | null,
                            "basis": "critical" | "all", "items", "labels": { "reason", "stage", "trend" } },
-    "needsYou": null | [{ "id", "title" }],
+    "needsYou": null | [{ "id", "title", "createdAt", "blocked": null | { "items", "hours", "critical" } }],
+    "experiments": null | [<ledger experiment with no verdict>],
+    "ownerBlocks": null | { <mc item id>: { "items", "hours", "critical" } },
     "stuck": [{ "key", "itemType", "holder" | null, "reason", "since", "clearInput" | null, "critical", "reasonLabel" }],
     "windows": [{ "window": "6h" | "24h" | "7d", "since", "until", "byReason": [row], "byStage": [row], "closed": { <type>: n } }],
     "anomalies": [{ "id", "subject", "value" | null, "unit", "threshold" | null, "judged", "breached", "window", "text", "reason" | null }],
@@ -1236,7 +1278,14 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   (reason "ledger unreadable" or "the ledger holds no event for this workspace") means constraint,
   stuck and windows were not measured and every anomaly is null: an empty list then is not "nothing
   stuck". spend is "partial" when the index is ready but reports an error (the reason).
-  onTrack.goal is null until a goal is set (story 12); onTrack.state is then "at-risk".
+  onTrack.goal is null until a goal is set (board goal set); onTrack.state is then "at-risk", reason
+  "no goal set". With a goal: itemsLeft = goal keys the ledger does not hold closed; throughputPerDay
+  = closes of the goal keys' item types in each of the last 3 days; p50At / p90At from an exact
+  bootstrap over those days; no close in 3 days is no forecast (reason says so), never a date.
+  needsYou[].blocked: open ledger items waiting "owner" whose link (parent) is mc-item:<id>, their
+  summed waiting hours and whether any is critical; null when nothing links, or when the ledger is
+  not measured (then inputs.ledger.reason says why). goalState "unknown": the goal file could not be
+  read (reason "goal not measured: ..."), never "no goal set".
   staleSince is generatedAt when the answer is older than 120 s (two ticks); treat it as stale.
   --line then ends with "stale since <time>" (AEDT/AEST).
   The constraint is the reason with the most waiting hours in the last 24 h (finished waits clipped
@@ -1254,7 +1303,8 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   one per (producer of the last event, item type), subject "<producer>/<type>", "<item> silent for <n>
   min (threshold <t> min)"; threshold max(10
   min, 2 x the type's 7-day p90 lifetime), unknown under 20 closed), cost-per-landed-item (spend over
-  the last 7 UTC days / ranges closed landed over the same days; never flagged).
+  the last 7 UTC days / ranges closed landed over the same days, from close events; never flagged),
+  cache-read-per-landed-item (cache-read tokens / the same landed ranges, 7 d; never flagged).
   labels and reasonLabel are the owner's words for the tokens (src/lib/constraint-labels.ts); line and
   the text form use only them. stuck is the 50 oldest waits, capped after the mine filter;
   stuckTotal is how many matched (the text form prints "50 of N").
@@ -1262,6 +1312,115 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   workspace's orchestrator. An answer older than 120 s, or with the ledger unknown, neither raises
   nor clears. judged is false when the value or threshold is null or the measure never flags; an
   anomaly that cannot be judged keeps its raised flag.
+
+## Board goal (ADR-0034 §10)
+
+GET|PUT|DELETE /api/cli/workspaces/<workspaceId>/board-goal
+  (purplemux board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS)
+  GET: read scope; { "workspaceId", "goal": null | { "label", "items", "setAt", "setBy" } }.
+  PUT { "label": "<1..120>", "items": ["<type>:<key>", ... 1..500] }: the workspace's own token only
+  (403 otherwise; an admin token is not a workspace). 400 invalid-request lists every defect
+  ("items[0]: saw \"story-3\", expected <type>:<key> ..."). DELETE clears. PUT and DELETE drop the
+  finder's cached answer and answer { "workspaceId", "goal" | "cleared", "onTrack" } derived at once.
+
+## Pulse (ADR-0034 §9)
+
+GET /api/cli/workspaces/<workspaceId>/pulse          (purplemux board pulse -w WS [--json])
+GET /api/mission-control/pulse[?workspaceId=all|WS]  (human session; all answers { "pulses": [...] })
+  Read scope on WS. Hourly movement over the last 48 h, cached 60 s per workspace. Response:
+  { "workspaceId", "generatedAt", "staleSince" | null, "scope": { "basis": "epic" | "directories", "epics": [...] },
+    "hours": null | [{ "start", "total", "bySource": { <source>: n }, "gatesPassed", "gatesFailed" } x 48],
+    "sources": [{ "id", "label", "state": "ok" | "unknown", "reason" | null, "count" | null, "lastAt" | null, "from": [...],
+                  "sharedWith": null | [<workspace name>] }],
+    "stall": { "state": "stalled" | "moving" | "steady" | "idle" | "not-measured", "reason", "lastMovementAt" | null,
+               "hoursSinceMovement" | null, "lastHour" | null, "medianPerHour" | null,
+               "oldestStuck": null | { "kind": "ledger-item" | "agent-tab" | "mc-item", "id", "label", "since" } },
+    "wip": { "count" | null, "basis": "ledger" | "agent-tabs" | "none", "basisReason",
+             "sources": { "ledger": "measured" | "no-events" | "unreadable", "agentTabs" | "missionControl": "measured" | "unreadable" | "not-used" } },
+    "priority": { "text", "basis": "constraint" | "stuck-critical" | "none" | "unknown", "needsYou" | null } }
+  Scope: every event belongs to one workspace. A workspace holding an epic:<slug> lease counts that
+  epic's _output/<slug> gate logs and review records, the repositories its status.yaml names with an
+  integration_branch (that exact branch and each story's branch, stories[].branch else story/<key>),
+  and every directory whose .v2/status.yaml names the epic (main, gate logs, receipts, landings).
+  Where two leased epics share a repository, a commit counts for one epic only: the one whose story
+  branches alone hold it; any other commit both reach is a commits source with sharedWith set. Without a lease: its own directories, minus what
+  another workspace's epic covers; a directory another workspace lists too is a source with
+  sharedWith set, shown after the six and never counted in hours or stall.
+  Sources (in order): ledger (open, clear, close on range, slice, gate, review, landing, deploy),
+  commits (the scope's refs), gates (gate.sh logs: VERDICT word VALID with EXIT=0 passes, RED fails,
+  VOID/REFUSED/KILLED/STOPPED are not finished; v2 logs: the GATE PASS|FAIL line naming the file),
+  reviews (v2 receipts and every _output/<epic>/reviews/*-out.md), landed (.v2/landings.log LANDED
+  lines), answers (Mission Control answers). Each read has a 10 s deadline ("read timed out"). Reads
+  on an sshfs mount (_output) run at most 2 at a time; a mount that does not answer within 5 s reads
+  "<mount> not answering since <time>" until a probe stat of it returns. A
+  source that cannot be read is "unknown" with count null, never 0, and adds nothing to the bars;
+  hours is null when no source is read.
+  stall: stalled when wip.count > 0 and nothing moved for 2 h (names the oldest counted item: an
+  MC item, a tab waiting for input, or a ledger item); moving when the last 60 min is above 0 and
+  at or above the median of the active hours (any event) among the 168 complete hours before the
+  current one (stall.medianPerHour, stall.activeHours); idle when wip.count is
+  0; steady otherwise; not-measured with no basis or when no file-born source (commits, gates,
+  reviews, landed) was read. The reason names every source not measured.
+  wip: the ledger's open range, slice, gate, review, landing and deploy items once the ledger holds
+  an event on one of those types for the workspace in 7 days; else busy or needs-input agent tabs (the orchestrator
+  only while it waits for the owner: a pane prompt or a NEEDS-DECISION/BLOCKED turn end) plus open Mission Control
+  items; else none.
+  priority: the constraint with its owner and clear input; else the oldest stuck critical item;
+  with the needs-you count. staleSince: the finder answer it rests on is older than 120 s.
+
+## Context lifecycle (ADR-0036)
+
+A seat is an agent tab created with a handoff file: POST /api/cli/tabs with "handoff": "/abs/path.md"
+and optionally "rotateAt": <50000..900000> | "off"   (purplemux tab create ... --handoff PATH [--rotate-at N|off]).
+The path is absolute (the CLI resolves it against its cwd) and need not exist yet; a remote tab, a
+relative path, or rotateAt without handoff is 400 invalid-request. The tab answers and lists
+"handoffPath" and "rotateAt". Paths by convention: v2 seats .v2/seats/<seat>/handoff.md; other
+workspaces ~/.purplemux/workspaces/<ws>/seats/<tab-name>/handoff.md. Only seats rotate.
+Context: the Claude statusline's last request (input + cache writes + cache reads), per session.
+Rotation: when the context reaches the seat's threshold (rotateAt, else fleet config
+context.rotate-at-tokens, default 300000), or after a compaction, and the tab is at its prompt (idle,
+ready for review, or waiting) with no registered tab bg job and no open background task (armed
+watches survive a restart and do not count; an unreadable transcript blocks), the server types one
+urgent event (kind "rotate", ADR-0035), never mid-turn and never within 5 s of another delivery:
+  ROTATE: bring <path> up to date, then end your turn with HANDOFF-READY.
+A turn whose last line is HANDOFF-READY (or starts "HANDOFF-READY:") gets the file checked at the
+next idle with the checker below, against the request time (whole seconds). Any other turn end, or a
+new submission after HANDOFF-READY, asks ROTATE again with a new request time: the file is checked
+only as of the seat's last turn. While a rotation is owed or under way the seat's digests are held.
+Pass: the tab restarts --clear under the same id (ADR-0028: leases, watches, probes, notes and
+reportsTo stay; a seat waiting only on watches restarts with interrupt, decided inside the restart
+lock) and its first message, typed once a session newer than the restart is idle at its prompt, is
+"Read <path>, then continue: <resume command>". The seat item stays "rotating" until then, so a
+server restart resumes the rotation. Fail: one message
+"HANDOFF CHECK FAILED: <path>: <reasons>. Fix the file, then end your turn with HANDOFF-READY.";
+a second failure raises the rotation alarm and leaves the session as it is (a later HANDOFF-READY
+that passes still rotates and clears it). A rotation has one 30 min deadline from its first ROTATE
+and asks ROTATE at most twice; past the deadline the digest hold is released, it counts as one
+failed check, and the next rotation waits 30 min. HANDOFF-READY may end with "." or "!".
+Seat item: ledger item seat:<ws>:<tab-name>, holder the tab name, written by the server: open at
+create (or at the first reading after a server start), state = the rotation phase (watching,
+rotate-requested, handoff-ready, rotating, rotation-alarm), attrs tabId, handoffPath, rotateAtTokens,
+contextTokens and contextAt (a changed reading at most every 5 min), compactions,
+compactionsSinceRotation, lastCompactAt, rotations, lastRotationAt, rotateRequestedAt,
+rotationFailures, rotationAlarm; closed when the tab closes. Board anomalies (ADR-0034):
+context-per-call, seat-compactions (compactionsSinceRotation, threshold 0: a compaction is a missed
+rotation) and rotation-alarm (rotationFailures, threshold 1) and handoff-undelivered (a rotated seat whose first
+message was dropped after 10 min, threshold 0); each breach is a ledger flag alert. While a seat is
+rotating its urgent events are held too and typed after the first message.
+
+POST /api/cli/handoff/check   (purplemux handoff check PATH [--rotate-requested-at UTC] [--now UTC] [--json])
+  Any CLI scope. Body: { "text": the file, "rotateRequestedAt"?: UTC, "now"?: UTC } (UTC =
+  YYYY-MM-DDTHH:MM[:SS[.ffffff]] ending in Z or +00:00; else 400 invalid-request). Response
+  { "ok", "reasons": [string], "seat" | null, "updatedAt" | null, "resumeCommand" | null }. The schema:
+  the title "# Handoff: <seat> · updated <UTC>" first, not older than the request nor more than 5 min
+  after now; the headings ## Role (1-3 lines), ## In flight (none, or the table | item key | state |
+  next action | waiting on |), ## Open questions (none, or Mission Control item ids), ## Standing rules
+  (none, or "- <rule> (source: SO-<n> | DEC-<n> | ARC-<n> | lane ledger <name> <YYYY-MM-DDTHH:MM:SSZ> |
+  owner message <UTC date>)", one source per rule), ## Decisions in the last 24 h, ## Do not,
+  ## Resume command (one line), once each, in that order, no other; at most 12288 bytes. KR-<n>,
+  C-<name> and an ORCH-<n> stamp without "lane ledger" are not sources. The CLI reads the file
+  (unreadable or non-UTF-8: exit 1), prints "handoff-check: PASS <path>" (exit 0) or one
+  "handoff-check: <reason>" line each (exit 1), the wording of v2's tools/handoff-check.py.
 
 ## Portfolio board
 

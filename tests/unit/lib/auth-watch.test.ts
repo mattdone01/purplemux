@@ -141,7 +141,7 @@ class Harness {
   sent: Array<IEnqueueRequest<'watch'> & { line: string }> = [];
   fired: IWatch[] = [];
   reads = 0;
-  host: string | null = null;
+  host: { known: false } | { known: true; host: string | null } = { known: true, host: null };
 
   deps(): IWatchDeps {
     return {
@@ -246,11 +246,28 @@ describe('watch kind auth (story 14 AC 5)', () => {
 
   it('refuses an auth wait from a remote tab, naming both hosts: its sign-in is not on this server', async () => {
     const h = new Harness();
-    h.host = 'ai-server';
+    h.host = { known: true, host: 'ai-server' };
     const manager = new WatchManager(h.deps());
     await expect(manager.create(caller('ws-a', 'tab-a'), { kind: 'auth', target: 'dev', until: 'signed-in' }))
       .rejects.toThrow("an auth watch reads the SSO cache of this server's host (mdserver1); tab tab-a runs on ai-server, whose sign-in it cannot see");
     expect(h.state.watches).toEqual([]);
+  });
+
+  it('fails closed when the layout cannot say where the tab runs: caller-unresolved, no watch written (confirm NIT 4)', async () => {
+    const h = new Harness();
+    h.host = { known: false };
+    const manager = new WatchManager(h.deps());
+    await expect(manager.create(caller('ws-a', 'tab-a'), { kind: 'auth', target: 'dev', until: 'signed-in' })).rejects.toMatchObject({
+      code: 'caller-unresolved',
+      message: "the host of tab tab-a could not be read from the layout of ws-a; an auth watch reads only this server's SSO cache: retry",
+    });
+    expect(h.state.watches).toEqual([]);
+  });
+
+  it('the runtime tabHost answers known: false with no layout file, never a local answer (confirm NIT 4)', async () => {
+    const { defaultWatchDeps } = await import('@/lib/watch-manager');
+    const deps = await defaultWatchDeps();
+    expect(await deps.tabHost('ws-nolayout', 'tab-a')).toEqual({ known: false });
   });
 
   it('starts no process at all while an auth watch is created, read and fired (DEC-261)', async () => {
