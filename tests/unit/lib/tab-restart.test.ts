@@ -378,6 +378,8 @@ describe('restartTab (ADR-0028)', () => {
 
   it('a remote tab restarts on the same host, fresh only', async () => {
     tmux.killSession.mockResolvedValue({ ...REAP, reaper: 'remote', sessionGone: true });
+    // Present before the reap, gone after it, as the remote tmux answers.
+    tmux.hasSessionOrUnreachable.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
     await writeLayout([claudeTab({ host: 'ai-server' })]);
     const { restartTab } = await import('@/lib/tab-restart');
     const { sessionHostOf } = await import('@/lib/session-host');
@@ -391,6 +393,9 @@ describe('restartTab (ADR-0028)', () => {
       expect.objectContaining({ host: 'ai-server' }),
       expect.objectContaining({ resumeSessionId: null }),
     );
+    // The identity is what makes createRemoteSession rewrite the prompt file and ship it: a remote restart
+    // loads the standing orders active at the restart (ADR-0041; architect ruling on story 14 AC 2).
+    expect(tmux.createSession).toHaveBeenCalledWith(session('tab-t'), 80, 24, '/srv/r', { workspaceId: WS, tabId: 'tab-t' });
   });
 
   it('a remote host that does not answer kills nothing: 503 remote-host-unreachable', async () => {

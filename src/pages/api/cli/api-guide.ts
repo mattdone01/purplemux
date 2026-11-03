@@ -118,6 +118,9 @@ to an exit code through one table:
      6  no answer (pool, ADR-0039)               pool-timeout                               fall back to a local slot, log it;
                                                                                             never for a gate.no-local-
                                                                                             fallback repository (ADR-0039 §6)
+     2  usage error (standing orders, ADR-0041)  so-invalid, so-too-large                   fix the command, or strike an order
+     3  refused by state (orders, ADR-0041)      so-unreadable, so-struck                   after the file is repaired
+     7  not found (standing orders, ADR-0041)    so-not-found                               —
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -669,7 +672,7 @@ the owner ONE inbox line when the condition holds, then deletes it; it dies with
 GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a lease watch is
 evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
 max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
-server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
+server token (http-404, http-403, timeout, auth, gh-missing, sso-config, other); watch list shows the error
 text; after that notice the watch reads less often (2x, 4x, up to 8x its interval). A merged
 watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
 requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
@@ -686,6 +689,42 @@ GET /api/cli/watches[?workspaceId=WS]
   "live"|"closed"|"unknown", "ageSeconds", "expiresInSeconds", "failures", "lastError" }] }.
 DELETE /api/cli/watches/<id>
   The owner tab or admin (else 403). 404 watch-not-found (exit 7). Response: { "removed" }.
+
+Auth waits (ADR-0041): kind "auth", target an AWS profile (stored as "aws-sso:<profile>"), until
+"signed-in", optional "ledgerItem" (a ledger item key). The server reads only that profile's AWS
+SSO cache file (~/.aws/sso/cache/<sha1 of its sso-session, or of a legacy sso_start_url>.json)
+every 60 s by default and starts no aws process (DEC-261); a profile ~/.aws/config does not define
+as SSO is 400 watch-invalid. A valid token (accessToken present, expiresAt in the future) sends
+"[purplemux watch w-…] aws-sso:<profile> is signed in: its SSO token is valid until <UTC>; retry
+the step that needed it — watch cleared", and the server clears, with a ledger "clear" event, the
+open "deploy-auth" wait of ledgerItem and of every item of the workspace whose clear input names
+the profile as a word. An unreadable config or cache file is the failing token "sso-config".
+CLI: purplemux wait add --auth PROFILE [--item KEY] [--ttl 24h] [--label TEXT].
+
+## Standing orders (ADR-0041)
+
+The owner's rules, said once: ~/.purplemux/standing-orders.md (fleet; seeded with the W8 orders
+SO-1..SO-7) and ~/.purplemux/workspaces/<ws>/standing-orders.md. Each order SO-<n> (ids unique on
+the host) has text (≤ 600), source (the owner message id and UTC date, ≤ 300), scope (default the
+file's owner), check (a hook or test name, default "prose") and state (active | struck). The active
+fleet and workspace orders are written into the workspace's claude-prompt.md at every Claude launch
+(tab create, restart, resume) and on every change; a change also sends each live agent tab it
+reaches one urgent line: "[purplemux standing order] SO-<n> added|struck (<owner>): <text> — …".
+
+GET /api/cli/standing-orders[?workspaceId=WS][&all=1]
+  A tab reads the fleet's and its own workspace's orders; admin reads one workspace or every file.
+  Active orders only unless all=1. Response: { "orders": [{ id, owner, text, source, scope, check,
+  state, added, struck? }] }.
+POST /api/cli/standing-orders   { "text", "source", "workspaceId"?, "scope"?, "check"? }
+  No workspaceId: a fleet order (admin token only, else 403 forbidden). A workspace order: that
+  workspace's tabs or admin. 400 so-invalid names the field; 400 so-too-large when the active orders
+  one workspace loads would pass 8192 bytes, with the measured size. Response: { owner, order, bytes,
+  workspaceId, promptsWritten, tabsNotified }.
+POST /api/cli/standing-orders/<SO-n>/strike   { "reason" }
+  The same authority as the order's file. 404 so-not-found; 409 so-struck when already struck (exit 3).
+  The order stays in its file with "struck: <UTC> — <reason>".
+CLI: purplemux so add (-w WS | --fleet) --text T --source S [--scope S] [--check C]; so strike
+SO-N --reason R; so list [-w WS] [--all] [--json].
 
 ## Fleet config (ADR-0019)
 

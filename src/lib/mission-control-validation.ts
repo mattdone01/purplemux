@@ -93,7 +93,9 @@ const parse = <T>(schema: z.ZodType<T>, input: unknown): T => {
 
 // `answer:auto:` is the event ID of the bookkeeping rule's answer (ADR-0031 §6): its submission ID is
 // predictable, so a producer must not take the event ID first.
-const RESERVED_EVENT_ID_PREFIXES = ['system:migration:', 'system:rebind:', 'answer:auto:'];
+// `system:needs-decision:` is the server's NEEDS-DECISION opener (ADR-0041): only it may take one.
+export const NEEDS_DECISION_EVENT_PREFIX = 'system:needs-decision:';
+const RESERVED_EVENT_ID_PREFIXES = ['system:migration:', 'system:rebind:', 'answer:auto:', NEEDS_DECISION_EVENT_PREFIX];
 const RESERVED_SUBMISSION_ID_PREFIX = 'auto:';
 
 export interface IMissionEventBatch {
@@ -132,9 +134,14 @@ const checkQuestions = (events: TParsedEvent[], minVersion: 1 | 2): IMissionEven
   return { events: checked as TMissionProducerEvent[], lint };
 };
 
-export const parseMissionEventBatch = (input: unknown, options: { questionMinVersion?: 1 | 2 } = {}): IMissionEventBatch => {
+/** `serverPrefix`: the one reserved namespace a server producer writes in; no request ever carries it. */
+export const parseMissionEventBatch = (
+  input: unknown,
+  options: { questionMinVersion?: 1 | 2; serverPrefix?: string } = {},
+): IMissionEventBatch => {
   const events = parse(z.array(eventSchema).min(1).max(25), input);
-  if (events.some((event) => RESERVED_EVENT_ID_PREFIXES.some((prefix) => event.eventId.startsWith(prefix)))) {
+  const reserved = RESERVED_EVENT_ID_PREFIXES.filter((prefix) => prefix !== options.serverPrefix);
+  if (events.some((event) => reserved.some((prefix) => event.eventId.startsWith(prefix)))) {
     throw new MissionControlError(400, 'invalid-request', 'event ID uses a reserved namespace');
   }
   const eventIds = events.map((event) => event.eventId);

@@ -42,6 +42,7 @@ import {
   WAIT_BACKSTOP_CONFIG_KEY,
   WAIT_BACKSTOP_DEFAULT_MS,
   classifyTurnEnd,
+  lastTurnLine,
   holdsOffStall,
   idleNudgeDue,
   isBackgroundWaitStalled,
@@ -1033,6 +1034,17 @@ export class StatusManager {
     const entry = this.tabs.get(tabId);
     if (!entry || !isAgentPanelType(entry.panelType) || this.isRetired(tabId) || this.isHaltedByUsageLimit(tabId)) return false;
     return entry.cliState === 'idle' || entry.cliState === 'ready-for-review' || this.isWaitingAtPrompt(tabId);
+  }
+
+  /** Agent tabs whose agent runs, of one workspace or (null) of all: who a changed standing order reaches (ADR-0041). */
+  liveAgentTabs(workspaceId: string | null): Array<{ workspaceId: string; tabId: string }> {
+    const live: Array<{ workspaceId: string; tabId: string }> = [];
+    for (const [tabId, entry] of this.tabs) {
+      if (!isAgentPanelType(entry.panelType) || this.isRetired(tabId) || entry.cliState === 'inactive') continue;
+      if (workspaceId !== null && entry.workspaceId !== workspaceId) continue;
+      live.push({ workspaceId: entry.workspaceId, tabId });
+    }
+    return live;
   }
 
   /** A closed tab's held events will never be typed (ADR-0035; review F12). */
@@ -2517,6 +2529,14 @@ export class StatusManager {
       this.broadcastUpdate(tabId, entry);
       return;
     }
+    // Whatever its reportOn, a NEEDS-DECISION turn reaches the owner as a Mission Control item (ADR-0041). The item
+    // opens before the nudge, so the nudge names it and the orchestrator never copies the question (review r1, R1).
+    let decisionNote = '';
+    const endLine = turnEnd.kind === 'turn-marker' ? turnEnd.lines.at(-1) : undefined;
+    if (stopSeq !== undefined && endLine?.startsWith('NEEDS-DECISION:')) {
+      decisionNote = await this.openNeedsDecision(tabId, entry, snapshot?.lastAssistantTail, endLine, stopSeq, previous?.at ?? entry.busySince ?? at);
+      if (this.tabs.get(tabId) !== entry || entry.lastEvent?.name !== 'stop' || entry.lastEvent.seq !== stopSeq) return;
+    }
     if (turnEnd.kind === 'turn-marker') {
       entry.turnEnd = { kind: 'turn-marker', at, seq: stopSeq, marker: turnEnd.lines };
     } else {
@@ -2539,18 +2559,60 @@ export class StatusManager {
       log.info({ tabId, marker: turnEnd.lines.at(-1), reportOn: entry.reportOn, filtered: this.reportOnFiltered }, 'turn-marker nudge withheld: the marker is outside the tab\'s reportOn');
     }
     const nudge = forwarded && turnEnd.kind === 'turn-marker'
-      ? { kind: 'turn-marker' as const, detail: turnEnd.lines.join('\n') }
+      ? { kind: 'turn-marker' as const, detail: `${turnEnd.lines.join('\n')}${decisionNote}` }
       : null;
     if (entry.cliState !== 'ready-for-review') {
       this.applyCliState(tabId, entry, 'ready-for-review', { nudge });
       this.persistToLayout(entry);
-    } else if (nudge && !(previous?.kind === 'turn-marker' && previous.marker?.join('\n') === nudge.detail)) {
+    } else if (nudge && !(previous?.kind === 'turn-marker' && turnEnd.kind === 'turn-marker'
+      && previous.marker?.join('\n') === turnEnd.lines.join('\n'))) {
       this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail).catch((err) => {
         log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
       });
     }
     this.persistTurnEnd(entry);
     this.broadcastUpdate(tabId, entry);
+  }
+
+  /**
+   * Open the turn's NEEDS-DECISION item (ADR-0041) and return what the orchestrator's nudge says of it. The question
+   * is built from the whole last line of the tail, not the marker line clipped for the nudge (review r1, R2). When no
+   * item can open, the owner is alerted with the line instead, so the question still reaches them (review r1, N11).
+   */
+  private async openNeedsDecision(
+    tabId: string, entry: ITabStatusEntry, tail: string | null | undefined, markerLine: string, stopSeq: number, turnStartedAt: number,
+  ): Promise<string> {
+    const full = lastTurnLine(tail);
+    const { line, complete } = full?.line.startsWith('NEEDS-DECISION:') ? full : { line: markerLine, complete: false };
+    try {
+      const { needsDecisionDeps, openNeedsDecisionItem } = await import('@/lib/needs-decision-opener');
+      const outcome = await openNeedsDecisionItem(await needsDecisionDeps(), {
+        workspaceId: entry.workspaceId, tabId, tabName: entry.tabName, line, lineComplete: complete, stopSeq, turnStartedAt,
+      });
+      if (outcome.opened) return ` [MC item ${outcome.itemId} opened]`;
+      if (outcome.reason === 'already-open') return ` [MC item ${outcome.itemId} already open]`;
+      if (outcome.reason === 'asked-this-turn') return ` [MC item ${outcome.itemId} opened by the tab this turn]`;
+      log.warn({ tabId, ...outcome }, 'NEEDS-DECISION reached no Mission Control item; alerting the owner');
+      await this.alertNeedsDecision(tabId, entry, line, outcome.reason);
+      return ` [no MC item: ${outcome.reason}; the owner was alerted]`;
+    } catch (err) {
+      log.warn(`NEEDS-DECISION item failed for ${tabId}: ${err instanceof Error ? err.message : err}`);
+      return '';
+    }
+  }
+
+  private async alertNeedsDecision(tabId: string, entry: ITabStatusEntry, line: string, reason: string): Promise<void> {
+    await this.dispatchAlert({
+      kind: 'flag',
+      tabId,
+      workspace: await getWorkspaceByIdCached(entry.workspaceId),
+      workspaceId: entry.workspaceId,
+      tabName: entry.tabName,
+      providerId: toAlertProvider(entry.agentProviderId),
+      agentSessionId: entry.agentSessionId,
+      // An alert body is 100 characters: the question goes first, the reason is in the log line above.
+      detail: `${entry.tabName || tabId} needs your decision: ${line.slice('NEEDS-DECISION:'.length).trim()}`,
+    }).catch((err) => log.warn(`NEEDS-DECISION alert (${reason}) failed for ${tabId}: ${err instanceof Error ? err.message : err}`));
   }
 
   /** `replayedAt`: the time a spooled event happened, for a replay (ADR-0020); a live event has none. */

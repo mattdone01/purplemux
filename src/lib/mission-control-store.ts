@@ -847,6 +847,18 @@ export class MissionControlStore {
       ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string }>)
       .map((row) => ({ id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? '') }));
 
+  /** Items the tab opened at or after `since`, any state: a NEEDS-DECISION turn that already asked opens none (ADR-0041). */
+  itemsOpenedByTab = (workspaceId: string, tabId: string, since: number): string[] =>
+    (this.database.prepare(`SELECT item_id FROM mission_item_openers INDEXED BY mission_item_openers_tab_idx
+      WHERE workspace_id = ? AND tab_id = ? AND opened_at >= ? ORDER BY opened_at, item_id`).all(workspaceId, tabId, since) as Array<{ item_id: string }>)
+      .map((row) => row.item_id);
+
+  /** Items the tab opened that are still candidate or open: not answered, resolved or cancelled (ADR-0041). */
+  openItemsOfTab = (workspaceId: string, tabId: string): string[] =>
+    (this.database.prepare(`SELECT o.item_id FROM mission_item_openers o JOIN attention_items a ON a.id = o.item_id
+      WHERE o.workspace_id = ? AND o.tab_id = ? AND a.state IN ('candidate','open') ORDER BY o.opened_at, o.item_id`)
+      .all(workspaceId, tabId) as Array<{ item_id: string }>).map((row) => row.item_id);
+
   /** Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). */
   openItemOpeners = (): IMissionOpenItemOpener[] => {
     const rows = this.database.prepare(`SELECT a.id AS item_id, a.workspace_id, a.created_at,

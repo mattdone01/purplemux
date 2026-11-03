@@ -14,6 +14,11 @@ const workspaceStore = vi.hoisted(() => ({
   getWorkspacesCached: vi.fn(),
 }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
+const needsDecision = vi.hoisted(() => ({
+  open: vi.fn(async (_deps: unknown, _stop: unknown): Promise<Record<string, unknown>> => ({ opened: true, itemId: 'nd-0123456789abcdef0123456789abcdef', runId: 'run-a' })),
+}));
+const alerts = vi.hoisted(() => ({ dispatch: vi.fn(async (_draft: unknown) => {}) }));
+vi.mock('@/lib/needs-decision-opener', () => ({ needsDecisionDeps: async () => ({}), openNeedsDecisionItem: needsDecision.open }));
 
 // The file logger writes under the temp HOME, which each test removes; a write
 // still pending at removal surfaced as an unhandled ENOENT (gate 26-r1).
@@ -40,7 +45,7 @@ vi.mock('@/lib/tmux', async (importOriginal) => ({
 vi.mock('@/lib/notification-dispatcher', () => ({
   createStatusSocketChannel: vi.fn(() => ({})),
   createWebPushChannel: vi.fn(() => ({})),
-  getNotificationDispatcher: () => ({ dispatch: vi.fn(async () => {}), register: vi.fn() }),
+  getNotificationDispatcher: () => ({ dispatch: alerts.dispatch, register: vi.fn() }),
 }));
 
 const FIXTURES = path.join(__dirname, '../../fixtures');
@@ -199,6 +204,69 @@ describe('stop classification (ADR-0018)', () => {
         `[orchestrator-watchdog] worker worker (w1) ended: ${BLOCKED} — read with: purplemux tab result -w ws-1 worker`,
       );
       expect(manager.getReportOnFilteredCount()).toBe(0);
+    });
+
+    it('opens a Mission Control item for a NEEDS-DECISION end, even when reportOn withholds the nudge (ADR-0041)', async () => {
+      const { manager, paste } = await managerWithPaste();
+      const line = 'NEEDS-DECISION: [scope] Is the export in this epic? (a) yes (b) no';
+      const entry = { ...worker('claude-code', await writeLines('claude/nd.jsonl', [claudeEnd(`Built what I can.\n\n${line}`)])), reportOn: ['DONE'] as TTurnMarkerName[], busySince: 1234 };
+      manager.registerTab('worker', entry);
+
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(needsDecision.open).toHaveBeenCalledTimes(1));
+      await settle();
+
+      expect(needsDecision.open.mock.calls[0]).toEqual([{}, { workspaceId: 'ws-1', tabId: 'worker', tabName: 'w1', line, lineComplete: true, stopSeq: entry.turnEnd!.seq, turnStartedAt: 1234 }]);
+      expect(paste).not.toHaveBeenCalled();
+      expect(manager.getReportOnFilteredCount()).toBe(1);
+    });
+
+    it('the nudge names the Mission Control item, so the orchestrator never copies the question (R1)', async () => {
+      const { manager, paste } = await managerWithPaste();
+      const line = 'NEEDS-DECISION: Is the export in this epic?';
+      manager.registerTab('worker', worker('claude-code', await writeLines('claude/nd2.jsonl', [claudeEnd(`Stuck.\n\n${line}`)])));
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+      expect(paste).toHaveBeenCalledWith('tmux-root',
+        `[orchestrator-watchdog] worker worker (w1) ended: ${line} [MC item nd-0123456789abcdef0123456789abcdef opened] — read with: purplemux tab result -w ws-1 worker`);
+      needsDecision.open.mockResolvedValueOnce({ opened: false, reason: 'already-open', itemId: 'nd-0123456789abcdef0123456789abcdef' });
+      const { manager: m2, paste: p2 } = await managerWithPaste();
+      m2.registerTab('worker', worker('claude-code', await writeLines('claude/nd3.jsonl', [claudeEnd(`Still stuck.\n\n${line}`)])));
+      m2.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(p2).toHaveBeenCalledTimes(1));
+      expect(p2.mock.calls[0][1]).toContain(`${line} [MC item nd-0123456789abcdef0123456789abcdef already open] — read with`);
+    });
+
+    it('hands the opener the whole last line, not the marker line clipped at 300 chars (R2)', async () => {
+      const { manager } = await managerWithPaste();
+      const line = `NEEDS-DECISION: ${'which rule do we ship '.repeat(14)}? (a) base currency (b) transaction currency (c) defer`;
+      expect(line.length).toBeGreaterThan(300);
+      manager.registerTab('worker', worker('claude-code', await writeLines('claude/nd4.jsonl', [claudeEnd(`Done.\n\n${line}`)])));
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(needsDecision.open).toHaveBeenCalledTimes(1));
+      expect(needsDecision.open.mock.calls[0][1]).toMatchObject({ line, lineComplete: true });
+    });
+
+    it('with no item to open, the owner is alerted with the line and the nudge says so (N11)', async () => {
+      needsDecision.open.mockResolvedValueOnce({ opened: false, reason: 'no-orchestrator-run', detail: 'root' });
+      const { manager, paste } = await managerWithPaste();
+      const line = 'NEEDS-DECISION: Ship it?';
+      manager.registerTab('worker', worker('claude-code', await writeLines('claude/nd5.jsonl', [claudeEnd(`Ok.\n\n${line}`)])));
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+      expect(paste.mock.calls[0][1]).toContain(`${line} [no MC item: no-orchestrator-run; the owner was alerted]`);
+      const flags = alerts.dispatch.mock.calls.map(([draft]) => draft as { kind?: string; body?: string });
+      expect(flags).toContainEqual(expect.objectContaining({ kind: 'flag', body: 'w1 needs your decision: Ship it?' }));
+    });
+
+    it('opens no item for another end line', async () => {
+      const { manager, paste } = await managerWithPaste();
+      const entry = worker('claude-code', await writeLines('claude/bl2.jsonl', [claudeEnd(`Gate red.\n\n${BLOCKED}`)]));
+      manager.registerTab('worker', entry);
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+      await settle();
+      expect(needsDecision.open).not.toHaveBeenCalled();
     });
 
     it('sends no idle nudge after a withheld marker: the stop had an end line', async () => {

@@ -29,6 +29,8 @@ const CLI_COMMANDS = new Set([
   'grant',
   'deploy',
   'watch',
+  'wait',
+  'so',
   'api-guide',
   'help',
   '-h',

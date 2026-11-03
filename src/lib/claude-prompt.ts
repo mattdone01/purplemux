@@ -1,12 +1,14 @@
+import { randomBytes } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import { resolveLayoutDir } from '@/lib/layout-store';
+import { promptSectionFor } from '@/lib/standing-orders-store';
 import type { IWorkspace } from '@/types/terminal';
 
 export const getClaudePromptPath = (workspaceId: string): string =>
   path.join(resolveLayoutDir(workspaceId), 'claude-prompt.md');
 
-const buildBody = (ws: IWorkspace): string => {
+export const buildClaudePromptBody = (ws: Pick<IWorkspace, 'id'>, standingOrders = ''): string => {
   return `# purplemux context
 
 You are running inside a purplemux workspace tab.
@@ -44,6 +46,8 @@ purplemux note list --open --to-me                     # notes for you: run at t
 purplemux note send --to-epic SLUG --subject T -f FILE # local to the holder; cross-workspace coordinator-to-coordinator; body pulled, never typed
 purplemux watch pr OWNER/REPO#N --until merged         # one inbox line when it holds (also closed, head-moved, checks-settled)
 purplemux watch lease NAME --until free                # wait for a lease without a polling loop; watch list / watch clear ID
+purplemux wait add --auth PROFILE [--item KEY]         # waiting on the owner's AWS sign-in: one inbox line when its SSO token is valid
+purplemux so list                                      # the owner's standing orders (also below); so add -w ${ws.id} --text T --source S
 \`\`\`
 
 At turn start, run \`purplemux note list --open --to-me\` and ack each note you applied (\`purplemux note ack ID --comment ...\`).
@@ -80,18 +84,31 @@ purplemux api-guide
   see \`purplemux api-guide\`) directly.
 - **\`terminal\` / \`claude-code\` / \`codex-cli\` tabs**: run inside tmux, so \`alive\` is a valid
   liveness signal.
-`;
+${standingOrders ? `\n${standingOrders}` : ''}`;
 };
 
-export const writeClaudePromptFile = async (ws: IWorkspace): Promise<void> => {
+/**
+ * The prompt file every Claude tab of the workspace loads with `--append-system-prompt-file`, with the
+ * active standing orders (ADR-0041). Written at server start, on a workspace change, before every
+ * Claude launch (tab create and restart) and when an order changes.
+ */
+export const writeClaudePromptFile = async (ws: Pick<IWorkspace, 'id'>): Promise<void> => {
   const filePath = getClaudePromptPath(ws.id);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const body = buildBody(ws);
+  const body = buildClaudePromptBody(ws, await promptSectionFor(ws.id));
   try {
     const existing = await fs.readFile(filePath, 'utf-8');
     if (existing === body) return;
   } catch {
     // missing — write below
   }
-  await fs.writeFile(filePath, body, 'utf-8');
+  // A launch reads this file while another writer may be mid-write: tmp + rename, a name per writer (review r1, R6).
+  const tmp = `${filePath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(tmp, body, 'utf-8');
+    await fs.rename(tmp, filePath);
+  } catch (err) {
+    await fs.unlink(tmp).catch(() => {});
+    throw err;
+  }
 };
