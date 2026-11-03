@@ -64,6 +64,14 @@ describe('purplemux tab create --host (ADR-0022)', { timeout: 30_000 }, () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ host: 'ai-server' });
   });
 
+  it('sends --host auto as given: the server places the tab (ADR-0039)', async () => {
+    reply = { status: 201, body: { tabId: 'tab-new', host: 'ai-lan', placement: { host: 'ai-lan', local: false, reason: 'r', fallback: false } } };
+    const result = await cli(['tab', 'create', '-w', 'ws-a', '-t', 'claude-code', '--host', 'auto']);
+    expect(result.code).toBe(0);
+    expect(requests[0].body).toEqual({ workspaceId: 'ws-a', panelType: 'claude-code', host: 'auto' });
+    expect(JSON.parse(result.stdout)).toMatchObject({ placement: { host: 'ai-lan' } });
+  });
+
   it('sends --cwd with the create', async () => {
     reply = { status: 201, body: { tabId: 'tab-new' } };
     await cli(['tab', 'create', '-w', 'ws-a', '-t', 'claude-code', '--host', 'ai-server', '--cwd', '/home/mdone/wt/x']);

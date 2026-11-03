@@ -46,7 +46,36 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * are sent (ADR-0022), and fleet-wide keys any one workspace's orchestrator must
  * not set for every other workspace (ADR-0027 ruling R2).
  */
-export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool)\./;
+
+const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|tab)$/;
+const POOL_ALIAS_KEY = /^pool\.(fallback|gate-host)\.[A-Za-z0-9._-]+$/;
+
+const TAB_CAP_KEYS = /^tabs\.cap-per-workspace(\.[A-Za-z0-9_-]+)?$/;
+
+/** The WIP cap and a workspace's own cap (ADR-0027, ADR-0039): an integer 1..200, as `parseTabCap` reads it. */
+const checkTabCapValue = (key: string, value: string): void => {
+  if (!key.startsWith('tabs.cap-per-workspace')) return;
+  if (!TAB_CAP_KEYS.test(key)) throw new FleetConfigError('config-invalid', `${key} is not a cap key: tabs.cap-per-workspace or tabs.cap-per-workspace.<workspaceId>`);
+  const text = value.trim();
+  if (!/^\d{1,3}$/.test(text) || Number(text) < 1 || Number(text) > 200) {
+    throw new FleetConfigError('config-invalid', `${key} must be an integer 1..200, got ${JSON.stringify(value)}`);
+  }
+};
+
+/** The pool's keys (ADR-0039): slot caps are whole numbers 0..64; a fallback or gate host is an ssh alias. */
+const checkPoolValue = (key: string, value: string): void => {
+  if (!key.startsWith('pool.')) return;
+  if (POOL_SLOTS_KEY.test(key)) {
+    if (!/^\d{1,2}$/.test(value) || Number(value) > 64) throw new FleetConfigError('config-invalid', `${key} must be a whole number 0..64, got ${JSON.stringify(value)}`);
+    return;
+  }
+  if (POOL_ALIAS_KEY.test(key)) {
+    if (!isValidRemoteHostName(value)) throw new FleetConfigError('config-invalid', `${key} must be an ssh alias, got ${JSON.stringify(value)}`);
+    return;
+  }
+  throw new FleetConfigError('config-invalid', `${key} is not a pool key: pool.slots.<host>.<gate|build|tab>, pool.fallback.<alias> or pool.gate-host.<host>`);
+};
 
 /** Values the remote keys must hold, checked at write time so a bad one never reaches a create. */
 const checkRemoteValue = (key: string, value: string, state: IFleetConfigState): void => {
@@ -61,6 +90,7 @@ const checkRemoteValue = (key: string, value: string, state: IFleetConfigState):
   if (key === REMOTE_HOSTS_KEY) {
     const bad = value.split(',').map((h) => h.trim()).filter((h) => h && !isValidRemoteHostName(h));
     if (bad.length) throw new FleetConfigError('config-invalid', `${REMOTE_HOSTS_KEY} names that are not ssh aliases: ${bad.join(', ')}`);
+    if (value.split(',').some((h) => h.trim() === 'auto')) throw new FleetConfigError('config-invalid', `${REMOTE_HOSTS_KEY} cannot name a host "auto": \`tab create --host auto\` asks the pool (ADR-0039)`);
   }
 };
 
@@ -94,6 +124,8 @@ export const putValue = async (
   await requireWriter(caller, authority, key);
   const { state, change } = await mutateFleetConfig((s) => {
     checkRemoteValue(key, value, s);
+    checkPoolValue(key, value);
+    checkTabCapValue(key, value);
     return setValue(s, { key, value, expectedVersion }, setterOf(caller), authority.now());
   });
   if (change) await audit(change, caller);

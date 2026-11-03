@@ -111,6 +111,13 @@ to an exit code through one table:
                                                  ledger-event-conflict
      7  not found (ledger, ADR-0033)             ledger-experiment-not-found                —
      1  unexpected error (ledger, ADR-0033)      ledger-store-failed                        investigate
+     2  usage error (pool, ADR-0039)             pool-invalid                               fix the command
+     3  refused by state (pool, ADR-0039)        pool-full, pool-unreadable                 after the state changes, or a local
+                                                                                            slot; never for a gate.no-local-
+                                                                                            fallback repository (ADR-0039 §6)
+     6  no answer (pool, ADR-0039)               pool-timeout                               fall back to a local slot, log it;
+                                                                                            never for a gate.no-local-
+                                                                                            fallback repository (ADR-0039 §6)
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -158,6 +165,79 @@ POST /api/cli/leases/release-epic { "epic", "kind"? }     → { "released": [nam
 
 An unreadable lease store answers 500 \`lease-store-unreadable\`: nothing is known about who holds
 what, so treat it as a refusal.
+
+## Pool (ADR-0039)
+
+One scheduler places gates, builds and agent tabs on this host and the remote.hosts hosts from
+live headroom. This host is read through host-metrics on every call; each remote host by one ssh
+read (\`sh -s\`, 5 s hard timeout, then pool.fallback.<alias> once) every 30 s. A failed read
+makes the host unknown for 30 s: it shows no figures, never 0, takes nothing new, and keeps its
+leases. A read older than 90 s is unknown too. A host that answered only through its fallback
+alias shows its figures and "via", but "placeable" is false and "reason" says
+"answers only through <fallback>; <alias> failed (...)": it takes nothing new.
+
+GET /api/cli/pool   (any valid scope)
+  \`purplemux pool show [--json]\`. The board's pool section reads the same model.
+  Response: { "at", "totals": { "threads", "memTotalBytes", "memAvailableBytes", "knownHosts",
+  "unknownHosts", "slots": { "gate"|"build"|"tab": { "used", "cap", "free" } } }, "hosts": [{   (totals' "free"
+  counts placeable hosts only; "used" and "cap" count every known host)
+  "host", "local", "state": "known"|"unknown", "placeable", "readAt", "via", "reason", "loadPerThread",
+  "agentTabs", "slots", "metrics": null | { "threads", "load1", "load5", "memTotalBytes",
+  "memAvailableBytes", "disks": [{ "path", "usedPct", "freeBytes" }], "gpus": null | [{ "index",
+  "name", "utilPct", "memUsedMiB", "memTotalMiB" }], "sccacheSweep": null | { "state":
+  "active"|"stopped"|"failed"|"not-installed", "failed", "timer": { "loadState", "activeState",
+  "unitFileState", "result" }, "service": null | { ...the same } } } }] }. "stopped" is an
+  installed timer that is stopped or disabled; null is not read. Totals count known hosts only.
+  A tab slot in use is an agent tab on that host (from the layouts) or a tab-kind lease.
+  503 pool-unreadable (exit 3) when the fleet config or the lease store cannot be read.
+
+POST /api/cli/pool/acquire   (a tab token, or the admin token)
+  Body: { "kind": "gate"|"build"|"tab", "memGb"?: 0..1024, "ttlSeconds"?: n,
+          "panelType"?: "claude-code", "role"?: "evaluator" }   (panelType and role: kind tab only)
+  \`purplemux pool acquire --kind K [--mem GB] [--ttl 60m] [--panel-type T] [--role R]\`.
+  Placement: unknown and fallback-only hosts are skipped. Gates and builds need a free slot, / under 85% and
+  memGb + 4 GiB free; they go to the lowest load per thread (load1 plus 8 threads for each gate
+  or build leased within 60 s of the read), then the most free memory. The pool never refuses a
+  tab: tab admission is the WIP cap (ADR-0027). Only a claude-code tab with no role may leave this
+  host (codex-cli and grok-cli cannot run remote, ADR-0022 §13; a coordinator is never remote,
+  §20); it goes to the placeable host with a free tab slot, the memory and the most free memory,
+  else here. Every other tab is placed here. A tie stays on this host. Memory leased within 60 s of a read counts against the host.
+  The slot is a lease "pool:<host>/<kind>-<n>" on the lease store (ADR-0011): the lowest free n,
+  held by the caller's tab, default TTL 60m, at most 24h, note "pool mem=<GB>". It ends with
+  \`pool release\`, its TTL, or its holder tab (the lease sweeper). Placement and the slot number
+  are taken inside the lease lock: two callers never get one slot.
+  Response: { "host", "local", "slot": "gate-1", "lease": "pool:ai-lan/gate-1", "expiresAt",
+  "reason", "gateHost": null | "<pool.gate-host.<host>>" }
+  Errors (gate and build only): 409 pool-full { "refusal": "no-known-host"|"no-free-slot"|"no-memory"|"disk-full" }
+  (exit 3); 400 pool-invalid (exit 2); 400 lease-policy (a TTL over 24h, exit 2); 403
+  caller-unresolved (no tab, exit 3).
+  Client rule: the CLI waits 2 s. No answer exits 6 (pool-timeout); the caller does what it does
+  without the pool and logs it: a lane uses its local slots, but a repository in
+  gate.no-local-fallback never runs here (below). A lease a late answer took expires at its TTL.
+  A gate passes --ttl of at least its gate timeout, or renews the lease while it runs.
+
+POST /api/cli/pool/release   Body: { "lease": "pool:<host>/<kind>-<n>" }
+  \`purplemux pool release LEASE\`. The holder only (409 lease-held-by-other, exit 3); 404
+  lease-not-found (exit 7); a name that is not a pool slot is 400 pool-invalid.
+  Response: { "released": <lease view> }
+
+The engineering gate's keys map onto the pool (migration, ADR-0039 §6; gate.sh and remote-gate.sh
+do not change until they read the pool, and every key keeps working until then):
+  gate.route=remote           gate.sh asks \`pool acquire --kind gate\` for a repository in
+                              gate.remote-repos; local, or a repository outside it, stays here.
+  gate.remote-repos           unchanged: the repositories whose gates the pool places.
+  gate.no-local-fallback      (default treasury-api treasury-event-consumer) never runs here: a
+                              local answer, pool-timeout or pool-full is handled as today (queue on
+                              the gate host, or REFUSED-REMOTE).
+  a remote answer             remote-gate.sh with ORCH_GATEHOST_HOST=<gateHost>: the pin needs no
+                              gate.remote-hosts entry (GATE_HOST resolves only against the list).
+  gate.remote-hosts entries   stay until gate.sh reads the pool. alias:slots:api-slots on a pool
+                              host maps to pool.gate-host.<host>=<alias> and
+                              pool.slots.<host>.gate=<slots> (gatehost-replica:6:2 ->
+                              pool.gate-host.ai-lan=gatehost-replica, pool.slots.ai-lan.gate=6);
+                              api slots stay in remote-gate.sh's host queue. gatehost-runner2
+                              (lfr-runner2, outside the pool, OD-7) has no pool host.
+  gate.slots                  pool.slots.<this host>.gate.
 
 ## Workspaces
 
@@ -257,6 +337,11 @@ POST /api/cli/tabs
   PMUX_TAB_ID, PMUX_WORKSPACE_ID, PMUX_URL (this server) and its own tab token, never the
   workspace token. A remote claude-code tab's hooks, transcript and CLI reach this server, so
   status, result, send, close and the watchdog work as for a local tab; status serves "host".
+  "host": "auto" asks the pool (ADR-0039): only a claude-code tab with no role may go to a known
+  remote host (the most free memory; a tie stays here), then passes the same checks as an
+  explicit host. Every other tab, a pool refusal, no pool answer in 2 s, or a "cwd" missing on
+  the chosen host creates the tab here. The answer adds "placement": { "host", "local",
+  "reason", "fallback" }; "fallback" is true when the pool's own answer was not used.
   "cwd" is the tab's start directory, an absolute path that must exist on the tab's host,
   else 400 { "code": "cwd-missing" } (exit 2).
   "reportsTo" names a live tab of the SAME workspace that receives this tab's watchdog nudges
@@ -285,7 +370,8 @@ POST /api/cli/tabs
 GET /api/cli/workspaces/<WS>/tab-count   (any scope that may read WS)
   The workspace's agent tabs against the WIP cap; \`purplemux tab count -w WS [--json]\` prints
   "<count> <cap>". Repository hooks read it instead of counting tmux sessions.
-  Response: { "workspaceId", "count", "cap", "capSource": "fleet-config" | "default" | "default-invalid", "overCap" }
+  Response: { "workspaceId", "count", "cap", "capSource": "workspace-config" | "workspace-config-invalid" | "fleet-config" | "default" | "default-invalid", "overCap", "capReason"? }
+  "capReason" is present with workspace-config-invalid: why the workspace's stored value was not used.
   404 not-found (exit 7) for an unknown workspace; 503 config-store-unreadable (exit 3); 500 tab-count-unreadable (exit 1).
 
 GET /api/cli/tabs/<tabId>?workspaceId=WS
@@ -605,7 +691,7 @@ DELETE /api/cli/watches/<id>
 
 Versioned string values that tools read at call time, so changing one needs no message to
 anyone: no broadcast, no nudge, no inbox notice. Every change is audited to
-~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][a-z0-9.-]{1,63}$; values are one
+~/.purplemux/audit/coordination.jsonl. Keys match ^[a-z][A-Za-z0-9._-]{1,63}$; values are one
 line of text, at most 256 characters, parsed by the reader. Writes need the admin token or the
 tab that is its workspace's enabled orchestrator (cooperative authority, not a boundary).
 
@@ -628,7 +714,8 @@ Keys in use:
                (2). Read on every fleet read; unset or invalid means the default. Written by the
                admin token or an enabled orchestrator (ADR-0019).
   remote.hosts The ssh aliases that remote tabs may use (ADR-0022), comma-separated; a name that is
-               not an ssh alias is 400 config-invalid. Unset means no remote host. Admin token only.
+               not an ssh alias, or "auto", is 400 config-invalid. Unset means no remote host. They
+               are also the pool's remote hosts (ADR-0039). Admin token only.
   remote.callback-url
                The URL a remote tab's hooks and CLI use to reach this server, http(s)://host[:port].
                Plain http only to loopback, 100.64.0.0/10, a *.ts.net name or a bare name on
@@ -642,6 +729,25 @@ Keys in use:
                for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
                (capSource "default-invalid", the value logged). Admin token only (exit 3 forbidden
                for a tab): any one orchestrator could otherwise raise it for every workspace.
+  tabs.cap-per-workspace.<workspaceId>
+               One workspace's WIP cap (ADR-0039), the id as written (case kept): it wins over the
+               fleet value for that workspace (capSource "workspace-config"). Both cap keys must be an
+               integer 1..200 when written (else 400 config-invalid). A stored value that is invalid
+               anyway serves the fleet cap with capSource "workspace-config-invalid" and "capReason",
+               and is logged. Admin token only, as above.
+  pool.slots.<host>.<gate|build|tab>
+               A pool host's slot cap for the kind (ADR-0039), a whole number 0..64 (0: none there);
+               <host> is the lower-case pool host (this host's name or a remote.hosts alias).
+               Unset means threads / 8 for gate and build, total memory / 8 GiB for tab. Read
+               on every pool read. Admin token only.
+  pool.fallback.<alias>
+               The ssh alias the pool read tries once when <alias> fails (the tailnet alias
+               behind a LAN alias, e.g. ai-server behind ai-lan). Unset means one try. Admin
+               token only.
+  pool.gate-host.<host>
+               The gate-host container on <host> that a remote gate pins (its ssh alias, e.g.
+               gatehost-replica); \`pool acquire --kind gate\` returns it as "gateHost". Admin
+               token only.
   flow.window-minutes  flow.lock-busy-percent  flow.queue-length  flow.oldest-minutes
                The flow-flag thresholds (ADR-0026): the busy-share window in minutes 10..10080
                (default 360), the busy percent 1..100 (80), the queue length, a whole number

@@ -25,6 +25,7 @@ import { startSpend, stopSpend } from './src/lib/spend/spend-service';
 import { startConstraintFinder, stopConstraintFinder } from './src/lib/constraint-tick';
 import { startFlagAlerts, stopFlagAlerts } from './src/lib/flag-alerts';
 import { startLedgerRetention, stopLedgerRetention } from './src/lib/ledger-retention';
+import { startPoolPoller, stopPoolPoller } from './src/lib/pool-read';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { dispatchHook } from './src/lib/hook-dispatch';
 import { drainHookSpoolsWithRemotePull } from './src/lib/remote-spool';
@@ -125,6 +126,7 @@ const shutdownWs = async () => {
   await getMissionControlRuntime().stop();
   await stopSpend();
   stopLedgerRetention();
+  stopPoolPoller();
   await stopWatches();
   await stopNotes();
   stopGrants();
@@ -425,6 +427,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await startSpend();
   // The work-item ledger's daily rollup and retention pass, first 10 min after boot (ADR-0033).
   startLedgerRetention();
+  // The pool read model: one ssh read of each remote host now, then every 30 s (ADR-0039).
+  startPoolPoller();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most
   // 10 s): a tab's state from before the restart gap must not look ready (ADR-0020).
   // Note paste-time policy must be registered before the inbox can drain legacy notices.
