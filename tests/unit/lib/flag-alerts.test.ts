@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IFleetFlag, IFleetRow, IFleetView, TFleetFlag } from '@/types/fleet-status';
 import type { IFlowHistoryRow, IFlowRecord, IFlowSnapshot } from '@/types/flow';
 import type { IWorkspace } from '@/types/terminal';
+import type { IFinderResult } from '@/types/constraint';
 import type { TAlertDraft } from '@/lib/alert-policy';
 
 const logs = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn() }));
@@ -22,6 +23,15 @@ type IFlagAlertConfig = import('@/lib/flag-alerts').IFlagAlertConfig;
 
 const MIN = 60_000;
 const T0 = 1_800_000_000_000;
+
+const deriveFinderStub = (generatedAt: number, ledgerState: 'ok' | 'unknown', anomalies: IFinderResult['anomalies']): IFinderResult => ({
+  generatedAt, onTrack: { state: 'at-risk', goal: null, itemsLeft: null, p50At: null, p90At: null }, constraint: null, stuck: [],
+  windows: [], anomalies, unknownShare: null, flowLocks: null, pool: null, line: '',
+  inputs: {
+    ledger: { state: ledgerState, reason: ledgerState === 'ok' ? null : 'ledger unreadable', at: null },
+    flow: { state: 'unknown', reason: null, at: null }, spend: { state: 'unknown', reason: null, at: null }, pool: { state: 'unknown', reason: null, at: null },
+  },
+});
 
 const workspace = (id: string, orchestratorTabId: string | null = 'tab-orch', enabled = true): IWorkspace => ({
   id,
@@ -82,6 +92,7 @@ interface IScript {
   workspaces: IWorkspace[] | Error;
   view: IFleetView | Error;
   flows: Record<string, IFlowRecord | null | Error>;
+  finder: Map<string, IFinderResult>;
 }
 
 const harness = (initial: Partial<IScript> = {}) => {
@@ -90,6 +101,7 @@ const harness = (initial: Partial<IScript> = {}) => {
     workspaces: [workspace('ws-a')],
     view: view([row('ws-a', 'tab-orch')]),
     flows: {},
+    finder: new Map(),
     ...initial,
   };
   const sent: Array<{ draft: TAlertDraft; workspaceDir: string | null | undefined }> = [];
@@ -115,6 +127,7 @@ const harness = (initial: Partial<IScript> = {}) => {
       if (value instanceof Error) throw value;
       return value;
     },
+    finderResults: () => script.finder,
     dispatch: async (draft, ctx) => {
       sent.push({ draft, workspaceDir: ctx.workspaceDir });
     },
@@ -295,6 +308,111 @@ describe('runFlagAlertTick — a scripted sequence', () => {
         { tabId: 'tab-orch', isOrchestrator: true, providerId: 'grok', body: 'landing holds 12 items (threshold 10)',
           flag: { source: 'flow', rule: 'queue-long', subject: 'landing', text: 'landing holds 12 items (threshold 10)' } },
       ]);
+  });
+
+  /** A finder answer computed at `at` with one re-gates anomaly: value null is unknown, above 0 is breached. */
+  const finderResult = (at: number, value: number | null, ledgerState: 'ok' | 'unknown' = 'ok'): IFinderResult => {
+    const text = value === null ? 're-gates: unknown (no gate item in the ledger) in 24h, threshold 0 gates' : `re-gates: ${value} gates in 24h, threshold 0 gates`;
+    return deriveFinderStub(at, ledgerState, [{
+      id: 're-gates', subject: 'workspace', value, unit: 'gates', threshold: 0, judged: value !== null, breached: value !== null && value > 0,
+      window: '24h', text,
+      reason: value === null ? 'no gate item in the ledger' : null,
+    }]);
+  };
+  const finder = (at: number, value: number | null, ledgerState: 'ok' | 'unknown' = 'ok') => new Map([['ws-a', finderResult(at, value, ledgerState)]]);
+  const LEDGER_KEY = 'ledger:ws-a:re-gates:workspace';
+
+  it('sends a breached finder anomaly as source ledger to the enabled orchestrator (ADR-0034, AC 6)', async () => {
+    const h = harness({ finder: finder(T0, 0) });
+    expect((await h.tick(T0)).baseline).toBe(true);
+    h.script.finder = finder(T0 + MIN, 3);
+    await h.tick(T0 + MIN);
+    expect(h.sent.map(({ draft }) => ({ tabId: draft.tabId, isOrchestrator: draft.isOrchestrator, flag: draft.flag }))).toEqual([{
+      tabId: 'tab-orch', isOrchestrator: true,
+      flag: { source: 'ledger', rule: 're-gates', subject: 'workspace', text: 're-gates: 3 gates in 24h, threshold 0 gates' },
+    }]);
+    h.script.finder = finder(T0 + 2 * MIN, 3);
+    await h.tick(T0 + 2 * MIN);
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('neither raises nor clears a ledger flag while the finder has no answer or could not read the ledger', async () => {
+    const h = harness();
+    await h.tick(T0);
+    h.script.finder = finder(T0 + MIN, 3, 'unknown');
+    await h.tick(T0 + MIN);
+    expect(h.sent).toEqual([]);
+    h.script.finder = finder(T0 + 2 * MIN, 3);
+    await h.tick(T0 + 2 * MIN);
+    expect(h.sent).toEqual([]);
+    h.script.finder = finder(T0 + 3 * MIN, 0);
+    await h.tick(T0 + 3 * MIN);
+    h.script.finder = finder(T0 + 4 * MIN, 3);
+    await h.tick(T0 + 4 * MIN);
+    expect(h.sent.map(({ draft }) => draft.flag?.source)).toEqual(['ledger']);
+  });
+
+  it('keeps a raised ledger flag standing while its anomaly reads unknown; a measured value clears it (F5)', async () => {
+    const h = harness({ finder: finder(T0, 0) });
+    await h.tick(T0);
+    h.script.finder = finder(T0 + MIN, 3);
+    await h.tick(T0 + MIN);
+    expect(h.state.entries.get(LEDGER_KEY)?.raisedAt).toBe(T0 + MIN);
+    h.script.finder = finder(T0 + 2 * MIN, null);
+    await h.tick(T0 + 2 * MIN);
+    expect(h.state.entries.get(LEDGER_KEY)?.raisedAt).toBe(T0 + MIN);
+    h.script.finder = finder(T0 + 3 * MIN, 0);
+    await h.tick(T0 + 3 * MIN);
+    expect(h.state.entries.get(LEDGER_KEY)?.raisedAt).toBeNull();
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('keeps a raised producer-silence flag while its threshold is unknown (fewer than 20 closed items)', async () => {
+    const silence = (at: number, value: number, threshold: number | null) => new Map([['ws-a', deriveFinderStub(at, 'ok', [{
+      id: 'producer-silence', subject: 'gate.sh', value, unit: 'min', threshold, judged: threshold !== null,
+      breached: threshold !== null && value > threshold, window: 'now', reason: threshold === null ? 'fewer than 20 gate items closed in 7 d: not flagged' : null,
+      text: `producer silence gate.sh: gate:t:1 silent for ${value} min (threshold ${threshold ?? 'unknown'})`,
+    }])]]);
+    const key = 'ledger:ws-a:producer-silence:gate.sh';
+    const h = harness({ finder: silence(T0, 5, 30) });
+    await h.tick(T0);
+    h.script.finder = silence(T0 + MIN, 35, 30);
+    await h.tick(T0 + MIN);
+    expect(h.sent).toHaveLength(1);
+    h.script.finder = silence(T0 + 2 * MIN, 36, null);
+    await h.tick(T0 + 2 * MIN);
+    expect(h.state.entries.get(key)?.raisedAt).toBe(T0 + MIN);
+    h.script.finder = silence(T0 + 3 * MIN, 1, 30);
+    await h.tick(T0 + 3 * MIN);
+    expect(h.state.entries.get(key)?.raisedAt).toBeNull();
+  });
+
+  it('forgets an anomaly subject the finder no longer reports, and keeps one it reports as unknown', async () => {
+    const h = harness({ finder: finder(T0, 0) });
+    await h.tick(T0);
+    const subject = 'ledger:ws-a/re-gates/workspace';
+    expect(h.state.readSources.has(subject)).toBe(true);
+    h.script.finder = finder(T0 + MIN, null);
+    await h.tick(T0 + MIN);
+    expect(h.state.readSources.has(subject)).toBe(true);
+    h.script.finder = new Map([['ws-a', deriveFinderStub(T0 + 2 * MIN, 'ok', [])]]);
+    await h.tick(T0 + 2 * MIN);
+    expect(h.state.readSources.has(subject)).toBe(false);
+    expect(h.state.readSources.has('ledger:ws-a')).toBe(true);
+  });
+
+  it('treats a finder answer older than two ticks as unread: it neither raises nor clears (F6)', async () => {
+    const h = harness({ finder: finder(T0, 0) });
+    await h.tick(T0);
+    h.script.finder = finder(T0, 3);
+    await h.tick(T0 + 2 * MIN + 1);
+    expect(h.sent).toEqual([]);
+    h.script.finder = finder(T0 + 3 * MIN, 3);
+    await h.tick(T0 + 3 * MIN);
+    expect(h.sent).toHaveLength(1);
+    h.script.finder = finder(T0 + 3 * MIN, 0);
+    await h.tick(T0 + 6 * MIN);
+    expect(h.state.entries.get(LEDGER_KEY)?.raisedAt).toBe(T0 + 3 * MIN);
   });
 
   it('sends nothing for a workspace-level flag with no orchestrator, a disabled one, or one the fleet view does not show; it logs flag-alert-no-target', async () => {
