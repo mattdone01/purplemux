@@ -6,6 +6,8 @@ const store = vi.hoisted(() => ({
   submitAnswer: vi.fn(),
   applyEvents: vi.fn(),
   unreplayedEventIds: vi.fn(),
+  // The events route reads the touched items' states before applying (story 33 R2).
+  itemStates: vi.fn(() => new Map()),
   humanInboxPolicy: vi.fn(),
 }));
 const runtime = vi.hoisted(() => ({

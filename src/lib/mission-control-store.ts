@@ -29,6 +29,7 @@ import type {
   TMissionProducerEvent,
   TMissionCandidateReason,
   TMissionHumanReview,
+  TMissionItemState,
   TMissionRebindCause,
 } from '@/types/mission-control';
 import { AUTO_ANSWERED_LIMIT } from '@/types/mission-control';
@@ -369,6 +370,16 @@ const itemFromRow = (
   };
 };
 
+/**
+ * An answer's content hash. `source` is metadata (story 33): left out, so every stored hash stays
+ * byte-identical and a resend that differs only in source is a replay, not a conflict.
+ */
+const answerHash = (itemId: string, request: IMissionAnswerRequest): string => {
+  const { source: ignored, ...content } = request;
+  void ignored;
+  return contentHash({ itemId, request: content });
+};
+
 const answerFromRow = (row: IAnswerRow): IMissionAnswer => {
   const request = JSON.parse(row.request_json) as IMissionAnswerRequest & { appliedRevision?: number };
   return {
@@ -378,6 +389,7 @@ const answerFromRow = (row: IAnswerRow): IMissionAnswer => {
     itemId: row.item_id,
     actor: row.actor,
     ...request,
+    source: request.source ?? null,
     // An answer stored before ADR-0037 applied only to the revision it named.
     appliedRevision: request.appliedRevision ?? request.expectedRevision,
     createdAt: row.created_at,
@@ -839,6 +851,15 @@ export class MissionControlStore {
     const hasMore = rows.length > limit;
     const events = rows.slice(0, limit).map(eventFromRow);
     return { schemaVersion: 1, events, cursor: events.at(-1)?.seq ?? after, hasMore };
+  };
+
+  /** The current state of each of `itemIds` that exists (story 33: read before a batch applies, for the alert transition rule). */
+  itemStates = (itemIds: readonly string[]): Map<string, TMissionItemState> => {
+    const ids = [...new Set(itemIds)];
+    if (!ids.length) return new Map();
+    const rows = this.database.prepare(`SELECT id, state FROM attention_items WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .all(...ids) as Array<{ id: string; state: TMissionItemState }>;
+    return new Map(rows.map((row) => [row.id, row.state]));
   };
 
   /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first: id, title and when it opened. */
@@ -1322,7 +1343,7 @@ export class MissionControlStore {
   ): IMissionAnswerResponse => this.answerTransaction(() => {
     // ADR-0031 §8: only the rule's tick answers as a system actor; a session subject never does.
     if (actor.startsWith('system:')) throw new MissionControlError(403, 'forbidden', 'a system actor cannot submit a human answer');
-    const requestHash = contentHash({ itemId, request });
+    const requestHash = answerHash(itemId, request);
     const existing = this.database.prepare('SELECT * FROM answers WHERE submission_id=?').get(request.submissionId) as IAnswerRow | undefined;
     if (existing) {
       if (existing.request_hash !== requestHash) missionConflict(`submission ${request.submissionId} was already used with different content`);
@@ -1371,7 +1392,7 @@ export class MissionControlStore {
     const optionLabel = item.options.find((option) => option.id === optionId)?.label as string;
     const note = autoAnswerNote(rule, now, optionLabel);
     const request: IMissionAnswerRequest = { submissionId, expectedRevision, optionIds: [optionId], text: note, actionCompleted: false };
-    const answerId = this.recordAnswer(item, request, contentHash({ itemId, request }), MISSION_AUTO_ANSWER_ACTOR, now,
+    const answerId = this.recordAnswer(item, request, answerHash(itemId, request), MISSION_AUTO_ANSWER_ACTOR, now,
       { actor: MISSION_AUTO_ANSWER_ACTOR });
     this.database.prepare(`INSERT INTO mission_auto_answers
       (answer_id,item_id,workspace_id,rule,rule_version,applied_option_id,at,note) VALUES (?,?,?,?,?,?,?,?)`)

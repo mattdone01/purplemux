@@ -1012,11 +1012,15 @@ GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
   first good read of any source read late; an unreadable store raises nothing and clears nothing;
   a target that cannot be checked is retried next tick. The orchestrator-only alert setting does
   not apply. No inbox notice is sent: the alert is for the human, not for an agent.
-  Attention alerts: an attention.opened that opens an item for the human (humanReview.humanNeed is
-  not "none", so the item state is "open") sends one notification:alert of kind
-  "attention-opened", title "Mission Control: answer needed", body the item title, and "itemId".
-  tabId is the opening tab, else the workspace's orchestrator. A candidate item, a replayed event,
-  attention.updated, an answer, a resolve and a cancel send nothing; an item alerts once.
+  Attention alerts: an item that first becomes owner-visible (state "open", humanReview.humanNeed
+  not "none") sends one notification:alert of kind "attention-opened": an attention.opened that is
+  open at once, or an attention.updated that moves a candidate to open. Title "Mission Control:
+  answer needed", body the item title, "itemId", and "question": { "formatVersion" (1|2),
+  "decision", "answerType", "options": [{ "id", "label", "needsText" }], "revision" } so a phone can
+  answer it from the notification. FCM carries "question" as JSON for a v2 item only, and only while
+  the data map stays under 3,584 UTF-8 bytes; Web Push does not carry it. tabId is the opening tab,
+  else the workspace's orchestrator. A candidate, a replayed event, an update of an item already
+  open, an answer, a resolve and a cancel send nothing; an item alerts once per server process.
 
 ## Spend (ADR-0030)
 

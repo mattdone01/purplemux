@@ -142,6 +142,30 @@ describe('the server opens the item (story 14 AC 4)', () => {
     expect(store.snapshot([], 'ws-a').workspaces).toBeDefined();
   });
 
+  // Story 33 (merge with story 14): a server-opened item reaches the alert through the same batch, and the
+  // real transition rule alerts it exactly once, with the summary an answer button needs.
+  it('a server-opened item alerts once through the story 33 rule', async () => {
+    startRun();
+    await openNeedsDecisionItem(await needsDecisionDeps(), stop());
+    expect(attention.alert).toHaveBeenCalledTimes(1);
+    const input = attention.alert.mock.calls[0][0] as Parameters<typeof import('@/lib/attention-alerts').dispatchAttentionOpenedAlerts>[0];
+    expect(input.previousStates).toEqual(new Map());
+    const real = await vi.importActual<typeof import('@/lib/attention-alerts')>('@/lib/attention-alerts');
+    const sent: unknown[] = [];
+    const deps = {
+      workspace: async () => null, findTab: async () => null, providerOf: async () => 'claude' as const,
+      dispatch: async (draft: unknown) => { sent.push(draft); },
+    };
+    const state = real.createAttentionAlertState();
+    await real.dispatchAttentionOpenedAlerts(input, deps, state);
+    await real.dispatchAttentionOpenedAlerts(input, deps, state);
+    const [item] = items();
+    expect(sent).toEqual([expect.objectContaining({
+      kind: 'attention-opened', itemId: item.id, tabId: 'tab-w',
+      question: expect.objectContaining({ formatVersion: 2, answerType: 'single', revision: 1, decision: 'Is the export in scope?' }),
+    })]);
+  });
+
   it('opens nothing more when the tab opened an item in the same turn, or for a second stop of the turn', async () => {
     startRun();
     const deps = await needsDecisionDeps();

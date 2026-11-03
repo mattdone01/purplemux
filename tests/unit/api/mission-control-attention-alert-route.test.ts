@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // event ids that were new before the request, and the server-resolved opener tab (never a payload
 // claim). The response never waits on the alert.
 
-const store = vi.hoisted(() => ({ applyEvents: vi.fn(), unreplayedEventIds: vi.fn(), humanInboxPolicy: vi.fn() }));
+const store = vi.hoisted(() => ({ applyEvents: vi.fn(), unreplayedEventIds: vi.fn(), humanInboxPolicy: vi.fn(), itemStates: vi.fn() }));
 const scope = vi.hoisted(() => ({ resolveCliScope: vi.fn() }));
 const alerts = vi.hoisted(() => ({ alertOpenedAttention: vi.fn() }));
 
@@ -39,6 +39,7 @@ beforeEach(() => {
   store.applyEvents.mockReturnValue({ events: committed, cursor: 4, replayed: false });
   store.unreplayedEventIds.mockImplementation((events: Array<{ eventId: string }>) => new Set(events.map((e) => e.eventId)));
   store.humanInboxPolicy.mockReturnValue({ version: 1, legacyReviewPending: 0 });
+  store.itemStates.mockImplementation(() => new Map());
   alerts.alertOpenedAttention.mockReturnValue(new Promise(() => undefined));
 });
 
@@ -67,6 +68,20 @@ describe('POST /api/cli/mission-control/events: attention-opened alerts', () => 
     const [input] = alerts.alertOpenedAttention.mock.calls[0];
     expect(input.openerTabId).toBeNull();
     expect(input.fresh.size).toBe(0);
+  });
+
+  it('reads the states of the items a fresh update touches before the batch applies (story 33 R2)', async () => {
+    scope.resolveCliScope.mockReturnValue({ type: 'workspace', workspaceId: 'ws-a', tabId: 'tab-w', tabVerified: true });
+    const order: string[] = [];
+    store.itemStates.mockImplementation((ids: string[]) => { order.push(`states:${ids.join(',')}`); return new Map([['item-a', 'candidate']]); });
+    store.applyEvents.mockImplementation(() => { order.push('apply'); return { events: committed, cursor: 4, replayed: false }; });
+    const updated = { ...opened, eventId: 'e-up', expectedRevision: 1, type: 'attention.updated' };
+
+    await post([updated]);
+
+    expect(order).toEqual(['states:item-a', 'apply']);
+    const [input] = alerts.alertOpenedAttention.mock.calls[0];
+    expect([...input.previousStates]).toEqual([['item-a', 'candidate']]);
   });
 
   it('sends nothing when the store refuses the batch', async () => {

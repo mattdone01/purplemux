@@ -283,4 +283,11 @@ describe('alertFor kind attention-opened', () => {
   it('carries no itemId when none is given', () => {
     expect(alertFor(source({ itemId: undefined }))).not.toHaveProperty('itemId');
   });
+
+  it('carries the question summary on attention-opened only (story 33 AC 3)', () => {
+    const question = { formatVersion: 2 as const, decision: 'Ship?', answerType: 'confirm' as const, revision: 1, options: [] };
+    expect(alertFor(source({ question })).question).toEqual(question);
+    expect(alertFor(source())).not.toHaveProperty('question');
+    expect(alertFor({ ...source({ question }), kind: 'review' })).not.toHaveProperty('question');
+  });
 });
