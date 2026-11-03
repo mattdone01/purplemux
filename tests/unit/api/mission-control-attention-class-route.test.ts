@@ -53,15 +53,15 @@ describe('POST /api/cli/mission-control/events: attention class and stated defau
   });
 
   it.each([
-    ['an unknown class', { class: 'urgent' }, /^class must be one of money, irreversible, scope, bookkeeping$/],
-    ['a default that names no option', { defaultOptionId: 'maybe' }, /^defaultOptionId must name one of the item's options$/],
-    ['a default on an action item', { kind: 'action', options: [] }, /^defaultOptionId is refused on an action item$/],
-  ])('refuses %s with 400, the field named, and nothing stored', async (_case, over, message) => {
+    ['an unknown class', { class: 'urgent' }, 'class', /class must be one of money, irreversible, scope, bookkeeping/],
+    ['a default that names no option', { defaultOptionId: 'maybe' }, 'defaultOptionId', /defaultOptionId must name one of the item's options/],
+    ['a default on an action item', { kind: 'action', options: [] }, 'defaultOptionId', /defaultOptionId is refused on an action item/],
+  ])('refuses %s with 400 question-invalid, the field named, and nothing stored (ADR-0037)', async (_case, over, field, message) => {
     const good = { ...opened, eventId: 'e-good', payload: { ...opened.payload, itemId: 'item-good' } };
     const bad = { ...opened, payload: { ...opened.payload, ...over } };
     const r = await post([good, bad]);
     expect(r.status).toBe(400);
-    expect(r.body).toMatchObject({ code: 'invalid-request' });
+    expect(r.body).toMatchObject({ code: 'question-invalid', defects: [{ eventId: bad.eventId, field }] });
     expect(r.body.error).toMatch(message);
     expect(store.applyEvents).not.toHaveBeenCalled();
   });

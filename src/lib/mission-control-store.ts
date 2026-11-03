@@ -21,6 +21,7 @@ import type {
   IMissionEvidence,
   IMissionHumanInboxPolicy,
   IMissionQuestion,
+  IMissionQuestionChanges,
   IMissionRun,
   IMissionRunReboundPayload,
   IMissionSnapshot,
@@ -38,6 +39,14 @@ import {
   missionConflict,
 } from '@/lib/mission-control-errors';
 import { ATTENTION_CLASS_KEYS, MISSION_AUTO_ANSWER_ACTOR, attentionClassKey } from '@/lib/attention-class';
+import {
+  answerRefusal,
+  defect,
+  diffMissionQuestions,
+  mergeMissionChanges,
+  questionLint,
+  type TMissionStoredQuestion,
+} from '@/lib/mission-question-format';
 import {
   AUTO_ANSWER_KEY,
   autoAnswerNote,
@@ -323,8 +332,20 @@ const autoAnswerFromRow = (row: IAutoAnswerRow): IMissionAutoAnswer => ({
   note: row.note,
 });
 
-const itemFromRow = (row: IItemRow, autoAnswer: IMissionAutoAnswer | null = null): IMissionAttentionItem => {
-  const question = JSON.parse(row.question_json) as IMissionQuestion & IMissionAttentionClassInput;
+interface IChangesRow {
+  item_id: string;
+  workspace_id: string;
+  revision: number;
+  changes_json: string;
+  at: number;
+}
+
+const itemFromRow = (
+  row: IItemRow,
+  autoAnswer: IMissionAutoAnswer | null = null,
+  changes: IMissionQuestionChanges | null = null,
+): IMissionAttentionItem => {
+  const { evidence: evidenceLinks, ...question } = JSON.parse(row.question_json) as TMissionStoredQuestion;
   return {
     id: row.id,
     workspaceId: row.workspace_id,
@@ -332,6 +353,9 @@ const itemFromRow = (row: IItemRow, autoAnswer: IMissionAutoAnswer | null = null
     revision: row.revision,
     state: row.state,
     ...question,
+    evidenceLinks: evidenceLinks ?? [],
+    lint: questionLint(question),
+    changes,
     evidence: JSON.parse(row.evidence_json) as IMissionEvidence,
     answerId: row.answer_id,
     resolution: row.resolution,
@@ -345,15 +369,20 @@ const itemFromRow = (row: IItemRow, autoAnswer: IMissionAutoAnswer | null = null
   };
 };
 
-const answerFromRow = (row: IAnswerRow): IMissionAnswer => ({
-  id: row.id,
-  workspaceId: row.workspace_id,
-  runId: row.run_id,
-  itemId: row.item_id,
-  actor: row.actor,
-  ...(JSON.parse(row.request_json) as IMissionAnswerRequest),
-  createdAt: row.created_at,
-});
+const answerFromRow = (row: IAnswerRow): IMissionAnswer => {
+  const request = JSON.parse(row.request_json) as IMissionAnswerRequest & { appliedRevision?: number };
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    runId: row.run_id,
+    itemId: row.item_id,
+    actor: row.actor,
+    ...request,
+    // An answer stored before ADR-0037 applied only to the revision it named.
+    appliedRevision: request.appliedRevision ?? request.expectedRevision,
+    createdAt: row.created_at,
+  };
+};
 
 const deliveryFromRow = (row: IDeliveryRow): IMissionDelivery => ({
   id: row.id,
@@ -410,7 +439,21 @@ export class MissionControlStore {
     this.migrate();
     this.ensureOpenerTable();
     this.ensureAutoAnswerTable();
+    this.ensureChangesTable();
   }
+
+  /**
+   * One `changes` record per `attention.updated` revision (ADR-0037 §4): an unversioned side table
+   * like the openers, so a release that ignores it still opens the file.
+   */
+  private ensureChangesTable = (): void => {
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS mission_item_changes (
+        item_id TEXT NOT NULL, workspace_id TEXT NOT NULL, revision INTEGER NOT NULL,
+        changes_json TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (item_id, revision)
+      );
+    `);
+  };
 
   /**
    * Opener attribution (ADR-0023) lives in an unversioned side table, so a
@@ -570,7 +613,13 @@ export class MissionControlStore {
     return row ? autoAnswerFromRow(row) : null;
   };
 
-  private item = (row: IItemRow): IMissionAttentionItem => itemFromRow(row, this.autoAnswerOf(row.id));
+  private changesOf = (itemId: string): IMissionQuestionChanges | null => {
+    const row = this.database.prepare('SELECT * FROM mission_item_changes WHERE item_id = ? ORDER BY revision DESC LIMIT 1')
+      .get(itemId) as IChangesRow | undefined;
+    return row ? JSON.parse(row.changes_json) as IMissionQuestionChanges : null;
+  };
+
+  private item = (row: IItemRow): IMissionAttentionItem => itemFromRow(row, this.autoAnswerOf(row.id), this.changesOf(row.id));
 
   private insertEvent = (
     event: TMissionProducerEvent,
@@ -608,8 +657,10 @@ export class MissionControlStore {
       const generatedAt = Date.now();
       const autoAnswerByItem = new Map((this.database.prepare(`SELECT * FROM mission_auto_answers${where} ORDER BY at, answer_id`)
         .all(...args) as IAutoAnswerRow[]).map((row) => [row.item_id, autoAnswerFromRow(row)]));
+      const changesByItem = new Map((this.database.prepare(`SELECT * FROM mission_item_changes${where} ORDER BY item_id, revision`)
+        .all(...args) as IChangesRow[]).map((row) => [row.item_id, JSON.parse(row.changes_json) as IMissionQuestionChanges]));
       const items = (this.database.prepare(`SELECT * FROM attention_items${where} ORDER BY updated_at DESC`).all(...args) as IItemRow[])
-        .map((row) => itemFromRow(row, autoAnswerByItem.get(row.id) ?? null));
+        .map((row) => itemFromRow(row, autoAnswerByItem.get(row.id) ?? null, changesByItem.get(row.id) ?? null));
       const answersByClass = this.answersByClass(generatedAt, workspaceId);
       const autoAnswered = this.autoAnswered(generatedAt, workspaceId);
       const answers = (this.database.prepare(`SELECT * FROM answers${where} ORDER BY created_at DESC`).all(...args) as IAnswerRow[]).map(answerFromRow);
@@ -836,6 +887,7 @@ export class MissionControlStore {
   applyEvents = (
     events: TMissionProducerEvent[],
     resolvedBindings: ReadonlyMap<string, TMissionIdentity | IMissionEventAuthority | null> = new Map(),
+    options: { questionMinVersion?: 1 | 2 } = {},
   ): IMissionApplyEventsResult => {
     const transaction = this.database.transaction(() => {
       const committed: IMissionEvent[] = [];
@@ -853,7 +905,7 @@ export class MissionControlStore {
         const authority: IMissionEventAuthority = suppliedAuthority && 'resolvedIdentity' in suppliedAuthority
           ? suppliedAuthority
           : { resolvedIdentity: suppliedAuthority, configuredOrchestratorTabId: null };
-        committed.push(this.applyOneEvent(event, requestHash, authority));
+        committed.push(this.applyOneEvent(event, requestHash, authority, options.questionMinVersion ?? 1));
       }
       const cursor = Number((this.database.prepare('SELECT COALESCE(MAX(seq), 0) AS cursor FROM events').get() as { cursor: number }).cursor);
       return { events: committed, cursor, replayed: allReplayed };
@@ -871,6 +923,7 @@ export class MissionControlStore {
     event: TMissionProducerEvent,
     requestHash: string,
     authority: IMissionEventAuthority,
+    questionMinVersion: 1 | 2,
   ): IMissionEvent => {
     const now = Date.now();
     const resolvedIdentity = authority.resolvedIdentity;
@@ -1001,7 +1054,9 @@ export class MissionControlStore {
       if (!['open', 'candidate'].includes(item.state)) missionConflict('only open or candidate items can be updated', item);
       const { itemId: ignored, humanReview: reviewInput, ...question } = event.payload;
       void ignored;
-      const changed = contentHash(question) !== contentHash(this.questionFromItem(item));
+      const previous = JSON.parse(itemRow.question_json) as TMissionStoredQuestion;
+      this.requireQuestionFormat(event.eventId, item.id, previous, question, questionMinVersion);
+      const changed = contentHash(question) !== contentHash(previous);
       if (item.state === 'open' && changed && !reviewInput) {
         missionConflict('changed human attention requires renewed orchestrator review', item);
       }
@@ -1021,13 +1076,16 @@ export class MissionControlStore {
         humanReview = null;
       }
       const revision = item.revision + 1;
+      const changes = diffMissionQuestions(previous, question, item.revision, revision);
       this.database.prepare(`UPDATE attention_items SET revision=?, state=?, question_json=?, evidence_json=?,
         human_review_json=?, candidate_reason=?, updated_at=? WHERE id=?`)
         .run(revision, state, toJson(question), toJson({ source: 'agent', sourceId: event.eventId, observedAt: event.producerAt, confidence: 'confirmed' }),
           humanReview ? toJson(humanReview) : null, candidateReason, now, item.id);
+      this.database.prepare('INSERT OR REPLACE INTO mission_item_changes (item_id,workspace_id,revision,changes_json,at) VALUES (?,?,?,?,?)')
+        .run(item.id, item.workspaceId, revision, toJson(changes), now);
       this.confirmBootstrap(run.id, now);
       return this.insertEvent(event, item.id, revision, now, requestHash,
-        this.attentionEventPayload(event.payload, state, candidateReason, humanReview));
+        { ...this.attentionEventPayload(event.payload, state, candidateReason, humanReview), changes });
     }
 
     if (event.type === 'attention.cancelled') {
@@ -1150,18 +1208,23 @@ export class MissionControlStore {
       WHERE run_id=? AND state IN ('queued','dispatching','submitted','held')`).run(now, runId);
   };
 
-  private questionFromItem = (item: IMissionAttentionItem): IMissionQuestion & IMissionAttentionClassInput => ({
-    kind: item.kind,
-    title: item.title,
-    context: item.context,
-    storyIds: item.storyIds,
-    options: item.options,
-    recommendation: item.recommendation,
-    blockingScope: item.blockingScope,
-    canContinue: item.canContinue,
-    ...(item.class === null ? {} : { class: item.class }),
-    ...(item.defaultOptionId === null ? {} : { defaultOptionId: item.defaultOptionId }),
-  });
+  /**
+   * ADR-0037 §2: at min-version 2 an update may keep a v1 item v1 (it is not a new question), but
+   * never turns a format-2 item back into v1.
+   */
+  private requireQuestionFormat = (
+    eventId: string,
+    itemId: string,
+    stored: TMissionStoredQuestion,
+    next: TMissionStoredQuestion,
+    minVersion: 1 | 2,
+  ): void => {
+    if (minVersion < 2 || next.formatVersion === 2 || stored.formatVersion !== 2) return;
+    const refusal = defect('formatVersion', 'absent (v1) on an item stored as formatVersion 2',
+      'at least 2 (fleet config mission.question-format.min-version)');
+    throw new MissionControlError(400, 'question-invalid', `1 question defect in 1 event: ${refusal.message}`, undefined,
+      { defects: [{ eventId, itemId, ...refusal }] });
+  };
 
   private stampHumanReview = (
     event: Extract<TMissionProducerEvent, { type: 'attention.opened' | 'attention.updated' }>,
@@ -1247,10 +1310,9 @@ export class MissionControlStore {
     if (!item.humanReview || item.humanReview.humanNeed === 'none') {
       missionConflict('attention item is not eligible for a human answer', item);
     }
-    if (item.revision !== request.expectedRevision) missionConflict('stale attention revision', item);
-    const allowedOptions = new Set(item.options.map((option) => option.id));
-    if (request.optionIds.some((optionId) => !allowedOptions.has(optionId))) invalidMissionRequest('answer selected an unknown option');
-    if (item.kind === 'action' && request.optionIds.length) invalidMissionRequest('action answers cannot select question options');
+    this.requireAnswerableRevision(item, request.expectedRevision);
+    const refusal = answerRefusal(item, request);
+    if (refusal) invalidMissionRequest(refusal);
     const answerId = this.recordAnswer(item, request, requestHash, actor, Date.now(), {});
     return this.answerResponse(this.database.prepare('SELECT * FROM answers WHERE id=?').get(answerId) as IAnswerRow, false);
   });
@@ -1292,6 +1354,23 @@ export class MissionControlStore {
     return this.answerResponse(this.database.prepare('SELECT * FROM answers WHERE id=?').get(answerId) as IAnswerRow, false);
   });
 
+  /**
+   * ADR-0037 §4: an answer made on revision r still applies to the current revision r' when every
+   * revision between them was compatible; otherwise 409 with what changed.
+   */
+  private requireAnswerableRevision = (item: IMissionAttentionItem, expectedRevision: number): void => {
+    if (expectedRevision === item.revision) return;
+    if (expectedRevision > item.revision) missionConflict('stale attention revision', item);
+    const records = new Map((this.database.prepare(`SELECT * FROM mission_item_changes
+      WHERE item_id = ? AND revision > ? AND revision <= ? ORDER BY revision`)
+      .all(item.id, expectedRevision, item.revision) as IChangesRow[])
+      .map((row) => [row.revision, JSON.parse(row.changes_json) as IMissionQuestionChanges]));
+    const changes = mergeMissionChanges(expectedRevision, item.revision, records);
+    if (!changes.compatible) {
+      missionConflict(`the question changed incompatibly since revision ${expectedRevision}; answer revision ${item.revision}`, item, { changes });
+    }
+  };
+
   private answerTransaction = (work: () => IMissionAnswerResponse): IMissionAnswerResponse => {
     try {
       return this.database.transaction(work)();
@@ -1316,7 +1395,8 @@ export class MissionControlStore {
     this.database.prepare(`INSERT INTO answers
       (id,submission_id,request_hash,workspace_id,run_id,item_id,actor,request_json,created_at)
       VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(answerId, request.submissionId, requestHash, item.workspaceId, item.runId, item.id, actor, toJson(request), now);
+      .run(answerId, request.submissionId, requestHash, item.workspaceId, item.runId, item.id, actor,
+        toJson({ ...request, appliedRevision: item.revision }), now);
     const revision = item.revision + 1;
     this.database.prepare(`UPDATE attention_items SET revision=?, state='answered', answer_id=?, updated_at=? WHERE id=?`)
       .run(revision, answerId, now, item.id);
@@ -1331,7 +1411,8 @@ export class MissionControlStore {
       (id,request_hash,schema_version,workspace_id,run_id,entity_id,revision,type,payload_json,producer_at,committed_at)
       VALUES (?,?,1,?,?,?,?, 'answer.recorded',?,?,?)`)
       .run(`answer:${request.submissionId}`, requestHash, item.workspaceId, item.runId, item.id, revision,
-        toJson({ answerId, submissionId: request.submissionId, ...eventDetail }), now, now);
+        toJson({ answerId, submissionId: request.submissionId, expectedRevision: request.expectedRevision,
+          appliedRevision: item.revision, ...eventDetail }), now, now);
     return answerId;
   };
 

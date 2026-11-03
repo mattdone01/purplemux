@@ -18,6 +18,7 @@ import {
   editMissionDraft,
   isMissionDraftEmpty,
   missionDraftRequest,
+  rebaseMissionDraft,
   reconcileMissionDraftWithItem,
 } from '@/components/features/mission-control/mission-control-utils';
 import type { IMissionDraft, IMissionDraftPatch } from '@/components/features/mission-control/mission-control-utils';
@@ -57,6 +58,7 @@ const MissionControlPage = () => {
     error,
     refresh,
     applyAnswer,
+    applyItem,
     applyBootstrap,
   } = useMissionControl();
   const [drafts, setDrafts] = useState<Record<string, IMissionDraft>>({});
@@ -120,6 +122,15 @@ const MissionControlPage = () => {
           const latest = isAttentionItem(responseBody.current)
             ? normalizeMissionItem(responseBody.current)
             : snapshot?.items.find((candidate) => candidate.id === item.id) ?? submittingDraft.item;
+          if (latest.state === 'open' && latest.revision > submittingDraft.expectedRevision) {
+            // ADR-0037 §4: the server found the change incompatible; answer the current revision.
+            applyItem(latest);
+            setDrafts((current) => ({
+              ...current,
+              [item.id]: rebaseMissionDraft({ ...(current[item.id] ?? submittingDraft), hasAttempted: true }, latest, responseBody.changes),
+            }));
+            return;
+          }
           setDrafts((current) => ({
             ...current,
             [item.id]: {
@@ -153,7 +164,7 @@ const MissionControlPage = () => {
         },
       }));
     }
-  }, [applyAnswer, drafts, snapshot?.items]);
+  }, [applyAnswer, applyItem, drafts, snapshot?.items]);
 
   const handleBootstrap = useCallback(async () => {
     const requestId = bootstrapId ?? createMissionSubmissionId();

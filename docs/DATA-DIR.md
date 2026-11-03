@@ -309,6 +309,9 @@ rolled back onto the file still opens it and ignores them:
 - `mission_auto_answers` — one row per bookkeeping auto-answer (ADR-0031): `answer_id` (primary key), `item_id`,
   `workspace_id`, `rule`, `rule_version`, `applied_option_id`, `at`, `note`. Written in the answer's transaction. The
   rule's answers are also audit lines (`attention-auto-answer`) in `audit/coordination.jsonl`.
+- `mission_item_changes` — one row per `attention.updated` (ADR-0037): `item_id` and `revision` (primary key),
+  `workspace_id`, `changes_json` (what the revision changed and whether it is compatible), `at`. The answer route reads
+  it to accept an answer made on an older compatible revision.
 - the `portfolio_*` tables, added by `portfolio-store.ts`, which opens the same file (selection, impacts, events, watch
   uses, watch history unknown, actions, wakes, escalations, milestones).
 

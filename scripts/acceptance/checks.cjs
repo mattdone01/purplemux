@@ -5,7 +5,8 @@
 // background work, hook-time identity, drive grants, the grants read, the coordination panel, Mission
 // Control delivery through the inbox) live in checks-wave4.cjs; the wave-5 recovery checks in
 // checks-wave5.cjs; the wave-6 epic burndown publish and board read in checks-burndown.cjs; the wave-7
-// default Mission Control page (Needs you before the portfolio board) in checks-mission-control-page.cjs, run last.
+// default Mission Control page (Needs you before the portfolio board) in checks-mission-control-page.cjs; the wave-8
+// question format v2 checks (ADR-0037) in checks-mc-question-v2.cjs, run last.
 // Before wave 1, checks-wip-cap.cjs sets the scratch fleet's WIP cap that the fixtures need and proves
 // the refusal at the cap (story 20; ADR-0027).
 //
@@ -52,6 +53,7 @@ const { wave4, request, humanSession, liveStandIn, standInRecord } = require('./
 const { wave5 } = require('./checks-wave5.cjs');
 const { wave6 } = require('./checks-burndown.cjs');
 const { wave7 } = require('./checks-mission-control-page.cjs');
+const { wave8 } = require('./checks-mc-question-v2.cjs');
 const { fixtureCapGate } = require('./checks-wip-cap.cjs');
 
 const POLL_MS = 200;
@@ -1572,7 +1574,7 @@ const freePort = () =>
 
 /** The waves in run order; `--only-wave N` selects the Nth. Building the list calls no wave. */
 const wavesFor = (inst, opts, helpers) => [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers),
-  () => wave5(inst, helpers), () => wave6(inst, helpers), () => wave7(inst)];
+  () => wave5(inst, helpers), () => wave6(inst, helpers), () => wave7(inst), () => wave8(inst)];
 const WAVE_COUNT = wavesFor(null, {}, {}).length;
 
 const parseArgs = (argv) => {

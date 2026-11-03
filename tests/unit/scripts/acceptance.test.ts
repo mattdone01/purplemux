@@ -721,13 +721,13 @@ describe('checks-wip-cap.cjs (story 20)', () => {
   });
 
   it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
-    expect(checks.WAVE_COUNT).toBe(7);
+    expect(checks.WAVE_COUNT).toBe(8);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
-    expect(checks.parseArgs(['--state', 's', '--only-wave', '7']).onlyWave).toBe(7);
-    for (const bad of ['0', '8', '1.5', '-1', 'x', '']) {
-      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..7, not ${JSON.stringify(bad)}`);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '8']).onlyWave).toBe(8);
+    for (const bad of ['0', '9', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..8, not ${JSON.stringify(bad)}`);
     }
-    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..7, not null');
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..8, not null');
   });
 
   describe('checks.cjs runs the gate first (spawned against a fake candidate)', () => {
@@ -796,7 +796,7 @@ process.exit(1);
     it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
       const r = runChecks('ok', ['--only-wave', '9']);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('--only-wave takes an integer 1..7, not "9"');
+      expect(r.stderr).toContain('--only-wave takes an integer 1..8, not "9"');
       expect(r.calls).toEqual([]);
     });
 
@@ -820,6 +820,26 @@ describe('checks-mission-control-page.cjs', () => {
     expect(wave7.pageOrder(`${board}${section}`).first).toBe(false);
     expect(wave7.pageOrder(board)).toMatchObject({ needsYou: -1, first: false });
     expect(wave7.pageOrder(section)).toMatchObject({ board: -1, first: false });
+  });
+});
+
+describe('checks-mc-question-v2.cjs (ADR-0037)', () => {
+  const wave8 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-mc-question-v2.cjs'));
+
+  it('drafts one readable and one unreadable question, the second with exactly the defect the checks expect', async () => {
+    const { validateMissionQuestion } = await import('@/lib/mission-question-format');
+    const question = (options: unknown[]) => {
+      const { itemId: _itemId, ...payload } = wave8.askDraft('ws-a', 'run-a', options).payload;
+      return payload;
+    };
+    expect(validateMissionQuestion(question(wave8.READABLE), 2).ok).toBe(true);
+    const refused = validateMissionQuestion(question(wave8.UNREADABLE), 2);
+    expect(refused.ok ? [] : refused.defects.map((entry: { message: string }) => entry.message)).toEqual([wave8.ONE_OPTION_DEFECT]);
+  });
+
+  it('expects the reshape reason the check route serves', () => {
+    const route = fs.readFileSync(path.join(ROOT, 'src/pages/api/cli/mission-control/questions/check.ts'), 'utf8');
+    expect(route).toContain(wave8.RESHAPE_REASON);
   });
 });
 
