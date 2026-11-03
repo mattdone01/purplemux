@@ -115,3 +115,13 @@ paste leaves that row `delivered: false` in the table and the history, although 
 "outcome unknown after a restart". `purplemux events show` reads the table directly and can show an urgent row as not
 delivered while its paste runs.
 
+
+## Amendment (2026-11-03, story 13: alarm routing)
+
+Ledger flags enter the router from the flag tick (ADR-0032, amendment of 2026-11-03): an item alarm as kind `alarm`
+and an anomaly's line as kind `flag`, each classed by §1's severity rule (block urgent, warn digest). §2's duplicate
+rule is unchanged and never suppresses an alarm repeat, whose text carries the age; the hourly repeat of a standing
+alarm is the tick's, and the raise and every repeat are held back while a copy of the same item and reason still waits
+for the tab's digest.
+`TabEventsTable.copies(workspaceId, tabId, kind, opening, since)` answers that guard from the log (one held copy, and
+the latest delivery of any copy, matched on the text's opening), over `tab_events_tab_idx`.
