@@ -969,7 +969,7 @@ GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
 
 ## Spend (ADR-0030)
 
-GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role]
+GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|day|model|role|seat|phase|item]
                                                        (purplemux spend show -w WS [--since D] [--until D] [--by ...] [--json])
   Read scope on WS. since/until are UTC days, both inclusive; the default is the last 7 UTC days
   and by=tab. Spend keeps the last 92 UTC days (today − 91 … today), including usage whose
@@ -995,6 +995,33 @@ GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|
   workspace's enabled orchestrator NOW) and "other". Transcripts are read by a background
   index; while index.state is "indexing" the numbers are partial. A request never parses a
   transcript.
+  by=seat rows are tab names (the open tab's name, else the name recorded with the binding).
+  by=phase and by=item read the work-item ledger: each Claude message counts at its UTC 5-min
+  slot, for the ledger item its tab held (holder = the tab's id or name) at the slot's midpoint;
+  of several, the one with the latest event. Phases: plan, build, review, evaluate, land,
+  coordinate, and "other" (the tab held no item). The wait reason decides first (review-queue,
+  review-findings: review; rework: build; receipt-rekey and every land and deploy reason: land;
+  owner: coordinate), else the item type (slice: build; review: review; gate, experiment:
+  evaluate; range, landing, deploy: land; owner-issue: plan; mc-item: coordinate); seat items
+  never count. by=phase|item serve at most 7 UTC days (else 400 invalid-request naming the cap).
+  Their answers add "unattributedReasons": [ISpendRow] (keys no-binding, no-message-time for
+  Codex, Grok and pre-slot usage, ledger-unreadable, no-ledger-history before the ledger's
+  horizon, no-held-item for by=item; they sum to "unattributed") and "phaseBasis": { "slotMs":
+  300000, "ledgerHorizon": <ms>|null (null: no item yet), "ledgerReadable" }. Mission Control
+  refuses by=phase|item with workspaceId=all. Every ISpendRow also carries "cacheReadCostUsd":
+  the cache reads' part of costUsd, null when not priced or a Codex/Grok session cost cannot be
+  split.
+
+GET /api/cli/spend/phases?workspaceId=WS[&day=YYYY-MM-DD]   (purplemux spend phases -w WS [--day D] [--json])
+  Read scope on WS. One UTC day (default today; from today − 91 to today, else 400
+  invalid-request) as the by=phase ISpendView, each row with "wallMs" (distinct 5-min slots
+  with usage x 5 min; null for usage with no message time), plus "day" and
+  "cacheReadPerLandedItem": { "day": M, "7d": M }, M = { "metric":
+  "cache_read_tokens_per_landed_item", "window", "from", "to", "cacheReadTokens", "landedItems"
+  (range landings the store's projection applied in the window, one per applied close with state
+  landed: a repeat, orphan or re-sent close counts none; null when the ledger cannot be read or holds
+  no item for the workspace), "value" (null when not measured), "reason" (why not
+  measured, else null) }.
 
 ## Ledger (ADR-0033)
 
@@ -1215,7 +1242,8 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   one per (producer of the last event, item type), subject "<producer>/<type>", "<item> silent for <n>
   min (threshold <t> min)"; threshold max(10
   min, 2 x the type's 7-day p90 lifetime), unknown under 20 closed), cost-per-landed-item (spend over
-  the last 7 UTC days / ranges closed landed over the same days; never flagged).
+  the last 7 UTC days / ranges closed landed over the same days, from close events; never flagged),
+  cache-read-per-landed-item (cache-read tokens / the same landed ranges, 7 d; never flagged).
   labels and reasonLabel are the owner's words for the tokens (src/lib/constraint-labels.ts); line and
   the text form use only them. stuck is the 50 oldest waits, capped after the mine filter;
   stuckTotal is how many matched (the text form prints "50 of N").

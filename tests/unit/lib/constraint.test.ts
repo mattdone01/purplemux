@@ -33,6 +33,11 @@ const SPEND_SINCE = Date.UTC(2026, 9, 28);
 
 const READY_SPEND: IFinderSpendInput = {
   index: { state: 'ready', filesIndexed: 10, filesTotal: 10, indexedThrough: NOW - MIN }, since: SPEND_SINCE, costUsd: 120, cacheReadTokens: 1_000_000,
+  landedRanges: 2,
+  cacheReadTokensPerLandedItem: {
+    metric: 'cache_read_tokens_per_landed_item', window: '7d', from: '2026-10-28', to: '2026-11-03', cacheReadTokens: 1_000_000,
+    landedItems: 2, value: 500_000, reason: null,
+  },
 };
 
 /** Every module specifier a TypeScript file names: static, multi-line, side-effect, dynamic and require. */
@@ -309,7 +314,7 @@ describe('missing inputs (AC 7)', () => {
     expect(result.constraint).toBeNull();
     expect(result.windows).toEqual([]);
     expect(result.unknownShare).toBeNull();
-    expect(result.anomalies).toHaveLength(7);
+    expect(result.anomalies).toHaveLength(8);
     for (const a of result.anomalies) expect(a).toMatchObject({ value: null, breached: false, reason: 'ledger unreadable' });
     expect(result.line).toBe('no goal set · items left — · constraint unknown (ledger unreadable)');
     expect(result.inputs.flow.state).toBe('ok');
@@ -324,11 +329,11 @@ describe('missing inputs (AC 7)', () => {
     expect(result.stuck).toEqual([]);
     expect(result.line).toBe('no goal set · items left — · constraint unknown (the ledger holds no event for this workspace)');
     expect(result.anomalies.map((a) => [a.id, a.value, a.reason])).toEqual([
-      're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item',
+      're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item', 'cache-read-per-landed-item',
     ].map((id) => [id, null, 'the ledger holds no event for this workspace']));
     expect(result.anomalies.map((a) => [a.id, a.threshold, a.judged])).toEqual([
       ['re-gates', 0, false], ['rework-rate', 0.1, false], ['context-per-call', 300_000, false], ['wakes-per-hour', 6, false],
-      ['unknown-share', 0.05, false], ['producer-silence', null, false], ['cost-per-landed-item', null, false],
+      ['unknown-share', 0.05, false], ['producer-silence', null, false], ['cost-per-landed-item', null, false], ['cache-read-per-landed-item', null, false],
     ]);
     expect(result.anomalies.find((a) => a.id === 'wakes-per-hour')!.text)
       .toBe('wakes per hour: unknown (the ledger holds no event for this workspace) in 6h, threshold 6.0/h');
@@ -465,34 +470,36 @@ describe('anomalies (AC 3): each names its measured value and threshold', () => 
     expect(result.anomalies.filter((a) => a.id === 'producer-silence').map((a) => a.subject)).toEqual(['gate.sh/gate', 'land.sh/landing']);
   });
 
-  it('cost per landed item: 7 d spend over landed ranges; unknown while spend indexes or nothing landed', () => {
-    const items = [item('range:a:1', { closedAt: NOW - DAY, state: 'landed' }), item('range:a:2', { closedAt: NOW - DAY, state: 'landed' }),
-      item('range:a:3', { closedAt: NOW - DAY, state: 'dropped' })];
-    expect(find(deriveConstraint(ledger({ items }), null, READY_SPEND, null, NOW), 'cost-per-landed-item'))
-      .toMatchObject({ value: 60, threshold: null, breached: false, unit: 'USD' });
+  it('cost per landed item: 7 d spend over the spend input\'s landed ranges; unknown while spend indexes, nothing landed or landings are unknown', () => {
+    expect(find(deriveConstraint(ledger(), null, READY_SPEND, null, NOW), 'cost-per-landed-item'))
+      .toMatchObject({ value: 60, threshold: null, breached: false, unit: 'USD', reason: null,
+        text: 'cost per landed item: $60.00 over 2 landed ranges in 7d, no threshold' });
     const indexing = { ...READY_SPEND, index: { ...READY_SPEND.index, state: 'indexing' as const } };
-    expect(find(deriveConstraint(ledger({ items }), null, indexing, null, NOW), 'cost-per-landed-item'))
+    expect(find(deriveConstraint(ledger(), null, indexing, null, NOW), 'cost-per-landed-item'))
       .toMatchObject({ value: null, reason: 'spend index indexing' });
-    expect(find(deriveConstraint(ledger(), null, READY_SPEND, null, NOW), 'cost-per-landed-item')).toMatchObject({ value: null, reason: 'no range landed' });
+    expect(find(deriveConstraint(ledger(), null, { ...READY_SPEND, landedRanges: 0 }, null, NOW), 'cost-per-landed-item'))
+      .toMatchObject({ value: null, reason: 'no range landed' });
+    expect(find(deriveConstraint(ledger(), null, { ...READY_SPEND, landedRanges: null }, null, NOW), 'cost-per-landed-item'))
+      .toMatchObject({ value: null, reason: 'landed ranges not read from the ledger' });
+    const partial = { ...READY_SPEND, index: { ...READY_SPEND.index, error: 'session-tabs.json unreadable' } };
+    expect(find(deriveConstraint(ledger(), null, partial, null, NOW), 'cost-per-landed-item'))
+      .toMatchObject({ value: 60, reason: 'spend partial: session-tabs.json unreadable' });
   });
 
-  it('cost per landed item counts landings over the same UTC days as the spend, and notes a partial spend (F9)', () => {
-    const items = [
-      item('range:a:1', { closedAt: Date.UTC(2026, 9, 27, 12), state: 'landed' }),
-      item('range:a:2', { closedAt: Date.UTC(2026, 9, 28, 1), state: 'landed' }),
-      item('range:a:3', { closedAt: NOW - HOUR, state: 'landed' }),
-    ];
-    expect(find(deriveConstraint(ledger({ items }), null, READY_SPEND, null, NOW), 'cost-per-landed-item'))
-      .toMatchObject({ value: 60, reason: null, text: 'cost per landed item: $60.00 over 2 landed ranges in 7d, no threshold' });
-    const partial = { ...READY_SPEND, index: { ...READY_SPEND.index, error: 'session-tabs.json unreadable' } };
-    expect(find(deriveConstraint(ledger({ items }), null, partial, null, NOW), 'cost-per-landed-item'))
-      .toMatchObject({ value: 60, reason: 'spend partial: session-tabs.json unreadable' });
+  it('cache reads per landed item: reads story 04\'s metric, reported and never flagged; its reason when not measured', () => {
+    expect(find(deriveConstraint(ledger(), null, READY_SPEND, null, NOW), 'cache-read-per-landed-item'))
+      .toMatchObject({ value: 500_000, threshold: null, breached: false, unit: 'tokens', window: '7d', reason: null });
+    const none = { ...READY_SPEND, cacheReadTokensPerLandedItem: { ...READY_SPEND.cacheReadTokensPerLandedItem, landedItems: null, value: null,
+      reason: 'the ledger holds no items for this workspace yet' } };
+    expect(find(deriveConstraint(ledger(), null, none, null, NOW), 'cache-read-per-landed-item'))
+      .toMatchObject({ value: null, reason: 'the ledger holds no items for this workspace yet' });
+    expect(find(deriveConstraint(ledger(), null, null, null, NOW), 'cache-read-per-landed-item')).toMatchObject({ value: null, reason: 'spend not read' });
   });
 
   it('every anomaly carries a threshold field and a text naming value and threshold', () => {
     const result = deriveConstraint(ledger(), null, null, null, NOW);
     expect(result.anomalies.map((a) => a.id)).toEqual([
-      're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item',
+      're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item', 'cache-read-per-landed-item',
     ]);
     for (const a of result.anomalies) expect(a.text).toMatch(/threshold|no threshold/);
   });

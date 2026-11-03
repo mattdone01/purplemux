@@ -58,7 +58,8 @@ Option 3. This record holds the finder and the board read; story 12 adds the vie
    | `wakes-per-hour` | per tab: `tab_events` delivered in 6 h, class not `log`, one per `digest_id`, / 6 | 6/h |
    | `unknown-share` | `unknown` / all waiting hours on `range`, `deploy`, `owner-issue`, 24 h | 5% |
    | `producer-silence` | open `slice`, `gate`, `review`, `landing` items with no wait: now - last event, one row per (producer of the item's last event, item type), subject `<producer>/<type>`, naming that pair's longest-silent item: `<item> silent for <n> min (threshold <t> min)` | max(10 min, 2 x the type's 7-day p90 lifetime); unknown and never flagged under 20 closed of the type |
-   | `cost-per-landed-item` | spend over the last 7 UTC days / ranges closed `landed` over the same days; a partial spend index notes its reason | none: reported, never flagged (story 04 owns the join) |
+   | `cost-per-landed-item` | spend over the last 7 UTC days / ranges closed `landed` over the same days (`ledger-store.landedRanges`: the landings the store's projection applied, `close` with state `landed` on a `range`, read through `getFinderSpend`; amended by harness-flow-loop 04); a partial spend index notes its reason | none: reported, never flagged |
+   | `cache-read-per-landed-item` | `cache_read_tokens_per_landed_item` (harness-flow-loop 04, ADR-0030 amendment): cache-read tokens over the same 7 UTC days / the same landed ranges, from `getFinderSpend`; not measured carries the metric's reason | none: reported, never flagged |
 
 5. **Missing inputs** are `unknown`, never 0: `inputs.{ledger,flow,spend,pool}` each carry `state` (`ok`, `partial`,
    `stale`, `unknown`), `reason` and `at`. The ledger is `unknown` when it cannot be read (`ledger unreadable`) and when

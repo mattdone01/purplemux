@@ -20,7 +20,7 @@ const HOUR = 3_600_000;
 const emptyLedger = (): IFinderLedgerInput => ({ intervals: [], items: [], lastProducer: {}, firstEventAt: T0 - 30 * 24 * HOUR, tabWakes: null });
 
 const harness = () => {
-  const reads = { ledger: 0, spend: 0 };
+  const reads = { ledger: 0, spend: 0, spendIds: [] as string[] };
   const deps: IFinderDeps = {
     workspaces: async () => [{ id: 'ws-a' }, { id: 'ws-b' }],
     ledger: async (workspaceId) => {
@@ -32,11 +32,14 @@ const harness = () => {
       };
     },
     flow: async () => null,
-    spend: async () => {
+    spend: async (workspaceIds) => {
       reads.spend += 1;
+      reads.spendIds = [...workspaceIds];
       return {
         index: { state: 'ready', filesIndexed: 1, filesTotal: 1, indexedThrough: T0 }, since: T0 - 6 * 24 * HOUR,
-        byWorkspace: new Map([['ws-a', { costUsd: 12, cacheReadTokens: 5 }]]),
+        byWorkspace: new Map([['ws-a', { costUsd: 12, cacheReadTokens: 5, landedRanges: 1, cacheReadTokensPerLandedItem: {
+          metric: 'cache_read_tokens_per_landed_item' as const, window: '7d' as const, from: 'f', to: 't', cacheReadTokens: 5, landedItems: 1,
+          value: 5, reason: null } }]]),
       };
     },
     pool: async () => null,
@@ -65,13 +68,17 @@ describe('the finder tick (AC 4)', () => {
     expect(logs.warn).toHaveBeenCalledWith({ workspaceId: 'ws-b' }, 'constraint finder: ledger unreadable (database is locked)');
   });
 
-  it('reads the spend once per tick; a workspace with no spend row spent nothing', async () => {
+  it('reads the spend once per tick for every workspace; a workspace the read did not cover has an unknown spend', async () => {
     const h = harness();
     await runScheduledConstraintTick(h.deps, () => T0);
     expect(h.reads.spend).toBe(1);
-    expect(spendFor(await h.deps.spend(T0), 'ws-a')).toMatchObject({ costUsd: 12, cacheReadTokens: 5, since: T0 - 6 * 24 * HOUR });
-    expect(spendFor(await h.deps.spend(T0), 'ws-c')).toMatchObject({ costUsd: 0, cacheReadTokens: 0 });
+    expect(h.reads.spendIds).toEqual(['ws-a', 'ws-b']);
+    expect(spendFor(await h.deps.spend(['ws-a'], T0), 'ws-a')).toMatchObject({
+      costUsd: 12, cacheReadTokens: 5, since: T0 - 6 * 24 * HOUR, landedRanges: 1, cacheReadTokensPerLandedItem: { value: 5 },
+    });
+    expect(spendFor(await h.deps.spend(['ws-a'], T0), 'ws-c')).toBeNull();
     expect(spendFor(null, 'ws-a')).toBeNull();
+    expect(cachedFinderResults().get('ws-a')!.anomalies.find((a) => a.id === 'cache-read-per-landed-item')).toMatchObject({ value: 5 });
   });
 
   it('shares one derive between reads of a workspace the tick has not reached', async () => {
