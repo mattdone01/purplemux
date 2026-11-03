@@ -23,6 +23,7 @@ import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio-runtime';
 import { startSpend, stopSpend } from './src/lib/spend/spend-service';
 import { startFlagAlerts, stopFlagAlerts } from './src/lib/flag-alerts';
+import { startLedgerRetention, stopLedgerRetention } from './src/lib/ledger-retention';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
 import { dispatchHook } from './src/lib/hook-dispatch';
 import { drainHookSpoolsWithRemotePull } from './src/lib/remote-spool';
@@ -121,6 +122,7 @@ const shutdownWs = async () => {
   await stopFlagAlerts();
   await getMissionControlRuntime().stop();
   await stopSpend();
+  stopLedgerRetention();
   await stopWatches();
   await stopNotes();
   stopGrants();
@@ -417,6 +419,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   startFlagAlerts();
   // The spend index starts its first pass 120 s after boot, one transcript at a time (ADR-0030).
   await startSpend();
+  // The work-item ledger's daily rollup and retention pass, first 10 min after boot (ADR-0033).
+  startLedgerRetention();
   // The inbox's first tick waits for the first boot drain of the hook spool (at most
   // 10 s): a tab's state from before the restart gap must not look ready (ADR-0020).
   // Note paste-time policy must be registered before the inbox can drain legacy notices.
