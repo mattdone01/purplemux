@@ -40,7 +40,7 @@ const stuckItem = (extra: Partial<IBoardStuckItem> = {}): IBoardStuckItem => ({
 });
 
 const finderAt = (at: number, stuck: IBoardStuckItem[]): IFinderResult => ({
-  generatedAt: at, onTrack: { state: 'at-risk', goal: null, goalState: 'none', itemsLeft: null, throughputPerDay: null, p50At: null, p90At: null, reason: null }, constraint: null, stuck,
+  generatedAt: at, onTrack: { state: 'at-risk', goal: null, goalState: 'none', itemsLeft: null, throughputPerDay: null, p50At: null, p90At: null, reason: null }, constraint: null, stuck, ownerBlocks: null,
   windows: [], anomalies: [], unknownShare: null, flowLocks: null, pool: null, line: '',
   inputs: {
     ledger: { state: 'ok', reason: null, at }, flow: { state: 'unknown', reason: null, at: null },
