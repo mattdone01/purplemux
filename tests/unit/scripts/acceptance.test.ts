@@ -721,13 +721,13 @@ describe('checks-wip-cap.cjs (story 20)', () => {
   });
 
   it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
-    expect(checks.WAVE_COUNT).toBe(9);
+    expect(checks.WAVE_COUNT).toBe(10);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
-    expect(checks.parseArgs(['--state', 's', '--only-wave', '9']).onlyWave).toBe(9);
-    for (const bad of ['0', '10', '1.5', '-1', 'x', '']) {
-      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..9, not ${JSON.stringify(bad)}`);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '10']).onlyWave).toBe(10);
+    for (const bad of ['0', '11', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..10, not ${JSON.stringify(bad)}`);
     }
-    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..9, not null');
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..10, not null');
   });
 
   describe('checks.cjs runs the gate first (spawned against a fake candidate)', () => {
@@ -794,9 +794,9 @@ process.exit(1);
     });
 
     it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
-      const r = runChecks('ok', ['--only-wave', '10']);
+      const r = runChecks('ok', ['--only-wave', '11']);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('--only-wave takes an integer 1..9, not "10"');
+      expect(r.stderr).toContain('--only-wave takes an integer 1..10, not "11"');
       expect(r.calls).toEqual([]);
     });
 

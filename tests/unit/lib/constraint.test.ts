@@ -309,7 +309,7 @@ describe('missing inputs (AC 7)', () => {
     expect(result.constraint).toBeNull();
     expect(result.windows).toEqual([]);
     expect(result.unknownShare).toBeNull();
-    expect(result.anomalies).toHaveLength(7);
+    expect(result.anomalies).toHaveLength(10);
     for (const a of result.anomalies) expect(a).toMatchObject({ value: null, breached: false, reason: 'ledger unreadable' });
     expect(result.line).toBe('no goal set · items left — · constraint unknown (ledger unreadable)');
     expect(result.inputs.flow.state).toBe('ok');
@@ -325,10 +325,12 @@ describe('missing inputs (AC 7)', () => {
     expect(result.line).toBe('no goal set · items left — · constraint unknown (the ledger holds no event for this workspace)');
     expect(result.anomalies.map((a) => [a.id, a.value, a.reason])).toEqual([
       're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item',
+      'seat-compactions', 'rotation-alarm', 'handoff-undelivered',
     ].map((id) => [id, null, 'the ledger holds no event for this workspace']));
     expect(result.anomalies.map((a) => [a.id, a.threshold, a.judged])).toEqual([
       ['re-gates', 0, false], ['rework-rate', 0.1, false], ['context-per-call', 300_000, false], ['wakes-per-hour', 6, false],
       ['unknown-share', 0.05, false], ['producer-silence', null, false], ['cost-per-landed-item', null, false],
+      ['seat-compactions', 0, false], ['rotation-alarm', 1, false], ['handoff-undelivered', 0, false],
     ]);
     expect(result.anomalies.find((a) => a.id === 'wakes-per-hour')!.text)
       .toBe('wakes per hour: unknown (the ledger holds no event for this workspace) in 6h, threshold 6.0/h');
@@ -422,6 +424,53 @@ describe('anomalies (AC 3): each names its measured value and threshold', () => 
     expect(find(deriveConstraint(ledger(), null, null, null, NOW), 'context-per-call')).toMatchObject({ value: null, reason: 'no seat item in the ledger' });
   });
 
+  it('seat compactions: a compaction since the last rotation is a missed rotation (ADR-0036 §3)', () => {
+    const items = [
+      item('seat:ws-a:orchestrator', { attrs: { compactions: 5, compactionsSinceRotation: 2 } }),
+      item('seat:ws-a:kit', { attrs: { compactions: 3, compactionsSinceRotation: 0 } }),
+      item('seat:ws-a:scope'),
+      item('seat:ws-a:old', { closedAt: NOW - HOUR, attrs: { compactionsSinceRotation: 9 } }),
+    ];
+    const result = deriveConstraint(ledger({ items }), null, null, null, NOW);
+    const orch = find(result, 'seat-compactions', 'seat:ws-a:orchestrator');
+    expect(orch).toMatchObject({ value: 2, threshold: 0, breached: true });
+    expect(orch.text).toBe('seat compactions seat:ws-a:orchestrator: 2 compactions since the last rotation (5 in all), threshold 0 compactions');
+    expect(find(result, 'seat-compactions', 'seat:ws-a:kit')).toMatchObject({ value: 0, breached: false });
+    expect(find(result, 'seat-compactions', 'seat:ws-a:scope')).toMatchObject({ value: null, reason: 'no compaction count on the seat' });
+    expect(result.anomalies.some((a) => a.subject === 'seat:ws-a:old')).toBe(false);
+    expect(find(deriveConstraint(ledger(), null, null, null, NOW), 'seat-compactions')).toMatchObject({ value: null, reason: 'no seat item in the ledger' });
+  });
+
+  it('rotation alarm: a second failed handoff check flags the seat; one does not (ADR-0036 §2)', () => {
+    const items = [
+      item('seat:ws-a:orchestrator', { state: 'rotation-alarm', attrs: { rotationFailures: 2, rotationAlarm: 'missing heading "## Do not" (expected once)' } }),
+      item('seat:ws-a:kit', { state: 'rotate-requested', attrs: { rotationFailures: 1 } }),
+      item('seat:ws-a:sm', { attrs: { rotationFailures: 0 } }),
+      item('seat:ws-a:scope'),
+    ];
+    const result = deriveConstraint(ledger({ items }), null, null, null, NOW);
+    const orch = find(result, 'rotation-alarm', 'seat:ws-a:orchestrator');
+    expect(orch).toMatchObject({ value: 2, threshold: 1, breached: true });
+    expect(orch.text).toBe('rotation alarm seat:ws-a:orchestrator: 2 failed handoff checks, the session left as it is: missing heading "## Do not" (expected once)');
+    expect(find(result, 'rotation-alarm', 'seat:ws-a:kit')).toMatchObject({ value: 1, breached: false });
+    expect(find(result, 'rotation-alarm', 'seat:ws-a:sm')).toMatchObject({ value: 0, breached: false });
+    expect(find(result, 'rotation-alarm', 'seat:ws-a:scope')).toMatchObject({ value: null, breached: false, judged: false, reason: 'no rotation record on the seat' });
+    expect(find(deriveConstraint(ledger(), null, null, null, NOW), 'rotation-alarm')).toMatchObject({ value: null, reason: 'no seat item in the ledger' });
+  });
+
+  it('handoff not delivered: a rotated seat whose first message was dropped is flagged until a later one is delivered (ADR-0036)', () => {
+    const items = [
+      item('seat:ws-a:orchestrator', { attrs: { handoffUndeliveredAt: Date.UTC(2026, 10, 3, 9, 30) } }),
+      item('seat:ws-a:kit', { attrs: { handoffUndeliveredAt: null } }),
+    ];
+    const result = deriveConstraint(ledger({ items }), null, null, null, NOW);
+    const orch = find(result, 'handoff-undelivered', 'seat:ws-a:orchestrator');
+    expect(orch).toMatchObject({ value: 1, threshold: 0, breached: true });
+    expect(orch.text).toBe('handoff not delivered seat:ws-a:orchestrator: rotated but the handoff was not delivered (first message dropped 2026-11-03T09:30:00Z)');
+    expect(find(result, 'handoff-undelivered', 'seat:ws-a:kit')).toMatchObject({ value: 0, breached: false });
+    expect(find(deriveConstraint(ledger(), null, null, null, NOW), 'handoff-undelivered')).toMatchObject({ value: null, reason: 'no seat item in the ledger' });
+  });
+
   it('wakes per hour per seat: deliveries over 6 h against 6/h; unknown with no tab event at all', () => {
     const result = deriveConstraint(ledger({ tabWakes: [{ tabId: 'tab-orch', wakes: 42 }, { tabId: 'tab-kit', wakes: 6 }] }), null, null, null, NOW);
     expect(find(result, 'wakes-per-hour', 'tab-orch')).toMatchObject({ value: 7, threshold: 6, breached: true, window: '6h' });
@@ -493,6 +542,7 @@ describe('anomalies (AC 3): each names its measured value and threshold', () => 
     const result = deriveConstraint(ledger(), null, null, null, NOW);
     expect(result.anomalies.map((a) => a.id)).toEqual([
       're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item',
+      'seat-compactions', 'rotation-alarm', 'handoff-undelivered',
     ]);
     for (const a of result.anomalies) expect(a.text).toMatch(/threshold|no threshold/);
   });

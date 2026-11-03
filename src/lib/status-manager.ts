@@ -66,6 +66,11 @@ import { getLedgerStore } from '@/lib/ledger-store';
 import type { TabEventsTable } from '@/lib/tab-events-store';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
+import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
+import { DEFAULT_ROTATE_AT_TOKENS } from '@/lib/constraint';
+import { SERVER_PRODUCER } from '@/lib/ledger-store';
+import type { ISeatTab } from '@/types/context-lifecycle';
+
 import type { IPendingDigest, ITabEvent } from '@/types/tab-events';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
 import type { ISessionHistoryEntry } from '@/types/session-history';
@@ -233,6 +238,10 @@ export class StatusManager {
   private automatedPrompts: AutomatedPromptDispatcher;
   /** Every event bound for a tab goes through its wake class and into `tab_events` (ADR-0035). */
   private tabEvents: TabEventRouter;
+  /** Seats rotate from their handoff file (ADR-0036). */
+  private readonly contextLifecycle: ContextLifecycle;
+  private contextTimer: ReturnType<typeof setInterval> | null = null;
+  private fleetRotateAt = DEFAULT_ROTATE_AT_TOKENS;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
   private updateAgentState: typeof updateTabAgentState;
   /** Tab → when its once-per-busy-stretch `stuck` nudge went out (the fleet panel reads the time, ADR-0023). */
@@ -291,6 +300,9 @@ export class StatusManager {
       now: () => Date.now(),
       deliver: (workspaceId, tabId, message, whenReady) => this.deliverAutomatedPrompt(workspaceId, tabId, message, 'tab event', whenReady),
       atPrompt: (tabId) => this.isAtPrompt(tabId),
+      // A seat that owes a rotation, or waits for its first message, takes no digest (ADR-0036, F1, F4).
+      holdDigest: (tabId) => this.contextLifecycle.holdsDigest(tabId),
+      holdUrgent: (tabId) => this.contextLifecycle.holdsUrgent(tabId),
       // The client holds these nudges as "held for digest": the same ids again, now delivered (review r2, F9).
       onDigestDelivered: (events) => {
         for (const event of events) {
@@ -304,8 +316,143 @@ export class StatusManager {
         });
       },
     });
+    this.contextLifecycle = new ContextLifecycle(this.contextLifecycleDeps());
     this.cacheCodexRateLimits = cacheCodexRateLimits;
     this.updateAgentState = updateAgentState;
+  }
+
+  /** The tab as a seat (ADR-0036): a local agent tab created with `--handoff`. */
+  private seatOf(tabId: string): ISeatTab | null {
+    const entry = this.tabs.get(tabId);
+    if (!entry?.handoffPath || !isAgentPanelType(entry.panelType)) return null;
+    return { workspaceId: entry.workspaceId, tabId, tabName: entry.tabName, handoffPath: entry.handoffPath, rotateAt: entry.rotateAt ?? null };
+  }
+
+  private contextLifecycleDeps(): IContextLifecycleDeps {
+    return {
+      now: () => Date.now(),
+      seat: (tabId) => this.seatOf(tabId),
+      seats: () => [...this.tabs.keys()].map((tabId) => this.seatOf(tabId)).filter((seat): seat is ISeatTab => seat !== null),
+      fleetRotateAt: () => this.fleetRotateAt,
+      canRotate: (tabId) => this.canRotate(tabId),
+      atPrompt: (tabId) => this.isAtPrompt(tabId),
+      send: async (seat, text, whenReady) => (await this.tabEvents.route({
+        workspaceId: seat.workspaceId, tabId: seat.tabId, kind: 'rotate', text, class: classifyWake('rotate'), whenReady,
+      })).delivered,
+      // A BOM is kept, so the checker refuses it as v2's does (F6).
+      readHandoff: async (file) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await fs.readFile(file)),
+      restart: (seat) => this.restartSeat(seat),
+      sessionId: (tabId) => this.tabs.get(tabId)?.agentSessionId ?? null,
+      typeFirstMessage: (seat, text) => this.typeFirstMessage(seat.tabId, text),
+      releaseUrgent: (seat, since) => {
+        void this.tabEvents.releaseHeldUrgent(seat.workspaceId, seat.tabId, since)
+          .catch((err) => log.warn(`held urgent events of ${seat.tabId} not released: ${err instanceof Error ? err.message : err}`));
+      },
+      record: (workspaceId, events) => {
+        getLedgerStore().append(workspaceId, SERVER_PRODUCER, events, Date.now());
+      },
+      readSeatItem: (workspaceId, itemKey, holder) => {
+        const item = getLedgerStore().items(workspaceId, { open: true, type: 'seat', holder }, Date.now()).items.find((row) => row.itemKey === itemKey);
+        return item ? { state: item.state, attrs: item.attrs } : null;
+      },
+    };
+  }
+
+  /** `tab restart --clear` (ADR-0028) for a rotation; imported at call time: tab-restart reads this manager. */
+  private async restartSeat(seat: ISeatTab): Promise<TRestartOutcome> {
+    try {
+      const { restartTab } = await import('@/lib/tab-restart');
+      // A stop WAITING only on armed watches is busy to `tab restart` (ADR-0028 §3), but its turn has ended and the
+      // watches survive the restart; `canRotate` already proved no task or job would die with it (consult 10-C1).
+      // Decided inside the restart lock (F1): only while the latest event is still that WAITING stop and nothing
+      // was submitted after it, so a delivered turn is never killed.
+      const result = await restartTab({
+        workspaceId: seat.workspaceId, tabId: seat.tabId, clear: true, interrupt: false,
+        interruptIf: (tab) => this.isWaitingAtPrompt(seat.tabId) && !this.submittedAfterStop(seat.tabId, tab),
+        by: { kind: 'server', reason: 'context-rotation' },
+      });
+      if (result.status === 200) return { ok: true };
+      return { ok: false, busy: result.body.code === 'tab-busy', error: `${result.body.code}: ${result.body.error}` };
+    } catch (err) {
+      return { ok: false, busy: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** A paste recorded after the tab's latest stop (orchestration-activity.ts): a turn is on its way. */
+  private submittedAfterStop(tabId: string, tab: ITab): boolean {
+    const stop = this.tabs.get(tabId)?.lastEvent;
+    const submitted = tab.orchestrationActivity?.turn?.at;
+    return submitted !== undefined && (stop?.name !== 'stop' || submitted >= stop.at);
+  }
+
+  /** Idle or ready for review: not mid-turn, not waiting on its own work, not halted, not closing or restarting. */
+  isIdleAtPrompt(tabId: string): boolean {
+    const entry = this.tabs.get(tabId);
+    if (!entry || !isAgentPanelType(entry.panelType) || this.isRetired(tabId) || this.isHaltedByUsageLimit(tabId)) return false;
+    return entry.cliState === 'idle' || entry.cliState === 'ready-for-review';
+  }
+
+  /**
+   * A rotation may start (ADR-0036 §2, consult 10-C1): the tab is at its prompt (idle, ready for review, or WAITING
+   * with no newer event) with no live registered `tab bg` job and no open background task of its own, both read
+   * now: they die with the restart. Armed watches, probes and leases survive it (ADR-0028 §5) and never block. An
+   * unknown task count is not zero: a transcript that cannot be read blocks the rotation.
+   */
+  private async canRotate(tabId: string): Promise<boolean> {
+    if (!this.isAtPrompt(tabId)) return false;
+    if (await this.liveRegisteredJobs(tabId) > 0) return false;
+    const entry = this.tabs.get(tabId);
+    const handle = entry ? this.runtimeHandle(entry) : null;
+    const provider = entry ? getProviderByPanelType(entry.panelType) : null;
+    if (!entry || !handle || !provider) return false;
+    try {
+      const snapshot = await provider.readRuntimeSnapshot(handle, { tasksSince: await this.agentProcessStartedAt(tabId, entry), withBackground: true });
+      if (snapshot.transcriptRead === false || snapshot.openBackgroundTasks === undefined || snapshot.openBackgroundTasks > 0) return false;
+    } catch (err) {
+      hookLog.debug({ tabId, err: String(err) }, 'background task read failed: no rotation');
+      return false;
+    }
+    return this.isAtPrompt(tabId);
+  }
+
+  /** A statusline reading (AC 5): the context of the session it names, kept on the tab bound to it. */
+  recordContextReading(agentSessionId: string, contextTokens: number): void {
+    for (const [tabId, entry] of this.tabs) {
+      if (entry.agentSessionId === agentSessionId) {
+        this.contextLifecycle.onContext(tabId, contextTokens, agentSessionId);
+        return;
+      }
+    }
+  }
+
+  /**
+   * A rotated seat's first message (ADR-0036 §2). The lifecycle asks only once a session newer than the restart
+   * reported in (F4); it is typed only while the fresh agent is idle at its prompt, re-checked inside the dispatch
+   * lock, so a launch that failed never gets it typed into a bare shell.
+   */
+  private async typeFirstMessage(tabId: string, text: string): Promise<boolean> {
+    const entry = this.tabs.get(tabId);
+    if (!entry || !this.isIdleAtPrompt(tabId)) return false;
+    // A TUI that just started can drop a paste: the same 800 ms settle as a kickoff.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    return this.deliverAutomatedPrompt(entry.workspaceId, tabId, text, 'rotation first message', () => this.isIdleAtPrompt(tabId));
+  }
+
+  /** A tab created with `--handoff` opens its seat item at once. */
+  registerSeat(tabId: string): void {
+    this.contextLifecycle.register(tabId);
+  }
+
+  private async contextTick(): Promise<void> {
+    try {
+      const fleet = await readFleetConfig();
+      this.fleetRotateAt = fleetRotateAtFrom(valueOf(fleet, ROTATE_AT_CONFIG_KEY)?.value ?? null, (value) => {
+        log.warn({ key: ROTATE_AT_CONFIG_KEY, value }, 'fleet config value out of range; the default applies');
+      });
+    } catch (err) {
+      log.warn(`fleet config unreadable; the rotate threshold stays at ${this.fleetRotateAt}: ${err instanceof Error ? err.message : err}`);
+    }
+    await this.contextLifecycle.tick();
   }
 
   async init(): Promise<void> {
@@ -330,6 +477,11 @@ export class StatusManager {
     this.hookScanReady = true;
     this.startPolling();
     this.tabEvents.start();
+    this.contextTimer = setInterval(() => {
+      this.contextTick().catch((err) => log.warn(`context lifecycle tick failed: ${err instanceof Error ? err.message : err}`));
+    }, CONTEXT_TICK_MS);
+    this.contextTimer.unref?.();
+    void this.contextTick().catch((err) => log.warn(`context lifecycle tick failed: ${err instanceof Error ? err.message : err}`));
 
     this.rateLimitsWatcher = createRateLimitsWatcher((data) => {
       this.lastRateLimits = data;
@@ -403,6 +555,8 @@ export class StatusManager {
           ...entryAgentFields(provider, tab, detected.jsonlPath),
           reportsTo: tab.reportsTo ?? null,
           reportOn: tab.reportOn ?? null,
+          handoffPath: tab.handoffPath ?? null,
+          rotateAt: tab.rotateAt ?? null,
           lastUserMessage: tab.lastUserMessage,
           lastAssistantMessage: detected.lastAssistantSnippet,
           currentAction: detected.currentAction,
@@ -804,6 +958,8 @@ export class StatusManager {
             ...entryAgentFields(provider, tab, detected.jsonlPath),
             reportsTo: tab.reportsTo ?? null,
             reportOn: tab.reportOn ?? null,
+            handoffPath: tab.handoffPath ?? null,
+            rotateAt: tab.rotateAt ?? null,
             lastUserMessage: tab.lastUserMessage,
             lastAssistantMessage: detected.lastAssistantSnippet,
             currentAction: detected.currentAction,
@@ -846,6 +1002,8 @@ export class StatusManager {
         existing.lastUserMessage = tab.lastUserMessage;
         existing.reportsTo = tab.reportsTo ?? null;
         existing.reportOn = tab.reportOn ?? null;
+        existing.handoffPath = tab.handoffPath ?? null;
+        existing.rotateAt = tab.rotateAt ?? null;
         this.reconcileJsonlWatch(tab.id, existing);
 
         if (processChanged) {
@@ -1469,6 +1627,7 @@ export class StatusManager {
     if (newState === 'idle' && this.pendingKickoffs.has(tabId)) {
       this.deliverKickoff(tabId);
     }
+    if (newState === 'idle' || newState === 'ready-for-review') this.contextLifecycle.onIdle(tabId);
     const nudgeKind = opts.nudge === null ? null : nudgeKindForTransition(prevState, newState, !!opts.silent);
     if (nudgeKind) {
       const nudge = opts.nudge && !opts.silent ? opts.nudge : { kind: nudgeKind, detail: undefined };
@@ -1687,7 +1846,7 @@ export class StatusManager {
       tabName: entry?.tabName ?? '',
       providerId: toAlertProvider(entry?.agentProviderId),
       agentSessionId: entry?.agentSessionId,
-      detail: `${stale.count} event(s) held for ${entry?.tabName || stale.tabId}'s digest, the oldest ${minutes} min: the tab has not been at its prompt. Read them: purplemux events show -w ${stale.workspaceId} ${stale.tabId} --since ${new Date(stale.oldestAt).toISOString()}`,
+      detail: `${stale.count} event(s) held for ${entry?.tabName || stale.tabId}'s digest, the oldest ${minutes} min: ${this.contextLifecycle.holdReason(stale.tabId) ?? 'the tab has not been at its prompt'}. Read them: purplemux events show -w ${stale.workspaceId} ${stale.tabId} --since ${new Date(stale.oldestAt).toISOString()}`,
     });
   }
 
@@ -2036,6 +2195,7 @@ export class StatusManager {
       log.info({ tabId, restartId }, 'tab restarting: watchdog checks retired');
       return;
     }
+    if (phase === 'restarted') this.contextLifecycle.onRestarted(tabId);
     const open = this.openRestarts.get(tabId);
     open?.delete(restartId);
     if (open?.size === 0) this.openRestarts.delete(tabId);
@@ -2503,6 +2663,8 @@ export class StatusManager {
       liveRegisteredJobs,
       armedWatches,
     });
+    // HANDOFF-READY answers a ROTATE; the check itself waits for the prompt (ADR-0036 §2).
+    this.contextLifecycle.onTurnEnd(tabId, snapshot?.lastAssistantTail);
     // A replayed stop ended its turn when it happened, so the idle clocks start there.
     const at = replayedAt ?? Date.now();
     if (turnEnd.kind === 'waiting') {
@@ -2515,6 +2677,8 @@ export class StatusManager {
       this.persistToLayout(entry);
       this.persistTurnEnd(entry);
       this.broadcastUpdate(tabId, entry);
+      // A stop waiting only on watches is at its prompt for a rotation (consult 10-C1).
+      this.contextLifecycle.onIdle(tabId);
       return;
     }
     if (turnEnd.kind === 'turn-marker') {
@@ -2571,6 +2735,7 @@ export class StatusManager {
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');
       this.setCompacting(tabId, entry, event === 'pre-compact' ? now : null);
+      this.contextLifecycle.onCompact(tabId, event === 'pre-compact' ? 'pre' : 'post');
       return;
     }
 
@@ -2613,7 +2778,10 @@ export class StatusManager {
       }
       // A new agent session is not the halted one (story 26 review r2).
       if (entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'session-start');
+      // A /clear or a fresh launch has no context reading yet; after a rotation it is the session the first message waits for.
+      this.contextLifecycle.onSessionStart(tabId);
     }
+    if (eventName === 'prompt-submit') this.contextLifecycle.onPromptSubmit(tabId);
     this.broadcast({ type: 'status:hook-event', tabId, event: entry.lastEvent });
 
     const prevState = entry.cliState;
@@ -2800,6 +2968,7 @@ export class StatusManager {
   }
 
   removeTab(tabId: string): void {
+    this.contextLifecycle.onClosed(tabId, this.seatOf(tabId));
     const entry = this.tabs.get(tabId);
     if (entry) getLivenessManager().removeTab(entry.workspaceId, tabId);
     if (entry && (entry.cliState === 'busy' || entry.cliState === 'needs-input') && entry.lastUserMessage) {
@@ -3186,6 +3355,8 @@ export class StatusManager {
     const floorsSaved = this.hookFloors.flush();
     this.stopPolling();
     this.tabEvents.stop();
+    if (this.contextTimer) clearInterval(this.contextTimer);
+    this.contextTimer = null;
     this.rateLimitsWatcher?.stop();
     this.claudeUsagePoller?.stop();
     for (const tabId of [...this.jsonlWatchers.keys()]) {

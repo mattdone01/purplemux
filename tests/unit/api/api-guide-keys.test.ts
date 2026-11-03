@@ -9,6 +9,7 @@ import { QUESTION_MIN_VERSION_KEY } from '@/lib/mission-question-config';
 import { REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_KEY } from '@/lib/remote-host';
 import { TAB_CAP_KEY } from '@/lib/tab-cap';
 import { IDLE_NUDGE_CONFIG_KEY, WAIT_BACKSTOP_CONFIG_KEY } from '@/lib/turn-end';
+import { ROTATE_AT_CONFIG_KEY } from '@/lib/context-lifecycle';
 
 vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: () => ({ type: 'admin' }) }));
 
@@ -26,6 +27,7 @@ const SERVER_KEYS = [
   AUTO_ANSWER_KEY,
   QUESTION_MIN_VERSION_KEY,
   ...Object.values(FLAG_ALERT_CONFIG_KEYS),
+  ROTATE_AT_CONFIG_KEY,
 ];
 
 const keysInUse = async (): Promise<string> => {

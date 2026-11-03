@@ -395,6 +395,34 @@ generation) is skipped; a skipped replay is recorded by `recordSkippedReplay` as
 
 ---
 
+### Context lifecycle (ADR-0036)
+
+A tab created with `--handoff <path>` is a seat (`ITab.handoffPath`, mirrored on `ITabStatusEntry.handoffPath` /
+`rotateAt`). `StatusManager` owns one `ContextLifecycle` (`src/lib/context-lifecycle.ts`) and feeds it:
+
+| Input | Call | Effect |
+|---|---|---|
+| statusline POST (`/api/status/statusline`) | `recordContextReading(sessionId, tokens)` → `onContext` | context kept; recorded on the seat item at most every 5 min; a rotation checked |
+| `pre-compact` hook | `onCompact(tabId, 'pre')` | `compactions` + 1 on the seat item (board anomaly `seat-compactions`) |
+| `post-compact` hook | `onCompact(tabId, 'post')` | rotation due at the next idle, whatever the context |
+| classified `stop` (`applyStopTurnEnd`) | `onTurnEnd(tabId, tail)` | a last line `HANDOFF-READY` answers an open ROTATE; any other end line while a rotation is owed asks ROTATE again |
+| `session-start` (not a compaction's) | `onSessionStart(tabId)` | the context reading is dropped; after a rotation's restart it opens the first-message gate |
+| `prompt-submit` | `onPromptSubmit(tabId)` | a submission after HANDOFF-READY puts the seat back to `rotate-requested` |
+| `applyCliState` → `idle` / `ready-for-review` | `onIdle(tabId)` | the next step runs |
+| `tab-restart` `restarted` | `onRestarted` | the context reading is dropped |
+| `removeTab` | `onClosed` | the seat item closes |
+
+A step runs only when `canRotate` holds (consult 10-C1): `isAtPrompt` (idle, ready for review, or a WAITING stop
+with no newer event), and a fresh read finds no live registered job and no open background task (an unreadable
+transcript blocks). Armed watches never block: they survive the restart. A WAITING stop also calls `onIdle`.
+ROTATE goes through the tab event router as kind `rotate` (urgent) with `whenReady = isAtPrompt`, re-checked
+inside the dispatch lock with the router's 5 s settle window. While a rotation is owed or under way the router's
+`holdDigest` holds the seat's digests. A passing handoff check calls `restartTab({ clear: true, interrupt: false,
+interruptIf, by: { kind: 'server', reason: 'context-rotation' } })`; `interruptIf` runs inside the restart lock
+(`isWaitingAtPrompt` and no `orchestrationActivity.turn` newer than the stop). The first message goes through
+`typeFirstMessage` once a session newer than the restart reported in, with `whenReady = isIdleAtPrompt`, never by
+a fallback timer. A 30 s tick re-reads `context.rotate-at-tokens` and steps every seat.
+
 ## Server Restart Policy
 
 The only state that can be lost across a server restart is `busy` (Claude might fire `stop`/`notification` while the server is down). All other states have "the ball in the user's court", so no automatic transitions occur and the persisted value can stay as-is.

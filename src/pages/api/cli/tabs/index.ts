@@ -25,6 +25,8 @@ import type { ILastEvent } from '@/types/status';
 import { remoteHostUnreachableBody } from '@/lib/cli-error';
 import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
 import { checkEvaluatorBrowser, checkTabRole } from '@/lib/tab-role';
+import { checkSeatOptions } from '@/lib/context-lifecycle';
+import type { TRotateAt } from '@/types/context-lifecycle';
 
 const log = createLogger('api:cli:tabs');
 
@@ -115,6 +117,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       role?: TTabRole;
       previewOrigin?: string;
       pgService?: string;
+      /** The seat's handoff file (ADR-0036); absent for a tab that never rotates. */
+      handoffPath?: string;
+      rotateAt?: TRotateAt;
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -157,6 +162,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             ...(tab.role ? { role: tab.role } : {}),
             ...(tab.previewOrigin ? { previewOrigin: tab.previewOrigin } : {}),
             ...(tab.pgService ? { pgService: tab.pgService } : {}),
+            ...(tab.handoffPath ? { handoffPath: tab.handoffPath } : {}),
+            ...(tab.rotateAt !== undefined ? { rotateAt: tab.rotateAt } : {}),
           });
         }
       }
@@ -165,7 +172,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd, role, previewUrl, pgService, overCap } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd, role, previewUrl, pgService, overCap, handoff, rotateAt } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -181,6 +188,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       previewUrl?: unknown;
       pgService?: unknown;
       overCap?: unknown;
+      handoff?: unknown;
+      rotateAt?: unknown;
     };
     if (!workspaceId) {
       return res.status(400).json({ error: 'workspaceId is required' });
@@ -200,6 +209,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     // The markers whose end lines reach the target (ADR-0025); absent or null forwards every marker.
     const reportOnChecked = reportOn === undefined ? { markers: null } : checkReportOn(reportOn);
     if (isReportOnInvalid(reportOnChecked)) return res.status(400).json(reportOnChecked);
+    const seat = checkSeatOptions(handoff, rotateAt, host);
+    if (!seat.ok) return res.status(400).json(seat);
     const dispatchPolicy = await checkAgentDispatchPolicy(workspaceId);
     if (!dispatchPolicy.ok) {
       return res.status(409).json(dispatchPolicy);
@@ -268,6 +279,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         previewOrigin: roleCheck.previewOrigin,
         pgService: roleCheck.pgService,
         admit: admission?.admit,
+        ...seat.options,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
       const wip = admission?.wip() ?? null;
@@ -287,9 +299,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           agentSessionId: provider?.readSessionId(tab) ?? null,
           reportsTo: tab.reportsTo ?? null,
           reportOn: tab.reportOn ?? null,
+          handoffPath: tab.handoffPath ?? null,
+          rotateAt: tab.rotateAt ?? null,
           lastEvent: null,
           eventSeq: 0,
         });
+        if (tab.handoffPath) getStatusManager().registerSeat(tab.id);
         if (command) getStatusManager().markAgentLaunch(tab.id);
       }
 
@@ -346,6 +361,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         ...(tab.role ? { role: tab.role } : {}),
         ...(tab.previewOrigin ? { previewOrigin: tab.previewOrigin } : {}),
         ...(tab.pgService ? { pgService: tab.pgService } : {}),
+        ...(tab.handoffPath ? { handoffPath: tab.handoffPath } : {}),
+        ...(tab.rotateAt !== undefined ? { rotateAt: tab.rotateAt } : {}),
         ...(wip ? { wip } : {}),
       });
     } catch (err) {

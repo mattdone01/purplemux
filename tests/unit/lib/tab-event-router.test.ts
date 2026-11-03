@@ -85,6 +85,74 @@ describe('urgent events (AC 2)', () => {
     expect(result.delivered).toBe(false);
     expect(store.tabEvents.list(WS, { since: 0, limit: 5 })[0].deliveredAt).toBeNull();
   });
+
+  it('carry their own readiness into the dispatch lock: a ROTATE for a tab that started a turn is not typed (ADR-0036 §2)', async () => {
+    const rotate = { workspaceId: WS, tabId: TAB, kind: 'rotate', class: 'urgent' as const, text: 'ROTATE: bring /h.md up to date, then end your turn with HANDOFF-READY.' };
+    const refused = await router().route({ ...rotate, whenReady: () => false });
+    expect(refused).toMatchObject({ class: 'urgent', delivered: false });
+    expect(typed).toEqual([]);
+    const typedNow = await router().route({ ...rotate, whenReady: () => true });
+    expect(typedNow.delivered).toBe(true);
+    expect(store.tabEvents.list(WS, { since: 0, limit: 5 }).map((row) => [row.kind, row.class, row.deliveredAt])).toEqual([
+      ['rotate', 'urgent', null], ['rotate', 'urgent', T0],
+    ]);
+  });
+});
+
+describe('a seat mid-rotation (ADR-0036)', () => {
+  it('ROTATE queued behind a digest waits: it is not typed inside the settle window of that delivery (F2)', async () => {
+    const r = router();
+    await r.route(checkpoint(1));
+    await vi.waitFor(() => expect(typed).toHaveLength(1));
+    const rotate = { workspaceId: WS, tabId: TAB, kind: 'rotate', class: 'urgent' as const, text: 'ROTATE: x', whenReady: () => true };
+    now += DIGEST_SETTLE_MS - 1;
+    expect((await r.route(rotate)).delivered).toBe(false);
+    expect(typed).toHaveLength(1);
+    // A refused paste typed nothing and stamps nothing: the window runs from the digest.
+    now += 1;
+    expect((await r.route(rotate)).delivered).toBe(true);
+    expect(typed.at(-1)?.message).toBe('ROTATE: x');
+  });
+
+  it('holds digests while the seat says so; urgent events still go (F1, F4)', async () => {
+    let hold = true;
+    const r = new TabEventRouter({
+      table: () => store.tabEvents, now: () => now, deliver, atPrompt: () => atPrompt, newDigestId: () => `dg-${++digestN}`,
+      holdDigest: () => hold,
+    });
+    await r.route(checkpoint(1));
+    await r.tick();
+    expect(typed).toEqual([]);
+    expect((await r.route(checkpoint(2, { class: 'urgent', text: 'ended: DONE: x' }))).delivered).toBe(true);
+    hold = false;
+    now += DIGEST_SETTLE_MS;
+    await r.tick();
+    expect(typed.at(-1)?.message).toMatch(/^DIGEST 1 since /);
+  });
+});
+
+describe('the urgent hold of a rotated seat (ADR-0036)', () => {
+  it('records an urgent event undelivered while held and types the held ones in order on release, never a ROTATE', async () => {
+    let hold = true;
+    const r = new TabEventRouter({
+      table: () => store.tabEvents, now: () => now, deliver, atPrompt: () => atPrompt, newDigestId: () => `dg-${++digestN}`,
+      holdUrgent: () => hold,
+    });
+    const urgent = (text: string, kind = 'turn-marker') => ({ workspaceId: WS, tabId: TAB, kind, class: 'urgent' as const, text });
+    expect((await r.route(urgent('ended: DONE: one'))).delivered).toBe(false);
+    now += 1;
+    await r.route(urgent('ROTATE: stale', 'rotate'));
+    now += 1;
+    await r.route(urgent('ended: BLOCKED: two'));
+    expect(typed).toEqual([]);
+    hold = false;
+    expect(await r.releaseHeldUrgent(WS, TAB, T0)).toBe(2);
+    expect(typed.map((t) => t.message)).toEqual(['ended: DONE: one', 'ended: BLOCKED: two']);
+    expect(store.tabEvents.list(WS, { since: 0, limit: 10 }).map((row) => [row.kind, row.deliveredAt !== null])).toEqual([
+      ['turn-marker', true], ['rotate', false], ['turn-marker', true],
+    ]);
+    expect(await r.releaseHeldUrgent(WS, TAB, T0)).toBe(0);
+  });
 });
 
 describe('the digest (AC 3)', () => {

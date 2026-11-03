@@ -142,6 +142,13 @@ export interface ITab {
    */
   reportOn?: import('@/lib/turn-end').TTurnMarkerName[];
   /**
+   * The seat's handoff file (ADR-0036): set at create with `--handoff`, it makes the tab rotate from that file
+   * at its context threshold. Absent: the tab never rotates.
+   */
+  handoffPath?: string;
+  /** The tab's own rotate threshold (ADR-0036 §1); absent: the fleet's `context.rotate-at-tokens`. */
+  rotateAt?: import('@/types/context-lifecycle').TRotateAt;
+  /**
    * The ssh alias of the host whose tmux runs this tab (ADR-0022). Absent: this
    * server's host. Set once at create; a tab never changes host.
    */

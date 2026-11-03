@@ -90,9 +90,23 @@ describe('the write and read path', () => {
   });
 
   it('marks more rows than one statement may bind', () => {
-    const seqs = Array.from({ length: 1_200 }, (_, i) => store.tabEvents.append(ev({ at: T0 + i, text: `e${i}` })));
+    // SQLite refuses a statement with more than 32,766 parameters (measured on the bundled 3.53): one row
+    // past that proves the chunking. The rows are seeded in one transaction on a second handle (WAL), so the
+    // test measures markDelivered, not 33,000 fsync'd commits (it timed out under disk load at 1,200).
+    const rows = 33_000;
+    const raw = new Database(file);
+    let seqs: number[];
+    try {
+      expect(() => raw.prepare(`SELECT 1 WHERE 1 IN (${Array(rows).fill('?').join(',')})`)).toThrow(/too many SQL variables/);
+      const insert = raw.prepare(`INSERT INTO tab_events (workspace_id, tab_id, at, class, kind, text) VALUES (?, 'tab-o', ?, 'digest', 'turn-marker', ?)`);
+      seqs = raw.transaction(() => Array.from({ length: rows }, (_, i) => Number(insert.run(WS, T0 + i, `e${i}`).lastInsertRowid)))();
+    } finally {
+      raw.close();
+    }
+    expect(store.tabEvents.pending(WS, 'tab-o')).toHaveLength(rows);
     store.tabEvents.markDelivered(seqs, T0 + DAY_MS, 'dg-big');
     expect(store.tabEvents.pending(WS, 'tab-o')).toEqual([]);
+    expect(store.tabEvents.list(WS, { since: 0, limit: rows }).every((row) => row.deliveredAt === T0 + DAY_MS && row.digestId === 'dg-big')).toBe(true);
   });
 
   it('knows whether a workspace has any tab event', () => {

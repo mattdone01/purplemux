@@ -112,7 +112,10 @@ export type TFinderAnomalyId =
   | 'wakes-per-hour'
   | 'unknown-share'
   | 'producer-silence'
-  | 'cost-per-landed-item';
+  | 'cost-per-landed-item'
+  | 'seat-compactions'
+  | 'rotation-alarm'
+  | 'handoff-undelivered';
 
 export interface IFinderAnomaly {
   id: TFinderAnomalyId;
