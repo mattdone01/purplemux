@@ -195,6 +195,10 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'ledger-experiment-cap': EXIT.CONFLICT,
   'ledger-experiment-closed': EXIT.CONFLICT,
   'ledger-experiment-not-found': EXIT.NOT_FOUND,
+  'pool-invalid': EXIT.USAGE,
+  'pool-full': EXIT.CONFLICT,
+  'pool-unreadable': EXIT.CONFLICT,
+  'pool-timeout': EXIT.UNREACHABLE,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -207,6 +211,8 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'wip-cap': "refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason",
   'tab-busy': 'the tab is mid-turn — retry when it is idle, or restart with --interrupt to abandon the turn',
   'restart-not-confirmed': 'a process or the session outlived the reap; nothing was relaunched — inspect the tab before a retry',
+  'pool-timeout': 'the pool did not answer in 2 s — do what you do without the pool and log it (a repository in gate.no-local-fallback queues on the gate host or is REFUSED-REMOTE, never runs here); a lease the late answer took expires at its TTL',
+  'pool-full': 'no host has a free slot, the memory or the disk — wait for a release; a repository in gate.no-local-fallback queues on the gate host or is REFUSED-REMOTE, never runs here',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -971,7 +977,7 @@ const leaseName = (args, what = 'NAME') => {
 // Fleet config (ADR-0019): versioned values tools read at call time. A change
 // is audited and sent to nobody.
 const CONFIG_USAGE = 'usage: config get KEY | list [--json] | set KEY VALUE [--expect-version N] | unset KEY [--expect-version N] | history [KEY] [--json]';
-const CONFIG_KEY = /^[a-z][a-z0-9.-]{1,63}$/;
+const CONFIG_KEY = /^[a-z][A-Za-z0-9._-]{1,63}$/;
 
 const configKey = (key) => {
   if (!key || !CONFIG_KEY.test(key)) die(`KEY must match ${CONFIG_KEY.source}, got ${JSON.stringify(key ?? '')}`);
@@ -1400,6 +1406,109 @@ const cmdLease = async (args) => {
   }
 };
 
+// ---- pool (ADR-0039) ----
+
+const POOL_USAGE = 'usage: pool show [--json] | acquire --kind gate|build|tab [--mem GB] [--ttl 60m] [--panel-type T] [--role R] | release LEASE';
+// The client rule: no answer in 2 s exits 6 (pool-timeout), and the caller falls back to its local slots and logs it.
+const POOL_ACQUIRE_TIMEOUT_MS = 2000;
+
+const poolRequest = async (method, requestPath, data) => {
+  const opts = {
+    method,
+    headers: headersFor(requestPath, { 'Content-Type': 'application/json' }, data, method),
+    signal: AbortSignal.timeout(POOL_ACQUIRE_TIMEOUT_MS),
+  };
+  if (data !== undefined) opts.body = JSON.stringify(data);
+  const timedOut = (err) => err?.name === 'TimeoutError' || err?.name === 'AbortError';
+  const late = () => fail('pool-timeout', `no answer from ${BASE} in ${POOL_ACQUIRE_TIMEOUT_MS} ms`);
+  let resp;
+  try {
+    resp = await fetch(`${BASE}${requestPath}`, opts);
+  } catch (err) {
+    if (timedOut(err)) return late();
+    return networkFailure(method, requestPath, err);
+  }
+  failIfRouteAbsent(resp, requestPath);
+  let body = null;
+  if (isJson(resp)) {
+    try {
+      body = await resp.json();
+    } catch (err) {
+      if (timedOut(err)) return late();
+      if (!(err instanceof SyntaxError)) return networkFailure(method, requestPath, err);
+    }
+  }
+  if (!resp.ok) failFromResponse(resp, body);
+  if (!body) fail(null, `HTTP ${resp.status} without a JSON body — is purplemux the server ${SERVER_LABEL}?`);
+  return body;
+};
+
+const GIB = 1024 ** 3;
+const gib = (bytes) => (bytes === null || bytes === undefined ? '-' : `${(bytes / GIB).toFixed(1)}`);
+const slotText = (s) => `${s.used}/${s.cap}`;
+
+const printPool = (view) => {
+  const t = view.totals;
+  process.stdout.write(`pool ${t.knownHosts} known, ${t.unknownHosts} unknown: ${t.threads} threads, ${gib(t.memAvailableBytes)}/${gib(t.memTotalBytes)} GiB free, gate ${slotText(t.slots.gate)} build ${slotText(t.slots.build)} tab ${slotText(t.slots.tab)}\n`);
+  for (const h of view.hosts) {
+    const name = `${h.host}${h.local ? ' (this host)' : ''}`;
+    if (!h.metrics) {
+      process.stdout.write(`  ${name}: unknown — ${h.reason}; slots held gate ${h.slots.gate.used} build ${h.slots.build.used} tab ${h.slots.tab.used}\n`);
+      continue;
+    }
+    const m = h.metrics;
+    const disks = m.disks.map((d) => `${d.path} ${d.usedPct === null ? '-' : `${d.usedPct}%`}`).join(' ');
+    const gpu = m.gpus ? ` gpu ${m.gpus.map((g) => `${g.name} ${g.utilPct ?? '-'}%`).join(', ') || 'none'}` : '';
+    const sweep = m.sccacheSweep ? ` sccache-sweep ${m.sccacheSweep.state}` : '';
+    const notPlaceable = h.placeable === false ? `; not placeable: ${h.reason}` : '';
+    process.stdout.write(`  ${name}: ${m.threads} threads, load ${m.load1}/${m.load5} (${h.loadPerThread}/thread), ${gib(m.memAvailableBytes)}/${gib(m.memTotalBytes)} GiB free, ${disks}${gpu}${sweep}; gate ${slotText(h.slots.gate)} build ${slotText(h.slots.build)} tab ${slotText(h.slots.tab)}${h.via && h.via !== h.host ? ` via ${h.via}` : ''}${notPlaceable}\n`);
+  }
+};
+
+const cmdPool = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'show': {
+      requireEnv();
+      const { body } = await api('GET', '/api/cli/pool');
+      if (rest.includes('--json')) return out(body);
+      return printPool(body);
+    }
+    case 'acquire': {
+      const kind = flagValue(rest, '--kind');
+      if (!['gate', 'build', 'tab'].includes(kind)) die(`--kind must be gate, build or tab — ${POOL_USAGE}`);
+      const data = { kind };
+      const mem = flagValue(rest, '--mem');
+      if (mem !== null) {
+        if (!/^\d+(\.\d+)?$/.test(mem)) die(`--mem must be a number of GiB, got "${mem}"`);
+        data.memGb = Number(mem);
+      }
+      const ttl = flagValue(rest, '--ttl');
+      if (ttl !== null) {
+        const seconds = parseTtl(ttl);
+        if (seconds === null) die('--ttl none is not allowed: a pool slot must expire');
+        data.ttlSeconds = seconds;
+      }
+      const panelType = flagValue(rest, '--panel-type');
+      if (panelType !== null) data.panelType = panelType;
+      const role = flagValue(rest, '--role');
+      if (role !== null) data.role = role;
+      requireEnv();
+      return out(await poolRequest('POST', '/api/cli/pool/acquire', data));
+    }
+    case 'release': {
+      const lease = rest.find((a) => !a.startsWith('-'));
+      if (!lease) die(`release needs a LEASE (pool:<host>/<kind>-<n>) — ${POOL_USAGE}`);
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/pool/release', { lease });
+      return out(body);
+    }
+    default:
+      die(POOL_USAGE);
+  }
+};
+
 const OVER_CAP_REASON_MAX = 500;
 
 const cmdTabCreate = async (args) => {
@@ -1418,7 +1527,7 @@ const cmdTabCreate = async (args) => {
   const reportsTo = flagValue(args, '--reports-to');
   // The end-line markers whose nudges the target receives (ADR-0025); the server validates the names.
   const reportOn = flagValue(args, '--report-on');
-  // The ssh alias of a registered remote host (ADR-0022); the tab's tmux runs there.
+  // The ssh alias of a registered remote host (ADR-0022), or `auto`: the pool places it (ADR-0039).
   const host = flagValue(args, '--host');
   // The tab's start directory: it must exist on the host the tab runs on.
   const cwd = flagValue(args, '--cwd');
@@ -1432,7 +1541,7 @@ const cmdTabCreate = async (args) => {
   if (args.includes('--preview-url') && !previewUrl) die('--preview-url needs the http(s) URL of the preview the evaluator may browse');
   if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
   if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
-  if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
+  if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts, or auto (the pool places it)');
   if (args.includes('--cwd') && !cwd) die('--cwd needs an absolute directory on the tab\'s host');
   // Past the WIP cap (ADR-0027): only the workspace's enabled orchestrator, with a reason that is audited.
   const overCap = args.includes('--over-cap');
@@ -2260,7 +2369,11 @@ Commands:
              [--host HOST]                 Run the tab's tmux on HOST over ssh (ADR-0022): an ssh alias listed in
                                            fleet config remote.hosts. terminal and claude-code only; exit 2
                                            otherwise, exit 6 when HOST does not answer. The pane's purplemux
-                                           reaches this server through PMUX_URL with the tab's own token
+                                           reaches this server through PMUX_URL with the tab's own token.
+                                           --host auto: the pool places it (ADR-0039): a claude-code tab with no
+                                           role may go to the known host with the most free memory; every other
+                                           tab, and any pool refusal, no answer in 2 s or a --cwd missing there,
+                                           stays here. The answer's "placement" says where and why
              [--cwd DIR]                   Start the tab in DIR, an absolute directory that must exist on the
                                            tab's host (cwd-missing, exit 2). A remote worker works in its own
                                            checkout or worktree on that host
@@ -2288,7 +2401,8 @@ Commands:
                                            that is audited; any other caller exits 3 forbidden. The answer's
                                            "wip" is { count, cap, overCap } after the create
   tab count -w WS [--json]                 Print "<count> <cap>": WS's agent tabs (claude-code, codex-cli, grok-cli)
-                                           and the WIP cap; --json adds workspaceId, capSource, overCap. Hooks use it
+                                           and the WIP cap (tabs.cap-per-workspace.<WS> wins over the fleet value);
+                                           --json adds workspaceId, capSource, overCap. Hooks use it
                                            instead of counting tmux sessions
   tab reports-to -w WS TAB_ID TARGET       Route TAB_ID's nudges to TARGET while TARGET is live; --clear
                   [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
@@ -2424,6 +2538,17 @@ Commands:
   lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
   lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
                                            epic:SLUG; a tab of a claiming workspace releases its own claims)
+  pool show [--json]                       The compute pool (ADR-0039): per host threads, load, free memory, disk,
+                                           GPU and slots used/cap; an unknown host shows no figures, never 0
+  pool acquire --kind gate|build|tab [--mem GB] [--ttl 60m] [--panel-type T] [--role R]
+                                           Place the work and take a slot lease: prints {host, local, slot, lease,
+                                           expiresAt, reason, gateHost}. Gates and builds go by load per thread,
+                                           then memory; tabs by memory and never refused. Exit 3 pool-full; exit 6
+                                           when no answer comes in 2 s: do what you do without the pool and log it
+                                           (gate.no-local-fallback repositories never run here). A gate passes --ttl
+                                           of at least its gate timeout
+  pool release LEASE                       Release a slot you hold (pool:<host>/<kind>-<n>); a slot also ends
+                                           with its TTL (default 60m, at most 24h) or its holder tab
   inbox list -w WS [--all]                 Server notices (notes, watches, deploys, Mission Control) queued or held
                                            for WS's tabs; --all adds delivered and dropped (kept 7 days)
   inbox retry ID                           Re-queue a held notice once (the target workspace, the note's sender, or admin).
@@ -2540,6 +2665,8 @@ const main = async () => {
       return cmdLedger(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
+    case 'pool':
+      return cmdPool(args.slice(1));
     case 'mission':
     case 'mc':
       return cmdMission(args.slice(1));
