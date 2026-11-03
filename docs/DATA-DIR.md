@@ -194,11 +194,13 @@ Cross-workspace log of completed Claude sessions (max 200 entries, version 1). K
 ### `session-tabs.json` — `src/lib/spend/session-tabs-store.ts`
 
 Which tab ran which agent session, for the spend read model (ADR-0030). `{version: 1, bindings:
-{"<provider>:<sessionId>": {workspaceId, tabId, firstSeenAt, lastSeenAt}}}`, mode 0600, written by
+{"<provider>:<sessionId>": {workspaceId, tabId, tabName?, firstSeenAt, lastSeenAt}}}`, mode 0600, written by
 tmp + rename under one lock. Both session-id writers in `src/lib/layout-store.ts`,
 `updateTabAgentSessionId` and `updateTabAgentState` (the status manager's hook, launch and poll saves),
 record each non-null session after their layout write (a failure is logged and never fails the hook path); the spend indexer seeds it once per boot
-from `session-history.json` and every layout's current session ids. A session moves to another tab
+from `session-history.json` and every layout's current session ids. `tabName` is the tab's name at the
+newest sighting that named one: a sighting under a new name is written even inside the hourly touch interval, and a
+sighting without a name keeps the stored one. It names the seat of a tab closed since (harness-flow-loop 04). A session moves to another tab
 only on a newer sighting. Bindings last seen before the spend floor (today − 91, UTC) are pruned. A malformed file is refused, never
 read as empty or overwritten: spend then attributes no usage to a tab and says why. While the file is
 refused, the hook path reads it at most once every 60 s and logs one warning per read, with the path
@@ -492,7 +494,7 @@ Claude usage statistics cache. Derived from `{home}/projects/**/*.jsonl` across 
 | File | Contents |
 | --- | --- |
 | `cache.json` | `IStatsFileCache` — per-day aggregates (messages, sessions, tool calls, hourly counts, per-model token usage). Cache version `3` (`CACHE_VERSION` in `stats-cache.ts`). Main transcripts only: subagent transcripts are not counted here. |
-| `spend-index.json` | The spend read model's index (`src/lib/spend/spend-index.ts`, version 1, 0600, tmp + rename). Per transcript: `size`, `mtimeMs`, `ino`, the byte `offset` after the last complete line, the last 256 message ids, and usage buckets per UTC day, model and session; Codex and Grok sessions keep one usage figure. Covers the main transcripts, the subagent transcripts (any `.jsonl` below `<project>/<sessionId>/subagents/`), `~/.codex/sessions` and every grok home. Built in the background (first pass 120 s after boot, newest file first, one file at a time; rescan every 5 min; written at most every 60 s and at the end of a pass). A transcript that leaves the disk (`ENOENT`/`ENOTDIR` on its own stat; any other error changes nothing) keeps its entry with `goneAt` set and its usage, until its days pass the spend floor (today − 91, UTC); a path that comes back is read again from 0. So this file is **not** purely regeneratable: deleting it loses the usage of transcripts already deleted (at most 92 days). A damaged file is moved to `spend-index.json.corrupt-<ms>` and rebuilt from the transcripts still on disk; until the rebuild ends spend reports `indexing`. |
+| `spend-index.json` | The spend read model's index (`src/lib/spend/spend-index.ts`, version 1, 0600, tmp + rename). Per transcript: `size`, `mtimeMs`, `ino`, the byte `offset` after the last complete line, the last 256 message ids, and usage buckets per UTC day, model, session and UTC 5-minute `slot` (harness-flow-loop 04; a live entry indexed before slots, without `slotted: true`, is read again from 0 once, and a gone one keeps its day buckets with no slot); Codex and Grok sessions keep one usage figure. Covers the main transcripts, the subagent transcripts (any `.jsonl` below `<project>/<sessionId>/subagents/`), `~/.codex/sessions` and every grok home. Built in the background (first pass 120 s after boot, newest file first, one file at a time; rescan every 5 min; written at most every 60 s and at the end of a pass). A transcript that leaves the disk (`ENOENT`/`ENOTDIR` on its own stat; any other error changes nothing) keeps its entry with `goneAt` set and its usage, until its days pass the spend floor (today − 91, UTC); a path that comes back is read again from 0. So this file is **not** purely regeneratable: deleting it loses the usage of transcripts already deleted (at most 92 days). A damaged file is moved to `spend-index.json.corrupt-<ms>` and rebuilt from the transcripts still on disk; until the rebuild ends spend reports `indexing`. |
 | `uptime-cache.json` | Per-day uptime/active-minutes roll-up. |
 | `daily-reports/{date}.json` | AI-generated daily brief (`IDailyReportDay`) keyed by `YYYY-MM-DD`. |
 

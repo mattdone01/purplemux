@@ -9,15 +9,31 @@ import { readSessionTabs, seedSessionTabs, SessionTabsStoreError } from '@/lib/s
 import type { ISessionTabSighting } from '@/lib/spend/session-tabs-store';
 import { loadSpendIndex, spendIndexStatus, spendIndexUsage, startSpendIndexer, stopSpendIndexer } from '@/lib/spend/spend-index';
 import {
-  addUtcDays, buildSpendView, isUtcDay, MAX_SPEND_RANGE_DAYS, rangeDays, spendFloor, tokensByDay, utcDay,
+  addUtcDays, buildSpendView, isUtcDay, landingMetric, MAX_SPEND_RANGE_DAYS, rangeDays, spendFloor, tokensByDay, utcDay,
 } from '@/lib/spend/spend-model';
-import type { ISpendBindingRef, ISpendWorkspaceRef } from '@/lib/spend/spend-model';
-import type { ISpendTokensByDay, ISpendView, TSpendBy, TSpendPeriod } from '@/types/spend';
+import type { ISpendBindingRef, ISpendWorkspaceRef, TSpendLandedRead } from '@/lib/spend/spend-model';
+import { buildSpendHoldings, ledgerHorizon } from '@/lib/spend/spend-phase';
+import type { ISpendHoldings } from '@/lib/spend/spend-phase';
+import { getLedgerStore } from '@/lib/ledger-store';
+import type {
+  ISpendIndexStatus, ISpendLandingMetric, ISpendPhasesView, ISpendTokensByDay, ISpendView, TSpendBy, TSpendPeriod,
+} from '@/types/spend';
 
 const log = createLogger('spend');
 
-const CLI_BY: readonly TSpendBy[] = ['tab', 'day', 'model', 'role'];
-const MISSION_BY: readonly TSpendBy[] = ['tab', 'day', 'model', 'role', 'workspace'];
+const CLI_BY: readonly TSpendBy[] = ['tab', 'day', 'model', 'role', 'seat', 'phase', 'item'];
+const MISSION_BY: readonly TSpendBy[] = [...CLI_BY, 'workspace'];
+const LEDGER_BY: readonly TSpendBy[] = ['phase', 'item'];
+/**
+ * `by=phase|item` replays the ledger synchronously from `since − 7 d`: at most 7 UTC days, so a request
+ * reads at most 14 days of events (04-F1: 99 days measured ~8-9 s and over 1 GB on the synthetic peak).
+ */
+export const MAX_LEDGER_BY_DAYS = 7;
+
+const ledgerRangeError = (by: TSpendBy, days: number): string | null =>
+  LEDGER_BY.includes(by) && days > MAX_LEDGER_BY_DAYS
+    ? `range: saw ${days} days, expected at most ${MAX_LEDGER_BY_DAYS} for by=${by} (the ledger replay is bounded)` : null;
+const DAY_MS = 86_400_000;
 const PERIOD_DAYS: Record<TSpendPeriod, number> = { today: 1, '7d': 7, '30d': 30 };
 const DEFAULT_DAYS = 7;
 
@@ -53,6 +69,8 @@ export const parseCliSpendQuery = (query: Record<string, string | string[] | und
   if (from > to) return { ok: false, error: `since ${from} is after until ${to}` };
   const days = rangeDays(from, to);
   if (days > MAX_SPEND_RANGE_DAYS) return { ok: false, error: `range: saw ${days} days, expected at most ${MAX_SPEND_RANGE_DAYS}` };
+  const ledgerRange = ledgerRangeError(by, days);
+  if (ledgerRange) return { ok: false, error: ledgerRange };
   const floor = spendFloor(now);
   if (from < floor) {
     return { ok: false, error: `since: saw ${from}, expected a day on or after ${floor} (spend keeps the last ${MAX_SPEND_RANGE_DAYS} UTC days)` };
@@ -69,6 +87,9 @@ export const parseMissionSpendQuery = (query: Record<string, string | string[] |
   const by = parseBy(single(query.by), MISSION_BY);
   if (!by) return { ok: false, error: `by: saw ${JSON.stringify(single(query.by))}, expected one of ${MISSION_BY.join(', ')}` };
   if (by === 'workspace' && workspaceId !== 'all') return { ok: false, error: 'by=workspace needs workspaceId=all' };
+  if (LEDGER_BY.includes(by) && workspaceId === 'all') return { ok: false, error: `by=${by} needs one workspace: the ledger is per workspace` };
+  const ledgerRange = ledgerRangeError(by, PERIOD_DAYS[period as TSpendPeriod]);
+  if (ledgerRange) return { ok: false, error: ledgerRange };
   const to = utcDay(now);
   return { ok: true, query: { workspaceId, from: addUtcDays(to, -(PERIOD_DAYS[period as TSpendPeriod] - 1)), to, by } };
 };
@@ -91,8 +112,36 @@ const loadWorkspaceRefs = async (): Promise<ISpendWorkspaceRef[]> => {
 export const workspaceExists = async (workspaceId: string): Promise<boolean> =>
   (await getWorkspaces()).workspaces.some((workspace) => workspace.id === workspaceId);
 
+const dayStart = (day: string): number => Date.parse(`${day}T00:00:00Z`);
+
+/**
+ * The ledger's holdings for `by=phase|item` over [from, to]. A ledger that cannot be read attributes
+ * no phase (every slot is before its history) and says why; it never fails the spend answer.
+ */
+const loadHoldings = (workspaceId: string, from: string, to: string, now: number): { holdings: Record<string, ISpendHoldings>; error: string | null } => {
+  try {
+    const replay = getLedgerStore().phaseReplay(workspaceId, dayStart(from), Math.min(now, dayStart(to) + DAY_MS));
+    return { holdings: { [workspaceId]: buildSpendHoldings(replay, ledgerHorizon(replay.firstOpenedAt, now)) }, error: null };
+  } catch (error) {
+    log.warn(`spend phase: ledger not read for ${workspaceId}: ${(error as Error).message}`);
+    return { holdings: {}, error: `ledger.sqlite unreadable (${(error as Error).message}); no usage is attributed to a phase or item` };
+  }
+};
+
+/** Ranges closed `landed` in [from, to] (UTC days, `to` clipped to now), or why the ledger cannot say. */
+const landedIn = (workspaceId: string, from: string, to: string, now: number): TSpendLandedRead => {
+  try {
+    const store = getLedgerStore();
+    if (store.firstOpenedAt(workspaceId) === null) return { state: 'empty' };
+    return { state: 'read', landed: store.landedRanges(workspaceId, dayStart(from), Math.min(now + 1, dayStart(to) + DAY_MS)) };
+  } catch (error) {
+    log.warn(`spend: landed ranges not read for ${workspaceId}: ${(error as Error).message}`);
+    return { state: 'unreadable' };
+  }
+};
+
 /** The one spend answer for the CLI and the human route. Reads the index in memory; never parses a transcript. */
-export const getSpendView = async (query: ISpendQuery, now = Date.now()): Promise<ISpendView> => {
+export const getSpendView = async (query: ISpendQuery, now = Date.now(), options: { wall?: boolean } = {}): Promise<ISpendView> => {
   await loadSpendIndex();
   let bindings: Record<string, ISpendBindingRef> = {};
   let bindingError: string | null = null;
@@ -102,8 +151,10 @@ export const getSpendView = async (query: ISpendQuery, now = Date.now()): Promis
     if (!(error instanceof SessionTabsStoreError)) throw error;
     bindingError = `${error.message}; no usage is attributed to a tab`;
   }
+  const ledger = LEDGER_BY.includes(query.by) && query.workspaceId !== 'all'
+    ? loadHoldings(query.workspaceId, query.from, query.to, now) : { holdings: undefined, error: null };
   const index = spendIndexStatus();
-  const error = [index.error, bindingError].filter(Boolean).join('; ');
+  const error = [index.error, bindingError, ledger.error].filter(Boolean).join('; ');
   return buildSpendView({
     usage: spendIndexUsage(),
     bindings,
@@ -111,7 +162,64 @@ export const getSpendView = async (query: ISpendQuery, now = Date.now()): Promis
     ...query,
     generatedAt: now,
     index: { ...index, ...(error ? { error } : {}) },
+    holdings: ledger.holdings,
+    ledgerUnreadable: ledger.error !== null,
+    wall: options.wall,
   });
+};
+
+/** `GET /api/cli/spend/phases`: `day` is a UTC day from the spend floor to today; default today. */
+export const parseSpendPhasesQuery = (
+  query: Record<string, string | string[] | undefined>, now = Date.now(),
+): { ok: true; workspaceId: string; day: string } | { ok: false; error: string } => {
+  const workspaceId = single(query.workspaceId);
+  if (!workspaceId) return { ok: false, error: 'workspaceId is required' };
+  const today = utcDay(now);
+  const day = single(query.day) ?? today;
+  if (!isUtcDay(day)) return { ok: false, error: `day: saw ${JSON.stringify(day)}, expected a UTC day YYYY-MM-DD` };
+  const floor = spendFloor(now);
+  if (day < floor || day > today) return { ok: false, error: `day: saw ${day}, expected a day from ${floor} to ${today}` };
+  return { ok: true, workspaceId, day };
+};
+
+/**
+ * `cache_read_tokens_per_landed_item` for the UTC day `day` and the 7 UTC days ending on it (the
+ * first clipped to the spend floor). The constraint finder reads it through `getFinderSpend`.
+ */
+export const getCacheReadPerLandedItem = async (
+  workspaceId: string, day: string, now = Date.now(),
+): Promise<{ day: ISpendLandingMetric; '7d': ISpendLandingMetric; week: ISpendView }> => {
+  const floor = spendFloor(now);
+  const weekFrom = addUtcDays(day, -6) < floor ? floor : addUtcDays(day, -6);
+  const week = await getSpendView({ workspaceId, from: weekFrom, to: day, by: 'day' }, now);
+  const dayCacheReads = week.rows.find((row) => row.key === day)?.cacheReadTokens ?? 0;
+  return {
+    day: landingMetric('day', day, day, dayCacheReads, landedIn(workspaceId, day, day, now), week.index.state),
+    '7d': landingMetric('7d', weekFrom, day, week.totals.cacheReadTokens, landedIn(workspaceId, weekFrom, day, now), week.index.state),
+    week,
+  };
+};
+
+/** The per-phase table of one UTC day (`purplemux spend phases`): tokens by kind, est. cost and wall time per phase. */
+export const getSpendPhases = async (workspaceId: string, day: string, now = Date.now()): Promise<ISpendPhasesView> => {
+  const view = await getSpendView({ workspaceId, from: day, to: day, by: 'phase' }, now, { wall: true });
+  const { week: _week, ...metric } = await getCacheReadPerLandedItem(workspaceId, day, now);
+  return { ...view, day, cacheReadPerLandedItem: metric };
+};
+
+/**
+ * The spend the constraint finder joins (ADR-HFL-02; story 03's `IFinderSpendInput` plus the
+ * per-landing metric): the last 7 UTC days ending today.
+ */
+export const getFinderSpend = async (workspaceId: string, now = Date.now()): Promise<{
+  index: ISpendIndexStatus; since: number; costUsd: number | null; cacheReadTokens: number;
+  cacheReadTokensPerLandedItem: { day: ISpendLandingMetric; '7d': ISpendLandingMetric };
+}> => {
+  const { week, ...metric } = await getCacheReadPerLandedItem(workspaceId, utcDay(now), now);
+  return {
+    index: week.index, since: dayStart(week.from), costUsd: week.totals.costUsd, cacheReadTokens: week.totals.cacheReadTokens,
+    cacheReadTokensPerLandedItem: metric,
+  };
 };
 
 /**
@@ -126,7 +234,7 @@ export const getSpendTokensByDay = async (workspaceId: string, from: string, now
   const byDay = new Map(tokensByDay(view).map((row) => [row.day, row]));
   const days: ISpendTokensByDay[] = [];
   for (let day = start; day <= to; day = addUtcDays(day, 1)) {
-    days.push(byDay.get(day) ?? { day, totalTokens: 0, sidechainTokens: 0 });
+    days.push(byDay.get(day) ?? { day, totalTokens: 0, sidechainTokens: 0, cacheReadTokens: 0 });
   }
   return days;
 };
@@ -146,7 +254,8 @@ export const seedSessionTabBindings = async (now = Date.now()): Promise<number> 
       const provider = getProviderByPanelType(tab.panelType);
       const sessionId = provider?.readSessionId(tab);
       if (!provider || !sessionId) continue;
-      sightings.push({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: workspace.id, tabId: tab.id, seenAt: now });
+      sightings.push({ providerId: toSessionHistoryProvider(provider.id), sessionId, workspaceId: workspace.id, tabId: tab.id,
+        ...(tab.name ? { tabName: tab.name } : {}), seenAt: now });
     }
   }
   return seedSessionTabs(sightings, now);

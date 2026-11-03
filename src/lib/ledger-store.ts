@@ -4,6 +4,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { brandCodedError } from '@/lib/coded-error';
+import { foldLedgerEvent, parseAttrs, PHASE_REPLAY_LOOKBACK_MS, silentFor } from '@/lib/ledger-fold';
+import type { ILedgerItemRow } from '@/lib/ledger-fold';
 import {
   DAY_MS,
   LAND_QUEUE_HEAD_BLOCKED,
@@ -12,7 +14,6 @@ import {
   LEDGER_ROLLUP_RETENTION_DAYS,
   LEDGER_SERVER_PRODUCER,
   LEDGER_SILENT_MS,
-  LEDGER_UNKNOWN_ITEM_TYPES,
   UNKNOWN_REASON,
   clippedMs,
   percentile,
@@ -25,7 +26,6 @@ import type {
   ILedgerExperimentInput,
   ILedgerItem,
   ILedgerWaitRow,
-  TLedgerAttrValue,
   TLedgerExperimentVerdict,
   TLedgerIntervalReason,
   TLedgerItemType,
@@ -34,7 +34,6 @@ import type {
 
 const SCHEMA_VERSION = 1;
 const defaultDbPath = (): string => path.join(os.homedir(), '.purplemux', 'ledger.sqlite');
-const MAX_ITEM_ATTR_KEYS = 64;
 /** The producer name the server's own events carry. */
 export const SERVER_PRODUCER = LEDGER_SERVER_PRODUCER;
 
@@ -61,23 +60,23 @@ export class LedgerStoreError extends Error {
   }
 }
 
-interface IItemRow {
-  workspace_id: string;
-  item_key: string;
-  item_type: TLedgerItemType;
-  opened_at: number;
-  closed_at: number | null;
-  state: string | null;
-  state_since: number | null;
-  wait_reason: TLedgerIntervalReason | null;
-  wait_since: number | null;
-  holder: string | null;
-  clear_input: string | null;
-  parent_key: string | null;
-  attrs_json: string | null;
-  last_seq: number;
-  last_event_at: number;
+type IItemRow = ILedgerItemRow;
+
+/** One stored event as the phase replay folds it; attrs are not read. */
+export type TLedgerReplayEvent = Omit<ILedgerEventInput, 'event_id' | 'attrs'> & { seq: number };
+
+export interface ILedgerPhaseReplay {
+  workspaceId: string;
+  scanStart: number;
+  seed: ILedgerItemRow[];
+  events: TLedgerReplayEvent[];
+  /** Items open at the scan start that have events inside the scan, as they stand now (the replay starts them at their first scanned event). */
+  carried: ILedgerItemRow[];
+  /** The earliest `opened_at` the workspace's items hold; null when the ledger holds none. */
+  firstOpenedAt: number | null;
 }
+
+const CARRIED_CHUNK = 500;
 
 interface IIntervalRow {
   item_key: string;
@@ -132,19 +131,6 @@ export interface ILedgerRetentionResult {
   rolledUpDays: string[];
 }
 
-const isLandQueue = (reason: string | null): boolean =>
-  reason === LAND_QUEUE_LOCK_BUSY || reason === LAND_QUEUE_HEAD_BLOCKED;
-
-const parseAttrs = (json: string | null): Record<string, TLedgerAttrValue> =>
-  json ? JSON.parse(json) as Record<string, TLedgerAttrValue> : {};
-
-const mergeAttrs = (json: string | null, next: Record<string, TLedgerAttrValue> | null | undefined): string | null => {
-  if (!next || !Object.keys(next).length) return json;
-  const merged = { ...parseAttrs(json), ...next };
-  // A producer that cycles keys must not grow one row without bound: the newest event's attrs win.
-  return JSON.stringify(Object.keys(merged).length > MAX_ITEM_ATTR_KEYS ? next : merged);
-};
-
 const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
 /**
@@ -172,10 +158,6 @@ const bodyDigest = (event: ILedgerEventInput): Buffer => {
 export const RETENTION_CHUNK = 5_000;
 
 const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
-
-/** The one `unknown` predicate the write path and every read share (ADR-0033 §3.3). */
-const silentFor = (row: Pick<IItemRow, 'item_type' | 'closed_at' | 'wait_reason'>, gapMs: number): boolean =>
-  row.closed_at === null && row.wait_reason === null && gapMs > LEDGER_SILENT_MS && LEDGER_UNKNOWN_ITEM_TYPES.includes(row.item_type);
 
 const itemFromRow = (row: IItemRow, now: number): ILedgerItem => {
   const silent = silentFor(row, now - row.last_event_at);
@@ -373,59 +355,19 @@ export class LedgerStore {
     return written;
   };
 
-  /** One event onto its item's projection (the consult ruling recorded in ADR-0033 §Derivation). */
+  /** One event onto its item's projection: the pure fold (`ledger-fold.ts`), then its writes. */
   private project = (
     workspaceId: string, event: ILedgerEventInput, seq: number,
   ): { intervals: number; closedItem: boolean; orphan: boolean } => {
-    const existing = this.getItem(workspaceId, event.item_key);
-    // Only an open creates an item: a late event for an item never seen, or one retention deleted, is a record only.
-    if (!existing && event.kind !== 'open') return { intervals: 0, closedItem: false, orphan: true };
-    // Only an open after the close reopens the item; anything else, or a late open, leaves the closed item alone.
-    if (existing && existing.closed_at !== null && !(event.kind === 'open' && event.at > existing.closed_at)) {
-      return { intervals: 0, closedItem: true, orphan: false };
-    }
-    const reopened = !existing || existing.closed_at !== null;
-    // Time never runs backwards for one item: no interval can be negative or overlap another of the item.
-    const at = existing && !reopened ? Math.max(event.at, existing.last_event_at, existing.wait_since ?? 0) : event.at;
-    const item: IItemRow = existing && !reopened ? { ...existing } : {
-      workspace_id: workspaceId, item_key: event.item_key, item_type: event.item_type, opened_at: at, closed_at: null,
-      state: existing?.state ?? null, state_since: existing?.state_since ?? null, wait_reason: null, wait_since: null,
-      holder: existing?.holder ?? null, clear_input: null, parent_key: existing?.parent_key ?? null,
-      attrs_json: existing?.attrs_json ?? null, last_seq: seq, last_event_at: at,
-    };
+    const fold = foldLedgerEvent(workspaceId, this.getItem(workspaceId, event.item_key), event, seq,
+      () => this.landQueueReason(workspaceId));
+    if (!fold.applied) return { intervals: 0, closedItem: fold.closedItem, orphan: fold.orphan };
+    const { item, reopened, closing, at } = fold;
     let intervals = 0;
-    const holder = event.holder ?? item.holder;
-    const moves = event.kind !== 'link';
-    if (moves && !reopened && silentFor(item, at - item.last_event_at)) {
-      intervals += this.writeInterval(workspaceId, item, UNKNOWN_REASON, item.last_event_at, at);
+    for (const interval of fold.intervals) {
+      intervals += this.writeInterval(workspaceId, { item_key: item.item_key, item_type: item.item_type, holder: interval.holder },
+        interval.reason, interval.start, interval.end);
     }
-    const continues = event.kind === 'wait' && item.wait_reason !== null && holder === item.holder
-      && (event.wait_reason === 'land-queue' ? isLandQueue(item.wait_reason) : event.wait_reason === item.wait_reason);
-    if (item.wait_reason !== null && ['wait', 'state', 'clear', 'close'].includes(event.kind) && !continues) {
-      intervals += this.writeInterval(workspaceId, item, item.wait_reason, item.wait_since ?? at, at);
-      item.wait_reason = null;
-      item.wait_since = null;
-      item.clear_input = null;
-    }
-    item.holder = holder;
-    item.parent_key = event.parent_key ?? item.parent_key;
-    item.attrs_json = mergeAttrs(item.attrs_json, event.attrs);
-    item.last_seq = seq;
-    if (moves) item.last_event_at = at;
-    if (event.kind === 'state' || (event.kind === 'close' && event.state)) {
-      item.state = event.state ?? item.state;
-      item.state_since = at;
-    }
-    if (event.kind === 'wait') {
-      if (!continues) {
-        item.wait_reason = event.wait_reason === 'land-queue'
-          ? this.landQueueReason(workspaceId) : event.wait_reason as TLedgerIntervalReason;
-        item.wait_since = at;
-      }
-      item.clear_input = event.clear_input ?? item.clear_input;
-    }
-    const closing = event.kind === 'close';
-    if (closing) item.closed_at = at;
     this.database.prepare(`INSERT INTO items (workspace_id, item_key, item_type, opened_at, closed_at, state, state_since,
         wait_reason, wait_since, holder, clear_input, parent_key, attrs_json, last_seq, last_event_at)
       VALUES (@workspace_id, @item_key, @item_type, @opened_at, @closed_at, @state, @state_since, @wait_reason, @wait_since,
@@ -505,6 +447,46 @@ export class LedgerStore {
   intervalsIn = (workspaceId: string, since: number, until: number): IIntervalRow[] =>
     this.database.prepare(`SELECT item_key, item_type, reason, holder, start, "end" FROM intervals
       WHERE workspace_id = ? AND "end" > ? AND start < ? ORDER BY start, id`).all(workspaceId, since, until) as IIntervalRow[];
+
+  /**
+   * Landings in [since, until): `close` events with state `landed` on `range` items, read on the `at`
+   * index. Each close counts, so a range reopened and landed again counts twice; a close with no state
+   * counts none. The one landed count of cache reads per landed item and the constraint finder.
+   */
+  landedRanges = (workspaceId: string, since: number, until: number): number =>
+    (this.database.prepare(`SELECT COUNT(*) AS n FROM events WHERE at >= ? AND at < ? AND workspace_id = ?
+      AND item_type = 'range' AND kind = 'close' AND state = 'landed'`).get(since, until, workspaceId) as { n: number }).n;
+
+  /** The earliest `opened_at` of the workspace's items; null when the ledger holds none for it. */
+  firstOpenedAt = (workspaceId: string): number | null =>
+    (this.database.prepare('SELECT MIN(opened_at) AS at FROM items WHERE workspace_id = ?').get(workspaceId) as { at: number | null }).at;
+
+  /**
+   * What the spend view's phase replay folds (harness-flow-loop 04 consult ruling): the open items
+   * silent since before `since - 7 d` as the seed, then every event of the workspace from there to
+   * `until` in arrival order. The scan rides the `at` index; there is no per-item event index.
+   */
+  phaseReplay = (workspaceId: string, since: number, until: number): ILedgerPhaseReplay => {
+    const scanStart = since - PHASE_REPLAY_LOOKBACK_MS;
+    const seed = this.database.prepare(`SELECT * FROM items INDEXED BY items_open_idx WHERE workspace_id = ?
+      AND closed_at IS NULL AND last_event_at < ? ORDER BY item_key`).all(workspaceId, scanStart) as IItemRow[];
+    const events = this.database.prepare(`SELECT seq, at, item_type, item_key, kind, state, wait_reason, holder, clear_input,
+        parent_key FROM events WHERE at >= ? AND at < ? AND workspace_id = ? ORDER BY seq`)
+      .all(scanStart, until, workspaceId) as TLedgerReplayEvent[];
+    const opensFirst = new Map<string, boolean>();
+    for (const event of events) if (!opensFirst.has(event.item_key)) opensFirst.set(event.item_key, event.kind === 'open');
+    const unopened = [...opensFirst].filter(([, opens]) => !opens).map(([key]) => key);
+    const carried: IItemRow[] = [];
+    for (let i = 0; i < unopened.length; i += CARRIED_CHUNK) {
+      const keys = unopened.slice(i, i + CARRIED_CHUNK);
+      carried.push(...this.database.prepare(`SELECT * FROM items WHERE workspace_id = ? AND item_key IN (${keys.map(() => '?').join(', ')})
+        AND opened_at < ? AND (closed_at IS NULL OR closed_at >= ?)`).all(workspaceId, ...keys, scanStart, scanStart) as IItemRow[]);
+    }
+    return {
+      workspaceId, scanStart, seed, events, carried: carried.sort((a, b) => a.item_key.localeCompare(b.item_key)),
+      firstOpenedAt: this.firstOpenedAt(workspaceId),
+    };
+  };
 
   waits = (workspaceId: string, query: ILedgerWaitsQuery, now: number): { rows: ILedgerWaitRow[]; totals: Omit<ILedgerWaitRow, 'key'> } => {
     const { since, until, by } = query;

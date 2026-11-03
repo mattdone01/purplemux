@@ -99,3 +99,68 @@ Option 3.
 - Non-goal: budgets, spend alerts and cost caps.
 - Spend keeps 92 UTC days whatever the transcript cleanup does; older days are refused, never shown as 0. The index is
   no longer purely derived: losing it loses the usage of transcripts already deleted (at most 92 days' worth).
+
+## Amendment (harness-flow-loop 04, 2026-11-03): spend by seat, phase and item; cache reads on every face
+
+**Context.** Cache reads are 55% of spend (the epic's audit), about 69 M cache-read tokens per landing (its research
+§3.3), and no face showed them beside the total. Cost had no seat, no phase and no item. The index kept usage per UTC
+day only, so no message could be placed in time; the work-item ledger (ADR-0033) now says which items a tab held when.
+
+**Decision** (the phase contract is the architect seat's consult ruling, Opus 5.5 xhigh, recorded in the story).
+1. **`by` gains `seat`, `phase` and `item`** on both routes and the CLI. Mission Control refuses `phase` and `item`
+   with `workspaceId=all`: the ledger is per workspace.
+   - `seat` = the tab name of the bound session: the open tab's name, else `tabName` recorded with the binding (§3
+     gains `tabName?`: the name at the newest sighting that carried one, from both session-id writers and the seed; a
+     sighting under a new name is written even inside the hourly touch interval), else `tab:<id>` labelled "closed,
+     name not recorded". With `all`, keys are `<ws>/<name>`.
+   - `phase` and `item` serve at most 7 UTC days (400 `invalid-request` naming the cap, on both routes): the replay
+     below runs synchronously and reads up to 14 days of events. Measured (review, synthetic peak ledger): a 7-day
+     window is about 105,000 rows of the window itself, read in 179 ms, about 74 MB; an uncapped 99-day window was about
+     8-9 s and over 1 GB.
+   - `phase` = the ledger item the tab held at the message's time, mapped by one fixed table; `item` = that item's key.
+2. **Message time.** Claude buckets gain `slot`, the UTC 5-minute start (ms); the bucket key is `(day, model,
+   sessionId, slot)`. A live entry without `slotted: true` is read again from 0 once (its day totals are unchanged;
+   test); `INDEX_VERSION` stays 1 and gone entries keep their day buckets, unmigrated. Measured on mdserver1
+   2026-11-03, 6,708 live Claude files: 7,117 day buckets become about 52,833 slot buckets (1-min would be 138,540).
+3. **Holdings.** For a window, `ledger-store.phaseReplay` returns the open items silent since `since − 7 d` (seed),
+   the items open then with later events (carried, started at their first scanned event with the holder their row has
+   now, unless a scanned event names a holder or an event after the scan moved the row, `last_seq` above the item's
+   last scanned seq: then the holder is unknown until a scanned event names one), and every event of the workspace from `since − 7 d` to
+   `until` on the `at` index, in arrival order. The replay folds them with `foldLedgerEvent` (`src/lib/ledger-fold.ts`),
+   the same pure fold `project` now calls, so the store and the replay derive one projection. Each state is kept at
+   the item's last move (`last_event_at`): a `link` does not move the clock, so a link that arrives before an earlier
+   move cannot unsort the item's timeline. A tab holds an item when
+   the item is open and its holder equals the tab's id or its name. Usage is evaluated at its slot's midpoint; of
+   several held items the one with the latest event at or before then wins, the lowest key on a tie. Seat items never
+   count.
+4. **Table.** Wait reason first: review-queue, review-findings → review; rework → build; receipt-rekey and every land
+   and deploy reason (land-queue/* included) → land; owner → coordinate; agent-idle, host-load, unknown, or no wait →
+   the item type: slice → build; review → review; gate, experiment → evaluate; range, landing, deploy → land;
+   owner-issue → plan; mc-item → coordinate. A tab that held no item is `other`, a row, never dropped.
+5. **Unattributed, named.** For `phase` and `item`, `unattributedReasons` splits `unattributed` into `no-binding`,
+   `no-message-time` (Codex, Grok, pre-slot gone entries), `ledger-unreadable` (ledger.sqlite could not be read; also
+   `phaseBasis.ledgerReadable: false` and the error in `index.error`), `no-ledger-history` (a slot midpoint before the horizon =
+   max(ledger retention cutoff + 7 d, the workspace's first item's `opened_at`); null with no item, so an empty ledger
+   attributes no phase and says so) and `no-held-item` (`item` only). `sum(rows) + unattributed = totals` holds for
+   every `by`, and the reasons sum to `unattributed`. `phaseBasis` carries the slot size, the horizon and whether the
+   ledger was read. A ledger that cannot be read never fails the spend answer.
+6. **Cache reads on every face.** The tile prints "N cache reads (P% of tokens, est. Q% of cost)" beside the total and
+   the burndown tokens line "N cache reads (P% of tokens)"; the CLI adds `CACHE-READ-SHARE` and
+   `CACHE-READ-COST-SHARE` columns and a "cache reads: N of M tokens (P%); est. Q% of the est. cost" line. A row with
+   no tokens has no token share ("—"), never 0%. `ISpendRow` gains `cacheReadCostUsd`: the cache reads' part of
+   `costUsd`, null when nothing is priced or a priced Codex or Grok session cost cannot be split (no cost share then).
+   `ISpendTokensByDay` gains `cacheReadTokens`.
+7. **`cache_read_tokens_per_landed_item`**, for a UTC day and the 7 UTC days ending on it (clipped to the spend floor):
+   the workspace's cache-read tokens over the landed ranges in the window. One count serves it and the constraint
+   finder: `ledger-store.landedRanges` = `close` events with state `landed` on `range` items, on the `at` index (a
+   range reopened and landed again counts each landing; a close with no state counts none). Not measured (value null,
+   with the reason) when the ledger cannot be read, holds no item for the workspace yet, the index is not ready, or no
+   range landed. Served by `GET /api/cli/spend/phases` and read by the constraint finder through `getFinderSpend`.
+8. **`purplemux spend phases -w WS [--day D]`** (`GET /api/cli/spend/phases`): one UTC day by phase with wall time =
+   distinct 5-minute slots in which usage resolved to the row × 5 min (a union per row; rows overlap, so they may sum
+   above the total; null for usage with no message time), tokens by kind, est. cost, and the metric for the day and 7 d.
+
+**What proves it wrong.** (1) One live day attributed from raw message times against 5-minute slots: more than 5% of
+its Claude tokens change phase → 1-minute slots. (2) After 7 days of live producers, `other` above 30% of attributed
+Claude spend in a workspace → holder matching or the table is wrong. (3) Any live entry whose day totals change
+across the slot re-read.

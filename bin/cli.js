@@ -661,8 +661,9 @@ const cmdFlow = async (args) => {
   process.stdout.write(`ok ${body.receivedAt} ${body.historyRows}\n`);
 };
 
-const SPEND_USAGE = 'usage: spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]';
-const SPEND_VALUE_FLAGS = ['-w', '--workspace', '--since', '--until', '--by'];
+const SPEND_USAGE = 'usage: spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role|seat|phase|item] [--json]'
+  + ' | spend phases -w WS [--day YYYY-MM-DD] [--json]';
+const SPEND_VALUE_FLAGS = { show: ['-w', '--workspace', '--since', '--until', '--by'], phases: ['-w', '--workspace', '--day'] };
 const SPEND_BOOL_FLAGS = ['--json'];
 
 // A cost the server could not price is null: it prints as "—", never as $0.
@@ -671,14 +672,39 @@ const spendCost = (row) => {
   return row.unpricedTokens > 0 && row.costUsd !== null ? `${cost} (+${row.unpricedTokens} unpriced)` : cost;
 };
 
-const printSpend = (view) => {
-  const columns = ['KEY', 'LABEL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'SUBAGENTS', 'COST'];
-  const line = (row) => [row.key, row.label, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheCreationTokens,
-    row.totalTokens, row.sidechainTokens, spendCost(row)].map(String);
-  const table = [columns, ...view.rows.map(line), ...(view.unattributed ? [line(view.unattributed)] : []), line(view.totals)];
-  const widths = columns.map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
-  process.stdout.write(`spend ${view.workspaceId} ${view.from}..${view.to} UTC by ${view.by} (cost is an estimate)\n`);
+// A row with no tokens has no share: "—", never 0%.
+const cacheReadShare = (row) => (row.totalTokens > 0 ? `${Math.round((row.cacheReadTokens / row.totalTokens) * 100)}%` : '—');
+// The cache reads' part of the estimated cost; "—" when the cost or its cache-read part is not known.
+const cacheReadCostShare = (row) => (row.cacheReadCostUsd !== null && row.cacheReadCostUsd !== undefined && row.costUsd
+  ? `est. ${Math.round((row.cacheReadCostUsd / row.costUsd) * 100)}%` : '—');
+
+const writeTable = (table) => {
+  const widths = table[0].map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
   for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
+};
+
+// The unattributed row, then (phase and item) one indented row per reason, which sum to it.
+const unattributedRows = (view, line) => (view.unattributed
+  ? [line(view.unattributed), ...(view.unattributedReasons || []).map((row) => line({ ...row, key: `  ${row.key}` }))] : []);
+
+const phaseNote = (view) => {
+  if (!view.phaseBasis) return;
+  const { ledgerHorizon: horizon, ledgerReadable } = view.phaseBasis;
+  const ledger = ledgerReadable === false ? 'the ledger could not be read, so no phase is known (see the error note)'
+    : horizon === null ? 'the ledger holds no items for this workspace yet' : `no history before ${new Date(horizon).toISOString()}`;
+  process.stdout.write(`note: phase is the ledger item the tab held at each message's 5-min slot; ${ledger}\n`);
+};
+
+const printSpend = (view) => {
+  const columns = ['KEY', 'LABEL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'CACHE-READ-SHARE', 'SUBAGENTS', 'COST',
+    'CACHE-READ-COST-SHARE'];
+  const line = (row) => [row.key, row.label, row.inputTokens, row.outputTokens, row.cacheReadTokens, row.cacheCreationTokens,
+    row.totalTokens, cacheReadShare(row), row.sidechainTokens, spendCost(row), cacheReadCostShare(row)].map(String);
+  process.stdout.write(`spend ${view.workspaceId} ${view.from}..${view.to} UTC by ${view.by} (cost is an estimate)\n`);
+  writeTable([columns, ...view.rows.map(line), ...unattributedRows(view, line), line(view.totals)]);
+  process.stdout.write(`cache reads: ${view.totals.cacheReadTokens} of ${view.totals.totalTokens} tokens (${cacheReadShare(view.totals)}); `
+    + `${cacheReadCostShare(view.totals)} of the est. cost\n`);
+  phaseNote(view);
   if (view.roleBasis === 'current-orchestrator') process.stdout.write('note: role uses the current orchestrator mapping, not the one at the time of use\n');
   process.stdout.write('note: Codex and Grok usage counts on the session start day\n');
   const index = view.index || {};
@@ -687,27 +713,57 @@ const printSpend = (view) => {
   if (index.error) process.stdout.write(`note: ${index.error}\n`);
 };
 
+// Distinct 5-min slots with usage, as "1h 05m"; null (no message time) prints "—".
+const wallTime = (ms) => {
+  if (ms === null || ms === undefined) return '—';
+  const minutes = Math.round(ms / 60_000);
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m` : `${minutes}m`;
+};
+
+const landingLine = (metric) => {
+  const window = metric.window === 'day' ? 'day' : `7d (${metric.from}..${metric.to})`;
+  const value = metric.value === null
+    ? `— (${metric.reason}; ${metric.cacheReadTokens} cache reads)`
+    : `${Math.round(metric.value)} (${metric.cacheReadTokens} cache reads / ${metric.landedItems} landed)`;
+  return `cache_read_tokens_per_landed_item ${window}: ${value}\n`;
+};
+
+const printSpendPhases = (view) => {
+  const columns = ['PHASE', 'LABEL', 'WALL', 'INPUT', 'OUTPUT', 'CACHE-READ', 'CACHE-CREATE', 'TOTAL', 'CACHE-READ-SHARE', 'COST',
+    'CACHE-READ-COST-SHARE'];
+  const line = (row) => [row.key, row.label, wallTime(row.wallMs), row.inputTokens, row.outputTokens, row.cacheReadTokens,
+    row.cacheCreationTokens, row.totalTokens, cacheReadShare(row), spendCost(row), cacheReadCostShare(row)].map(String);
+  process.stdout.write(`spend phases ${view.workspaceId} ${view.day} UTC (cost is an estimate)\n`);
+  writeTable([columns, ...view.rows.map(line), ...unattributedRows(view, line), line(view.totals)]);
+  process.stdout.write(landingLine(view.cacheReadPerLandedItem.day));
+  process.stdout.write(landingLine(view.cacheReadPerLandedItem['7d']));
+  phaseNote(view);
+  process.stdout.write('note: wall = distinct 5-min slots with usage in the row; phases overlap, so the rows may sum above the total\n');
+};
+
 const cmdSpend = async (args) => {
   const sub = args[0];
   const rest = args.slice(1);
-  if (sub !== 'show') die(SPEND_USAGE);
-  const positional = stripBooleanFlags(stripFlags(rest, SPEND_VALUE_FLAGS), SPEND_BOOL_FLAGS);
+  if (sub !== 'show' && sub !== 'phases') die(SPEND_USAGE);
+  const positional = stripBooleanFlags(stripFlags(rest, SPEND_VALUE_FLAGS[sub]), SPEND_BOOL_FLAGS);
   if (positional.length) die(`unexpected argument: ${positional[0]} — ${SPEND_USAGE}`);
   const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
   if (!wsId) die('--workspace is required');
   const qs = new URLSearchParams({ workspaceId: wsId });
-  for (const name of ['since', 'until', 'by']) {
+  for (const name of SPEND_VALUE_FLAGS[sub].filter((flag) => flag.startsWith('--') && flag !== '--workspace').map((flag) => flag.slice(2))) {
     const value = flagValue(rest, `--${name}`);
     if (value !== null) qs.set(name, value);
   }
   requireEnv();
-  const { body } = await api('GET', `/api/cli/spend?${qs}`);
+  const { body } = await api('GET', `/api/cli/spend${sub === 'phases' ? '/phases' : ''}?${qs}`);
   if (rest.includes('--json')) out(body);
   // An index that cannot be read has no numbers: its totals are zeros that mean nothing.
   if (body.index && body.index.state === 'unavailable') {
     return fail(null, `spend not available: ${body.index.error || 'the spend index cannot be read'}`);
   }
-  if (!rest.includes('--json')) printSpend(body);
+  if (rest.includes('--json')) return;
+  if (sub === 'phases') printSpendPhases(body);
+  else printSpend(body);
 };
 
 // A value printed inside a command an agent may copy into its shell: single-quoted unless plainly safe.
@@ -2347,13 +2403,21 @@ Commands:
             [--history all|window|none]    since), meters, producer flags, and "stale" after 10 min without a
                                            publish. No record: "no flow published", exit 7 (flow-not-found);
                                            a damaged record: exit 1 (flow-unreadable)
-  spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role] [--json]
-                                           Tokens (input, output, cache read, cache creation, subagents) and the
-                                           estimated cost ("est."; "—" when no price is known) per tab, UTC day, model
-                                           or role, plus the unattributed row and the total. Default: the last 7 UTC
-                                           days by tab; at most 92 days, none before today - 91 (exit 2). Role uses
-                                           the current orchestrator. An unreadable spend index exits 1.
-                                           Read scope on WS (ADR-0030)
+  spend show -w WS [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--by tab|day|model|role|seat|phase|item] [--json]
+                                           Tokens (input, output, cache read and its share, cache creation, subagents)
+                                           and the estimated cost ("est."; "—" when no price is known) per tab, UTC
+                                           day, model, role, seat (tab name), phase or held ledger item, plus the
+                                           unattributed row (by phase/item: one row per reason) and the total, with
+                                           the cache reads' share of tokens and of the est. cost. Default: the last 7
+                                           UTC days by tab; at most 92 days (7 by phase or item), none before
+                                           today - 91 (exit 2). Role uses the current orchestrator. An unreadable
+                                           spend index exits 1. Read scope on WS (ADR-0030)
+  spend phases -w WS [--day YYYY-MM-DD] [--json]
+                                           One UTC day (default today) by phase: wall time (distinct 5-min slots),
+                                           tokens by kind, est. cost, and cache_read_tokens_per_landed_item (landed
+                                           ranges) for the day and the 7 days ending on it ("—" with the reason when
+                                           it is not measured).
+                                           Read scope on WS (ADR-0030 amendment, harness-flow-loop 04)
   ledger token issue -w WS --producer NAME [--out FILE]
                                            Issue a producer token (scope ledger:emit on WS only) into a 0600 file,
                                            default ~/.purplemux/ledger-tokens/WS/NAME.json; rotates NAME's token
