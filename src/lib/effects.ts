@@ -28,7 +28,7 @@ export const NEXT_TURN_BOUND_MS = 30_000;
 /** A component is a deletion candidate only on at least this many deliveries with an observed turn, none followed. */
 export const CANDIDATE_MIN_OBSERVED = 10;
 
-export const EFFECTS_SOURCE = 'fired: tab_events rows recorded in the window, any class (a firing debounced before the router, '
+export const EFFECTS_SOURCE = 'fired: tab_events rows recorded in the window, any class but the curator\'s call log (ADR-0038) (a firing debounced before the router, '
   + 'or routed to the board or phone only, is not recorded); delivered: those of class urgent or digest delivered in the window '
   + '(0 = never reached a tab, not never fired); followed: the recipient\'s next turn in tab_turns, started within 30 s of the '
   + 'paste, made an acting tool call (edit, write, shell): a count of what came next, not of what the delivery caused; '

@@ -24,6 +24,7 @@ const CLI_COMMANDS = new Set([
   'portfolio',
   'lease',
   'pool',
+  'curator',
   'inbox',
   'note',
   'config',

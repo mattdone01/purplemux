@@ -118,6 +118,10 @@ to an exit code through one table:
      6  no answer (pool, ADR-0039)               pool-timeout                               fall back to a local slot, log it;
                                                                                             never for a gate.no-local-
                                                                                             fallback repository (ADR-0039 §6)
+     2  usage error (curator, ADR-0038)          curator-task-invalid,                      fix the command
+                                                 curator-workspace-invalid
+     3  refused by state (curator, ADR-0038)     curator-gate-refused, curator-refused,     after the state changes
+                                                 curator-unavailable
      2  usage error (standing orders, ADR-0041)  so-invalid, so-too-large                   fix the command, or strike an order
      3  refused by state (orders, ADR-0041)      so-unreadable, so-struck                   after the file is repaired
      7  not found (standing orders, ADR-0041)    so-not-found                               —
@@ -794,6 +798,18 @@ Keys in use:
                The gate-host container on <host> that a remote gate pins (its ssh alias, e.g.
                gatehost-replica); \`pool acquire --kind gate\` returns it as "gateHost". Admin
                token only.
+  curator.routing.workspaces
+               The workspaces where a curator task in state routing routes (ADR-0038; consult v2
+               point 6): workspace ids, comma-separated. Unset (the default) routes nowhere; every
+               other workspace only logs. treasury-v2's workspace stays out until v2 records its
+               own row. Admin token only.
+  curator.min-interval-ms
+               The least gap between two curator call starts, whole ms 0..600000 (default 0). The
+               kodit rule's own 10 s limit (ADR-0038 §7) applies whichever is longer. Admin token
+               only.
+  curator.enabled
+               on (the default) or off: off makes no curator call at all and the board shows the
+               curator down, switched off. Admin token only.
   flow.window-minutes  flow.lock-busy-percent  flow.queue-length  flow.oldest-minutes
                The flow-flag thresholds (ADR-0026): the busy-share window in minutes 10..10080
                (default 360), the busy percent 1..100 (80), the queue length, a whole number
@@ -1302,7 +1318,13 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
     "windows": [{ "window": "6h" | "24h" | "7d", "since", "until", "byReason": [row], "byStage": [row], "closed": { <type>: n } }],
     "anomalies": [{ "id", "subject", "value" | null, "unit", "threshold" | null, "judged", "breached", "window", "text", "reason" | null }],
     "unknownShare" | null, "flowLocks" | null, "pool" | null, "line",
-    "inputs": { "ledger" | "flow" | "spend" | "pool": { "state": "ok" | "partial" | "stale" | "unknown", "reason" | null, "at" | null } } }
+    "inputs": { "ledger" | "flow" | "spend" | "pool": { "state": "ok" | "partial" | "stale" | "unknown", "reason" | null, "at" | null } },
+    "curator": null | { "health": { "state": "up" | "down" | "unknown", "reason" | null, "since" | null, "checkedAt" | null },
+                        "tasks": [{ "task", "state": "shadow" | "routing", "routingHere", "promptVersion", "shadowSince" | null,
+                                    "shadowEndsAt" | null, "promotedAt" | null, "promotedPromptVersion" | null }],
+                        "agreement": null | [{ "task", "calls", "compared", "agreed" }] } }
+  curator (ADR-0038): health "down" means the tunnel or the model does not answer and the rules route;
+  \`board show\` prints "curator down" and \`--line\` appends " · curator down".
   row: { "key", "wip", "waitingHours", "p50Hours" | null, "p90Hours" | null, "throughput", "trend" | null, "previousWaitingHours" }.
   inputs.ledger.state is "ok" when the ledger was read and holds an event for the workspace; "unknown"
   (reason "ledger unreadable" or "the ledger holds no event for this workspace") means constraint,
@@ -1342,6 +1364,62 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   workspace's orchestrator. An answer older than 120 s, or with the ledger unknown, neither raises
   nor clears. judged is false when the value or threshold is null or the measure never flags; an
   anomaly that cannot be judged keeps its raised flag.
+
+## Curator (ADR-0038)
+
+gemma4:26b on ai-server's Ollama, reached through the user unit purplemux-curator-tunnel
+(127.0.0.1:11435 -> ai-lan 127.0.0.1:11434). It classifies harness text; it never decides,
+answers or writes. One call at a time, 30 s timeout; a call queued over 10 min drops to the rules;
+after a down result the queue backs off 30 s doubling to 5 min; inputs keep their last 6,000 tokens
+(the cut is logged). Every call is a tab_events row, class log, kind curator, text the JSON record
+{ task, model, promptVersion, sourceId | null, outcome, label | null, rulesLabel, span | null,
+withheld?, spanFound, latencyMs | null, waitedMs, cutTokens, promptTokens | null, source }; a span
+from a credential-like text is withheld, and no raw reply is stored. A promptVersion is
+<base>-<8 hex of model, options and template>~<8 hex of the served digest and (matcher) the order set>:
+any prompt edit, re-pull of the tag or order edit is a new version, with its own clock and evidence;
+with no digest known, calls wait for a probe, routing reads shadow and promote refuses.
+Tasks: classify-owner-message (standing-order, product-rule, answer, status-ping, one-off),
+flag-owner-question (an unmarked turn ending whose last 3 lines hold a '?'), match-standing-order
+(SO-n or not-covered; also every MC ask whose review needs approval or decision). Each is shadow
+(logged, nothing routes) until promoted.
+
+GET  /api/cli/curator                       (purplemux curator status [--json])
+  Any scope: { model, health, queued, liveSince | null, rateLimitMs, kodit | null, evals: [...],
+  tasks: [{ task, state, promptVersion, shadowSince | null (this version's first live call),
+  shadowEndsAt | null, promotedAt, promotedPromptVersion, queue: { size, oldestAt },
+  gate: { checks | null: [{ label, metric, threshold, measured, successes, trials, lowerBound,
+  minTrials, pass }], shadow: [{ label, metric, threshold, successes, trials, pass }], refusals } }] }.
+POST /api/cli/curator/eval  { task, split?: "holdout" | "train" | "all" }   (curator eval --task T [--split S] [--no-wait])
+GET  /api/cli/curator/eval?task=T[&split=S]
+  Any scope. POST starts or joins an evaluation and answers 202 { progress }; GET answers
+  { progress | null, result | null }. The held-out result keeps per-class counts only; train and
+  all keep per-row id, gold, predicted, outcome and latency (never text) of training ids only. A
+  result whose calls span two served versions is refused. A result carries n,
+  unresolved, agedOut (unreadable and older than 30 days), unresolvedByClass, excluded { shadow,
+  disputed } and refused | null: more than 10% unresolved, overall or in a gated class, refuses
+  before any model call.
+POST /api/cli/curator/promote  { task, demote?: true }   (purplemux curator promote|demote --task T)
+  Admin token only (403 forbidden). Promote refuses with 409 curator-gate-refused (exit 3) and every
+  reason, each with its measure: each check's one-sided 95% Clopper-Pearson lower bound over the
+  latest held-out evaluation of the live prompt plus its labelled shadow rows (0 errors needs 149
+  trials for 0.98, 59 for 0.95, 29 for 0.90, 14 for recall 0.80); 72 h since this prompt version's
+  first live call; 30 labelled shadow rows per check at or above the threshold; a usable
+  evaluation; and for classify-owner-message and match-standing-order a readable owner spot check.
+POST /api/cli/curator/label-queue  { task }   (purplemux curator label-queue --task T)
+  Any scope. Adds the live version's unlabelled shadow calls of the last 30 days (for a
+  precision-only task every predicted positive and as many predicted negatives, seeded) and answers
+  { task, promptVersion, size, oldestAt, added, ids } — ids only, shuffled, never a prediction.
+POST /api/cli/curator/label-import  { task, labels: [{ id, label }] }   (curator label-import --task T --file F)
+  Admin token only. Every id must be queued (else 409 curator-refused, nothing written); labels go
+  to the set, the queued predictions to <task>.shadow.json. match-standing-order also takes exclude.
+POST /api/cli/curator/spot-check  { task, workspaceId[, commit: itemId] }   (curator spot-check open -w WS [--task T] [--run RUN])
+GET  /api/cli/curator/spot-check?task=T                                     (curator spot-check show [--task T])
+  Admin, or a tab of WS. POST drafts the format-2 multi question and writes nothing; the CLI posts
+  it as the run's attention.opened at revision 0 with humanReview decision, then POST with commit
+  records the 1-N -> id map once Mission Control holds the item. A redraw is refused (409
+  curator-refused) while the task's last item stands. The matcher's opens only once its pool passes
+  everything else. Options: all-right | some-wrong (numbers) | cant-judge (numbers); both lists:
+  "wrong: 3,7; unsure: 12". GET reads the answer: unanswered | unreadable (reason) | answered.
 
 ## Board goal (ADR-0034 §10)
 

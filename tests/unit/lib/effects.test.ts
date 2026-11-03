@@ -86,6 +86,7 @@ describe('the effect catalog (AC 1): every component the code can send', () => {
     expect(EFFECTS_SOURCE).toMatch(/0 = never reached a tab, not never fired/);
     expect(EFFECTS_SOURCE).toMatch(/within 30 s/);
     expect(EFFECTS_SOURCE).toMatch(/per-probe effect is not measured, counts are per firing kind/);
+    expect(EFFECTS_SOURCE).toMatch(/any class but the curator's call log \(ADR-0038\)/);
     expect(NEXT_TURN_BOUND_MS).toBe(30_000);
   });
 });

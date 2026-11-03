@@ -182,3 +182,49 @@ describe('wakes per seat (AC 6)', () => {
     expect(store.tabEvents.wakes('ws-b', { since: T0, until: T0 + 2 * DAY_MS })).toEqual([]);
   });
 });
+
+describe('curator call rows (ADR-0038 §2)', () => {
+  it('are read back by curatorCalls for the workspace and window, oldest first', () => {
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"n":1}', at: T0 }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"n":2}', at: T0 + MIN }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"n":0}', at: T0 - DAY_MS }));
+    store.tabEvents.append(ev({ workspaceId: 'ws-b', class: 'log', kind: 'curator', text: '{"other":1}', at: T0 }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'turn-marker', text: 'not a curator row', at: T0 }));
+    expect(store.tabEvents.curatorCalls(WS, T0 - MIN)).toEqual(['{"n":1}', '{"n":2}']);
+  });
+
+  it('curatorCallsSince reads every workspace but the evaluation\'s, with each row\'s own time (r2 F4)', () => {
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"a":1}', at: T0 + 5 }));
+    store.tabEvents.append(ev({ workspaceId: 'ws-b', class: 'log', kind: 'curator', text: '{"b":1}', at: T0 + 7 }));
+    store.tabEvents.append(ev({ workspaceId: '_curator-eval', class: 'log', kind: 'curator', text: '{"e":1}', at: T0 + 9 }));
+    expect(store.tabEvents.curatorCallsSince(T0, '_curator-eval')).toEqual([
+      { workspaceId: WS, at: T0 + 5, text: '{"a":1}' }, { workspaceId: 'ws-b', at: T0 + 7, text: '{"b":1}' },
+    ]);
+  });
+
+  it('never count as a logged event sent to the tab', () => {
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{}', at: T0 }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'turn-marker', text: 'held then retired', at: T0 }));
+    expect(store.tabEvents.wakes(WS, { since: T0 - MIN, until: T0 + MIN })).toEqual([
+      { tabId: 'tab-o', day: null, wakes: 0, digests: 0, urgent: 0, logged: 1 },
+    ]);
+  });
+});
+
+describe('the effect count never reads a curator call as a firing (ADR-0038; story 15 merge, M2)', () => {
+  it('recordedCounts leaves the curator log rows out, and computeEffects shows no curator component', async () => {
+    const { computeEffects } = await import('@/lib/effects');
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"task":"flag-owner-question"}', at: T0 + MIN }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"task":"classify-owner-message"}', at: T0 + 2 * MIN }));
+    store.tabEvents.append(ev({ class: 'urgent', kind: 'turn-marker', text: 'DONE: x', at: T0 + 3 * MIN }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'turn-marker', text: 'held then retired', at: T0 + 4 * MIN }));
+    const fired = store.tabEvents.recordedCounts(WS, T0, T0 + 10 * MIN);
+    expect(fired.map((f) => f.kind)).toEqual(['turn-marker']);
+    expect(fired[0].count).toBe(2);
+    const rows = computeEffects({
+      workspaceId: WS, requestedSince: T0, until: T0 + 10 * MIN, measuredSince: T0, fired, deliveries: [], turns: [], openTurns: new Map(), tabExists: () => true,
+    });
+    expect(rows.rows.map((r) => r.component)).not.toContain('curator');
+    expect(JSON.stringify(rows)).not.toMatch(/"component":"other"[^}]*"fired":2/);
+  });
+});

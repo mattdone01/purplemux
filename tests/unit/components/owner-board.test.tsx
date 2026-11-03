@@ -33,7 +33,7 @@ const boardOf = (over: Partial<IBoard> = {}, ledger = true): IBoard => ({
       item('range:b:1', { waitReason: 'owner', waitSince: NOW - 2 * HOUR, holder: 'owner', parentKey: 'mc-item:mc-1' }),
     ],
   } : null, null, null, null, NOW),
-  workspaceId: 'ws-a', stuckTotal: 2, ageMs: 0, staleSince: null, experiments: [],
+  workspaceId: 'ws-a', stuckTotal: 2, ageMs: 0, staleSince: null, experiments: [], curator: null,
   needsYou: [
     { id: 'mc-1', title: 'Pick a port', createdAt: NOW - 5 * HOUR, blocked: { items: 1, hours: 2, critical: false } },
     { id: 'mc-2', title: 'Approve QA', createdAt: NOW - HOUR, blocked: null },
@@ -285,5 +285,40 @@ describe('Mission Control views (AC 1, AC 6)', () => {
       <SWRConfig value={{ provider: () => new Map() as never, fallback: data }}><OwnerBoard /></SWRConfig>,
     );
     expect(html).toContain('data-board="ws-a"');
+  });
+});
+
+describe('the curator section (story 16 AC 8)', () => {
+  const tasks = (state: 'shadow' | 'routing', routingHere = false) => (['classify-owner-message', 'flag-owner-question', 'match-standing-order'] as const)
+    .map((task) => ({ task, state, routingHere, promptVersion: 'v1', shadowSince: NOW - HOUR, shadowEndsAt: NOW + 71 * HOUR, promotedAt: null, promotedPromptVersion: null }));
+  const boardWith = (curator: IBoard['curator']) => render({ boards: { boards: [boardOf({ curator })] } });
+
+  it('says "Curator down" with the reason and the time, and that the rules route', () => {
+    const html = boardWith({ health: { state: 'down', reason: 'tunnel (connect ECONNREFUSED)', since: NOW - HOUR, checkedAt: NOW }, tasks: tasks('shadow'), agreement: [] });
+    expect(html).toContain('data-board-section="curator"');
+    expect(html).toContain('data-curator-health="down"');
+    expect(html).toContain('Curator down: tunnel (connect ECONNREFUSED) since Tue 3 Nov 16:30 AEDT. The rules route; nothing waits.');
+  });
+
+  it('up: each task in its own words with its shadow end and agreement; never a wire token', () => {
+    const html = boardWith({
+      health: { state: 'up', reason: null, since: NOW - HOUR, checkedAt: NOW - 30_000 }, tasks: tasks('shadow'),
+      agreement: [{ task: 'classify-owner-message', calls: 5, compared: 4, agreed: 3 }],
+    });
+    expect(html).toContain('data-curator-health="up"');
+    expect(html).toContain('Owner message class: shadow (labels logged, nothing routed) · 72 h shadow ends Fri 6 Nov 16:30 AEDT · 3 of 4 labels agree with the rules (72 h)');
+    expect(html).toContain('Unmarked question flag: shadow (labels logged, nothing routed) · 72 h shadow ends Fri 6 Nov 16:30 AEDT · no labelled calls in 72 h');
+    expect(html).not.toMatch(/>[^<]*classify-owner-message/);
+  });
+
+  it('a routing task not opted in here says so; unread agreement and an unread curator are "not measured"', () => {
+    expect(boardWith({ health: { state: 'unknown', reason: null, since: null, checkedAt: null }, tasks: tasks('routing'), agreement: null }))
+      .toContain('Standing-order match: routing, not opted in here · agreement not measured');
+    const fresh = tasks('shadow').map((t) => ({ ...t, shadowSince: null, shadowEndsAt: null }));
+    expect(boardWith({ health: { state: 'up', reason: null, since: 1, checkedAt: null }, tasks: fresh, agreement: [] }))
+      .toContain('Owner message class: shadow (labels logged, nothing routed) · no live call of this prompt yet · no labelled calls in 72 h');
+    expect(boardWith({ health: { state: 'unknown', reason: null, since: null, checkedAt: null }, tasks: tasks('routing', true), agreement: [] }))
+      .toContain('Curator not probed yet.');
+    expect(boardWith(null)).toContain('Not measured: curator state unreadable.');
   });
 });

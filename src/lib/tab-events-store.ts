@@ -154,6 +154,17 @@ export class TabEventsTable {
     return rows.reverse().map(fromRow);
   };
 
+  /** The curator's call records in a workspace since `since` (ADR-0038 §2), oldest first: their JSON text only. */
+  curatorCalls = (workspaceId: string, since: number): string[] =>
+    this.database.prepare(`SELECT text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ? AND workspace_id = ?
+      AND class = 'log' AND kind = 'curator' ORDER BY seq`).pluck().all(since, workspaceId) as string[];
+
+  /** Every workspace's curator call records since `since`, but the evaluation's: the label queue reads them. */
+  curatorCallsSince = (since: number, excludeWorkspace: string): Array<{ workspaceId: string; at: number; text: string }> =>
+    (this.database.prepare(`SELECT workspace_id, at, text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ?
+      AND class = 'log' AND kind = 'curator' AND workspace_id != ? ORDER BY seq`).all(since, excludeWorkspace) as Array<{ workspace_id: string; at: number; text: string }>)
+      .map((row) => ({ workspaceId: row.workspace_id, at: row.at, text: row.text }));
+
   /** The events delivered to the workspace's tabs in [since, until), oldest first: the effect count's input (story 15). */
   deliveries = (workspaceId: string, since: number, until: number): ITabDelivery[] =>
     (this.database.prepare(`SELECT seq, tab_id, kind, rule, delivered_at, digest_id FROM tab_events INDEXED BY tab_events_delivered_idx
@@ -162,10 +173,14 @@ export class TabEventsTable {
       .all(workspaceId, since, until) as Array<{ seq: number; tab_id: string; kind: string; rule: string | null; delivered_at: number; digest_id: string | null }>)
       .map((row) => ({ seq: row.seq, tabId: row.tab_id, kind: row.kind, rule: row.rule, deliveredAt: row.delivered_at, digestId: row.digest_id }));
 
-  /** The rows recorded in [since, until), any class, counted by kind and rule: the effect count's firings (story 15). */
+  /**
+   * The rows recorded in [since, until), counted by kind and rule: the effect count's firings (story 15). Any class but
+   * the curator's call log, which records a classification, never an event sent to a tab (ADR-0038).
+   */
   recordedCounts = (workspaceId: string, since: number, until: number): ITabEventCount[] =>
     this.database.prepare(`SELECT kind, rule, COUNT(*) AS count FROM tab_events INDEXED BY tab_events_at_idx
-      WHERE at >= ? AND at < ? AND workspace_id = ? GROUP BY kind, rule ORDER BY kind, rule`)
+      WHERE at >= ? AND at < ? AND workspace_id = ? AND NOT (class = 'log' AND kind = 'curator')
+      GROUP BY kind, rule ORDER BY kind, rule`)
       .all(since, until, workspaceId) as ITabEventCount[];
 
   hasAny = (workspaceId: string): boolean =>
@@ -204,8 +219,9 @@ export class TabEventsTable {
         target.wakes += 1;
       }
     }
+    // A curator call is a log row about a tab, never an event sent to it (ADR-0038 §2).
     const logged = this.database.prepare(`SELECT tab_id, at FROM tab_events INDEXED BY tab_events_at_idx
-      WHERE at >= ? AND at < ? AND workspace_id = ? AND class = 'log'`).raw().all(query.since, query.until, workspaceId) as Array<[string, number]>;
+      WHERE at >= ? AND at < ? AND workspace_id = ? AND class = 'log' AND kind != 'curator'`).raw().all(query.since, query.until, workspaceId) as Array<[string, number]>;
     for (const [tabId, at] of logged) row(tabId, at).logged += 1;
     return [...rows.values()].sort((a, b) => a.tabId.localeCompare(b.tabId) || (a.day ?? '').localeCompare(b.day ?? ''));
   };

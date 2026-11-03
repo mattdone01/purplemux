@@ -199,6 +199,11 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'pool-full': EXIT.CONFLICT,
   'pool-unreadable': EXIT.CONFLICT,
   'pool-timeout': EXIT.UNREACHABLE,
+  'curator-task-invalid': EXIT.USAGE,
+  'curator-workspace-invalid': EXIT.USAGE,
+  'curator-gate-refused': EXIT.CONFLICT,
+  'curator-unavailable': EXIT.CONFLICT,
+  'curator-refused': EXIT.CONFLICT,
   'so-invalid': EXIT.USAGE,
   'so-too-large': EXIT.USAGE,
   'so-not-found': EXIT.NOT_FOUND,
@@ -938,12 +943,17 @@ const missionAsk = async (rest, wsId) => {
   if (!event || !['attention.opened', 'attention.updated'].includes(event.type) || !event.payload || typeof event.payload !== 'object') {
     die('mc ask takes one attention.opened or attention.updated event (or { "events": [that event] })');
   }
+  return out(await postAsk(event, wsId, rest.includes('--fix')));
+};
+
+// The question check, then the event: what `mc ask` does with a draft, and what `curator spot-check open` posts.
+const postAsk = async (event, wsId, fix) => {
   const { itemId: _itemId, humanReview: _humanReview, ...question } = event.payload;
   const query = `workspaceId=${encodeURIComponent(wsId)}`;
   const { body: check } = await api('POST', `/api/cli/mission-control/questions/check?${query}`, { question });
   if (!check.ok) {
     process.stderr.write(`question defects (${check.defects.length}, min-version ${check.minVersion}):\n${defectLines(check.defects)}\n`);
-    if (rest.includes('--fix')) {
+    if (fix) {
       const reshape = check.reshape || {};
       process.stderr.write(`--fix: ${reshape.enabled ? 'the curator reshape is enabled, but this CLI cannot call it yet' : reshape.reason || 'the curator reshape is not enabled'}; fix the defects in the draft\n`);
     }
@@ -951,7 +961,7 @@ const missionAsk = async (rest, wsId) => {
   }
   if (check.lint.length) process.stderr.write(`question lint (accepted at min-version ${check.minVersion}):\n${defectLines(check.lint)}\n`);
   const { body } = await api('POST', `/api/cli/mission-control/events?${query}`, { events: [event] });
-  return out(body);
+  return body;
 };
 
 const cmdPortfolio = async (args) => {
@@ -2423,9 +2433,11 @@ const boardTime = (ms) => {
 };
 
 // A finder answer older than two ticks says so on every face: a hung tick is not a fresh board.
-const boardLineText = (board) => (board.staleSince === null || board.staleSince === undefined
-  ? board.line
-  : `${board.line} · stale since ${boardTime(board.staleSince)}`);
+// A down curator rides on the line too (ADR-0038 §6): the owner's bare status ask is answered with it.
+const boardLineText = (board) => {
+  const line = board.staleSince === null || board.staleSince === undefined ? board.line : `${board.line} · stale since ${boardTime(board.staleSince)}`;
+  return board.curator && board.curator.health.state === 'down' ? `${line} · curator down` : line;
+};
 
 const boardInput = (name, input) => `${name} ${input.state}${input.reason ? ` (${input.reason})` : ''}`;
 
@@ -2466,6 +2478,17 @@ const boardText = (board) => {
     process.stdout.write(`stuck: unknown (${ledgerUnknown})\nanomalies: unknown (${ledgerUnknown})\n`);
   } else {
     boardMeasures(board);
+  }
+  if (board.curator) {
+    const agree = (task) => {
+      const a = (board.curator.agreement || []).find((x) => x.task === task.task);
+      return a && a.compared ? `${a.agreed}/${a.compared} agree` : 'no labels in 72 h';
+    };
+    process.stdout.write(`curator: ${board.curator.health.state === 'down' ? 'curator down' : board.curator.health.state}`
+      + `${board.curator.health.state === 'down' && board.curator.health.reason ? ` (${board.curator.health.reason}); the rules route` : ''}`
+      + ` · ${board.curator.tasks.map((t) => `${t.task} ${t.state}${t.state === 'routing' && !t.routingHere ? ' (not here)' : ''}, ${agree(t)}`).join(' · ')}\n`);
+  } else {
+    process.stdout.write('curator: unknown (state unreadable)\n');
   }
   const { ledger, flow, spend, pool } = board.inputs;
   process.stdout.write(`inputs: ${[boardInput('ledger', ledger), boardInput('flow', flow), boardInput('spend', spend), boardInput('pool', pool)].join(' · ')}\n`);
@@ -2570,6 +2593,172 @@ const cmdBoard = async (args) => {
     return;
   }
   boardText(body);
+};
+
+// ── curator (ADR-0038) ───────────────────────────────────────────────────────
+const CURATOR_TASKS = ['classify-owner-message', 'flag-owner-question', 'match-standing-order'];
+const CURATOR_USAGE = 'usage: curator status [--json] | eval --task T [--split holdout|train|all] [--no-wait] [--json] | promote|demote --task T'
+  + ' | label-queue --task T [--json] | label-import --task T --file F | spot-check open -w WS [--task T] [--run RUN] | spot-check show [--task T] [--json]';
+const CURATOR_EVAL_POLL_MS = 5000;
+const { spotCheckEvent } = require('./curator-spot-check-event.js');
+const CURATOR_SPLITS = ['holdout', 'train', 'all'];
+
+const curatorTask = (rest, fallback) => {
+  const task = flagValue(rest, '--task') || fallback;
+  if (!CURATOR_TASKS.includes(task)) die(`--task must be one of ${CURATOR_TASKS.join(', ')} — ${CURATOR_USAGE}`);
+  return task;
+};
+
+const ratio = (value) => (value === null || value === undefined ? 'not measured' : value.toFixed(3));
+
+const curatorHealthText = (health) => {
+  if (health.state === 'up') return 'up';
+  if (health.state === 'down') return `DOWN${health.reason ? ` (${health.reason})` : ''}${health.since ? ` since ${boardTime(health.since)}` : ''}: the rules route`;
+  return 'not probed yet';
+};
+
+// The bound decides, the point estimate explains (consult 16-promote-gate, ruling 1).
+// A bound is printed rounded down to 4 decimals: just under its threshold never reads as reaching it.
+const boundText = (value) => (value === null || value === undefined ? 'not measured' : (Math.floor(value * 1e4) / 1e4).toFixed(4));
+const curatorCheckText = (check) => `${check.pass ? 'PASS' : 'FAIL'} ${check.label} ${check.metric} ${check.successes}/${check.trials} = ${ratio(check.measured)}; `
+  + `95% lower bound ${boundText(check.lowerBound)} >= ${check.threshold.toFixed(2)}? (0 errors needs ${check.minTrials})`;
+
+const curatorEvalText = (result) => {
+  const outcomes = Object.entries(result.outcomes).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+  process.stdout.write(`${result.task} · prompt ${result.promptVersion} · ${result.model} · ${result.split} · ${result.n} items`
+    + ` (unresolved ${result.unresolved}, aged out ${result.agedOut}, left out: ${result.excluded.shadow} shadow, ${result.excluded.disputed} disputed)`
+    + ` · ran ${boardTime(result.startedAt)} to ${boardTime(result.finishedAt)}\n`);
+  if (result.refused) {
+    process.stdout.write(`REFUSED: ${result.refused} — no model call was made; promote reads this as no evaluation\n`);
+    return;
+  }
+  process.stdout.write(`outcomes: ${outcomes} · latency p50 ${result.latency.p50 ?? '—'} ms, p90 ${result.latency.p90 ?? '—'} ms\n`);
+  printTable(['CLASS', 'SUPPORT', 'PREDICTED', 'PRECISION', 'RECALL', 'RULES P', 'RULES R'], result.score.classes.map((c) => {
+    const rules = result.rules.classes.find((r) => r.label === c.label) || {};
+    return [c.label, String(c.support), String(c.predicted), ratio(c.precision), ratio(c.recall), ratio(rules.precision), ratio(rules.recall)];
+  }));
+  process.stdout.write('gate on this run alone (ADR-0038 §5; promote adds the labelled shadow rows):\n');
+  for (const check of result.score.checks) process.stdout.write(`  ${curatorCheckText(check)}\n`);
+  process.stdout.write(`gate: ${result.score.pass ? 'PASS' : 'FAIL'} (promote also needs 72 h and 30 labelled shadow rows of this prompt`
+    + `${result.task === 'flag-owner-question' ? '' : ', and the owner\'s spot check'})\n`);
+};
+
+const curatorEval = async (rest) => {
+  const task = curatorTask(rest);
+  const split = flagValue(rest, '--split') || (rest.includes('--all') ? 'all' : 'holdout');
+  if (!CURATOR_SPLITS.includes(split)) die(`--split must be one of ${CURATOR_SPLITS.join(', ')}`);
+  requireEnv();
+  const { body: started } = await api('POST', '/api/cli/curator/eval', { task, split });
+  if (rest.includes('--no-wait')) return out(started);
+  const since = started.progress.startedAt;
+  for (;;) {
+    const { body } = await api('GET', `/api/cli/curator/eval?task=${encodeURIComponent(task)}&split=${split}`);
+    if (body.progress && body.progress.error) fail('curator-unavailable', `evaluation failed: ${body.progress.error}`);
+    if (body.progress && !body.progress.running && body.result && body.result.startedAt >= since) {
+      if (rest.includes('--json')) return out(body.result);
+      return curatorEvalText(body.result);
+    }
+    if (body.progress && process.stderr.isTTY) process.stderr.write(`\r${task}: ${body.progress.done}/${body.progress.total || '?'}`);
+    await new Promise((resolve) => setTimeout(resolve, CURATOR_EVAL_POLL_MS));
+  }
+};
+
+const curatorStatusText = (body) => {
+  process.stdout.write(`curator ${body.model} · ${curatorHealthText(body.health)} · queued ${body.queued}`
+    + `${body.rateLimitMs ? ` · ${body.rateLimitMs / 1000} s between calls (kodit rule)` : ''}\n`);
+  printTable(['TASK', 'STATE', 'PROMPT', 'SHADOW ENDS', 'PROMOTED', 'LABEL QUEUE'], body.tasks.map((t) => [
+    t.task, t.state, t.promptVersion, t.shadowEndsAt ? boardTime(t.shadowEndsAt) : 'no live call yet', t.promotedAt ? boardTime(t.promotedAt) : '—',
+    t.queue && t.queue.size ? `${t.queue.size}, oldest ${boardTime(t.queue.oldestAt)}` : '0',
+  ]));
+  for (const t of body.tasks) {
+    const gate = t.gate || {};
+    process.stdout.write(`${t.task} gate:\n`);
+    if (gate.checks) for (const check of gate.checks) process.stdout.write(`  pool ${curatorCheckText(check)}\n`);
+    else process.stdout.write('  pool: no usable held-out evaluation of this prompt\n');
+    for (const c of gate.shadow || []) process.stdout.write(`  shadow ${c.label} ${c.metric} ${c.successes}/${c.trials} (needs n >= 30, >= ${c.threshold.toFixed(2)}): ${c.pass ? 'PASS' : 'FAIL'}\n`);
+  }
+  const k = body.kodit;
+  if (!k) process.stdout.write('kodit: not measured yet\n');
+  else {
+    const rate = (w) => (w && w.docsPerHour !== null ? `${w.docsPerHour.toFixed(0)} docs/h, ${w.summariesPerHour.toFixed(0)} summaries/h (${w.samples} samples)` : 'not measured');
+    process.stdout.write(`kodit before: ${rate(k.before)}\nkodit after: ${k.after ? rate(k.after) : `waits for 72 h live (from ${body.liveSince ? boardTime(body.liveSince + 72 * 3600000) : '—'})`}`
+      + `${k.drop === null ? '' : ` · change ${(-k.drop * 100).toFixed(1)}%`}\n`);
+  }
+  for (const e of body.evals || []) process.stdout.write(`eval ${e.task}: ${e.running ? `running ${e.done}/${e.total}` : e.error ? `failed: ${e.error}` : 'finished'}\n`);
+};
+
+const curatorSpotCheckOpen = async (rest) => {
+  const wsId = missionWorkspace(rest);
+  const task = curatorTask(rest, 'classify-owner-message');
+  requireEnv();
+  const { body: snapshot } = await api('GET', `/api/cli/mission-control?workspaceId=${encodeURIComponent(wsId)}`);
+  const runs = missionBoundRuns(snapshot, wsId);
+  const runId = flagValue(rest, '--run');
+  const run = runId ? runs.find((r) => r.runId === runId) : runs.length === 1 ? runs[0] : null;
+  if (!run) die(`--run must name one bound run of ${wsId}: ${runs.map((r) => r.runId).join(', ') || 'none is bound'}`);
+  const { body: draft } = await api('POST', '/api/cli/curator/spot-check', { task, workspaceId: wsId });
+  process.stderr.write(`drawn per class: ${Object.entries(draft.perClass).map(([k, v]) => `${k} ${v}`).join(', ')} · skipped as credential-like: ${draft.skippedSecret}\n`);
+  // A new item is revision 0 (review r1 F1); the number map is recorded only once the item exists.
+  const posted = await postAsk(spotCheckEvent({ draft, run, workspaceId: wsId, task, now: Date.now() }), wsId, false);
+  const { body: committed } = await api('POST', '/api/cli/curator/spot-check', { task, workspaceId: wsId, commit: draft.itemId });
+  return out({ posted, committed });
+};
+
+const curatorLabelImport = async (rest) => {
+  const task = curatorTask(rest);
+  const file = flagValue(rest, '--file');
+  if (!file) die('--file is required: a JSON array of { "id", "label" }');
+  let labels;
+  try { labels = JSON.parse(require('fs').readFileSync(file, 'utf-8')); } catch (e) { die(`--file ${file}: ${e.message}`); }
+  requireEnv();
+  const { body } = await api('POST', '/api/cli/curator/label-import', { task, labels });
+  return out(body);
+};
+
+const cmdCurator = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub === 'status') {
+    requireEnv();
+    const { body } = await api('GET', '/api/cli/curator');
+    if (rest.includes('--json')) return out(body);
+    return curatorStatusText(body);
+  }
+  if (sub === 'eval') return curatorEval(rest);
+  if (sub === 'label-queue') {
+    const task = curatorTask(rest);
+    requireEnv();
+    const { body } = await api('POST', '/api/cli/curator/label-queue', { task });
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(`${task} · prompt ${body.promptVersion} · ${body.size} queued (${body.added} new)`
+      + `${body.oldestAt ? ` · oldest ${boardTime(body.oldestAt)}` : ''}\n${body.ids.join('\n')}${body.ids.length ? '\n' : ''}`);
+    return;
+  }
+  if (sub === 'label-import') return curatorLabelImport(rest);
+  if (sub === 'promote' || sub === 'demote') {
+    const task = curatorTask(rest);
+    requireEnv();
+    const { body } = await api('POST', '/api/cli/curator/promote', { task, ...(sub === 'demote' ? { demote: true } : {}) });
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(sub === 'demote' ? `${task}: shadow${body.wasRouting ? ' (was routing)' : ''}\n` : `${task}: routing (every gate condition met)\n`);
+    return;
+  }
+  if (sub === 'spot-check') {
+    const action = rest[0];
+    if (action === 'open') return curatorSpotCheckOpen(rest.slice(1));
+    if (action === 'show') {
+      const task = curatorTask(rest.slice(1), 'classify-owner-message');
+      requireEnv();
+      const { body } = await api('GET', `/api/cli/curator/spot-check?task=${encodeURIComponent(task)}`);
+      if (rest.includes('--json')) return out(body);
+      const v = body.verdict;
+      const text = v.state === 'answered' ? `answered: ${v.disputed.length} wrong of ${v.judged} judged (${(v.wrongShare * 100).toFixed(1)}%), ${v.unjudged.length} not judged`
+        : v.state === 'unreadable' ? `answer unreadable: ${v.reason}` : 'unanswered';
+      process.stdout.write(`spot check ${body.itemId ?? '(not opened)'}${body.workspaceId ? ` in ${body.workspaceId}` : ''}: ${text}\n`);
+      return;
+    }
+  }
+  die(CURATOR_USAGE);
 };
 
 const cmdLedgerShow = async (rest) => {
@@ -3054,6 +3243,19 @@ Commands:
   lease break NAME --reason TEXT           Remove another holder's lease (admin token only; audited)
   lease release-epic SLUG [--kind num]     Release an epic's survives-tab claims (run it while you still hold
                                            epic:SLUG; a tab of a claiming workspace releases its own claims)
+  curator status [--json]                  The local curator (ADR-0038): up or down, queue, each task's state
+                                           (shadow | routing), the shadow clock and the kodit measure
+  curator eval --task T [--split holdout|train|all] [--no-wait] [--json]
+                                           Evaluate a task (held-out 30% by default: counts only): precision and
+                                           recall per class, each check's 95% lower bound, and the rules' scores
+  curator promote|demote --task T          Move a task to routing (refused below the 95% lower bound, before 72 h
+                                           and 30 labelled shadow rows of the live prompt, or without the owner's
+                                           spot check) or back to shadow; admin
+  curator label-queue --task T | label-import --task T --file F
+                                           The blind label pass: queue the live prompt's shadow calls (ids only);
+                                           import their gold labels (admin)
+  curator spot-check open -w WS [--task T] [--run RUN] | spot-check show [--task T] [--json]
+                                           Open the owner's spot check as one Mission Control item; read it
   pool show [--json]                       The compute pool (ADR-0039): per host threads, load, free memory, disk,
                                            GPU and slots used/cap; an unknown host shows no figures, never 0
   pool acquire --kind gate|build|tab [--mem GB] [--ttl 60m] [--panel-type T] [--role R]
@@ -3201,6 +3403,8 @@ const main = async () => {
       return cmdLease(args.slice(1));
     case 'pool':
       return cmdPool(args.slice(1));
+    case 'curator':
+      return cmdCurator(args.slice(1));
     case 'mission':
     case 'mc':
       return cmdMission(args.slice(1));

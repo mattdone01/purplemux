@@ -1,3 +1,4 @@
+import type { ICuratorBoard } from '@/types/curator';
 import type { ILedgerExperiment, ILedgerItem, TLedgerIntervalReason, TLedgerItemType, TLedgerStage } from '@/types/ledger';
 import type { IFlowRecord } from '@/types/flow';
 import type { ISpendIndexStatus, ISpendLandingMetric } from '@/types/spend';
@@ -251,6 +252,8 @@ export interface IBoard extends IFinderResult {
   ageMs: number;
   /** `generatedAt` when the answer is older than two ticks (120 s): a hung tick, not a fresh board. Null when fresh. */
   staleSince: number | null;
+  /** The local curator (ADR-0038): up or down, and each task's state; null when its state cannot be read. */
+  curator: ICuratorBoard | null;
 }
 
 export interface IFinderInputs {

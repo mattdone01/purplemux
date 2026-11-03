@@ -57,5 +57,9 @@ export const applyMissionEventBatch = async (
   const applied = store.applyEvents(events, authorities, { questionMinVersion });
   // An item that first becomes owner-visible alerts once (ADR-0032 channels), a server-opened one too; a replayed event never does.
   void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null, previousStates });
+  // An ask the owner must approve or decide, a server-opened NEEDS-DECISION one too, is matched against the standing
+  // orders in shadow (ADR-0038 §2); a replay never is. Imported here so the curator never sits in this module's graph.
+  const fresh = events.filter((event) => unreplayed.has(event.eventId));
+  if (fresh.length) void import('@/lib/curator-service').then((curator) => curator.curatorOnMissionEvents(fresh)).catch(() => undefined);
   return { ...applied, humanInboxPolicy: store.humanInboxPolicy(workspaceId), lint };
 };

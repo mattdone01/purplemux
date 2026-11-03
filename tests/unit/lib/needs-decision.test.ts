@@ -24,6 +24,8 @@ vi.mock('@/lib/workspace-store', () => ({
 vi.mock('@/lib/mission-question-config', () => ({ readQuestionMinVersion: vi.fn(async () => 2) }));
 const attention = vi.hoisted(() => ({ alert: vi.fn(async (_input: unknown) => []) }));
 vi.mock('@/lib/attention-alerts', () => ({ alertOpenedAttention: attention.alert }));
+const curator = vi.hoisted(() => ({ onMissionEvents: vi.fn() }));
+vi.mock('@/lib/curator-service', () => ({ curatorOnMissionEvents: curator.onMissionEvents }));
 
 import { MissionControlStore } from '@/lib/mission-control-store';
 import { validateMissionQuestion } from '@/lib/mission-question-format';
@@ -198,6 +200,29 @@ describe('the server opens the item (story 14 AC 4)', () => {
     expect(again).toMatchObject({ opened: true });
     expect((again as { itemId: string }).itemId).not.toBe(itemId);
     expect(items()).toHaveLength(2);
+  });
+
+  // Story 16 merge (M1): the curator shadows every owner ask that passes the batch, a server-opened one too.
+  it('hands each fresh batch to the curator once: an mc ask, a NEEDS-DECISION the server opened, never a replay', async () => {
+    startRun();
+    curator.onMissionEvents.mockClear();
+    const { applyMissionEventBatch } = await import('@/lib/mission-control-events');
+    const ask = {
+      eventId: 'ask-1', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
+      type: 'attention.opened', payload: { itemId: 'ask-item', ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line: 'NEEDS-DECISION: own?' }),
+        humanReview: { humanNeed: 'decision', humanReason: 'Owner call.', handling: 'Checked.', reviewerTabId: 'tab-orch' } },
+    };
+    await applyMissionEventBatch('ws-a', [ask], { tabId: 'tab-w', identity: 'launch' });
+    await vi.waitFor(() => expect(curator.onMissionEvents).toHaveBeenCalledTimes(1));
+    expect(curator.onMissionEvents.mock.calls[0][0]).toEqual([expect.objectContaining({ eventId: 'ask-1', type: 'attention.opened' })]);
+    await applyMissionEventBatch('ws-a', [ask], { tabId: 'tab-w', identity: 'launch' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(curator.onMissionEvents).toHaveBeenCalledTimes(1);
+    expect(await openNeedsDecisionItem(await needsDecisionDeps(), stop({ turnStartedAt: Date.now() + 5 }))).toMatchObject({ opened: true });
+    await vi.waitFor(() => expect(curator.onMissionEvents).toHaveBeenCalledTimes(2));
+    expect(curator.onMissionEvents.mock.calls[1][0]).toEqual([expect.objectContaining({
+      type: 'attention.opened', payload: expect.objectContaining({ humanReview: expect.objectContaining({ humanNeed: 'decision' }) }),
+    })]);
   });
 
   it('an item the tab opened itself this turn (mc ask) suppresses the automatic one', async () => {

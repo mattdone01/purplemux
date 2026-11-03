@@ -58,6 +58,10 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── workspace-tokens.json    # per-workspace CLI tokens (0600)
 ├── mission-control.sqlite   # Mission Control and portfolio database: runs, items, answers, deliveries, events (0600; WAL)
 ├── ledger.sqlite            # work-item ledger: events, items, wait intervals, rollups, tab events and turns, experiments (ADR-0033; 0600; WAL)
+├── curator/                 # the local curator (ADR-0038; 0700): state.json (kodit anchor, per-version shadow clocks, task states),
+│   └── eval/                #   labelled sets {task}.json (ids, labels, times, twin locators; no text), {task}.shadow.json,
+│                            #   {task}.queue.json, match-standing-order.orders.json, spot-check.{task}.json (N -> id),
+│                            #   results/{task}.json (held-out counts) and results/{task}.{train|all}.json (0600)
 ├── ledger-tokens.json       # SHA-256 of each ledger producer token: scope ledger:emit on one workspace (ADR-0033; 0600)
 ├── ledger-tokens/           # producer token files the CLI writes: {wsId}/{producer}.json (0700 dir, 0600 files)
 ├── ledger-spool/            # events `ledger emit` could not deliver: {producer}.jsonl, {producer}.rejected.jsonl, lock dirs (0700)
@@ -359,6 +363,24 @@ to `ledger-tokens/{wsId}/{producer}.json` (or `--out`) and spools undelivered ev
 the next `ledger emit` sends the spool first, and an event the server refuses moves alone to
 `{producer}.rejected.jsonl`. `{producer}.drain.lock/` (one drainer, refreshed every batch, stale after 60 s) and
 `{producer}.jsonl.lock/` (every change to the spool file, stale after 10 s) are lock directories.
+
+### `curator/` — `src/lib/curator-store.ts`
+
+The local curator (ADR-0038). `state.json`: `{ version: 1, liveSince, tasks: { <task>: { state, promotedAt,
+promotedPromptVersion, shadowSince: { <promptVersion>: ms } } }, kodit, rateLimitMs }`. `liveSince` (the first start
+of a server carrying the client) anchors the kodit window; each prompt version's 72 h shadow clock is its own first
+live call. `eval/<task>.json` holds `{ task, labelledBy, labelledAt, items: [{ id, label, at?, alt? }] }` and never
+message text: an id is `<wsId>/<historyEntryId>` (an owner message, read from `message-history.json`, else from `alt`,
+its transcript twin `{ ref: <ws>/<session>/<userUuid>, start, length, mode: raw | collapsed, sha }`, a 16-hex
+sha256), `<wsId>/<sessionId>/<assistantUuid>` (a turn ending, read from the Claude transcript) or `<wsId>/mc/<itemId>`
+(an agent's ask in `mission-control.sqlite`). `at` is the source time; an unreadable item older than 30 days has aged
+out. The held-out 30% is a hash of the id, so no split is stored. `eval/<task>.shadow.json` holds `{ rows: [{ id,
+promptVersion, predicted, outcome, at }] }`, the predictions of labelled shadow calls; `eval/<task>.queue.json` the
+label queue (ids and predictions, plus `excluded`: ids a pass marked no permission ask; the CLI shows ids only). `eval/results/<task>.json` is the latest held-out
+evaluation (per-class counts, no per-id prediction); `results/<task>.train.json` and `.all.json` keep the rows of training ids only.
+`eval/spot-check.<task>.json` maps the owner's spot-check numbers to ids, written only after the item exists. Every
+curator call is also a `tab_events` row (class `log`, kind `curator`) in `ledger.sqlite`. Regeneratable except the
+labelled sets and the shadow evidence, which are labelling passes' output.
 
 ### `audit/coordination.jsonl` — `src/lib/coordination-audit.ts`
 

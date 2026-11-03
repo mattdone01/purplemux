@@ -2776,6 +2776,9 @@ export class StatusManager {
         // null: the background ledger was not read, which differs from "read, nothing open".
         openBackgroundTasks: snapshot?.openBackgroundTasks ?? null, liveRegisteredJobs, armedWatches,
       };
+      // A stop with no end line may still ask the owner something: the curator flags it, in shadow (ADR-0038 §2).
+      const sourceId = entry.agentSessionId && snapshot?.lastAssistantUuid ? `${entry.workspaceId}/${entry.agentSessionId}/${snapshot.lastAssistantUuid}` : null;
+      void import('@/lib/curator-service').then((curator) => curator.curatorOnUnmarkedTurnEnd(entry.workspaceId, tabId, snapshot?.lastAssistantTail, sourceId));
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);
         log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');

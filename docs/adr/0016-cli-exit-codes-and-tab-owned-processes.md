@@ -39,6 +39,8 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 2 | usage error (pool, ADR-0039) | `pool-invalid` | fix the command |
 | 3 | refused by state (pool, ADR-0039) | `pool-full`: no host has a free slot, the memory or the disk; `pool-unreadable` | after the state changes, or fall back to a local slot; never for a `gate.no-local-fallback` repository (ADR-0039 §6) |
 | 6 | no answer (pool, ADR-0039) | `pool-timeout`: `pool acquire` had no answer in 2 s | fall back to a local slot and log it; never for a `gate.no-local-fallback` repository (ADR-0039 §6) |
+| 2 | usage error (curator, ADR-0038) | `curator-task-invalid`, `curator-workspace-invalid` | fix the command |
+| 3 | refused by state (curator, ADR-0038) | `curator-gate-refused`: promote below the 95% lower bound, before 72 h and 30 labelled shadow rows of the live prompt, or without the spot check; `curator-refused`: a standing spot check, an import id not in the queue; `curator-unavailable` | after the state changes |
 | 2 | usage error (standing orders, ADR-0041) | `so-invalid`, `so-too-large`: the active orders one workspace loads would pass 8192 bytes; the message names the measured size | fix the command, or strike an order |
 | 3 | refused by state (standing orders, ADR-0041) | `so-unreadable`: an order file is not in its layout and is never read as empty; `so-struck`: the order is already struck | after the file is repaired; a struck order stays struck |
 | 7 | not found (standing orders, ADR-0041) | `so-not-found` | — |

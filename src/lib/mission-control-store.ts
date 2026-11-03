@@ -870,6 +870,20 @@ export class MissionControlStore {
         id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? ''), createdAt: row.created_at,
       }));
 
+  /** One item's state and question JSON, or null (ADR-0038: the curator's spot check and its shadow match read them). */
+  itemQuestion = (workspaceId: string, itemId: string): { state: string; questionJson: string } | null => {
+    const row = this.database.prepare('SELECT state, question_json FROM attention_items WHERE workspace_id = ? AND id = ?')
+      .get(workspaceId, itemId) as { state: string; question_json: string } | undefined;
+    return row ? { state: row.state, questionJson: row.question_json } : null;
+  };
+
+  /** The latest answer to one item, or null: the curator's spot check reads the owner's (ADR-0038 §5). */
+  latestAnswer = (workspaceId: string, itemId: string): IMissionAnswer | null => {
+    const row = this.database.prepare('SELECT * FROM answers WHERE workspace_id = ? AND item_id = ? ORDER BY created_at DESC, id DESC LIMIT 1')
+      .get(workspaceId, itemId) as IAnswerRow | undefined;
+    return row ? answerFromRow(row) : null;
+  };
+
   /** The pulse (ADR-0034 §9): when each answer to a workspace's items was recorded, since `since`. */
   answerTimes = (workspaceId: string, since: number): number[] =>
     this.database.prepare('SELECT created_at FROM answers WHERE workspace_id = ? AND created_at >= ? ORDER BY created_at')
