@@ -57,6 +57,7 @@ export const buildFcmMessage = (alert: IAlert, ctx: IAlertContext, token: string
   };
   // The flag text is already the body; the structured field carries what routes the tap.
   if (alert.flag) data.flag = JSON.stringify({ source: alert.flag.source, rule: alert.flag.rule, subject: alert.flag.subject });
+  if (alert.itemId) data.itemId = alert.itemId;
   if (ctx.agentSessionId) data.agentSessionId = ctx.agentSessionId;
   if (ctx.workspaceDir) data.workspaceDir = ctx.workspaceDir;
 
@@ -64,7 +65,7 @@ export const buildFcmMessage = (alert: IAlert, ctx: IAlertContext, token: string
     message: {
       token,
       data,
-      android: { priority: alert.kind === 'needs-input' ? 'high' : 'normal' },
+      android: { priority: alert.kind === 'needs-input' || alert.kind === 'attention-opened' ? 'high' : 'normal' },
     },
   };
 };
