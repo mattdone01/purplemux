@@ -1,5 +1,5 @@
 import type { ISessionInfo } from '@/types/timeline';
-import type { ITab, TPanelType, IWorkspace } from '@/types/terminal';
+import type { ITab, TPanelType, IWorkspace, TTabRole } from '@/types/terminal';
 import type { ICurrentAction } from '@/types/status';
 import type { IPermissionRequest } from '@/types/codex-permission';
 
@@ -7,12 +7,22 @@ export interface IAgentResumeCommandOptions {
   workspaceId?: string;
   model?: string;
   effort?: string;
+  /** Claude only: the tab's role tool configuration and its preview origin (ADR-0040). */
+  role?: TTabRole;
+  previewOrigin?: string;
+  /** An evaluator's libpq service, exported as PGSERVICE (ADR-0040). */
+  pgService?: string;
 }
 
 export interface IAgentLaunchCommandOptions {
   workspaceId?: string;
   model?: string;
   effort?: string;
+  /** Claude only: the tab's role tool configuration and its preview origin (ADR-0040). */
+  role?: TTabRole;
+  previewOrigin?: string;
+  /** An evaluator's libpq service, exported as PGSERVICE (ADR-0040). */
+  pgService?: string;
 }
 
 export interface IAgentSessionWatchOptions {
