@@ -254,7 +254,7 @@ describe('renderDigest', () => {
   const rows = (n: number, text = (i: number) => `[orchestrator-watchdog] worker tab-w${i} (lane) ended: CHECKPOINTED: handoff ${i} — read with: purplemux tab result -w ${WS} tab-w${i}`): ITabEvent[] =>
     Array.from({ length: n }, (_, i) => ({
       seq: i + 1, workspaceId: WS, tabId: TAB, at: T0 + i * 60_000, class: 'digest', kind: 'turn-marker', text: text(i),
-      sourceTabId: null, sourceTabName: null, deliveredAt: null, digestId: null,
+      sourceTabId: null, sourceTabName: null, rule: null, deliveredAt: null, digestId: null,
     }));
 
   it('one line per event without the watchdog prefix or its pane pointer, then the pointer to the full text', () => {

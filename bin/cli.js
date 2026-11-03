@@ -2729,6 +2729,48 @@ const cmdEvents = async (args) => {
   }
 };
 
+// ── effects (story 15, ADR-0035 §7) ─────────────────────────────────────────
+const EFFECTS_USAGE = 'usage: effects show [-w WS] [--days N] [--json]   (N: 1 to 30, default 7; WS defaults to $PMUX_WORKSPACE_ID)';
+
+const effectCount = (value) => (value === null ? '—' : String(value));
+
+const cmdEffectsShow = async (rest) => {
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w') || process.env.PMUX_WORKSPACE_ID;
+  if (!wsId) die(`--workspace is required outside a tab\n${EFFECTS_USAGE}`);
+  if (stripFlags(rest, ['-w', '--workspace', '--days']).filter((arg) => arg !== '--json').length) die(EFFECTS_USAGE);
+  const qs = new URLSearchParams({ days: flagValue(rest, '--days') ?? '7' });
+  requireEnv();
+  const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/effects?${qs}`);
+  if (rest.includes('--json')) return out(body);
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const window = `${iso(body.requestedSince)}..${iso(body.until)}`;
+  const counted = body.since === null
+    ? (body.measuredSince === null ? 'nothing measured: no turn recorded yet' : `nothing measured: turns recorded from ${iso(body.measuredSince)}`)
+    : body.since > body.requestedSince ? `counted from ${iso(body.since)}, the first recorded turn` : 'all of it counted';
+  process.stdout.write(`effects ${wsId} ${window}: ${counted}\nsource: ${body.source}\n`);
+  const measured = body.rows.filter((row) => row.notMeasured === null);
+  const share = (row) => (row.judged ? `${Math.round((100 * row.followed) / row.judged)}%` : '—');
+  if (measured.length) {
+    const candidate = (row) => (row.candidate === null ? '—' : row.candidate ? 'yes' : 'no');
+    printTable(['COMPONENT', 'FAMILY', 'FIRED', 'DELIVERED', 'IN-DIGEST', 'FOLLOWED', 'JUDGED', 'SHARE', 'NO-TURN', 'MID-TURN', 'PENDING',
+      'CLOSED', 'UNMEASURED', 'CANDIDATE'], measured.map((row) => [row.component, row.family,
+      ...['fired', 'delivered', 'inDigest', 'followed', 'judged'].map((key) => effectCount(row[key])), share(row),
+      ...['noTurn', 'midTurn', 'pending', 'closed', 'unmeasured'].map((key) => effectCount(row[key])), candidate(row)]));
+    process.stdout.write(`\nCANDIDATE yes: at least ${body.candidateMinObserved} deliveries with an observed turn, none followed; — is not measured (--json gives candidateReason). `
+      + 'Delivered 0 is never a candidate: it means the component reached no tab, not that it never fired.\n');
+  }
+  const unmeasured = body.rows.filter((row) => row.notMeasured !== null);
+  if (unmeasured.length) {
+    process.stdout.write(`${measured.length ? '\n' : ''}not measured:\n`);
+    printTable(['COMPONENT', 'FAMILY', 'WHY'], unmeasured.map((row) => [row.component, row.family, row.notMeasured]));
+  }
+};
+
+const cmdEffects = async (args) => {
+  if (args[0] !== 'show') die(EFFECTS_USAGE);
+  return cmdEffectsShow(args.slice(1));
+};
+
 const cmdApiGuide = async () => {
   requireEnv();
   const guidePath = '/api/cli/api-guide';
@@ -2970,6 +3012,15 @@ Commands:
   events wakes -w WS [--since T] [--until T] [--by-day] [--json]
                                            Wakes and digests per tab: one delivery is one wake, a digest counts once.
                                            Default: the last 24 h
+  effects show [-w WS] [--days N] [--json] Per nudge kind, probe kind and flag rule: firings recorded, delivery units (an
+                                           urgent paste, or a digest counted once per component) and how many were
+                                           followed: the recipient's next turn, started within 30 s of the paste, made an
+                                           acting tool call (edit, write, shell). Followed is what came next, not what the
+                                           delivery caused. Delivered 0 = never reached a tab, not never fired. A paste
+                                           into a running turn, a pending or closed tab and an unrecorded turn are counted
+                                           apart. CANDIDATE yes needs 10 deliveries with an observed turn and none
+                                           followed; otherwise it is not measured. Turns are recorded from the first one after this release;
+                                           an earlier window is clamped. Per-probe effect is not measured. Default: 7 days
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
                                            attention.opened/updated accept class (money|irreversible|scope|bookkeeping) and defaultOptionId
@@ -3144,6 +3195,8 @@ const main = async () => {
       return cmdLedger(args.slice(1));
     case 'events':
       return cmdEvents(args.slice(1));
+    case 'effects':
+      return cmdEffects(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'pool':

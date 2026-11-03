@@ -65,7 +65,7 @@ One item per task with its current status; every blocker names the exact input t
 Mission Control is the durable decision record. At kickoff/resume and on ordinary turns, read outstanding answers and human-inbox policy guidance with purplemux mission answers -w {{WORKSPACE_ID}}. Acknowledge each exact answer ID with the ackCommand that purplemux mission answers prints for it (its generation, revision, and event ID) after applying it, then explicitly resolve the attention item. Workers route blockers to you; ordinary attention events create durable workspace candidates. Use existing instructions, authority, evidence, and delegated handling first. Routine setup, coordination, already-granted permissions, and parked-work choices are not human questions merely because a worker stopped. Only the remaining human-exclusive decision, approval, information, or external action receives an explicit human review from the configured orchestrator. Record workspace handling with a none review or cancel an issue handled elsewhere. Reuse stable item IDs and report transitions, not repeated unchanged issues. Emit stable Mission Control events when the run starts/resumes, meaningful progress changes, an attention item opens/changes, an answer is applied, or the run finishes. Do not turn standup blockers or historical transcript questions into confirmed decisions. Completion requires an explicit run.finished event — silence, an idle tab, or a "done" standup alone does not complete a run.
 
 ## Rules
-- Max {{MAX_WORKERS}} concurrent workers. One task per worker tab.
+- The workspace's WIP cap bounds concurrent workers: purplemux tab count -w {{WORKSPACE_ID}} prints "<count> <cap>", and an agent tab create at the cap exits 3 wip-cap. One task per worker tab.
 - Never assume a worker's state — capture its pane before acting.
 
 ## The work
@@ -77,14 +77,14 @@ export interface IKickoffTemplateVars {
   workspaceId: string;
   workspaceName: string;
   task?: string;
-  maxWorkers?: number;
 }
 
 export const resolveKickoffTemplate = (template: string, vars: IKickoffTemplateVars): string =>
   template
     .replaceAll('{{WORKSPACE_ID}}', vars.workspaceId)
     .replaceAll('{{WORKSPACE_NAME}}', vars.workspaceName)
-    .replaceAll('{{MAX_WORKERS}}', String(vars.maxWorkers ?? 3))
+    // A stored template from before the one-cap rule (story 15) names the enforced cap, not a count of its own.
+    .replaceAll('{{MAX_WORKERS}}', `the WIP cap (purplemux tab count -w ${vars.workspaceId})`)
     .replaceAll('{{TASK}}', vars.task ?? '(described in the next message)');
 
 export const buildNudgeMessage = (

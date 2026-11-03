@@ -57,7 +57,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── tab-tokens.json          # per-tab CLI tokens (0600)
 ├── workspace-tokens.json    # per-workspace CLI tokens (0600)
 ├── mission-control.sqlite   # Mission Control and portfolio database: runs, items, answers, deliveries, events (0600; WAL)
-├── ledger.sqlite            # work-item ledger: events, items, wait intervals, rollups, tab events, experiments (ADR-0033; 0600; WAL)
+├── ledger.sqlite            # work-item ledger: events, items, wait intervals, rollups, tab events and turns, experiments (ADR-0033; 0600; WAL)
 ├── ledger-tokens.json       # SHA-256 of each ledger producer token: scope ledger:emit on one workspace (ADR-0033; 0600)
 ├── ledger-tokens/           # producer token files the CLI writes: {wsId}/{producer}.json (0700 dir, 0600 files)
 ├── ledger-spool/            # events `ledger emit` could not deliver: {producer}.jsonl, {producer}.rejected.jsonl, lock dirs (0700)
@@ -343,12 +343,14 @@ file from `mission-control.sqlite`, so the high-volume feed never couples to the
 Tables: `events` (append-only; `event_key`, 12 bytes of SHA-256 over the workspace, the producer and its `event_id`, is unique, so a replayed batch or spool is skipped), `items`
 (the projection per `(workspace_id, item_key)`), `intervals` (one row per finished wait, written in the transaction of
 the event that ends it), `rollups_daily` (per UTC day, item type and reason), `tab_events` (ADR-0035: every nudge, notice, tab send and digest
-a tab was sent, with its wake class, its source tab and when and in which digest it was delivered; read with
-`purplemux events show`), `experiments` (ADR-HFL-03), `landings` (one row per range landing the projection applied,
+a tab was sent, with its wake class, its source tab, a flag's rule, and when and in which digest it was delivered; read
+with `purplemux events show`), `tab_turns` (story 15, ADR-0035 §7: one row per finished turn of an agent tab, its start
+when seen and its acting tool calls; with `tab_events` the input of `purplemux effects show`), `experiments` (ADR-HFL-03), `landings` (one row per range landing the projection applied,
 written in the event's transaction; created and filled once from the stored events on the first open of a ledger
-without it; harness-flow-loop 04) and `ledger_meta` (rollup progress, each workspace's longest interval). A daily job,
+without it; harness-flow-loop 04) and `ledger_meta` (rollup progress, each workspace's longest interval, when the first
+turn was recorded). A daily job,
 10 min after boot and then every 24 h, rolls up every day not yet rolled and every day a newly finished wait covers,
-then deletes events, intervals and landings older than 92 days, tab events older than 30 days, items closed before
+then deletes events, intervals and landings older than 92 days, tab events and tab turns older than 30 days, items closed before
 then, and rollups older than 400 days, in chunks of 5,000 rows. Not regeneratable: the events are the record.
 
 `ledger-tokens.json` (`src/lib/ledger-token.ts`) keeps `{ version: 1, tokens: [{ hash, workspaceId, producer,

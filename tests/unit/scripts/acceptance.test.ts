@@ -721,16 +721,17 @@ describe('checks-wip-cap.cjs (story 20)', () => {
   });
 
   it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
-    expect(checks.WAVE_COUNT).toBe(12);
+    expect(checks.WAVE_COUNT).toBe(13);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '9']).onlyWave).toBe(9);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '10']).onlyWave).toBe(10);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '11']).onlyWave).toBe(11);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '12']).onlyWave).toBe(12);
-    for (const bad of ['0', '13', '1.5', '-1', 'x', '']) {
-      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..12, not ${JSON.stringify(bad)}`);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '13']).onlyWave).toBe(13);
+    for (const bad of ['0', '14', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..13, not ${JSON.stringify(bad)}`);
     }
-    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..12, not null');
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..13, not null');
   });
 
 
@@ -798,9 +799,9 @@ process.exit(1);
     });
 
     it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
-      const r = runChecks('ok', ['--only-wave', '13']);
+      const r = runChecks('ok', ['--only-wave', '14']);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('--only-wave takes an integer 1..12, not "13"');
+      expect(r.stderr).toContain('--only-wave takes an integer 1..13, not "14"');
       expect(r.calls).toEqual([]);
     });
 
@@ -1439,8 +1440,8 @@ describe('wave 12: one attention alert per item that becomes owner-visible (stor
     expect(alertWave.judgeAttentionAlerts({ ...base, states: { opened: 'open', promoted: 'candidate' }, frames: ok }).ok).toBe(false);
   });
 
-  it('runs last, after the context lifecycle wave', () => {
+  it('runs twelfth, after the context lifecycle wave and before the effects wave (story 15 merge, M2)', () => {
     expect(fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks.cjs'), 'utf8'))
-      .toMatch(/\(\) => wave11\(inst, helpers\), \(\) => waveAttentionAlert\(inst, helpers\)\];/);
+      .toMatch(/\(\) => wave11\(inst, helpers\), \(\) => waveAttentionAlert\(inst, helpers\),\n {2}\(\) => wave13\(inst, helpers\)\];/);
   });
 });

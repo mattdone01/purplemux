@@ -65,6 +65,8 @@ import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
 import { getLedgerStore } from '@/lib/ledger-store';
 import type { TabEventsTable } from '@/lib/tab-events-store';
+import type { TabTurnsTable } from '@/lib/tab-turns-store';
+import { TurnTracker, isActingTool } from '@/lib/turn-tracker';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
 import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
@@ -257,6 +259,9 @@ export class StatusManager {
   private tabEvents: TabEventRouter;
   /** Seats rotate from their handoff file (ADR-0036). */
   private readonly contextLifecycle: ContextLifecycle;
+  /** Each agent tab's turns and acting tool calls, the effect counts' second input (story 15, ADR-0035 §7). */
+  private readonly turns: TurnTracker;
+  private turnWriteFailing = false;
   private contextTimer: ReturnType<typeof setInterval> | null = null;
   private fleetRotateAt = DEFAULT_ROTATE_AT_TOKENS;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
@@ -310,6 +315,7 @@ export class StatusManager {
     cacheCodexRateLimits = cacheCodexRateLimitsFromJsonl,
     updateAgentState = updateTabAgentState,
     tabEventTable: () => TabEventsTable = () => getLedgerStore().tabEvents,
+    tabTurnTable: () => TabTurnsTable = () => getLedgerStore().tabTurns,
   ) {
     this.automatedPrompts = automatedPrompts;
     this.tabEvents = new TabEventRouter({
@@ -334,8 +340,34 @@ export class StatusManager {
       },
     });
     this.contextLifecycle = new ContextLifecycle(this.contextLifecycleDeps());
+    this.turns = new TurnTracker({
+      record: (turn) => this.writeTurn(() => tabTurnTable().record(turn)),
+      addToolCall: (id) => {
+        this.writeTurn(() => {
+          tabTurnTable().addToolCall(id);
+          return id;
+        });
+      },
+    });
     this.cacheCodexRateLimits = cacheCodexRateLimits;
     this.updateAgentState = updateAgentState;
+  }
+
+  /** A turn the ledger cannot take is lost to the effect counts, never to the tab: logged once per failing stretch. */
+  private writeTurn(write: () => number): number | null {
+    try {
+      const id = write();
+      this.turnWriteFailing = false;
+      return id;
+    } catch (err) {
+      if (!this.turnWriteFailing) log.warn(`tab turn not recorded: ${err instanceof Error ? err.message : err}`);
+      this.turnWriteFailing = true;
+      return null;
+    }
+  }
+
+  private turnProvider(entry: ITabStatusEntry): string {
+    return getProviderByPanelType(entry.panelType)?.id ?? entry.panelType ?? 'unknown';
   }
 
   /** The tab as a seat (ADR-0036): a local agent tab created with `--handoff`. */
@@ -1734,6 +1766,7 @@ export class StatusManager {
     if (!entry) return;
     const expectedProvider = getProviderByPanelType(entry.panelType);
     if (expectedProvider && expectedProvider.id !== providerId) return;
+    if (isActingTool(activity.tool)) this.turns.toolCall(entry.workspaceId, tabId, providerId, replayedAt ?? Date.now());
 
     const meta = this.tabScopeCache.get(tabId);
     if (!meta || Date.now() - meta.at > TAB_SCOPE_TTL_MS) {
@@ -1742,6 +1775,23 @@ export class StatusManager {
       this.refreshTabScope(tabId, entry).catch(() => {});
     }
     getSignalEngine().record(tabId, activity, meta?.scope, meta?.cwd);
+  }
+
+  /** A tool call from a provider that feeds no signal engine (Codex PostToolUse): counted on the tab's turn only. */
+  handleToolCall(providerId: string, tmuxSession: string, tool: string, at: number): void {
+    if (!isActingTool(tool)) return;
+    const tabId = this.findTabIdBySession(tmuxSession);
+    const entry = tabId ? this.tabs.get(tabId) : undefined;
+    if (!tabId || !entry) return;
+    const expectedProvider = getProviderByPanelType(entry.panelType);
+    if (expectedProvider && expectedProvider.id !== providerId) return;
+    // Codex starts a turn only with UserPromptSubmit: a tool call with none open belongs to a turn of unknown start.
+    this.turns.toolCall(entry.workspaceId, tabId, providerId, at, false);
+  }
+
+  /** The turns this server is still counting, by tab, for the effect counts (story 15). */
+  openTurns(workspaceId: string): Map<string, number | null> {
+    return this.turns.openIn(workspaceId);
   }
 
   private async refreshTabScope(tabId: string, entry: ITabStatusEntry): Promise<void> {
@@ -2826,8 +2876,14 @@ export class StatusManager {
     return ` [no MC item (${reason}): owner push dispatched, delivery not confirmed]`;
   }
 
-  /** `replayedAt`: the time a spooled event happened, for a replay (ADR-0020); a live event has none. */
-  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource, replayedAt?: number): void {
+  /**
+   * `replayedAt`: the time a spooled event happened, for a replay (ADR-0020); a live event has none. `fromTool`: a
+   * prompt-submit that is a Codex tool event, which shows a running turn and starts none (story 15).
+   */
+  updateTabFromHook(
+    tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource, replayedAt?: number,
+    opts: { fromTool?: boolean } = {},
+  ): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ tmuxSession, event, notificationType }, 'no tabId for session');
@@ -2889,8 +2945,13 @@ export class StatusManager {
       if (entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'session-start');
       // A /clear or a fresh launch has no context reading yet; after a rotation it is the session the first message waits for.
       this.contextLifecycle.onSessionStart(tabId);
+      // A relaunch after the agent died mid-turn: that turn ended here, with no count.
+      this.turns.sessionStart(tabId, now);
     }
     if (eventName === 'prompt-submit') this.contextLifecycle.onPromptSubmit(tabId);
+    if (eventName === 'prompt-submit' && opts.fromTool) this.turns.running(entry.workspaceId, tabId, this.turnProvider(entry));
+    else if (eventName === 'prompt-submit') this.turns.start(entry.workspaceId, tabId, this.turnProvider(entry), now);
+    else if (eventName === 'stop' || eventName === 'interrupt') this.turns.end(entry.workspaceId, tabId, this.turnProvider(entry), now);
     this.broadcast({ type: 'status:hook-event', tabId, event: entry.lastEvent });
 
     const prevState = entry.cliState;
@@ -3078,6 +3139,7 @@ export class StatusManager {
 
   removeTab(tabId: string): void {
     this.contextLifecycle.onClosed(tabId, this.seatOf(tabId));
+    this.turns.closed(tabId);
     const entry = this.tabs.get(tabId);
     if (entry) getLivenessManager().removeTab(entry.workspaceId, tabId);
     if (entry && (entry.cliState === 'busy' || entry.cliState === 'needs-input') && entry.lastUserMessage) {
@@ -3119,6 +3181,8 @@ export class StatusManager {
         this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source, replayedAt);
         break;
       case 'prompt-submit':
+        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt, { fromTool: event.fromTool === true });
+        break;
       case 'stop':
       case 'interrupt':
       case 'pre-compact':

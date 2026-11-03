@@ -6,7 +6,7 @@ import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab, TPanelType } from '@/types/terminal';
 import type { TTurnMarkerName } from '@/lib/turn-end';
-import { memoryTabEvents } from './tab-events-harness';
+import { memoryLedgerTables } from './tab-events-harness';
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 const workspaceStore = vi.hoisted(() => ({
@@ -68,7 +68,7 @@ const managerWithPaste = async () => {
   });
   await import('@/lib/providers');
   const { StatusManager } = await import('@/lib/status-manager');
-  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), memoryTabEvents());
+  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), ...memoryLedgerTables());
   manager.registerTab('root', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'root', tmuxSession: 'tmux-root', panelType: 'claude-code' });
   return { manager, paste };
 };

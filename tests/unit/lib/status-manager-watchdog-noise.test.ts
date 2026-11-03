@@ -6,7 +6,7 @@ import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
 import type { IBackgroundJob, TLivenessEvent } from '@/types/liveness';
-import { memoryTabEvents } from './tab-events-harness';
+import { memoryLedgerTables, memoryTabEvents } from './tab-events-harness';
 
 // Watchdog noise (h-selfimprove item 3; L38, L49, L37):
 //  - L38: a tab closed through the API raises no INACTIVE; a tab whose agent dies unclosed still does.
@@ -97,7 +97,7 @@ const setup = async (worker: Partial<ITabStatusEntry> = {}) => {
   await import('@/lib/providers');
   const { StatusManager } = await import('@/lib/status-manager');
   const tabEvents = memoryTabEvents();
-  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents);
+  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents, memoryLedgerTables()[1]);
   const alerts = vi.fn(async (_params: { kind: string }) => {});
   (manager as unknown as { dispatchAlert: typeof alerts }).dispatchAlert = alerts;
   manager.registerTab('root', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'root', tmuxSession: 'tmux-root', panelType: 'claude-code' });
@@ -439,7 +439,7 @@ describe('the idle nudge survives a server restart (review r1 finding 2)', () =>
       paste,
     });
     const tabEvents = memoryTabEvents();
-    const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents);
+    const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents, memoryLedgerTables()[1]);
     manager.registerTab('root', { cliState: 'idle', workspaceId: 'ws-1', tabName: 'root', tmuxSession: 'tmux-root', panelType: 'claude-code' });
     state.running = true;
     await manager.poll();

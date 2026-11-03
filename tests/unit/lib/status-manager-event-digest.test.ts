@@ -4,7 +4,7 @@ import type { TLivenessEvent } from '@/types/liveness';
 import type { ITabStatusEntry } from '@/types/status';
 import type { TabEventsTable } from '@/lib/tab-events-store';
 import type { ITab } from '@/types/terminal';
-import { memoryTabEvents } from './tab-events-harness';
+import { memoryLedgerTables, memoryTabEvents } from './tab-events-harness';
 
 const workspaceStore = vi.hoisted(() => ({ getWorkspaceByIdCached: vi.fn(), getWorkspacesCached: vi.fn() }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
@@ -43,7 +43,7 @@ const setup = async (opts: {
   });
   const tabEvents = opts.tabEvents ?? memoryTabEvents();
   const { StatusManager } = await import('@/lib/status-manager');
-  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents);
+  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents, memoryLedgerTables()[1]);
   const internals = manager as unknown as {
     nudgeOrchestrator: (tabId: string, e: ITabStatusEntry, kind: string, detail?: string, episode?: string) => Promise<boolean>;
     tabEvents: { tick: () => Promise<void> };
@@ -122,7 +122,7 @@ describe('watchdog nudges through the wake classes (ADR-0035)', () => {
     const { marker, tabEvents } = await setup();
     await marker('DONE: before the restart', 'seq:1');
     const { StatusManager } = await import('@/lib/status-manager');
-    const restarted = new StatusManager(undefined, vi.fn(async () => true), vi.fn(async () => {}), tabEvents);
+    const restarted = new StatusManager(undefined, vi.fn(async () => true), vi.fn(async () => {}), tabEvents, memoryLedgerTables()[1]);
     expect(restarted.getOrchestrationNudges('ws-1')).toEqual([expect.objectContaining({
       tabId: 'w', tabName: 'w', kind: 'turn-marker', delivered: true, wakeClass: 'urgent', message: expect.stringContaining('DONE: before the restart'),
     })]);
