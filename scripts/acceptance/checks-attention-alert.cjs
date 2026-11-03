@@ -1,5 +1,5 @@
 'use strict';
-// Wave-11 acceptance check (harness-flow-loop story 33, round 2): a Mission Control item that becomes
+// Wave-12 acceptance check (harness-flow-loop story 33, round 2): a Mission Control item that becomes
 // owner-visible sends exactly ONE `attention-opened` alert through the candidate's production build,
 // on the status socket the phone listens to. Two items: one opened owner-visible at once
 // (`attention.opened` with a human need), one opened as a candidate and promoted by

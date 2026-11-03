@@ -16,7 +16,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │   └── {wsId}/
 │       ├── layout.json           # pane/tab tree
 │       ├── message-history.json  # per-workspace input history
-│       ├── claude-prompt.md      # --append-system-prompt-file content
+│       ├── claude-prompt.md      # --append-system-prompt-file content, with the active standing orders
+│       ├── standing-orders.md    # the workspace's standing orders SO-<n> (ADR-0041; 0600)
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       ├── burndown.json         # latest published epic burndown (Scrum Master)
 │       ├── flow.json             # latest published pipeline flow + server history (ADR-0026)
@@ -48,6 +49,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── leases.json              # held leases (ADR-0011; 0600)
 ├── notes.json               # coordinator notes (ADR-0013; 0600)
 ├── watches.json             # harness watches (ADR-0015; 0600)
+├── standing-orders.md       # the fleet's standing orders SO-<n>, seeded with the W8 orders (ADR-0041; 0600)
+├── standing-orders-seq.json # the highest SO-<n> ever handed out, so no id is reused (ADR-0041; 0600)
 ├── inbox.json               # server notices queued or held for tabs (ADR-0012; 0600)
 ├── fleet-config.json        # fleet config keys, versions and history (ADR-0019; 0600)
 ├── deploy-announcements.json # deploy announcements and their recipients, 7 days (ADR-0017; 0600; coordination `deploys` reads the last 24 h)
@@ -427,7 +430,19 @@ Per-workspace input history for Claude tabs. Capped at 500 entries. Locks are ke
 
 ### `claude-prompt.md` — `src/lib/claude-prompt.ts`
 
-The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change. Contains workspace ID + CLI quick-reference.
+The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change, before every Claude launch (tab create, restart, resume), and when a standing order changes. Contains workspace ID + CLI quick-reference + the active standing orders (ADR-0041).
+
+### `standing-orders.md` — `src/lib/standing-orders-store.ts`
+
+The owner's standing orders (ADR-0041), one file for the fleet (`~/.purplemux/standing-orders.md`) and one per
+workspace. Each `## SO-<n>` block carries `text`, `source` (the owner message and its UTC date), `scope`, `check` (a
+hook or test, or `prose`), `state` (`active` or `struck`), `added`, and `struck` once struck. Ids are unique across
+every file. The active orders of the fleet and the workspace are written into `claude-prompt.md`; together they may
+take at most 8 KB there. A missing fleet file is created with the W8 seed orders; a missing workspace file holds
+none; a file in another layout (or empty, or without its `# Standing orders:` header) is refused, never read as empty. The seed is
+written under the host lock, every write is tmp + rename with a name of its own, and `standing-orders-seq.json`
+(`{ "high": n }`) keeps the highest id ever handed out, so an id is never reused even when its workspace directory
+is removed. Written with `purplemux so add|strike`.
 
 ### `standups.json` — `src/lib/standup-store.ts`
 

@@ -395,6 +395,34 @@ generation) is skipped; a skipped replay is recorded by `recordSkippedReplay` as
 
 ---
 
+### Context lifecycle (ADR-0036)
+
+A tab created with `--handoff <path>` is a seat (`ITab.handoffPath`, mirrored on `ITabStatusEntry.handoffPath` /
+`rotateAt`). `StatusManager` owns one `ContextLifecycle` (`src/lib/context-lifecycle.ts`) and feeds it:
+
+| Input | Call | Effect |
+|---|---|---|
+| statusline POST (`/api/status/statusline`) | `recordContextReading(sessionId, tokens)` → `onContext` | context kept; recorded on the seat item at most every 5 min; a rotation checked |
+| `pre-compact` hook | `onCompact(tabId, 'pre')` | `compactions` + 1 on the seat item (board anomaly `seat-compactions`) |
+| `post-compact` hook | `onCompact(tabId, 'post')` | rotation due at the next idle, whatever the context |
+| classified `stop` (`applyStopTurnEnd`) | `onTurnEnd(tabId, tail)` | a last line `HANDOFF-READY` answers an open ROTATE; any other end line while a rotation is owed asks ROTATE again |
+| `session-start` (not a compaction's) | `onSessionStart(tabId)` | the context reading is dropped; after a rotation's restart it opens the first-message gate |
+| `prompt-submit` | `onPromptSubmit(tabId)` | a submission after HANDOFF-READY puts the seat back to `rotate-requested` |
+| `applyCliState` → `idle` / `ready-for-review` | `onIdle(tabId)` | the next step runs |
+| `tab-restart` `restarted` | `onRestarted` | the context reading is dropped |
+| `removeTab` | `onClosed` | the seat item closes |
+
+A step runs only when `canRotate` holds (consult 10-C1): `isAtPrompt` (idle, ready for review, or a WAITING stop
+with no newer event), and a fresh read finds no live registered job and no open background task (an unreadable
+transcript blocks). Armed watches never block: they survive the restart. A WAITING stop also calls `onIdle`.
+ROTATE goes through the tab event router as kind `rotate` (urgent) with `whenReady = isAtPrompt`, re-checked
+inside the dispatch lock with the router's 5 s settle window. While a rotation is owed or under way the router's
+`holdDigest` holds the seat's digests. A passing handoff check calls `restartTab({ clear: true, interrupt: false,
+interruptIf, by: { kind: 'server', reason: 'context-rotation' } })`; `interruptIf` runs inside the restart lock
+(`isWaitingAtPrompt` and no `orchestrationActivity.turn` newer than the stop). The first message goes through
+`typeFirstMessage` once a session newer than the restart reported in, with `whenReady = isIdleAtPrompt`, never by
+a fallback timer. A 30 s tick re-reads `context.rotate-at-tokens` and steps every seat.
+
 ## Server Restart Policy
 
 The only state that can be lost across a server restart is `busy` (Claude might fire `stop`/`notification` while the server is down). All other states have "the ball in the user's court", so no automatic transitions occur and the persisted value can stay as-is.
@@ -715,6 +743,15 @@ says "no reply needed", is held for the digest unless it carries a verdict marke
 A ledger that cannot be opened or written holds nothing: the router types every non-log event at once. A digest's
 delivery is broadcast again under the nudges' ids; an hour-old held backlog raises one flag alert.
 
+A classified stop whose last line starts `NEEDS-DECISION:` also opens a Mission Control item (ADR-0041 §2), whatever the
+tab's `reportOn`: `applyStopTurnEnd` awaits `openNeedsDecision` before the nudge, handing the whole last line of the
+tail, the stop's seq and time, and the turn's start (the previous stop's `at`, else `busySince`) to
+`openNeedsDecisionItem`, which opens nothing when an item for the same line is still open or the tab already opened one
+this turn. The nudge's end line then carries the item note. With no item, a live orchestrator that receives the tab's
+escalations is told to open it (the nudge is forwarded even past `reportOn`); otherwise one `needs-decision` push goes
+to the owner, never awaited, at most once a day per line. A changed
+standing order reaches each live agent tab (`liveAgentTabs`) as one `standing-order` event, class urgent.
+
 ---
 
 ## Standup Ticks
@@ -876,6 +913,7 @@ A 60 s interval (`globalThis.__ptFlagAlertTick`), started beside the Mission Con
 
 - **Fleet flags** from `readFleetView(now)` (ADR-0023, the 5 s cache): STALL?, WAITING-LONG and UNANSWERED per agent tab (subject: the tab id), and a workspace's unattributed UNANSWERED (subject: the workspace id).
 - **Flow flags**: `deriveFlowFlags(readFlow(ws), readFlowThresholds(), now)` over every workspace's record (ADR-0026). A stale record raises only `stale`.
+- **Ledger flags** from the constraint finder's cached answers (ADR-0034, source `ledger:<ws>`): each breached anomaly (rule the anomaly id), and each open wait past its `ledger.threshold.<reason>` (rule the reason, subject the item key; `ledgerFlagScan`, `src/lib/ledger-alarms.ts`).
 
 The raise-edge state is on `globalThis.__ptFlagAlertState`, keyed `source:workspaceId:rule:subject`. A key present now and absent in the previous read is a raise, and sends one `flag` alert unless that key alerted within fleet config `alerts.flag-repeat-minutes` (default 60). A flag that stays raised sends nothing more.
 
@@ -891,7 +929,9 @@ Each flag names its **sources**, the reads its rule can depend on: `fleet-view`,
 | target cannot be checked | the fleet view or the workspace's layout is unreadable, or the orchestrator's row is in state `unknown`: the raise stays pending, is retried on each tick while the flag stays raised, and `flag-alert-target-unknown` is logged with the reason |
 | a tick still runs at the next interval | the next tick is skipped; a tick over 5 s logs its duration |
 
-The tick calls `getNotificationDispatcher().dispatch` directly (status socket, web push, FCM) and never sends an inbox notice. `alerts.flags` and `alerts.flag-repeat-minutes` are written by the admin token only (`ADMIN_ONLY_KEYS`).
+The tick calls `getNotificationDispatcher().dispatch` directly (status socket, web push, FCM) for fleet, flow and anomaly flags, and never sends an inbox notice. `alerts.flags` and `alerts.flag-repeat-minutes` are written by the admin token only (`ADMIN_ONLY_KEYS`).
+
+**Ledger routing (story 13, ADR-0032 amendment of 2026-11-03).** A ledger flag goes to the tabs `ledger.route.<ws>` names (`ledgerFlagTargets`): a tab name, `$holder`, `$orchestrator` or `$board`, with the enabled orchestrator for an unnamed reason and in place of a holder or name that is no tab; an unreadable view, layout or routed row defers the raise. Each line enters `StatusManager.routeTabEvent` (the tab event router): an item alarm as kind `alarm` (urgent for `red-main` and a critical-path `chain-down`, else digest; never the phone), an anomaly as kind `flag` (digest) beside its phone alert, which names the first routed tab. Neither a digest-line raise nor a repeat adds a line to a tab whose digest still holds a copy of the same item and reason (`TabEventsTable.copies`); an urgent raise is typed whatever the tab's digest holds, since it never waits in a digest (confirmation N2). A standing item alarm is routed again, as a digest line, once the repeat window has passed since the later of its last copy to that tab (with none: the later of the key's last alert and the tick that recorded it, read once per tick before that tick's sends) and that copy's delivery, and only on a tick whose sources all read well; after a restart or after `alerts.flags` comes back on, its first repeat comes one window after that tick. A repeat counts as an alert for the repeat window, so a new episode of the same item inside one window of a repeat is not raised again; `globalThis.__ptFlagAlertState.alarmSends` keeps the per-tab send times. An unreadable fleet config makes every `ledger:<ws>` source unread for the tick: no ledger flag raises, repeats or clears.
 
 
 ## Codex launch policy and observed model

@@ -875,6 +875,18 @@ export class MissionControlStore {
     this.database.prepare('SELECT created_at FROM answers WHERE workspace_id = ? AND created_at >= ? ORDER BY created_at')
       .pluck().all(workspaceId, since) as number[];
 
+  /** Items the tab opened at or after `since`, any state: a NEEDS-DECISION turn that already asked opens none (ADR-0041). */
+  itemsOpenedByTab = (workspaceId: string, tabId: string, since: number): string[] =>
+    (this.database.prepare(`SELECT item_id FROM mission_item_openers INDEXED BY mission_item_openers_tab_idx
+      WHERE workspace_id = ? AND tab_id = ? AND opened_at >= ? ORDER BY opened_at, item_id`).all(workspaceId, tabId, since) as Array<{ item_id: string }>)
+      .map((row) => row.item_id);
+
+  /** Still-open items (candidate or open) whose id starts with the prefix, whoever opened them (ADR-0041 §2). */
+  openItemsWithIdPrefix = (workspaceId: string, prefix: string): string[] =>
+    (this.database.prepare(`SELECT id FROM attention_items WHERE workspace_id = ? AND substr(id, 1, length(?)) = ?
+      AND state IN ('candidate','open') ORDER BY created_at, id`).all(workspaceId, prefix, prefix) as Array<{ id: string }>)
+      .map((row) => row.id);
+
   /** Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). */
   openItemOpeners = (): IMissionOpenItemOpener[] => {
     const rows = this.database.prepare(`SELECT a.id AS item_id, a.workspace_id, a.created_at,

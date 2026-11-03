@@ -199,6 +199,11 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'pool-full': EXIT.CONFLICT,
   'pool-unreadable': EXIT.CONFLICT,
   'pool-timeout': EXIT.UNREACHABLE,
+  'so-invalid': EXIT.USAGE,
+  'so-too-large': EXIT.USAGE,
+  'so-not-found': EXIT.NOT_FOUND,
+  'so-unreadable': EXIT.CONFLICT,
+  'so-struck': EXIT.CONFLICT,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -1249,6 +1254,95 @@ const cmdWatch = async (args) => {
   }
 };
 
+// Auth waits (ADR-0041): an auth watch on the owner's AWS sign-in. The server reads the SSO cache file
+// every 60 s and starts no aws process (DEC-261); the notice reaches this tab through the inbox.
+const WAIT_USAGE = 'usage: wait add --auth PROFILE [--item LEDGER_ITEM_KEY] [--ttl 24h] [--label TEXT] (list and clear with purplemux watch list|clear)';
+
+const cmdWait = async (args) => {
+  if (args[0] !== 'add') die(WAIT_USAGE);
+  const rest = args.slice(1);
+  if (stripFlags(rest, ['--auth', '--item', '--ttl', '--label']).length) die(WAIT_USAGE);
+  const profile = flagValue(rest, '--auth');
+  if (!profile) die(WAIT_USAGE);
+  const data = { kind: 'auth', target: profile, until: 'signed-in' };
+  const item = flagValue(rest, '--item');
+  if (item !== null) data.ledgerItem = item;
+  const ttl = flagValue(rest, '--ttl');
+  if (ttl !== null) {
+    const seconds = parseTtl(ttl);
+    if (seconds === null) die('--ttl needs a duration (a wait always expires, at most 7d)');
+    data.ttlSeconds = seconds;
+  }
+  const label = flagValue(rest, '--label');
+  if (label !== null) data.label = label;
+  requireEnv();
+  const { body } = await api('POST', '/api/cli/watches', data);
+  return out(body);
+};
+
+// Standing orders (ADR-0041): the owner's rules, written into every Claude tab's workspace prompt file.
+const SO_USAGE = 'usage: so add (-w WS | --fleet) --text TEXT --source "OWNER MESSAGE ID, UTC DATE" [--scope S] [--check HOOK|TEST|prose]; so strike SO-N --reason TEXT; so list [-w WS] [--all] [--json]';
+
+const printOrders = (orders) => {
+  if (!orders.length) {
+    process.stdout.write('no standing orders\n');
+    return;
+  }
+  for (const o of orders) {
+    const struck = o.state === 'struck' ? `  STRUCK ${o.struck}` : '';
+    process.stdout.write(`${o.id}  [${o.owner}; scope ${o.scope}; check ${o.check}]  ${o.text}\n    source: ${o.source}${struck}\n`);
+  }
+};
+
+const cmdSo = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  const ws = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  switch (sub) {
+    case 'add': {
+      const positional = stripBooleanFlags(stripFlags(rest, ['--text', '--source', '--scope', '--check', '-w', '--workspace']), ['--fleet', '--json']);
+      if (positional.length) die(SO_USAGE);
+      const fleet = rest.includes('--fleet');
+      if (fleet === !!ws) die('so add needs exactly one of -w WS (a workspace order) or --fleet (admin token)');
+      const text = flagValue(rest, '--text');
+      const source = flagValue(rest, '--source');
+      if (!text || !source) die(SO_USAGE);
+      const data = { text, source };
+      if (ws) data.workspaceId = ws;
+      const scope = flagValue(rest, '--scope');
+      if (scope !== null) data.scope = scope;
+      const check = flagValue(rest, '--check');
+      if (check !== null) data.check = check;
+      requireEnv();
+      const { body } = await api('POST', '/api/cli/standing-orders', data);
+      if (rest.includes('--json')) return out(body);
+      process.stdout.write(`${body.order.id} added (${body.owner}); its prompt section is ${body.bytes} bytes of 8192; ${body.promptsWritten} prompt file(s) rewritten, ${body.tabsNotified} live tab(s) told\n`);
+      return;
+    }
+    case 'strike': {
+      const positional = stripBooleanFlags(stripFlags(rest, ['--reason']), ['--json']);
+      const reason = flagValue(rest, '--reason');
+      if (positional.length !== 1 || !reason) die(SO_USAGE);
+      requireEnv();
+      const { body } = await api('POST', `/api/cli/standing-orders/${encodeURIComponent(positional[0])}/strike`, { reason });
+      if (rest.includes('--json')) return out(body);
+      process.stdout.write(`${body.order.id} struck (${body.owner}); ${body.promptsWritten} prompt file(s) rewritten, ${body.tabsNotified} live tab(s) told\n`);
+      return;
+    }
+    case 'list': {
+      const positional = stripBooleanFlags(stripFlags(rest, ['-w', '--workspace']), ['--all', '--json']);
+      if (positional.length) die(SO_USAGE);
+      requireEnv();
+      const query = [ws ? `workspaceId=${encodeURIComponent(ws)}` : '', rest.includes('--all') ? 'all=1' : ''].filter(Boolean).join('&');
+      const { body } = await api('GET', `/api/cli/standing-orders${query ? `?${query}` : ''}`);
+      if (rest.includes('--json')) return out(body);
+      return printOrders(body.orders || []);
+    }
+    default:
+      die(SO_USAGE);
+  }
+};
+
 // Portfolio drive grants (ADR-0014) and the owner grant (ADR-0029): read-only here. A grant is
 // created and revoked only in the web UI (a human session plus the purplemux password); no CLI token can do either.
 const cmdGrant = async (args) => {
@@ -1591,7 +1685,12 @@ const cmdTabCreate = async (args) => {
   const role = flagValue(args, '--role');
   const previewUrl = flagValue(args, '--preview-url');
   const pgService = flagValue(args, '--pg-service');
+  // A seat (ADR-0036): rotate from this handoff file at the context threshold; the path is resolved against the cwd.
+  const handoff = flagValue(args, '--handoff');
+  const rotateAt = flagValue(args, '--rotate-at');
   if (!wsId) die('--workspace is required');
+  if (args.includes('--handoff') && !handoff) die('--handoff needs the path of the seat\'s handoff file');
+  if (args.includes('--rotate-at') && !rotateAt) die('--rotate-at needs a token count (50000..900000) or off');
   if (args.includes('--role') && !role) die('--role needs a role name (evaluator)');
   if (args.includes('--pg-service') && !pgService) die('--pg-service needs a ~/.pg_service.conf entry name');
   if (args.includes('--preview-url') && !previewUrl) die('--preview-url needs the http(s) URL of the preview the evaluator may browse');
@@ -1620,9 +1719,43 @@ const cmdTabCreate = async (args) => {
     ...(role ? { role } : {}),
     ...(previewUrl ? { previewUrl } : {}),
     ...(pgService ? { pgService } : {}),
+    ...(handoff ? { handoff: path.resolve(handoff) } : {}),
+    ...(rotateAt ? { rotateAt } : {}),
     ...(overCap ? { overCap: { reason } } : {}),
   });
   out(body);
+};
+
+/**
+ * `handoff check <path>` (ADR-0036 §4): the file is read here and checked by the server's checkHandoff, the
+ * function the rotation runs. PASS exits 0; refusals print one `handoff-check:` line each and exit 1, as v2's
+ * tools/handoff-check.py did.
+ */
+const cmdHandoff = async (args) => {
+  const [sub, file, ...rest] = args;
+  if (sub !== 'check' || !file || file.startsWith('-')) die('usage: handoff check <path> [--rotate-requested-at UTC] [--now UTC] [--json]');
+  const rotateRequestedAt = flagValue(rest, '--rotate-requested-at');
+  const now = flagValue(rest, '--now');
+  if (rest.includes('--rotate-requested-at') && !rotateRequestedAt) die('--rotate-requested-at needs a UTC time');
+  if (rest.includes('--now') && !now) die('--now needs a UTC time');
+  requireEnv();
+  let text;
+  try {
+    // A BOM is kept, so it is refused as v2's checker refuses it.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file));
+  } catch (err) {
+    process.stdout.write(`handoff-check: cannot read ${file}: ${err.message || err} (expected a readable UTF-8 handoff file)\n`);
+    process.exit(1);
+  }
+  const { body } = await api('POST', '/api/cli/handoff/check', {
+    text,
+    ...(rotateRequestedAt ? { rotateRequestedAt } : {}),
+    ...(now ? { now } : {}),
+  });
+  if (rest.includes('--json')) out(body);
+  else if (body.ok) process.stdout.write(`handoff-check: PASS ${file}\n`);
+  else process.stdout.write(body.reasons.map((reason) => `handoff-check: ${reason}\n`).join(''));
+  if (!body.ok) process.exit(1);
 };
 
 const cmdTabCount = async (args) => {
@@ -2276,8 +2409,9 @@ const printTable = (columns, rows) => {
 };
 
 // ── board (ADR-0034) ─────────────────────────────────────────────────────────
-const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine] | board pulse -w WS [--json]'
-  + ' | board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS';
+const BOARD_USAGE = 'usage: board show [-w WS] [--json|--line|--mine] | board pulse [-w WS] [--json]'
+  + ' | board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS'
+  + " (show and pulse default to this tab's workspace, PMUX_WORKSPACE_ID)";
 
 // The owner reads times in AEDT/AEST (ADR-HFL-02); Intl names the offset that applies on the day.
 const boardTime = (ms) => {
@@ -2415,8 +2549,9 @@ const cmdBoard = async (args) => {
   const rest = args.slice(1);
   if (sub === 'goal') return cmdBoardGoal(rest);
   if (sub !== 'show' && sub !== 'pulse') die(BOARD_USAGE);
-  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
-  if (!wsId) die('--workspace is required');
+  // A tab asks about its own workspace: seed order SO-7 runs `board show --line` with no -w (review r1, R4).
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w') || process.env.PMUX_WORKSPACE_ID;
+  if (!wsId) die('--workspace is required outside a purplemux tab (PMUX_WORKSPACE_ID is not set)');
   if (sub === 'pulse') {
     requireEnv();
     const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/pulse`);
@@ -2685,6 +2820,12 @@ Commands:
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
+             [--handoff PATH [--rotate-at N|off]]
+                                           A seat (ADR-0036): at its context threshold (fleet config
+                                           context.rotate-at-tokens, default 300000; --rotate-at 50000..900000 or
+                                           off for this tab), idle with no background work, it is sent ROTATE; on
+                                           HANDOFF-READY the file at PATH is checked and the tab restarts --clear
+                                           with "Read PATH, then continue: <resume command>". Local tabs only
              [--over-cap --reason TEXT]    An agent tab is refused at the WIP cap (fleet config tabs.cap-per-workspace,
                                            default 8): exit 3 wip-cap. Only the workspace's verified, enabled
                                            orchestrator tab passes it, with a reason (1-500 characters, else exit 2)
@@ -2789,13 +2930,14 @@ Commands:
                                            ranges) for the day and the 7 days ending on it ("—" with the reason when
                                            it is not measured).
                                            Read scope on WS (ADR-0030 amendment, harness-flow-loop 04)
-  board show -w WS [--json|--line|--mine]  The constraint finder's board (ADR-0034, refreshed every 60 s): the
+  board show [-w WS] [--json|--line|--mine] The constraint finder's board (ADR-0034, refreshed every 60 s; -w
+                                           defaults to PMUX_WORKSPACE_ID): the
                                            constraint (24 h, critical items first), its trend, owner and clear
                                            input; Mission Control's open items; stuck items oldest first; anomalies
                                            over threshold; each input's state. --line: goal, items left,
                                            constraint, trend on one line. --mine: only the items the calling tab
                                            holds (needs PMUX_TAB_TOKEN). Read scope on WS
-  board pulse -w WS [--json]               Hourly movement, last 48 h (ADR-0034 §9): one mark per hour from
+  board pulse [-w WS] [--json]             Hourly movement, last 48 h (ADR-0034 §9): one mark per hour from
                                            ledger changes, commits, gates (pass/fail), review rounds, v2 LANDED
                                            lines and Mission Control answers; stalled / moving / steady / idle;
                                            priority now; each source's own state ("not measured", never 0).
@@ -2817,6 +2959,9 @@ Commands:
                                            Default: the last 7 days by reason. T is Unix ms or ISO-8601
   ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT
   ledger experiment list -w WS [--json]    Improvement experiments (ADR-HFL-03): one active per stage, two in all
+  handoff check PATH [--rotate-requested-at UTC] [--now UTC] [--json]
+                                           Check a seat handoff file against the ADR-0036 schema (the checker the
+                                           rotation runs): PASS exits 0; each refusal prints a line, exit 1
   events show -w WS [TAB] [--since T] [--limit N] [--json]
                                            What each tab was sent (ADR-0035), whole for one TAB, one line each for
                                            the workspace: urgent typed at once, digest held for
@@ -2915,6 +3060,18 @@ Commands:
   watch list [-w WS] [--json]              Watches of your workspace: owner tab (live/closed), age, expiry, last check,
                                            the last error text
   watch clear ID                           Remove a watch (its owner tab or admin)
+  wait add --auth PROFILE [--item KEY] [--ttl 24h] [--label TEXT]
+                                           Wait on the owner's AWS SSO sign-in: the server reads that profile's SSO
+                                           cache file every 60 s (no aws process, DEC-261) and sends ONE inbox line
+                                           when its token is valid; a ledger deploy-auth wait on KEY, or naming the
+                                           profile in its clear input, clears then. 2 a profile that is not SSO
+  so add (-w WS | --fleet) --text TEXT --source "MESSAGE ID, UTC DATE" [--scope S] [--check NAME|prose]
+                                           Add a standing order SO-<n>: written into the workspace prompt file of
+                                           every Claude tab it reaches, and one urgent line to each live tab. A
+                                           fleet order needs the admin token. Over 8192 bytes of active orders for
+                                           one workspace is refused with the measured size (exit 2 so-too-large)
+  so strike SO-N --reason TEXT             Strike an order; it stays in its file, struck, and live tabs are told
+  so list [-w WS] [--all] [--json]         The active orders you load (--all: struck ones too), with their sources
   api-guide                                Print full HTTP API reference
   help                                     Show this usage
 
@@ -3008,6 +3165,12 @@ const main = async () => {
       return cmdDeploy(args.slice(1));
     case 'watch':
       return cmdWatch(args.slice(1));
+    case 'handoff':
+      return cmdHandoff(args.slice(1));
+    case 'wait':
+      return cmdWait(args.slice(1));
+    case 'so':
+      return cmdSo(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

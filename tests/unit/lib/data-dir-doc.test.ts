@@ -12,7 +12,7 @@ const STORES = [
   'owner-grants.json', 'grants.json', 'leases.json', 'notes.json', 'watches.json', 'inbox.json', 'fleet-config.json',
   'deploy-announcements.json', 'tab-tokens.json', 'workspace-tokens.json', 'mission-control.sqlite',
   'orchestrator-presence.json', 'evaluator/', 'bin/evaluator-sql', 'bin/evaluator-chrome-mcp', 'bin/evaluator-mcp-filter.cjs', 'audit/coordination.jsonl', 'session-stats/', 'hook-spool/', 'remote-transcripts/',
-  'stats/', 'spend-index.json', 'ledger.sqlite', 'ledger-tokens.json', 'ledger-tokens/', 'ledger-spool/',
+  'stats/', 'spend-index.json', 'ledger.sqlite', 'ledger-tokens.json', 'ledger-tokens/', 'ledger-spool/', 'standing-orders.md', 'standing-orders-seq.json',
 ];
 
 /** A store is named as a whole code span (`` `flow.json` ``) or a whole tree entry (`── flow.json `), never as a prefix. */

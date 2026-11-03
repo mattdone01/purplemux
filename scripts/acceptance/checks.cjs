@@ -8,7 +8,8 @@
 // Mission Control page (the owner board by default, Needs you at ?view=answers) in checks-mission-control-page.cjs;
 // the wave-8 question format v2 checks (ADR-0037) in checks-mc-question-v2.cjs; the wave-9 event digest checks
 // (ADR-0035) in checks-event-digest.cjs; the wave-10 owner board and pulse (story 12) in checks-board.cjs; the
-// wave-11 attention alert (story 33: one alert per item that becomes owner-visible) in checks-attention-alert.cjs, run last.
+// wave-11 context lifecycle checks (ADR-0036) in checks-context-lifecycle.cjs; the wave-12 attention alert (story 33:
+// one alert per item that becomes owner-visible) in checks-attention-alert.cjs, run last.
 // Before wave 1, checks-wip-cap.cjs sets the scratch fleet's WIP cap that the fixtures need and proves
 // the refusal at the cap (story 20; ADR-0027).
 //
@@ -58,6 +59,7 @@ const { wave7 } = require('./checks-mission-control-page.cjs');
 const { wave8 } = require('./checks-mc-question-v2.cjs');
 const { wave9 } = require('./checks-event-digest.cjs');
 const { wave10 } = require('./checks-board.cjs');
+const { wave11 } = require('./checks-context-lifecycle.cjs');
 const { waveAttentionAlert } = require('./checks-attention-alert.cjs');
 const { fixtureCapGate } = require('./checks-wip-cap.cjs');
 
@@ -1586,7 +1588,7 @@ const freePort = () =>
 /** The waves in run order; `--only-wave N` selects the Nth. Building the list calls no wave. */
 const wavesFor = (inst, opts, helpers) => [() => wave1(inst, opts), () => wave2(inst), () => wave3(inst, helpers), () => wave4(inst, helpers),
   () => wave5(inst, helpers), () => wave6(inst, helpers), () => wave7(inst), () => wave8(inst),
-  () => wave9(inst, helpers), () => wave10(inst, helpers), () => waveAttentionAlert(inst, helpers)];
+  () => wave9(inst, helpers), () => wave10(inst, helpers), () => wave11(inst, helpers), () => waveAttentionAlert(inst, helpers)];
 const WAVE_COUNT = wavesFor(null, {}, {}).length;
 
 const parseArgs = (argv) => {

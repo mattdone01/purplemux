@@ -209,3 +209,12 @@ week (then the threshold moves to story 20's 1.3 gates per landing). For the boa
 not fall below 1 a week within 14 days of the board, or the owner names a stuck item the board did not show. For the pulse: over 7 days of harness-flow-loop and treasury-v2,
 a window of 2 h or more with no movement, a story `in-progress`, no busy or needs-input worker tab and no open MC item
 (workers idle after DONE, the orchestrator stuck) reads `idle`, not `stalled`: idle story-worker tabs must then count.
+
+## Amendment (2026-11-03, story 13: alarm routing)
+
+§2's owner seat stays the heaviest holder: a routed seat is a delivery fact, not a finder measure, and the finder
+stays pure of fleet config. §8's "names the workspace's orchestrator until story 13 routes it" is replaced: a ledger
+flag names the tab `ledger.route.<ws>` routes its anomaly id to, with `$holder` read as its subject seat, and the
+orchestrator for an id the table does not name (ADR-0032, amendment of 2026-11-03). The flag tick also reads the
+cached answer's `stuck` list, uncapped, for item alarms; `stuck` therefore stays the full list of open waits, and
+only the board read caps it at 50. `FINDER_ANOMALY_IDS` is exported for the route table's pattern check.

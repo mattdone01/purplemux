@@ -118,6 +118,9 @@ to an exit code through one table:
      6  no answer (pool, ADR-0039)               pool-timeout                               fall back to a local slot, log it;
                                                                                             never for a gate.no-local-
                                                                                             fallback repository (ADR-0039 §6)
+     2  usage error (standing orders, ADR-0041)  so-invalid, so-too-large                   fix the command, or strike an order
+     3  refused by state (orders, ADR-0041)      so-unreadable, so-struck                   after the file is repaired
+     7  not found (standing orders, ADR-0041)    so-not-found                               —
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -669,7 +672,7 @@ the owner ONE inbox line when the condition holds, then deletes it; it dies with
 GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a lease watch is
 evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
 max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
-server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
+server token (http-404, http-403, timeout, auth, gh-missing, sso-config, other); watch list shows the error
 text; after that notice the watch reads less often (2x, 4x, up to 8x its interval). A merged
 watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
 requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
@@ -686,6 +689,45 @@ GET /api/cli/watches[?workspaceId=WS]
   "live"|"closed"|"unknown", "ageSeconds", "expiresInSeconds", "failures", "lastError" }] }.
 DELETE /api/cli/watches/<id>
   The owner tab or admin (else 403). 404 watch-not-found (exit 7). Response: { "removed" }.
+
+Auth waits (ADR-0041): kind "auth", target an AWS profile (stored as "aws-sso:<profile>"), until
+"signed-in", optional "ledgerItem" (a ledger item key). The server reads only that profile's AWS
+SSO cache file (~/.aws/sso/cache/<sha1 of its sso-session, or of a legacy sso_start_url>.json)
+every 60 s by default and starts no aws process (DEC-261); a profile ~/.aws/config does not define
+as SSO is 400 watch-invalid; so is a wait from a remote tab (the cache read is this server's host),
+and a tab whose host the layout cannot tell is 403 caller-unresolved (exit 3; never taken for a local
+tab). It fires on a sign-in: a token valid (accessToken present, expiresAt at least 5 min ahead) and
+different from the one valid at creation, if any. It then sends
+"[purplemux watch w-…] aws-sso:<profile> is signed in: its SSO token is valid until <UTC>; retry
+the step that needed it — watch cleared", and the server clears, with a ledger "clear" event, the
+open "deploy-auth" wait of ledgerItem and of every item of the workspace whose clear input names
+the profile as a word. An unreadable config or cache file is the failing token "sso-config".
+CLI: purplemux wait add --auth PROFILE [--item KEY] [--ttl 24h] [--label TEXT].
+
+## Standing orders (ADR-0041)
+
+The owner's rules, said once: ~/.purplemux/standing-orders.md (fleet; seeded with the W8 orders
+SO-1..SO-7) and ~/.purplemux/workspaces/<ws>/standing-orders.md. Each order SO-<n> (ids unique on
+the host) has text (≤ 600), source (the owner message id and UTC date, ≤ 300), scope (default the
+file's owner), check (a hook or test name, default "prose") and state (active | struck). The active
+fleet and workspace orders are written into the workspace's claude-prompt.md at every Claude launch
+(tab create, restart, resume) and on every change; a change also sends each live agent tab it
+reaches one urgent line: "[purplemux standing order] SO-<n> added|struck (<owner>): <text> — …".
+
+GET /api/cli/standing-orders[?workspaceId=WS][&all=1]
+  A tab reads the fleet's and its own workspace's orders; admin reads one workspace or every file.
+  Active orders only unless all=1. Response: { "orders": [{ id, owner, text, source, scope, check,
+  state, added, struck? }] }.
+POST /api/cli/standing-orders   { "text", "source", "workspaceId"?, "scope"?, "check"? }
+  No workspaceId: a fleet order (admin token only, else 403 forbidden). A workspace order: that
+  workspace's tabs or admin. 400 so-invalid names the field; 400 so-too-large when the active orders
+  one workspace loads would pass 8192 bytes, with the measured size. Response: { owner, order, bytes,
+  workspaceId, promptsWritten, tabsNotified }.
+POST /api/cli/standing-orders/<SO-n>/strike   { "reason" }
+  The same authority as the order's file. 404 so-not-found; 409 so-struck when already struck (exit 3).
+  The order stays in its file with "struck: <UTC> — <reason>".
+CLI: purplemux so add (-w WS | --fleet) --text T --source S [--scope S] [--check C]; so strike
+SO-N --reason R; so list [-w WS] [--all] [--json].
 
 ## Fleet config (ADR-0019)
 
@@ -724,6 +766,10 @@ Keys in use:
   remote.callback-allow-hosts
                Bare lower-case host names that remote.callback-url may name over plain http,
                comma-separated. Admin token only.
+  context.rotate-at-tokens
+               The context a seat rotates at (ADR-0036): a whole number of tokens 50000..900000.
+               Read every 30 s; unset or invalid means 300000 (an invalid value is logged). A tab's
+               own --rotate-at wins. Written by the admin token or an enabled orchestrator (ADR-0019).
   tabs.cap-per-workspace
                The WIP cap (ADR-0027): an integer 1..200 of agent tabs per workspace, one value
                for the fleet. Unset means 8 (capSource "default"); any other invalid value means 8
@@ -1325,6 +1371,60 @@ GET /api/mission-control/pulse[?workspaceId=all|WS]  (human session; all answers
   items; else none.
   priority: the constraint with its owner and clear input; else the oldest stuck critical item;
   with the needs-you count. staleSince: the finder answer it rests on is older than 120 s.
+
+## Context lifecycle (ADR-0036)
+
+A seat is an agent tab created with a handoff file: POST /api/cli/tabs with "handoff": "/abs/path.md"
+and optionally "rotateAt": <50000..900000> | "off"   (purplemux tab create ... --handoff PATH [--rotate-at N|off]).
+The path is absolute (the CLI resolves it against its cwd) and need not exist yet; a remote tab, a
+relative path, or rotateAt without handoff is 400 invalid-request. The tab answers and lists
+"handoffPath" and "rotateAt". Paths by convention: v2 seats .v2/seats/<seat>/handoff.md; other
+workspaces ~/.purplemux/workspaces/<ws>/seats/<tab-name>/handoff.md. Only seats rotate.
+Context: the Claude statusline's last request (input + cache writes + cache reads), per session.
+Rotation: when the context reaches the seat's threshold (rotateAt, else fleet config
+context.rotate-at-tokens, default 300000), or after a compaction, and the tab is at its prompt (idle,
+ready for review, or waiting) with no registered tab bg job and no open background task (armed
+watches survive a restart and do not count; an unreadable transcript blocks), the server types one
+urgent event (kind "rotate", ADR-0035), never mid-turn and never within 5 s of another delivery:
+  ROTATE: bring <path> up to date, then end your turn with HANDOFF-READY.
+A turn whose last line is HANDOFF-READY (or starts "HANDOFF-READY:") gets the file checked at the
+next idle with the checker below, against the request time (whole seconds). Any other turn end, or a
+new submission after HANDOFF-READY, asks ROTATE again with a new request time: the file is checked
+only as of the seat's last turn. While a rotation is owed or under way the seat's digests are held.
+Pass: the tab restarts --clear under the same id (ADR-0028: leases, watches, probes, notes and
+reportsTo stay; a seat waiting only on watches restarts with interrupt, decided inside the restart
+lock) and its first message, typed once a session newer than the restart is idle at its prompt, is
+"Read <path>, then continue: <resume command>". The seat item stays "rotating" until then, so a
+server restart resumes the rotation. Fail: one message
+"HANDOFF CHECK FAILED: <path>: <reasons>. Fix the file, then end your turn with HANDOFF-READY.";
+a second failure raises the rotation alarm and leaves the session as it is (a later HANDOFF-READY
+that passes still rotates and clears it). A rotation has one 30 min deadline from its first ROTATE
+and asks ROTATE at most twice; past the deadline the digest hold is released, it counts as one
+failed check, and the next rotation waits 30 min. HANDOFF-READY may end with "." or "!".
+Seat item: ledger item seat:<ws>:<tab-name>, holder the tab name, written by the server: open at
+create (or at the first reading after a server start), state = the rotation phase (watching,
+rotate-requested, handoff-ready, rotating, rotation-alarm), attrs tabId, handoffPath, rotateAtTokens,
+contextTokens and contextAt (a changed reading at most every 5 min), compactions,
+compactionsSinceRotation, lastCompactAt, rotations, lastRotationAt, rotateRequestedAt,
+rotationFailures, rotationAlarm; closed when the tab closes. Board anomalies (ADR-0034):
+context-per-call, seat-compactions (compactionsSinceRotation, threshold 0: a compaction is a missed
+rotation) and rotation-alarm (rotationFailures, threshold 1) and handoff-undelivered (a rotated seat whose first
+message was dropped after 10 min, threshold 0); each breach is a ledger flag alert. While a seat is
+rotating its urgent events are held too and typed after the first message.
+
+POST /api/cli/handoff/check   (purplemux handoff check PATH [--rotate-requested-at UTC] [--now UTC] [--json])
+  Any CLI scope. Body: { "text": the file, "rotateRequestedAt"?: UTC, "now"?: UTC } (UTC =
+  YYYY-MM-DDTHH:MM[:SS[.ffffff]] ending in Z or +00:00; else 400 invalid-request). Response
+  { "ok", "reasons": [string], "seat" | null, "updatedAt" | null, "resumeCommand" | null }. The schema:
+  the title "# Handoff: <seat> · updated <UTC>" first, not older than the request nor more than 5 min
+  after now; the headings ## Role (1-3 lines), ## In flight (none, or the table | item key | state |
+  next action | waiting on |), ## Open questions (none, or Mission Control item ids), ## Standing rules
+  (none, or "- <rule> (source: SO-<n> | DEC-<n> | ARC-<n> | lane ledger <name> <YYYY-MM-DDTHH:MM:SSZ> |
+  owner message <UTC date>)", one source per rule), ## Decisions in the last 24 h, ## Do not,
+  ## Resume command (one line), once each, in that order, no other; at most 12288 bytes. KR-<n>,
+  C-<name> and an ORCH-<n> stamp without "lane ledger" are not sources. The CLI reads the file
+  (unreadable or non-UTF-8: exit 1), prints "handoff-check: PASS <path>" (exit 0) or one
+  "handoff-check: <reason>" line each (exit 1), the wording of v2's tools/handoff-check.py.
 
 ## Portfolio board
 
