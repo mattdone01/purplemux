@@ -179,10 +179,11 @@ export const dispatchAttentionOpenedAlerts = async (
   // Each item's state as the batch moves it: an open-as-candidate then a promotion in one batch alerts once.
   const states = new Map<string, TMissionItemState>(input.previousStates ?? []);
   for (const event of input.events) {
+    // A replayed event changes no tracked state: its old state would mask the item's real one (confirm C1).
+    if (!input.fresh.has(event.id)) continue;
     const previous = states.get(event.entityId) ?? null;
     const after = committedState(event);
     if (after) states.set(event.entityId, after);
-    if (!input.fresh.has(event.id)) continue;
     const opened = attentionTransition(previous, event);
     if (!opened) continue;
     const key = keyOf(opened);

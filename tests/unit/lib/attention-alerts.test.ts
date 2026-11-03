@@ -216,6 +216,33 @@ describe('dispatchAttentionOpenedAlerts', () => {
     expect(sent).toEqual([]);
   });
 
+  // Architect confirm C1: a replayed event changes no tracked state, so its old state never masks the real one.
+  it('T1: a batch that replays the old candidate open and revises the open item sends nothing, after a restart', async () => {
+    const candidate = open('e-1', 'item-1', noOwner);
+    await run(apply([candidate]));
+    await run(apply([update('e-2', 'item-1', 1, needsOwner)]));
+    expect(sent).toHaveLength(1);
+    sent = [];
+    state = createAttentionAlertState();
+
+    const batch = apply([candidate, update('e-3', 'item-1', 2, needsOwner, 'Reworded?')]);
+    expect([...batch.fresh]).toEqual(['e-3']);
+    await run(batch);
+
+    expect(sent).toEqual([]);
+  });
+
+  it('T2: a replayed open plus a fresh promotion in one batch alerts once', async () => {
+    const candidate = open('e-1', 'item-1', noOwner);
+    await run(apply([candidate]));
+    state = createAttentionAlertState();
+
+    await run(apply([candidate, update('e-2', 'item-1', 1, needsOwner)]));
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].draft).toMatchObject({ itemId: 'item-1', question: { revision: 2 } });
+  });
+
   it('sends nothing for an update that keeps a candidate a candidate', async () => {
     await run(apply([open('e-1', 'item-1', noOwner)]));
     await run(apply([update('e-2', 'item-1', 1, noOwner, 'Still internal')]));
