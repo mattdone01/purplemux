@@ -188,6 +188,20 @@ export const CURATOR_TASKS: Readonly<Record<TCuratorTask, ICuratorTaskSpec>> = {
   'match-standing-order': spec('match-standing-order', 'mso-v1', [COVERED, NOT_COVERED], matchPrompt, () => NOT_COVERED),
 };
 
+/**
+ * The version key H every clock, evidence row, queue, evaluation and routing check uses (architect confirm R2): the
+ * static prompt version, then a hash of the served model's digest (a re-pull of the same tag is new weights) and, for
+ * the matcher, the sorted order set its prompt embeds. null when the digest is unknown: nothing is attributed then.
+ */
+export const servedVersion = (task: TCuratorTask, digest: string | null, orders?: readonly ICuratorStandingOrderRef[] | null): string | null => {
+  if (!digest) return null;
+  if (task === 'match-standing-order' && !orders) return null;
+  const set = task === 'match-standing-order'
+    ? [...orders!].map(({ id, text }) => ({ id, text })).sort((a, b) => a.id.localeCompare(b.id) || a.text.localeCompare(b.text))
+    : null;
+  return `${CURATOR_TASKS[task].promptVersion}~${fnv1a(JSON.stringify({ digest, orders: set }))}`;
+};
+
 export const CURATOR_TASK_IDS = Object.keys(CURATOR_TASKS) as TCuratorTask[];
 
 export const isCuratorTask = (value: unknown): value is TCuratorTask =>

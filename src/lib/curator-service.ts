@@ -15,7 +15,7 @@ import {
   readShadowEvidence, readSpotCheckFile, updateCuratorState, writeEvalResult, writeLabelQueue, writeLabelledSet, writeSpotCheckFile,
   type ILabelledItem,
 } from '@/lib/curator-store';
-import { CURATOR_TASKS, CURATOR_TASK_IDS, NOT_COVERED, endingAsksSomething, type ICuratorStandingOrderRef } from '@/lib/curator-tasks';
+import { CURATOR_TASKS, CURATOR_TASK_IDS, NOT_COVERED, endingAsksSomething, servedVersion, type ICuratorStandingOrderRef } from '@/lib/curator-tasks';
 import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { createLogger } from '@/lib/logger';
 import { readMessageHistory } from '@/lib/message-history-store';
@@ -40,6 +40,8 @@ const OWNER_MESSAGE_TAB = '-';
 
 const g = globalThis as unknown as {
   __ptCuratorShadowMarked?: Set<string>;
+  /** The order set `readOrders` last read: the matcher's version key needs it synchronously (confirm R2). */
+  __ptCuratorOrders?: ICuratorStandingOrderRef[];
   __ptCuratorAsksSeen?: Set<string>;
   __ptCuratorSpotDrafts?: Map<TCuratorTask, { file: ISpotCheckFile; question: ReturnType<typeof buildSpotCheckQuestion> }>;
   __ptCuratorClient?: CuratorClient;
@@ -67,11 +69,13 @@ const minIntervalMs = async (): Promise<number> => {
 
 /**
  * Every call into `tab_events` (AC 2): class `log`, kind `curator`, the record as JSON, never the input text. A live
- * call (outside the evaluation) of a prompt version that never ran starts that version's 72 h clock.
+ * model call (outside the evaluation; not a drop, which never reached the model; of a known served version) of a
+ * version that never ran starts that version's 72 h clock.
  */
 const recordCall = (job: ICuratorJob, record: ICuratorCallRecord, at: number): void => {
   const clock = `${record.task}\0${record.promptVersion}`;
-  if (job.workspaceId !== CURATOR_EVAL_WORKSPACE && !g.__ptCuratorShadowMarked!.has(clock)) {
+  const modelCall = record.outcome !== 'dropped' && record.modelDigest !== null;
+  if (job.workspaceId !== CURATOR_EVAL_WORKSPACE && modelCall && !g.__ptCuratorShadowMarked!.has(clock)) {
     g.__ptCuratorShadowMarked!.add(clock);
     void ensureShadowSince(record.task, record.promptVersion, at)
       .catch((err: unknown) => log.warn({ task: record.task }, `curator: shadow clock unwritable (${err instanceof Error ? err.message : String(err)})`));
@@ -99,15 +103,34 @@ export const getCuratorClient = (): CuratorClient => {
 const isEnabled = async (): Promise<boolean> => (await fleetValue(CURATOR_KEYS.enabled))?.trim() !== 'off';
 
 const readOrders = async (): Promise<ICuratorStandingOrderRef[]> => {
+  let orders: ICuratorStandingOrderRef[];
   try {
     const raw = JSON.parse(await fs.readFile(path.join(evalDir(), 'match-standing-order.orders.json'), 'utf-8')) as unknown;
-    return Array.isArray(raw)
+    orders = Array.isArray(raw)
       ? raw.flatMap((o: { id?: unknown; text?: unknown }) => (typeof o.id === 'string' && typeof o.text === 'string' ? [{ id: o.id, text: o.text }] : []))
       : [];
   } catch {
-    return [];
+    orders = [];
   }
+  g.__ptCuratorOrders = orders;
+  return orders;
 };
+
+/**
+ * The version key H the gate, clocks, evidence and routing use now (confirm R2): the static prompt version, the served
+ * model digest and (matcher) the order set. null while the digest or (matcher) the order set is unknown.
+ */
+const liveVersion = (task: TCuratorTask): string | null =>
+  servedVersion(task, getCuratorClient().digest(), task === 'match-standing-order' ? g.__ptCuratorOrders ?? null : null);
+
+/** The same, after reading the order file and, when no digest is known yet, probing the model once. */
+const liveVersionNow = async (task: TCuratorTask): Promise<string | null> => {
+  if (task === 'match-standing-order') await readOrders();
+  if (getCuratorClient().digest() === null && (await isEnabled())) await getCuratorClient().probe();
+  return liveVersion(task);
+};
+
+export const DIGEST_UNKNOWN = 'served model digest unknown: no probe of the curator has answered with gemma4:26b\'s digest';
 
 // The kodit rule (ADR-0038 §7): 72 h before the client went live against the 72 h after, once, then held.
 const checkKodit = async (now: number): Promise<void> => {
@@ -205,10 +228,12 @@ export const curatorOnMissionEvents = (events: ReadonlyArray<{ type: string; wor
 
 const taskStatus = (task: TCuratorTask, state: Awaited<ReturnType<typeof readCuratorState>>): ICuratorTaskStatus => {
   const entry = state.tasks[task];
-  const promptVersion = CURATOR_TASKS[task].promptVersion;
-  // A prompt changed since the gate passed is back in shadow: the gate was passed by another prompt.
-  const routing = entry?.state === 'routing' && entry.promotedPromptVersion === promptVersion;
-  const shadowSince = entry?.shadowSince?.[promptVersion] ?? null;
+  const version = liveVersion(task);
+  const promptVersion = version ?? `${CURATOR_TASKS[task].promptVersion}~unknown`;
+  // A prompt, a re-pulled model or an order edit since the gate passed is back in shadow: the gate was passed by
+  // another version. An unknown digest is never routing.
+  const routing = version !== null && entry?.state === 'routing' && entry.promotedPromptVersion === version;
+  const shadowSince = version === null ? null : entry?.shadowSince?.[version] ?? null;
   return {
     task, promptVersion, state: routing ? 'routing' : 'shadow', shadowSince,
     shadowEndsAt: shadowSince === null ? null : shadowSince + CURATOR_SHADOW_MS,
@@ -300,25 +325,27 @@ const shadowRowsOf = async (task: TCuratorTask, version: string, set: Awaited<Re
 
 /** The promote verdict without writing anything: `curator status` shows it, `curator promote` acts on it. */
 export const curatorGate = async (task: TCuratorTask, now: number): Promise<IPromoteVerdict> => {
-  const spec = CURATOR_TASKS[task];
+  const version = await liveVersionNow(task);
   const [state, result, set, spot] = await Promise.all([
     readCuratorState(), readEvalResult(task), readLabelledSet(task), SPOT_TASKS.includes(task) ? readSpotCheck(task) : Promise.resolve(null),
   ]);
-  const shadowRows = await shadowRowsOf(task, spec.promptVersion, set);
+  const key = version ?? `${CURATOR_TASKS[task].promptVersion}~unknown`;
+  const shadowRows = await shadowRowsOf(task, key, set);
   const verdict = spot?.verdict;
   const spotCheckApplied = verdict?.state === 'answered' && result?.spotCheck?.itemId === spot?.itemId
     && result !== null && result.startedAt >= (verdict.answeredAt ?? Infinity);
-  return promoteVerdict({
-    task, now, promptVersion: spec.promptVersion, labels: scoreLabels(task), shadowSince: taskStatus(task, state).shadowSince, result, shadowRows,
+  const gate = promoteVerdict({
+    task, now, promptVersion: key, labels: scoreLabels(task), shadowSince: taskStatus(task, state).shadowSince, result, shadowRows,
     ...(spot ? { spotCheck: spot.verdict, spotCheckApplied } : {}),
   });
+  return version === null ? { ...gate, ok: false, refusals: [DIGEST_UNKNOWN, ...gate.refusals] } : gate;
 };
 
 /** `curator promote` (AC 5, amended): every condition of `curatorGate`, refused with every reason. */
 export const promoteCuratorTask = async (task: TCuratorTask, now: number): Promise<IPromoteVerdict> => {
   const verdict = await curatorGate(task, now);
-  if (verdict.ok) {
-    const version = CURATOR_TASKS[task].promptVersion;
+  const version = liveVersion(task);
+  if (verdict.ok && version !== null) {
     await updateCuratorState((s) => {
       s.tasks[task] = { ...s.tasks[task], state: 'routing', promotedAt: now, promotedPromptVersion: version };
     });
@@ -341,7 +368,7 @@ export const readCuratorStatus = async () => {
     return {
       ...taskStatus(task, state),
       gate: { checks: gate.score?.checks ?? null, shadow: gate.shadow, refusals: gate.refusals },
-      queue: queue && queue.promptVersion === CURATOR_TASKS[task].promptVersion ? { size: queue.items.length, oldestAt: queueView(queue).oldestAt } : { size: 0, oldestAt: null },
+      queue: queue && queue.promptVersion === liveVersion(task) ? { size: queue.items.length, oldestAt: queueView(queue).oldestAt } : { size: 0, oldestAt: null },
     };
   }));
   return {
@@ -378,6 +405,8 @@ export const startCuratorEval = async (task: TCuratorTask, split: TCuratorSplit)
   if (running?.running) return running;
   const set = await readLabelledSet(task);
   if (!set || !set.items.length) throw new Error(`no labelled set for ${task} in ~/.purplemux/curator/eval/`);
+  const version = await liveVersionNow(task);
+  if (version === null) throw new CuratorRefusal(DIGEST_UNKNOWN);
   const { exclude, spotCheck } = await curatorEvalExclusions(task);
   const progress: ICuratorEvalProgress = { task, running: true, done: 0, total: 0, startedAt: Date.now(), error: null };
   g.__ptCuratorEvals!.set(task, progress);
@@ -388,6 +417,7 @@ export const startCuratorEval = async (task: TCuratorTask, split: TCuratorSplit)
     orders: readOrders,
     now: () => Date.now(),
     model: CURATOR_MODEL,
+    promptVersion: version,
     exclude,
     spotCheck,
     onProgress: (done, total) => { progress.done = done; progress.total = total; },
@@ -406,7 +436,8 @@ export const readCuratorEval = async (task: TCuratorTask, split: TCuratorSplit =
 
 /** `curator label-queue`: the live version's unlabelled shadow calls of the last 30 days join the queue; ids only out. */
 export const curatorLabelQueue = async (task: TCuratorTask, now: number) => {
-  const version = CURATOR_TASKS[task].promptVersion;
+  const version = await liveVersionNow(task);
+  if (version === null) throw new CuratorRefusal(DIGEST_UNKNOWN);
   const { getLedgerStore } = await import('@/lib/ledger-store');
   const calls: IShadowCall[] = getLedgerStore().tabEvents.curatorCallsSince(now - CURATOR_SOURCE_HORIZON_MS, CURATOR_EVAL_WORKSPACE).flatMap(({ at, text }) => {
     const r = parseRecord(text);
@@ -415,8 +446,13 @@ export const curatorLabelQueue = async (task: TCuratorTask, now: number) => {
       : [];
   });
   const [set, evidence, prior] = await Promise.all([readLabelledSet(task), readShadowEvidence(task), readLabelQueue(task)]);
-  const queue = prior && prior.promptVersion === version ? prior : { task, promptVersion: version, items: [] };
-  const known = new Set([...(set?.items ?? []).map((i) => i.id), ...evidence.map((r) => r.id), ...queue.items.map((i) => i.id)]);
+  // Ids a pass excluded (no permission ask) stay known across versions, so they never come back (confirm N2).
+  const queue = prior && prior.promptVersion === version
+    ? prior
+    : { task, promptVersion: version, items: [], ...(prior?.excluded?.length ? { excluded: prior.excluded } : {}) };
+  const known = new Set([
+    ...(set?.items ?? []).map((i) => i.id), ...evidence.map((r) => r.id), ...queue.items.map((i) => i.id), ...(queue.excluded ?? []),
+  ]);
   const added = queueAdditions(task, version, calls, known);
   queue.items.push(...added);
   await writeLabelQueue(queue);
@@ -466,7 +502,10 @@ export const curatorLabelImport = async (task: TCuratorTask, entries: unknown) =
     return { id, promptVersion: q.promptVersion, predicted: queued.predicted, outcome: queued.outcome, at: queued.at };
   }));
   const done = new Set([...verdict.accepted.map((a) => a.id), ...verdict.excluded]);
-  await writeLabelQueue({ ...q, items: q.items.filter((i) => !done.has(i.id)) });
+  await writeLabelQueue({
+    ...q, items: q.items.filter((i) => !done.has(i.id)),
+    ...(verdict.excluded.length || q.excluded?.length ? { excluded: [...new Set([...(q.excluded ?? []), ...verdict.excluded])] } : {}),
+  });
   return { task, imported: verdict.accepted.length, excluded: verdict.excluded.length, left: q.items.length - done.size };
 };
 
@@ -500,7 +539,7 @@ export const draftSpotCheck = async (task: TCuratorTask, workspaceId: string, no
     const gate = await curatorGate(task, now);
     const blocking = gate.refusals.filter((r) => !r.startsWith('spot-check'));
     if (blocking.length) throw new CuratorRefusal(`the matcher's spot check opens once the pool passes everything else: ${blocking.join('; ')}`);
-    const rows = await shadowRowsOf(task, CURATOR_TASKS[task].promptVersion, set);
+    const rows = await shadowRowsOf(task, (await liveVersionNow(task))!, set);
     draw = drawMatchSpotCheck(await withText(rows.filter((r) => r.gold !== NOT_COVERED && r.predicted === r.gold).map((r) => ({ id: r.id, label: r.gold }))), SPOT_CHECK_SIZE);
   }
   if (!draw.picked.length) throw new CuratorRefusal(`nothing to spot-check for ${task}`);

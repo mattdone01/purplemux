@@ -122,6 +122,9 @@ to an exit code through one table:
                                                  curator-workspace-invalid
      3  refused by state (curator, ADR-0038)     curator-gate-refused, curator-refused,     after the state changes
                                                  curator-unavailable
+     2  usage error (standing orders, ADR-0041)  so-invalid, so-too-large                   fix the command, or strike an order
+     3  refused by state (orders, ADR-0041)      so-unreadable, so-struck                   after the file is repaired
+     7  not found (standing orders, ADR-0041)    so-not-found                               —
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -673,7 +676,7 @@ the owner ONE inbox line when the condition holds, then deletes it; it dies with
 GitHub reads use the server's own gh, every intervalS (default 120, 60-3600); a lease watch is
 evaluated on each lease release and every pass. A watch expires after ttlSeconds (default 24 h,
 max 7 d) with one notice. Three failed reads in a row send one "failing" notice carrying a
-server token (http-404, http-403, timeout, auth, gh-missing, other); watch list shows the error
+server token (http-404, http-403, timeout, auth, gh-missing, sso-config, other); watch list shows the error
 text; after that notice the watch reads less often (2x, 4x, up to 8x its interval). A merged
 watch on a PR closed without a merge reports CLOSED. Host caps: 60 GitHub watches and 2,000 GitHub
 requests/h in all (a checks-settled watch reads 3 times per check) — 409 watch-cap, CLI exit 3; a
@@ -690,6 +693,45 @@ GET /api/cli/watches[?workspaceId=WS]
   "live"|"closed"|"unknown", "ageSeconds", "expiresInSeconds", "failures", "lastError" }] }.
 DELETE /api/cli/watches/<id>
   The owner tab or admin (else 403). 404 watch-not-found (exit 7). Response: { "removed" }.
+
+Auth waits (ADR-0041): kind "auth", target an AWS profile (stored as "aws-sso:<profile>"), until
+"signed-in", optional "ledgerItem" (a ledger item key). The server reads only that profile's AWS
+SSO cache file (~/.aws/sso/cache/<sha1 of its sso-session, or of a legacy sso_start_url>.json)
+every 60 s by default and starts no aws process (DEC-261); a profile ~/.aws/config does not define
+as SSO is 400 watch-invalid; so is a wait from a remote tab (the cache read is this server's host),
+and a tab whose host the layout cannot tell is 403 caller-unresolved (exit 3; never taken for a local
+tab). It fires on a sign-in: a token valid (accessToken present, expiresAt at least 5 min ahead) and
+different from the one valid at creation, if any. It then sends
+"[purplemux watch w-…] aws-sso:<profile> is signed in: its SSO token is valid until <UTC>; retry
+the step that needed it — watch cleared", and the server clears, with a ledger "clear" event, the
+open "deploy-auth" wait of ledgerItem and of every item of the workspace whose clear input names
+the profile as a word. An unreadable config or cache file is the failing token "sso-config".
+CLI: purplemux wait add --auth PROFILE [--item KEY] [--ttl 24h] [--label TEXT].
+
+## Standing orders (ADR-0041)
+
+The owner's rules, said once: ~/.purplemux/standing-orders.md (fleet; seeded with the W8 orders
+SO-1..SO-7) and ~/.purplemux/workspaces/<ws>/standing-orders.md. Each order SO-<n> (ids unique on
+the host) has text (≤ 600), source (the owner message id and UTC date, ≤ 300), scope (default the
+file's owner), check (a hook or test name, default "prose") and state (active | struck). The active
+fleet and workspace orders are written into the workspace's claude-prompt.md at every Claude launch
+(tab create, restart, resume) and on every change; a change also sends each live agent tab it
+reaches one urgent line: "[purplemux standing order] SO-<n> added|struck (<owner>): <text> — …".
+
+GET /api/cli/standing-orders[?workspaceId=WS][&all=1]
+  A tab reads the fleet's and its own workspace's orders; admin reads one workspace or every file.
+  Active orders only unless all=1. Response: { "orders": [{ id, owner, text, source, scope, check,
+  state, added, struck? }] }.
+POST /api/cli/standing-orders   { "text", "source", "workspaceId"?, "scope"?, "check"? }
+  No workspaceId: a fleet order (admin token only, else 403 forbidden). A workspace order: that
+  workspace's tabs or admin. 400 so-invalid names the field; 400 so-too-large when the active orders
+  one workspace loads would pass 8192 bytes, with the measured size. Response: { owner, order, bytes,
+  workspaceId, promptsWritten, tabsNotified }.
+POST /api/cli/standing-orders/<SO-n>/strike   { "reason" }
+  The same authority as the order's file. 404 so-not-found; 409 so-struck when already struck (exit 3).
+  The order stays in its file with "struck: <UTC> — <reason>".
+CLI: purplemux so add (-w WS | --fleet) --text T --source S [--scope S] [--check C]; so strike
+SO-N --reason R; so list [-w WS] [--all] [--json].
 
 ## Fleet config (ADR-0019)
 
@@ -986,11 +1028,15 @@ GET /api/cli/workspaces/<workspaceId>/flow[?history=all|window|none]
   first good read of any source read late; an unreadable store raises nothing and clears nothing;
   a target that cannot be checked is retried next tick. The orchestrator-only alert setting does
   not apply. No inbox notice is sent: the alert is for the human, not for an agent.
-  Attention alerts: an attention.opened that opens an item for the human (humanReview.humanNeed is
-  not "none", so the item state is "open") sends one notification:alert of kind
-  "attention-opened", title "Mission Control: answer needed", body the item title, and "itemId".
-  tabId is the opening tab, else the workspace's orchestrator. A candidate item, a replayed event,
-  attention.updated, an answer, a resolve and a cancel send nothing; an item alerts once.
+  Attention alerts: an item that first becomes owner-visible (state "open", humanReview.humanNeed
+  not "none") sends one notification:alert of kind "attention-opened": an attention.opened that is
+  open at once, or an attention.updated that moves a candidate to open. Title "Mission Control:
+  answer needed", body the item title, "itemId", and "question": { "formatVersion" (1|2),
+  "decision", "answerType", "options": [{ "id", "label", "needsText" }], "revision" } so a phone can
+  answer it from the notification. FCM carries "question" as JSON for a v2 item only, and only while
+  the data map stays under 3,584 UTF-8 bytes; Web Push does not carry it. tabId is the opening tab,
+  else the workspace's orchestrator. A candidate, a replayed event, an update of an item already
+  open, an answer, a resolve and a cancel send nothing; an item alerts once per server process.
 
 ## Spend (ADR-0030)
 
@@ -1172,7 +1218,7 @@ POST /api/cli/workspaces/<workspaceId>/ledger/experiments/<id>
 
 Retention: a daily job (10 min after boot, then every 24 h) rolls up into rollups_daily every day
 not yet rolled and every day a newly finished wait covers, then deletes events and intervals older
-than 92 days, tab events older than 30 days (ADR-0035), items closed before then, and rollups older
+than 92 days, tab events and tab turns older than 30 days (ADR-0035), items closed before then, and rollups older
 than 400 days, in chunks of 5,000 rows. A store failure answers 500 ledger-store-failed (exit 1).
 
 ## Event digest (ADR-0035)
@@ -1212,8 +1258,8 @@ GET /api/cli/workspaces/<workspaceId>/events?tab=&since=&limit=   (purplemux eve
   Read scope. since: an age (90s, 15m, 1h, 7d), Unix ms or ISO-8601, default 1h; limit 1..5000,
   default 500 (the newest kept). Response: { "workspaceId", "tabId" | null, "since", "now", "truncated",
   "events": [{ "seq", "workspaceId", "tabId" (the recipient), "at", "class", "kind", "text",
-  "sourceTabId" | null (the worker a nudge is about), "sourceTabName" | null, "deliveredAt" | null,
-  "digestId" | null }] }, oldest first. A digest event's deliveredAt is its digest's. The log
+  "sourceTabId" | null (the worker a nudge is about), "sourceTabName" | null, "rule" | null (a flag's
+  rule or an alarm's reason), "deliveredAt" | null, "digestId" | null }] }, oldest first. A digest event's deliveredAt is its digest's. The log
   survives a restart: a rotated or restarted tab reads what it was sent here. The CLI prints each
   event whole for one TAB (the digest's pointer) and one line each for the workspace.
 
@@ -1225,6 +1271,32 @@ GET /api/cli/workspaces/<workspaceId>/events/wakes?since=&until=&by=window|day
   "digests", "urgent" (delivered on their own), "logged" }] }. hasEvents false: the workspace has no
   tab event at all, so zero wakes is no record, not a quiet seat. 400 ledger-query-invalid names a bad
   since, until or by.
+
+GET /api/cli/workspaces/<workspaceId>/effects?days=N   (purplemux effects show [-w WS] [--days N] [--json])
+  Read scope; N 1..30, default 7 (400 ledger-query-invalid otherwise). Per component, what came next (story 15).
+  fired: tab_events rows recorded in the window, any class; a firing dropped before the router (the 60 s episode
+  filter) or routed to the board or phone only is not recorded. delivered: those of class urgent or digest delivered
+  in the window, in units: an urgent paste, or a digest counted once per component it carried (inDigest counts
+  those; every event of a digest takes the digest's outcome). delivered 0 means the component reached no tab, not
+  that it never fired. followed: the recipient's next turn, from tab_turns, started within 30 s of the paste
+  (nextTurnBoundMs) and made an acting tool call (edit, write or shell: Claude's PostToolUse matcher, Grok and Codex
+  tool names filtered to the same class). It is a count of what followed, not of what the delivery caused. The turn
+  is the one running at the paste or the first after it: one that started more than 5 s before the paste is midTurn;
+  one that started past the bound, or none by the bound, is noTurn (judged, not followed); a turn still running in
+  the server is pending, as is a paste younger than the bound; a tab gone with no turn is closed; a turn whose start
+  or tool calls were not recorded, or a tab with no turn recorded in the window, is unmeasured. judged = delivered
+  less midTurn, pending, closed and unmeasured. candidate: true when at least 10 (candidateMinObserved) deliveries
+  had an observed turn (judged less noTurn) and none followed, false when one followed, null (not measured)
+  otherwise, with candidateReason saying why: a candidate never rests on absence, so noTurn and delivered 0 count
+  toward none. Per-probe effect is not measured; counts are per
+  firing kind. Response: { "workspaceId", "requestedSince", "until", "since" (clamped to measuredSince; null:
+  nothing measured), "measuredSince" (the first recorded turn) | null, "nextTurnBoundMs", "candidateMinObserved",
+  "source", "rows": [{ "component" (a nudge kind, "stalled", "probe-failed", "flag:<anomaly>", "alarm:<wait reason>"
+  with a derived reason folded into its parent, a notice kind, "flow:<rule>", "fleet:<flag>"), "family" (nudge |
+  probe | flag | notice | phone | other), "fired", "delivered", "inDigest", "followed", "judged", "noTurn",
+  "midTurn", "pending", "closed", "unmeasured", "candidate", "candidateReason", "notMeasured" }] }. Every component the code can send
+  is listed, so one that reached no tab shows 0. A row with notMeasured (a reason) carries null counts, never 0: a
+  phone-only flag rule, a flag delivered before its rule was recorded, or a window before the first recorded turn.
 
 ## Board: the constraint finder (ADR-0034)
 
@@ -1303,7 +1375,9 @@ after a down result the queue backs off 30 s doubling to 5 min; inputs keep thei
 { task, model, promptVersion, sourceId | null, outcome, label | null, rulesLabel, span | null,
 withheld?, spanFound, latencyMs | null, waitedMs, cutTokens, promptTokens | null, source }; a span
 from a credential-like text is withheld, and no raw reply is stored. A promptVersion is
-<base>-<8 hex of the prompt template>: any prompt edit is a new version.
+<base>-<8 hex of model, options and template>~<8 hex of the served digest and (matcher) the order set>:
+any prompt edit, re-pull of the tag or order edit is a new version, with its own clock and evidence;
+with no digest known, calls wait for a probe, routing reads shadow and promote refuses.
 Tasks: classify-owner-message (standing-order, product-rule, answer, status-ping, one-off),
 flag-owner-question (an unmarked turn ending whose last 3 lines hold a '?'), match-standing-order
 (SO-n or not-covered; also every MC ask whose review needs approval or decision). Each is shadow
@@ -1319,7 +1393,8 @@ POST /api/cli/curator/eval  { task, split?: "holdout" | "train" | "all" }   (cur
 GET  /api/cli/curator/eval?task=T[&split=S]
   Any scope. POST starts or joins an evaluation and answers 202 { progress }; GET answers
   { progress | null, result | null }. The held-out result keeps per-class counts only; train and
-  all keep per-row id, gold, predicted, outcome and latency (never text). A result carries n,
+  all keep per-row id, gold, predicted, outcome and latency (never text) of training ids only. A
+  result whose calls span two served versions is refused. A result carries n,
   unresolved, agedOut (unreadable and older than 30 days), unresolvedByClass, excluded { shadow,
   disputed } and refused | null: more than 10% unresolved, overall or in a gated class, refuses
   before any model call.

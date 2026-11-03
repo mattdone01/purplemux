@@ -1,7 +1,7 @@
 import {
   CURATOR_BASE_URL, CURATOR_MODEL, CURATOR_QUEUE_MAX_WAIT_MS, CURATOR_TIMEOUT_MS, cutToLastTokens, parseCuratorReply, replySchema, spanOccurs,
 } from '@/lib/curator';
-import { CURATOR_REQUEST_OPTIONS, CURATOR_TASKS, type ICuratorTaskInput } from '@/lib/curator-tasks';
+import { CURATOR_REQUEST_OPTIONS, CURATOR_TASKS, servedVersion, type ICuratorTaskInput } from '@/lib/curator-tasks';
 import { createLogger } from '@/lib/logger';
 import { looksLikeSecret } from '@/lib/secret-patterns';
 import type { ICuratorCallRecord, ICuratorHealth, ICuratorResult, TCuratorOutcome, TCuratorTask } from '@/types/curator';
@@ -69,6 +69,7 @@ export class CuratorClient {
   private readonly queue: IQueued[] = [];
   private draining = false;
   private lastEndAt = 0;
+  private modelDigest: string | null = null;
   private downStreak = 0;
   private healthState: ICuratorHealth = { state: 'unknown', reason: null, since: null, checkedAt: null };
   private readonly baseUrl: string;
@@ -82,6 +83,9 @@ export class CuratorClient {
   }
 
   health = (): ICuratorHealth => ({ ...this.healthState });
+
+  /** The served model's digest from the last probe that found it; null before one. */
+  digest = (): string | null => this.modelDigest;
 
   queued = (): number => this.queue.length;
 
@@ -97,10 +101,14 @@ export class CuratorClient {
       if (!response.ok) {
         this.setHealth('down', `model down (Ollama answered ${response.status})`);
       } else {
-        const body = await response.json() as { models?: Array<{ name?: string; model?: string }> };
-        const present = (body.models ?? []).some((m) => m.name === this.model || m.model === this.model);
-        if (present) this.setHealth('up', null);
-        else this.setHealth('down', `model down (${this.model} not served)`);
+        const body = await response.json() as { models?: Array<{ name?: string; model?: string; digest?: string }> };
+        const served = (body.models ?? []).find((m) => m.name === this.model || m.model === this.model);
+        if (!served) this.setHealth('down', `model down (${this.model} not served)`);
+        else if (typeof served.digest !== 'string' || !served.digest) this.setHealth('down', `model down (${this.model} served with no digest)`);
+        else {
+          this.modelDigest = served.digest;
+          this.setHealth('up', null);
+        }
       }
     } catch (err) {
       this.setHealth('down', `tunnel down (${errorText(err)})`);
@@ -126,7 +134,8 @@ export class CuratorClient {
         this.dropExpired();
         const next = this.queue[0];
         if (!next) break;
-        if (this.healthState.state === 'down' || this.downStreak > 0) {
+        // No call runs without a known digest: a curator not yet probed (`unknown`) is probed first (confirm R2).
+        if (this.healthState.state !== 'up' || this.downStreak > 0) {
           if (this.downStreak > 0) {
             await this.deps.sleep(Math.min(CURATOR_DOWN_MAX_BACKOFF_MS, CURATOR_DOWN_RETRY_MS * 2 ** (this.downStreak - 1)));
             this.dropExpired();
@@ -173,7 +182,9 @@ export class CuratorClient {
     const span = extra.span ?? null;
     const withheld = span !== null && (looksLikeSecret(queued.job.input.text) || looksLikeSecret(span));
     const record: ICuratorCallRecord = {
-      task: queued.job.task, model: this.model, promptVersion: spec.promptVersion, sourceId: queued.job.sourceId ?? null, outcome, label,
+      task: queued.job.task, model: this.model, sourceId: queued.job.sourceId ?? null, modelDigest: this.modelDigest, outcome, label,
+      // H, the served version; a call that never reached a known model keeps the static version with `~unknown`.
+      promptVersion: servedVersion(queued.job.task, this.modelDigest, queued.job.input.orders) ?? `${spec.promptVersion}~unknown`,
       rulesLabel, span: withheld ? null : span, ...(withheld ? { withheld: true } : {}), spanFound: extra.spanFound ?? false, latencyMs: extra.latencyMs ?? null, waitedMs: extra.waitedMs,
       cutTokens: extra.cutTokens ?? 0, promptTokens: extra.promptTokens ?? null, source: label === null ? 'rules' : 'curator',
       ...(extra.error ? { error: extra.error } : {}),

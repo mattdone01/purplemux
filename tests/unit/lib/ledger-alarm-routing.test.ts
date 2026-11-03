@@ -375,6 +375,8 @@ describe('urgent and routed alarms', () => {
     f.script.stuck = [stuckItem({ holder: 'v2-w-gone' })];
     await f.run(0, 20);
     expect(f.alarms('tab-orch').map((e) => e.text)).toEqual([`${ITEM} not-armed for 20 min (threshold 20 min); clear: arm visa; holder v2-w-gone`]);
+    // Story 15: the reason travels with the line, so its effect is counted per reason.
+    expect(f.alarms('tab-orch').map((e) => e.rule)).toEqual(['not-armed']);
   });
 
   it('keeps an owner wait on the board: no tab line', async () => {
@@ -417,8 +419,8 @@ describe('anomaly flags (consult ruling 13, b)', () => {
     expect(f.dispatched.map((d) => ({ tabId: d.tabId, flag: d.flag }))).toEqual([{
       tabId: 'tab-kit', flag: { source: 'ledger', rule: 're-gates', subject: 'workspace', text: 're-gates: 2 gates in 24h, threshold 0 gates' },
     }]);
-    expect(f.table().list(WS, { since: 0, limit: 500 }).map((e) => [e.tabId, e.kind, e.class, e.text]))
-      .toEqual([['tab-kit', 'flag', 'digest', 're-gates: 2 gates in 24h, threshold 0 gates']]);
+    expect(f.table().list(WS, { since: 0, limit: 500 }).map((e) => [e.tabId, e.kind, e.rule, e.class, e.text]))
+      .toEqual([['tab-kit', 'flag', 're-gates', 'digest', 're-gates: 2 gates in 24h, threshold 0 gates']]);
   });
 });
 

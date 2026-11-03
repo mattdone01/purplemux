@@ -41,6 +41,9 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 6 | no answer (pool, ADR-0039) | `pool-timeout`: `pool acquire` had no answer in 2 s | fall back to a local slot and log it; never for a `gate.no-local-fallback` repository (ADR-0039 §6) |
 | 2 | usage error (curator, ADR-0038) | `curator-task-invalid`, `curator-workspace-invalid` | fix the command |
 | 3 | refused by state (curator, ADR-0038) | `curator-gate-refused`: promote below the 95% lower bound, before 72 h and 30 labelled shadow rows of the live prompt, or without the spot check; `curator-refused`: a standing spot check, an import id not in the queue; `curator-unavailable` | after the state changes |
+| 2 | usage error (standing orders, ADR-0041) | `so-invalid`, `so-too-large`: the active orders one workspace loads would pass 8192 bytes; the message names the measured size | fix the command, or strike an order |
+| 3 | refused by state (standing orders, ADR-0041) | `so-unreadable`: an order file is not in its layout and is never read as empty; `so-struck`: the order is already struck | after the file is repaired; a struck order stays struck |
+| 7 | not found (standing orders, ADR-0041) | `so-not-found` | — |
 
 3. stderr names the code and its class, e.g. `error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found`. A `readiness-timeout` names the waited milliseconds.
 4. A write that loses its connection after it connected exits 1 with `outcome-unknown`, not 6. The server may have acted on it, so a blind retry of `tab send` could type the prompt twice. A read, or a request that never connected, exits 6. Only undici's network failures (`fetch failed` / `terminated` with a coded cause) count as network failures; a request that could not be built is never sent and exits 1.

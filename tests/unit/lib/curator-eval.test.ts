@@ -15,7 +15,7 @@ const set = { task: 'classify-owner-message' as const, labelledBy: 't', labelled
 const held = items.filter((item) => isHeldOut(item.id));
 
 const record = (label: string | null, outcome: ICuratorCallRecord['outcome'] = 'labelled'): ICuratorCallRecord => ({
-  task: 'classify-owner-message', model: 'gemma4:26b', promptVersion: 'com-v1-x', sourceId: null, outcome, label, rulesLabel: 'one-off', span: null,
+  task: 'classify-owner-message', model: 'gemma4:26b', promptVersion: 'com-v1-x~d1', sourceId: null, modelDigest: 'd1', outcome, label, rulesLabel: 'one-off', span: null,
   spanFound: false, latencyMs: 1000, waitedMs: 0, cutTokens: 0, promptTokens: null, source: label ? 'curator' : 'rules',
 });
 
@@ -32,11 +32,27 @@ const deps = (over: Partial<ICuratorEvalDeps> = {}): ICuratorEvalDeps & { jobs: 
     orders: async () => [],
     now: () => NOW,
     model: 'gemma4:26b',
+    promptVersion: 'com-v1-x~d1',
     ...over,
   };
 };
 
 describe('runCuratorEval', () => {
+  it('takes its version from its calls, and refuses a run whose calls span two served versions (confirm R2)', async () => {
+    let n = 0;
+    const two = await runCuratorEval('classify-owner-message', set, 'holdout', deps({
+      classify: async () => {
+        n += 1;
+        return { record: { ...record('one-off'), promptVersion: n < 5 ? 'com-v1-x~d1' : 'com-v1-x~d2' }, routed: 'one-off' };
+      },
+    }));
+    expect(two.refused).toBe('the served model or the order set changed during the run (com-v1-x~d1, com-v1-x~d2)');
+    const one = await runCuratorEval('classify-owner-message', set, 'holdout', deps({ promptVersion: 'start' }));
+    expect(one).toMatchObject({ promptVersion: 'com-v1-x~d1', refused: null });
+    const none = await runCuratorEval('classify-owner-message', set, 'holdout', deps({ promptVersion: 'start', resolveText: async () => null }));
+    expect(none.promptVersion).toBe('start');
+  });
+
   it('the held-out run sends only held-out items under the evaluation workspace and keeps counts, no per-id rows (F7)', async () => {
     const d = deps();
     const result = await runCuratorEval('classify-owner-message', set, 'holdout', d);

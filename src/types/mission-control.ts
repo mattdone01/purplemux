@@ -204,15 +204,22 @@ export interface IMissionAttentionItem extends Omit<IMissionQuestion, 'evidence'
   updatedAt: number;
 }
 
+/** Where an owner answer was made (story 33, the epic's Measure). */
+export type TMissionAnswerSource = 'web' | 'phone' | 'notification';
+
 export interface IMissionAnswerRequest {
   submissionId: string;
   expectedRevision: number;
   optionIds: string[];
   text: string;
   actionCompleted: boolean;
+  /** Recorded in the stored request, outside its content hash; absent from an older client. */
+  source?: TMissionAnswerSource;
 }
 
-export interface IMissionAnswer extends IMissionAnswerRequest {
+export interface IMissionAnswer extends Omit<IMissionAnswerRequest, 'source'> {
+  /** Null: not recorded (an older client, an auto-answer, or a row from before story 33). */
+  source: TMissionAnswerSource | null;
   /** The item revision the answer applied to; above `expectedRevision` when compatible revisions came between (ADR-0037 §4). */
   appliedRevision: number;
   id: string;

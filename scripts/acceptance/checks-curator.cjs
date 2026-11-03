@@ -1,19 +1,19 @@
 'use strict';
-// Wave-12 acceptance checks: the local curator (ADR-0038, story 16) through the candidate's production build.
+// Wave-14 acceptance checks: the local curator (ADR-0038, story 16) through the candidate's production build.
 // The instance has its own HOME, so it holds no labelled set and no evaluation: every task is in shadow, promote
 // is refused with its reasons, and an evaluation names the missing set. `curator.enabled off` makes the board say
 // "curator down" on the text board and the one line without depending on the live tunnel; the key is unset after.
 //
-// `wave12(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
+// `wave14(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
 
 const TASKS = ['classify-owner-message', 'flag-owner-question', 'match-standing-order'];
 
-const wave12 = async (inst, helpers) => {
+const wave14 = async (inst, helpers) => {
   const results = [];
   try {
     await checks(inst, helpers, results);
   } catch (e) {
-    results.push({ status: 'fail', id: 'wave12-error', what: 'the curator checks ran to the end', measured: e instanceof Error ? e.stack : String(e), expected: 'no exception' });
+    results.push({ status: 'fail', id: 'wave14-error', what: 'the curator checks ran to the end', measured: e instanceof Error ? e.stack : String(e), expected: 'no exception' });
   } finally {
     await inst.cli(['config', 'unset', 'curator.enabled']);
   }
@@ -62,4 +62,4 @@ const checks = async (inst, { parseJson, brief }, results) => {
   'curator: curator down (...); the rules route · ... and a line ending " · curator down"');
 };
 
-module.exports = { wave12 };
+module.exports = { wave14 };

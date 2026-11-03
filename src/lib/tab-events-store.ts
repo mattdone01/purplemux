@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import type { IPendingDigest, ITabEvent, ITabEventInput, ITabWakeRow, TWakeClass } from '@/types/tab-events';
+import type { IPendingDigest, ITabDelivery, ITabEvent, ITabEventCount, ITabEventInput, ITabWakeRow, TWakeClass } from '@/types/tab-events';
 
 interface ITabEventRow {
   seq: number;
@@ -11,6 +11,7 @@ interface ITabEventRow {
   text: string;
   source_tab_id: string | null;
   source_tab_name: string | null;
+  rule: string | null;
   delivered_at: number | null;
   digest_id: string | null;
 }
@@ -25,12 +26,13 @@ const fromRow = (row: ITabEventRow): ITabEvent => ({
   text: row.text,
   sourceTabId: row.source_tab_id,
   sourceTabName: row.source_tab_name,
+  rule: row.rule,
   deliveredAt: row.delivered_at,
   digestId: row.digest_id,
 });
 
-/** The columns and indexes ADR-0035 adds to ADR-0033's `tab_events`. */
-const ADDED_COLUMNS = [['source_tab_id', 'TEXT'], ['source_tab_name', 'TEXT']] as const;
+/** The columns and indexes ADR-0035 adds to ADR-0033's `tab_events`; `rule` is story 15's (ADR-0035 §7). */
+const ADDED_COLUMNS = [['source_tab_id', 'TEXT'], ['source_tab_name', 'TEXT'], ['rule', 'TEXT']] as const;
 const ADDED_INDEXES = `
   CREATE INDEX IF NOT EXISTS tab_events_pending_idx ON tab_events(workspace_id, tab_id)
     WHERE class = 'digest' AND delivered_at IS NULL AND digest_id IS NULL;
@@ -70,9 +72,9 @@ export class TabEventsTable {
 
   append = (event: ITabEventInput): number =>
     Number(this.database.prepare(`INSERT INTO tab_events (workspace_id, tab_id, at, class, kind, text, source_tab_id,
-      source_tab_name, delivered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(event.workspaceId, event.tabId, event.at,
-      event.class, event.kind, event.text, event.sourceTabId ?? null, event.sourceTabName ?? null, event.deliveredAt ?? null)
-      .lastInsertRowid);
+      source_tab_name, rule, delivered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(event.workspaceId, event.tabId, event.at,
+      event.class, event.kind, event.text, event.sourceTabId ?? null, event.sourceTabName ?? null, event.rule ?? null,
+      event.deliveredAt ?? null).lastInsertRowid);
 
   markDelivered = (seqs: readonly number[], at: number, digestId: string | null = null): void => {
     const update = (chunk: readonly number[]) => this.database.prepare(`UPDATE tab_events SET delivered_at = ?, digest_id = ?
@@ -162,6 +164,24 @@ export class TabEventsTable {
     (this.database.prepare(`SELECT workspace_id, at, text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ?
       AND class = 'log' AND kind = 'curator' AND workspace_id != ? ORDER BY seq`).all(since, excludeWorkspace) as Array<{ workspace_id: string; at: number; text: string }>)
       .map((row) => ({ workspaceId: row.workspace_id, at: row.at, text: row.text }));
+
+  /** The events delivered to the workspace's tabs in [since, until), oldest first: the effect count's input (story 15). */
+  deliveries = (workspaceId: string, since: number, until: number): ITabDelivery[] =>
+    (this.database.prepare(`SELECT seq, tab_id, kind, rule, delivered_at, digest_id FROM tab_events INDEXED BY tab_events_delivered_idx
+      WHERE workspace_id = ? AND delivered_at IS NOT NULL AND delivered_at >= ? AND delivered_at < ? AND class != 'log'
+      ORDER BY delivered_at, seq`)
+      .all(workspaceId, since, until) as Array<{ seq: number; tab_id: string; kind: string; rule: string | null; delivered_at: number; digest_id: string | null }>)
+      .map((row) => ({ seq: row.seq, tabId: row.tab_id, kind: row.kind, rule: row.rule, deliveredAt: row.delivered_at, digestId: row.digest_id }));
+
+  /**
+   * The rows recorded in [since, until), counted by kind and rule: the effect count's firings (story 15). Any class but
+   * the curator's call log, which records a classification, never an event sent to a tab (ADR-0038).
+   */
+  recordedCounts = (workspaceId: string, since: number, until: number): ITabEventCount[] =>
+    this.database.prepare(`SELECT kind, rule, COUNT(*) AS count FROM tab_events INDEXED BY tab_events_at_idx
+      WHERE at >= ? AND at < ? AND workspace_id = ? AND NOT (class = 'log' AND kind = 'curator')
+      GROUP BY kind, rule ORDER BY kind, rule`)
+      .all(since, until, workspaceId) as ITabEventCount[];
 
   hasAny = (workspaceId: string): boolean =>
     (this.database.prepare('SELECT EXISTS (SELECT 1 FROM tab_events INDEXED BY tab_events_tab_idx WHERE workspace_id = ?) AS hit')

@@ -8,7 +8,7 @@ import type { TOrchestrationNudgeKind } from '@/types/status';
 import type { TWakeClass } from '@/types/tab-events';
 
 /** Kinds that are not watchdog nudges or inbox notices. */
-export type TWakeOtherKind = 'tab-send' | 'flag' | 'alarm' | 'red-main' | 'rotate';
+export type TWakeOtherKind = 'tab-send' | 'flag' | 'alarm' | 'red-main' | 'rotate' | 'standing-order';
 export type TWakeKind = TOrchestrationNudgeKind | TInboxKind | TWakeOtherKind;
 
 export interface IWakeDetail {
@@ -132,6 +132,8 @@ export const WAKE_CLASS_TABLE: Readonly<Record<TWakeKind, TRule>> = {
   alarm: bySeverity,
   'red-main': 'urgent',
   rotate: 'urgent',
+  // A changed standing order reaches every live tab at once (ADR-HFL-05 decision 4, ADR-0041).
+  'standing-order': 'urgent',
 };
 
 /** The kind's class; a kind the table does not hold is urgent. */

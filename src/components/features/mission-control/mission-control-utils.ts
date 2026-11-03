@@ -144,6 +144,8 @@ export const missionDraftRequest = (draft: IMissionDraft): IMissionAnswerRequest
   optionIds: draft.optionIds,
   text: missionDraftText(draft),
   actionCompleted: draft.actionCompleted,
+  // The web client is served by the server it posts to, so the field is always understood (story 33 R3).
+  source: 'web',
 });
 
 export const isMissionDraftEmpty = (draft: IMissionDraft): boolean =>

@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // ADR-0031: the events route accepts the producer's class and stated default, and refuses the
 // whole batch, naming the field, before any write when either is invalid.
 
-const store = vi.hoisted(() => ({ applyEvents: vi.fn(), unreplayedEventIds: vi.fn(), humanInboxPolicy: vi.fn() }));
+// `itemStates`: the events route reads the touched items' states before applying (story 33 R2).
+const store = vi.hoisted(() => ({ applyEvents: vi.fn(), unreplayedEventIds: vi.fn(), humanInboxPolicy: vi.fn(), itemStates: vi.fn(() => new Map()) }));
 const scope = vi.hoisted(() => ({ resolveCliScope: vi.fn() }));
 
 vi.mock('@/lib/mission-control-store', () => ({ getMissionControlStore: () => store }));

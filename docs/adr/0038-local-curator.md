@@ -40,13 +40,19 @@ of wall time. Almost all of the wall time is queueing behind kodit's enrichment,
      tab, `<ws>/mc/<itemId>`), outcome, label, the rules' label, span, latency, queue wait, tokens cut and prompt
      tokens. The input text is never recorded, nor the raw reply (an error names what was wrong, never the reply).
      A span is withheld (`span: null`, `withheld: true`) when the input or the span looks like a credential
-     (`src/lib/secret-patterns.ts`). A curator row is never counted as a logged event sent to a tab.
+     (`src/lib/secret-patterns.ts`). A curator row is never counted as a logged event sent to a tab, nor as a
+     firing in story 15's effect counts (`recordedCounts`).
    - The kodit gap runs from the end of one call to the start of the next. After a down result (a call or a probe)
      the queue waits 30 s, doubling to 5 min, before it probes again, so a model `/api/tags` lists but `/api/chat`
      refuses never spins.
 3. **Tasks** (`src/lib/curator-tasks.ts`). A prompt version is `<base>-<hash>`: an 8-hex FNV-1a of the model, the
    request options, the template rendered on placeholders, its labels and the reply schema, so any edit to the prompt
-   or a model change is a new version, with its own clock and evidence:
+   or a model change is a new version, with its own clock and evidence. The version key every clock, evidence row,
+   queue, evaluation and routing check uses is **H = the prompt hash, the served model digest and (matcher) the
+   order-set hash** (`servedVersion`, `<prompt version>~<8 hex>`): a new pull of the tag or an order edit is a new
+   version (architect confirm R2). The client probes before any call while health is not `up`, so no call runs
+   without a known digest; with the digest unknown, routing reads `shadow` and promote refuses. An evaluation whose
+   calls span two H is refused:
    - `classify-owner-message`: an owner message typed in purplemux, into five classes (`standing-order`,
      `product-rule`, `answer`, `status-ping`, `one-off`).
    - `flag-owner-question`: a stop with no end line whose last three lines hold a `?`. Measured on 2026-11-03, 674 of
@@ -54,7 +60,8 @@ of wall time. Almost all of the wall time is queueing behind kodit's enrichment,
      precision is then measured on exactly what the curator sees.
    - `match-standing-order`: an ending flagged as a question, against the standing orders, giving `SO-n` or
      `not-covered`. Also, in shadow, an `attention.opened` / `attention.updated` whose review needs the owner's
-     `approval` or `decision` (once per item; it opens nothing): 314 of the 384 labelled asks are MC items. Until
+     `approval` or `decision` (once per item; it opens nothing): 314 of the 384 labelled asks are MC items. The
+     hook sits in `applyMissionEventBatch`, so a NEEDS-DECISION item the server opens (ADR-0041) is shadowed too. Until
      story 14's store is wired in (story 23), the orders are the seed the set was labelled against
      (`eval/match-standing-order.orders.json`).
    - Each task is `shadow` or `routing`. A task routes only in state `routing`, on the prompt version it was promoted
@@ -74,7 +81,8 @@ of wall time. Almost all of the wall time is queueing behind kodit's enrichment,
      collapsed; 34 none), 500 turn endings drawn from the 674 that pass the `?` filter, 384 permission asks (331
      candidates excluded).
    - **Splits.** 30% held out by a hash of the id. `curator eval --split train` runs the complement and keeps its
-     rows for prompt work; the held-out run keeps per-class counts only, no per-id prediction.
+     rows for prompt work; the held-out run keeps per-class counts only, no per-id prediction, and a whole-set
+     (`all`) run keeps the rows of training ids only (its counts cover every item; architect confirm R1).
    - **Durability.** An unreadable item older than 30 days (`CURATOR_SOURCE_HORIZON_MS`: Claude Code's
      `cleanupPeriodDays` default and the `tab_events` retention) has aged out and leaves every denominator. Above 10%
      unresolved inside the horizon, of the split or of any gated class's gold, the evaluation refuses before any

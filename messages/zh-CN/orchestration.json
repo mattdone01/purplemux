@@ -7,7 +7,7 @@
   "modelPlaceholder": "default",
   "editTemplate": "Edit kickoff template",
   "hideTemplate": "Hide kickoff template",
-  "templateHint": "Placeholders (wrapped in double curly braces): WORKSPACE_ID, WORKSPACE_NAME, TASK, MAX_WORKERS",
+  "templateHint": "Placeholders (wrapped in double curly braces): WORKSPACE_ID, WORKSPACE_NAME, TASK",
   "start": "Start",
   "startFailed": "Failed to start orchestration",
   "setAsOrchestrator": "Set as orchestrator",

@@ -37,11 +37,13 @@ describe('tab_events shape (ADR-0035 §3)', () => {
     const raw = new Database(file);
     raw.exec(`DROP INDEX tab_events_pending_idx; DROP INDEX tab_events_delivered_idx; DROP INDEX tab_events_digest_idx;
       DROP INDEX tab_events_sourced_idx;`);
-    raw.exec('ALTER TABLE tab_events DROP COLUMN source_tab_name; ALTER TABLE tab_events DROP COLUMN source_tab_id;');
+    raw.exec(`ALTER TABLE tab_events DROP COLUMN source_tab_name; ALTER TABLE tab_events DROP COLUMN source_tab_id;
+      ALTER TABLE tab_events DROP COLUMN rule; DROP TABLE tab_turns;`);
     raw.close();
     store = new LedgerStore(file);
     expect(store.pragma('user_version')).toBe(1);
-    expect(store.columns('tab_events').slice(-2)).toEqual(['source_tab_id', 'source_tab_name']);
+    expect(store.columns('tab_events').slice(-3)).toEqual(['source_tab_id', 'source_tab_name', 'rule']);
+    expect(store.columns('tab_turns')).toEqual(['id', 'workspace_id', 'tab_id', 'provider', 'started_at', 'ended_at', 'tool_calls']);
     expect(store.tabEvents.list(WS, { since: 0, limit: 10 }).map((row) => row.text)).toEqual(['before']);
   });
 });
@@ -206,5 +208,23 @@ describe('curator call rows (ADR-0038 §2)', () => {
     expect(store.tabEvents.wakes(WS, { since: T0 - MIN, until: T0 + MIN })).toEqual([
       { tabId: 'tab-o', day: null, wakes: 0, digests: 0, urgent: 0, logged: 1 },
     ]);
+  });
+});
+
+describe('the effect count never reads a curator call as a firing (ADR-0038; story 15 merge, M2)', () => {
+  it('recordedCounts leaves the curator log rows out, and computeEffects shows no curator component', async () => {
+    const { computeEffects } = await import('@/lib/effects');
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"task":"flag-owner-question"}', at: T0 + MIN }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"task":"classify-owner-message"}', at: T0 + 2 * MIN }));
+    store.tabEvents.append(ev({ class: 'urgent', kind: 'turn-marker', text: 'DONE: x', at: T0 + 3 * MIN }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'turn-marker', text: 'held then retired', at: T0 + 4 * MIN }));
+    const fired = store.tabEvents.recordedCounts(WS, T0, T0 + 10 * MIN);
+    expect(fired.map((f) => f.kind)).toEqual(['turn-marker']);
+    expect(fired[0].count).toBe(2);
+    const rows = computeEffects({
+      workspaceId: WS, requestedSince: T0, until: T0 + 10 * MIN, measuredSince: T0, fired, deliveries: [], turns: [], openTurns: new Map(), tabExists: () => true,
+    });
+    expect(rows.rows.map((r) => r.component)).not.toContain('curator');
+    expect(JSON.stringify(rows)).not.toMatch(/"component":"other"[^}]*"fired":2/);
   });
 });

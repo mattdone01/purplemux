@@ -24,6 +24,8 @@ export interface ICuratorCallRecord {
   promptVersion: string;
   /** The labelled-set id of the input, for the blind label pass; null when the caller has none (codex, grok). */
   sourceId: string | null;
+  /** The served model's digest at the call (from /api/tags); null when no probe has answered. */
+  modelDigest: string | null;
   outcome: TCuratorOutcome;
   /** The model's label; null unless `labelled`. */
   label: string | null;

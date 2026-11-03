@@ -7,7 +7,8 @@ import {
   collapse, findTwin, missionAskText, readMissionAsks, resolveLabelledText, sha16, transcriptTurnEnds, transcriptUserEntries, userText, workspaceTranscripts,
 } from '@/lib/curator-sources';
 import { resolveLayoutDir } from '@/lib/layout-store';
-import { ensureLiveSince, readCuratorState, readLabelledSet, updateCuratorState, writeLabelledSet } from '@/lib/curator-store';
+import { ensureLiveSince, readCuratorState, readEvalResult, readLabelledSet, updateCuratorState, writeEvalResult, writeLabelledSet } from '@/lib/curator-store';
+import { isHeldOut } from '@/lib/curator';
 
 // AC 4: the sets hold ids and labels; the text is read at evaluation time from history, transcripts and MC.
 
@@ -144,6 +145,25 @@ describe('the curator store', () => {
       { id: 'ws-a/m1', label: 'standing-order' }, { id: 'ws-a/m2', label: 'one-off', at: 5, alt: { ref: 'ws-a/s/u', start: 0, length: 3, mode: 'raw', sha: 'abc' } },
     ]);
     expect(fs.statSync(path.join(directory, '.purplemux/curator/eval/classify-owner-message.json')).mode & 0o777).toBe(0o600);
+  });
+
+  it('a whole-set result keeps no row of a held-out id; its counts still cover every scored item (confirm R1)', async () => {
+    const rows = Array.from({ length: 60 }, (_, i) => ({ id: `ws-a/m${i}`, gold: 'one-off', predicted: 'one-off', outcome: 'labelled' as const, latencyMs: 1 }));
+    const held = rows.filter((r) => isHeldOut(r.id)).length;
+    expect(held).toBeGreaterThan(5);
+    const score = { classes: [], checks: [], pass: false };
+    const base = {
+      task: 'classify-owner-message' as const, promptVersion: 'v', model: 'm', startedAt: 0, finishedAt: 1, n: 60,
+      counts: [{ label: 'one-off', support: 60, predicted: 60, truePositives: 60 }], unresolved: 0, agedOut: 0, unresolvedByClass: {},
+      excluded: { shadow: 0, disputed: 0 }, spotCheck: null, refused: null, outcomes: {}, latency: { p50: 1, p90: 1 }, score, rules: score,
+    };
+    await writeEvalResult({ ...base, split: 'all', rows });
+    const all = (await readEvalResult('classify-owner-message', 'all'))!;
+    expect(all.rows!.some((r) => isHeldOut(r.id))).toBe(false);
+    expect(all.rows).toHaveLength(60 - held);
+    expect(all.counts).toEqual([{ label: 'one-off', support: 60, predicted: 60, truePositives: 60 }]);
+    await writeEvalResult({ ...base, split: 'holdout', rows });
+    expect(await readEvalResult('classify-owner-message')).not.toHaveProperty('rows');
   });
 
   it('the shadow clock starts once and never moves', async () => {

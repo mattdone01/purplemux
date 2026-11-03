@@ -117,6 +117,7 @@ const snapshot = (): IMissionSnapshot => ({
   ],
   answers: [{
     id: 'answer-1',
+    source: null,
     submissionId: '11111111-1111-4111-8111-111111111111',
     expectedRevision: 1,
     appliedRevision: 1,

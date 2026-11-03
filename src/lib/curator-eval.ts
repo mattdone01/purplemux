@@ -18,6 +18,8 @@ export interface ICuratorEvalDeps {
   orders: () => Promise<ICuratorStandingOrderRef[]>;
   now: () => number;
   model: string;
+  /** The served version H when the run starts: the result's version when no call ran (a refused run). */
+  promptVersion: string;
   /** Ids a labelled shadow row of this version holds (the shadow row counts instead) and ids the owner disputed. */
   exclude?: { shadow: ReadonlySet<string>; disputed: ReadonlySet<string> };
   spotCheck?: { itemId: string; answeredAt: number } | null;
@@ -88,10 +90,12 @@ export const runCuratorEval = async (task: TCuratorTask, set: ILabelledSet, spli
   const refused = refusalOf(task, selected.length - agedOut, unresolved, goldByClass, unresolvedByClass);
   const rows: ICuratorEvalRow[] = [];
   const rulesRows: Array<{ gold: string; predicted: string }> = [];
+  const versions = new Set<string>();
   if (!refused) {
     for (const [index, { item, text }] of texts.entries()) {
       const input = { text, ...(orders ? { orders } : {}) };
       const { record } = await deps.classify({ task, workspaceId: CURATOR_EVAL_WORKSPACE, tabId: 'eval', input });
+      if (record.outcome !== 'dropped') versions.add(record.promptVersion);
       rows.push({ id: item.id, gold: item.label, predicted: record.label, outcome: record.outcome, latencyMs: record.latencyMs });
       rulesRows.push({ gold: item.label, predicted: spec.rules(input) });
       deps.onProgress?.(index + 1, texts.length);
@@ -103,10 +107,12 @@ export const runCuratorEval = async (task: TCuratorTask, set: ILabelledSet, spli
   const latencies = rows.flatMap((row) => (row.latencyMs === null ? [] : [row.latencyMs]));
   const labels = scoreLabels(task);
   const counts = countRows(task, labels, rows);
+  // One run, one version: a re-pull or an order edit mid-run makes its rows evidence for two prompts (confirm R2).
+  const mixed = versions.size > 1 ? `the served model or the order set changed during the run (${[...versions].join(', ')})` : null;
   return {
-    task, promptVersion: spec.promptVersion, model: deps.model, split, startedAt, finishedAt: deps.now(), n: rows.length, counts,
-    ...(split === 'holdout' ? {} : { rows }),
-    unresolved, agedOut, unresolvedByClass, excluded, spotCheck: deps.spotCheck ?? null, refused, outcomes,
+    task, promptVersion: versions.size === 1 ? [...versions][0] : deps.promptVersion, model: deps.model, split, startedAt, finishedAt: deps.now(),
+    n: rows.length, counts, ...(split === 'holdout' ? {} : { rows }),
+    unresolved, agedOut, unresolvedByClass, excluded, spotCheck: deps.spotCheck ?? null, refused: refused ?? mixed, outcomes,
     latency: { p50: percentile(latencies, 50), p90: percentile(latencies, 90) },
     score: scoreCounts(task, counts),
     rules: scoreCounts(task, countRows(task, labels, rulesRows)),

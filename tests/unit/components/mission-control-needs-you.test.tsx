@@ -394,7 +394,7 @@ describe('Auto-answered section (ADR-0031)', () => {
 describe('MissionControlDeliveryCard: who answered', () => {
   const answer = (actor: string): IMissionAnswer => ({
     id: 'a-1', workspaceId: 'ws-pay', runId: 'run-1', itemId: 'q-1', actor, submissionId: 's', expectedRevision: 1, appliedRevision: 1,
-    optionIds: ['staged'], text: 'Auto-answered under …', actionCompleted: false, createdAt: now,
+    optionIds: ['staged'], text: 'Auto-answered under …', actionCompleted: false, source: null, createdAt: now,
   });
 
   it('shows "Answered by rule" for the rule\'s answer, never the actor token', () => {

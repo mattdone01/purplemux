@@ -25,6 +25,7 @@ describe('the wake-class table (AC 1)', () => {
     ['note', 'digest'],
     ['red-main', 'urgent'],
     ['rotate', 'urgent'],
+    ['standing-order', 'urgent'],
   ])('%s is %s', (kind, expected) => {
     expect(classifyWake(kind)).toBe(expected);
   });
@@ -111,7 +112,7 @@ describe('the wake-class table (AC 1)', () => {
     const pinned = new Set(['needs-input', 'off-scope', 'thrash', 'api-error', 'usage-limit', 'inactive', 'stalled', 'model-drift',
       'ready-for-review', 'turn-ended', 'idle-no-end-line', 'long-wait', 'stuck', 'probe-failed', 'mission', 'resume', 'watch',
       'deploy', 'note', 'red-main', 'rotate', 'turn-marker', 'bg-completed', 'bg-failed', 'bg-exited-unknown', 'bg-died',
-      'heartbeat', 'flag', 'alarm', 'tab-send']);
+      'heartbeat', 'flag', 'alarm', 'tab-send', 'standing-order']);
     expect(new Set(Object.keys(WAKE_CLASS_TABLE))).toEqual(pinned);
     expect(classifyWake('something-new')).toBe('urgent');
     expect(classifyWake('toString')).toBe('urgent');

@@ -2,6 +2,7 @@ import { randomBytes } from 'crypto';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { isHeldOut } from '@/lib/curator';
 import { isCuratorTask } from '@/lib/curator-tasks';
 import type { ICuratorEvalResult, ICuratorState, ISpotCheckFile, TCuratorTask } from '@/types/curator';
 
@@ -133,10 +134,14 @@ export const writeLabelledSet = (set: ILabelledSet): Promise<void> =>
 export const readEvalResult = (task: TCuratorTask, split: ICuratorEvalResult['split'] = 'holdout'): Promise<ICuratorEvalResult | null> =>
   readJson<ICuratorEvalResult>(resultFile(task, split));
 
-/** A held-out result never carries per-id rows to disk, whatever the caller passed. */
+/**
+ * No per-id prediction of a held-out id ever reaches disk (review r1 F7, confirm R1): the held-out run keeps counts
+ * only, and a whole-set run keeps the rows of the training ids only. Its counts still cover every item it scored.
+ */
 export const writeEvalResult = (result: ICuratorEvalResult): Promise<void> => {
   const { rows, ...rest } = result;
-  return writeJson(resultFile(result.task, result.split), result.split === 'holdout' ? rest : { ...rest, rows });
+  if (result.split === 'holdout') return writeJson(resultFile(result.task, result.split), rest);
+  return writeJson(resultFile(result.task, result.split), { ...rest, rows: (rows ?? []).filter((row) => !isHeldOut(row.id)) });
 };
 
 export const readSpotCheckFile = (task: TCuratorTask): Promise<ISpotCheckFile | null> => readJson<ISpotCheckFile>(spotCheckFile(task));
@@ -168,6 +173,8 @@ export interface ILabelQueue {
   task: TCuratorTask;
   promptVersion: string;
   items: Array<{ id: string; predicted: string | null; outcome: string; at: number }>;
+  /** Ids a pass labelled `exclude` (no permission ask): ids only, kept known so they never return. */
+  excluded?: string[];
 }
 
 export const readLabelQueue = (task: TCuratorTask): Promise<ILabelQueue | null> => readJson<ILabelQueue>(queueFile(task));

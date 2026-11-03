@@ -42,6 +42,7 @@ import {
   WAIT_BACKSTOP_CONFIG_KEY,
   WAIT_BACKSTOP_DEFAULT_MS,
   classifyTurnEnd,
+  lastTurnLine,
   holdsOffStall,
   idleNudgeDue,
   isBackgroundWaitStalled,
@@ -64,6 +65,8 @@ import { AgentModelWatch } from '@/lib/agent-model-watch';
 import { AutomatedPromptDispatcher } from '@/lib/automated-prompt-dispatcher';
 import { getLedgerStore } from '@/lib/ledger-store';
 import type { TabEventsTable } from '@/lib/tab-events-store';
+import type { TabTurnsTable } from '@/lib/tab-turns-store';
+import { TurnTracker, isActingTool } from '@/lib/turn-tracker';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
 import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
@@ -86,6 +89,14 @@ import type { IOrchestratorPresenceFacts } from '@/types/coordination';
 import fs from 'fs/promises';
 import { watch, type FSWatcher } from 'fs';
 import { syncRemoteTranscript } from '@/lib/remote-transcript';
+import { needsDecisionText } from '@/lib/needs-decision';
+import {
+  needsDecisionDeps,
+  needsDecisionItemId,
+  needsDecisionLineKey,
+  openNeedsDecisionItem,
+  type TNeedsDecisionOutcome,
+} from '@/lib/needs-decision-opener';
 
 const toAlertProvider = (providerId: string | undefined): TAlertProviderId =>
   providerId === 'codex' || providerId === 'grok' ? providerId : 'claude';
@@ -199,7 +210,15 @@ export interface IHookHistoryItem {
   stale: boolean;
 }
 
-const g = globalThis as unknown as { __ptStatusManager?: StatusManager };
+const g = globalThis as unknown as { __ptStatusManager?: StatusManager; __ptNeedsDecisionPushes?: Map<string, number> };
+
+/** One owner push per NEEDS-DECISION line a day (ADR-0041 §2); in memory, so a restart may send one more. */
+export const NEEDS_DECISION_PUSH_WINDOW_MS = 24 * 60 * 60_000;
+export const NEEDS_DECISION_PUSH_MEMORY = 2_000;
+const needsDecisionPushes = (): Map<string, number> => {
+  if (!g.__ptNeedsDecisionPushes) g.__ptNeedsDecisionPushes = new Map();
+  return g.__ptNeedsDecisionPushes;
+};
 
 export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
@@ -240,6 +259,9 @@ export class StatusManager {
   private tabEvents: TabEventRouter;
   /** Seats rotate from their handoff file (ADR-0036). */
   private readonly contextLifecycle: ContextLifecycle;
+  /** Each agent tab's turns and acting tool calls, the effect counts' second input (story 15, ADR-0035 §7). */
+  private readonly turns: TurnTracker;
+  private turnWriteFailing = false;
   private contextTimer: ReturnType<typeof setInterval> | null = null;
   private fleetRotateAt = DEFAULT_ROTATE_AT_TOKENS;
   private cacheCodexRateLimits: typeof cacheCodexRateLimitsFromJsonl;
@@ -293,6 +315,7 @@ export class StatusManager {
     cacheCodexRateLimits = cacheCodexRateLimitsFromJsonl,
     updateAgentState = updateTabAgentState,
     tabEventTable: () => TabEventsTable = () => getLedgerStore().tabEvents,
+    tabTurnTable: () => TabTurnsTable = () => getLedgerStore().tabTurns,
   ) {
     this.automatedPrompts = automatedPrompts;
     this.tabEvents = new TabEventRouter({
@@ -317,8 +340,34 @@ export class StatusManager {
       },
     });
     this.contextLifecycle = new ContextLifecycle(this.contextLifecycleDeps());
+    this.turns = new TurnTracker({
+      record: (turn) => this.writeTurn(() => tabTurnTable().record(turn)),
+      addToolCall: (id) => {
+        this.writeTurn(() => {
+          tabTurnTable().addToolCall(id);
+          return id;
+        });
+      },
+    });
     this.cacheCodexRateLimits = cacheCodexRateLimits;
     this.updateAgentState = updateAgentState;
+  }
+
+  /** A turn the ledger cannot take is lost to the effect counts, never to the tab: logged once per failing stretch. */
+  private writeTurn(write: () => number): number | null {
+    try {
+      const id = write();
+      this.turnWriteFailing = false;
+      return id;
+    } catch (err) {
+      if (!this.turnWriteFailing) log.warn(`tab turn not recorded: ${err instanceof Error ? err.message : err}`);
+      this.turnWriteFailing = true;
+      return null;
+    }
+  }
+
+  private turnProvider(entry: ITabStatusEntry): string {
+    return getProviderByPanelType(entry.panelType)?.id ?? entry.panelType ?? 'unknown';
   }
 
   /** The tab as a seat (ADR-0036): a local agent tab created with `--handoff`. */
@@ -1193,6 +1242,17 @@ export class StatusManager {
     return entry.cliState === 'idle' || entry.cliState === 'ready-for-review' || this.isWaitingAtPrompt(tabId);
   }
 
+  /** Agent tabs whose agent runs, of one workspace or (null) of all: who a changed standing order reaches (ADR-0041). */
+  liveAgentTabs(workspaceId: string | null): Array<{ workspaceId: string; tabId: string }> {
+    const live: Array<{ workspaceId: string; tabId: string }> = [];
+    for (const [tabId, entry] of this.tabs) {
+      if (!isAgentPanelType(entry.panelType) || this.isRetired(tabId) || entry.cliState === 'inactive') continue;
+      if (workspaceId !== null && entry.workspaceId !== workspaceId) continue;
+      live.push({ workspaceId: entry.workspaceId, tabId });
+    }
+    return live;
+  }
+
   /** A closed tab's held events will never be typed (ADR-0035; review F12). */
   retireTabEvents(workspaceId: string, tabId: string): void {
     this.tabEvents.retire(workspaceId, tabId);
@@ -1706,6 +1766,7 @@ export class StatusManager {
     if (!entry) return;
     const expectedProvider = getProviderByPanelType(entry.panelType);
     if (expectedProvider && expectedProvider.id !== providerId) return;
+    if (isActingTool(activity.tool)) this.turns.toolCall(entry.workspaceId, tabId, providerId, replayedAt ?? Date.now());
 
     const meta = this.tabScopeCache.get(tabId);
     if (!meta || Date.now() - meta.at > TAB_SCOPE_TTL_MS) {
@@ -1714,6 +1775,23 @@ export class StatusManager {
       this.refreshTabScope(tabId, entry).catch(() => {});
     }
     getSignalEngine().record(tabId, activity, meta?.scope, meta?.cwd);
+  }
+
+  /** A tool call from a provider that feeds no signal engine (Codex PostToolUse): counted on the tab's turn only. */
+  handleToolCall(providerId: string, tmuxSession: string, tool: string, at: number): void {
+    if (!isActingTool(tool)) return;
+    const tabId = this.findTabIdBySession(tmuxSession);
+    const entry = tabId ? this.tabs.get(tabId) : undefined;
+    if (!tabId || !entry) return;
+    const expectedProvider = getProviderByPanelType(entry.panelType);
+    if (expectedProvider && expectedProvider.id !== providerId) return;
+    // Codex starts a turn only with UserPromptSubmit: a tool call with none open belongs to a turn of unknown start.
+    this.turns.toolCall(entry.workspaceId, tabId, providerId, at, false);
+  }
+
+  /** The turns this server is still counting, by tab, for the effect counts (story 15). */
+  openTurns(workspaceId: string): Map<string, number | null> {
+    return this.turns.openIn(workspaceId);
   }
 
   private async refreshTabScope(tabId: string, entry: ITabStatusEntry): Promise<void> {
@@ -2681,6 +2759,14 @@ export class StatusManager {
       this.contextLifecycle.onIdle(tabId);
       return;
     }
+    // Whatever its reportOn, a NEEDS-DECISION turn reaches the owner as a Mission Control item (ADR-0041). The item
+    // opens before the nudge, so the nudge names it and the orchestrator never copies the question (review r1, R1).
+    let decision = { note: '', mustReach: false };
+    const endLine = turnEnd.kind === 'turn-marker' ? turnEnd.lines.at(-1) : undefined;
+    if (stopSeq !== undefined && endLine?.startsWith('NEEDS-DECISION:')) {
+      decision = await this.openNeedsDecision(tabId, entry, snapshot?.lastAssistantTail, endLine, stopSeq, at, previous?.at ?? entry.busySince ?? at);
+      if (this.tabs.get(tabId) !== entry || entry.lastEvent?.name !== 'stop' || entry.lastEvent.seq !== stopSeq) return;
+    }
     if (turnEnd.kind === 'turn-marker') {
       entry.turnEnd = { kind: 'turn-marker', at, seq: stopSeq, marker: turnEnd.lines };
     } else {
@@ -2700,18 +2786,20 @@ export class StatusManager {
     }
     // Only an end line nudges at once (L49); a stop without one waits out the idle window.
     // A marker outside the tab's `reportOn` is recorded like any other and nudges nobody (ADR-0025).
-    const forwarded = turnEnd.kind === 'turn-marker' && reportOnAdmits(entry.reportOn, turnEnd.lines);
+    // A question no item took must reach the orchestrator that is told to open it, whatever the reportOn (ADR-0041 §2).
+    const forwarded = turnEnd.kind === 'turn-marker' && (reportOnAdmits(entry.reportOn, turnEnd.lines) || decision.mustReach);
     if (turnEnd.kind === 'turn-marker' && !forwarded) {
       this.reportOnFiltered += 1;
       log.info({ tabId, marker: turnEnd.lines.at(-1), reportOn: entry.reportOn, filtered: this.reportOnFiltered }, 'turn-marker nudge withheld: the marker is outside the tab\'s reportOn');
     }
     const nudge = forwarded && turnEnd.kind === 'turn-marker'
-      ? { kind: 'turn-marker' as const, detail: turnEnd.lines.join('\n') }
+      ? { kind: 'turn-marker' as const, detail: `${turnEnd.lines.join('\n')}${decision.note}` }
       : null;
     if (entry.cliState !== 'ready-for-review') {
       this.applyCliState(tabId, entry, 'ready-for-review', { nudge });
       this.persistToLayout(entry);
-    } else if (nudge && !(previous?.kind === 'turn-marker' && previous.marker?.join('\n') === nudge.detail)) {
+    } else if (nudge && !(previous?.kind === 'turn-marker' && turnEnd.kind === 'turn-marker'
+      && previous.marker?.join('\n') === turnEnd.lines.join('\n'))) {
       this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail).catch((err) => {
         log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
       });
@@ -2720,8 +2808,85 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  /** `replayedAt`: the time a spooled event happened, for a replay (ADR-0020); a live event has none. */
-  updateTabFromHook(tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource, replayedAt?: number): void {
+  /**
+   * Open the turn's NEEDS-DECISION item (ADR-0041 §2) and return what the orchestrator's nudge says of it. The question
+   * is built from the whole last line of the tail, not the marker line clipped for the nudge (review r1, R2). When no
+   * item opens, the orchestrator is told to open it when it can act; otherwise the owner gets one push (confirm F1).
+   */
+  private async openNeedsDecision(
+    tabId: string, entry: ITabStatusEntry, tail: string | null | undefined, markerLine: string, stopSeq: number, stopAt: number,
+    turnStartedAt: number,
+  ): Promise<{ note: string; mustReach: boolean }> {
+    const full = lastTurnLine(tail);
+    const { line, complete } = full?.line.startsWith('NEEDS-DECISION:') ? full : { line: markerLine, complete: false };
+    const stop = { workspaceId: entry.workspaceId, tabId, tabName: entry.tabName, line, lineComplete: complete, stopSeq, stopAt, turnStartedAt };
+    let outcome: TNeedsDecisionOutcome;
+    try {
+      outcome = await openNeedsDecisionItem(await needsDecisionDeps(), stop);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      log.error(`NEEDS-DECISION opener unavailable for ${tabId}: ${detail}`);
+      outcome = { opened: false, reason: 'error', itemId: needsDecisionItemId(stop).itemId, detail };
+    }
+    if (outcome.opened) return { note: ` [MC item ${outcome.itemId} opened for the owner by the server: do not open another]`, mustReach: false };
+    switch (outcome.reason) {
+      case 'not-needs-decision': return { note: '', mustReach: false };
+      case 'already-open': return { note: ` [MC item ${outcome.itemId} already open for the owner: do not open another]`, mustReach: false };
+      case 'asked-this-turn': return { note: ` [MC item ${outcome.itemId} opened by the tab this turn: handle it as any worker item]`, mustReach: false };
+    }
+    log.warn({ tabId, ...outcome }, 'NEEDS-DECISION opened no Mission Control item');
+    const ws = await getWorkspaceByIdCached(entry.workspaceId);
+    const orchestratorTabId = ws?.orchestration?.orchestratorTabId ?? null;
+    // (i) A live orchestrator that gets this tab's escalations can open the item: it is told to, the owner is not.
+    if (ws && outcome.reason !== 'no-orchestrator' && orchestratorTabId && orchestratorTabId !== tabId
+      && this.escalationTarget(tabId, entry, ws) === orchestratorTabId && this.isLiveAgentTab(orchestratorTabId)) {
+      return {
+        note: ` [no MC item (${outcome.reason}): open it yourself: resume or start your Mission Control run, then open item ${outcome.itemId} from this line with your human review. The owner has not been told.]`,
+        mustReach: true,
+      };
+    }
+    // (ii) No tab can act: one push per line a day, never awaited.
+    return { note: this.pushNeedsDecision(tabId, entry, ws, line, outcome.reason), mustReach: false };
+  }
+
+  private isLiveAgentTab(tabId: string): boolean {
+    const target = this.tabs.get(tabId);
+    return !!target && isAgentPanelType(target.panelType) && !this.isRetired(tabId) && target.cliState !== 'inactive';
+  }
+
+  /** The (ii) push and its note. The note says what the server did: delivery is not observable here. */
+  private pushNeedsDecision(tabId: string, entry: ITabStatusEntry, ws: IWorkspace | undefined, line: string, reason: string): string {
+    const now = Date.now();
+    const key = needsDecisionLineKey(entry.workspaceId, tabId, line);
+    const pushed = needsDecisionPushes();
+    const sentAt = pushed.get(key);
+    if (sentAt !== undefined && now - sentAt < NEEDS_DECISION_PUSH_WINDOW_MS) {
+      return ` [no MC item (${reason}): owner push for this line already dispatched at ${new Date(sentAt).toISOString()}]`;
+    }
+    pushed.delete(key);
+    pushed.set(key, now);
+    while (pushed.size > NEEDS_DECISION_PUSH_MEMORY) pushed.delete(pushed.keys().next().value!);
+    void this.dispatchAlert({
+      kind: 'needs-decision',
+      tabId,
+      workspace: ws,
+      workspaceId: entry.workspaceId,
+      tabName: entry.tabName,
+      providerId: toAlertProvider(entry.agentProviderId),
+      agentSessionId: entry.agentSessionId,
+      detail: `${entry.tabName || tabId} · ${ws?.name || entry.workspaceId}: ${needsDecisionText(line)}`,
+    }).catch((err) => log.warn(`NEEDS-DECISION push (${reason}) failed for ${tabId}: ${err instanceof Error ? err.message : err}`));
+    return ` [no MC item (${reason}): owner push dispatched, delivery not confirmed]`;
+  }
+
+  /**
+   * `replayedAt`: the time a spooled event happened, for a replay (ADR-0020); a live event has none. `fromTool`: a
+   * prompt-submit that is a Codex tool event, which shows a running turn and starts none (story 15).
+   */
+  updateTabFromHook(
+    tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource, replayedAt?: number,
+    opts: { fromTool?: boolean } = {},
+  ): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ tmuxSession, event, notificationType }, 'no tabId for session');
@@ -2783,8 +2948,13 @@ export class StatusManager {
       if (entry.turnError?.class === 'usage-limit') this.closeTurnErrorEpisode(entry, 'session-start');
       // A /clear or a fresh launch has no context reading yet; after a rotation it is the session the first message waits for.
       this.contextLifecycle.onSessionStart(tabId);
+      // A relaunch after the agent died mid-turn: that turn ended here, with no count.
+      this.turns.sessionStart(tabId, now);
     }
     if (eventName === 'prompt-submit') this.contextLifecycle.onPromptSubmit(tabId);
+    if (eventName === 'prompt-submit' && opts.fromTool) this.turns.running(entry.workspaceId, tabId, this.turnProvider(entry));
+    else if (eventName === 'prompt-submit') this.turns.start(entry.workspaceId, tabId, this.turnProvider(entry), now);
+    else if (eventName === 'stop' || eventName === 'interrupt') this.turns.end(entry.workspaceId, tabId, this.turnProvider(entry), now);
     this.broadcast({ type: 'status:hook-event', tabId, event: entry.lastEvent });
 
     const prevState = entry.cliState;
@@ -2972,6 +3142,7 @@ export class StatusManager {
 
   removeTab(tabId: string): void {
     this.contextLifecycle.onClosed(tabId, this.seatOf(tabId));
+    this.turns.closed(tabId);
     const entry = this.tabs.get(tabId);
     if (entry) getLivenessManager().removeTab(entry.workspaceId, tabId);
     if (entry && (entry.cliState === 'busy' || entry.cliState === 'needs-input') && entry.lastUserMessage) {
@@ -3013,6 +3184,8 @@ export class StatusManager {
         this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source, replayedAt);
         break;
       case 'prompt-submit':
+        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt, { fromTool: event.fromTool === true });
+        break;
       case 'stop':
       case 'interrupt':
       case 'pre-compact':

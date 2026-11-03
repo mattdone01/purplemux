@@ -38,9 +38,12 @@ describe('curator routes', () => {
     await writeFixture(mockHome.value, [{ id: 'ws-a', name: 'alpha', tabs: [{ id: 'tab-a1', name: 'orchestrator a' }], orchestratorTabId: 'tab-a1' }]);
     tabA = await (await import('@/lib/tab-token')).ensureTabToken({ workspaceId: 'ws-a', tabId: 'tab-a1' }, 'pt-ws-a-pane-1-tab-a1');
     admin = (await import('@/lib/cli-token')).getCliToken();
+    // No route test reaches a real Ollama: the probe finds nothing listening.
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED 127.0.0.1:11435') }); }));
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await drainRouteLocks();
     resetRouteGlobals();
     await fs.rm(mockHome.value, { recursive: true, force: true });
@@ -60,8 +63,10 @@ describe('curator routes', () => {
     const refused = await callRoute(promote, { method: 'POST', headers: { 'x-pmux-token': admin }, body: { task: 'flag-owner-question' } });
     expect(refused.status).toBe(409);
     expect(refused.body).toMatchObject({ code: 'curator-gate-refused', ok: false });
-    const version = (await import('@/lib/curator-tasks')).CURATOR_TASKS['flag-owner-question'].promptVersion;
+    const version = `${(await import('@/lib/curator-tasks')).CURATOR_TASKS['flag-owner-question'].promptVersion}~unknown`;
+    const { DIGEST_UNKNOWN } = await import('@/lib/curator-service');
     expect((refused.body as { refusals: string[] }).refusals).toEqual([
+      DIGEST_UNKNOWN,
       `shadow has not started for ${version}: no live call of this prompt yet`,
       `shadow evidence for ${version}: question-to-owner precision 0/0, needs n >= 30 and >= 0.95`,
       'no evaluation: run `purplemux curator eval --task flag-owner-question`',
@@ -105,6 +110,6 @@ describe('curator routes', () => {
     expect(await callRoute(importRoute, { method: 'POST', headers: { 'x-pmux-token': admin }, body: { task: 'flag-owner-question', labels: [{ id: 'x', label: 'not-a-question' }] } }))
       .toMatchObject({ status: 409, body: { code: 'curator-refused' } });
     const queue = await callRoute(await route('label-queue'), { method: 'POST', headers: { 'x-pmux-token': tabA }, body: { task: 'flag-owner-question' } });
-    expect(queue).toMatchObject({ status: 200, body: { size: 0, ids: [], added: 0 } });
+    expect(queue).toMatchObject({ status: 409, body: { code: 'curator-refused', error: expect.stringMatching(/^served model digest unknown/) } });
   });
 });

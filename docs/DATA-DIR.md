@@ -16,7 +16,8 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │   └── {wsId}/
 │       ├── layout.json           # pane/tab tree
 │       ├── message-history.json  # per-workspace input history
-│       ├── claude-prompt.md      # --append-system-prompt-file content
+│       ├── claude-prompt.md      # --append-system-prompt-file content, with the active standing orders
+│       ├── standing-orders.md    # the workspace's standing orders SO-<n> (ADR-0041; 0600)
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       ├── burndown.json         # latest published epic burndown (Scrum Master)
 │       ├── flow.json             # latest published pipeline flow + server history (ADR-0026)
@@ -48,13 +49,15 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── leases.json              # held leases (ADR-0011; 0600)
 ├── notes.json               # coordinator notes (ADR-0013; 0600)
 ├── watches.json             # harness watches (ADR-0015; 0600)
+├── standing-orders.md       # the fleet's standing orders SO-<n>, seeded with the W8 orders (ADR-0041; 0600)
+├── standing-orders-seq.json # the highest SO-<n> ever handed out, so no id is reused (ADR-0041; 0600)
 ├── inbox.json               # server notices queued or held for tabs (ADR-0012; 0600)
 ├── fleet-config.json        # fleet config keys, versions and history (ADR-0019; 0600)
 ├── deploy-announcements.json # deploy announcements and their recipients, 7 days (ADR-0017; 0600; coordination `deploys` reads the last 24 h)
 ├── tab-tokens.json          # per-tab CLI tokens (0600)
 ├── workspace-tokens.json    # per-workspace CLI tokens (0600)
 ├── mission-control.sqlite   # Mission Control and portfolio database: runs, items, answers, deliveries, events (0600; WAL)
-├── ledger.sqlite            # work-item ledger: events, items, wait intervals, rollups, tab events, experiments (ADR-0033; 0600; WAL)
+├── ledger.sqlite            # work-item ledger: events, items, wait intervals, rollups, tab events and turns, experiments (ADR-0033; 0600; WAL)
 ├── curator/                 # the local curator (ADR-0038; 0700): state.json (kodit anchor, per-version shadow clocks, task states),
 │   └── eval/                #   labelled sets {task}.json (ids, labels, times, twin locators; no text), {task}.shadow.json,
 │                            #   {task}.queue.json, match-standing-order.orders.json, spot-check.{task}.json (N -> id),
@@ -344,12 +347,14 @@ file from `mission-control.sqlite`, so the high-volume feed never couples to the
 Tables: `events` (append-only; `event_key`, 12 bytes of SHA-256 over the workspace, the producer and its `event_id`, is unique, so a replayed batch or spool is skipped), `items`
 (the projection per `(workspace_id, item_key)`), `intervals` (one row per finished wait, written in the transaction of
 the event that ends it), `rollups_daily` (per UTC day, item type and reason), `tab_events` (ADR-0035: every nudge, notice, tab send and digest
-a tab was sent, with its wake class, its source tab and when and in which digest it was delivered; read with
-`purplemux events show`), `experiments` (ADR-HFL-03), `landings` (one row per range landing the projection applied,
+a tab was sent, with its wake class, its source tab, a flag's rule, and when and in which digest it was delivered; read
+with `purplemux events show`), `tab_turns` (story 15, ADR-0035 §7: one row per finished turn of an agent tab, its start
+when seen and its acting tool calls; with `tab_events` the input of `purplemux effects show`), `experiments` (ADR-HFL-03), `landings` (one row per range landing the projection applied,
 written in the event's transaction; created and filled once from the stored events on the first open of a ledger
-without it; harness-flow-loop 04) and `ledger_meta` (rollup progress, each workspace's longest interval). A daily job,
+without it; harness-flow-loop 04) and `ledger_meta` (rollup progress, each workspace's longest interval, when the first
+turn was recorded). A daily job,
 10 min after boot and then every 24 h, rolls up every day not yet rolled and every day a newly finished wait covers,
-then deletes events, intervals and landings older than 92 days, tab events older than 30 days, items closed before
+then deletes events, intervals and landings older than 92 days, tab events and tab turns older than 30 days, items closed before
 then, and rollups older than 400 days, in chunks of 5,000 rows. Not regeneratable: the events are the record.
 
 `ledger-tokens.json` (`src/lib/ledger-token.ts`) keeps `{ version: 1, tokens: [{ hash, workspaceId, producer,
@@ -371,8 +376,8 @@ sha256), `<wsId>/<sessionId>/<assistantUuid>` (a turn ending, read from the Clau
 (an agent's ask in `mission-control.sqlite`). `at` is the source time; an unreadable item older than 30 days has aged
 out. The held-out 30% is a hash of the id, so no split is stored. `eval/<task>.shadow.json` holds `{ rows: [{ id,
 promptVersion, predicted, outcome, at }] }`, the predictions of labelled shadow calls; `eval/<task>.queue.json` the
-label queue (ids and predictions; the CLI shows ids only). `eval/results/<task>.json` is the latest held-out
-evaluation (per-class counts, no per-id prediction); `results/<task>.train.json` and `.all.json` keep their rows.
+label queue (ids and predictions, plus `excluded`: ids a pass marked no permission ask; the CLI shows ids only). `eval/results/<task>.json` is the latest held-out
+evaluation (per-class counts, no per-id prediction); `results/<task>.train.json` and `.all.json` keep the rows of training ids only.
 `eval/spot-check.<task>.json` maps the owner's spot-check numbers to ids, written only after the item exists. Every
 curator call is also a `tab_events` row (class `log`, kind `curator`) in `ledger.sqlite`. Regeneratable except the
 labelled sets and the shadow evidence, which are labelling passes' output.
@@ -449,7 +454,19 @@ Per-workspace input history for Claude tabs. Capped at 500 entries. Locks are ke
 
 ### `claude-prompt.md` — `src/lib/claude-prompt.ts`
 
-The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change. Contains workspace ID + CLI quick-reference.
+The `--append-system-prompt-file` content passed to every Claude tab in the workspace. Regenerated whenever the workspace is created, renamed, or its directories change, before every Claude launch (tab create, restart, resume), and when a standing order changes. Contains workspace ID + CLI quick-reference + the active standing orders (ADR-0041).
+
+### `standing-orders.md` — `src/lib/standing-orders-store.ts`
+
+The owner's standing orders (ADR-0041), one file for the fleet (`~/.purplemux/standing-orders.md`) and one per
+workspace. Each `## SO-<n>` block carries `text`, `source` (the owner message and its UTC date), `scope`, `check` (a
+hook or test, or `prose`), `state` (`active` or `struck`), `added`, and `struck` once struck. Ids are unique across
+every file. The active orders of the fleet and the workspace are written into `claude-prompt.md`; together they may
+take at most 8 KB there. A missing fleet file is created with the W8 seed orders; a missing workspace file holds
+none; a file in another layout (or empty, or without its `# Standing orders:` header) is refused, never read as empty. The seed is
+written under the host lock, every write is tmp + rename with a name of its own, and `standing-orders-seq.json`
+(`{ "high": n }`) keeps the highest id ever handed out, so an id is never reused even when its workspace directory
+is removed. Written with `purplemux so add|strike`.
 
 ### `standups.json` — `src/lib/standup-store.ts`
 

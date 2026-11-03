@@ -14,6 +14,8 @@ export interface ITabEventInput {
   /** The tab the event is about (a watchdog nudge's worker); null for a notice. */
   sourceTabId?: string | null;
   sourceTabName?: string | null;
+  /** The flag rule or alarm reason a `flag` or `alarm` event carries (story 15): its effect is counted per rule. */
+  rule?: string | null;
   deliveredAt?: number | null;
 }
 
@@ -27,6 +29,7 @@ export interface ITabEvent {
   text: string;
   sourceTabId: string | null;
   sourceTabName: string | null;
+  rule: string | null;
   deliveredAt: number | null;
   digestId: string | null;
 }
@@ -69,4 +72,21 @@ export interface ITabWakesResponse {
   /** False when the workspace has no tab event at all: zero wakes then means no record, not a quiet seat. */
   hasEvents: boolean;
   rows: ITabWakeRow[];
+}
+
+/** One delivered event as the effect count reads it (story 15). */
+export interface ITabDelivery {
+  seq: number;
+  tabId: string;
+  kind: string;
+  rule: string | null;
+  deliveredAt: number;
+  digestId: string | null;
+}
+
+/** Rows the router recorded for one kind and rule in a window (story 15: a component's firings). */
+export interface ITabEventCount {
+  kind: string;
+  rule: string | null;
+  count: number;
 }

@@ -1,11 +1,14 @@
 import { getDangerouslySkipPermissions } from '@/lib/config-store';
 import { HOOK_SETTINGS_PATH } from '@/lib/hook-settings';
-import { getClaudePromptPath } from '@/lib/claude-prompt';
+import { getClaudePromptPath, writeClaudePromptFile } from '@/lib/claude-prompt';
+import { createLogger } from '@/lib/logger';
 import { isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
 import { evaluatorClaudeFlags, evaluatorEnvPrefix } from '@/lib/tab-role';
 import type { TTabRole } from '@/types/terminal';
 
 export { CLAUDE_EFFORT_LEVELS, isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
+
+const log = createLogger('claude-launch');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -28,6 +31,13 @@ export const buildClaudeFlags = async (workspaceId?: string, opts?: IClaudeFlagO
   const skipPerms = opts?.role !== 'evaluator' && await getDangerouslySkipPermissions();
   const parts = [`--settings ${HOOK_SETTINGS_PATH}`];
   if (workspaceId) {
+    // The launch loads the file as it is now: the active standing orders go in first (ADR-0041). A write that
+    // fails never blocks a launch: it loads the last file written (review r1, R6).
+    try {
+      await writeClaudePromptFile({ id: workspaceId });
+    } catch (err) {
+      log.error(`claude prompt for ${workspaceId} not rewritten before launch; it loads the last file written: ${err instanceof Error ? err.message : err}`);
+    }
     parts.push(`--append-system-prompt-file ${getClaudePromptPath(workspaceId)}`);
   }
   if (opts?.model && isValidModelName(opts.model)) parts.push(`--model ${opts.model}`);

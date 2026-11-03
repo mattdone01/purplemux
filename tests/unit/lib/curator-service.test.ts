@@ -3,11 +3,13 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ICaller } from '@/lib/caller';
-import { CURATOR_TASKS } from '@/lib/curator-tasks';
+import { CURATOR_TASKS, servedVersion } from '@/lib/curator-tasks';
 import type { ICuratorCallRecord, ICuratorEvalResult } from '@/types/curator';
 
-const COM = CURATOR_TASKS['classify-owner-message'].promptVersion;
-const FOQ = CURATOR_TASKS['flag-owner-question'].promptVersion;
+// The served version keys (architect confirm R2) at the digest the fake Ollama serves by default.
+const digestNow = { value: 'sha256:d1' };
+const COM = servedVersion('classify-owner-message', 'sha256:d1')!;
+const FOQ = servedVersion('flag-owner-question', 'sha256:d1')!;
 
 // ADR-0038 in the server: routing per workspace (AC 3), the board's curator line (AC 8), shadow calls only in a
 // started server, promote and demote (AC 5), the spot check's answer (AC 6), the kodit rule (AC 7).
@@ -63,6 +65,11 @@ const writeState = (state: unknown) => {
 
 const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } });
 
+/** A served gemma4:26b at `digestNow`, answering every chat with `label`. */
+const serveTags = (label = 'one-off') => fetchMock.mockImplementation(async (url: string) => (String(url).endsWith('/api/tags')
+  ? json({ models: [{ name: 'gemma4:26b', digest: digestNow.value }] })
+  : json({ message: { content: JSON.stringify({ label, span: 'x' }) } })));
+
 beforeEach(() => {
   directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-curator-service-'));
   home = vi.spyOn(os, 'homedir').mockReturnValue(directory);
@@ -73,6 +80,7 @@ beforeEach(() => {
   latestAnswer = null;
   mcItems = {};
   koditLog = '';
+  digestNow.value = 'sha256:d1';
   fetchMock = vi.fn(async () => { throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED 127.0.0.1:11435') }); });
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -88,7 +96,9 @@ afterEach(async () => {
 
 describe('routing is per workspace and opt-in (AC 3)', () => {
   it('a task routes only in state routing, on the prompt it was promoted on, in a workspace that opts in', async () => {
+    serveTags();
     const service = await load();
+    await service.getCuratorClient().probe();
     expect(await service.curatorRoutesIn('classify-owner-message', 'ws-a')).toBe(false);
     writeState({ version: 1, liveSince: 1, tasks: { 'classify-owner-message': { state: 'routing', promotedAt: 2, promotedPromptVersion: COM } }, kodit: null, rateLimitMs: 0 });
     expect(await service.curatorRoutesIn('classify-owner-message', 'ws-a')).toBe(false);
@@ -121,7 +131,7 @@ describe('the board (AC 8)', () => {
   });
 
   it('up when the model is served; switched off reads as down with its reason', async () => {
-    fetchMock.mockImplementation(async () => json({ models: [{ name: 'gemma4:26b' }] }));
+    fetchMock.mockImplementation(async () => json({ models: [{ name: 'gemma4:26b', digest: digestNow.value }] }));
     const service = await load();
     await service.getCuratorClient().probe();
     expect((await service.readCuratorBoard('ws-a', Date.now())).health.state).toBe('up');
@@ -158,7 +168,7 @@ describe('shadow calls (ADR-0038 §2)', () => {
 
   it('in a started server: the owner message is classified and logged with its source id, the version clock starts, and an ending with no "?" is skipped', async () => {
     fetchMock.mockImplementation(async (url: string) => (String(url).endsWith('/api/tags')
-      ? json({ models: [{ name: 'gemma4:26b' }] })
+      ? json({ models: [{ name: 'gemma4:26b', digest: digestNow.value }] })
       : json({ message: { content: JSON.stringify({ label: 'standing-order', span: 'from now on' }) } })));
     const service = await load();
     await service.startCurator();
@@ -179,7 +189,7 @@ describe('shadow calls (ADR-0038 §2)', () => {
     fs.mkdirSync(path.join(directory, '.purplemux/curator/eval'), { recursive: true });
     fs.writeFileSync(path.join(directory, '.purplemux/curator/eval/match-standing-order.orders.json'), JSON.stringify([{ id: 'SO-4', text: 'Reversible work needs no approval.' }]));
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-      if (String(url).endsWith('/api/tags')) return json({ models: [{ name: 'gemma4:26b' }] });
+      if (String(url).endsWith('/api/tags')) return json({ models: [{ name: 'gemma4:26b', digest: digestNow.value }] });
       const label = String(init?.body).includes('SO-4: Reversible') ? 'SO-4' : 'question-to-owner';
       return json({ message: { content: JSON.stringify({ label, span: 'Shall I redeploy dev?' }) } });
     });
@@ -201,7 +211,7 @@ describe('shadow calls (ADR-0038 §2)', () => {
     fs.writeFileSync(path.join(directory, '.purplemux/curator/eval/match-standing-order.orders.json'), JSON.stringify([{ id: 'SO-4', text: 'Reversible work needs no approval.' }]));
     mcItems = { 'mc-1': { state: 'open', questionJson: JSON.stringify({ title: 'Redeploy dev?', context: 'Reversible.' }) } };
     fetchMock.mockImplementation(async (url: string) => (String(url).endsWith('/api/tags')
-      ? json({ models: [{ name: 'gemma4:26b' }] }) : json({ message: { content: JSON.stringify({ label: 'SO-4', span: 'Redeploy dev?' }) } })));
+      ? json({ models: [{ name: 'gemma4:26b', digest: digestNow.value }] }) : json({ message: { content: JSON.stringify({ label: 'SO-4', span: 'Redeploy dev?' }) } })));
     const service = await load();
     await service.startCurator();
     const opened = { type: 'attention.opened', workspaceId: 'ws-a', payload: { itemId: 'mc-1', humanReview: { humanNeed: 'approval' } } };
@@ -230,7 +240,15 @@ const heldOut = (counts: ICuratorEvalResult['counts']): Omit<ICuratorEvalResult,
 };
 
 describe('promote and demote (AC 5, amended)', () => {
+  it('with no probe answered, every check is refused first for the unknown digest, and nothing is attributed', async () => {
+    const service = await load();
+    const verdict = await service.promoteCuratorTask('flag-owner-question', Date.now());
+    expect(verdict.refusals[0]).toBe(service.DIGEST_UNKNOWN);
+    expect((await service.readCuratorStatus()).tasks[1]).toMatchObject({ state: 'shadow', promptVersion: `${CURATOR_TASKS['flag-owner-question'].promptVersion}~unknown`, shadowSince: null });
+  });
+
   it('refuses with every unmet condition: the version clock, shadow rows, the evaluation', async () => {
+    serveTags();
     const service = await load();
     const verdict = await service.promoteCuratorTask('flag-owner-question', Date.now());
     expect(verdict.ok).toBe(false);
@@ -242,6 +260,7 @@ describe('promote and demote (AC 5, amended)', () => {
   });
 
   it('promotes when the pooled bound, 72 h of this version and 30 shadow rows hold; demote puts it back', async () => {
+    serveTags();
     const now = Date.now();
     writeState({ version: 1, liveSince: 1, tasks: { 'flag-owner-question': { state: 'shadow', promotedAt: null, promotedPromptVersion: null, shadowSince: { [FOQ]: now - 80 * HOUR, 'foq-v0-00000000': 1 } } }, kodit: null, rateLimitMs: 0 });
     writeEval('results/flag-owner-question.json', heldOut([{ label: 'question-to-owner', support: 29, predicted: 29, truePositives: 29 }, { label: 'not-a-question', support: 0, predicted: 0, truePositives: 0 }]));
@@ -259,6 +278,41 @@ describe('promote and demote (AC 5, amended)', () => {
     expect((await service.readCuratorStatus()).tasks[1]).toMatchObject({ state: 'routing', promotedPromptVersion: FOQ, shadowSince: now - 80 * HOUR });
     expect(await service.demoteCuratorTask('flag-owner-question')).toBe(true);
     expect((await service.readCuratorStatus()).tasks[1]).toMatchObject({ state: 'shadow', shadowSince: now - 80 * HOUR });
+  });
+
+  it('a re-pull of the tag (a new digest) is a new version: a promoted task reads shadow and promote refuses its unstarted clock (R2)', async () => {
+    serveTags();
+    const now = Date.now();
+    writeState({ version: 1, liveSince: 1, tasks: { 'flag-owner-question': { state: 'routing', promotedAt: 1, promotedPromptVersion: FOQ, shadowSince: { [FOQ]: now - 80 * HOUR } } }, kodit: null, rateLimitMs: 0 });
+    const service = await load();
+    await service.getCuratorClient().probe();
+    expect((await service.readCuratorStatus()).tasks[1]).toMatchObject({ state: 'routing', promptVersion: FOQ });
+    await setFleet('curator.routing.workspaces', 'ws-a');
+    expect(await service.curatorRoutesIn('flag-owner-question', 'ws-a')).toBe(true);
+    digestNow.value = 'sha256:d2';
+    await service.getCuratorClient().probe();
+    const repulled = servedVersion('flag-owner-question', 'sha256:d2')!;
+    expect(repulled).not.toBe(FOQ);
+    expect((await service.readCuratorStatus()).tasks[1]).toMatchObject({ state: 'shadow', promptVersion: repulled, shadowSince: null });
+    expect(await service.curatorRoutesIn('flag-owner-question', 'ws-a')).toBe(false);
+    expect((await service.promoteCuratorTask('flag-owner-question', now)).refusals[0]).toBe(`shadow has not started for ${repulled}: no live call of this prompt yet`);
+  });
+
+  it("an edited standing order is a new matcher version: the old version's evidence no longer counts (R2)", async () => {
+    serveTags('SO-4');
+    const orders = [{ id: 'SO-4', text: 'Reversible work needs no approval.' }];
+    writeEval('match-standing-order.orders.json', orders);
+    const v1 = servedVersion('match-standing-order', 'sha256:d1', orders)!;
+    const ids = Array.from({ length: 40 }, (_, i) => `ws-a/mc/i${i}`);
+    writeEval('match-standing-order.json', { task: 'match-standing-order', labelledBy: 't', labelledAt: 't', items: ids.map((id) => ({ id, label: 'SO-4' })) });
+    writeEval('match-standing-order.shadow.json', { rows: ids.map((id) => ({ id, promptVersion: v1, predicted: 'SO-4', outcome: 'labelled', at: 1 })) });
+    const service = await load();
+    expect((await service.curatorGate('match-standing-order', Date.now())).shadow[0]).toMatchObject({ successes: 40, trials: 40 });
+    writeEval('match-standing-order.orders.json', [{ id: 'SO-4', text: 'Reversible work in Dev needs no approval.' }]);
+    const gate = await service.curatorGate('match-standing-order', Date.now());
+    expect(gate.shadow[0]).toMatchObject({ successes: 0, trials: 0 });
+    expect(gate.refusals[0]).toMatch(/^shadow has not started for mso-v1-[0-9a-f]{8}~[0-9a-f]{8}: /);
+    expect(gate.refusals[0]).not.toContain(v1);
   });
 
   it('owner messages read the spot check from the Mission Control answer, by actor', async () => {
@@ -296,6 +350,7 @@ describe('the blind label pass (consult 16-promote-gate, ruling 1)', () => {
   const rec = (sourceId: string, label: string) => JSON.stringify({ task: 'flag-owner-question', promptVersion: FOQ, sourceId, label, outcome: 'labelled' });
 
   it('queues the live version\'s calls as ids only; import adds the gold and the prediction, and refuses an id outside the queue', async () => {
+    serveTags();
     allCalls = [
       { workspaceId: 'ws-a', at: 1001, text: rec('ws-a/s/p1', 'question-to-owner') }, { workspaceId: 'ws-a', at: 1002, text: rec('ws-a/s/n1', 'not-a-question') },
       { workspaceId: 'ws-a', at: 1003, text: rec('ws-a/s/n2', 'not-a-question') }, { workspaceId: 'ws-a', at: 1004, text: 'not json' },
@@ -320,6 +375,22 @@ describe('the blind label pass (consult 16-promote-gate, ruling 1)', () => {
     expect(shadow.rows[0].at).toBe(1001);
     expect(set.items.find((i) => i.id === 'ws-a/s/p1')!.at).toBe(1001);
     expect(Object.keys(shadow.rows[0]).sort()).toEqual(['at', 'id', 'outcome', 'predicted', 'promptVersion']);
+  });
+});
+
+describe('an excluded ask never comes back (confirm N2)', () => {
+  it('ids a pass labelled exclude stay known to the queue', async () => {
+    serveTags('SO-4');
+    const orders = [{ id: 'SO-4', text: 'Reversible work needs no approval.' }];
+    writeEval('match-standing-order.orders.json', orders);
+    const v = servedVersion('match-standing-order', 'sha256:d1', orders)!;
+    const rec = (sourceId: string, label: string) => JSON.stringify({ task: 'match-standing-order', promptVersion: v, sourceId, label, outcome: 'labelled' });
+    allCalls = [{ workspaceId: 'ws-a', at: 5, text: rec('ws-a/mc/a', 'SO-4') }, { workspaceId: 'ws-a', at: 6, text: rec('ws-a/mc/b', 'not-covered') }];
+    const service = await load();
+    expect((await service.curatorLabelQueue('match-standing-order', Date.now())).size).toBe(2);
+    expect(await service.curatorLabelImport('match-standing-order', [{ id: 'ws-a/mc/a', label: 'exclude' }, { id: 'ws-a/mc/b', label: 'exclude' }]))
+      .toMatchObject({ imported: 0, excluded: 2, left: 0 });
+    expect(await service.curatorLabelQueue('match-standing-order', Date.now())).toMatchObject({ size: 0, added: 0 });
   });
 });
 
@@ -356,6 +427,7 @@ describe('the spot check is recorded only after its item exists (review r1 F1)',
   });
 
   it("the matcher's spot check refuses while the pool fails anything else", async () => {
+    serveTags();
     const service = await load();
     writeEval('match-standing-order.json', { task: 'match-standing-order', labelledBy: 't', labelledAt: 't', items: [] });
     await expect(service.draftSpotCheck('match-standing-order', 'ws-a', Date.now())).rejects.toThrow(/opens once the pool passes everything else: shadow has not started/);

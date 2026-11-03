@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CURATOR_QUEUE_MAX_WAIT_MS, CURATOR_TIMEOUT_MS } from '@/lib/curator';
 import { CURATOR_DOWN_MAX_BACKOFF_MS, CURATOR_DOWN_RETRY_MS, CuratorClient, type ICuratorJob } from '@/lib/curator-client';
-import { CURATOR_TASKS } from '@/lib/curator-tasks';
+import { CURATOR_TASKS, servedVersion } from '@/lib/curator-tasks';
 import type { ICuratorCallRecord } from '@/types/curator';
 
 // ADR-0038 §1, §2, §6 against a fake Ollama and a fake clock.
@@ -20,9 +20,9 @@ type TReply = (body: Record<string, unknown>, url: string) => Promise<Response> 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 const label = (l: string, span = 'from now on') => json({ message: { content: JSON.stringify({ label: l, span }) }, prompt_eval_count: 42 });
 const refused = () => { throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED 127.0.0.1:11435') }); };
-const tags = (models: string[]) => json({ models: models.map((name) => ({ name, model: name })) });
+const tags = (models: string[], digest: string | null = 'sha256:d1') => json({ models: models.map((name) => ({ name, model: name, ...(digest ? { digest } : {}) })) });
 
-const fake = (reply: TReply, opts: { minIntervalMs?: number; callMs?: number } = {}): IFake => {
+const fake = (reply: TReply, opts: { minIntervalMs?: number; callMs?: number; ownTags?: boolean; urls?: string[] } = {}): IFake => {
   const clock = { now: 1_000_000 };
   const records: IFake['records'] = [];
   const bodies: IFake['bodies'] = [];
@@ -34,6 +34,9 @@ const fake = (reply: TReply, opts: { minIntervalMs?: number; callMs?: number } =
     minIntervalMs: async () => opts.minIntervalMs ?? 0,
     record: (job, record) => { records.push({ job, record }); },
     fetch: (async (url: string, init?: RequestInit) => {
+      opts.urls?.push(url);
+      // The probe answers at once with the model and its digest, unless the test serves /api/tags itself.
+      if (url.endsWith('/api/tags') && !opts.ownTags) return tags(['gemma4:26b']);
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
       if (init?.body) bodies.push(body);
       inFlight.now += 1;
@@ -60,7 +63,8 @@ describe('curator client (AC 2)', () => {
     expect(result.routed).toBe('standing-order');
     expect(f.records).toHaveLength(1);
     expect(f.records[0].record).toMatchObject({
-      task: 'classify-owner-message', model: 'gemma4:26b', promptVersion: CURATOR_TASKS['classify-owner-message'].promptVersion, outcome: 'labelled', label: 'standing-order',
+      task: 'classify-owner-message', model: 'gemma4:26b', promptVersion: servedVersion('classify-owner-message', 'sha256:d1'), modelDigest: 'sha256:d1',
+      outcome: 'labelled', label: 'standing-order',
       rulesLabel: 'standing-order', span: 'from now on', spanFound: true, latencyMs: 1500, promptTokens: 42, cutTokens: 0, source: 'curator',
     });
     expect(f.records[0].job).toMatchObject({ workspaceId: 'ws-a', tabId: '-' });
@@ -154,25 +158,71 @@ describe('curator client (AC 2)', () => {
   });
 });
 
+describe('the served version (architect confirm R2)', () => {
+  it('probes before the first call: no call starts while health is unknown', async () => {
+    const urls: string[] = [];
+    const f = fake(() => label('one-off'), { urls });
+    expect(f.client.health().state).toBe('unknown');
+    await f.client.classify(job('hi'));
+    expect(urls.map((u) => u.replace(/^http:\/\/[^/]+/, ''))).toEqual(['/api/tags', '/api/chat']);
+  });
+
+  it('a re-pull of the same tag (a new digest) gives the next record a new version', async () => {
+    let digest = 'sha256:d1';
+    const f = fake((_body, url) => (url.endsWith('/api/tags') ? tags(['gemma4:26b'], digest) : label('one-off')), { ownTags: true });
+    await f.client.classify(job('a'));
+    digest = 'sha256:d2';
+    await f.client.probe();
+    await f.client.classify(job('b'));
+    const [a, b] = f.records.map((r) => r.record);
+    expect(a).toMatchObject({ modelDigest: 'sha256:d1', promptVersion: servedVersion('classify-owner-message', 'sha256:d1') });
+    expect(b).toMatchObject({ modelDigest: 'sha256:d2', promptVersion: servedVersion('classify-owner-message', 'sha256:d2') });
+    expect(a.promptVersion).not.toBe(b.promptVersion);
+    expect(a.promptVersion.startsWith(`${CURATOR_TASKS['classify-owner-message'].promptVersion}~`)).toBe(true);
+  });
+
+  it("the matcher's version follows its order set: one edited order text is a new version", async () => {
+    const f = fake(() => json({ message: { content: JSON.stringify({ label: 'SO-4', span: 'redeploy' }) } }));
+    const orders = [{ id: 'SO-4', text: 'Reversible work needs no approval.' }, { id: 'SO-1', text: 'Read v1 first.' }];
+    await f.client.classify({ task: 'match-standing-order', workspaceId: 'ws-a', tabId: 't', input: { text: 'may I redeploy?', orders } });
+    await f.client.classify({ task: 'match-standing-order', workspaceId: 'ws-a', tabId: 't', input: { text: 'may I redeploy?', orders: [...orders].reverse() } });
+    await f.client.classify({ task: 'match-standing-order', workspaceId: 'ws-a', tabId: 't', input: { text: 'may I redeploy?', orders: [{ ...orders[0], text: 'Reversible work needs no approval in Dev.' }, orders[1]] } });
+    const [v1, same, edited] = f.records.map((r) => r.record.promptVersion);
+    expect(same).toBe(v1);
+    expect(edited).not.toBe(v1);
+  });
+
+  it('a call dropped before any probe answered carries the static version marked unknown', async () => {
+    const f = fake(() => refused(), { ownTags: true });
+    const result = await f.client.classify(job('status?'));
+    expect(result.record).toMatchObject({ outcome: 'dropped', modelDigest: null, promptVersion: `${CURATOR_TASKS['classify-owner-message'].promptVersion}~unknown` });
+  });
+});
+
 describe('curator down (AC 8)', () => {
   it('a refused connection marks the tunnel down; the call waits in the queue and goes when it is back', async () => {
-    let up = false;
+    // The first probe answers; the call then finds the tunnel gone; the next probe (after the backoff) finds it back.
+    let probes = 0;
+    let chats = 0;
     const f = fake((_body, url) => {
-      if (url.endsWith('/api/tags')) { if (!up) refused(); return tags(['gemma4:26b']); }
-      if (!up) { up = true; refused(); }
+      if (url.endsWith('/api/tags')) { probes += 1; return tags(['gemma4:26b']); }
+      chats += 1;
+      if (chats === 1) refused();
       return label('one-off');
-    });
+    }, { ownTags: true });
     let calls = 0;
     const original = f.client.probe;
     f.client.probe = async () => { calls += 1; return original(); };
     const result = await f.client.classify(job('fix it'));
     expect(result.record.outcome).toBe('labelled');
-    expect(calls).toBeGreaterThanOrEqual(1);
+    expect(calls).toBe(2);
+    expect([probes, chats]).toEqual([2, 2]);
+    expect(f.sleeps).toEqual([CURATOR_DOWN_RETRY_MS]);
     expect(f.records).toHaveLength(1);
   });
 
   it('while down, a call queued over 10 min drops to the rules and the board reads down with the reason', async () => {
-    const f = fake(() => refused());
+    const f = fake(() => refused(), { ownTags: true });
     const result = await f.client.classify(job('status?'));
     expect(result).toMatchObject({ routed: 'status-ping', record: { outcome: 'dropped', source: 'rules', error: 'queued over 10 min' } });
     expect(result.record.waitedMs).toBeGreaterThan(CURATOR_QUEUE_MAX_WAIT_MS);
@@ -184,12 +234,15 @@ describe('curator down (AC 8)', () => {
   });
 
   it('the probe: no answer is the tunnel down, an answer without the model is the model down, else up', async () => {
-    const f = fake(() => refused());
+    const f = fake(() => refused(), { ownTags: true });
     expect((await f.client.probe()).state).toBe('down');
-    const g = fake(() => tags(['qwen3-embedding:4b']));
+    const g = fake(() => tags(['qwen3-embedding:4b']), { ownTags: true });
     expect(await g.client.probe()).toMatchObject({ state: 'down', reason: 'model down (gemma4:26b not served)' });
-    const h = fake(() => tags(['gemma4:26b']));
+    const h = fake(() => tags(['gemma4:26b']), { ownTags: true });
     expect(await h.client.probe()).toMatchObject({ state: 'up', reason: null });
+    expect(h.client.digest()).toBe('sha256:d1');
+    const k = fake(() => tags(['gemma4:26b'], null), { ownTags: true });
+    expect(await k.client.probe()).toMatchObject({ state: 'down', reason: 'model down (gemma4:26b served with no digest)' });
   });
 
   it('a 404 on /api/chat while /api/tags lists the model backs off, doubling to 5 min, then drops to rules (review r1 F9)', async () => {
@@ -198,7 +251,7 @@ describe('curator down (AC 8)', () => {
       if (url.endsWith('/api/tags')) return tags(['gemma4:26b']);
       chats += 1;
       return new Response('model "gemma4:26b" not found', { status: 404 });
-    });
+    }, { ownTags: true });
     const result = await f.client.classify(job('status?'));
     expect(result.record).toMatchObject({ outcome: 'dropped', source: 'rules' });
     expect(f.sleeps).toEqual([30_000, 60_000, 120_000, 240_000, 300_000]);
@@ -213,7 +266,7 @@ describe('curator down (AC 8)', () => {
       if (url.endsWith('/api/tags')) return tags(['gemma4:26b']);
       n += 1;
       return n === 1 ? new Response('not found', { status: 404 }) : label('one-off');
-    });
+    }, { ownTags: true });
     await f.client.classify(job('a'));
     await f.client.classify(job('b'));
     expect(f.sleeps).toEqual([30_000]);

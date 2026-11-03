@@ -125,3 +125,59 @@ alarm is the tick's, and the raise and every repeat are held back while a copy o
 for the tab's digest.
 `TabEventsTable.copies(workspaceId, tabId, kind, opening, since)` answers that guard from the log (one held copy, and
 the latest delivery of any copy, matched on the text's opening), over `tab_events_tab_idx`.
+
+## Amendment (2026-11-03, story 15: effect counts)
+
+§7. **What followed each delivery** (architecture ADR-HFL-03, the improvement seat's input; consult ruling and review
+round 2 in the story file). Additive, as §4: `user_version` stays 1.
+- `tab_events.rule`: the rule of a `flag` (the finder anomaly id) or the reason of an `alarm`, written by the flag tick's
+  router call. An alarm's derived reason (`land-queue/lock-busy`, `land-queue/head-blocked`) is counted under its
+  parent (`alarm:land-queue`), one row per reason, as the thresholds and routes are. A `flag` or `alarm` row without a
+  rule is its own component, not measured, never folded into a rule.
+- `tab_turns(id, workspace_id, tab_id, provider, started_at, ended_at, tool_calls)`, index `(workspace_id, ended_at)`,
+  kept 30 days as `tab_events`; `ledger_meta` `turns-measured-since` is stamped by the first row. The status manager
+  writes one row per stop or interrupt (`src/lib/turn-tracker.ts`). A turn starts at a user prompt (Claude and Grok
+  prompt-submit, Codex UserPromptSubmit), or at the first tool call after a stop the server saw (Claude and Grok: work a
+  background job resumed); a prompt inside an open turn continues it. Codex PreToolUse and PostToolUse, which the
+  work-state machine reads as prompt-submit, start no turn: with none open they open one of unknown start. A session
+  start ends any open turn with no count (an agent relaunched after dying mid-turn). `tool_calls` counts acting calls
+  only (edit, write, shell): Claude's PostToolUse matcher already sends no other, and Grok's and Codex's tool names
+  are filtered to the same class (`isActingTool`). A Claude tool hook is posted detached, so one within 3 s after its
+  turn's stop is added to that turn. A turn whose start the server did not see has `started_at` and `tool_calls` NULL.
+  Only a counter moves on a tool call; a write failure is logged once and never reaches the hook.
+- `GET /api/cli/workspaces/{ws}/effects?days=N` (`purplemux effects show [-w WS] [--days N] [--json]`, read scope,
+  N 1..30, default 7).
+  - `fired`: the rows the router recorded in the window, any class. A firing dropped before the router (the 60 s
+    episode filter), routed to the board only, or sent to the phone only is not recorded.
+  - `delivered`: delivery units, one per paste: an urgent event, or a digest counted once per component it carried
+    (`inDigest`), every event of a digest taking the digest's outcome. Delivered 0 means the component reached no tab,
+    not that it never fired: board-only routes, debounced and duplicate firings read 0 too.
+  - `followed`: the recipient's next turn made at least one acting call. It is temporal, not causal: it says what
+    came next, not what the delivery caused. The next turn is the one running at the paste or the first after it,
+    and it must start within 30 s of the paste (`nextTurnBoundMs`). Measured live by the story 15 reviewer, paste to
+    turn start for 67 deliveries to idle tabs, 2026-11-02..03: 51% within 5 s, 58% within 30 s, median 4.7 s, p90
+    1,118 s; the 42% past the bound read `noTurn`. A turn hundreds of seconds later is another input's, and an
+    hours-later human prompt never counts. A turn that started more than 5 s before the paste is `midTurn`; no turn by
+    the bound, at a tab with turns recorded in the window, is `noTurn` (judged, not followed); a turn still running in
+    this server, or a paste younger than the bound, is `pending`; a tab gone with no turn is `closed`; a NULL start or
+    count, or a tab with no turn recorded in the window, is `unmeasured`. `judged` is delivered less midTurn, pending,
+    closed and unmeasured.
+  - `candidate`: a deletion candidate rests on observed turns, never on absence: at least 10 deliveries whose turn was
+    recorded (judged less noTurn) and none followed; `candidateReason` says why. Fewer observed, noTurn only, or
+    delivered 0 whatever fired, is null, "not measured": a component whose firings do not all reach tabs is never a
+    candidate on delivered 0 alone.
+  - The window is clamped to `turns-measured-since`; before it, every row reads "not measured" with null counts.
+- **Components** come from the code, not from the rows, so one that reached no tab shows a true 0: every
+  `TOrchestrationNudgeKind` (family `nudge`, with `stalled` and `probe-failed` as `probe`; per-probe effect is not
+  measured, counts are per firing kind), every inbox kind, `tab-send` and `rotate` (`notice`), `flag:<anomaly>` for
+  every finder anomaly and `alarm:<reason>` for every wait reason (`flag`). The `red-main` kind is not listed: nothing
+  routes an event of that kind, and a red main reaches a tab as `alarm:red-main`. The fleet flags (ADR-0023) and flow
+  flags (ADR-0032) reach only the phone: `fleet:<flag>` and `flow:<rule>` are listed as not measured. A kind no
+  catalog names is `other`.
+- **One WIP cap.** The harness enforces one cap on work in progress: the per-workspace agent-tab cap (ADR-0027,
+  `tabs.cap-per-workspace[.<ws>]`). The library's `/run-tabs [max-workers]` is a dispatch limit the orchestrator
+  applies under that enforced cap (worker-slots.sh counts against it), not a second cap.
+
+What proves it wrong: a component whose followed share moves with no change to it, or a seat that acts on a paste in a
+turn the count calls mid-turn or no-turn more often than not. Then the turn boundary or the bound is wrong for that
+provider; fix the tracker or the bound, not the rows.
