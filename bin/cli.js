@@ -184,6 +184,17 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'flow-unreadable': EXIT.UNEXPECTED,
   'flow-not-found': EXIT.NOT_FOUND,
   'question-invalid': EXIT.USAGE,
+  'ledger-event-invalid': EXIT.USAGE,
+  'ledger-reason-invalid': EXIT.USAGE,
+  'ledger-experiment-invalid': EXIT.USAGE,
+  'ledger-query-invalid': EXIT.USAGE,
+  'ledger-token-invalid': EXIT.USAGE,
+  'ledger-too-large': EXIT.USAGE,
+  'ledger-type-reserved': EXIT.USAGE,
+  'ledger-event-conflict': EXIT.CONFLICT,
+  'ledger-experiment-cap': EXIT.CONFLICT,
+  'ledger-experiment-closed': EXIT.CONFLICT,
+  'ledger-experiment-not-found': EXIT.NOT_FOUND,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -1793,6 +1804,387 @@ const cmdTabBrowser = async (args) => {
   }
 };
 
+// ── ledger (ADR-0033) ────────────────────────────────────────────────────────
+const LEDGER_USAGE = [
+  'usage: ledger token issue -w WS --producer NAME [--out FILE]',
+  '       ledger emit -w WS --token-file FILE [--json @FILE|@-|JSON]',
+  '       ledger show -w WS [--open] [--type TYPE] [--holder H] [--json]',
+  '       ledger waits -w WS [--since T] [--until T] [--by reason|holder|type|stage] [--type TYPE] [--json]',
+  '       ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT | list -w WS [--json]',
+].join('\n');
+// Mirrors src/lib/ledger.ts: the server refuses more, so the CLI never builds a batch it cannot take.
+const LEDGER_MAX_EVENTS = 500;
+const LEDGER_MAX_BYTES = 1000 * 1000;
+const LEDGER_EMIT_TIMEOUT_MS = 5000;
+const LEDGER_PRODUCER = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const LEDGER_LOCK_WAIT_MS = 3000;
+const LEDGER_LOCK_STALE_MS = 60_000;
+const LEDGER_FILE_LOCK_STALE_MS = 10_000;
+
+const ledgerWorkspace = (rest) => {
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  return wsId;
+};
+
+const ledgerPath = (wsId, route) => `/api/cli/workspaces/${encodeURIComponent(wsId)}/ledger/${route}`;
+
+const writePrivateFile = (file, text) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+};
+
+const cmdLedgerTokenIssue = async (rest) => {
+  const wsId = ledgerWorkspace(rest);
+  const producer = flagValue(rest, '--producer');
+  if (!producer || !LEDGER_PRODUCER.test(producer)) die(`--producer: saw ${JSON.stringify(producer)}, expected a name matching ${LEDGER_PRODUCER.source}`);
+  const file = path.resolve(flagValue(rest, '--out') || path.join(os.homedir(), '.purplemux', 'ledger-tokens', wsId, `${producer}.json`));
+  requireEnv();
+  const { body } = await api('POST', ledgerPath(wsId, 'tokens'), { producer });
+  writePrivateFile(file, `${JSON.stringify(body, null, 2)}\n`);
+  process.stdout.write(`wrote ${file} (scope ${body.scope} on ${body.workspaceId} for producer ${body.producer}; an earlier token of this producer no longer works)\n`);
+};
+
+const readLedgerTokenFile = (file) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    return die(`--token-file: cannot read ${file}: ${err.code || err.message}`);
+  }
+  if (!parsed || typeof parsed.token !== 'string' || typeof parsed.workspaceId !== 'string' || !LEDGER_PRODUCER.test(parsed.producer || '')) {
+    return die(`--token-file: ${file} is not a token file written by "ledger token issue"`);
+  }
+  return parsed;
+};
+
+/** A JSON array, a { "events": [...] } batch, one event object, or JSON Lines of events. */
+const parseLedgerInput = (raw) => {
+  const text = raw.trim();
+  if (!text) return die('ledger emit: no events on input');
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    try {
+      return text.split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
+    } catch {
+      return die('ledger emit: input must be JSON (an event, an array, { "events": [...] }) or JSON Lines');
+    }
+  }
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === 'object' && Array.isArray(value.events)) return value.events;
+  return [value];
+};
+
+/**
+ * The spool as lines. A torn last line (a crash mid-append: no newline, not JSON) is counted and
+ * dropped. Any other line that is not JSON stops the drain: `bad` is its 1-based line number.
+ */
+const readLedgerSpool = (file) => {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { events: [], lines: 0, bad: null };
+    throw err;
+  }
+  const lines = text.split('\n');
+  const tail = lines.pop();
+  const events = [];
+  for (let index = 0; index < lines.length; index++) {
+    if (!lines[index].trim()) continue;
+    try { events.push(JSON.parse(lines[index])); } catch { return { events, lines: lines.length + (tail ? 1 : 0), bad: index + 1 }; }
+  }
+  if (tail && tail.trim()) {
+    try { events.push(JSON.parse(tail)); } catch { /* torn by a crash mid-append */ }
+  }
+  return { events, lines: lines.length + (tail ? 1 : 0), bad: null };
+};
+
+/** The raw lines past the first `count`: what other emits appended while this one drained. */
+const spoolLinesAfter = (file, count) => {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (err) { if (err.code === 'ENOENT') return []; throw err; }
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines.slice(count).filter((line) => line.trim());
+};
+
+const toJsonLines = (events) => events.map((event) => `${JSON.stringify(event)}\n`).join('');
+
+const rewriteLedgerSpool = (file, events, appendedLines) => {
+  const text = toJsonLines(events) + appendedLines.map((line) => `${line}\n`).join('');
+  if (text) writePrivateFile(file, text);
+  else fs.rmSync(file, { force: true });
+};
+
+/**
+ * A lock directory. Waits at most `waitMs`; a lock whose mtime is older than `staleMs` belongs to
+ * a crashed emit and is taken over. Returns `{ release, touch }`, or null when it stayed busy.
+ */
+const takeLock = async (lockDir, waitMs, staleMs) => {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      return {
+        release: () => fs.rmSync(lockDir, { recursive: true, force: true }),
+        touch: () => { try { const now = new Date(); fs.utimesSync(lockDir, now, now); } catch { /* released */ } },
+      };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - fs.statSync(lockDir).mtimeMs > staleMs) fs.rmSync(lockDir, { recursive: true, force: true });
+      } catch { /* the holder released it between the two calls */ }
+      if (Date.now() > deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+};
+
+/**
+ * Every change to a spool file happens under its short file lock: an append, the drainer's first
+ * read and its final rewrite. The wait outlasts the stale age, so the lock is always taken.
+ */
+const withSpoolFile = async (spoolFile, fn) => {
+  const lock = await takeLock(`${spoolFile}.lock`, LEDGER_FILE_LOCK_STALE_MS + 1000, LEDGER_FILE_LOCK_STALE_MS);
+  try {
+    return fn();
+  } finally {
+    lock?.release();
+  }
+};
+
+/** Append under the file lock; a torn last line is closed first, so it never swallows the new line. */
+const appendLedgerSpool = (spoolFile, events) => withSpoolFile(spoolFile, () => {
+  let prefix = '';
+  try {
+    const size = fs.statSync(spoolFile).size;
+    if (size > 0) {
+      const last = Buffer.alloc(1);
+      const fd = fs.openSync(spoolFile, 'r');
+      try { fs.readSync(fd, last, 0, 1, size - 1); } finally { fs.closeSync(fd); }
+      if (last.toString() !== '\n') prefix = '\n';
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  fs.appendFileSync(spoolFile, prefix + toJsonLines(events), { mode: 0o600 });
+});
+
+/** The leading entries of `rest` that fit one batch; a batch never mixes spooled and new events. */
+const nextLedgerBatch = (rest) => {
+  const batch = [];
+  let bytes = 20;
+  for (const entry of rest) {
+    const size = Buffer.byteLength(JSON.stringify(entry.event)) + 1;
+    if (batch.length && (entry.spooled !== batch[0].spooled || batch.length >= LEDGER_MAX_EVENTS || bytes + size > LEDGER_MAX_BYTES)) break;
+    batch.push(entry);
+    bytes += size;
+  }
+  return batch;
+};
+
+// A refusal no retry can change: the batch is wrong, not the ledger down.
+const LEDGER_REFUSAL_CODES = new Set(['ledger-type-reserved', 'ledger-event-conflict']);
+
+/** POST one batch; never exits. `delivered` false means the ledger could not take it now. */
+const postLedgerBatch = async (wsId, token, events) => {
+  if (!PORT && !URL_OVERRIDE) return { delivered: false, reason: 'no server port configured' };
+  let resp;
+  try {
+    resp = await fetch(`${BASE}${ledgerPath(wsId, 'events')}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Pmux-Token': token },
+      body: JSON.stringify({ events }),
+      signal: AbortSignal.timeout(LEDGER_EMIT_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const reason = err?.name === 'TimeoutError' ? `no answer in ${LEDGER_EMIT_TIMEOUT_MS} ms` : (causeCode(err) || err?.message || String(err));
+    return { delivered: false, reason };
+  }
+  let body = null;
+  try { body = await resp.json(); } catch { body = null; }
+  if (resp.ok && body && body.ok === true) return { delivered: true, body };
+  if (resp.status === 400 || resp.status === 413 || LEDGER_REFUSAL_CODES.has(body?.code)) {
+    return { delivered: false, refused: true, status: resp.status, body };
+  }
+  return { delivered: false, reason: `HTTP ${resp.status}${body?.code ? ` ${body.code}` : ''}` };
+};
+
+const ledgerEventIndex = (field) => {
+  const match = typeof field === 'string' ? /^events\[(\d+)\]/.exec(field) : null;
+  return match ? Number(match[1]) : null;
+};
+
+const cmdLedgerEmit = async (rest) => {
+  const wsId = ledgerWorkspace(rest);
+  const tokenFile = flagValue(rest, '--token-file');
+  if (!tokenFile) die('--token-file is required (write one with "ledger token issue")');
+  const credential = readLedgerTokenFile(tokenFile);
+  if (credential.workspaceId !== wsId) die(`--token-file emits for ${credential.workspaceId}, not ${wsId}`);
+  const value = flagValue(rest, '--json');
+  const raw = value && value.startsWith('@') && value !== '@-'
+    ? (() => { try { return fs.readFileSync(value.slice(1), 'utf8'); } catch (err) { return die(`cannot read ${value.slice(1)}: ${err.code || err.message}`); } })()
+    : (value && value !== '@-' ? value : await readStdin());
+  const fresh = parseLedgerInput(raw);
+  const spoolDir = path.join(os.homedir(), '.purplemux', 'ledger-spool');
+  const spoolFile = path.join(spoolDir, `${credential.producer}.jsonl`);
+  const rejectedFile = path.join(spoolDir, `${credential.producer}.rejected.jsonl`);
+  fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+  const drain = await takeLock(path.join(spoolDir, `${credential.producer}.drain.lock`), LEDGER_LOCK_WAIT_MS, LEDGER_LOCK_STALE_MS);
+  if (!drain) {
+    await appendLedgerSpool(spoolFile, fresh);
+    process.stderr.write(`warning: spooled ${fresh.length} events to ${spoolFile}: another emit of ${credential.producer} is draining\n`);
+    return;
+  }
+  let refusedNew = null;
+  try {
+    const spool = await withSpoolFile(spoolFile, () => readLedgerSpool(spoolFile));
+    if (spool.bad !== null) {
+      await appendLedgerSpool(spoolFile, fresh);
+      process.stderr.write(`warning: ${spoolFile} line ${spool.bad} is not JSON; nothing was drained and ${fresh.length} events were appended. `
+        + 'Fix or remove that line; the next emit drains the spool\n');
+      return;
+    }
+    let pending = [...spool.events.map((event) => ({ event, spooled: true })), ...fresh.map((event) => ({ event, spooled: false }))];
+    const totals = { accepted: 0, duplicates: 0, drained: 0, rejected: 0 };
+    while (pending.length) {
+      drain.touch();
+      const batch = nextLedgerBatch(pending);
+      const result = await postLedgerBatch(wsId, credential.token, batch.map((entry) => entry.event));
+      if (result.delivered) {
+        totals.accepted += result.body.accepted;
+        totals.duplicates += result.body.duplicates;
+        if (batch[0].spooled) totals.drained += batch.length;
+        pending = pending.slice(batch.length);
+        continue;
+      }
+      if (result.refused) {
+        // Only the refused event is set aside; the rest of its batch is sent again, in order.
+        const index = ledgerEventIndex(result.body?.field);
+        const refused = index !== null && index < batch.length ? [batch[index]] : batch;
+        fs.appendFileSync(rejectedFile, toJsonLines(refused.map((entry) => entry.event)), { mode: 0o600 });
+        process.stderr.write(`warning: kept ${refused.length} refused event(s) in ${rejectedFile}: ${result.body?.error || `HTTP ${result.status}`}\n`);
+        if (refused.some((entry) => !entry.spooled)) refusedNew = result;
+        totals.rejected += refused.length;
+        pending = pending.filter((entry) => !refused.includes(entry));
+        continue;
+      }
+      await withSpoolFile(spoolFile, () => rewriteLedgerSpool(spoolFile, pending.map((entry) => entry.event), spoolLinesAfter(spoolFile, spool.lines)));
+      process.stderr.write(`warning: spooled ${pending.length} events to ${spoolFile} (${result.reason}); the next emit sends them first\n`);
+      return;
+    }
+    await withSpoolFile(spoolFile, () => rewriteLedgerSpool(spoolFile, [], spoolLinesAfter(spoolFile, spool.lines)));
+    process.stdout.write(`ok accepted=${totals.accepted} duplicates=${totals.duplicates} drained=${totals.drained}${totals.rejected ? ` rejected=${totals.rejected}` : ''}\n`);
+  } finally {
+    drain.release();
+  }
+  if (refusedNew) failFromResponse({ status: refusedNew.status }, refusedNew.body);
+};
+
+const dash = (value) => (value === null || value === undefined ? '—' : String(value));
+
+const ledgerDuration = (ms) => {
+  if (ms === null || ms === undefined) return '—';
+  const minutes = Math.round(ms / 60_000);
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`;
+};
+
+const printTable = (columns, rows) => {
+  const table = [columns, ...rows];
+  const widths = columns.map((_, i) => Math.max(...table.map((cells) => cells[i].length)));
+  for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
+};
+
+const cmdLedgerShow = async (rest) => {
+  const wsId = ledgerWorkspace(rest);
+  const qs = new URLSearchParams();
+  if (rest.includes('--open')) qs.set('open', '1');
+  for (const name of ['type', 'holder']) {
+    const value = flagValue(rest, `--${name}`);
+    if (value !== null) qs.set(name, value);
+  }
+  requireEnv();
+  const { body } = await api('GET', `${ledgerPath(wsId, 'items')}?${qs}`);
+  if (rest.includes('--json')) return out(body);
+  process.stdout.write(`ledger ${wsId}: ${body.items.length} items${body.truncated ? ' (more match; narrow with --open, --type or --holder)' : ''}\n`);
+  printTable(['ITEM', 'TYPE', 'STATE', 'WAITING ON', 'FOR', 'HOLDER', 'CLOSED'], body.items.map((item) => [
+    item.itemKey, item.itemType, dash(item.state), dash(item.waitReason),
+    item.waitSince === null ? '—' : ledgerDuration(body.now - item.waitSince), dash(item.holder),
+    item.closedAt === null ? '—' : new Date(item.closedAt).toISOString(),
+  ]));
+};
+
+const cmdLedgerWaits = async (rest) => {
+  const wsId = ledgerWorkspace(rest);
+  const qs = new URLSearchParams();
+  for (const name of ['since', 'until', 'by', 'type']) {
+    const value = flagValue(rest, `--${name}`);
+    if (value !== null) qs.set(name, value);
+  }
+  requireEnv();
+  const { body } = await api('GET', `${ledgerPath(wsId, 'waits')}?${qs}`);
+  if (rest.includes('--json')) return out(body);
+  process.stdout.write(`waits ${wsId} ${new Date(body.since).toISOString()}..${new Date(body.until).toISOString()} by ${body.by}${body.type ? ` type ${body.type}` : ''}\n`);
+  const line = (key, row) => [key, ledgerDuration(row.waitedMs), String(row.finished), ledgerDuration(row.p50Ms), ledgerDuration(row.p90Ms),
+    String(row.openItems), ledgerDuration(row.openWaitedMs)];
+  printTable(['KEY', 'WAITED', 'FINISHED', 'P50', 'P90', 'OPEN', 'OPEN-WAITED'],
+    [...body.rows.map((row) => line(row.key === null ? '(no holder)' : row.key, row)), line('total', body.totals)]);
+};
+
+const cmdLedgerExperiment = async (sub, rest) => {
+  const wsId = ledgerWorkspace(rest);
+  if (sub === 'list') {
+    requireEnv();
+    const { body } = await api('GET', ledgerPath(wsId, 'experiments'));
+    if (rest.includes('--json')) return out(body);
+    printTable(['ID', 'STAGE', 'METRIC', 'STARTED', 'VERDICT', 'HYPOTHESIS'], body.experiments.map((e) => [
+      e.id, e.stage, e.metric, new Date(e.startedAt).toISOString(), e.verdict ? `${e.verdict} ${new Date(e.verdictAt).toISOString()}` : 'active', e.hypothesis,
+    ]));
+    return;
+  }
+  if (sub === 'open') {
+    const experiment = await readJsonFlag(rest, 'experiment');
+    requireEnv();
+    const { body } = await api('POST', ledgerPath(wsId, 'experiments'), experiment);
+    process.stdout.write(`opened ${body.experiment.id} (stage ${body.experiment.stage}, metric ${body.experiment.metric})\n`);
+    return;
+  }
+  if (sub === 'close') {
+    const positional = stripFlags(rest, ['-w', '--workspace', '--verdict', '--evidence']);
+    const id = positional[0];
+    if (!id || positional.length > 1) die(LEDGER_USAGE);
+    const verdict = flagValue(rest, '--verdict');
+    const evidence = flagValue(rest, '--evidence');
+    if (!verdict || !evidence) die('--verdict keep|revert and --evidence TEXT are required');
+    requireEnv();
+    const { body } = await api('POST', ledgerPath(wsId, `experiments/${encodeURIComponent(id)}`), { verdict, evidence });
+    process.stdout.write(`closed ${body.experiment.id}: ${body.experiment.verdict}\n`);
+    return;
+  }
+  die(LEDGER_USAGE);
+};
+
+const cmdLedger = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'token':
+      if (rest[0] !== 'issue') die(LEDGER_USAGE);
+      return cmdLedgerTokenIssue(rest.slice(1));
+    case 'emit': return cmdLedgerEmit(rest);
+    case 'show': return cmdLedgerShow(rest);
+    case 'waits': return cmdLedgerWaits(rest);
+    case 'experiment': return cmdLedgerExperiment(rest[0], rest.slice(1));
+    case 'experiments': return cmdLedgerExperiment('list', rest);
+    default: die(LEDGER_USAGE);
+  }
+};
+
 const cmdApiGuide = async () => {
   requireEnv();
   const guidePath = '/api/cli/api-guide';
@@ -1962,6 +2354,20 @@ Commands:
                                            days by tab; at most 92 days, none before today - 91 (exit 2). Role uses
                                            the current orchestrator. An unreadable spend index exits 1.
                                            Read scope on WS (ADR-0030)
+  ledger token issue -w WS --producer NAME [--out FILE]
+                                           Issue a producer token (scope ledger:emit on WS only) into a 0600 file,
+                                           default ~/.purplemux/ledger-tokens/WS/NAME.json; rotates NAME's token
+  ledger emit -w WS --token-file FILE [--json @FILE|@-|JSON]
+                                           Append work-item events (ADR-0033): one event, an array, a batch or JSON
+                                           Lines. Drains ~/.purplemux/ledger-spool/NAME.jsonl first, in order; on a
+                                           failure or no answer in 5 s it spools and exits 0. A refused event: exit 2
+  ledger show -w WS [--open] [--type TYPE] [--holder H] [--json]
+                                           Work items: state, the reason each waits on and for how long
+  ledger waits -w WS [--since T] [--until T] [--by reason|holder|type|stage] [--type TYPE] [--json]
+                                           Summed waits, p50 and p90 of finished waits, and open WIP per group.
+                                           Default: the last 7 days by reason. T is Unix ms or ISO-8601
+  ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT
+  ledger experiment list -w WS [--json]    Improvement experiments (ADR-HFL-03): one active per stage, two in all
   mission snapshot -w WS                   Read the workspace Mission Control snapshot
   mission events -w WS --json '{...}'      Submit an atomic batch of up to 25 producer events (or pipe JSON)
                                            attention.opened/updated accept class (money|irreversible|scope|bookkeeping) and defaultOptionId
@@ -2107,6 +2513,8 @@ const main = async () => {
       return cmdFlow(args.slice(1));
     case 'spend':
       return cmdSpend(args.slice(1));
+    case 'ledger':
+      return cmdLedger(args.slice(1));
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':

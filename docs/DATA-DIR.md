@@ -48,6 +48,10 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── tab-tokens.json          # per-tab CLI tokens (0600)
 ├── workspace-tokens.json    # per-workspace CLI tokens (0600)
 ├── mission-control.sqlite   # Mission Control and portfolio database: runs, items, answers, deliveries, events (0600; WAL)
+├── ledger.sqlite            # work-item ledger: events, items, wait intervals, rollups, tab events, experiments (ADR-0033; 0600; WAL)
+├── ledger-tokens.json       # SHA-256 of each ledger producer token: scope ledger:emit on one workspace (ADR-0033; 0600)
+├── ledger-tokens/           # producer token files the CLI writes: {wsId}/{producer}.json (0700 dir, 0600 files)
+├── ledger-spool/            # events `ledger emit` could not deliver: {producer}.jsonl, {producer}.rejected.jsonl, lock dirs (0700)
 ├── audit/
 │   └── coordination.jsonl   # coordination audit lines: leases, notes, grants, deploys, restarts (0600; rotated at 10 MiB, 3 kept)
 ├── session-stats/           # per-session statusline usage {sessionId}.json (0600)
@@ -316,6 +320,25 @@ rolled back onto the file still opens it and ignores them:
   uses, watch history unknown, actions, wakes, escalations, milestones).
 
 Not regeneratable: deleting the file loses every run, attention item, answer history and portfolio selection.
+
+### `ledger.sqlite` — `src/lib/ledger-store.ts`
+
+The work-item ledger (ADR-0033; better-sqlite3, WAL, 0600, `user_version` 1; a newer version is refused). A separate
+file from `mission-control.sqlite`, so the high-volume feed never couples to the attention store's schema version.
+Tables: `events` (append-only; `event_key`, 12 bytes of SHA-256 over the workspace, the producer and its `event_id`, is unique, so a replayed batch or spool is skipped), `items`
+(the projection per `(workspace_id, item_key)`), `intervals` (one row per finished wait, written in the transaction of
+the event that ends it), `rollups_daily` (per UTC day, item type and reason), `tab_events` (ADR-HFL-05; written by a
+later story), `experiments` (ADR-HFL-03) and `ledger_meta` (rollup progress, each workspace's longest interval). A
+daily job, 10 min after boot and then every 24 h, rolls up every day not yet rolled and every day a newly finished wait
+covers, then deletes events, intervals and tab events older than 92 days, items closed before then, and rollups older
+than 400 days, in chunks of 5,000 rows. Not regeneratable: the events are the record.
+
+`ledger-tokens.json` (`src/lib/ledger-token.ts`) keeps `{ version: 1, tokens: [{ hash, workspaceId, producer,
+issuedAt }] }`; the token itself is never stored. Issuing a producer again replaces its entry. The CLI writes the token
+to `ledger-tokens/{wsId}/{producer}.json` (or `--out`) and spools undelivered events per producer in `ledger-spool/`;
+the next `ledger emit` sends the spool first, and an event the server refuses moves alone to
+`{producer}.rejected.jsonl`. `{producer}.drain.lock/` (one drainer, refreshed every batch, stale after 60 s) and
+`{producer}.jsonl.lock/` (every change to the spool file, stale after 10 s) are lock directories.
 
 ### `audit/coordination.jsonl` — `src/lib/coordination-audit.ts`
 

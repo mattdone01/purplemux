@@ -101,6 +101,16 @@ to an exit code through one table:
      2  usage error (tab restart, ADR-0028)      restart-unsupported                        fix the command
      3  conflict (tab restart, ADR-0028)         tab-busy                                   when idle, or --interrupt
      2  usage error (questions, ADR-0037)        question-invalid                           fix the question
+     2  usage error (ledger, ADR-0033)           ledger-event-invalid,                      fix the command
+                                                 ledger-reason-invalid,
+                                                 ledger-experiment-invalid,
+                                                 ledger-query-invalid, ledger-token-invalid,
+                                                 ledger-too-large, ledger-type-reserved
+     3  refused by state (ledger, ADR-0033)      ledger-experiment-cap,                     after the state changes
+                                                 ledger-experiment-closed,
+                                                 ledger-event-conflict
+     7  not found (ledger, ADR-0033)             ledger-experiment-not-found                —
+     1  unexpected error (ledger, ADR-0033)      ledger-store-failed                        investigate
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -815,6 +825,133 @@ GET /api/cli/spend?workspaceId=WS[&since=YYYY-MM-DD][&until=YYYY-MM-DD][&by=tab|
   workspace's enabled orchestrator NOW) and "other". Transcripts are read by a background
   index; while index.state is "indexing" the numbers are partial. A request never parses a
   transcript.
+
+## Ledger (ADR-0033)
+
+The work-item ledger: producers push every state change of a work item; the server derives how
+long each item waited and why, from a closed vocabulary. Stored in ~/.purplemux/ledger.sqlite.
+Every answer carries Cache-Control: no-store.
+
+POST /api/cli/workspaces/<workspaceId>/ledger/tokens   (purplemux ledger token issue -w WS --producer NAME [--out FILE])
+  Body: { "producer": "<[a-z0-9][a-z0-9._-]{0,63}>" }. Own workspace only (the admin token, a peer
+  or a grant gets 403 forbidden). Response: { "scope": "ledger:emit", "workspaceId", "producer",
+  "token", "issuedAt" }. Issuing a producer again rotates its token. The server's own producer
+  name, purplemux (and purplemux:*), is reserved: 400 ledger-token-invalid. The CLI writes the response
+  to a 0600 file (default ~/.purplemux/ledger-tokens/WS/NAME.json). The server keeps only a SHA-256
+  of the token. A ledger:emit token is not a CLI token: every other route answers it 401 or 403.
+  An unsafe name: 400 ledger-token-invalid (exit 2).
+
+POST /api/cli/workspaces/<workspaceId>/ledger/events   (purplemux ledger emit -w WS --token-file F [--json @FILE|@-|JSON])
+  Header x-pmux-token: the ledger:emit token of this workspace. Any other token: 403 forbidden
+  (another workspace's ledger token, a tab, workspace or admin token); none or unknown: 401
+  unauthorized. The producer name comes from the token, never from the body.
+  Body: { "events": [1..500 events] }, at most 1 MiB serialized (413 ledger-too-large). Event:
+        { "event_id": "<1..128, producer-chosen>", "at": Unix ms (no older than 92 days, at most 5 min ahead),
+          "item_type": slice | range | gate | review | landing | deploy | owner-issue | mc-item | seat | experiment,
+          "item_key": "<item_type>:<id>" (1..200; range:<lane>:<key12>, gate:<tree12>:<started>,
+                      landing:<started>, slice:<lane>, seat:<ws>:<tab-name>, deploy:<env>:<sha12>,
+                      owner-issue:<id>, mc-item:<id>),
+          "kind": open | state | wait | clear | close | link,
+          "state"?: "<1..64>" (required for state; optional on close: landed, dropped, superseded, answered),
+          "wait_reason"?: required for wait, absent otherwise,
+          "holder"?: "<1..128>", "clear_input"?: "<1..500>" (wait only),
+          "parent_key"?: "<type>:<id>" (required for link), "attrs"?: { "<key>": string | number | bool | null } (<= 32 keys) }
+  Wait reasons (closed): build-review: review-queue, review-findings, rework, receipt-rekey; land:
+  not-armed, pre-arm-gate, fold-batch, own-lane-order, group-partner, guard-hold, gate-slot,
+  pre-flight-gate, land-queue, lock-wait, under-lock-gate, red-main, chain-down; deploy:
+  deploy-queue, deploy-run, deploy-auth, external-team; people: owner, agent-idle; hosts: host-load.
+  An unknown key is refused. Identifiers hold no control or format character and prose
+  (clear_input, attrs strings) no control character or bidi control, by the ADR-0026 rules. A
+  refusal answers 400 with { "error", "code", "field", "allowed"? }: ledger-reason-invalid for a
+  wait_reason outside the list (also the derived ones below), ledger-event-invalid for anything
+  else (an unknown item_type or kind names the allowed list). One refused event refuses the batch.
+  Producer tokens cannot send the server-owned item types experiment, seat and mc-item: 403
+  ledger-type-reserved (exit 2) with the field.
+  Response: { "ok": true, "workspaceId", "producer", "receivedAt", "accepted", "duplicates",
+  "closedItem", "orphan", "intervals" }. Only an open creates an item: any other event for an item
+  the ledger does not hold (never opened, or deleted by retention) is stored and counted as orphan. An event_id this producer already sent in this workspace, with the
+  same body, is a duplicate: skipped, so replaying a batch changes nothing. The same event_id with a
+  different body is refused 409 ledger-event-conflict (exit 3) with the field, and the batch stores
+  nothing. An event for a closed item is stored and changes nothing (closedItem), except an open
+  whose at is after the close, which reopens it.
+
+  Derivation (per item, in the event's transaction). Each event is applied at
+  max(at, the item's last event time, its wait start), so a late event never overlaps an earlier
+  wait; a landing split moves the split items' last event time to the split.
+    wait          ends the open wait (writes its interval) and opens the new one; the same reason
+                  and holder continue the open wait instead (no interval).
+    state, clear, close
+                  end the open wait. A state means "no wait".
+    unknown       (derived) an open range, deploy or owner-issue item (the types whose whole life
+                  is waiting) with no wait and no event other than link for more than 10 min: the
+                  whole silent gap, from its last event, is an unknown wait. Time with no wait on
+                  any other type (a gate running, a landing holding the lock, an experiment) is
+                  not waiting and is counted nowhere.
+    land-queue    (derived split) counted as land-queue/lock-busy while the workspace has an open
+                  landing item and land-queue/head-blocked while it has none; each landing open and
+                  close ends the segment.
+  A producer cannot send unknown or the land-queue/* reasons.
+
+  The CLI takes one event, an array, a batch or JSON Lines. It sends ~/.purplemux/ledger-spool/
+  <producer>.jsonl first, in order, then the new events, in batches under both ceilings. On a
+  connection failure, no answer in 5 s, a 401/403/404 or a 5xx it appends what it could not send
+  to the spool and exits 0, so a producer never fails because the ledger is down. A refused event
+  (400, 413, 403 ledger-type-reserved, 409 ledger-event-conflict) moves alone to
+  <producer>.rejected.jsonl and the rest of its batch is sent again, in order; a refused new event
+  sets the exit code after the rest is delivered. A spool line that is not JSON stops the drain
+  (the file is kept, the line number printed); a torn last line from a crash is dropped. Prints
+  ok accepted=<n> duplicates=<n> drained=<n>[ rejected=<n>].
+
+  Example, from a gate wrapper:
+    purplemux ledger emit -w "$WS" --token-file ~/.purplemux/ledger-tokens/$WS/v2.json --json @- <<'JSON'
+    { "event_id": "gate.sh:gate:4f2a9c1d0e3b:1793001600000:open", "at": 1793001600000,
+      "item_type": "gate", "item_key": "gate:4f2a9c1d0e3b:1793001600000", "kind": "open",
+      "holder": "lane-a", "attrs": { "host": "ai-server", "mode": "full" } }
+    JSON
+    ok accepted=1 duplicates=0 drained=0
+
+GET /api/cli/workspaces/<workspaceId>/ledger/items[?open=1&type=<item_type>&holder=<h>&limit=1..2000]
+                                                       (purplemux ledger show -w WS [--open] [--type T] [--holder H] [--json])
+  Read scope: the own token, a peer, a grant, the admin token. Response: { "workspaceId", "now",
+  "items": [{ "workspaceId", "itemKey", "itemType", "openedAt", "closedAt" | null, "state" | null,
+  "stateSince" | null, "waitReason" | null, "waitSince" | null, "holder" | null, "clearInput" | null,
+  "parentKey" | null, "attrs", "lastEventAt", "lastSeq" }], "truncated" }, oldest first, at most
+  limit (500 by default). waitReason reads unknown for a silent open item (see above).
+
+GET /api/cli/workspaces/<workspaceId>/ledger/waits[?since=&until=&by=reason|holder|type|stage&type=<item_type>]
+                                                       (purplemux ledger waits -w WS [--since T] [--until T] [--by B] [--type T] [--json])
+  Read scope as items. since and until are Unix ms or ISO-8601; until defaults to now, since to 7
+  days before until. since older than the 92-day retention limit is refused (400
+  ledger-query-invalid): deleted waits must not read as no waiting. by defaults to reason; stage is build-review, land, deploy,
+  people, hosts or unknown. type limits finished and open waits to one item type. Response:
+  { "workspaceId", "since", "until", "now", "by", "type" | null, "rows": [{
+  "key" | null (a wait with no holder), "waitedMs", "finished", "p50Ms" | null, "p90Ms" | null,
+  "openItems", "openWaitedMs" }], "totals" }. waitedMs sums the finished waits, each clipped to the
+  window. p50Ms and p90Ms (nearest rank) are over the full length of the waits that ended inside
+  the window; null when none did. openItems counts items waiting now whose wait began before
+  until; openWaitedMs is their elapsed wait, clipped to the window, and is not part of waitedMs.
+  Rows are sorted by waitedMs + openWaitedMs, largest first. 400 ledger-query-invalid (exit 2)
+  names a bad since, until, by or type.
+
+GET  /api/cli/workspaces/<workspaceId>/ledger/experiments   (purplemux ledger experiment list -w WS [--json])
+POST /api/cli/workspaces/<workspaceId>/ledger/experiments   (purplemux ledger experiment open -w WS --json @FILE)
+POST /api/cli/workspaces/<workspaceId>/ledger/experiments/<id>
+                                                       (purplemux ledger experiment close -w WS EXP-n --verdict keep|revert --evidence TEXT)
+  Improvement experiments (ADR-HFL-03). Reads: read scope; writes: own workspace only. Open body:
+  { "hypothesis": "<1..500>", "stage": build-review | land | deploy | people | hosts, "metric": "<1..64>",
+  "min_days": 1..90, "max_days": min_days..90, "change_ref"?, "reason"? (a counted reason),
+  "baseline"?: { "value", "window" }, "target"?, "guards"?: [{ "metric", "limit" }] (<= 8), "revert_if"? }.
+  The server assigns EXP-<n>, started_at, and opens the item experiment:EXP-<n>. One active
+  experiment per stage and at most two in all: 409 ledger-experiment-cap (exit 3). Close body:
+  { "verdict": "keep" | "revert", "evidence": "<1..2000>" }; it closes the item (state kept or
+  reverted). 409 ledger-experiment-closed for a second verdict, 404 ledger-experiment-not-found.
+  400 ledger-experiment-invalid names the field. Response: { "experiment" } (201 on open), or
+  { "workspaceId", "experiments": [...] } for the list.
+
+Retention: a daily job (10 min after boot, then every 24 h) rolls up into rollups_daily every day
+not yet rolled and every day a newly finished wait covers, then deletes events, intervals and tab
+events older than 92 days, items closed before then, and rollups older than 400 days, in chunks of
+5,000 rows. A store failure answers 500 ledger-store-failed (exit 1).
 
 ## Portfolio board
 
