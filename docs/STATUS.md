@@ -876,6 +876,7 @@ A 60 s interval (`globalThis.__ptFlagAlertTick`), started beside the Mission Con
 
 - **Fleet flags** from `readFleetView(now)` (ADR-0023, the 5 s cache): STALL?, WAITING-LONG and UNANSWERED per agent tab (subject: the tab id), and a workspace's unattributed UNANSWERED (subject: the workspace id).
 - **Flow flags**: `deriveFlowFlags(readFlow(ws), readFlowThresholds(), now)` over every workspace's record (ADR-0026). A stale record raises only `stale`.
+- **Ledger flags** from the constraint finder's cached answers (ADR-0034, source `ledger:<ws>`): each breached anomaly (rule the anomaly id), and each open wait past its `ledger.threshold.<reason>` (rule the reason, subject the item key; `ledgerFlagScan`, `src/lib/ledger-alarms.ts`).
 
 The raise-edge state is on `globalThis.__ptFlagAlertState`, keyed `source:workspaceId:rule:subject`. A key present now and absent in the previous read is a raise, and sends one `flag` alert unless that key alerted within fleet config `alerts.flag-repeat-minutes` (default 60). A flag that stays raised sends nothing more.
 
@@ -891,7 +892,9 @@ Each flag names its **sources**, the reads its rule can depend on: `fleet-view`,
 | target cannot be checked | the fleet view or the workspace's layout is unreadable, or the orchestrator's row is in state `unknown`: the raise stays pending, is retried on each tick while the flag stays raised, and `flag-alert-target-unknown` is logged with the reason |
 | a tick still runs at the next interval | the next tick is skipped; a tick over 5 s logs its duration |
 
-The tick calls `getNotificationDispatcher().dispatch` directly (status socket, web push, FCM) and never sends an inbox notice. `alerts.flags` and `alerts.flag-repeat-minutes` are written by the admin token only (`ADMIN_ONLY_KEYS`).
+The tick calls `getNotificationDispatcher().dispatch` directly (status socket, web push, FCM) for fleet, flow and anomaly flags, and never sends an inbox notice. `alerts.flags` and `alerts.flag-repeat-minutes` are written by the admin token only (`ADMIN_ONLY_KEYS`).
+
+**Ledger routing (story 13, ADR-0032 amendment of 2026-11-03).** A ledger flag goes to the tabs `ledger.route.<ws>` names (`ledgerFlagTargets`): a tab name, `$holder`, `$orchestrator` or `$board`, with the enabled orchestrator for an unnamed reason and in place of a holder or name that is no tab; an unreadable view, layout or routed row defers the raise. Each line enters `StatusManager.routeTabEvent` (the tab event router): an item alarm as kind `alarm` (urgent for `red-main` and a critical-path `chain-down`, else digest; never the phone), an anomaly as kind `flag` (digest) beside its phone alert, which names the first routed tab. Neither a digest-line raise nor a repeat adds a line to a tab whose digest still holds a copy of the same item and reason (`TabEventsTable.copies`); an urgent raise is typed whatever the tab's digest holds, since it never waits in a digest (confirmation N2). A standing item alarm is routed again, as a digest line, once the repeat window has passed since the later of its last copy to that tab (with none: the later of the key's last alert and the tick that recorded it, read once per tick before that tick's sends) and that copy's delivery, and only on a tick whose sources all read well; after a restart or after `alerts.flags` comes back on, its first repeat comes one window after that tick. A repeat counts as an alert for the repeat window, so a new episode of the same item inside one window of a repeat is not raised again; `globalThis.__ptFlagAlertState.alarmSends` keeps the per-tab send times. An unreadable fleet config makes every `ledger:<ws>` source unread for the tick: no ledger flag raises, repeats or clears.
 
 
 ## Codex launch policy and observed model

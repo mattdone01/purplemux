@@ -285,6 +285,8 @@ const LABELS: Record<TFinderAnomalyId, string> = {
   'cost-per-landed-item': 'cost per landed item',
 };
 
+export const FINDER_ANOMALY_IDS = Object.keys(LABELS) as readonly TFinderAnomalyId[];
+
 const WORKSPACE_SUBJECT = 'workspace';
 
 const ANOMALY_WINDOWS: Record<TFinderAnomalyId, IFinderAnomaly['window']> = {
@@ -515,7 +517,7 @@ const CONSTANT_THRESHOLDS: Record<TFinderAnomalyId, number | null> = {
 
 /** Every anomaly, unknown for the one reason the ledger measures were not taken. */
 const unknownAnomalies = (reason: string): IFinderAnomaly[] =>
-  (Object.keys(LABELS) as TFinderAnomalyId[]).map((id) =>
+  FINDER_ANOMALY_IDS.map((id) =>
     anomaly(id, ANOMALY_WINDOWS[id], ANOMALY_UNITS[id], { value: null, threshold: CONSTANT_THRESHOLDS[id], reason }));
 
 /**

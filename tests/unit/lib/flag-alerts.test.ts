@@ -18,6 +18,8 @@ const {
   parseFlagAlertConfig, runFlagAlertTick, runScheduledFlagAlertTick, startFlagAlerts, stopFlagAlerts,
 } = await import('@/lib/flag-alerts');
 const { DEFAULT_FLOW_THRESHOLDS } = await import('@/lib/flow-flags');
+const { resolveThresholds } = await import('@/lib/ledger-alarms');
+type ITabEventRoute = import('@/lib/tab-event-router').ITabEventRoute;
 type IFlagAlertDeps = import('@/lib/flag-alerts').IFlagAlertDeps;
 type IFlagAlertConfig = import('@/lib/flag-alerts').IFlagAlertConfig;
 
@@ -106,6 +108,7 @@ const harness = (initial: Partial<IScript> = {}) => {
   };
   const sent: Array<{ draft: TAlertDraft; workspaceDir: string | null | undefined }> = [];
   const reads = { fleet: 0, flow: [] as string[] };
+  const routed: ITabEventRoute[] = [];
   const deps: IFlagAlertDeps = {
     config: async () => {
       if (script.config instanceof Error) throw script.config;
@@ -131,10 +134,16 @@ const harness = (initial: Partial<IScript> = {}) => {
     dispatch: async (draft, ctx) => {
       sent.push({ draft, workspaceDir: ctx.workspaceDir });
     },
+    ledgerRouting: async () => ({ routes: new Map(), thresholds: resolveThresholds(new Map()).thresholds }),
+    routeTabEvent: async (event) => {
+      routed.push(event);
+      return { class: event.class, delivered: event.class === 'urgent', seq: routed.length, duplicate: false };
+    },
+    alarmCopies: async () => ({ held: false, lastDeliveredAt: null }),
   };
   const state = createFlagAlertState();
   const tick = (at: number) => runFlagAlertTick(deps, state, at);
-  return { script, sent, reads, deps, state, tick };
+  return { script, sent, reads, routed, deps, state, tick };
 };
 
 const keysOf = (drafts: Array<{ draft: TAlertDraft }>) => drafts.map(({ draft }) => draft.flag && flagKey({ ...draft.flag, workspaceId: draft.workspaceId }));
@@ -256,7 +265,7 @@ describe('runFlagAlertTick — a scripted sequence', () => {
       flows: { 'ws-a': flowRecord('ws-a', 12, T0 - MIN) },
     });
     const first = await h.tick(T0);
-    expect(first).toEqual({ baseline: true, sent: [], noTarget: [], targetUnknown: [] });
+    expect(first).toEqual({ baseline: true, sent: [], noTarget: [], targetUnknown: [], routed: [] });
     expect(h.sent).toEqual([]);
 
     h.script.view = view([row('ws-a', 'tab-orch'), row('ws-a', 'tab-1', ['stall', 'unanswered'])]);
@@ -331,9 +340,11 @@ describe('runFlagAlertTick — a scripted sequence', () => {
       tabId: 'tab-orch', isOrchestrator: true,
       flag: { source: 'ledger', rule: 're-gates', subject: 'workspace', text: 're-gates: 3 gates in 24h, threshold 0 gates' },
     }]);
+    expect(h.routed).toEqual([{ workspaceId: 'ws-a', tabId: 'tab-orch', kind: 'flag', text: 're-gates: 3 gates in 24h, threshold 0 gates', class: 'digest' }]);
     h.script.finder = finder(T0 + 2 * MIN, 3);
     await h.tick(T0 + 2 * MIN);
     expect(h.sent).toHaveLength(1);
+    expect(h.routed).toHaveLength(1);
   });
 
   it('neither raises nor clears a ledger flag while the finder has no answer or could not read the ledger', async () => {
@@ -487,7 +498,7 @@ describe('runFlagAlertTick — a scripted sequence', () => {
     h.script.view = view([row('ws-a', 'tab-orch'), row('ws-a', 'tab-1', ['stall'])]);
     h.script.flows = { 'ws-a': flowRecord('ws-a', 12, T0 + MIN) };
     const reads = h.reads.fleet;
-    expect(await h.tick(T0 + MIN)).toEqual({ skipped: 'off', baseline: false, sent: [], noTarget: [], targetUnknown: [] });
+    expect(await h.tick(T0 + MIN)).toEqual({ skipped: 'off', baseline: false, sent: [], noTarget: [], targetUnknown: [], routed: [] });
     expect(h.reads.fleet).toBe(reads);
     expect(h.sent).toEqual([]);
 
@@ -503,7 +514,7 @@ describe('runFlagAlertTick — a scripted sequence', () => {
     const h = harness({ view: view([row('ws-a', 'tab-orch'), row('ws-a', 'tab-1', ['stall'])]) });
     await h.tick(T0);
     h.script.config = new Error('fleet-config.json is not JSON');
-    expect(await h.tick(T0 + MIN)).toEqual({ skipped: 'config-unreadable', baseline: false, sent: [], noTarget: [], targetUnknown: [] });
+    expect(await h.tick(T0 + MIN)).toEqual({ skipped: 'config-unreadable', baseline: false, sent: [], noTarget: [], targetUnknown: [], routed: [] });
     expect(logs.warn).toHaveBeenCalledWith('flag alert tick skipped: fleet config unreadable (fleet-config.json is not JSON)');
     h.script.config = { enabled: true, repeatMinutes: 60 };
     await h.tick(T0 + 2 * MIN);
@@ -512,7 +523,7 @@ describe('runFlagAlertTick — a scripted sequence', () => {
 
   it('unreadable workspaces skip the tick', async () => {
     const h = harness({ workspaces: new Error('EACCES') });
-    expect(await h.tick(T0)).toEqual({ skipped: 'workspaces-unreadable', baseline: false, sent: [], noTarget: [], targetUnknown: [] });
+    expect(await h.tick(T0)).toEqual({ skipped: 'workspaces-unreadable', baseline: false, sent: [], noTarget: [], targetUnknown: [], routed: [] });
     expect(h.state.readSources.size).toBe(0);
   });
 
