@@ -1,10 +1,10 @@
 'use strict';
-// Wave-12 acceptance checks: effect counts (story 15, ADR-0035 §7) through the candidate's production build. A
+// Wave-13 acceptance checks: effect counts (story 15, ADR-0035 §7) through the candidate's production build. A
 // `tab send` reaches a live stand-in; its turn (prompt-submit, a Bash PostToolUse posted as status-hook.sh posts it,
 // stop) is written to tab_turns; `effects show` counts the send as delivered and followed, and reads every
 // phone-only flag rule as not measured with null counts, never 0.
 //
-// `wave12(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
+// `wave13(inst, helpers)` returns results in checks.cjs's shape: { status, id, what, measured?, expected? }.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -13,12 +13,12 @@ const { request } = require('./checks-wave4.cjs');
 
 const IDS = ['effects-followed', 'effects-not-measured', 'effects-text'];
 
-const wave12 = async (inst, helpers) => {
+const wave13 = async (inst, helpers) => {
   const results = [];
   try {
     await checks(inst, helpers, results);
   } catch (e) {
-    results.push({ status: 'fail', id: 'wave12-error', what: 'the effect count checks ran to the end', measured: e instanceof Error ? e.stack : String(e), expected: 'no exception' });
+    results.push({ status: 'fail', id: 'wave13-error', what: 'the effect count checks ran to the end', measured: e instanceof Error ? e.stack : String(e), expected: 'no exception' });
   }
   return results;
 };
@@ -94,4 +94,4 @@ const checks = async (inst, { parseJson, within, sleep, brief }, results) => {
   }
 };
 
-module.exports = { wave12 };
+module.exports = { wave13 };

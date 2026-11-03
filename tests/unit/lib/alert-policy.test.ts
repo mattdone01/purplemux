@@ -125,6 +125,15 @@ describe('alertFor', () => {
     expect(unknown.body).toBe('pid 4242 exited with unknown status');
   });
 
+  it('a needs-decision alert has its fixed title and a body cut at 100 code points (ADR-0041)', () => {
+    const detail = `w1 · ws-a: ${'€'.repeat(150)}`;
+    const alert = alertFor({ ...base, kind: 'needs-decision', detail });
+    expect(alert.title).toBe('Decision needed: no Mission Control item');
+    expect(Array.from(alert.body)).toHaveLength(100);
+    expect(alert.body).toBe(Array.from(detail).slice(0, 100).join(''));
+    expect(alertFor({ ...base, kind: 'needs-decision', detail: 'w1 · ws-a: Ship it?' }).body).toBe('w1 · ws-a: Ship it?');
+  });
+
   it('clamps liveness alert bodies and falls back to the tab name', () => {
     expect(alertFor({ ...base, kind: 'work-stalled', detail: 'x'.repeat(200) }).body).toHaveLength(100);
     expect(alertFor({ ...base, kind: 'bg-job-died', detail: null }).body).toBe('orchestrator');
@@ -273,5 +282,12 @@ describe('alertFor kind attention-opened', () => {
 
   it('carries no itemId when none is given', () => {
     expect(alertFor(source({ itemId: undefined }))).not.toHaveProperty('itemId');
+  });
+
+  it('carries the question summary on attention-opened only (story 33 AC 3)', () => {
+    const question = { formatVersion: 2 as const, decision: 'Ship?', answerType: 'confirm' as const, revision: 1, options: [] };
+    expect(alertFor(source({ question })).question).toEqual(question);
+    expect(alertFor(source())).not.toHaveProperty('question');
+    expect(alertFor({ ...source({ question }), kind: 'review' })).not.toHaveProperty('question');
   });
 });

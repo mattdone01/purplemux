@@ -437,6 +437,7 @@ const snapshot = (runBinding: IMissionBinding | null = binding, runRevision = 4)
   }],
   answers: [{
     id: 'answer-one',
+    source: null,
     submissionId: 'submission-one',
     expectedRevision: 1,
     appliedRevision: 1,

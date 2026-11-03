@@ -46,6 +46,7 @@ const NUDGE_KINDS: Readonly<Record<TOrchestrationNudgeKind, TEffectFamily>> = {
 // `red-main` is left out: nothing routes an event of that kind; a red main reaches a tab as `alarm:red-main`.
 const NOTICE_KINDS: Readonly<Record<TInboxKind | Exclude<TWakeOtherKind, 'flag' | 'alarm' | 'red-main'>, TEffectFamily>> = {
   note: 'notice', watch: 'notice', deploy: 'notice', mission: 'notice', resume: 'notice', 'tab-send': 'notice', rotate: 'notice',
+  'standing-order': 'notice',
 };
 const FLOW_RULES: Readonly<Record<TFlowRule, true>> = {
   'lock-busy': true, 'queue-long': true, 'queue-old': true, 'queue-full': true, 'meter-over': true, stale: true,

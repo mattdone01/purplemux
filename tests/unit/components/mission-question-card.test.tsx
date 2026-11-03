@@ -105,6 +105,8 @@ describe('question card layout per answer type (ADR-0037 §5)', () => {
     const filled = editMissionDraft(draft, { optionTexts: { change: 'Split the lock work out.' }, text: 'Also tell lane B.' });
     expect(missionSubmitState(filled).disabled).toBe(false);
     expect(missionDraftRequest(filled).text).toBe('Change something first: Split the lock work out.\n\nOther: Also tell lane B.');
+    // Story 33 R3: the web records its answers as `web`.
+    expect(missionDraftRequest(filled).source).toBe('web');
   });
 
   it('"Other" is always last among the answer inputs', () => {

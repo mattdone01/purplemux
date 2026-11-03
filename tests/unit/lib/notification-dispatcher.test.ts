@@ -258,6 +258,19 @@ describe('createWebPushChannel', () => {
     expect(sent[1].payload).not.toHaveProperty('itemId');
   });
 
+  it('leaves the question summary out of the Web Push payload: nothing reads it there (story 33 R4)', async () => {
+    const { channel, sent } = setup([record('https://push/phone', 'D2')]);
+    const question = {
+      formatVersion: 2 as const, decision: 'Ship?', answerType: 'confirm' as const, revision: 3,
+      options: [{ id: 'yes', label: 'Yes', needsText: false }, { id: 'no', label: 'No', needsText: false }],
+    };
+
+    await channel.deliver({ ...draft({ kind: 'attention-opened', itemId: 'item-7', question }), id: 'alert-4', seq: 10 }, {});
+
+    expect(sent[0].payload).toMatchObject({ itemId: 'item-7' });
+    expect(sent[0].payload).not.toHaveProperty('question');
+  });
+
   it('reaps subscriptions the push service reports as gone', async () => {
     const records = [record('https://push/gone', 'D1'), record('https://push/live', 'D2')];
     const dropped: string[] = [];
