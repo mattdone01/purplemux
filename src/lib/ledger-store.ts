@@ -126,6 +126,18 @@ export interface ILedgerWaitsQuery {
   type?: TLedgerItemType;
 }
 
+/** Open items of these types are work in progress for the pulse (consult 12, Q1). */
+export const PULSE_WORK_ITEM_TYPES: readonly TLedgerItemType[] = ['range', 'slice', 'gate', 'review', 'landing', 'deploy'];
+
+export interface ILedgerPulseSnapshot {
+  /** `at` of each open, clear and close event on a work item type since the window start. */
+  movement: number[];
+  /** Any event on a work item type for the workspace since the window start. */
+  eventSince: boolean;
+  openWork: number;
+  oldest: { itemKey: string; itemType: TLedgerItemType; waitReason: string | null; since: number } | null;
+}
+
 export interface ILedgerRetentionResult {
   events: number;
   intervals: number;
@@ -616,6 +628,32 @@ export class LedgerStore {
         .map(([tabId, wakes]) => ({ tabId, wakes }))
       : null;
     return { intervals, items, lastProducer, firstEventAt, tabWakes };
+  };
+
+  /**
+   * What the pulse reads (ADR-0034 §9): movement (open, clear and close events) on the work item
+   * types only, whether any event on those types arrived since `since` (experiment, seat and MC item
+   * events never switch the WIP basis, round 2 F2), and the open work items with the oldest of them
+   * by its wait (else its open).
+   */
+  pulseSnapshot = (workspaceId: string, since: number): ILedgerPulseSnapshot => {
+    const types = PULSE_WORK_ITEM_TYPES.map(() => '?').join(', ');
+    const movement = (this.database.prepare(`SELECT at FROM events WHERE at >= ? AND workspace_id = ?
+      AND kind IN ('open', 'clear', 'close') AND item_type IN (${types})`).pluck()
+      .all(since, workspaceId, ...PULSE_WORK_ITEM_TYPES) as number[]);
+    const eventSince = this.database.prepare(`SELECT 1 FROM events WHERE at >= ? AND workspace_id = ? AND item_type IN (${types}) LIMIT 1`)
+      .get(since, workspaceId, ...PULSE_WORK_ITEM_TYPES) !== undefined;
+    const openWork = (this.database.prepare(`SELECT COUNT(*) FROM items INDEXED BY items_open_idx
+      WHERE workspace_id = ? AND closed_at IS NULL AND item_type IN (${types})`).pluck()
+      .get(workspaceId, ...PULSE_WORK_ITEM_TYPES) as number);
+    const oldest = this.database.prepare(`SELECT item_key, item_type, wait_reason, COALESCE(wait_since, opened_at) AS since
+      FROM items INDEXED BY items_open_idx WHERE workspace_id = ? AND closed_at IS NULL AND item_type IN (${types})
+      ORDER BY since, item_key LIMIT 1`).get(workspaceId, ...PULSE_WORK_ITEM_TYPES) as
+      { item_key: string; item_type: TLedgerItemType; wait_reason: string | null; since: number } | undefined;
+    return {
+      movement, eventSince, openWork,
+      oldest: oldest ? { itemKey: oldest.item_key, itemType: oldest.item_type, waitReason: oldest.wait_reason, since: oldest.since } : null,
+    };
   };
 
   experiments = (workspaceId: string): ILedgerExperiment[] =>

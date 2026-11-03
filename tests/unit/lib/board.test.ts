@@ -32,9 +32,11 @@ beforeEach(() => {
 
 describe('readBoard', () => {
   it('adds the workspace, the finder age and Mission Control\'s open items', async () => {
-    mc.titles.mockReturnValue([{ id: 'mc-1', title: 'Approve the QA deploy' }]);
+    mc.titles.mockReturnValue([{ id: 'mc-1', title: 'Approve the QA deploy', createdAt: NOW - HOUR }]);
     const board = await readBoard('ws-a', NOW);
-    expect(board).toMatchObject({ workspaceId: 'ws-a', ageMs: 30_000, needsYou: [{ id: 'mc-1', title: 'Approve the QA deploy' }] });
+    expect(board).toMatchObject({
+      workspaceId: 'ws-a', ageMs: 30_000, needsYou: [{ id: 'mc-1', title: 'Approve the QA deploy', createdAt: NOW - HOUR, blocked: null }],
+    });
     expect(mc.titles).toHaveBeenCalledWith('ws-a');
   });
 
@@ -76,4 +78,40 @@ describe('readBoard', () => {
     expect((await readBoard('ws-a', NOW, ['lane-a', 'tab-x'])).stuck.map((s) => s.key)).toEqual(['range:a:1']);
     expect((await readBoard('ws-a', NOW, ['orchestrator', 'tab-b'])).stuck.map((s) => s.key)).toEqual(['range:b:1']);
   });
+
+  it('each needs-you row carries what it blocks from the ledger (AC 3); no link is null, never 0', async () => {
+    const owner = (key: string, mcId: string, since: number, attrs = {}) => ({
+      workspaceId: 'ws-a', itemKey: key, itemType: 'range' as const, openedAt: since, closedAt: null, state: null, stateSince: null,
+      waitReason: 'owner' as const, waitSince: since, holder: 'owner', clearInput: 'answer it', parentKey: `mc-item:${mcId}`, attrs,
+      lastEventAt: since, lastSeq: 1,
+    });
+    finder.result = deriveConstraint({
+      intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null,
+      items: [
+        owner('range:a:1', 'mc-1', NOW - 3 * HOUR), owner('range:b:1', 'mc-1', NOW - 90 * 60_000, { critical: true }),
+        owner('range:c:1', 'mc-2', NOW - HOUR), { ...owner('range:d:1', 'mc-1', NOW - HOUR), closedAt: NOW - 1 },
+        { ...owner('range:e:1', 'mc-3', NOW - HOUR), waitReason: 'not-armed' as const },
+      ],
+    }, null, null, null, NOW);
+    mc.titles.mockReturnValue([
+      { id: 'mc-1', title: 'Pick a port', createdAt: NOW - 4 * HOUR }, { id: 'mc-2', title: 'Approve', createdAt: NOW - 2 * HOUR },
+      { id: 'mc-3', title: 'Unlinked', createdAt: NOW - HOUR }, { id: 'constructor', title: 'Prototype-named', createdAt: NOW },
+    ]);
+    const board = await readBoard('ws-a', NOW);
+    expect(board.needsYou?.map((row) => [row.id, row.blocked])).toEqual([
+      ['mc-1', { items: 2, hours: 4.5, critical: true }],
+      ['mc-2', { items: 1, hours: 1, critical: false }],
+      ['mc-3', null],
+      ['constructor', null],
+    ]);
+  });
+
+  it('an unmeasured ledger leaves every row\'s blocked cost null', async () => {
+    finder.result = deriveConstraint(null, null, null, null, NOW);
+    mc.titles.mockReturnValue([{ id: 'mc-1', title: 'Pick a port', createdAt: NOW }]);
+    const board = await readBoard('ws-a', NOW);
+    expect(board.ownerBlocks).toBeNull();
+    expect(board.needsYou?.[0].blocked).toBeNull();
+  });
 });
+

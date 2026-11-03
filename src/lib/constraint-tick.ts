@@ -1,6 +1,6 @@
 import { FINDER_LOOKBACK_MS, FINDER_WAKES_WINDOW_MS, deriveConstraint } from '@/lib/constraint';
 import { createLogger } from '@/lib/logger';
-import type { IFinderLedgerInput, IFinderPoolInput, IFinderResult, IFinderSpendAll, IFinderSpendInput } from '@/types/constraint';
+import type { IBoardGoal, IFinderLedgerInput, IFinderPoolInput, IFinderResult, IFinderSpendAll, IFinderSpendInput } from '@/types/constraint';
 import type { IFlowRecord } from '@/types/flow';
 
 // The finder's tick (ADR-0034, the ADR-0032 pattern): every 60 s, per process, derive each
@@ -24,6 +24,8 @@ export interface IFinderDeps {
   spend: (workspaceIds: readonly string[], now: number) => Promise<IFinderSpendAll | null>;
   /** No pool scheduler yet (ADR-HFL-09, story 17): null is an unknown pool. */
   pool: () => Promise<IFinderPoolInput | null>;
+  /** The workspace's goal (`board goal set`); absent or null is no goal. */
+  goal?: (workspaceId: string) => Promise<IBoardGoal | null>;
 }
 
 interface IFinderTimer {
@@ -76,11 +78,19 @@ const deriveForWorkspace = async (
   deps: IFinderDeps, workspaceId: string, now: number, shared: IShared, clock: () => number,
 ): Promise<IFinderResult> => {
   const started = clock();
-  const [ledger, flow] = await Promise.all([
+  const [ledger, flow, goal] = await Promise.all([
     orNull(() => deps.ledger(workspaceId, now), 'ledger', workspaceId),
     orNull(() => deps.flow(workspaceId), 'flow', workspaceId),
+    // An unreadable goal is "goal not measured", never "no goal set" (round 2, F7).
+    (async () => (deps.goal ? deps.goal(workspaceId) : null))().then(
+      (value) => ({ value, error: null }),
+      (err: unknown) => {
+        log.warn({ workspaceId }, `constraint finder: goal unreadable (${errorText(err)})`);
+        return { value: null, error: errorText(err) };
+      },
+    ),
   ]);
-  const result = deriveConstraint(ledger, flow, spendFor(shared.spend, workspaceId), shared.pool, now);
+  const result = deriveConstraint(ledger, flow, spendFor(shared.spend, workspaceId), shared.pool, now, goal.value, goal.error);
   cache().set(workspaceId, result);
   const durationMs = clock() - started;
   if (durationMs > FINDER_SLOW_WORKSPACE_MS) log.warn({ workspaceId, durationMs }, `constraint finder: ${workspaceId} took ${durationMs} ms`);
@@ -104,6 +114,7 @@ const realDeps = (): IFinderDeps => ({
   flow: async (workspaceId) => (await import('@/lib/flow-store')).readFlow(workspaceId),
   spend: async (workspaceIds, now) => (await import('@/lib/spend/spend-service')).getFinderSpend(workspaceIds, now),
   pool: async () => null,
+  goal: async (workspaceId) => (await import('@/lib/board-goal-store')).readBoardGoal(workspaceId),
 });
 
 /** One scheduled tick: skipped while the previous one still runs, logged when it takes longer than 5 s. */
@@ -148,6 +159,11 @@ export const readFinderResult = async (
     .finally(() => inflight.delete(workspaceId));
   inflight.set(workspaceId, derive);
   return derive;
+};
+
+/** Drop a workspace's cached answer so the next read derives it (a new goal shows at once, not at the next tick). */
+export const forgetFinderResult = (workspaceId: string): void => {
+  cache().delete(workspaceId);
 };
 
 /** Every cached answer, for the flag tick (source `ledger`). */

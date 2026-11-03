@@ -1210,10 +1210,13 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   mine=1 keeps the stuck items the calling tab holds (by tab name or id); it needs a tab token
   (400 invalid-request otherwise). Response (times Unix ms):
   { "workspaceId", "generatedAt", "ageMs", "staleSince" | null, "stuckTotal",
-    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "itemsLeft" | null, "p50At" | null, "p90At" | null },
+    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "goalState": "set" | "none" | "unknown",
+                 "itemsLeft" | null, "p50At" | null, "p90At" | null, "throughputPerDay": null | [n, n, n], "reason" | null },
     "constraint": null | { "reason", "stage", "waitingHours", "trend", "ownerSeat" | null, "clearInput" | null,
                            "basis": "critical" | "all", "items", "labels": { "reason", "stage", "trend" } },
-    "needsYou": null | [{ "id", "title" }],
+    "needsYou": null | [{ "id", "title", "createdAt", "blocked": null | { "items", "hours", "critical" } }],
+    "experiments": null | [<ledger experiment with no verdict>],
+    "ownerBlocks": null | { <mc item id>: { "items", "hours", "critical" } },
     "stuck": [{ "key", "itemType", "holder" | null, "reason", "since", "clearInput" | null, "critical", "reasonLabel" }],
     "windows": [{ "window": "6h" | "24h" | "7d", "since", "until", "byReason": [row], "byStage": [row], "closed": { <type>: n } }],
     "anomalies": [{ "id", "subject", "value" | null, "unit", "threshold" | null, "judged", "breached", "window", "text", "reason" | null }],
@@ -1224,7 +1227,14 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   (reason "ledger unreadable" or "the ledger holds no event for this workspace") means constraint,
   stuck and windows were not measured and every anomaly is null: an empty list then is not "nothing
   stuck". spend is "partial" when the index is ready but reports an error (the reason).
-  onTrack.goal is null until a goal is set (story 12); onTrack.state is then "at-risk".
+  onTrack.goal is null until a goal is set (board goal set); onTrack.state is then "at-risk", reason
+  "no goal set". With a goal: itemsLeft = goal keys the ledger does not hold closed; throughputPerDay
+  = closes of the goal keys' item types in each of the last 3 days; p50At / p90At from an exact
+  bootstrap over those days; no close in 3 days is no forecast (reason says so), never a date.
+  needsYou[].blocked: open ledger items waiting "owner" whose link (parent) is mc-item:<id>, their
+  summed waiting hours and whether any is critical; null when nothing links, or when the ledger is
+  not measured (then inputs.ledger.reason says why). goalState "unknown": the goal file could not be
+  read (reason "goal not measured: ..."), never "no goal set".
   staleSince is generatedAt when the answer is older than 120 s (two ticks); treat it as stale.
   --line then ends with "stale since <time>" (AEDT/AEST).
   The constraint is the reason with the most waiting hours in the last 24 h (finished waits clipped
@@ -1251,6 +1261,61 @@ GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answe
   workspace's orchestrator. An answer older than 120 s, or with the ledger unknown, neither raises
   nor clears. judged is false when the value or threshold is null or the measure never flags; an
   anomaly that cannot be judged keeps its raised flag.
+
+## Board goal (ADR-0034 §10)
+
+GET|PUT|DELETE /api/cli/workspaces/<workspaceId>/board-goal
+  (purplemux board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS)
+  GET: read scope; { "workspaceId", "goal": null | { "label", "items", "setAt", "setBy" } }.
+  PUT { "label": "<1..120>", "items": ["<type>:<key>", ... 1..500] }: the workspace's own token only
+  (403 otherwise; an admin token is not a workspace). 400 invalid-request lists every defect
+  ("items[0]: saw \"story-3\", expected <type>:<key> ..."). DELETE clears. PUT and DELETE drop the
+  finder's cached answer and answer { "workspaceId", "goal" | "cleared", "onTrack" } derived at once.
+
+## Pulse (ADR-0034 §9)
+
+GET /api/cli/workspaces/<workspaceId>/pulse          (purplemux board pulse -w WS [--json])
+GET /api/mission-control/pulse[?workspaceId=all|WS]  (human session; all answers { "pulses": [...] })
+  Read scope on WS. Hourly movement over the last 48 h, cached 60 s per workspace. Response:
+  { "workspaceId", "generatedAt", "staleSince" | null, "scope": { "basis": "epic" | "directories", "epics": [...] },
+    "hours": null | [{ "start", "total", "bySource": { <source>: n }, "gatesPassed", "gatesFailed" } x 48],
+    "sources": [{ "id", "label", "state": "ok" | "unknown", "reason" | null, "count" | null, "lastAt" | null, "from": [...],
+                  "sharedWith": null | [<workspace name>] }],
+    "stall": { "state": "stalled" | "moving" | "steady" | "idle" | "not-measured", "reason", "lastMovementAt" | null,
+               "hoursSinceMovement" | null, "lastHour" | null, "medianPerHour" | null,
+               "oldestStuck": null | { "kind": "ledger-item" | "agent-tab" | "mc-item", "id", "label", "since" } },
+    "wip": { "count" | null, "basis": "ledger" | "agent-tabs" | "none", "basisReason",
+             "sources": { "ledger": "measured" | "no-events" | "unreadable", "agentTabs" | "missionControl": "measured" | "unreadable" | "not-used" } },
+    "priority": { "text", "basis": "constraint" | "stuck-critical" | "none" | "unknown", "needsYou" | null } }
+  Scope: every event belongs to one workspace. A workspace holding an epic:<slug> lease counts that
+  epic's _output/<slug> gate logs and review records, the repositories its status.yaml names with an
+  integration_branch (that exact branch and each story's branch, stories[].branch else story/<key>),
+  and every directory whose .v2/status.yaml names the epic (main, gate logs, receipts, landings).
+  Where two leased epics share a repository, a commit counts for one epic only: the one whose story
+  branches alone hold it; any other commit both reach is a commits source with sharedWith set. Without a lease: its own directories, minus what
+  another workspace's epic covers; a directory another workspace lists too is a source with
+  sharedWith set, shown after the six and never counted in hours or stall.
+  Sources (in order): ledger (open, clear, close on range, slice, gate, review, landing, deploy),
+  commits (the scope's refs), gates (gate.sh logs: VERDICT word VALID with EXIT=0 passes, RED fails,
+  VOID/REFUSED/KILLED/STOPPED are not finished; v2 logs: the GATE PASS|FAIL line naming the file),
+  reviews (v2 receipts and every _output/<epic>/reviews/*-out.md), landed (.v2/landings.log LANDED
+  lines), answers (Mission Control answers). Each read has a 10 s deadline ("read timed out"). Reads
+  on an sshfs mount (_output) run at most 2 at a time; a mount that does not answer within 5 s reads
+  "<mount> not answering since <time>" until a probe stat of it returns. A
+  source that cannot be read is "unknown" with count null, never 0, and adds nothing to the bars;
+  hours is null when no source is read.
+  stall: stalled when wip.count > 0 and nothing moved for 2 h (names the oldest counted item: an
+  MC item, a tab waiting for input, or a ledger item); moving when the last 60 min is above 0 and
+  at or above the median of the active hours (any event) among the 168 complete hours before the
+  current one (stall.medianPerHour, stall.activeHours); idle when wip.count is
+  0; steady otherwise; not-measured with no basis or when no file-born source (commits, gates,
+  reviews, landed) was read. The reason names every source not measured.
+  wip: the ledger's open range, slice, gate, review, landing and deploy items once the ledger holds
+  an event on one of those types for the workspace in 7 days; else busy or needs-input agent tabs (the orchestrator
+  only while it waits for the owner: a pane prompt or a NEEDS-DECISION/BLOCKED turn end) plus open Mission Control
+  items; else none.
+  priority: the constraint with its owner and clear input; else the oldest stuck critical item;
+  with the needs-you count. staleSince: the finder answer it rests on is older than 120 s.
 
 ## Portfolio board
 

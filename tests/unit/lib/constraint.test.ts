@@ -354,13 +354,13 @@ describe('missing inputs (AC 7)', () => {
 
   it('with no goal, the on-track line is at-risk with nothing forecast (story 08 contract)', () => {
     const result = deriveConstraint(ledger(), null, null, null, NOW);
-    expect(result.onTrack).toEqual({ state: 'at-risk', goal: null, itemsLeft: null, p50At: null, p90At: null });
+    expect(result.onTrack).toEqual({ state: 'at-risk', goal: null, goalState: 'none', itemsLeft: null, p50At: null, p90At: null, throughputPerDay: null, reason: 'no goal set' });
   });
 });
 
 describe('board line (AC 5)', () => {
   it('prints goal, items left, constraint and trend on one line', () => {
-    const line = boardLine({ state: 'on-track', goal: 'Walking skeleton', itemsLeft: 12, p50At: null, p90At: null }, {
+    const line = boardLine({ state: 'on-track', goal: 'Walking skeleton', goalState: 'set', itemsLeft: 12, p50At: null, p90At: null, throughputPerDay: null, reason: null }, {
       reason: 'land-queue/lock-busy', stage: 'land', waitingHours: 14.25, trend: 'up', ownerSeat: 'v2-kit', clearInput: null, basis: 'all', items: 3,
       labels: { reason: 'landing queue, lock busy', stage: 'landing', trend: 'rising' },
     }, null);

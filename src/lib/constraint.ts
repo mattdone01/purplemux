@@ -1,10 +1,13 @@
 // The constraint finder (ADR-0034, ADR-HFL-02 decision 1). One pure function: no Node import, no
 // I/O, no clock. The tick (`constraint-tick.ts`) reads the inputs and caches the answer.
+import { onTrackFor } from '@/lib/board-forecast';
 import { reasonLabel, stageLabel, trendLabel } from '@/lib/constraint-labels';
 import { isFlowStale } from '@/lib/flow';
 import { LEDGER_UNKNOWN_ITEM_TYPES, UNKNOWN_REASON, clippedMs, percentile, stageOfReason } from '@/lib/ledger';
 import type {
+  IBoardBlocked,
   IBoardConstraint,
+  IBoardGoal,
   IBoardOnTrack,
   IBoardStuckItem,
   IFinderAnomaly,
@@ -253,6 +256,25 @@ export const stuckItems = (ledger: IFinderLedgerInput, critical: ReadonlySet<str
     }))
     .sort((a, b) => a.since - b.since || a.key.localeCompare(b.key));
 
+const MC_ITEM_PREFIX = 'mc-item:';
+
+/**
+ * What each open Mission Control item blocks (ADR-HFL-11 §1): the open items waiting `owner` whose
+ * link names `mc-item:<id>`, their summed waiting hours and whether any is critical. An MC item
+ * that no ledger item links to has no entry: "not measured", never 0.
+ */
+export const ownerBlocks = (ledger: IFinderLedgerInput, critical: ReadonlySet<string>, now: number): Record<string, IBoardBlocked> => {
+  const waited = new Map<string, { items: number; ms: number; critical: boolean }>();
+  for (const item of ledger.items) {
+    if (item.closedAt !== null || item.waitReason !== 'owner' || item.waitSince === null) continue;
+    if (!item.parentKey?.startsWith(MC_ITEM_PREFIX)) continue;
+    const id = item.parentKey.slice(MC_ITEM_PREFIX.length);
+    const entry = waited.get(id) ?? { items: 0, ms: 0, critical: false };
+    waited.set(id, { items: entry.items + 1, ms: entry.ms + Math.max(0, now - item.waitSince), critical: entry.critical || critical.has(item.itemKey) });
+  }
+  return Object.fromEntries([...waited].map(([id, entry]) => [id, { items: entry.items, hours: hours(entry.ms), critical: entry.critical }]));
+};
+
 /** `unknown` waiting time over all waiting time on the wait-life types, last 24 h; null when nothing waited. */
 export const unknownShareOf = (spans: readonly IWaitSpan[], now: number): number | null => {
   const since = now - DAY_MS;
@@ -499,11 +521,9 @@ const spendStatus = (spend: IFinderSpendInput | null): IFinderInputStatus => {
   return status('ok', null, spend.index.indexedThrough);
 };
 
-const NO_GOAL: IBoardOnTrack = { state: 'at-risk', goal: null, itemsLeft: null, p50At: null, p90At: null };
-
 /** `ledgerUnknown` is the reason the ledger measures were not taken; null when they were. */
 export const boardLine = (onTrack: IBoardOnTrack, constraint: IBoardConstraint | null, ledgerUnknown: string | null): string => {
-  const goal = onTrack.goal ?? 'no goal set';
+  const goal = onTrack.goal ?? (onTrack.goalState === 'unknown' ? onTrack.reason ?? 'goal not measured' : 'no goal set');
   const left = onTrack.itemsLeft === null ? 'items left —' : `${onTrack.itemsLeft} items left`;
   if (ledgerUnknown) return `${goal} · ${left} · constraint unknown (${ledgerUnknown})`;
   if (!constraint) return `${goal} · ${left} · no constraint: nothing waited in 24 h`;
@@ -540,6 +560,8 @@ export const deriveConstraint = (
   spend: IFinderSpendInput | null,
   pool: IFinderPoolInput | null,
   now: number,
+  goal: IBoardGoal | null = null,
+  goalError: string | null = null,
 ): IFinderResult => {
   // An empty ledger is not "nothing waited": no producer has spoken for this workspace yet.
   const ledgerUnknown = !ledger ? LEDGER_UNREADABLE : ledger.firstEventAt === null ? LEDGER_EMPTY : null;
@@ -556,9 +578,10 @@ export const deriveConstraint = (
     slotsTotal: pool.hosts.reduce((sum, host) => sum + host.slotsTotal, 0),
   } : null;
   if (!ledger || ledgerUnknown) {
+    const onTrack = onTrackFor(goal, null, now, goalError);
     return {
-      generatedAt: now, onTrack: NO_GOAL, constraint: null, stuck: [], windows: [], anomalies: unknownAnomalies(ledgerUnknown!),
-      unknownShare: null, inputs, flowLocks, pool: poolView, line: boardLine(NO_GOAL, null, ledgerUnknown),
+      generatedAt: now, onTrack, constraint: null, stuck: [], ownerBlocks: null, windows: [], anomalies: unknownAnomalies(ledgerUnknown!),
+      unknownShare: null, inputs, flowLocks, pool: poolView, line: boardLine(onTrack, null, ledgerUnknown),
     };
   }
   const spans = waitSpans(ledger, now);
@@ -566,17 +589,19 @@ export const deriveConstraint = (
   const constraint = pickConstraint(spans, critical, now, ledger.firstEventAt);
   const unknownShare = unknownShareOf(spans, now);
   const ctx: IAnomalyContext = { ledger, spans, spend, unknownShare, now };
+  const onTrack = onTrackFor(goal, ledger.items, now, goalError);
   return {
     generatedAt: now,
-    onTrack: NO_GOAL,
+    onTrack,
     constraint,
     stuck: stuckItems(ledger, critical),
+    ownerBlocks: ownerBlocks(ledger, critical, now),
     windows: FINDER_WINDOWS.map(({ window, ms }) => windowView(spans, ledger, window, ms, now)),
     anomalies: ANOMALY_RULES.flatMap((rule) => rule(ctx)),
     unknownShare,
     inputs,
     flowLocks,
     pool: poolView,
-    line: boardLine(NO_GOAL, constraint, null),
+    line: boardLine(onTrack, constraint, null),
   };
 };
