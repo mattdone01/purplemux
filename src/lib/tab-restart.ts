@@ -163,7 +163,7 @@ const restartLocked = async (input: IRestartTabInput, run: IRestartRun): Promise
     const provider = getProviderByPanelType(tab.panelType);
     const launched = provider
       ? await launchAgentInTab(
-        { workspaceId, tabId, sessionName: tab.sessionName, panelType: tab.panelType, host: tab.host, agentLaunchConfig: tab.agentLaunchConfig },
+        { workspaceId, tabId, sessionName: tab.sessionName, panelType: tab.panelType, host: tab.host, agentLaunchConfig: tab.agentLaunchConfig, role: tab.role, previewOrigin: tab.previewOrigin, pgService: tab.pgService },
         { provider, resumeSessionId, targetLockHeld: true, resetAgentSession: resumeSessionId === null },
       )
       : null;

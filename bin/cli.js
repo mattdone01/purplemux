@@ -1422,7 +1422,14 @@ const cmdTabCreate = async (args) => {
   const host = flagValue(args, '--host');
   // The tab's start directory: it must exist on the host the tab runs on.
   const cwd = flagValue(args, '--cwd');
+  // A fixed tool configuration for the tab (ADR-0040); the server validates the name.
+  const role = flagValue(args, '--role');
+  const previewUrl = flagValue(args, '--preview-url');
+  const pgService = flagValue(args, '--pg-service');
   if (!wsId) die('--workspace is required');
+  if (args.includes('--role') && !role) die('--role needs a role name (evaluator)');
+  if (args.includes('--pg-service') && !pgService) die('--pg-service needs a ~/.pg_service.conf entry name');
+  if (args.includes('--preview-url') && !previewUrl) die('--preview-url needs the http(s) URL of the preview the evaluator may browse');
   if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
   if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
   if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
@@ -1445,6 +1452,9 @@ const cmdTabCreate = async (args) => {
     ...(reportOn ? { reportOn } : {}),
     ...(host ? { host } : {}),
     ...(cwd ? { cwd } : {}),
+    ...(role ? { role } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+    ...(pgService ? { pgService } : {}),
     ...(overCap ? { overCap: { reason } } : {}),
   });
   out(body);
@@ -2254,6 +2264,19 @@ Commands:
              [--cwd DIR]                   Start the tab in DIR, an absolute directory that must exist on the
                                            tab's host (cwd-missing, exit 2). A remote worker works in its own
                                            checkout or worktree on that host
+             [--role evaluator --preview-url URL [--pg-service NAME]]
+                                           A claude-code tab (implied when -t is omitted) that cannot change the
+                                           repository (ADR-0040). Tools: Read, Grep, Glob, Bash and the
+                                           chrome-devtools MCP (headless Chrome 149+, URL's origin only); Bash runs
+                                           Claude Code's read-only commands (not docker, ps, pgrep, lsof, ss)
+                                           and ~/.purplemux/bin/evaluator-sql, which queries the libpq service
+                                           NAME (exported as PGSERVICE; the service's SELECT-only role is the
+                                           guard);
+                                           credential paths (~/.purplemux, ~/.ssh, *token*, ...) are unreadable;
+                                           anything else is denied, never prompted. Every relaunch keeps it; never
+                                           an orchestrator. Exit 2 without --preview-url (an http(s) URL on a
+                                           plain host, not purplemux's own port), for another type, a remote
+                                           host, an unknown role or a headless Chrome under 149
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets the
              [--no-launch]                 reasoning effort — claude-code: low|medium|high|xhigh|max (claude --effort;
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);

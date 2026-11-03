@@ -2,6 +2,8 @@ import { getDangerouslySkipPermissions } from '@/lib/config-store';
 import { HOOK_SETTINGS_PATH } from '@/lib/hook-settings';
 import { getClaudePromptPath } from '@/lib/claude-prompt';
 import { isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
+import { evaluatorClaudeFlags, evaluatorEnvPrefix } from '@/lib/tab-role';
+import type { TTabRole } from '@/types/terminal';
 
 export { CLAUDE_EFFORT_LEVELS, isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
 
@@ -10,14 +12,27 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const isValidSessionId = (id: unknown): id is string =>
   typeof id === 'string' && UUID_RE.test(id);
 
-export const buildClaudeFlags = async (workspaceId?: string, opts?: { model?: string; effort?: string }): Promise<string> => {
-  const skipPerms = await getDangerouslySkipPermissions();
+interface IClaudeFlagOptions {
+  model?: string;
+  effort?: string;
+  role?: TTabRole;
+  previewOrigin?: string;
+  pgService?: string;
+}
+
+/** The one start of every local claude command: an evaluator's environment (ADR-0040), then `claude`. */
+export const claudeCommand = (rest: string, opts?: IClaudeFlagOptions): string => `${evaluatorEnvPrefix(opts)}claude ${rest}`;
+
+export const buildClaudeFlags = async (workspaceId?: string, opts?: IClaudeFlagOptions): Promise<string> => {
+  // An evaluator's allow-list restricts nothing under bypass permissions (ADR-0040).
+  const skipPerms = opts?.role !== 'evaluator' && await getDangerouslySkipPermissions();
   const parts = [`--settings ${HOOK_SETTINGS_PATH}`];
   if (workspaceId) {
     parts.push(`--append-system-prompt-file ${getClaudePromptPath(workspaceId)}`);
   }
   if (opts?.model && isValidModelName(opts.model)) parts.push(`--model ${opts.model}`);
   if (opts?.effort && isValidClaudeEffort(opts.effort)) parts.push(`--effort ${opts.effort}`);
+  if (opts?.role === 'evaluator') parts.push(...await evaluatorClaudeFlags(opts.previewOrigin));
   if (skipPerms) parts.push('--dangerously-skip-permissions');
   return parts.join(' ');
 };
@@ -36,11 +51,11 @@ export const buildRemoteClaudeLaunch = async (workspaceId: string, opts?: { mode
 export const buildResumeCommand = async (
   sessionId: string,
   workspaceId?: string,
-  opts?: { model?: string; effort?: string },
+  opts?: IClaudeFlagOptions,
 ): Promise<string> => {
   if (!isValidSessionId(sessionId)) {
     throw new Error(`Invalid session ID format: ${sessionId}`);
   }
   const flags = await buildClaudeFlags(workspaceId, opts);
-  return `claude --resume ${sessionId} ${flags}`;
+  return claudeCommand(`--resume ${sessionId} ${flags}`, opts);
 };

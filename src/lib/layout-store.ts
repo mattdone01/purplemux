@@ -23,7 +23,7 @@ import {
   equalizeNode,
   isEqualized,
 } from '@/lib/layout-tree';
-import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig } from '@/types/terminal';
+import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig, TTabRole } from '@/types/terminal';
 import type { TTurnMarkerName } from '@/lib/turn-end';
 import type { TCliState } from '@/types/timeline';
 import type { IAgentProvider } from '@/lib/providers/types';
@@ -372,7 +372,7 @@ export const deletePane = async (
  */
 export type TTabAdmit = (layout: ILayoutData) => { ok: true } | { ok: false; refusal: Error };
 
-export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; reportOn?: TTurnMarkerName[]; host?: string; admit?: TTabAdmit }): Promise<ITab | null> =>
+export const addTabToPane = async (wsId: string, paneId: string, name?: string, cwd?: string, panelType?: string, command?: string, opts?: { scope?: string[]; agentLaunchConfig?: IAgentLaunchConfig; reportsTo?: string; reportOn?: TTurnMarkerName[]; host?: string; role?: TTabRole; previewOrigin?: string; pgService?: string; admit?: TTabAdmit }): Promise<ITab | null> =>
   withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -403,7 +403,7 @@ export const addTabToPane = async (wsId: string, paneId: string, name?: string, 
     const defaultName = defaultTabNameForPanelType(panelType as ITab['panelType']);
     const tabName = name?.trim() || defaultName;
     const scope = opts?.scope?.map((s) => s.trim()).filter(Boolean);
-    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}), ...(opts?.reportOn?.length ? { reportOn: [...opts.reportOn] } : {}), ...(host ? { host } : {}) };
+    const tab: ITab = { id: tabId, sessionName, name: tabName, order: nextOrder, ...(cwd ? { cwd } : {}), ...(panelType ? { panelType: panelType as ITab['panelType'] } : {}), ...(scope?.length ? { scope } : {}), ...(opts?.agentLaunchConfig ? { agentLaunchConfig: opts.agentLaunchConfig } : {}), ...(opts?.reportsTo ? { reportsTo: opts.reportsTo } : {}), ...(opts?.reportOn?.length ? { reportOn: [...opts.reportOn] } : {}), ...(host ? { host } : {}), ...(opts?.role ? { role: opts.role } : {}), ...(opts?.previewOrigin ? { previewOrigin: opts.previewOrigin } : {}), ...(opts?.pgService ? { pgService: opts.pgService } : {}) };
 
     if (command && !isWebBrowser) prepareOrchestrationLaunch(tab);
     pane.tabs.push(tab);
