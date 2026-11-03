@@ -37,11 +37,13 @@ describe('tab_events shape (ADR-0035 §3)', () => {
     const raw = new Database(file);
     raw.exec(`DROP INDEX tab_events_pending_idx; DROP INDEX tab_events_delivered_idx; DROP INDEX tab_events_digest_idx;
       DROP INDEX tab_events_sourced_idx;`);
-    raw.exec('ALTER TABLE tab_events DROP COLUMN source_tab_name; ALTER TABLE tab_events DROP COLUMN source_tab_id;');
+    raw.exec(`ALTER TABLE tab_events DROP COLUMN source_tab_name; ALTER TABLE tab_events DROP COLUMN source_tab_id;
+      ALTER TABLE tab_events DROP COLUMN rule; DROP TABLE tab_turns;`);
     raw.close();
     store = new LedgerStore(file);
     expect(store.pragma('user_version')).toBe(1);
-    expect(store.columns('tab_events').slice(-2)).toEqual(['source_tab_id', 'source_tab_name']);
+    expect(store.columns('tab_events').slice(-3)).toEqual(['source_tab_id', 'source_tab_name', 'rule']);
+    expect(store.columns('tab_turns')).toEqual(['id', 'workspace_id', 'tab_id', 'provider', 'started_at', 'ended_at', 'tool_calls']);
     expect(store.tabEvents.list(WS, { since: 0, limit: 10 }).map((row) => row.text)).toEqual(['before']);
   });
 });

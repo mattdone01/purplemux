@@ -26,7 +26,7 @@ so no environment setup is needed.
 \`\`\`bash
 purplemux workspaces                                # list all workspaces
 purplemux tab list -w ${ws.id}                        # list tabs in this workspace
-purplemux tab create -w ${ws.id} [-n NAME] [-t TYPE]  # create a tab (type: terminal | claude-code | codex-cli | agent-sessions | web-browser | diff)
+purplemux tab create -w ${ws.id} [-n NAME] [-t TYPE]  # create a tab (type: terminal | claude-code | codex-cli | grok-cli | agent-sessions | web-browser | diff)
                     [--reports-to TAB_ID]              # its watchdog nudges go to TAB_ID, not the workspace orchestrator
                     [--report-on MARKERS]              # forward only these end lines, e.g. DONE,BLOCKED,NEEDS-DECISION (default: all five)
 purplemux tab send -w ${ws.id} TAB_ID CONTENT...      # send input to a tab
@@ -68,7 +68,6 @@ purplemux api-guide
 
 - Delegate work to another tab when a task benefits from isolation
   (long-running builds, different project context, parallel exploration).
-- Poll \`status\` and read \`result\` to verify delegated work.
 - Prefer small, scoped tabs over cramming everything into one session.
 
 ### Tab type notes
@@ -78,7 +77,7 @@ purplemux api-guide
   value, not a sign the tab is dead. Do not gate actions on \`alive\`. Use the
   browser-specific HTTP endpoints (\`/browser/url\`, \`/browser/screenshot\`, …;
   see \`purplemux api-guide\`) directly.
-- **\`terminal\` / \`claude-code\` / \`codex-cli\` tabs**: run inside tmux, so \`alive\` is a valid
+- **\`terminal\` / \`claude-code\` / \`codex-cli\` / \`grok-cli\` tabs**: run inside tmux, so \`alive\` is a valid
   liveness signal.
 `;
 };

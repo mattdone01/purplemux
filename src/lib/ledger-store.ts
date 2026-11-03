@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { brandCodedError } from '@/lib/coded-error';
 import { TabEventsTable } from '@/lib/tab-events-store';
+import { TabTurnsTable } from '@/lib/tab-turns-store';
 import { foldLedgerEvent, isLanding, parseAttrs, PHASE_REPLAY_LOOKBACK_MS, silentFor } from '@/lib/ledger-fold';
 import type { ILedgerItemRow } from '@/lib/ledger-fold';
 import {
@@ -143,6 +144,7 @@ export interface ILedgerRetentionResult {
   intervals: number;
   landings: number;
   tabEvents: number;
+  tabTurns: number;
   items: number;
   rollups: number;
   rolledUpDays: string[];
@@ -256,6 +258,8 @@ export class LedgerStore {
   private readonly database: Database.Database;
   /** The durable tab event log (ADR-0035) over this handle. */
   readonly tabEvents: TabEventsTable;
+  /** Each agent tab's finished turns and their acting tool calls (story 15, ADR-0035 §7). */
+  readonly tabTurns: TabTurnsTable;
 
   constructor(databasePath = defaultDbPath()) {
     if (databasePath !== ':memory:') fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -268,6 +272,8 @@ export class LedgerStore {
       this.migrate();
       this.tabEvents = new TabEventsTable(this.database);
       this.tabEvents.ensureShape();
+      this.tabTurns = new TabTurnsTable(this.database);
+      this.tabTurns.ensureShape();
       this.ensureLandings();
     } catch (error) {
       // A refused file (a newer schema) must not leave a handle open for every request that tries it.
@@ -798,7 +804,7 @@ export class LedgerStore {
 
   /**
    * The daily job: roll up (see rollUpRange), then delete events and intervals older than 92 days,
-   * tab events older than 30 days, items closed before then, and rollups older than 400 days. Each day's rollup is one
+   * tab events and tab turns older than 30 days, items closed before then, and rollups older than 400 days. Each day's rollup is one
    * transaction and each delete runs in chunks of RETENTION_CHUNK rows, yielding to the event loop
    * between them, so the server keeps answering while it runs.
    */
@@ -823,6 +829,7 @@ export class LedgerStore {
       landings: await this.deleteInChunks('DELETE FROM landings WHERE event_seq IN (SELECT event_seq FROM landings WHERE at < ? LIMIT ?)', [cutoff]),
       tabEvents: await this.deleteInChunks('DELETE FROM tab_events WHERE seq IN (SELECT seq FROM tab_events WHERE at < ? LIMIT ?)',
         [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
+      tabTurns: await this.deleteInChunks(TabTurnsTable.RETENTION_DELETE, [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
       items: await this.deleteInChunks(`DELETE FROM items WHERE (workspace_id, item_key) IN (SELECT workspace_id, item_key FROM items
         WHERE closed_at IS NOT NULL AND closed_at < ? LIMIT ?)`, [cutoff]),
       rollups: await this.deleteInChunks(`DELETE FROM rollups_daily WHERE (workspace_id, day, item_type, reason) IN

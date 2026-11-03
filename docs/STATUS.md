@@ -698,6 +698,9 @@ With `hooks=debug` you see, for example:
 | `src/lib/wake-class.ts` | `WAKE_CLASS_TABLE`, `classifyWake`: every tab-bound event's class (ADR-0035) |
 | `src/lib/tab-event-router.ts` | `TabEventRouter`: urgent typed, digest held, log recorded; `renderDigest` |
 | `src/lib/tab-events-store.ts` | `tab_events` in `ledger.sqlite`: the durable log, pending digests, wakes per seat |
+| `src/lib/turn-tracker.ts` | `TurnTracker`: each agent tab's turns and acting tool calls from the hooks (story 15) |
+| `src/lib/tab-turns-store.ts` | `tab_turns` in `ledger.sqlite`: one row per finished turn |
+| `src/lib/effects.ts` | `computeEffects`: per component, delivered and followed by an acting tool call |
 
 ### Client
 
@@ -742,6 +745,20 @@ are recorded when typed; a `tab send` to a tab that is only on its header's `cc`
 says "no reply needed", is held for the digest unless it carries a verdict marker or relays an owner answer.
 A ledger that cannot be opened or written holds nothing: the router types every non-log event at once. A digest's
 delivery is broadcast again under the nudges' ids; an hour-old held backlog raises one flag alert.
+
+### Turn rows and effect counts (story 15, ADR-0035 §7)
+
+`StatusManager.updateTabFromHook` hands the `TurnTracker` each user `prompt-submit` (a turn starts unless one is open),
+each `stop` or `interrupt` (the turn ends; one `tab_turns` row) and each non-compaction `session-start` (an open turn
+ends with no count). A Codex PreToolUse or PostToolUse arrives as `{ kind: 'prompt-submit', fromTool: true }`: it keeps
+an open turn going and otherwise opens one of unknown start. `handleToolActivity` (Claude PostToolUse, Grok
+`post_tool_use`) and `handleToolCall` (Codex PostToolUse, from `hook-dispatch.ts`) add one to the open turn's count
+when `isActingTool` says the tool edits, writes or runs a shell; with no turn open, a call within 3 s of the last stop
+is that turn's late hook; otherwise a Claude or Grok call after a seen stop starts a turn, and any other opens one of
+unknown start. A turn whose start this server did not see is written with no start and no count. Only a counter moves
+on a tool call; a turn the ledger cannot take is logged once and lost to the counts, never to the tab.
+`StatusManager.openTurns(ws)` lists the turns still running, which `purplemux effects show` reads with `tab_events`
+deliveries and these rows: a paste is followed when its turn started between 5 s before and 30 s after it and acted.
 
 ---
 

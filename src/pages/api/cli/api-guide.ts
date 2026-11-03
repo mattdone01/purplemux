@@ -1156,7 +1156,7 @@ POST /api/cli/workspaces/<workspaceId>/ledger/experiments/<id>
 
 Retention: a daily job (10 min after boot, then every 24 h) rolls up into rollups_daily every day
 not yet rolled and every day a newly finished wait covers, then deletes events and intervals older
-than 92 days, tab events older than 30 days (ADR-0035), items closed before then, and rollups older
+than 92 days, tab events and tab turns older than 30 days (ADR-0035), items closed before then, and rollups older
 than 400 days, in chunks of 5,000 rows. A store failure answers 500 ledger-store-failed (exit 1).
 
 ## Event digest (ADR-0035)
@@ -1196,8 +1196,8 @@ GET /api/cli/workspaces/<workspaceId>/events?tab=&since=&limit=   (purplemux eve
   Read scope. since: an age (90s, 15m, 1h, 7d), Unix ms or ISO-8601, default 1h; limit 1..5000,
   default 500 (the newest kept). Response: { "workspaceId", "tabId" | null, "since", "now", "truncated",
   "events": [{ "seq", "workspaceId", "tabId" (the recipient), "at", "class", "kind", "text",
-  "sourceTabId" | null (the worker a nudge is about), "sourceTabName" | null, "deliveredAt" | null,
-  "digestId" | null }] }, oldest first. A digest event's deliveredAt is its digest's. The log
+  "sourceTabId" | null (the worker a nudge is about), "sourceTabName" | null, "rule" | null (a flag's
+  rule or an alarm's reason), "deliveredAt" | null, "digestId" | null }] }, oldest first. A digest event's deliveredAt is its digest's. The log
   survives a restart: a rotated or restarted tab reads what it was sent here. The CLI prints each
   event whole for one TAB (the digest's pointer) and one line each for the workspace.
 
@@ -1209,6 +1209,32 @@ GET /api/cli/workspaces/<workspaceId>/events/wakes?since=&until=&by=window|day
   "digests", "urgent" (delivered on their own), "logged" }] }. hasEvents false: the workspace has no
   tab event at all, so zero wakes is no record, not a quiet seat. 400 ledger-query-invalid names a bad
   since, until or by.
+
+GET /api/cli/workspaces/<workspaceId>/effects?days=N   (purplemux effects show [-w WS] [--days N] [--json])
+  Read scope; N 1..30, default 7 (400 ledger-query-invalid otherwise). Per component, what came next (story 15).
+  fired: tab_events rows recorded in the window, any class; a firing dropped before the router (the 60 s episode
+  filter) or routed to the board or phone only is not recorded. delivered: those of class urgent or digest delivered
+  in the window, in units: an urgent paste, or a digest counted once per component it carried (inDigest counts
+  those; every event of a digest takes the digest's outcome). delivered 0 means the component reached no tab, not
+  that it never fired. followed: the recipient's next turn, from tab_turns, started within 30 s of the paste
+  (nextTurnBoundMs) and made an acting tool call (edit, write or shell: Claude's PostToolUse matcher, Grok and Codex
+  tool names filtered to the same class). It is a count of what followed, not of what the delivery caused. The turn
+  is the one running at the paste or the first after it: one that started more than 5 s before the paste is midTurn;
+  one that started past the bound, or none by the bound, is noTurn (judged, not followed); a turn still running in
+  the server is pending, as is a paste younger than the bound; a tab gone with no turn is closed; a turn whose start
+  or tool calls were not recorded, or a tab with no turn recorded in the window, is unmeasured. judged = delivered
+  less midTurn, pending, closed and unmeasured. candidate: true when at least 10 (candidateMinObserved) deliveries
+  had an observed turn (judged less noTurn) and none followed, false when one followed, null (not measured)
+  otherwise, with candidateReason saying why: a candidate never rests on absence, so noTurn and delivered 0 count
+  toward none. Per-probe effect is not measured; counts are per
+  firing kind. Response: { "workspaceId", "requestedSince", "until", "since" (clamped to measuredSince; null:
+  nothing measured), "measuredSince" (the first recorded turn) | null, "nextTurnBoundMs", "candidateMinObserved",
+  "source", "rows": [{ "component" (a nudge kind, "stalled", "probe-failed", "flag:<anomaly>", "alarm:<wait reason>"
+  with a derived reason folded into its parent, a notice kind, "flow:<rule>", "fleet:<flag>"), "family" (nudge |
+  probe | flag | notice | phone | other), "fired", "delivered", "inDigest", "followed", "judged", "noTurn",
+  "midTurn", "pending", "closed", "unmeasured", "candidate", "candidateReason", "notMeasured" }] }. Every component the code can send
+  is listed, so one that reached no tab shows 0. A row with notMeasured (a reason) carries null counts, never 0: a
+  phone-only flag rule, a flag delivered before its rule was recorded, or a window before the first recorded turn.
 
 ## Board: the constraint finder (ADR-0034)
 

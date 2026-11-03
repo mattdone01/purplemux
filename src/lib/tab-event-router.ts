@@ -38,6 +38,8 @@ export interface ITabEventRoute {
   class: TWakeClass;
   sourceTabId?: string | null;
   sourceTabName?: string | null;
+  /** A `flag` or `alarm` event's rule or reason, kept so its effect is counted per rule (story 15). */
+  rule?: string | null;
   /**
    * An urgent event that must not land mid-turn (ROTATE): re-checked inside the tab's dispatch lock before the
    * paste, together with the settle window, so it never follows another delivery into the turn it started.

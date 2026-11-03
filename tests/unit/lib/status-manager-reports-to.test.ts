@@ -3,7 +3,7 @@ import { AutomatedPromptDispatcher, type IAutomatedPromptDispatcherDeps } from '
 import type { TLivenessEvent } from '@/types/liveness';
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
-import { memoryTabEvents } from './tab-events-harness';
+import { memoryLedgerTables, memoryTabEvents } from './tab-events-harness';
 
 const workspaceStore = vi.hoisted(() => ({
   getWorkspaceByIdCached: vi.fn(),
@@ -53,7 +53,7 @@ const setup = async (orchestration: { enabled: boolean; orchestratorTabId: strin
   });
   const { StatusManager } = await import('@/lib/status-manager');
   const tabEvents = memoryTabEvents();
-  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents);
+  const manager = new StatusManager(dispatcher, vi.fn(async () => true), vi.fn(async () => {}), tabEvents, memoryLedgerTables()[1]);
   const internals = manager as unknown as {
     nudgeOrchestrator: (tabId: string, e: ITabStatusEntry, kind: 'stuck', detail?: string) => Promise<void>;
     handleLivenessEvent: (event: TLivenessEvent) => Promise<void>;

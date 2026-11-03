@@ -581,7 +581,9 @@ interface ILedgerDelivery {
 const routeLine = async (
   ledger: ILedgerDelivery, flag: IRaisedFlag, row: IFleetRow, kind: 'alarm' | 'flag', text: string, severity: 'warn' | 'block',
 ): Promise<boolean> => {
-  const event: ITabEventRoute = { workspaceId: flag.workspaceId, tabId: row.tabId, kind, text, class: classifyWake(kind, { severity }) };
+  const event: ITabEventRoute = {
+    workspaceId: flag.workspaceId, tabId: row.tabId, kind, text, class: classifyWake(kind, { severity }), rule: flag.rule,
+  };
   try {
     await ledger.deps.routeTabEvent(event);
   } catch (err) {

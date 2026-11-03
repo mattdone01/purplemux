@@ -340,7 +340,7 @@ describe('runFlagAlertTick — a scripted sequence', () => {
       tabId: 'tab-orch', isOrchestrator: true,
       flag: { source: 'ledger', rule: 're-gates', subject: 'workspace', text: 're-gates: 3 gates in 24h, threshold 0 gates' },
     }]);
-    expect(h.routed).toEqual([{ workspaceId: 'ws-a', tabId: 'tab-orch', kind: 'flag', text: 're-gates: 3 gates in 24h, threshold 0 gates', class: 'digest' }]);
+    expect(h.routed).toEqual([{ workspaceId: 'ws-a', tabId: 'tab-orch', kind: 'flag', text: 're-gates: 3 gates in 24h, threshold 0 gates', class: 'digest', rule: 're-gates' }]);
     h.script.finder = finder(T0 + 2 * MIN, 3);
     await h.tick(T0 + 2 * MIN);
     expect(h.sent).toHaveLength(1);

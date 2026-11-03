@@ -55,9 +55,10 @@ describe('ledger.sqlite (AC 1)', () => {
       'state_since', 'wait_reason', 'wait_since', 'holder', 'clear_input', 'parent_key', 'attrs_json', 'last_seq', 'last_event_at']);
     expect(store.columns('intervals')).toEqual(['id', 'workspace_id', 'item_key', 'item_type', 'reason', 'holder', 'start', 'end']);
     expect(store.columns('rollups_daily')).toEqual(['workspace_id', 'day', 'item_type', 'reason', 'waited_ms', 'items', 'p50_ms', 'p90_ms']);
-    // ADR-0035 adds the event's source tab to ADR-0033's columns.
+    // ADR-0035 adds the event's source tab to ADR-0033's columns, and story 15 a flag's rule (ADR-0035 §7).
     expect(store.columns('tab_events')).toEqual(['seq', 'workspace_id', 'tab_id', 'at', 'class', 'kind', 'text', 'delivered_at', 'digest_id',
-      'source_tab_id', 'source_tab_name']);
+      'source_tab_id', 'source_tab_name', 'rule']);
+    expect(store.columns('tab_turns')).toEqual(['id', 'workspace_id', 'tab_id', 'provider', 'started_at', 'ended_at', 'tool_calls']);
     expect(store.columns('experiments')).toEqual(expect.arrayContaining(['workspace_id', 'id', 'hypothesis', 'change_ref', 'stage',
       'reason', 'metric', 'baseline_json', 'target', 'guards_json', 'revert_if', 'min_days', 'max_days', 'started_at', 'verdict',
       'verdict_at', 'evidence']));

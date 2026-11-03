@@ -188,7 +188,8 @@ export type THookEventKind = typeof HOOK_EVENT_KINDS[number];
  */
 export type TAgentWorkStateEvent =
   | { kind: 'session-start'; source?: TSessionStartSource }
-  | { kind: 'prompt-submit' }
+  /** `fromTool`: a Codex PreToolUse or PostToolUse, read as prompt-submit by the work-state machine; it starts no turn. */
+  | { kind: 'prompt-submit'; fromTool?: true }
   | { kind: 'notification'; notificationType?: string }
   | { kind: 'stop' }
   | { kind: 'interrupt' }
