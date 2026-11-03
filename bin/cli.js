@@ -1591,7 +1591,12 @@ const cmdTabCreate = async (args) => {
   const role = flagValue(args, '--role');
   const previewUrl = flagValue(args, '--preview-url');
   const pgService = flagValue(args, '--pg-service');
+  // A seat (ADR-0036): rotate from this handoff file at the context threshold; the path is resolved against the cwd.
+  const handoff = flagValue(args, '--handoff');
+  const rotateAt = flagValue(args, '--rotate-at');
   if (!wsId) die('--workspace is required');
+  if (args.includes('--handoff') && !handoff) die('--handoff needs the path of the seat\'s handoff file');
+  if (args.includes('--rotate-at') && !rotateAt) die('--rotate-at needs a token count (50000..900000) or off');
   if (args.includes('--role') && !role) die('--role needs a role name (evaluator)');
   if (args.includes('--pg-service') && !pgService) die('--pg-service needs a ~/.pg_service.conf entry name');
   if (args.includes('--preview-url') && !previewUrl) die('--preview-url needs the http(s) URL of the preview the evaluator may browse');
@@ -1620,9 +1625,43 @@ const cmdTabCreate = async (args) => {
     ...(role ? { role } : {}),
     ...(previewUrl ? { previewUrl } : {}),
     ...(pgService ? { pgService } : {}),
+    ...(handoff ? { handoff: path.resolve(handoff) } : {}),
+    ...(rotateAt ? { rotateAt } : {}),
     ...(overCap ? { overCap: { reason } } : {}),
   });
   out(body);
+};
+
+/**
+ * `handoff check <path>` (ADR-0036 §4): the file is read here and checked by the server's checkHandoff, the
+ * function the rotation runs. PASS exits 0; refusals print one `handoff-check:` line each and exit 1, as v2's
+ * tools/handoff-check.py did.
+ */
+const cmdHandoff = async (args) => {
+  const [sub, file, ...rest] = args;
+  if (sub !== 'check' || !file || file.startsWith('-')) die('usage: handoff check <path> [--rotate-requested-at UTC] [--now UTC] [--json]');
+  const rotateRequestedAt = flagValue(rest, '--rotate-requested-at');
+  const now = flagValue(rest, '--now');
+  if (rest.includes('--rotate-requested-at') && !rotateRequestedAt) die('--rotate-requested-at needs a UTC time');
+  if (rest.includes('--now') && !now) die('--now needs a UTC time');
+  requireEnv();
+  let text;
+  try {
+    // A BOM is kept, so it is refused as v2's checker refuses it.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file));
+  } catch (err) {
+    process.stdout.write(`handoff-check: cannot read ${file}: ${err.message || err} (expected a readable UTF-8 handoff file)\n`);
+    process.exit(1);
+  }
+  const { body } = await api('POST', '/api/cli/handoff/check', {
+    text,
+    ...(rotateRequestedAt ? { rotateRequestedAt } : {}),
+    ...(now ? { now } : {}),
+  });
+  if (rest.includes('--json')) out(body);
+  else if (body.ok) process.stdout.write(`handoff-check: PASS ${file}\n`);
+  else process.stdout.write(body.reasons.map((reason) => `handoff-check: ${reason}\n`).join(''));
+  if (!body.ok) process.exit(1);
 };
 
 const cmdTabCount = async (args) => {
@@ -2685,6 +2724,12 @@ Commands:
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
                                            grok-cli: none|minimal|low|medium|high|xhigh|max (grok --effort);
                                            codex: minimal|low|medium|high. --no-launch keeps the old bare-shell behavior.
+             [--handoff PATH [--rotate-at N|off]]
+                                           A seat (ADR-0036): at its context threshold (fleet config
+                                           context.rotate-at-tokens, default 300000; --rotate-at 50000..900000 or
+                                           off for this tab), idle with no background work, it is sent ROTATE; on
+                                           HANDOFF-READY the file at PATH is checked and the tab restarts --clear
+                                           with "Read PATH, then continue: <resume command>". Local tabs only
              [--over-cap --reason TEXT]    An agent tab is refused at the WIP cap (fleet config tabs.cap-per-workspace,
                                            default 8): exit 3 wip-cap. Only the workspace's verified, enabled
                                            orchestrator tab passes it, with a reason (1-500 characters, else exit 2)
@@ -2817,6 +2862,9 @@ Commands:
                                            Default: the last 7 days by reason. T is Unix ms or ISO-8601
   ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT
   ledger experiment list -w WS [--json]    Improvement experiments (ADR-HFL-03): one active per stage, two in all
+  handoff check PATH [--rotate-requested-at UTC] [--now UTC] [--json]
+                                           Check a seat handoff file against the ADR-0036 schema (the checker the
+                                           rotation runs): PASS exits 0; each refusal prints a line, exit 1
   events show -w WS [TAB] [--since T] [--limit N] [--json]
                                            What each tab was sent (ADR-0035), whole for one TAB, one line each for
                                            the workspace: urgent typed at once, digest held for
@@ -3008,6 +3056,8 @@ const main = async () => {
       return cmdDeploy(args.slice(1));
     case 'watch':
       return cmdWatch(args.slice(1));
+    case 'handoff':
+      return cmdHandoff(args.slice(1));
     case 'tab':
       switch (sub) {
         case 'list': return cmdTabList(rest);

@@ -56,6 +56,12 @@ export const ANOMALY_THRESHOLDS = {
   silenceFloorMs: 10 * MINUTE_MS,
   silenceP90Factor: 2,
   silenceMinClosed: 20,
+  /** ADR-0036 §3: any compaction since the last rotation. */
+  seatCompactions: 0,
+  /** ADR-0036 §2: the second failed handoff check of one rotation. */
+  rotationFailures: 1,
+  /** ADR-0036 §2: a rotated seat whose first message was dropped never read its handoff. */
+  handoffUndelivered: 0,
 } as const;
 
 /** Open items of these types with no wait are mid-work: their silence is a producer's, not a wait (ADR-0033 §3.3). */
@@ -306,6 +312,9 @@ const LABELS: Record<TFinderAnomalyId, string> = {
   'producer-silence': 'producer silence',
   'cost-per-landed-item': 'cost per landed item',
   'cache-read-per-landed-item': 'cache reads per landed item',
+  'seat-compactions': 'seat compactions',
+  'rotation-alarm': 'rotation alarm',
+  'handoff-undelivered': 'handoff not delivered',
 };
 
 export const FINDER_ANOMALY_IDS = Object.keys(LABELS) as readonly TFinderAnomalyId[];
@@ -315,11 +324,13 @@ const WORKSPACE_SUBJECT = 'workspace';
 const ANOMALY_WINDOWS: Record<TFinderAnomalyId, IFinderAnomaly['window']> = {
   're-gates': '24h', 'rework-rate': '24h', 'context-per-call': 'now', 'wakes-per-hour': '6h',
   'unknown-share': '24h', 'producer-silence': 'now', 'cost-per-landed-item': '7d', 'cache-read-per-landed-item': '7d',
+  'seat-compactions': 'now', 'rotation-alarm': 'now', 'handoff-undelivered': 'now',
 };
 
 const ANOMALY_UNITS: Record<TFinderAnomalyId, string> = {
   're-gates': 'gates', 'rework-rate': 'share', 'context-per-call': 'tokens', 'wakes-per-hour': 'per hour',
   'unknown-share': 'share', 'producer-silence': 'min', 'cost-per-landed-item': 'USD', 'cache-read-per-landed-item': 'tokens',
+  'seat-compactions': 'compactions', 'rotation-alarm': 'failed checks', 'handoff-undelivered': 'rotations',
 };
 
 const formatValue = (value: number, unit: string): string => {
@@ -403,7 +414,7 @@ const numberAttr = (item: ILedgerItem, key: string): number | null => {
 };
 
 const contextPerCall = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
-  const seats = ledger.items.filter((item) => item.itemType === 'seat' && item.closedAt === null);
+  const seats = openSeats(ledger);
   if (!seats.length) {
     return [anomaly('context-per-call', 'now', 'tokens', { value: null, threshold: DEFAULT_ROTATE_AT_TOKENS, reason: 'no seat item in the ledger' })];
   }
@@ -412,6 +423,54 @@ const contextPerCall = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
     return anomaly('context-per-call', 'now', 'tokens', {
       subject: seat.itemKey, value, threshold: numberAttr(seat, 'rotateAtTokens') ?? DEFAULT_ROTATE_AT_TOKENS,
       reason: value === null ? 'no context reading on the seat' : null,
+    });
+  });
+};
+
+const openSeats = (ledger: IFinderLedgerInput): ILedgerItem[] => ledger.items.filter((item) => item.itemType === 'seat' && item.closedAt === null);
+
+/** ADR-0036 §3: a compaction is a missed rotation; the count since the seat's last rotation is flagged above 0. */
+const seatCompactions = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
+  const threshold = ANOMALY_THRESHOLDS.seatCompactions;
+  const seats = openSeats(ledger);
+  if (!seats.length) return [anomaly('seat-compactions', 'now', 'compactions', { value: null, threshold, reason: 'no seat item in the ledger' })];
+  return seats.map((seat) => {
+    const value = numberAttr(seat, 'compactionsSinceRotation');
+    const total = numberAttr(seat, 'compactions');
+    return anomaly('seat-compactions', 'now', 'compactions', {
+      subject: seat.itemKey, value, threshold,
+      detail: `since the last rotation${total === null ? '' : ` (${total} in all)`}`,
+      reason: value === null ? 'no compaction count on the seat' : null,
+    });
+  });
+};
+
+/** ADR-0036 §2: the second failed handoff check of one rotation leaves the session and raises this alarm. */
+const rotationAlarm = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
+  const threshold = ANOMALY_THRESHOLDS.rotationFailures;
+  const seats = openSeats(ledger);
+  if (!seats.length) return [anomaly('rotation-alarm', 'now', 'failed checks', { value: null, threshold, reason: 'no seat item in the ledger' })];
+  return seats.map((seat) => {
+    const value = numberAttr(seat, 'rotationFailures');
+    const why = typeof seat.attrs.rotationAlarm === 'string' ? seat.attrs.rotationAlarm : null;
+    return anomaly('rotation-alarm', 'now', 'failed checks', {
+      subject: seat.itemKey, value, threshold,
+      reason: value === null ? 'no rotation record on the seat' : null,
+      sentence: value !== null && value > threshold ? `${value} failed handoff checks, the session left as it is${why ? `: ${why}` : ''}` : undefined,
+    });
+  });
+};
+
+/** ADR-0036 §2: a seat restarted whose first message was dropped: rotated, but the handoff was not delivered. */
+const handoffUndelivered = ({ ledger }: IAnomalyContext): IFinderAnomaly[] => {
+  const threshold = ANOMALY_THRESHOLDS.handoffUndelivered;
+  const seats = openSeats(ledger);
+  if (!seats.length) return [anomaly('handoff-undelivered', 'now', 'rotations', { value: null, threshold, reason: 'no seat item in the ledger' })];
+  return seats.map((seat) => {
+    const at = numberAttr(seat, 'handoffUndeliveredAt');
+    return anomaly('handoff-undelivered', 'now', 'rotations', {
+      subject: seat.itemKey, value: at === null ? 0 : 1, threshold,
+      sentence: at === null ? undefined : `rotated but the handoff was not delivered (first message dropped ${new Date(at).toISOString().replace(/\.\d{3}Z$/, 'Z')})`,
     });
   });
 };
@@ -506,6 +565,7 @@ const cacheReadPerLandedItem = ({ spend }: IAnomalyContext): IFinderAnomaly[] =>
 
 const ANOMALY_RULES: ReadonlyArray<(ctx: IAnomalyContext) => IFinderAnomaly[]> = [
   reGates, reworkRate, contextPerCall, wakesPerHour, unknownShareAnomaly, producerSilence, costPerLandedItem, cacheReadPerLandedItem,
+  seatCompactions, rotationAlarm, handoffUndelivered,
 ];
 
 const status = (state: IFinderInputStatus['state'], reason: string | null, at: number | null): IFinderInputStatus => ({ state, reason, at });
@@ -545,6 +605,9 @@ const CONSTANT_THRESHOLDS: Record<TFinderAnomalyId, number | null> = {
   'producer-silence': null,
   'cost-per-landed-item': null,
   'cache-read-per-landed-item': null,
+  'seat-compactions': ANOMALY_THRESHOLDS.seatCompactions,
+  'rotation-alarm': ANOMALY_THRESHOLDS.rotationFailures,
+  'handoff-undelivered': ANOMALY_THRESHOLDS.handoffUndelivered,
 };
 
 /** Every anomaly, unknown for the one reason the ledger measures were not taken. */

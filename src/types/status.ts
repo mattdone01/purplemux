@@ -54,6 +54,10 @@ export interface ITabStatusEntry {
   reportsTo?: string | null;
   /** The markers whose end lines are forwarded (ADR-0025); mirrors ITab.reportOn. Null: every marker. */
   reportOn?: import('@/lib/turn-end').TTurnMarkerName[] | null;
+  /** The seat's handoff file (ADR-0036); mirrors ITab.handoffPath. Null: not a seat. */
+  handoffPath?: string | null;
+  /** Mirrors ITab.rotateAt. */
+  rotateAt?: import('@/types/context-lifecycle').TRotateAt | null;
   /** How the watchdog classified the last `stop` (ADR-0018). Runtime only. */
   turnEnd?: ITurnEndRecord | null;
   /** The provider-error episode this tab is in; a clean stop ends it (story 26). Runtime only. */
