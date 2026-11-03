@@ -1478,7 +1478,14 @@ const cmdTabCreate = async (args) => {
   const host = flagValue(args, '--host');
   // The tab's start directory: it must exist on the host the tab runs on.
   const cwd = flagValue(args, '--cwd');
+  // A fixed tool configuration for the tab (ADR-0040); the server validates the name.
+  const role = flagValue(args, '--role');
+  const previewUrl = flagValue(args, '--preview-url');
+  const pgService = flagValue(args, '--pg-service');
   if (!wsId) die('--workspace is required');
+  if (args.includes('--role') && !role) die('--role needs a role name (evaluator)');
+  if (args.includes('--pg-service') && !pgService) die('--pg-service needs a ~/.pg_service.conf entry name');
+  if (args.includes('--preview-url') && !previewUrl) die('--preview-url needs the http(s) URL of the preview the evaluator may browse');
   if (args.includes('--reports-to') && !reportsTo) die('--reports-to needs a tab id');
   if (args.includes('--report-on') && !reportOn) die('--report-on needs a comma-separated list of markers (DONE, BLOCKED, NEEDS-DECISION, READY-TO-MERGE, CHECKPOINTED) or all');
   if (args.includes('--host') && !host) die('--host needs a host name from fleet config remote.hosts');
@@ -1501,6 +1508,9 @@ const cmdTabCreate = async (args) => {
     ...(reportOn ? { reportOn } : {}),
     ...(host ? { host } : {}),
     ...(cwd ? { cwd } : {}),
+    ...(role ? { role } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+    ...(pgService ? { pgService } : {}),
     ...(overCap ? { overCap: { reason } } : {}),
   });
   out(body);
@@ -2156,6 +2166,79 @@ const printTable = (columns, rows) => {
   for (const cells of table) process.stdout.write(cells.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd() + '\n');
 };
 
+// ── board (ADR-0034) ─────────────────────────────────────────────────────────
+const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine]';
+
+// The owner reads times in AEDT/AEST (ADR-HFL-02); Intl names the offset that applies on the day.
+const boardTime = (ms) => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-AU', {
+    timeZone: 'Australia/Sydney', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    hourCycle: 'h23', timeZoneName: 'short',
+  }).formatToParts(new Date(ms)).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${parts.timeZoneName}`;
+};
+
+// A finder answer older than two ticks says so on every face: a hung tick is not a fresh board.
+const boardLineText = (board) => (board.staleSince === null || board.staleSince === undefined
+  ? board.line
+  : `${board.line} · stale since ${boardTime(board.staleSince)}`);
+
+const boardInput = (name, input) => `${name} ${input.state}${input.reason ? ` (${input.reason})` : ''}`;
+
+const boardMeasures = (board) => {
+  const now = board.generatedAt + board.ageMs;
+  const shown = board.stuck.length < board.stuckTotal ? `${board.stuck.length} of ${board.stuckTotal}` : String(board.stuckTotal);
+  process.stdout.write(`stuck, oldest first: ${shown}\n`);
+  if (board.stuck.length) {
+    printTable(['ITEM', 'REASON', 'AGE', 'HOLDER', 'CLEARS'], board.stuck.map((item) => [
+      `${item.critical ? '* ' : ''}${item.key}`, item.reasonLabel, ledgerDuration(now - item.since), dash(item.holder), dash(item.clearInput),
+    ]));
+  }
+  const breached = board.anomalies.filter((a) => a.breached);
+  process.stdout.write(`anomalies over threshold: ${breached.length}\n`);
+  for (const a of breached) process.stdout.write(`  ${a.text}\n`);
+};
+
+const boardText = (board) => {
+  const lines = [`board ${board.workspaceId} · finder ran ${ledgerDuration(board.ageMs)} ago`, boardLineText(board)];
+  const c = board.constraint;
+  lines.push(c
+    ? `constraint: ${c.labels.reason} (${c.labels.stage}), ${c.waitingHours.toFixed(1)} h in 24 h on ${c.items} item(s), `
+      + `${c.basis === 'critical' ? 'critical items' : 'all items'}, ${c.labels.trend}; owner ${dash(c.ownerSeat)}; clears: ${c.clearInput ?? 'not recorded'}`
+    : `constraint: ${board.inputs.ledger.state === 'ok' ? 'none measured in 24 h' : 'unknown'}`);
+  lines.push(board.needsYou === null ? 'needs you: unknown (Mission Control unreadable)' : `needs you: ${board.needsYou.length} open in Mission Control`);
+  for (const item of board.needsYou ?? []) lines.push(`  ${item.id}  ${item.title}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+  const ledgerUnknown = board.inputs.ledger.state === 'ok' ? null : (board.inputs.ledger.reason || board.inputs.ledger.state);
+  if (ledgerUnknown) {
+    // Not measured is not none: an unread ledger never prints as "0 stuck".
+    process.stdout.write(`stuck: unknown (${ledgerUnknown})\nanomalies: unknown (${ledgerUnknown})\n`);
+  } else {
+    boardMeasures(board);
+  }
+  const { ledger, flow, spend, pool } = board.inputs;
+  process.stdout.write(`inputs: ${[boardInput('ledger', ledger), boardInput('flow', flow), boardInput('spend', spend), boardInput('pool', pool)].join(' · ')}\n`);
+};
+
+const cmdBoard = async (args) => {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (sub !== 'show') die(BOARD_USAGE);
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const modes = ['--json', '--line', '--mine'].filter((flag) => rest.includes(flag));
+  if (rest.includes('--json') && rest.includes('--line')) die('--json and --line are exclusive');
+  requireEnv();
+  const query = modes.includes('--mine') ? '?mine=1' : '';
+  const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/board${query}`);
+  if (modes.includes('--json')) return out(body);
+  if (modes.includes('--line')) {
+    process.stdout.write(`${boardLineText(body)}\n`);
+    return;
+  }
+  boardText(body);
+};
+
 const cmdLedgerShow = async (rest) => {
   const wsId = ledgerWorkspace(rest);
   const qs = new URLSearchParams();
@@ -2310,6 +2393,19 @@ Commands:
              [--cwd DIR]                   Start the tab in DIR, an absolute directory that must exist on the
                                            tab's host (cwd-missing, exit 2). A remote worker works in its own
                                            checkout or worktree on that host
+             [--role evaluator --preview-url URL [--pg-service NAME]]
+                                           A claude-code tab (implied when -t is omitted) that cannot change the
+                                           repository (ADR-0040). Tools: Read, Grep, Glob, Bash and the
+                                           chrome-devtools MCP (headless Chrome 149+, URL's origin only); Bash runs
+                                           Claude Code's read-only commands (not docker, ps, pgrep, lsof, ss)
+                                           and ~/.purplemux/bin/evaluator-sql, which queries the libpq service
+                                           NAME (exported as PGSERVICE; the service's SELECT-only role is the
+                                           guard);
+                                           credential paths (~/.purplemux, ~/.ssh, *token*, ...) are unreadable;
+                                           anything else is denied, never prompted. Every relaunch keeps it; never
+                                           an orchestrator. Exit 2 without --preview-url (an http(s) URL on a
+                                           plain host, not purplemux's own port), for another type, a remote
+                                           host, an unknown role or a headless Chrome under 149
              [-m MODEL] [-r EFFORT]        Agent tabs auto-launch their CLI (hooks wired). -m sets the model; -r sets the
              [--no-launch]                 reasoning effort — claude-code: low|medium|high|xhigh|max (claude --effort;
                                            omitted = the user's global default, so orchestrators should ALWAYS pin it);
@@ -2418,6 +2514,12 @@ Commands:
                                            ranges) for the day and the 7 days ending on it ("—" with the reason when
                                            it is not measured).
                                            Read scope on WS (ADR-0030 amendment, harness-flow-loop 04)
+  board show -w WS [--json|--line|--mine]  The constraint finder's board (ADR-0034, refreshed every 60 s): the
+                                           constraint (24 h, critical items first), its trend, owner and clear
+                                           input; Mission Control's open items; stuck items oldest first; anomalies
+                                           over threshold; each input's state. --line: goal, items left,
+                                           constraint, trend on one line. --mine: only the items the calling tab
+                                           holds (needs PMUX_TAB_TOKEN). Read scope on WS
   ledger token issue -w WS --producer NAME [--out FILE]
                                            Issue a producer token (scope ledger:emit on WS only) into a 0600 file,
                                            default ~/.purplemux/ledger-tokens/WS/NAME.json; rotates NAME's token
@@ -2577,6 +2679,8 @@ const main = async () => {
       return cmdFlow(args.slice(1));
     case 'spend':
       return cmdSpend(args.slice(1));
+    case 'board':
+      return cmdBoard(args.slice(1));
     case 'ledger':
       return cmdLedger(args.slice(1));
     case 'lease':

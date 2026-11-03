@@ -841,6 +841,12 @@ export class MissionControlStore {
     return { schemaVersion: 1, events, cursor: events.at(-1)?.seq ?? after, hasMore };
   };
 
+  /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first, id and title only. */
+  openItemTitles = (workspaceId: string): Array<{ id: string; title: string }> =>
+    (this.database.prepare(`SELECT id, question_json FROM attention_items WHERE workspace_id = ? AND state = 'open'
+      ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string }>)
+      .map((row) => ({ id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? '') }));
+
   /** Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). */
   openItemOpeners = (): IMissionOpenItemOpener[] => {
     const rows = this.database.prepare(`SELECT a.id AS item_id, a.workspace_id, a.created_at,

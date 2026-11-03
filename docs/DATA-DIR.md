@@ -29,6 +29,11 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 ├── codex-hook.sh            # Codex hook → POST /api/status/hook?provider=codex (generated, 0700)
 ├── grok-hook.sh             # Grok hook → POST /api/status/hook?provider=grok (generated, 0700)
 ├── statusline.sh            # statusline → POST /api/status/statusline (generated, 0755)
+├── bin/
+│   ├── evaluator-sql        # an evaluator tab's one read-only SQL probe (generated, 0755; ADR-0040)
+│   ├── evaluator-chrome-mcp # an evaluator tab's chrome-devtools MCP launcher (generated, 0755; ADR-0040)
+│   └── evaluator-mcp-filter.cjs # drops the client's MCP roots for that launcher (generated, 0644; ADR-0040)
+├── evaluator/               # evaluator screenshots and files, one {tabId}/ per tab, outside every repository (ADR-0040)
 ├── rate-limits.json         # latest statusline JSON written by statusline.sh
 ├── session-history.json     # completed Claude session log (cross-workspace)
 ├── session-tabs.json        # agent session → tab bindings for spend (ADR-0030; 0600)
@@ -152,6 +157,10 @@ When no server answers (no port or token file, a refused or never-finished conne
 `grok-hook.sh` reads Grok Build's payload from **stdin** (grok pipes the event JSON to the hook process; the keys are camelCase and the `hookEventName` VALUE is snake_case), forwards it verbatim, and also passes `GROK_HOOK_EVENT` — which grok injects into every hook process — as a query parameter so an empty stdin still reports. It time-boxes the request with `curl --max-time 2`, backgrounds it, and always exits 0: `Stop` runs on the turn's critical path and a non-zero exit there would block grok from finishing.
 
 Do not edit these by hand — they are rewritten on startup when content differs.
+
+### `bin/evaluator-sql`, `bin/evaluator-chrome-mcp`, `bin/evaluator-mcp-filter.cjs`, `evaluator/` — `src/lib/tab-role.ts`
+
+Written (one rename each, only when the content differs) whenever an evaluator tab's launch command is built ([ADR-0040](adr/0040-evaluator-tab-role.md)). `evaluator-sql` runs one statement through the user-space psql 18 at `~/.local/lib/pg-client` (outside `~/.purplemux`), with a scrubbed environment, `-X`, `-d service=$PGSERVICE` (the tab's `--pg-service`) and a read-only transaction. It refuses a second argument, a backslash, a second statement, a missing or bad `PGSERVICE`, and a missing psql. `evaluator-chrome-mcp` starts the pinned `chrome-devtools-mcp` on `~/.local/bin/headless-chrome` through `evaluator-mcp-filter.cjs`, which removes the client's `roots` capability so claude's working directory (the repository) is not a file root. It takes the tab's preview URL pattern as its one argument (`--allowedUrlPattern`) and refuses to start without it or on a headless Chrome under 149. Its only file roots are `evaluator/{tabId}/` and `evaluator/{tabId}/tmp/` (its `TMPDIR`), which it creates; nothing prunes them, so screenshots outlive the tab.
 
 ### `workspaces/{wsId}/grok-home/` and `$GROK_HOME/hooks/purplemux.json`
 

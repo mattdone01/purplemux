@@ -22,6 +22,7 @@ import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
 import { startWatches, stopWatches } from './src/lib/watch-manager';
 import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio-runtime';
 import { startSpend, stopSpend } from './src/lib/spend/spend-service';
+import { startConstraintFinder, stopConstraintFinder } from './src/lib/constraint-tick';
 import { startFlagAlerts, stopFlagAlerts } from './src/lib/flag-alerts';
 import { startLedgerRetention, stopLedgerRetention } from './src/lib/ledger-retention';
 import { ensureHookSettings, removePortFile } from './src/lib/hook-settings';
@@ -120,6 +121,7 @@ const shutdownWs = async () => {
   await stopAutoAnswerTick();
   await stopInbox();
   await stopFlagAlerts();
+  await stopConstraintFinder();
   await getMissionControlRuntime().stop();
   await stopSpend();
   stopLedgerRetention();
@@ -415,6 +417,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await getMissionControlRuntime().start();
   // The bookkeeping auto-answer rule: off until the admin sets its fleet-config key (ADR-0031).
   startAutoAnswerTick();
+  // The constraint finder's 60 s tick caches each workspace's board; its breached anomalies reach the flag tick (ADR-0034).
+  startConstraintFinder();
   // One raise-edge flag tick per process; its first tick, 60 s on, is the no-replay baseline (ADR-0032).
   startFlagAlerts();
   // The spend index starts its first pass 120 s after boot, one transcript at a time (ADR-0030).

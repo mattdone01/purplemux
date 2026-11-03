@@ -150,6 +150,16 @@ credential (ADR-0010), never from the payload: `launch` is verified, `hook` and 
 authorization, and `IMissionSnapshot` and the event feed do not carry it. A missing row means unattributed. The
 trust-boundary sentence above still holds for a workspace-token caller; a launch tab token does name its tab.
 
+## Board (ADR-0034)
+
+`GET /api/mission-control/board?workspaceId=all|WS` (human session only; a CLI token gets 401; default `all`)
+answers `IBoard` (`src/types/constraint.ts`) for one workspace, or `{boards: IBoard[]}` for all; an unknown
+workspace answers 404. `GET /api/cli/workspaces/{ws}/board[?mine=1]` serves the same answer with read scope, and
+`board show -w WS [--json|--line|--mine]` prints it. The answer is the constraint finder's cached result (a 60 s tick,
+`src/lib/constraint-tick.ts`) plus `needsYou`, Mission Control's open items (`{id, title}`; null when the store is
+unreadable). `inputs.ledger.state` other than `ok` means the ledger measures (constraint, stuck, windows, anomalies)
+were not taken; `onTrack.goal` is null until a goal is set (story 12), and `onTrack.state` is then `at-risk`.
+
 ## Flow (ADR-0026)
 
 An orchestrator publishes its pipeline with `purplemux flow publish -w WS --json @FILE` (`IFlowSnapshot`,

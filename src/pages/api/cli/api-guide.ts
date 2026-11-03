@@ -374,6 +374,70 @@ GET /api/cli/tabs/<tabId>/result?workspaceId=WS[&suggestions=0 | &raw=1]
   "[suggestion] <text>". suggestions=0 drops it; raw=1 returns the escapes untouched.
   Response: { "content": "...", "suggestion": "<the composer suggestion>" | null }
 
+## Evaluator role (ADR-0040)
+
+An evaluator tab drives one preview origin in headless Chrome and reads state; it cannot change
+the repository or read the denied credential paths. The tool configuration enforces it, not
+prompt text. Seat instructions reach it as prompt text (tab send): it loads no CLAUDE.md, no
+.claude/commands and no plugin.
+
+POST /api/cli/tabs  { ..., "role": "evaluator", "previewUrl": URL, "pgService"?: NAME }
+                    (purplemux tab create -w WS --role evaluator --preview-url URL [--pg-service NAME])
+  A local claude-code tab (an omitted panelType means claude-code). previewUrl is an http(s)
+  URL without credentials on a plain hostname or IPv4 host ([A-Za-z0-9.-]; bracketed IPv6 is
+  refused: chrome-devtools-mcp cannot compile it into its URL pattern), not on this server's
+  own port; its origin is stored as "previewOrigin". pgService (optional, ^[A-Za-z0-9_-]{1,63}$)
+  names a ~/.pg_service.conf entry; every launch command then starts PGSERVICE=NAME claude ...
+  The answer and GET /api/cli/tabs carry "role", "previewOrigin" and "pgService". Set once: no
+  update path changes them,
+  a panelType change answers 409 conflict naming the role, and every launch, resume,
+  auto-resume and tab restart applies them. 400 invalid-request (exit 2) for an unknown role,
+  another panelType, a "host", a missing or non-http previewUrl, a previewUrl without the
+  role, a bad pgService or one without the role, or a ~/.local/bin/headless-chrome under
+  Chrome 149 (the reason names its version).
+
+Tool set — measured at session start (claude 2.1.317): Bash, Glob, Grep, Read and the
+chrome-devtools MCP tools (32 in chrome-devtools-mcp 1.12.0); no other built-in exists
+(EnterWorktree, Task, Cron*, Write, ... answer "No such tool available").
+  --tools Read,Grep,Glob,Bash                 the whole built-in set
+  --disallowedTools                           Edit, Write, NotebookEdit, and Read(...) deny rules for
+                                              ~/.purplemux, ~/.config, ~/.aws, ~/.ssh, ~/.claude, ~/.codex,
+                                              ~/.gnupg, ~/.docker, ~/.netrc, ~/.git-credentials,
+                                              ~/.pg_service.conf, ~/.pgpass and any file
+                                              named *token*, *secret*, *.pem, *.key anywhere (//**/ rules).
+                                              A Read rule also binds
+                                              Grep, Glob and the read-only Bash commands;
+                                              Bash(docker|ps|pgrep|lsof|ss:*) are denied
+  --permission-mode dontAsk                   anything not allowed is denied, never prompted;
+                                              --dangerously-skip-permissions is never passed
+  --allowedTools                              Bash(~/.purplemux/bin/evaluator-sql:*) (absolute path),
+                                              mcp__chrome-devtools, Read, Grep, Glob
+  --strict-mcp-config --mcp-config            one MCP server, chrome-devtools
+  --setting-sources ''                        user, project and local settings do not widen the list;
+                                              the hook --settings file still loads
+Bash also runs Claude Code's own read-only commands without a rule (measured: cat, head, ls,
+wc, pwd, git status, git log inside the repository). Their write flags are denied (git log
+--output, sort -o, find -fprint), as are git branch/stash/config, env, curl, redirects and
+anything reading a denied path.
+Probes:
+  HTTP        through the browser, on the preview origin only: navigate_page, new_page, or
+              evaluate_script with fetch (the preview's own session). There is no curl.
+  SQL         ~/.purplemux/bin/evaluator-sql "<one statement>": psql 18 from
+              ~/.local/lib/pg-client, scrubbed env, -X, -d service=$PGSERVICE (the tab's
+              --pg-service), read-only transaction; refuses a second argument, a backslash, a
+              second statement, a missing or bad PGSERVICE and a missing psql. An env prefix
+              (PGSERVICE=other ...) is denied. The guard is the service's SELECT-only role
+              (ADR-0040 §3: no CREATE, write, signal or server-file roles, no dblink,
+              default_transaction_read_only); the wrapper is a second layer.
+  Browser     chrome-devtools-mcp@1.12.0 on ~/.local/bin/headless-chrome (Chrome 149+,
+              --headless --isolated --allowedUrlPattern <previewOrigin>/*): file:, every other
+              origin and every other port are blocked. Its file tools, take_screenshot filePath
+              included, reach only ~/.purplemux/evaluator/<tabId>/ (and its tmp/), which
+              outlives the tab: the client's MCP roots (claude's cwd) are filtered out.
+An evaluator tab is never an orchestrator: designating one answers 409
+orchestrator-candidate-invalid (exit 3). The Electron browser routes (/browser/*) are not an
+evaluator surface and gained nothing.
+
 ## Liveness watch
 
 Watchers for DELEGATED WORK, not tab state. A tab that is idle while its background
@@ -978,6 +1042,56 @@ Retention: a daily job (10 min after boot, then every 24 h) rolls up into rollup
 not yet rolled and every day a newly finished wait covers, then deletes events, intervals and tab
 events older than 92 days, items closed before then, and rollups older than 400 days, in chunks of
 5,000 rows. A store failure answers 500 ledger-store-failed (exit 1).
+
+## Board: the constraint finder (ADR-0034)
+
+GET /api/cli/workspaces/<workspaceId>/board[?mine=1]   (purplemux board show -w WS [--json|--line|--mine])
+GET /api/mission-control/board[?workspaceId=all|WS]    (human session; all answers { "boards": [...] })
+  Read scope on WS. A pure finder runs every 60 s per workspace over the ledger, the flow record,
+  the spend index and the pool, and caches its answer; a read before the first tick derives it.
+  mine=1 keeps the stuck items the calling tab holds (by tab name or id); it needs a tab token
+  (400 invalid-request otherwise). Response (times Unix ms):
+  { "workspaceId", "generatedAt", "ageMs", "staleSince" | null, "stuckTotal",
+    "onTrack": { "state": "on-track" | "at-risk", "goal" | null, "itemsLeft" | null, "p50At" | null, "p90At" | null },
+    "constraint": null | { "reason", "stage", "waitingHours", "trend", "ownerSeat" | null, "clearInput" | null,
+                           "basis": "critical" | "all", "items", "labels": { "reason", "stage", "trend" } },
+    "needsYou": null | [{ "id", "title" }],
+    "stuck": [{ "key", "itemType", "holder" | null, "reason", "since", "clearInput" | null, "critical", "reasonLabel" }],
+    "windows": [{ "window": "6h" | "24h" | "7d", "since", "until", "byReason": [row], "byStage": [row], "closed": { <type>: n } }],
+    "anomalies": [{ "id", "subject", "value" | null, "unit", "threshold" | null, "judged", "breached", "window", "text", "reason" | null }],
+    "unknownShare" | null, "flowLocks" | null, "pool" | null, "line",
+    "inputs": { "ledger" | "flow" | "spend" | "pool": { "state": "ok" | "partial" | "stale" | "unknown", "reason" | null, "at" | null } } }
+  row: { "key", "wip", "waitingHours", "p50Hours" | null, "p90Hours" | null, "throughput", "trend" | null, "previousWaitingHours" }.
+  inputs.ledger.state is "ok" when the ledger was read and holds an event for the workspace; "unknown"
+  (reason "ledger unreadable" or "the ledger holds no event for this workspace") means constraint,
+  stuck and windows were not measured and every anomaly is null: an empty list then is not "nothing
+  stuck". spend is "partial" when the index is ready but reports an error (the reason).
+  onTrack.goal is null until a goal is set (story 12); onTrack.state is then "at-risk".
+  staleSince is generatedAt when the answer is older than 120 s (two ticks); treat it as stale.
+  --line then ends with "stale since <time>" (AEDT/AEST).
+  The constraint is the reason with the most waiting hours in the last 24 h (finished waits clipped
+  to the window plus open waits' elapsed time) on critical items, else on all items. An item is
+  critical when it, its parent, or the slice its own key names (range:<lane>:<key12> -> slice:<lane>)
+  carries attrs.critical. trend: up / down beyond 20% of the previous window, else flat; new when
+  the previous window measured nothing; unknown when the ledger's history starts after the previous
+  window began. ownerSeat and clearInput are weighted by open waiting hours (ties by name). stage is
+  build-review, land, deploy, people, hosts or unknown. A missing input is "unknown", never 0.
+  Anomalies (ids): re-gates (gates in 24 h on a tree a same-or-wider gate already passed; close
+  state "pass"; attrs.mode reused never counts; threshold 0), rework-rate (24 h; 10%; flagged from 10
+  closed ranges), context-per-call (seat attrs.contextTokens over attrs.rotateAtTokens, default
+  300,000), wakes-per-hour (deliveries per tab in 6 h, one per digest; 6/h), unknown-share (range,
+  deploy, owner-issue, 24 h; 5%), producer-silence (open slice/gate/review/landing items with no wait,
+  one per (producer of the last event, item type), subject "<producer>/<type>", "<item> silent for <n>
+  min (threshold <t> min)"; threshold max(10
+  min, 2 x the type's 7-day p90 lifetime), unknown under 20 closed), cost-per-landed-item (spend over
+  the last 7 UTC days / ranges closed landed over the same days; never flagged).
+  labels and reasonLabel are the owner's words for the tokens (src/lib/constraint-labels.ts); line and
+  the text form use only them. stuck is the 50 oldest waits, capped after the mine filter;
+  stuckTotal is how many matched (the text form prints "50 of N").
+  Each breached anomaly is a flag alert (ADR-0032) with source "ledger", rule = id, sent to the
+  workspace's orchestrator. An answer older than 120 s, or with the ledger unknown, neither raises
+  nor clears. judged is false when the value or threshold is null or the measure never flags; an
+  anomaly that cannot be judged keeps its raised flag.
 
 ## Portfolio board
 

@@ -19,11 +19,12 @@ import { tabIdentityOf } from '@/lib/tab-token';
 import { RemoteHostError, isValidRemoteHostName, readRemoteHosts, remoteDirExists } from '@/lib/remote-host';
 import fs from 'fs/promises';
 import path from 'path';
-import type { TPanelType } from '@/types/terminal';
+import type { TPanelType, TTabRole } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import type { ILastEvent } from '@/types/status';
 import { remoteHostUnreachableBody } from '@/lib/cli-error';
 import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
+import { checkEvaluatorBrowser, checkTabRole } from '@/lib/tab-role';
 
 const log = createLogger('api:cli:tabs');
 
@@ -110,6 +111,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       identity: 'launch' | 'hook' | 'none';
       /** The remote host that runs the tab (ADR-0022); absent for a local tab. */
       host?: string;
+      /** The tab's fixed tool configuration (ADR-0040); absent for an ordinary tab. */
+      role?: TTabRole;
+      previewOrigin?: string;
+      pgService?: string;
     }> = [];
 
     // An unscoped list must not become a directory of every other epic's
@@ -149,6 +154,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             reportOn: tab.reportOn ?? null,
             identity: tab.panelType === 'web-browser' ? 'none' : tabIdentityOf(id, tab.id),
             ...(tab.host ? { host: tab.host } : {}),
+            ...(tab.role ? { role: tab.role } : {}),
+            ...(tab.previewOrigin ? { previewOrigin: tab.previewOrigin } : {}),
+            ...(tab.pgService ? { pgService: tab.pgService } : {}),
           });
         }
       }
@@ -157,7 +165,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd, overCap } = req.body as {
+    const { workspaceId, name, panelType, model, reasoning, launch, scope, reportsTo, reportOn, host, cwd, role, previewUrl, pgService, overCap } = req.body as {
       workspaceId?: string;
       name?: string;
       panelType?: string;
@@ -169,6 +177,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       reportOn?: unknown;
       host?: unknown;
       cwd?: unknown;
+      role?: unknown;
+      previewUrl?: unknown;
+      pgService?: unknown;
       overCap?: unknown;
     };
     if (!workspaceId) {
@@ -203,7 +214,13 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         validPanelTypes: VALID_PANEL_TYPES,
       });
     }
-    const resolvedType: TPanelType = panelType ? (panelType as TPanelType) : 'terminal';
+    const roleCheck = checkTabRole(role, panelType as TPanelType | undefined, host, previewUrl, pgService);
+    if (!roleCheck.ok) return res.status(400).json(roleCheck.body);
+    if (roleCheck.role === 'evaluator') {
+      const browser = await checkEvaluatorBrowser();
+      if (!browser.ok) return res.status(400).json({ error: browser.error, code: 'invalid-request', role: roleCheck.role });
+    }
+    const resolvedType: TPanelType = panelType ? (panelType as TPanelType) : roleCheck.role ? 'claude-code' : 'terminal';
     let remoteHost: string | undefined;
     if (host !== undefined) {
       const checked = await checkRemoteHost(host, resolvedType);
@@ -237,7 +254,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const shouldLaunch = launch !== false && isAgentPanelType(resolvedType);
     const agentLaunchConfig = agentLaunchConfigFromOptions(model, reasoning);
     const command = shouldLaunch
-      ? await buildFreshLaunchCommand(workspaceId, { panelType: resolvedType, host: remoteHost, agentLaunchConfig })
+      ? await buildFreshLaunchCommand(workspaceId, { panelType: resolvedType, host: remoteHost, agentLaunchConfig, role: roleCheck.role, previewOrigin: roleCheck.previewOrigin, pgService: roleCheck.pgService })
       : undefined;
 
     try {
@@ -247,6 +264,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
         reportOn: reportOnChecked.markers ?? undefined,
         host: remoteHost,
+        role: roleCheck.role,
+        previewOrigin: roleCheck.previewOrigin,
+        pgService: roleCheck.pgService,
         admit: admission?.admit,
       });
       if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
@@ -323,6 +343,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         ...(tab.reportOn ? { reportOn: tab.reportOn } : {}),
         ...(codexLaunchState ? { launchState: codexLaunchState } : {}),
         ...(tab.host ? { host: tab.host } : {}),
+        ...(tab.role ? { role: tab.role } : {}),
+        ...(tab.previewOrigin ? { previewOrigin: tab.previewOrigin } : {}),
+        ...(tab.pgService ? { pgService: tab.pgService } : {}),
         ...(wip ? { wip } : {}),
       });
     } catch (err) {

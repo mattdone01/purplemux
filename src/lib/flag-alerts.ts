@@ -1,15 +1,18 @@
 import { alertFor, isOrchestratorTab } from '@/lib/alert-policy';
+import { FINDER_STALE_MS, cachedFinderResults } from '@/lib/constraint-tick';
 import type { TAlertDraft } from '@/lib/alert-policy';
 import { DEFAULT_FLOW_THRESHOLDS, deriveFlowFlags } from '@/lib/flow-flags';
 import { createLogger } from '@/lib/logger';
 import type { IAlertContext } from '@/lib/notification-dispatcher';
+import type { IFinderResult } from '@/types/constraint';
 import type { IFleetRow, IFleetView } from '@/types/fleet-status';
 import type { IFlowRecord, IFlowThresholds } from '@/types/flow';
 import type { IAlertFlag, TAlertProviderId } from '@/types/status';
 import type { IWorkspace } from '@/types/terminal';
 
-// Flag alerts (ADR-0032): a 60 s tick reads the fleet flags and the derived flow flags, and sends
-// one `flag` alert when a flag is raised. Each flag names the reads it rests on: any of them failing
+// Flag alerts (ADR-0032): a 60 s tick reads the fleet flags, the derived flow flags and the
+// constraint finder's breached anomalies (ADR-0034, source `ledger`), and sends one `flag` alert
+// when a flag is raised. Each flag names the reads it rests on: any of them failing
 // keeps it from clearing, and the narrower set whose failure could make it false keeps it from
 // raising. A flag first seen in a source with no good read since the start, or since the switch came
 // back on, is recorded and sends nothing, so a deploy or a read that recovers replays nothing.
@@ -36,7 +39,12 @@ export const FLAG_SOURCES = {
   layout: (workspaceId: string) => `layout:${workspaceId}`,
   tab: (workspaceId: string, tabId: string) => `tab:${workspaceId}/${tabId}`,
   flow: (workspaceId: string) => `flow:${workspaceId}`,
+  ledger: (workspaceId: string) => `ledger:${workspaceId}`,
+  ledgerSubject: (workspaceId: string, id: string, subject: string) => `ledger:${workspaceId}/${id}/${subject}`,
 } as const;
+
+/** A finder answer older than two ticks is not a read (`FINDER_STALE_MS`). */
+export const LEDGER_STALE_MS = FINDER_STALE_MS;
 
 export interface IRaisedFlag extends IAlertFlag {
   key: string;
@@ -195,6 +203,42 @@ export const flowFlagScan = (reads: TFlowRead[], thresholds: IFlowThresholds, no
   return { flags, read, failed };
 };
 
+/**
+ * The constraint finder's breached anomalies (ADR-0034), each workspace-level, so each names the
+ * orchestrator until story 13 routes them. A workspace the finder has not reached, whose ledger it
+ * could not read, or whose answer is older than two ticks is an unread source: its flags neither
+ * raise nor clear. Each anomaly subject is its own source, failed while its value cannot be judged
+ * (`judged: false`), so an anomaly that turns unknown or unflaggable keeps its flag standing.
+ */
+export const ledgerFlagScan = (
+  results: ReadonlyMap<string, IFinderResult>, workspaces: Array<Pick<IWorkspace, 'id'>>, now: number,
+): IFlagScan => {
+  const read = new Set<string>();
+  const failed = new Set<string>();
+  const flags: IRaisedFlag[] = [];
+  for (const { id } of workspaces) {
+    const source = FLAG_SOURCES.ledger(id);
+    const result = results.get(id);
+    if (!result || result.inputs.ledger.state !== 'ok' || now - result.generatedAt > LEDGER_STALE_MS) {
+      failed.add(source);
+      continue;
+    }
+    read.add(source);
+    for (const a of result.anomalies) {
+      const subject = FLAG_SOURCES.ledgerSubject(id, a.id, a.subject);
+      // A value that cannot be judged (unknown, no threshold, or too few to flag) can neither raise nor clear.
+      if (a.judged) read.add(subject);
+      else failed.add(subject);
+      if (!a.breached) continue;
+      flags.push(raised({
+        source: 'ledger', workspaceId: id, rule: a.id, subject: a.subject, text: a.text, tabId: null,
+        sources: [source, subject], raiseSources: [source],
+      }));
+    }
+  }
+  return { flags, read, failed };
+};
+
 export const mergeFlagScans = (...scans: IFlagScan[]): IFlagScan => ({
   flags: scans.flatMap((scan) => scan.flags),
   read: new Set(scans.flatMap((scan) => [...scan.read])),
@@ -239,13 +283,13 @@ export const stepFlagAlerts = (state: IFlagAlertState, scan: IFlagScan, now: num
 export const pruneFlagSources = (state: IFlagAlertState, workspaces: Array<Pick<IWorkspace, 'id'>>, scan: IFlagScan): void => {
   const ids = new Set(workspaces.map((w) => w.id));
   for (const source of state.readSources) {
-    const match = /^(layout|flow|tab):([^/]+)(\/.+)?$/.exec(source);
+    const match = /^(layout|flow|ledger|tab):([^/]+)(\/.+)?$/.exec(source);
     if (!match) continue;
-    const [, kind, workspaceId] = match;
+    const [, kind, workspaceId, rest] = match;
+    // A tab the layout no longer shows, or an anomaly subject the finder no longer reports.
+    const parent = kind === 'tab' ? FLAG_SOURCES.layout(workspaceId) : kind === 'ledger' && rest ? FLAG_SOURCES.ledger(workspaceId) : null;
     if (!ids.has(workspaceId)) state.readSources.delete(source);
-    else if (kind === 'tab' && scan.read.has(FLAG_SOURCES.layout(workspaceId)) && !scan.read.has(source) && !scan.failed.has(source)) {
-      state.readSources.delete(source);
-    }
+    else if (parent && scan.read.has(parent) && !scan.read.has(source) && !scan.failed.has(source)) state.readSources.delete(source);
   }
 };
 
@@ -316,6 +360,8 @@ export interface IFlagAlertDeps {
   fleetView: (now: number) => Promise<IFleetView>;
   flowThresholds: () => Promise<IFlowThresholds>;
   readFlow: (workspaceId: string) => Promise<IFlowRecord | null>;
+  /** The constraint finder's cached answers per workspace (ADR-0034). */
+  finderResults: () => ReadonlyMap<string, IFinderResult>;
   dispatch: (draft: TAlertDraft, ctx: IAlertContext) => Promise<unknown>;
 }
 
@@ -370,7 +416,7 @@ export const runFlagAlertTick = async (deps: IFlagAlertDeps, state: IFlagAlertSt
     })),
   ]);
   const baseline = state.readSources.size === 0;
-  const scan = mergeFlagScans(fleetFlagScan(view, workspaces), flowFlagScan(reads, thresholds, now));
+  const scan = mergeFlagScans(fleetFlagScan(view, workspaces), flowFlagScan(reads, thresholds, now), ledgerFlagScan(deps.finderResults(), workspaces, now));
   const raises = stepFlagAlerts(state, scan, now, config.repeatMinutes * 60_000);
   pruneFlagSources(state, workspaces, scan);
   const byId = new Map(workspaces.map((w) => [w.id, w]));
@@ -419,6 +465,7 @@ const realDeps = (): IFlagAlertDeps => ({
   fleetView: async (now) => (await import('@/lib/fleet-status-snapshot')).readFleetView(now),
   flowThresholds: async () => (await import('@/lib/flow-view')).readFlowThresholds(),
   readFlow: async (workspaceId) => (await import('@/lib/flow-store')).readFlow(workspaceId),
+  finderResults: () => cachedFinderResults(),
   dispatch: async (draft, ctx) => (await import('@/lib/notification-dispatcher')).getNotificationDispatcher().dispatch(draft, ctx),
 });
 
