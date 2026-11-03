@@ -100,6 +100,7 @@ to an exit code through one table:
      1  unexpected error (tab restart, ADR-0028) restart-not-confirmed                      inspect the tab
      2  usage error (tab restart, ADR-0028)      restart-unsupported                        fix the command
      3  conflict (tab restart, ADR-0028)         tab-busy                                   when idle, or --interrupt
+     2  usage error (questions, ADR-0037)        question-invalid                           fix the question
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -577,6 +578,11 @@ Keys in use:
                The bookkeeping auto-answer rule (ADR-0031): an integer 1..10080 of minutes. Unset
                (the default) or any invalid value is off (an invalid value is logged). Admin token
                only (exit 3 forbidden for a tab): the rule answers items in every workspace.
+  mission.question-format.min-version
+               The oldest Mission Control question format the events route accepts (ADR-0037): 1
+               (the default) accepts a v1 question and returns its format-2 lint; 2 refuses a new v1
+               question with 400 question-invalid. Unset, invalid or unreadable means 1. Admin token
+               only (exit 3 forbidden for a tab): the owner raises it (OD-10).
   alerts.flags  alerts.flag-repeat-minutes
                Flag alerts (ADR-0032). alerts.flags "off" stops every flag alert; any other value,
                or unset, is on. alerts.flag-repeat-minutes, 1..10080 (default 60, decimals allowed),
@@ -995,7 +1001,92 @@ POST /api/cli/mission-control/events?workspaceId=WS
   still bound by run.resumed.
   Clients must treat an event type they do not know as an opaque audit row.
 
+Question format v2 (ADR-0037):
+  attention.opened and attention.updated carry a question. A question with "formatVersion": 2 is
+  checked against the format-2 rules; one without it is v1 and is checked against the v1 rules
+  above. Format-2 fields:
+    "decision"           required, one line, at most 120 chars: the thing to decide
+    "whyNow"             at most 200 chars; required on "kind": "question"
+    "answerType"         "single" | "multi" | "confirm" | "text" | "action-done";
+                         "action-done" needs "kind": "action", every other type "kind": "question"
+    "options"            single and multi: 2-4; confirm: exactly 2 (omit them for Yes/No);
+                         text and action-done: none. Each { "id", "label" (at most 60, one line),
+                         "consequence"? (one line, at most 160), "recommended"? (at most one true on
+                         single and confirm), "needsText"? (selecting it requires answer text) }
+    "recommendationWhy"  at most 200 chars; required when an option is recommended. It replaces
+                         "recommendation", which a format-2 question does not take
+    "evidence"           at most 8 { "label" (at most 60), "url" (http or https) }, each url once
+    "context"            optional CommonMark + GFM, at most 4000 chars; shown with no raw HTML,
+                         collapsed beyond 12 lines, links open in a new tab
+    "title" (at most 80), "storyIds", "blockingScope", "canContinue", "class", "defaultOptionId"
+                         keep their v1 rules; "source" (the original draft, at most 16000 chars of
+                         JSON) is set by the curator reshape
+  Unknown fields are refused. The owner can always answer with text alone ("Other").
+  A refusal is 400 { "code": "question-invalid", "error", "defects": [{ "eventId", "itemId",
+  "field", "measured", "limit", "message" }] } listing every defect of every event, for example
+  "options[2].label: 87 chars, at most 60" or "options: 1 option on answerType single, needs 2-4";
+  nothing in the batch is written (CLI exit 2). At fleet config mission.question-format.min-version
+  1 (the default) a v1 question is accepted and the 200 response carries "lint": [{ "eventId",
+  "itemId", "findings": [defect, ...] }] for it; at 2 a new v1 question (attention.opened) is
+  refused, an attention.updated that keeps a v1 item v1 is accepted with its lint, and one that
+  would turn a format-2 item back into v1 is refused.
+  The snapshot item carries the format-2 fields as stored, its evidence links as "evidenceLinks"
+  ("evidence" stays the item's provenance), "lint" (the format-2 findings of a v1 question, [] on
+  v2), "changes" (the latest attention.updated record, null when none) and, once the work-item
+  ledger serves it, "blocked": { "items", "hours", "critical" } (absent until then, never 0).
+
+  One example per answer type (the "payload" of an attention.opened):
+  single:  {"itemId":"q-gate","formatVersion":2,"kind":"question","title":"Gate policy",
+    "decision":"Should the landing lock reuse the pre-flight gate?","whyNow":"Re-gating costs 13 lock-hours a day.",
+    "answerType":"single","options":[{"id":"reuse","label":"Reuse the pre-flight gate",
+    "consequence":"The gate runs once.","recommended":true},{"id":"keep","label":"Keep re-gating"},
+    {"id":"change","label":"Change something first","needsText":true}],
+    "recommendationWhy":"85% of lock time re-runs a passed gate.",
+    "evidence":[{"label":"Lock-hours, 7 days","url":"https://example.com/lock"}],
+    "context":"The **pre-flight** gate ran on the same tree.","storyIds":["20"],"blockingScope":"story","canContinue":true}
+  multi:   {"itemId":"q-batch","formatVersion":2,"kind":"question","title":"Owner decisions",
+    "decision":"Which of these decisions do you approve?","whyNow":"Five stories wait on them.","answerType":"multi",
+    "options":[{"id":"od-1","label":"OD-1 evaluator defines done"},{"id":"od-2","label":"OD-2 one gate"}],
+    "storyIds":[],"blockingScope":"run","canContinue":true}
+  confirm: {"itemId":"q-deploy","formatVersion":2,"kind":"question","title":"Deploy",
+    "decision":"Deploy 0.31.0 to the live server now?","whyNow":"The dry run passed.","answerType":"confirm",
+    "storyIds":[],"blockingScope":"none","canContinue":true}            (options omitted: Yes / No)
+  text:    {"itemId":"q-note","formatVersion":2,"kind":"question","title":"Release note",
+    "decision":"How should the release note describe the WIP cap?","whyNow":"The release is cut at 17:00.",
+    "answerType":"text","storyIds":[],"blockingScope":"story","canContinue":true}
+  action-done: {"itemId":"q-pixel","formatVersion":2,"kind":"action","title":"Pair the Pixel",
+    "decision":"Pair your Pixel for wireless debugging.","answerType":"action-done",
+    "context":"Run \`adb tcpip 5555\` once over USB.","storyIds":[],"blockingScope":"run","canContinue":false}
+
+  Revisions keep the owner's answer: each attention.updated stores "changes": { "fromRevision",
+  "toRevision", "compatible", "decision": { "from", "to" } | null, "answerType": { "from", "to" } |
+  null, "options": { "added": [ids], "removed": [ids], "relabelled": [{ "id", "from", "to",
+  "needsText"?: { "from", "to" } }] }, "recommended": { "from": [ids], "to": [ids] } | null,
+  "recommendation": bool (recommendationWhy on v2, recommendation on v1), "whyNow": bool,
+  "title": bool (v2), "context": bool, "evidence": bool, "unrecorded": [revisions] } on its event
+  and on the item. A
+  revision is compatible when the decision (the title on v1) and the answer type are unchanged and
+  no option was removed. An answer whose expectedRevision is older than the item's revision is
+  accepted when every revision between them is compatible and every selected option still
+  exists; the answer then carries "appliedRevision" (the current revision) beside
+  "expectedRevision", and so does its answer.recorded event. Otherwise 409 conflict with "current"
+  (the item) and "changes" (the span merged; a revision with no record, written before ADR-0037,
+  is listed in "unrecorded" and counts as incompatible). An answer to a format-2 item selects at
+  most one option on single and confirm, and gives text when a selected option has needsText
+  (400 invalid-request otherwise).
+
+POST /api/cli/mission-control/questions/check?workspaceId=WS   { "question": { ... } }
+  Any valid token. The events route's question check without the write: 200 { "ok", "formatVersion",
+  "minVersion", "defects", "lint", "question" (normalized, null when refused), "reshape": {
+  "enabled": false, "reason" } }. The curator reshape is not enabled until harness-flow-loop
+  story 23 lands.
+
 CLI equivalents:
+  purplemux mc ask -w WS --json @DRAFT [--fix]
+  DRAFT is one attention.opened or attention.updated event (or { "events": [that event] }). The
+  CLI checks its question, prints every defect (field: measured, limit) and exits 2 with nothing
+  posted, or prints any lint and posts the event. --fix asks for the curator reshape; while it is
+  not enabled the CLI prints the defects and the reason and exits 2. "mc" is "mission".
   purplemux mission snapshot -w WS
   purplemux mission bootstrap -w WS
   purplemux mission events -w WS --json '{"events":[...]}'

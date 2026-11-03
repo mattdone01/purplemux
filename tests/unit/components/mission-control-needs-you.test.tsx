@@ -47,6 +47,9 @@ const question = (over: Partial<IMissionAttentionItem> = {}): IMissionAttentionI
   class: null,
   defaultOptionId: null,
   autoAnswer: null,
+  evidenceLinks: [],
+  lint: [],
+  changes: null,
   createdAt: now - 60_000,
   updatedAt: now,
   ...over,
@@ -380,7 +383,7 @@ describe('Auto-answered section (ADR-0031)', () => {
 
 describe('MissionControlDeliveryCard: who answered', () => {
   const answer = (actor: string): IMissionAnswer => ({
-    id: 'a-1', workspaceId: 'ws-pay', runId: 'run-1', itemId: 'q-1', actor, submissionId: 's', expectedRevision: 1,
+    id: 'a-1', workspaceId: 'ws-pay', runId: 'run-1', itemId: 'q-1', actor, submissionId: 's', expectedRevision: 1, appliedRevision: 1,
     optionIds: ['staged'], text: 'Auto-answered under …', actionCompleted: false, createdAt: now,
   });
 

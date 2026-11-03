@@ -16,6 +16,7 @@ const CLI_COMMANDS = new Set([
   'flow',
   'spend',
   'mission',
+  'mc',
   'portfolio',
   'lease',
   'inbox',

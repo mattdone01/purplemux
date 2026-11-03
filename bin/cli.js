@@ -183,6 +183,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'flow-too-large': EXIT.USAGE,
   'flow-unreadable': EXIT.UNEXPECTED,
   'flow-not-found': EXIT.NOT_FOUND,
+  'question-invalid': EXIT.USAGE,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -301,8 +302,11 @@ const legacyCode = (body) => {
   return null;
 };
 
+const defectLines = (defects) => defects.map((d) => `  ${d.eventId ? `${d.eventId} ` : ''}${d.message}`).join('\n');
+
 const failFromResponse = (resp, body) => {
   if (!body || typeof body !== 'object') return fail(null, `HTTP ${resp.status}`);
+  if (Array.isArray(body.defects) && body.defects.length) process.stderr.write(`question defects:\n${defectLines(body.defects)}\n`);
   const code = typeof body.code === 'string' ? body.code : legacyCode(body);
   const message = typeof body.error === 'string' ? body.error : `HTTP ${resp.status}`;
   return fail(code, code ? message : `${message} (HTTP ${resp.status})`, body);
@@ -843,7 +847,33 @@ const cmdMission = async (args) => {
     const { body } = await api('POST', `/api/cli/mission-control/events?workspaceId=${encodeURIComponent(wsId)}`, { events: [event] });
     return out(body);
   }
-  die('usage: mission snapshot|bootstrap|events|answers|ack -w WS [options]');
+  if (sub === 'ask') return missionAsk(rest, wsId);
+  die('usage: mission snapshot|bootstrap|events|answers|ack|ask -w WS [options]');
+};
+
+// `mc ask` (ADR-0037 §3): the server's question check before the post, so an unreadable
+// question is fixed in the same turn. --fix asks for the curator reshape, which story 23 enables.
+const missionAsk = async (rest, wsId) => {
+  const draft = await readJsonFlag(rest, 'mc ask draft');
+  const events = draft && Array.isArray(draft.events) ? draft.events : [draft];
+  const event = events.length === 1 ? events[0] : null;
+  if (!event || !['attention.opened', 'attention.updated'].includes(event.type) || !event.payload || typeof event.payload !== 'object') {
+    die('mc ask takes one attention.opened or attention.updated event (or { "events": [that event] })');
+  }
+  const { itemId: _itemId, humanReview: _humanReview, ...question } = event.payload;
+  const query = `workspaceId=${encodeURIComponent(wsId)}`;
+  const { body: check } = await api('POST', `/api/cli/mission-control/questions/check?${query}`, { question });
+  if (!check.ok) {
+    process.stderr.write(`question defects (${check.defects.length}, min-version ${check.minVersion}):\n${defectLines(check.defects)}\n`);
+    if (rest.includes('--fix')) {
+      const reshape = check.reshape || {};
+      process.stderr.write(`--fix: ${reshape.enabled ? 'the curator reshape is enabled, but this CLI cannot call it yet' : reshape.reason || 'the curator reshape is not enabled'}; fix the defects in the draft\n`);
+    }
+    return fail('question-invalid', `${check.defects.length} defect${check.defects.length === 1 ? '' : 's'}; nothing was posted`);
+  }
+  if (check.lint.length) process.stderr.write(`question lint (accepted at min-version ${check.minVersion}):\n${defectLines(check.lint)}\n`);
+  const { body } = await api('POST', `/api/cli/mission-control/events?${query}`, { events: [event] });
+  return out(body);
 };
 
 const cmdPortfolio = async (args) => {
@@ -1941,6 +1971,11 @@ Commands:
   mission answers -w WS [--run ID] [--all] Read unacknowledged answers for current answered items, each with its ackCommand; --all includes history
   mission ack -w WS --run ID --answer ID --generation N --revision N --event-id ID --producer-at MS
                                            Acknowledge one persisted answer after reading and applying it
+  mc ask -w WS --json @DRAFT [--fix]      Check one attention.opened/attention.updated event's question against the
+                                           server's format rules (ADR-0037), then post it. Defects print one per line
+                                           (field: measured, limit) and exit 2 with nothing posted; lint on an accepted
+                                           v1 question prints to stderr. --fix asks for the curator reshape; until it
+                                           is enabled it prints the defects and exits 2. "mc" is "mission".
   portfolio board --workspaces WS,WS       Scoped release blockers for the explicitly selected workspaces (current manager tab and read grants)
   portfolio report -w WS --json '{...}'    Current orchestrator reports a revisioned blocker; see API guide for schema
   portfolio applied -w WS --json '{...}'   Current orchestrator records application of a routed note, not blocker resolution
@@ -2075,6 +2110,7 @@ const main = async () => {
     case 'lease':
       return cmdLease(args.slice(1));
     case 'mission':
+    case 'mc':
       return cmdMission(args.slice(1));
     case 'portfolio':
       return cmdPortfolio(args.slice(1));

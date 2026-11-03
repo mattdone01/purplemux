@@ -5,6 +5,7 @@ import { FLEET_CONFIG_KEYS } from '@/lib/fleet-status-snapshot';
 import { FLAG_ALERT_CONFIG_KEYS } from '@/lib/flag-alerts';
 import { FLOW_CONFIG_KEYS } from '@/lib/flow-flags';
 import { AUTO_ANSWER_KEY } from '@/lib/mission-control-auto-answer';
+import { QUESTION_MIN_VERSION_KEY } from '@/lib/mission-question-config';
 import { REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_KEY } from '@/lib/remote-host';
 import { TAB_CAP_KEY } from '@/lib/tab-cap';
 import { IDLE_NUDGE_CONFIG_KEY, WAIT_BACKSTOP_CONFIG_KEY } from '@/lib/turn-end';
@@ -23,6 +24,7 @@ const SERVER_KEYS = [
   TAB_CAP_KEY,
   ...Object.values(FLOW_CONFIG_KEYS),
   AUTO_ANSWER_KEY,
+  QUESTION_MIN_VERSION_KEY,
   ...Object.values(FLAG_ALERT_CONFIG_KEYS),
 ];
 

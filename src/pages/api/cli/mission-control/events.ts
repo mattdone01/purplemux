@@ -6,7 +6,8 @@ import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
 import { resolveMissionTargetIdentity } from '@/lib/mission-control-runtime';
 import { getMissionControlStore, type IMissionEventAuthority, type IMissionItemOpener } from '@/lib/mission-control-store';
-import { parseMissionEvents } from '@/lib/mission-control-validation';
+import { parseMissionEventBatch } from '@/lib/mission-control-validation';
+import { readQuestionMinVersion } from '@/lib/mission-question-config';
 import { getWorkspaceById } from '@/lib/workspace-store';
 
 export const config = {
@@ -30,7 +31,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       throw new MissionControlError(403, 'forbidden', `Mission Control writes require this workspace token. ${FOREIGN_MUTATION_HINT}`);
     }
     const body = req.body as { events?: unknown } | null;
-    const events = parseMissionEvents(body?.events);
+    const questionMinVersion = await readQuestionMinVersion();
+    const { events, lint } = parseMissionEventBatch(body?.events, { questionMinVersion });
     if (events.some((event) => event.workspaceId !== workspaceId)) {
       throw new MissionControlError(403, 'forbidden', 'Every event must match the authorized workspace');
     }
@@ -67,8 +69,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       });
     }
     return res.status(200).json({
-      ...store.applyEvents(events, authorities),
+      ...store.applyEvents(events, authorities, { questionMinVersion }),
       humanInboxPolicy: store.humanInboxPolicy(workspaceId),
+      lint,
     });
   } catch (error) {
     sendMissionError(res, error);
