@@ -27,7 +27,7 @@ const item = (key: string, extra: Partial<ILedgerItem> = {}): ILedgerItem => ({
 
 const boardOf = (over: Partial<IBoard> = {}, ledger = true): IBoard => ({
   ...deriveConstraint(ledger ? {
-    intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null,
+    intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null,
     items: [
       item('range:a:1', { waitReason: 'not-armed', waitSince: NOW - 3 * HOUR, holder: 'lane-a', clearInput: 'arm the receipt', attrs: { critical: true } }),
       item('range:b:1', { waitReason: 'owner', waitSince: NOW - 2 * HOUR, holder: 'owner', parentKey: 'mc-item:mc-1' }),

@@ -17,7 +17,7 @@ const {
 const T0 = Date.UTC(2026, 10, 3, 6, 0, 0);
 const HOUR = 3_600_000;
 
-const emptyLedger = (): IFinderLedgerInput => ({ intervals: [], items: [], lastProducer: {}, firstEventAt: T0 - 30 * 24 * HOUR, tabWakes: null });
+const emptyLedger = (): IFinderLedgerInput => ({ intervals: [], items: [], lastProducer: {}, firstEventAt: T0 - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null });
 
 const harness = () => {
   const reads = { ledger: 0, spend: 0, spendIds: [] as string[] };

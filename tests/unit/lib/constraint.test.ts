@@ -3,7 +3,7 @@ import path from 'path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { FINDER_WINDOWS, boardLine, criticalKeys, deriveConstraint, trendOf } from '@/lib/constraint';
-import type { IFinderInterval, IFinderLedgerInput, IFinderSpendInput } from '@/types/constraint';
+import type { IFinderInterval, IFinderLedgerInput, IFinderOwnerIssueSource, IFinderSpendInput } from '@/types/constraint';
 import type { IFlowRecord } from '@/types/flow';
 import type { ILedgerItem, TLedgerAttrValue, TLedgerIntervalReason, TLedgerItemType } from '@/types/ledger';
 
@@ -25,7 +25,7 @@ const item = (itemKey: string, extra: Partial<ILedgerItem> = {}): ILedgerItem =>
 });
 
 const ledger = (extra: Partial<IFinderLedgerInput> = {}): IFinderLedgerInput => ({
-  intervals: [], items: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ...extra,
+  intervals: [], items: [], lastProducer: {}, firstEventAt: NOW - 30 * 24 * HOUR, tabWakes: null, ownerIssueSource: null, ...extra,
 });
 
 /** The spend view's first UTC day starts 6 days before today's: 2026-10-28T00:00Z. */
@@ -314,7 +314,7 @@ describe('missing inputs (AC 7)', () => {
     expect(result.constraint).toBeNull();
     expect(result.windows).toEqual([]);
     expect(result.unknownShare).toBeNull();
-    expect(result.anomalies).toHaveLength(11);
+    expect(result.anomalies).toHaveLength(12);
     for (const a of result.anomalies) expect(a).toMatchObject({ value: null, breached: false, reason: 'ledger unreadable' });
     expect(result.line).toBe('no goal set · items left — · constraint unknown (ledger unreadable)');
     expect(result.inputs.flow.state).toBe('ok');
@@ -330,12 +330,12 @@ describe('missing inputs (AC 7)', () => {
     expect(result.line).toBe('no goal set · items left — · constraint unknown (the ledger holds no event for this workspace)');
     expect(result.anomalies.map((a) => [a.id, a.value, a.reason])).toEqual([
       're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item', 'cache-read-per-landed-item',
-      'seat-compactions', 'rotation-alarm', 'handoff-undelivered',
+      'seat-compactions', 'rotation-alarm', 'handoff-undelivered', 'owner-found-defects',
     ].map((id) => [id, null, 'the ledger holds no event for this workspace']));
     expect(result.anomalies.map((a) => [a.id, a.threshold, a.judged])).toEqual([
       ['re-gates', 0, false], ['rework-rate', 0.1, false], ['context-per-call', 300_000, false], ['wakes-per-hour', 6, false],
       ['unknown-share', 0.05, false], ['producer-silence', null, false], ['cost-per-landed-item', null, false], ['cache-read-per-landed-item', null, false],
-      ['seat-compactions', 0, false], ['rotation-alarm', 1, false], ['handoff-undelivered', 0, false],
+      ['seat-compactions', 0, false], ['rotation-alarm', 1, false], ['handoff-undelivered', 0, false], ['owner-found-defects', null, false],
     ]);
     expect(result.anomalies.find((a) => a.id === 'wakes-per-hour')!.text)
       .toBe('wakes per hour: unknown (the ledger holds no event for this workspace) in 6h, threshold 6.0/h');
@@ -549,9 +549,127 @@ describe('anomalies (AC 3): each names its measured value and threshold', () => 
     const result = deriveConstraint(ledger(), null, null, null, NOW);
     expect(result.anomalies.map((a) => a.id)).toEqual([
       're-gates', 'rework-rate', 'context-per-call', 'wakes-per-hour', 'unknown-share', 'producer-silence', 'cost-per-landed-item', 'cache-read-per-landed-item',
-      'seat-compactions', 'rotation-alarm', 'handoff-undelivered',
+      'seat-compactions', 'rotation-alarm', 'handoff-undelivered', 'owner-found-defects',
     ]);
     for (const a of result.anomalies) expect(a.text).toMatch(/threshold|no threshold/);
+  });
+});
+
+describe('owner-found defects (story 35)', () => {
+  const SINCE = NOW - 7 * DAY;
+  const live = { firstReceivedAt: NOW - 10 * DAY, lastReceivedAt: NOW - MIN };
+  /** The fixed feed's shape: every item carries `attrs.raisedAt` (here its open time) unless a test says otherwise. */
+  const issue = (id: string, openedAt: number, extra: Partial<ILedgerItem> = {}) =>
+    item(`owner-issue:${id}`, { openedAt, attrs: { raisedAt: openedAt }, ...extra });
+  const source = (items: ILedgerItem[], extra: Partial<IFinderOwnerIssueSource> = {}, producer = 'v2'): IFinderOwnerIssueSource => ({
+    producerOf: new Map(items.map((it) => [it.itemKey, producer])), newestProducer: producer,
+    receipts: new Map([[producer, live]]), earliestOpenedAt: Math.min(NOW - 10 * DAY, ...items.map((it) => it.openedAt)), anyRaisedAt: true,
+    ...extra,
+  });
+  const defects = (items: ILedgerItem[], src: IFinderOwnerIssueSource | null = source(items)) =>
+    deriveConstraint(ledger({ items, ownerIssueSource: src }), null, null, null, NOW).anomalies.find((a) => a.id === 'owner-found-defects')!;
+
+  it('is null with its reason when the ledger holds no owner-issue item; reported, never flagged', () => {
+    expect(defects([], null)).toEqual({
+      id: 'owner-found-defects', subject: 'workspace', value: null, unit: 'a day', threshold: null, judged: false, breached: false,
+      window: '7d', reason: 'no owner-issue item in the ledger',
+      text: 'defects you found: unknown (no owner-issue item in the ledger) in 7d, no threshold',
+    });
+  });
+
+  it('counts the items raised in the last 7 days, open or closed, divided by 7', () => {
+    const items = [
+      issue('a', NOW - HOUR), issue('b', NOW - DAY, { closedAt: NOW - HOUR, state: 'closed' }), issue('c', SINCE + 1),
+      issue('d', SINCE), issue('e', NOW - 9 * DAY), issue('f', NOW + MIN), item('range:x:1', { openedAt: NOW - HOUR }),
+    ];
+    const a = defects(items);
+    expect(a).toMatchObject({ value: 3 / 7, threshold: null, judged: false, breached: false, reason: null });
+    expect(a.text).toBe('defects you found: 0.4 a day (3 raised) in 7d, no threshold');
+  });
+
+  it('reports a real 0 when the source is live and covers the window', () => {
+    expect(defects([issue('old', NOW - 9 * DAY)])).toMatchObject({ value: 0, reason: null });
+  });
+
+  it('dates an item by attrs.raisedAt, not by when the feed first saw it (consult Q2)', () => {
+    const items = [
+      issue('seen-late', NOW - HOUR, { attrs: { raisedAt: NOW - 9 * DAY } }),
+      issue('raised-2d', NOW - HOUR, { attrs: { raisedAt: NOW - 2 * DAY } }),
+    ];
+    expect(defects(items)).toMatchObject({ value: 1 / 7, reason: null });
+  });
+
+  it('is null when the producer of the newest item received no event in 24 h', () => {
+    const items = [issue('a', NOW - HOUR)];
+    expect(defects(items, source(items, { receipts: new Map([['v2', { ...live, lastReceivedAt: NOW - DAY }]]) })))
+      .toMatchObject({ value: null, reason: 'owner-issue producer silent' });
+    expect(defects(items, source(items, { receipts: new Map([['v2', { ...live, lastReceivedAt: NOW - DAY + 1 }]]) })))
+      .toMatchObject({ value: 1 / 7, reason: null });
+  });
+
+  it('picks the newest item by its raised time, else the item opened last in the store', () => {
+    const quiet = { firstReceivedAt: NOW - 10 * DAY, lastReceivedAt: NOW - 2 * DAY };
+    const items = [issue('late-feed', NOW - HOUR, { attrs: { raisedAt: NOW - 5 * DAY } }), issue('fresh', NOW - 2 * HOUR)];
+    const two = (lateFeed: string, fresh: string): IFinderOwnerIssueSource => ({
+      producerOf: new Map([['owner-issue:late-feed', lateFeed], ['owner-issue:fresh', fresh]]), newestProducer: lateFeed,
+      receipts: new Map([['old-feed', quiet], ['v2', live]]), earliestOpenedAt: NOW - 10 * DAY, anyRaisedAt: true,
+    });
+    expect(defects(items, two('old-feed', 'v2'))).toMatchObject({ value: 2 / 7, reason: null });
+    expect(defects(items, two('v2', 'old-feed'))).toMatchObject({ value: null, reason: 'owner-issue producer silent' });
+    const none = { producerOf: new Map(), receipts: new Map([['old-feed', quiet], ['v2', live]]), earliestOpenedAt: NOW - 20 * DAY, anyRaisedAt: true };
+    expect(defects([], { ...none, newestProducer: 'old-feed' })).toMatchObject({ value: null, reason: 'owner-issue producer silent' });
+    expect(defects([], { ...none, newestProducer: 'v2' })).toMatchObject({ value: 0, reason: null });
+  });
+
+  it('is null when the producer is under 7 days old and no item proves the window, unless one does (consult Q1)', () => {
+    const young = { firstReceivedAt: NOW - 3 * DAY, lastReceivedAt: NOW - MIN };
+    const items = [issue('a', NOW - 3 * DAY), issue('b', NOW - HOUR)];
+    const uncovered = source(items, { receipts: new Map([['v2', young]]), earliestOpenedAt: NOW - 3 * DAY });
+    expect(defects(items, uncovered)).toMatchObject({ value: null, reason: 'window not covered' });
+    expect(defects(items, { ...uncovered, receipts: new Map([['v2', { ...young, firstReceivedAt: SINCE }]]) }))
+      .toMatchObject({ value: 2 / 7, reason: null });
+    expect(defects(items, { ...uncovered, earliestOpenedAt: SINCE })).toMatchObject({ value: 2 / 7, reason: null });
+    const backdated = [...items, issue('c', NOW - HOUR, { attrs: { raisedAt: SINCE } })];
+    expect(defects(backdated, { ...uncovered, producerOf: new Map(backdated.map((it) => [it.itemKey, 'v2'])) }))
+      .toMatchObject({ value: 2 / 7, reason: null });
+  });
+
+  it('is null when an item in reach, or still open, has no raised time; never a count by the feed\'s time (round 2 F1)', () => {
+    const missing = { attrs: {} };
+    expect(defects([issue('ok', NOW - DAY), issue('seen', NOW - HOUR, missing)]))
+      .toMatchObject({ value: null, reason: 'owner-issue raised time missing' });
+    expect(defects([issue('ok', NOW - DAY), issue('seen', NOW - HOUR, { ...missing, closedAt: NOW - MIN, state: 'closed' })]))
+      .toMatchObject({ value: null, reason: 'owner-issue raised time missing' });
+    expect(defects([issue('open-old', NOW - 9 * DAY, missing)])).toMatchObject({ value: null, reason: 'owner-issue raised time missing' });
+    expect(defects([issue('closed-old', NOW - 9 * DAY, { ...missing, closedAt: NOW - 8 * DAY, state: 'closed' })]))
+      .toMatchObject({ value: 0, reason: null });
+    expect(defects([issue('seen', NOW - HOUR, missing), issue('bad', NOW - HOUR, { attrs: { raisedAt: 'x' } })]))
+      .toMatchObject({ value: null, reason: 'owner-issue raised time missing' });
+    const young = source([issue('seen', NOW - HOUR, missing)], {
+      receipts: new Map([['v2', { firstReceivedAt: NOW - 3 * DAY, lastReceivedAt: NOW - MIN }]]), earliestOpenedAt: NOW - 3 * DAY,
+    });
+    expect(defects([issue('seen', NOW - HOUR, missing)], young)).toMatchObject({ value: null, reason: 'window not covered' });
+  });
+
+  it('is null, never 0, when no owner-issue item in the store carries a raised time (architect R1)', () => {
+    const undated = [issue('a', NOW - 9 * DAY, { attrs: {}, closedAt: NOW - 8 * DAY, state: 'closed' }),
+      issue('b', NOW - 10 * DAY, { attrs: {}, closedAt: NOW - 8 * DAY, state: 'closed' })];
+    expect(defects(undated, source(undated, { anyRaisedAt: false }))).toMatchObject({ value: null, reason: 'owner-issue raised time missing' });
+    expect(defects(undated, source(undated, { anyRaisedAt: true }))).toMatchObject({ value: 0, reason: null });
+  });
+
+  it('is null when an item in reach carries a raised time it cannot read; never a fallback to openedAt', () => {
+    for (const raisedAt of ['28 Oct', 1.5, 0, -1, NOW, true]) {
+      const items = [issue('ok', NOW - DAY), issue('bad', NOW - HOUR, { attrs: { raisedAt } })];
+      expect(defects(items)).toMatchObject({ value: null, reason: 'owner-issue raised time unreadable' });
+    }
+    const closedLongAgo = { closedAt: NOW - 8 * DAY, state: 'closed', attrs: { raisedAt: 'x' } };
+    expect(defects([issue('ok', NOW - DAY), issue('old', NOW - 9 * DAY, closedLongAgo)])).toMatchObject({ value: 1 / 7, reason: null });
+    expect(defects([issue('ok', NOW - DAY), issue('old', NOW - 9 * DAY, { attrs: { raisedAt: 'x' } })]))
+      .toMatchObject({ value: null, reason: 'owner-issue raised time unreadable' });
+    const silentToo = [issue('bad', NOW - HOUR, { attrs: { raisedAt: 'x' } })];
+    expect(defects(silentToo, source(silentToo, { receipts: new Map([['v2', { ...live, lastReceivedAt: NOW - 2 * DAY }]]) })))
+      .toMatchObject({ value: null, reason: 'owner-issue producer silent' });
   });
 });
 

@@ -22,7 +22,7 @@ import {
   percentile,
   stageOfReason,
 } from '@/lib/ledger';
-import type { IFinderLedgerInput } from '@/types/constraint';
+import type { IFinderLedgerInput, IFinderOwnerIssueSource } from '@/types/constraint';
 import type {
   ILedgerAppendResult,
   ILedgerEventInput,
@@ -290,6 +290,7 @@ export class LedgerStore {
       this.tabTurns = new TabTurnsTable(this.database);
       this.tabTurns.ensureShape();
       this.ensureLandings();
+      this.database.exec('CREATE INDEX IF NOT EXISTS events_ws_producer_received_idx ON events(workspace_id, producer, received_at)');
     } catch (error) {
       // A refused file (a newer schema) must not leave a handle open for every request that tries it.
       this.database.close();
@@ -659,7 +660,28 @@ export class LedgerStore {
         .all(workspaceId, window.wakesSince - DAY_MS, now, window.wakesSince, now) as Array<[string, number]>)
         .map(([tabId, wakes]) => ({ tabId, wakes }))
       : null;
-    return { intervals, items, lastProducer, firstEventAt, tabWakes };
+    return { intervals, items, lastProducer, firstEventAt, tabWakes, ownerIssueSource: this.ownerIssueSource(workspaceId, window.since) };
+  };
+
+  private ownerIssueSource = (workspaceId: string, since: number): IFinderOwnerIssueSource | null => {
+    const newest = this.database.prepare(`SELECT e.producer FROM items AS i JOIN events AS e ON e.seq = i.last_seq
+      WHERE i.workspace_id = ? AND i.item_type = 'owner-issue' ORDER BY i.opened_at DESC, i.item_key LIMIT 1`)
+      .get(workspaceId) as { producer: string } | undefined;
+    if (!newest) return null;
+    const producerOf = new Map(this.database.prepare(`SELECT i.item_key, e.producer FROM items AS i JOIN events AS e ON e.seq = i.last_seq
+      WHERE i.workspace_id = ? AND i.item_type = 'owner-issue' AND (i.closed_at IS NULL OR i.closed_at > ?)`).raw()
+      .all(workspaceId, since) as Array<[string, string]>);
+    const received = this.database.prepare(`SELECT MIN(received_at) AS first, MAX(received_at) AS last FROM events
+      WHERE workspace_id = ? AND producer = ?`);
+    const receipts = new Map([...new Set([newest.producer, ...producerOf.values()])].map((producer) => {
+      const row = received.get(workspaceId, producer) as { first: number; last: number };
+      return [producer, { firstReceivedAt: row.first, lastReceivedAt: row.last }];
+    }));
+    const { earliest } = this.database.prepare(`SELECT MIN(opened_at) AS earliest FROM items WHERE workspace_id = ? AND item_type = 'owner-issue'`)
+      .get(workspaceId) as { earliest: number };
+    const { dated } = this.database.prepare(`SELECT EXISTS (SELECT 1 FROM items WHERE workspace_id = ? AND item_type = 'owner-issue'
+      AND json_type(attrs_json, '$.raisedAt') = 'integer') AS dated`).get(workspaceId) as { dated: number };
+    return { producerOf, newestProducer: newest.producer, receipts, earliestOpenedAt: earliest, anyRaisedAt: dated === 1 };
   };
 
   /**

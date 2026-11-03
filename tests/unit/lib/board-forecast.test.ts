@@ -83,7 +83,7 @@ describe('on-track line (AC 5)', () => {
   });
 
   it('the finder carries the goal into onTrack and the line; an unmeasured ledger leaves items left unknown', () => {
-    const ledger = { intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * DAY, tabWakes: null, items: [item('range:a:1', NOW - HOUR)] };
+    const ledger = { intervals: [], lastProducer: {}, firstEventAt: NOW - 30 * DAY, tabWakes: null, ownerIssueSource: null, items: [item('range:a:1', NOW - HOUR)] };
     const result = deriveConstraint(ledger, null, null, null, NOW, goal(['range:a:1', 'range:b:1']));
     expect(result.onTrack).toMatchObject({ goal: 'Walking skeleton', itemsLeft: 1, state: 'on-track' });
     expect(result.line).toMatch(/^Walking skeleton · 1 items left · /);

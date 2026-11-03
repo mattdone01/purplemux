@@ -41,6 +41,25 @@ export interface IFinderLedgerInput {
    * rows sharing a `digest_id` counted once. null when the workspace has no `tab_events` row.
    */
   tabWakes: IFinderTabWakes[] | null;
+  /** The `owner-issue` source (story 35); null when the ledger holds no `owner-issue` item. */
+  ownerIssueSource: IFinderOwnerIssueSource | null;
+}
+
+/**
+ * Who feeds `owner-issue` items (story 35). Receipts count events of any item type: a feed that dates
+ * rows by when they were raised still speaks now.
+ */
+export interface IFinderOwnerIssueSource {
+  /** The producer of each `owner-issue` item's last event, for the `owner-issue` items in `items`. */
+  producerOf: Map<string, string>;
+  /** The producer of the last event of the `owner-issue` item opened last: the pick when `items` holds none. */
+  newestProducer: string;
+  /** First and last event received, for each producer named above. */
+  receipts: Map<string, { firstReceivedAt: number; lastReceivedAt: number }>;
+  /** The earliest `opened_at` of any `owner-issue` item, open or closed. */
+  earliestOpenedAt: number;
+  /** Any `owner-issue` item of the workspace, open or closed, of any age, carries an integer `attrs.raisedAt`. */
+  anyRaisedAt: boolean;
 }
 
 /** The spend the finder joins (story 04 feeds the per-landing metric); null when the spend index cannot answer. */
@@ -128,7 +147,8 @@ export type TFinderAnomalyId =
   | 'cache-read-per-landed-item'
   | 'seat-compactions'
   | 'rotation-alarm'
-  | 'handoff-undelivered';
+  | 'handoff-undelivered'
+  | 'owner-found-defects';
 
 export interface IFinderAnomaly {
   id: TFinderAnomalyId;

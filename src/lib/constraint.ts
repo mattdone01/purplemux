@@ -315,6 +315,7 @@ const LABELS: Record<TFinderAnomalyId, string> = {
   'seat-compactions': 'seat compactions',
   'rotation-alarm': 'rotation alarm',
   'handoff-undelivered': 'handoff not delivered',
+  'owner-found-defects': 'defects you found',
 };
 
 export const FINDER_ANOMALY_IDS = Object.keys(LABELS) as readonly TFinderAnomalyId[];
@@ -324,13 +325,14 @@ const WORKSPACE_SUBJECT = 'workspace';
 const ANOMALY_WINDOWS: Record<TFinderAnomalyId, IFinderAnomaly['window']> = {
   're-gates': '24h', 'rework-rate': '24h', 'context-per-call': 'now', 'wakes-per-hour': '6h',
   'unknown-share': '24h', 'producer-silence': 'now', 'cost-per-landed-item': '7d', 'cache-read-per-landed-item': '7d',
-  'seat-compactions': 'now', 'rotation-alarm': 'now', 'handoff-undelivered': 'now',
+  'seat-compactions': 'now', 'rotation-alarm': 'now', 'handoff-undelivered': 'now', 'owner-found-defects': '7d',
 };
 
 const ANOMALY_UNITS: Record<TFinderAnomalyId, string> = {
   're-gates': 'gates', 'rework-rate': 'share', 'context-per-call': 'tokens', 'wakes-per-hour': 'per hour',
   'unknown-share': 'share', 'producer-silence': 'min', 'cost-per-landed-item': 'USD', 'cache-read-per-landed-item': 'tokens',
   'seat-compactions': 'compactions', 'rotation-alarm': 'failed checks', 'handoff-undelivered': 'rotations',
+  'owner-found-defects': 'a day',
 };
 
 const formatValue = (value: number, unit: string): string => {
@@ -339,6 +341,7 @@ const formatValue = (value: number, unit: string): string => {
   if (unit === 'min') return `${Math.round(value)} min`;
   if (unit === 'tokens') return `${Math.round(value).toLocaleString('en-US')} tokens`;
   if (unit === 'per hour') return `${value.toFixed(1)}/h`;
+  if (unit === 'a day') return `${value.toFixed(1)} a day`;
   return `${value} ${unit}`;
 };
 
@@ -563,9 +566,53 @@ const cacheReadPerLandedItem = ({ spend }: IAnomalyContext): IFinderAnomaly[] =>
   })];
 };
 
+/**
+ * When an owner issue was raised (consult Q2, story 35 round 2): its `attrs.raisedAt` (epoch ms, at most
+ * `openedAt`); `missing` when the feed sent none, `unreadable` when it sent one this cannot read.
+ */
+export const ownerIssueRaisedAt = (item: ILedgerItem): number | 'missing' | 'unreadable' => {
+  if (!Object.hasOwn(item.attrs, 'raisedAt')) return 'missing';
+  const raised = item.attrs.raisedAt;
+  return typeof raised === 'number' && Number.isSafeInteger(raised) && raised > 0 && raised <= item.openedAt ? raised : 'unreadable';
+};
+
+/**
+ * Story 35: the owner-found defects a day over 7 d, reported and never flagged (the limits live in the
+ * improvement seat's candidate table). Null while the source cannot vouch for the whole window
+ * (consult Q1): silent for 24 h, or under 7 d old with no item raised before the window; and while
+ * an item that could be in the window, or is still open, has no readable raised time.
+ */
+const ownerFoundDefects = ({ ledger, now }: IAnomalyContext): IFinderAnomaly[] => {
+  const unknown = (reason: string) => [anomaly('owner-found-defects', '7d', 'a day', { value: null, threshold: null, flaggable: false, reason })];
+  const source = ledger.ownerIssueSource;
+  if (!source) return unknown('no owner-issue item in the ledger');
+  const since = now - 7 * DAY_MS;
+  const issues = ledger.items.filter((item) => item.itemType === 'owner-issue')
+    .map((item) => ({ item, raisedAt: ownerIssueRaisedAt(item) }));
+  // Without a readable raised time the item orders by `openedAt`: it only picks whose silence is checked, never a count.
+  const newest = issues.map(({ item, raisedAt }) => ({ key: item.itemKey, at: typeof raisedAt === 'number' ? raisedAt : item.openedAt }))
+    .sort((a, b) => b.at - a.at || a.key.localeCompare(b.key))[0];
+  const producer = (newest && source.producerOf.get(newest.key)) ?? source.newestProducer;
+  const receipts = source.receipts.get(producer);
+  if (!receipts || receipts.lastReceivedAt <= now - DAY_MS) return unknown('owner-issue producer silent');
+  const covered = receipts.firstReceivedAt <= since || source.earliestOpenedAt <= since
+    || issues.some(({ raisedAt }) => typeof raisedAt === 'number' && raisedAt <= since);
+  if (!covered) return unknown('window not covered');
+  // A feed that dates no row at all also misses rows raised and closed between its passes: a 0 then is not measured.
+  if (!source.anyRaisedAt) return unknown('owner-issue raised time missing');
+  // A raised time is never after `openedAt`, so only items opened inside the window can be raised in it. An open
+  // item is re-sent on every feed pass, so one without a raised time shows the feed does not date its rows.
+  const inReach = issues.filter(({ item }) => item.openedAt > since);
+  const judged = issues.filter(({ item }) => item.openedAt > since || item.closedAt === null);
+  if (judged.some(({ raisedAt }) => raisedAt === 'missing')) return unknown('owner-issue raised time missing');
+  if (judged.some(({ raisedAt }) => raisedAt === 'unreadable')) return unknown('owner-issue raised time unreadable');
+  const count = inReach.filter(({ raisedAt }) => typeof raisedAt === 'number' && raisedAt > since && raisedAt <= now).length;
+  return [anomaly('owner-found-defects', '7d', 'a day', { value: count / 7, threshold: null, flaggable: false, detail: `(${count} raised)` })];
+};
+
 const ANOMALY_RULES: ReadonlyArray<(ctx: IAnomalyContext) => IFinderAnomaly[]> = [
   reGates, reworkRate, contextPerCall, wakesPerHour, unknownShareAnomaly, producerSilence, costPerLandedItem, cacheReadPerLandedItem,
-  seatCompactions, rotationAlarm, handoffUndelivered,
+  seatCompactions, rotationAlarm, handoffUndelivered, ownerFoundDefects,
 ];
 
 const status = (state: IFinderInputStatus['state'], reason: string | null, at: number | null): IFinderInputStatus => ({ state, reason, at });
@@ -608,6 +655,7 @@ const CONSTANT_THRESHOLDS: Record<TFinderAnomalyId, number | null> = {
   'seat-compactions': ANOMALY_THRESHOLDS.seatCompactions,
   'rotation-alarm': ANOMALY_THRESHOLDS.rotationFailures,
   'handoff-undelivered': ANOMALY_THRESHOLDS.handoffUndelivered,
+  'owner-found-defects': null,
 };
 
 /** Every anomaly, unknown for the one reason the ledger measures were not taken. */
