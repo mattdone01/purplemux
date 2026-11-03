@@ -48,7 +48,7 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * are sent (ADR-0022), and fleet-wide keys any one workspace's orchestrator must
  * not set for every other workspace (ADR-0027 ruling R2).
  */
-export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator)\./;
 
 const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|tab)$/;
 const POOL_ALIAS_KEY = /^pool\.(fallback|gate-host)\.[A-Za-z0-9._-]+$/;
@@ -94,6 +94,26 @@ const checkRemoteValue = (key: string, value: string, state: IFleetConfigState):
     if (bad.length) throw new FleetConfigError('config-invalid', `${REMOTE_HOSTS_KEY} names that are not ssh aliases: ${bad.join(', ')}`);
     if (value.split(',').some((h) => h.trim() === 'auto')) throw new FleetConfigError('config-invalid', `${REMOTE_HOSTS_KEY} cannot name a host "auto": \`tab create --host auto\` asks the pool (ADR-0039)`);
   }
+};
+
+/** The curator's keys (ADR-0038): routing opts in per workspace; a call gap in ms; an off switch. */
+const checkCuratorValue = (key: string, value: string): void => {
+  if (!key.startsWith('curator.')) return;
+  const text = value.trim();
+  if (key === 'curator.routing.workspaces') {
+    const bad = text.split(',').map((ws) => ws.trim()).filter((ws) => ws && !/^ws-[A-Za-z0-9_-]+$/.test(ws));
+    if (bad.length) throw new FleetConfigError('config-invalid', `${key} takes workspace ids (ws-...), comma-separated: ${bad.join(', ')}`);
+    return;
+  }
+  if (key === 'curator.min-interval-ms') {
+    if (!/^\d{1,6}$/.test(text) || Number(text) > 600_000) throw new FleetConfigError('config-invalid', `${key} must be whole milliseconds 0..600000, got ${JSON.stringify(value)}`);
+    return;
+  }
+  if (key === 'curator.enabled') {
+    if (text !== 'on' && text !== 'off') throw new FleetConfigError('config-invalid', `${key} must be on or off, got ${JSON.stringify(value)}`);
+    return;
+  }
+  throw new FleetConfigError('config-invalid', `${key} is not a curator key: curator.routing.workspaces, curator.min-interval-ms or curator.enabled`);
 };
 
 /** The alarm keys (ADR-HFL-03 decision 1): a route table parses whole; a threshold names a producer reason and holds minutes or `off`. */
@@ -149,6 +169,7 @@ export const putValue = async (
     checkPoolValue(key, value);
     checkTabCapValue(key, value);
     checkLedgerValue(key, value);
+    checkCuratorValue(key, value);
     return setValue(s, { key, value, expectedVersion }, setterOf(caller), authority.now());
   });
   if (change) await audit(change, caller);

@@ -180,3 +180,31 @@ describe('wakes per seat (AC 6)', () => {
     expect(store.tabEvents.wakes('ws-b', { since: T0, until: T0 + 2 * DAY_MS })).toEqual([]);
   });
 });
+
+describe('curator call rows (ADR-0038 §2)', () => {
+  it('are read back by curatorCalls for the workspace and window, oldest first', () => {
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"n":1}', at: T0 }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"n":2}', at: T0 + MIN }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"n":0}', at: T0 - DAY_MS }));
+    store.tabEvents.append(ev({ workspaceId: 'ws-b', class: 'log', kind: 'curator', text: '{"other":1}', at: T0 }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'turn-marker', text: 'not a curator row', at: T0 }));
+    expect(store.tabEvents.curatorCalls(WS, T0 - MIN)).toEqual(['{"n":1}', '{"n":2}']);
+  });
+
+  it('curatorCallsSince reads every workspace but the evaluation\'s, with each row\'s own time (r2 F4)', () => {
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{"a":1}', at: T0 + 5 }));
+    store.tabEvents.append(ev({ workspaceId: 'ws-b', class: 'log', kind: 'curator', text: '{"b":1}', at: T0 + 7 }));
+    store.tabEvents.append(ev({ workspaceId: '_curator-eval', class: 'log', kind: 'curator', text: '{"e":1}', at: T0 + 9 }));
+    expect(store.tabEvents.curatorCallsSince(T0, '_curator-eval')).toEqual([
+      { workspaceId: WS, at: T0 + 5, text: '{"a":1}' }, { workspaceId: 'ws-b', at: T0 + 7, text: '{"b":1}' },
+    ]);
+  });
+
+  it('never count as a logged event sent to the tab', () => {
+    store.tabEvents.append(ev({ class: 'log', kind: 'curator', text: '{}', at: T0 }));
+    store.tabEvents.append(ev({ class: 'log', kind: 'turn-marker', text: 'held then retired', at: T0 }));
+    expect(store.tabEvents.wakes(WS, { since: T0 - MIN, until: T0 + MIN })).toEqual([
+      { tabId: 'tab-o', day: null, wakes: 0, digests: 0, urgent: 0, logged: 1 },
+    ]);
+  });
+});

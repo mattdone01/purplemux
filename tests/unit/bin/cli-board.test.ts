@@ -137,6 +137,21 @@ describe('purplemux board show (AC 5)', () => {
     expect(json.staleSince).toBe(Date.UTC(2026, 10, 3, 6, 35));
   });
 
+  it('says "curator down" with the reason when the tunnel is down, on the text board and the one line (ADR-0038 §6)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED 127.0.0.1:11435') }); }));
+    try {
+      await (await import('@/lib/curator-service')).getCuratorClient().probe();
+      const text = await cli(['board', 'show', '-w', 'ws-a'], orchA);
+      expect(text.code, text.stderr).toBe(0);
+      expect(text.stdout).toMatch(/^curator: curator down \(tunnel down \(fetch failed: connect ECONNREFUSED 127\.0\.0\.1:11435\)\); the rules route · classify-owner-message shadow, no labels in 72 h · /m);
+      const line = await cli(['board', 'show', '-w', 'ws-a', '--line'], orchA);
+      expect(line.stdout).toBe('no goal set · items left — · constraint: not armed to land, 3.0 h in 24 h · trend not measured · curator down\n');
+    } finally {
+      vi.unstubAllGlobals();
+      delete (globalThis as Record<string, unknown>).__ptCuratorClient;
+    }
+  });
+
   it('says "50 of N" when the stuck list is capped', async () => {
     const now = Date.now();
     const events = Array.from({ length: 51 }, (_, i) => [

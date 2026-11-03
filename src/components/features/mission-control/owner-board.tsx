@@ -15,6 +15,7 @@ import {
 import type { ISectionAge } from '@/components/features/mission-control/board-model';
 import useWorkspaceStore from '@/hooks/use-workspace-store';
 import { stageLabel, trendLabel } from '@/lib/constraint-labels';
+import { curatorTaskName } from '@/lib/curator-tasks';
 import { cn } from '@/lib/utils';
 import type { IBoard, IMissionBoardListResponse } from '@/types/constraint';
 import type { IMissionPulseListResponse } from '@/types/pulse';
@@ -263,6 +264,47 @@ const PoolSection = ({ board, age }: { board: IBoard; age: ISectionAge }) => (
   </SectionFrame>
 );
 
+const CURATOR_STATE_WORDS: Readonly<Record<string, string>> = { shadow: 'shadow (labels logged, nothing routed)', routing: 'routing' };
+
+const CuratorSection = ({ board, age, now }: { board: IBoard; age: ISectionAge; now: number }) => {
+  const curator = board.curator;
+  return (
+    <SectionFrame id="curator" title="Curator" age={age} wide>
+      {!curator ? <Muted>Not measured: curator state unreadable.</Muted> : (
+        <div className="space-y-2 text-sm">
+          {curator.health.state === 'down' && (
+            <p role="status" className="flex items-start gap-2 text-ui-red" data-curator-health="down">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span className="min-w-0 break-words">
+                Curator down{curator.health.reason ? `: ${curator.health.reason}` : ''}
+                {curator.health.since !== null ? ` since ${aedtTime(curator.health.since)}` : ''}. The rules route; nothing waits.
+              </span>
+            </p>
+          )}
+          {curator.health.state === 'up' && <p data-curator-health="up">Curator up{curator.health.checkedAt !== null ? `, checked ${ageText(now - curator.health.checkedAt)} ago` : ''}.</p>}
+          {curator.health.state === 'unknown' && <Muted>Curator not probed yet.</Muted>}
+          <ul className="space-y-1 text-xs text-muted-foreground">
+            {curator.tasks.map((task) => {
+              const agreement = curator.agreement?.find((a) => a.task === task.task);
+              const stateWord = Object.hasOwn(CURATOR_STATE_WORDS, task.state) ? CURATOR_STATE_WORDS[task.state] : 'state not in the label map';
+              const shadowEnds = task.state !== 'shadow' ? '' : task.shadowEndsAt !== null
+                ? ` · 72 h shadow ends ${aedtTime(task.shadowEndsAt)}` : ' · no live call of this prompt yet';
+              const agree = !curator.agreement ? 'agreement not measured'
+                : !agreement || agreement.compared === 0 ? 'no labelled calls in 72 h'
+                  : `${agreement.agreed} of ${agreement.compared} labels agree with the rules (72 h)`;
+              return (
+                <li key={task.task} className="break-words" data-curator-task={task.task}>
+                  {curatorTaskName(task.task)}: {stateWord}{task.state === 'routing' && !task.routingHere ? ', not opted in here' : ''}{shadowEnds} · {agree}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </SectionFrame>
+  );
+};
+
 const BoardSections = ({ board, now }: { board: IBoard; now: number }) => {
   const finderAge = sectionAge(board.generatedAt, board.staleSince, now);
   const input = (state: IBoard['inputs']['ledger']): ISectionAge =>
@@ -278,6 +320,7 @@ const BoardSections = ({ board, now }: { board: IBoard; now: number }) => {
       <ExperimentsSection board={board} age={finderAge} now={now} />
       <SeatsSection board={board} age={input(board.inputs.spend)} workspaceId={board.workspaceId} />
       <PoolSection board={board} age={input(board.inputs.pool)} />
+      <CuratorSection board={board} age={finderAge} now={now} />
     </div>
   );
 };

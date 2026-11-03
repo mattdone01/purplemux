@@ -125,6 +125,8 @@ export interface IAgentRuntimeSnapshot {
    * provider cannot read it.
    */
   lastAssistantTail?: string | null;
+  /** The transcript uuid of the entry `lastAssistantTail` was read from (Claude only): the curator's source id. */
+  lastAssistantUuid?: string | null;
   /** The current turn's terminal provider error; null for a clean end; absent when the provider cannot tell. */
   lastTurnError?: ITurnError | null;
 }

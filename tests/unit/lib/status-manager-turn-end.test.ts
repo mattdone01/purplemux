@@ -14,6 +14,7 @@ const workspaceStore = vi.hoisted(() => ({
   getWorkspacesCached: vi.fn(),
 }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
+const curator = vi.hoisted(() => ({ onUnmarkedTurnEnd: vi.fn() }));
 
 // The file logger writes under the temp HOME, which each test removes; a write
 // still pending at removal surfaced as an unhandled ENOENT (gate 26-r1).
@@ -31,6 +32,7 @@ vi.mock('@/lib/workspace-store', () => ({
   getWorkspacesCached: workspaceStore.getWorkspacesCached,
 }));
 vi.mock('@/lib/liveness-manager', () => ({ getLivenessManager: () => liveness }));
+vi.mock('@/lib/curator-service', () => ({ curatorOnUnmarkedTurnEnd: curator.onUnmarkedTurnEnd }));
 vi.mock('@/lib/tmux', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/tmux')>()),
   getSessionPanePid: vi.fn(async () => null),
@@ -261,6 +263,29 @@ describe('stop classification (ADR-0018)', () => {
     manager.updateTabFromHook('tmux-worker', 'stop');
     await waitFor(() => expect(entry.turnEnd?.kind).toBe('ready-for-review'));
     expect(entry.turnEnd).toMatchObject({ kind: 'ready-for-review', transcript: true, openBackgroundTasks: 0, liveRegisteredJobs: 0, armedWatches: 0 });
+  });
+
+  it('hands a stop with no end line to the curator, in shadow, with its tail; a marker stop never (ADR-0038 §2)', async () => {
+    const { manager } = await managerWithPaste();
+    const entry = worker('claude-code', await writeLines('claude/s.jsonl', [claudeEnd('Fixed.\nShall I merge it?')]));
+    manager.registerTab('worker', entry);
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(curator.onUnmarkedTurnEnd).toHaveBeenCalledWith('ws-1', 'worker', 'Fixed.\nShall I merge it?', null));
+    const marked = worker('claude-code', await writeLines('claude/m.jsonl', [claudeEnd('Merged.\n\nDONE: shipped')]));
+    marked.tmuxSession = 'tmux-marked';
+    manager.registerTab('marked', marked);
+    manager.updateTabFromHook('tmux-marked', 'stop');
+    await waitFor(() => expect(marked.turnEnd?.kind).toBe('turn-marker'));
+    await settle();
+    expect(curator.onUnmarkedTurnEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("a Claude tab's unmarked stop carries its source id: <ws>/<session>/<assistant uuid> (consult 16-promote-gate)", async () => {
+    const { manager } = await managerWithPaste();
+    const entry = { ...worker('claude-code', await writeLines('claude/u.jsonl', [{ ...claudeEnd('Shall I merge?'), uuid: 'a-uuid-1' }])), agentSessionId: 'sess-1' };
+    manager.registerTab('worker', entry);
+    manager.updateTabFromHook('tmux-worker', 'stop');
+    await waitFor(() => expect(curator.onUnmarkedTurnEnd).toHaveBeenCalledWith('ws-1', 'worker', 'Shall I merge?', 'ws-1/sess-1/a-uuid-1'));
   });
 
   it('serves turnEnd to clients through the real getAllForClient (the tab status route reads it there)', async () => {

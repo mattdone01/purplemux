@@ -10,6 +10,7 @@ import { REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_
 import { TAB_CAP_KEY } from '@/lib/tab-cap';
 import { IDLE_NUDGE_CONFIG_KEY, WAIT_BACKSTOP_CONFIG_KEY } from '@/lib/turn-end';
 import { ROTATE_AT_CONFIG_KEY } from '@/lib/context-lifecycle';
+import { CURATOR_KEYS } from '@/lib/curator-service';
 
 vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: () => ({ type: 'admin' }) }));
 
@@ -32,6 +33,7 @@ const SERVER_KEYS = [
   QUESTION_MIN_VERSION_KEY,
   ...Object.values(FLAG_ALERT_CONFIG_KEYS),
   ROTATE_AT_CONFIG_KEY,
+  ...Object.values(CURATOR_KEYS),
 ];
 
 const keysInUse = async (): Promise<string> => {

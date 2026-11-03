@@ -152,6 +152,17 @@ export class TabEventsTable {
     return rows.reverse().map(fromRow);
   };
 
+  /** The curator's call records in a workspace since `since` (ADR-0038 §2), oldest first: their JSON text only. */
+  curatorCalls = (workspaceId: string, since: number): string[] =>
+    this.database.prepare(`SELECT text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ? AND workspace_id = ?
+      AND class = 'log' AND kind = 'curator' ORDER BY seq`).pluck().all(since, workspaceId) as string[];
+
+  /** Every workspace's curator call records since `since`, but the evaluation's: the label queue reads them. */
+  curatorCallsSince = (since: number, excludeWorkspace: string): Array<{ workspaceId: string; at: number; text: string }> =>
+    (this.database.prepare(`SELECT workspace_id, at, text FROM tab_events INDEXED BY tab_events_at_idx WHERE at >= ?
+      AND class = 'log' AND kind = 'curator' AND workspace_id != ? ORDER BY seq`).all(since, excludeWorkspace) as Array<{ workspace_id: string; at: number; text: string }>)
+      .map((row) => ({ workspaceId: row.workspace_id, at: row.at, text: row.text }));
+
   hasAny = (workspaceId: string): boolean =>
     (this.database.prepare('SELECT EXISTS (SELECT 1 FROM tab_events INDEXED BY tab_events_tab_idx WHERE workspace_id = ?) AS hit')
       .get(workspaceId) as { hit: number }).hit === 1;
@@ -188,8 +199,9 @@ export class TabEventsTable {
         target.wakes += 1;
       }
     }
+    // A curator call is a log row about a tab, never an event sent to it (ADR-0038 §2).
     const logged = this.database.prepare(`SELECT tab_id, at FROM tab_events INDEXED BY tab_events_at_idx
-      WHERE at >= ? AND at < ? AND workspace_id = ? AND class = 'log'`).raw().all(query.since, query.until, workspaceId) as Array<[string, number]>;
+      WHERE at >= ? AND at < ? AND workspace_id = ? AND class = 'log' AND kind != 'curator'`).raw().all(query.since, query.until, workspaceId) as Array<[string, number]>;
     for (const [tabId, at] of logged) row(tabId, at).logged += 1;
     return [...rows.values()].sort((a, b) => a.tabId.localeCompare(b.tabId) || (a.day ?? '').localeCompare(b.day ?? ''));
   };

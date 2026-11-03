@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { alertOpenedAttention } from '@/lib/attention-alerts';
 import { resolveCaller } from '@/lib/caller';
 import { FOREIGN_MUTATION_HINT } from '@/lib/cli-error';
+import { curatorOnMissionEvents } from '@/lib/curator-service';
 import { isOwnWorkspace } from '@/lib/cli-utils';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
@@ -72,6 +73,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     const applied = store.applyEvents(events, authorities, { questionMinVersion });
     // An item opened for the human alerts once (ADR-0032 channels); a replayed event never does.
     void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null });
+    // An ask the owner must approve or decide is matched against the standing orders, in shadow (ADR-0038 §2).
+    curatorOnMissionEvents(events.filter((event) => unreplayed.has(event.eventId)));
     return res.status(200).json({
       ...applied,
       humanInboxPolicy: store.humanInboxPolicy(workspaceId),

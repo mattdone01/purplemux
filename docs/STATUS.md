@@ -395,6 +395,15 @@ generation) is skipped; a skipped replay is recorded by `recordSkippedReplay` as
 
 ---
 
+### The curator's shadow flag (ADR-0038)
+
+A classified `stop` whose turn ends with no end line (`ready-for-review`) is handed to the local curator in shadow:
+`applyStopTurnEnd` calls `curatorOnUnmarkedTurnEnd(workspaceId, tabId, lastAssistantTail, sourceId)` (fire and forget);
+`sourceId` is `<ws>/<agentSessionId>/<lastAssistantUuid>` for a Claude tab (the runtime snapshot's `lastAssistantUuid`), else null. The
+curator runs `flag-owner-question` only when the tail's last three lines hold a `?`, and logs its label as a
+`tab_events` row (class `log`, kind `curator`); nothing routes and the tab's state is unchanged. A marker stop and a
+WAITING stop are never handed over. Outside a started server (tests, scripts) the hook makes no call.
+
 ### Context lifecycle (ADR-0036)
 
 A tab created with `--handoff <path>` is a seat (`ITab.handoffPath`, mirrored on `ITabStatusEntry.handoffPath` /
