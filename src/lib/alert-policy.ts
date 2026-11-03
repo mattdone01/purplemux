@@ -119,6 +119,8 @@ const titleFor = (kind: TAlertKind): string => {
     case 'bg-job-unknown': return 'Background Job Status Unknown';
     case 'flag': return 'Flag Raised';
     case 'attention-opened': return 'Mission Control: answer needed';
+    // A NEEDS-DECISION line no Mission Control item could take, and no orchestrator can act on (ADR-0041 §2).
+    case 'needs-decision': return 'Decision needed: no Mission Control item';
   }
 };
 
@@ -141,6 +143,8 @@ const bodyFor = (source: IAlertSource): string => {
       return cutBody(source.detail || source.flag?.text || source.tabName || source.tabId);
     case 'attention-opened':
       return cutBody(source.itemTitle?.trim() || source.workspaceName || source.tabName || source.tabId);
+    case 'needs-decision':
+      return cutBody(source.detail || source.tabName || source.tabId);
   }
 };
 

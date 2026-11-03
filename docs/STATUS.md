@@ -743,6 +743,15 @@ says "no reply needed", is held for the digest unless it carries a verdict marke
 A ledger that cannot be opened or written holds nothing: the router types every non-log event at once. A digest's
 delivery is broadcast again under the nudges' ids; an hour-old held backlog raises one flag alert.
 
+A classified stop whose last line starts `NEEDS-DECISION:` also opens a Mission Control item (ADR-0041 §2), whatever the
+tab's `reportOn`: `applyStopTurnEnd` awaits `openNeedsDecision` before the nudge, handing the whole last line of the
+tail, the stop's seq and time, and the turn's start (the previous stop's `at`, else `busySince`) to
+`openNeedsDecisionItem`, which opens nothing when an item for the same line is still open or the tab already opened one
+this turn. The nudge's end line then carries the item note. With no item, a live orchestrator that receives the tab's
+escalations is told to open it (the nudge is forwarded even past `reportOn`); otherwise one `needs-decision` push goes
+to the owner, never awaited, at most once a day per line. A changed
+standing order reaches each live agent tab (`liveAgentTabs`) as one `standing-order` event, class urgent.
+
 ---
 
 ## Standup Ticks

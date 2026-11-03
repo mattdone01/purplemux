@@ -30,6 +30,8 @@ const CLI_COMMANDS = new Set([
   'deploy',
   'watch',
   'handoff',
+  'wait',
+  'so',
   'api-guide',
   'help',
   '-h',
