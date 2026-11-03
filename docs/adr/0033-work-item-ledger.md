@@ -116,10 +116,17 @@ Option 3.
    retention limit, or 400 `ledger-query-invalid`: deleted waits must not read as no waiting) answers, per group, the finished waits
    clipped to the window (summed ms), p50 and p90 (nearest rank) of the waits that ended inside it, and open WIP
    (items waiting now whose wait began before `until`, with their elapsed wait clipped to the window, reported apart
-   from the sum); `GET .../ledger/experiments`. CLI: `ledger show`, `ledger waits`, `ledger experiment open|close|list`.
+   from the sum); `GET .../ledger/experiments`. CLI: `ledger show`, `ledger waits`, `ledger experiment open|close|list|extend`.
 8. **Experiments** (ADR-HFL-03 point 3): the server assigns `EXP-<n>`, opens the item `experiment:EXP-<n>`, and holds
    one active experiment per stage and at most two in all (409 `ledger-experiment-cap`). A close takes a verdict, keep
    or revert, and evidence, and closes the item.
+   *Amended 2026-11-03 (harness-flow-loop story 22, "extend once" in ADR-HFL-03 decision 2 step 1):* an active
+   experiment can be extended once: `POST .../ledger/experiments/<id>/extend {days, evidence}` (CLI
+   `ledger experiment extend`) adds `days` to `max_days`, at most to 90 (409 `ledger-experiment-cap`, field `days`). A
+   second extension is 409 `ledger-experiment-extended`; a closed experiment is 409 `ledger-experiment-closed`. The
+   record gains `extended_at`, `extension_days` and `extension_evidence` (columns added on open of an older ledger;
+   `user_version` stays 1), and the item gains a server `state` event `extended`. The board's experiment line says
+   "extended once".
 9. **Retention.** A daily job (`src/lib/ledger-retention.ts`, first pass 10 min after boot) rolls up into
    `rollups_daily` every whole UTC day from the day after the last rolled-up day, or from the earliest day a wait
    finished since the last pass covers, whichever is earlier, to yesterday (never before the cutoff). A wait longer

@@ -45,6 +45,7 @@ export type TLedgerStoreErrorCode =
   | 'ledger-event-conflict'
   | 'ledger-experiment-cap'
   | 'ledger-experiment-closed'
+  | 'ledger-experiment-extended'
   | 'ledger-experiment-not-found';
 
 /**
@@ -111,6 +112,9 @@ interface IExperimentRow {
   verdict: TLedgerExperimentVerdict | null;
   verdict_at: number | null;
   evidence: string | null;
+  extended_at: number | null;
+  extension_days: number | null;
+  extension_evidence: string | null;
 }
 
 export interface ILedgerItemQuery {
@@ -218,7 +222,17 @@ const experimentFromRow = (row: IExperimentRow): ILedgerExperiment => ({
   verdict: row.verdict,
   verdictAt: row.verdict_at,
   evidence: row.evidence,
+  extendedAt: row.extended_at,
+  extensionDays: row.extension_days,
+  extensionEvidence: row.extension_evidence,
 });
+
+/** The extend-once columns (story 22, ADR-HFL-03 decision 3 amended 2026-11-03), additive like `tab_events`' columns. */
+const EXPERIMENT_ADDED_COLUMNS: ReadonlyArray<[string, string]> = [
+  ['extended_at', 'INTEGER'], ['extension_days', 'INTEGER'], ['extension_evidence', 'TEXT'],
+];
+/** `max_days` after an extension, as `parseExperimentInput` bounds it at open. */
+export const EXPERIMENT_MAX_DAYS = 90;
 
 const WAITS_GROUP_COLUMN: Readonly<Record<TLedgerWaitsBy, string>> = {
   reason: 'reason', holder: 'holder', type: 'item_type', stage: 'reason',
@@ -270,6 +284,7 @@ export class LedgerStore {
       this.database.pragma('busy_timeout = 5000');
       this.database.pragma('synchronous = FULL');
       this.migrate();
+      this.ensureExperimentColumns();
       this.tabEvents = new TabEventsTable(this.database);
       this.tabEvents.ensureShape();
       this.tabTurns = new TabTurnsTable(this.database);
@@ -331,6 +346,17 @@ export class LedgerStore {
       CREATE TABLE ledger_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
       PRAGMA user_version = ${SCHEMA_VERSION};
     `))();
+  };
+
+  /** The extend-once columns on a ledger written before story 22; `user_version` stays 1. */
+  private ensureExperimentColumns = (): void => {
+    const present = new Set((this.database.prepare('SELECT name FROM pragma_table_info(?)').all('experiments') as Array<{ name: string }>)
+      .map((row) => row.name));
+    this.database.transaction(() => {
+      for (const [name, type] of EXPERIMENT_ADDED_COLUMNS) {
+        if (!present.has(name)) this.database.exec(`ALTER TABLE experiments ADD COLUMN ${name} ${type}`);
+      }
+    })();
   };
 
   private recordLanding = (workspaceId: string, itemKey: string, at: number, seq: number): void => {
@@ -711,6 +737,36 @@ export class LedgerStore {
       this.appendInTransaction(workspaceId, SERVER_PRODUCER, [{
         event_id: `${SERVER_PRODUCER}:${found.itemKey}:close`, at: now, item_type: 'experiment', item_key: found.itemKey,
         kind: 'close', state: verdict === 'keep' ? 'kept' : 'reverted',
+      }], now);
+      return this.experiments(workspaceId).find((experiment) => experiment.id === id)!;
+    })();
+
+  /**
+   * Extend an active experiment once (ADR-HFL-03 decision 2 step 1, "extend once"): `max_days` grows by `days`, at most to
+   * 90. A second extension is refused (409 `ledger-experiment-extended`), and so is a closed experiment. The ledger item
+   * gains a server `state` event `extended`.
+   */
+  extendExperiment = (workspaceId: string, id: string, days: number, evidence: string, now: number): ILedgerExperiment =>
+    this.database.transaction(() => {
+      const found = this.experiments(workspaceId).find((experiment) => experiment.id === id);
+      if (!found) throw new LedgerStoreError('ledger-experiment-not-found', `no experiment ${id} in ${workspaceId}`);
+      if (found.verdict !== null) {
+        throw new LedgerStoreError('ledger-experiment-closed', `${id} already has the verdict ${found.verdict}`);
+      }
+      if (found.extendedAt !== null) {
+        throw new LedgerStoreError('ledger-experiment-extended',
+          `${id} was extended once already, by ${found.extensionDays} days at ${new Date(found.extendedAt).toISOString()}`);
+      }
+      const maxDays = found.maxDays + days;
+      if (maxDays > EXPERIMENT_MAX_DAYS) {
+        throw new LedgerStoreError('ledger-experiment-cap',
+          `max_days ${found.maxDays} + ${days} = ${maxDays}, at most ${EXPERIMENT_MAX_DAYS}`, 'days');
+      }
+      this.database.prepare(`UPDATE experiments SET max_days = ?, extended_at = ?, extension_days = ?, extension_evidence = ?
+          WHERE workspace_id = ? AND id = ?`).run(maxDays, now, days, evidence, workspaceId, id);
+      this.appendInTransaction(workspaceId, SERVER_PRODUCER, [{
+        event_id: `${SERVER_PRODUCER}:${found.itemKey}:extend`, at: now, item_type: 'experiment', item_key: found.itemKey,
+        kind: 'state', state: 'extended', attrs: { extension_days: days, max_days: maxDays },
       }], now);
       return this.experiments(workspaceId).find((experiment) => experiment.id === id)!;
     })();

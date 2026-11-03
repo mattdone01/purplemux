@@ -108,6 +108,7 @@ to an exit code through one table:
                                                  ledger-too-large, ledger-type-reserved
      3  refused by state (ledger, ADR-0033)      ledger-experiment-cap,                     after the state changes
                                                  ledger-experiment-closed,
+                                                 ledger-experiment-extended,
                                                  ledger-event-conflict
      7  not found (ledger, ADR-0033)             ledger-experiment-not-found                —
      1  unexpected error (ledger, ADR-0033)      ledger-store-failed                        investigate
@@ -1213,7 +1214,13 @@ POST /api/cli/workspaces/<workspaceId>/ledger/experiments/<id>
   experiment per stage and at most two in all: 409 ledger-experiment-cap (exit 3). Close body:
   { "verdict": "keep" | "revert", "evidence": "<1..2000>" }; it closes the item (state kept or
   reverted). 409 ledger-experiment-closed for a second verdict, 404 ledger-experiment-not-found.
-  400 ledger-experiment-invalid names the field. Response: { "experiment" } (201 on open), or
+  400 ledger-experiment-invalid names the field.
+POST /api/cli/workspaces/<workspaceId>/ledger/experiments/<id>/extend
+                                                       (purplemux ledger experiment extend -w WS EXP-n --days N --evidence TEXT)
+  Extend an active experiment once (ADR-HFL-03 "extend once"). Body: { "days": 1..90, "evidence": "<1..2000>" }.
+  max_days grows by days, at most to 90 (409 ledger-experiment-cap, field days). A second extension is 409
+  ledger-experiment-extended; a closed experiment is 409 ledger-experiment-closed. The item gains a server state
+  event "extended". The experiment carries "extendedAt", "extensionDays" and "extensionEvidence" (null until extended). Response: { "experiment" } (201 on open), or
   { "workspaceId", "experiments": [...] } for the list.
 
 Retention: a daily job (10 min after boot, then every 24 h) rolls up into rollups_daily every day

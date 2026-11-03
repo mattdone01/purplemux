@@ -101,6 +101,23 @@ describe('board model', () => {
 });
 
 describe('owner board view (AC 2, 3, 4, 7, 10)', () => {
+  it('an experiment line says "extended once" only after its one extension (story 22)', () => {
+    const experiment = {
+      workspaceId: 'ws-a', id: 'EXP-1', itemKey: 'experiment:EXP-1', hypothesis: 'one gate outside the lock', changeRef: null,
+      stage: 'land' as const, reason: null, metric: 'lock-hours', baseline: null, target: null, guards: [], revertIf: null,
+      minDays: 3, maxDays: 7, startedAt: NOW - 2 * 24 * HOUR, verdict: null, verdictAt: null, evidence: null,
+      extendedAt: null, extensionDays: null, extensionEvidence: null,
+    };
+    const line = (html: string) => html.slice(html.indexOf('data-experiment="EXP-1"'), html.indexOf('</li>', html.indexOf('data-experiment="EXP-1"')));
+    const plain = line(render({ boards: { boards: [boardOf({ experiments: [experiment] })] } }));
+    expect(plain).toContain('ends by day 7');
+    expect(plain).not.toContain('extended once');
+    const extended = { ...experiment, maxDays: 10, extendedAt: NOW - HOUR, extensionDays: 3, extensionEvidence: 'noisy' };
+    const after = line(render({ boards: { boards: [boardOf({ experiments: [extended] })] } }));
+    expect(after).toContain('ends by day 10');
+    expect(after).toContain('extended once, by 3 days');
+  });
+
   it('the pulse comes first, then the sections in ADR-HFL-02 order', () => {
     const html = render();
     const order = ['pulse', 'on-track', 'constraint', 'needs-you', 'stuck', 'flow', 'experiments', 'seats', 'pool']

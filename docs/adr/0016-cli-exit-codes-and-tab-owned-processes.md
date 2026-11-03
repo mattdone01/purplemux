@@ -33,7 +33,7 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 3 | conflict (ADR-0028) | `tab-busy`: the tab is mid-turn or holds a pending launch or turn | when it is idle, or with `--interrupt` |
 | 2 | usage error (ADR-0037, Mission Control questions) | `question-invalid`: the question breaks the format rules; the body lists every defect | fix the question |
 | 2 | usage error (ledger, ADR-0033) | `ledger-event-invalid`, `ledger-reason-invalid`, `ledger-experiment-invalid`, `ledger-query-invalid`, `ledger-token-invalid`, `ledger-too-large`, `ledger-type-reserved` | fix the command |
-| 3 | refused by state (ledger, ADR-0033) | `ledger-experiment-cap`, `ledger-experiment-closed`, `ledger-event-conflict` | after the state changes |
+| 3 | refused by state (ledger, ADR-0033) | `ledger-experiment-cap`, `ledger-experiment-closed`, `ledger-experiment-extended`, `ledger-event-conflict` | after the state changes |
 | 7 | not found (ledger, ADR-0033) | `ledger-experiment-not-found` | — |
 | 1 | unexpected error (ledger, ADR-0033) | `ledger-store-failed` (unmapped) | investigate |
 | 2 | usage error (pool, ADR-0039) | `pool-invalid` | fix the command |

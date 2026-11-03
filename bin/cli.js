@@ -194,6 +194,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'ledger-event-conflict': EXIT.CONFLICT,
   'ledger-experiment-cap': EXIT.CONFLICT,
   'ledger-experiment-closed': EXIT.CONFLICT,
+  'ledger-experiment-extended': EXIT.CONFLICT,
   'ledger-experiment-not-found': EXIT.NOT_FOUND,
   'pool-invalid': EXIT.USAGE,
   'pool-full': EXIT.CONFLICT,
@@ -2129,6 +2130,7 @@ const LEDGER_USAGE = [
   '       ledger show -w WS [--open] [--type TYPE] [--holder H] [--json]',
   '       ledger waits -w WS [--since T] [--until T] [--by reason|holder|type|stage] [--type TYPE] [--json]',
   '       ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT | list -w WS [--json]',
+  '       ledger experiment extend -w WS EXP-n --days N --evidence TEXT',
 ].join('\n');
 // Mirrors src/lib/ledger.ts: the server refuses more, so the CLI never builds a batch it cannot take.
 const LEDGER_MAX_EVENTS = 500;
@@ -2804,7 +2806,8 @@ const cmdLedgerExperiment = async (sub, rest) => {
     const { body } = await api('GET', ledgerPath(wsId, 'experiments'));
     if (rest.includes('--json')) return out(body);
     printTable(['ID', 'STAGE', 'METRIC', 'STARTED', 'VERDICT', 'HYPOTHESIS'], body.experiments.map((e) => [
-      e.id, e.stage, e.metric, new Date(e.startedAt).toISOString(), e.verdict ? `${e.verdict} ${new Date(e.verdictAt).toISOString()}` : 'active', e.hypothesis,
+      e.id, e.stage, e.metric, new Date(e.startedAt).toISOString(),
+      e.verdict ? `${e.verdict} ${new Date(e.verdictAt).toISOString()}` : e.extendedAt ? `active, extended +${e.extensionDays}d` : 'active', e.hypothesis,
     ]));
     return;
   }
@@ -2825,6 +2828,18 @@ const cmdLedgerExperiment = async (sub, rest) => {
     requireEnv();
     const { body } = await api('POST', ledgerPath(wsId, `experiments/${encodeURIComponent(id)}`), { verdict, evidence });
     process.stdout.write(`closed ${body.experiment.id}: ${body.experiment.verdict}\n`);
+    return;
+  }
+  if (sub === 'extend') {
+    const positional = stripFlags(rest, ['-w', '--workspace', '--days', '--evidence']);
+    const id = positional[0];
+    if (!id || positional.length > 1) die(LEDGER_USAGE);
+    const daysText = flagValue(rest, '--days');
+    const evidence = flagValue(rest, '--evidence');
+    if (!daysText || !/^\d+$/.test(daysText) || !evidence) die('--days N (a whole number of days) and --evidence TEXT are required');
+    requireEnv();
+    const { body } = await api('POST', ledgerPath(wsId, `experiments/${encodeURIComponent(id)}/extend`), { days: Number(daysText), evidence });
+    process.stdout.write(`extended ${body.experiment.id} by ${body.experiment.extensionDays} days: ends by day ${body.experiment.maxDays}\n`);
     return;
   }
   die(LEDGER_USAGE);
@@ -3190,6 +3205,9 @@ Commands:
                                            Default: the last 7 days by reason. T is Unix ms or ISO-8601
   ledger experiment open -w WS --json @FILE | close -w WS EXP-n --verdict keep|revert --evidence TEXT
   ledger experiment list -w WS [--json]    Improvement experiments (ADR-HFL-03): one active per stage, two in all
+  ledger experiment extend -w WS EXP-n --days N --evidence TEXT
+                                           Extend an active experiment once: max_days grows by N, at most to 90; a
+                                           second extension is refused (exit 3, ledger-experiment-extended)
   handoff check PATH [--rotate-requested-at UTC] [--now UTC] [--json]
                                            Check a seat handoff file against the ADR-0036 schema (the checker the
                                            rotation runs): PASS exits 0; each refusal prints a line, exit 1

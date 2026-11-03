@@ -88,6 +88,7 @@ describe('purplemux ledger — the installed CLI against the real routes', () =>
       waits: (await import(`${base}/waits`)).default,
       experiments: (await import(`${base}/experiments/index`)).default,
       experiment: (await import(`${base}/experiments/[id]`)).default,
+      extend: (await import(`${base}/experiments/[id]/extend`)).default,
       tokens: (await import(`${base}/tokens`)).default,
     };
     const route = (handler: THandler, query: Record<string, string>): THandler => (req, res) => {
@@ -102,6 +103,7 @@ describe('purplemux ledger — the installed CLI against the real routes', () =>
       routes[`${at}/waits`] = route(handlers.waits, { workspaceId: ws });
       routes[`${at}/experiments`] = route(handlers.experiments, { workspaceId: ws });
       routes[`${at}/experiments/EXP-1`] = route(handlers.experiment, { workspaceId: ws, id: 'EXP-1' });
+      routes[`${at}/experiments/EXP-1/extend`] = route(handlers.extend, { workspaceId: ws, id: 'EXP-1' });
       routes[`${at}/tokens`] = route(handlers.tokens, { workspaceId: ws });
     }
     server = await serveLeaseRoutes(routes);
@@ -306,6 +308,15 @@ describe('purplemux ledger — the installed CLI against the real routes', () =>
     expect(opened.stdout).toBe('opened EXP-1 (stage land, metric lock-hours)\n');
     expect((await cli(['ledger', 'experiment', 'open', '-w', 'ws-a', '--json', `@${spec}`], orchA)).code).toBe(3);
     expect((await cli(['ledger', 'experiment', 'list', '-w', 'ws-a'], orchA)).stdout).toMatch(/EXP-1\s+land\s+lock-hours\s+\S+\s+active\s+one gate/);
+    const extend = ['ledger', 'experiment', 'extend', '-w', 'ws-a', 'EXP-1', '--days', '3', '--evidence', 'still noisy'];
+    const extended = await cli(extend, orchA);
+    expect(extended.stdout, extended.stderr).toBe('extended EXP-1 by 3 days: ends by day 10\n');
+    expect((await cli(['ledger', 'experiment', 'list', '-w', 'ws-a'], orchA)).stdout).toMatch(/EXP-1\s+land\s+lock-hours\s+\S+\s+active, extended \+3d\s+one gate/);
+    const twice = await cli(extend, orchA);
+    expect(twice.code).toBe(3);
+    expect(twice.stderr).toMatch(/extended once already/);
+    expect((await cli(['ledger', 'experiment', 'extend', '-w', 'ws-a', 'EXP-1', '--days', 'x', '--evidence', 'e'], orchA)).code).toBe(2);
+    expect((await cli(['ledger', 'experiment', 'extend', '-w', 'ws-a', 'EXP-1', '--days', '3'], orchA)).code).toBe(2);
     const closed = await cli(['ledger', 'experiment', 'close', '-w', 'ws-a', 'EXP-1', '--verdict', 'keep', '--evidence', 'lock hours fell'], orchA);
     expect(closed.stdout).toBe('closed EXP-1: keep\n');
     const list = JSON.parse((await cli(['ledger', 'experiments', '-w', 'ws-a', '--json'], orchA)).stdout);
