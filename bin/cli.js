@@ -2111,7 +2111,8 @@ const printTable = (columns, rows) => {
 };
 
 // ── board (ADR-0034) ─────────────────────────────────────────────────────────
-const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine]';
+const BOARD_USAGE = 'usage: board show -w WS [--json|--line|--mine] | board pulse -w WS [--json]'
+  + ' | board goal set -w WS --items KEY,KEY --label TEXT | board goal show|clear -w WS';
 
 // The owner reads times in AEDT/AEST (ADR-HFL-02); Intl names the offset that applies on the day.
 const boardTime = (ms) => {
@@ -2144,16 +2145,23 @@ const boardMeasures = (board) => {
 };
 
 const boardText = (board) => {
-  const lines = [`board ${board.workspaceId} · finder ran ${ledgerDuration(board.ageMs)} ago`, boardLineText(board)];
+  const lines = [`board ${board.workspaceId} · finder ran ${ledgerDuration(board.ageMs)} ago`, boardLineText(board), goalText(board)];
   const c = board.constraint;
   lines.push(c
     ? `constraint: ${c.labels.reason} (${c.labels.stage}), ${c.waitingHours.toFixed(1)} h in 24 h on ${c.items} item(s), `
       + `${c.basis === 'critical' ? 'critical items' : 'all items'}, ${c.labels.trend}; owner ${dash(c.ownerSeat)}; clears: ${c.clearInput ?? 'not recorded'}`
     : `constraint: ${board.inputs.ledger.state === 'ok' ? 'none measured in 24 h' : 'unknown'}`);
   lines.push(board.needsYou === null ? 'needs you: unknown (Mission Control unreadable)' : `needs you: ${board.needsYou.length} open in Mission Control`);
-  for (const item of board.needsYou ?? []) lines.push(`  ${item.id}  ${item.title}`);
-  process.stdout.write(`${lines.join('\n')}\n`);
   const ledgerUnknown = board.inputs.ledger.state === 'ok' ? null : (board.inputs.ledger.reason || board.inputs.ledger.state);
+  for (const item of board.needsYou ?? []) {
+    let blocked = 'no ledger item links to this item';
+    if (ledgerUnknown) blocked = `blocked cost not measured: ${ledgerUnknown}`;
+    else if (item.blocked) {
+      blocked = `blocks ${item.blocked.items} item(s), ${item.blocked.hours.toFixed(1)} h waiting${item.blocked.critical ? ', critical path' : ''}`;
+    }
+    lines.push(`  ${item.id}  ${item.title} · ${blocked}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
   if (ledgerUnknown) {
     // Not measured is not none: an unread ledger never prints as "0 stuck".
     process.stdout.write(`stuck: unknown (${ledgerUnknown})\nanomalies: unknown (${ledgerUnknown})\n`);
@@ -2164,12 +2172,93 @@ const boardText = (board) => {
   process.stdout.write(`inputs: ${[boardInput('ledger', ledger), boardInput('flow', flow), boardInput('spend', spend), boardInput('pool', pool)].join(' · ')}\n`);
 };
 
+// ── board pulse (ADR-0034 §9) ────────────────────────────────────────────────
+const PULSE_BLOCKS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const PULSE_STATE_WORDS = { stalled: 'STALLED', moving: 'moving', steady: 'steady', idle: 'idle', 'not-measured': 'not measured' };
+
+// One character per clock hour, oldest left; a measured zero is '·', never a blank.
+const pulseStrip = (hours) => {
+  const max = Math.max(...hours.map((hour) => hour.total));
+  return hours.map((hour) => (hour.total === 0 ? '·' : PULSE_BLOCKS[Math.min(7, Math.ceil((hour.total / max) * 8) - 1)])).join('');
+};
+
+const pulseText = (pulse) => {
+  const scope = pulse.scope && pulse.scope.basis === 'epic' ? `epic ${pulse.scope.epics.join(', ')}` : 'its own directories';
+  const lines = [`pulse ${pulse.workspaceId} (counts ${scope}) · read ${ledgerDuration(Date.now() - pulse.generatedAt)} ago`];
+  lines.push(pulse.hours
+    ? `last 48 h, one mark per hour, oldest left: ${pulseStrip(pulse.hours)}`
+    : 'last 48 h: not measured (no movement source could be read)');
+  if (pulse.hours) {
+    const failed = pulse.hours.reduce((sum, hour) => sum + hour.gatesFailed, 0);
+    const passed = pulse.hours.reduce((sum, hour) => sum + hour.gatesPassed, 0);
+    lines.push(`gates in 48 h: ${passed} passed, ${failed} failed`);
+  }
+  const stateWord = Object.hasOwn(PULSE_STATE_WORDS, pulse.stall.state) ? PULSE_STATE_WORDS[pulse.stall.state] : 'state not in the label map';
+  lines.push(pulse.stall.state === 'not-measured' ? pulse.stall.reason : `${stateWord}: ${pulse.stall.reason}`);
+  lines.push(`priority now: ${pulse.priority.text}${pulse.staleSince === null ? '' : ` · stale since ${boardTime(pulse.staleSince)}`}`);
+  lines.push(`work in progress: ${pulse.wip.basisReason}`);
+  lines.push('sources:');
+  process.stdout.write(`${lines.join('\n')}\n`);
+  printTable(['  SOURCE', '48 H', 'LAST'], pulse.sources.map((source) => [
+    `  ${source.label}${source.sharedWith ? ` (shared with ${source.sharedWith.join(', ')}; not counted)` : ''}`,
+    source.state === 'ok' ? String(source.count) : `not measured (${source.reason})`,
+    source.lastAt === null ? '—' : boardTime(source.lastAt),
+  ]));
+};
+
+const goalText = (body) => {
+  const t = body.onTrack;
+  if (t && t.goalState === 'unknown') return `goal: ${t.reason || 'goal not measured'}`;
+  if (!t || t.goal === null) return 'goal: no goal set';
+  const forecast = t.p50At === null ? `no forecast (${t.reason})` : `p50 ${boardTime(t.p50At)}, p90 ${boardTime(t.p90At)}`;
+  const rate = t.throughputPerDay ? ` · closed per day, last 3 days: ${t.throughputPerDay.join(', ')}` : '';
+  return `goal: ${t.goal} · ${t.itemsLeft === null ? 'items left unknown' : `${t.itemsLeft} items left`} · ${forecast}${rate} · ${t.state}`;
+};
+
+const cmdBoardGoal = async (rest) => {
+  const action = rest[0];
+  const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
+  if (!wsId) die('--workspace is required');
+  const path = `/api/cli/workspaces/${encodeURIComponent(wsId)}/board-goal`;
+  requireEnv();
+  if (action === 'show') {
+    const { body } = await api('GET', path);
+    if (rest.includes('--json')) return out(body);
+    const board = (await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/board`)).body;
+    process.stdout.write(`${goalText(board)}\n`);
+    if (body.goal) process.stdout.write(`items: ${body.goal.items.join(', ')}\nset by ${body.goal.setBy} at ${boardTime(body.goal.setAt)}\n`);
+    return;
+  }
+  if (action === 'clear') {
+    const { body } = await api('DELETE', path);
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(body.cleared ? 'goal cleared\n' : 'no goal was set\n');
+    return;
+  }
+  if (action !== 'set') die(BOARD_USAGE);
+  const items = flagValue(rest, '--items');
+  const label = flagValue(rest, '--label');
+  if (!items) die('--items is required: ledger item keys, comma-separated (range:<lane>:<key12>, slice:<lane>, ...)');
+  if (!label) die('--label is required');
+  const { body } = await api('PUT', path, { label, items: items.split(',').map((key) => key.trim()).filter(Boolean) });
+  if (rest.includes('--json')) return out(body);
+  process.stdout.write(`${goalText(body)}\n`);
+};
+
 const cmdBoard = async (args) => {
   const sub = args[0];
   const rest = args.slice(1);
-  if (sub !== 'show') die(BOARD_USAGE);
+  if (sub === 'goal') return cmdBoardGoal(rest);
+  if (sub !== 'show' && sub !== 'pulse') die(BOARD_USAGE);
   const wsId = flagValue(rest, '--workspace') || flagValue(rest, '-w');
   if (!wsId) die('--workspace is required');
+  if (sub === 'pulse') {
+    requireEnv();
+    const { body } = await api('GET', `/api/cli/workspaces/${encodeURIComponent(wsId)}/pulse`);
+    if (rest.includes('--json')) return out(body);
+    pulseText(body);
+    return;
+  }
   const modes = ['--json', '--line', '--mine'].filter((flag) => rest.includes(flag));
   if (rest.includes('--json') && rest.includes('--line')) die('--json and --line are exclusive');
   requireEnv();
@@ -2456,6 +2545,14 @@ Commands:
                                            over threshold; each input's state. --line: goal, items left,
                                            constraint, trend on one line. --mine: only the items the calling tab
                                            holds (needs PMUX_TAB_TOKEN). Read scope on WS
+  board pulse -w WS [--json]               Hourly movement, last 48 h (ADR-0034 §9): one mark per hour from
+                                           ledger changes, commits, gates (pass/fail), review rounds, v2 LANDED
+                                           lines and Mission Control answers; stalled / moving / steady / idle;
+                                           priority now; each source's own state ("not measured", never 0).
+                                           Read scope on WS
+  board goal set -w WS --items KEY,KEY --label TEXT
+                                           Set the goal the on-track line forecasts (p50/p90 from 3-day
+                                           throughput, AEDT). Own workspace only. board goal show|clear -w WS
   ledger token issue -w WS --producer NAME [--out FILE]
                                            Issue a producer token (scope ledger:emit on WS only) into a 0600 file,
                                            default ~/.purplemux/ledger-tokens/WS/NAME.json; rotates NAME's token

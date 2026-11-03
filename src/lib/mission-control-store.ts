@@ -841,11 +841,18 @@ export class MissionControlStore {
     return { schemaVersion: 1, events, cursor: events.at(-1)?.seq ?? after, hasMore };
   };
 
-  /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first, id and title only. */
-  openItemTitles = (workspaceId: string): Array<{ id: string; title: string }> =>
-    (this.database.prepare(`SELECT id, question_json FROM attention_items WHERE workspace_id = ? AND state = 'open'
-      ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string }>)
-      .map((row) => ({ id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? '') }));
+  /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first: id, title and when it opened. */
+  openItemTitles = (workspaceId: string): Array<{ id: string; title: string; createdAt: number }> =>
+    (this.database.prepare(`SELECT id, question_json, created_at FROM attention_items WHERE workspace_id = ? AND state = 'open'
+      ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string; created_at: number }>)
+      .map((row) => ({
+        id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? ''), createdAt: row.created_at,
+      }));
+
+  /** The pulse (ADR-0034 §9): when each answer to a workspace's items was recorded, since `since`. */
+  answerTimes = (workspaceId: string, since: number): number[] =>
+    this.database.prepare('SELECT created_at FROM answers WHERE workspace_id = ? AND created_at >= ? ORDER BY created_at')
+      .pluck().all(workspaceId, since) as number[];
 
   /** Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). */
   openItemOpeners = (): IMissionOpenItemOpener[] => {

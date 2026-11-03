@@ -25,7 +25,7 @@ const MIN = 60_000;
 const T0 = 1_800_000_000_000;
 
 const deriveFinderStub = (generatedAt: number, ledgerState: 'ok' | 'unknown', anomalies: IFinderResult['anomalies']): IFinderResult => ({
-  generatedAt, onTrack: { state: 'at-risk', goal: null, itemsLeft: null, p50At: null, p90At: null }, constraint: null, stuck: [],
+  generatedAt, onTrack: { state: 'at-risk', goal: null, goalState: 'none', itemsLeft: null, p50At: null, p90At: null, throughputPerDay: null, reason: 'no goal set' }, constraint: null, stuck: [], ownerBlocks: null,
   windows: [], anomalies, unknownShare: null, flowLocks: null, pool: null, line: '',
   inputs: {
     ledger: { state: ledgerState, reason: ledgerState === 'ok' ? null : 'ledger unreadable', at: null },

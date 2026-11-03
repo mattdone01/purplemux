@@ -2,10 +2,13 @@ import { STUCK_LIMIT } from '@/lib/constraint';
 import { FINDER_STALE_MS, readFinderResult } from '@/lib/constraint-tick';
 import { createLogger } from '@/lib/logger';
 import type { IBoard, IBoardNeedsYou } from '@/types/constraint';
+import type { ILedgerExperiment } from '@/types/ledger';
 
 const log = createLogger('board');
 
-const readNeedsYou = async (workspaceId: string): Promise<IBoardNeedsYou[] | null> => {
+type TOpenItem = Omit<IBoardNeedsYou, 'blocked'>;
+
+const readOpenItems = async (workspaceId: string): Promise<TOpenItem[] | null> => {
   try {
     return (await import('@/lib/mission-control-store')).getMissionControlStore().openItemTitles(workspaceId);
   } catch (err) {
@@ -14,17 +17,30 @@ const readNeedsYou = async (workspaceId: string): Promise<IBoardNeedsYou[] | nul
   }
 };
 
+/** Experiments with no verdict yet (ADR-HFL-03); null when the ledger cannot be read. */
+const readExperiments = async (workspaceId: string): Promise<ILedgerExperiment[] | null> => {
+  try {
+    return (await import('@/lib/ledger-store')).getLedgerStore().experiments(workspaceId).filter((experiment) => experiment.verdict === null);
+  } catch (err) {
+    log.warn({ workspaceId }, `board: experiments unreadable (${err instanceof Error ? err.message : String(err)})`);
+    return null;
+  }
+};
+
 /**
- * One workspace's board (ADR-0034): the finder's cached answer and Mission Control's open items.
- * `holders` limits the stuck list to the items those holders hold (`board show --mine`); the cap of
- * 50 oldest applies after that filter, and `stuckTotal` says how many matched.
+ * One workspace's board (ADR-0034): the finder's cached answer, Mission Control's open items with
+ * what each blocks, and the running experiments. `holders` limits the stuck list to the items those
+ * holders hold (`board show --mine`); the cap of 50 oldest applies after that filter, and
+ * `stuckTotal` says how many matched.
  */
 export const readBoard = async (workspaceId: string, now: number, holders: readonly string[] | null = null): Promise<IBoard> => {
-  const [finder, needsYou] = await Promise.all([readFinderResult(workspaceId, now), readNeedsYou(workspaceId)]);
+  const [finder, open, experiments] = await Promise.all([readFinderResult(workspaceId, now), readOpenItems(workspaceId), readExperiments(workspaceId)]);
   const stuck = holders ? finder.stuck.filter((item) => item.holder !== null && holders.includes(item.holder)) : finder.stuck;
+  const blocks = finder.ownerBlocks;
+  const needsYou = open?.map((item) => ({ ...item, blocked: blocks && Object.hasOwn(blocks, item.id) ? blocks[item.id] : null })) ?? null;
   const ageMs = Math.max(0, now - finder.generatedAt);
   return {
-    ...finder, workspaceId, stuck: stuck.slice(0, STUCK_LIMIT), stuckTotal: stuck.length, needsYou, ageMs,
+    ...finder, workspaceId, stuck: stuck.slice(0, STUCK_LIMIT), stuckTotal: stuck.length, needsYou, experiments, ageMs,
     staleSince: ageMs > FINDER_STALE_MS ? finder.generatedAt : null,
   };
 };

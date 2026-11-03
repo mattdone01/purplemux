@@ -301,8 +301,21 @@ describe('MissionControlStore', () => {
     const store = new MissionControlStore(databasePath());
     expect(store.openItemTitles('ws-a')).toEqual([]);
     seed(store);
-    expect(store.openItemTitles('ws-a')).toEqual([{ id: 'item-a', title: 'Choose a rollout' }]);
+    expect(store.openItemTitles('ws-a')).toEqual([{ id: 'item-a', title: 'Choose a rollout', createdAt: expect.any(Number) }]);
     expect(store.openItemTitles('ws-b')).toEqual([]);
+    store.close();
+  });
+
+  it('lists when each answer to a workspace was recorded, for the pulse (ADR-0034 §9)', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const before = Date.now();
+    expect(store.answerTimes('ws-a', 0)).toEqual([]);
+    store.submitAnswer('item-a', { submissionId: 'pulse-answer', expectedRevision: 1, optionIds: ['gradual'], text: '', actionCompleted: false }, 'user');
+    const [at] = store.answerTimes('ws-a', 0);
+    expect(at).toBeGreaterThanOrEqual(before - 1_000);
+    expect(store.answerTimes('ws-a', at + 1)).toEqual([]);
+    expect(store.answerTimes('ws-b', 0)).toEqual([]);
     store.close();
   });
 

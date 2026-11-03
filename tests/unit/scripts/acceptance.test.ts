@@ -721,13 +721,13 @@ describe('checks-wip-cap.cjs (story 20)', () => {
   });
 
   it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
-    expect(checks.WAVE_COUNT).toBe(8);
+    expect(checks.WAVE_COUNT).toBe(9);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '8']).onlyWave).toBe(8);
-    for (const bad of ['0', '9', '1.5', '-1', 'x', '']) {
-      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..8, not ${JSON.stringify(bad)}`);
+    for (const bad of ['0', '10', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..9, not ${JSON.stringify(bad)}`);
     }
-    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..8, not null');
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..9, not null');
   });
 
   describe('checks.cjs runs the gate first (spawned against a fake candidate)', () => {
@@ -794,9 +794,9 @@ process.exit(1);
     });
 
     it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
-      const r = runChecks('ok', ['--only-wave', '9']);
+      const r = runChecks('ok', ['--only-wave', '10']);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('--only-wave takes an integer 1..8, not "9"');
+      expect(r.stderr).toContain('--only-wave takes an integer 1..9, not "10"');
       expect(r.calls).toEqual([]);
     });
 
@@ -813,13 +813,34 @@ process.exit(1);
 describe('checks-mission-control-page.cjs', () => {
   const wave7 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-mission-control-page.cjs'));
 
-  it('passes only when the Needs you section precedes the portfolio board heading', () => {
+  it('tells the board view from the answers view, and neither from a page with both or none', () => {
     const section = '<section aria-labelledby="needs-you-heading"><div id="needs-you-heading"></div></section>';
-    const board = '<h1 class="text-xl font-semibold">Portfolio board</h1>';
-    expect(wave7.pageOrder(`<title>Portfolio board · PurpleMux</title>${section}${board}`).first).toBe(true);
-    expect(wave7.pageOrder(`${board}${section}`).first).toBe(false);
-    expect(wave7.pageOrder(board)).toMatchObject({ needsYou: -1, first: false });
-    expect(wave7.pageOrder(section)).toMatchObject({ board: -1, first: false });
+    const board = '<div class="space-y-5" data-owner-board="">';
+    expect(wave7.pageView(`<title>Mission Control · PurpleMux</title>${board}`).view).toBe('board');
+    expect(wave7.pageView(section).view).toBe('answers');
+    expect(wave7.pageView(`${board}${section}`).view).toBe('unknown');
+    expect(wave7.pageView('<h1>Portfolio board</h1>')).toMatchObject({ needsYou: -1, board: -1, view: 'unknown' });
+  });
+});
+
+describe('checks-board.cjs (story 12)', () => {
+  const wave9 = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-board.cjs'));
+
+  it('accepts a served pulse and names each contract break', async () => {
+    const { derivePulse } = await import('@/lib/pulse');
+    const pulse = derivePulse({
+      workspaceId: 'ws-a', now: Date.UTC(2026, 10, 3, 6), staleSince: null, oldestStuck: null,
+      reads: [{ id: 'commits', events: [{ at: Date.UTC(2026, 10, 3, 5) }], reason: null, from: [] }],
+      wip: { count: 0, basis: 'agent-tabs', basisReason: 'x', sources: { ledger: 'no-events', agentTabs: 'measured', missionControl: 'measured' } },
+      priority: { basis: 'none', needsYou: 0, text: 'nothing waited in 24 h · needs you: 0' },
+    });
+    expect(wave9.pulseDefects(pulse)).toEqual([]);
+    const zeroForUnknown = { ...pulse, sources: pulse.sources.map((source: { id: string }) => (source.id === 'gates' ? { ...source, count: 0 } : source)) };
+    expect(wave9.pulseDefects(zeroForUnknown)).toEqual(['gates: unknown with count 0 and reason no reader']);
+    expect(wave9.pulseDefects({ ...pulse, hours: [] })).toEqual(['hours: 0, expected 48 or null']);
+    expect(wave9.pulseDefects(null)).toEqual(['no pulse']);
+    const withShared = { ...pulse, sources: [...pulse.sources, { ...pulse.sources[1], sharedWith: ['Audit'] }] };
+    expect(wave9.pulseDefects(withShared)).toEqual([]);
   });
 });
 

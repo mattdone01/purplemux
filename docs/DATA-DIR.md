@@ -20,6 +20,7 @@ File permissions are `0600` for anything containing a secret (config, tokens, la
 │       ├── standups.json         # orchestrator standup ticks (latest + history)
 │       ├── burndown.json         # latest published epic burndown (Scrum Master)
 │       ├── flow.json             # latest published pipeline flow + server history (ADR-0026)
+│       ├── board-goal.json       # the board's goal, `purplemux board goal set` (ADR-0034 §10)
 │       ├── liveness.json         # the tabs' liveness probes and background jobs (0600)
 │       ├── codex-prompt.md       # Codex developer_instructions content
 │       ├── claude-home/          # per-workspace CLAUDE_CONFIG_DIR
@@ -428,6 +429,12 @@ The `--append-system-prompt-file` content passed to every Claude tab in the work
 Orchestrator standup ticks, newest first, capped at 50. The latest tick renders in the
 workspace sidebar; `StatusManager` hydrates from this file on boot so "where are things
 at" survives a server restart. See STATUS.md → Standup Ticks for the full flow.
+
+### `board-goal.json` — `src/lib/board-goal-store.ts`
+
+The workspace's goal (`{ label, items, setAt, setBy }`, mode 0600), written by `purplemux board goal set` and removed
+by `board goal clear`. The constraint finder reads it on each tick and forecasts the on-track line from it. A file that
+does not hold a goal is an error the tick logs; it is never read as "no goal set" by the store.
 
 ### `burndown.json` — `src/lib/burndown-store.ts`
 

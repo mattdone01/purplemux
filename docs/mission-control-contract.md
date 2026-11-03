@@ -156,9 +156,34 @@ trust-boundary sentence above still holds for a workspace-token caller; a launch
 answers `IBoard` (`src/types/constraint.ts`) for one workspace, or `{boards: IBoard[]}` for all; an unknown
 workspace answers 404. `GET /api/cli/workspaces/{ws}/board[?mine=1]` serves the same answer with read scope, and
 `board show -w WS [--json|--line|--mine]` prints it. The answer is the constraint finder's cached result (a 60 s tick,
-`src/lib/constraint-tick.ts`) plus `needsYou`, Mission Control's open items (`{id, title}`; null when the store is
-unreadable). `inputs.ledger.state` other than `ok` means the ledger measures (constraint, stuck, windows, anomalies)
-were not taken; `onTrack.goal` is null until a goal is set (story 12), and `onTrack.state` is then `at-risk`.
+`src/lib/constraint-tick.ts`) plus `needsYou`, Mission Control's open items (`{id, title, createdAt, blocked}`; null
+when the store is unreadable), and `experiments` (the ledger's experiments with no verdict; null when unreadable).
+`blocked` is `{items, hours, critical}`: the open ledger items waiting `owner` whose link (parent) is `mc-item:<id>`,
+their summed waiting hours and whether any is critical; null when no ledger item links to the MC item, and null for
+every row when the ledger is not measured (the faces then say "blocked cost not measured: <ledger reason>", apart
+from "no ledger item links to this item"). `inputs.ledger.state` other than `ok` means the ledger measures (constraint, stuck, windows,
+anomalies, `ownerBlocks`) were not taken; `onTrack.goal` is null until `purplemux board goal set`, and `onTrack.state`
+is then `at-risk` with `reason` "no goal set" and `goalState: none`; an unreadable goal file is `goalState: unknown`
+with `reason` "goal not measured: <reason>", never "no goal set".
+
+**Goal** (story 12 AC 5). `GET|PUT|DELETE /api/cli/workspaces/{ws}/board-goal` (`PUT {label, items}`; writes from the
+workspace's own token only) and `purplemux board goal set -w WS --items KEY,KEY --label TEXT | show | clear`. The goal
+is stored in `workspaces/{ws}/board-goal.json`; a write drops the finder's cached answer, so the next read forecasts it.
+`onTrack` then carries `itemsLeft` (goal keys the ledger does not hold closed), `throughputPerDay` (closes of the goal
+keys' item types in each of the last 3 days, dropped and superseded left out), and `p50At` / `p90At` from an exact
+bootstrap over those days (`src/lib/board-forecast.ts`, pure); no close in 3 days is no forecast, never a date.
+
+**Pulse** (ADR-0034 §9). `GET /api/mission-control/pulse?workspaceId=all|WS` (human session; `{pulses: IPulse[]}` for
+all) and `GET /api/cli/workspaces/{ws}/pulse` (read scope; `purplemux board pulse -w WS [--json]`) answer `IPulse`
+(`src/types/pulse.ts`): 48 clock-hour bars of movement, each source's own state, the stall marker, work in progress
+with its basis, and priority now. Cached 60 s per workspace; each source read has a 10 s deadline, and reads on the sshfs `_output` mount run at most 2
+at a time behind a breaker ("<mount> not answering since <time>"). `scope` says whose
+movement it is: an epic lease's records and repositories, or the workspace's own directories; a source read from a
+directory another workspace lists too carries `sharedWith` and is never counted (ADR-0034 §9).
+
+**The view.** `/mission-control` (`?view=board`, the default) is the board: the pulse rows first, then one workspace's
+sections in ADR-HFL-02 order. `?view=answers` is the Needs you answer list and `?item=<id>` opens it on that item's
+card; `?view=portfolio` is the portfolio board. The board sends no write.
 
 ## Flow (ADR-0026)
 

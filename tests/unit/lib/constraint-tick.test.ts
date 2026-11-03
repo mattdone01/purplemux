@@ -10,7 +10,7 @@ vi.mock('@/lib/logger', () => {
 });
 
 const {
-  cachedFinderResults, readFinderResult, resetConstraintFinderForTests, runScheduledConstraintTick, spendFor, startConstraintFinder,
+  cachedFinderResults, forgetFinderResult, readFinderResult, resetConstraintFinderForTests, runScheduledConstraintTick, spendFor, startConstraintFinder,
   stopConstraintFinder,
 } = await import('@/lib/constraint-tick');
 
@@ -165,5 +165,27 @@ describe('the finder tick (AC 4)', () => {
     await stopConstraintFinder();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(h.reads.ledger).toBe(2);
+  });
+});
+
+describe('the goal (story 12 AC 5)', () => {
+  it('reads each workspace\'s goal into onTrack; forgetting the answer shows a new goal at the next read', async () => {
+    const { deps } = harness();
+    let label = 'Walking skeleton';
+    deps.goal = async (workspaceId) => (workspaceId === 'ws-a' ? { label, items: ['range:a:1'], setAt: T0, setBy: 'orch' } : null);
+    const first = await readFinderResult('ws-a', T0, deps, () => T0);
+    expect(first.onTrack).toMatchObject({ goal: 'Walking skeleton', itemsLeft: 1 });
+    label = 'Second goal';
+    expect((await readFinderResult('ws-a', T0, deps, () => T0)).onTrack.goal).toBe('Walking skeleton');
+    forgetFinderResult('ws-a');
+    expect((await readFinderResult('ws-a', T0, deps, () => T0)).onTrack.goal).toBe('Second goal');
+  });
+
+  it('an unreadable goal is logged and reads "goal not measured", never "no goal set" or a failed tick (round 2, F7)', async () => {
+    const { deps } = harness();
+    deps.goal = async () => { throw new Error('goal storage unreadable: the file is not JSON'); };
+    const result = await readFinderResult('ws-a', T0, deps, () => T0);
+    expect(result.onTrack).toMatchObject({ goal: null, goalState: 'unknown', reason: 'goal not measured: goal storage unreadable: the file is not JSON' });
+    expect(logs.warn).toHaveBeenCalledWith({ workspaceId: 'ws-a' }, expect.stringContaining('goal unreadable'));
   });
 });
