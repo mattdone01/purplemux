@@ -2778,7 +2778,8 @@ export class StatusManager {
       };
       // A stop with no end line may still ask the owner something: the curator flags it, in shadow (ADR-0038 §2).
       const sourceId = entry.agentSessionId && snapshot?.lastAssistantUuid ? `${entry.workspaceId}/${entry.agentSessionId}/${snapshot.lastAssistantUuid}` : null;
-      void import('@/lib/curator-service').then((curator) => curator.curatorOnUnmarkedTurnEnd(entry.workspaceId, tabId, snapshot?.lastAssistantTail, sourceId));
+      void import('@/lib/curator-service').then((curator) => curator.curatorOnUnmarkedTurnEnd(entry.workspaceId, tabId, snapshot?.lastAssistantTail, sourceId))
+        .catch((err: unknown) => log.warn({ tabId }, `curator turn-end hook not loaded: ${err instanceof Error ? err.message : String(err)}`));
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);
         log.info({ tabId, panelType: entry.panelType }, 'no transcript for turn-end classification; ready-for-review fallback');

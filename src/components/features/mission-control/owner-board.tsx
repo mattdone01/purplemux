@@ -289,7 +289,9 @@ const CuratorSection = ({ board, age, now }: { board: IBoard; age: ISectionAge; 
               const stateWord = Object.hasOwn(CURATOR_STATE_WORDS, task.state) ? CURATOR_STATE_WORDS[task.state] : 'state not in the label map';
               const shadowEnds = task.state !== 'shadow' ? '' : task.shadowEndsAt !== null
                 ? ` · 72 h shadow ends ${aedtTime(task.shadowEndsAt)}` : ' · no live call of this prompt yet';
-              const agree = !curator.agreement ? 'agreement not measured'
+              // A reshape has no rules' label to agree with: its gate is its evaluation and the judge (story 23).
+              const agree = task.task === 'reshape-question' ? 'gated by its evaluation and judge, not by agreement'
+                : !curator.agreement ? 'agreement not measured'
                 : !agreement || agreement.compared === 0 ? 'no labelled calls in 72 h'
                   : `${agreement.agreed} of ${agreement.compared} labels agree with the rules (72 h)`;
               return (

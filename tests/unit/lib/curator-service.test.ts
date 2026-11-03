@@ -127,6 +127,7 @@ describe('the board (AC 8)', () => {
     expect(board.health.reason).toMatch(/^tunnel down \(/);
     expect(board.tasks.map((t) => [t.task, t.state, t.routingHere])).toEqual([
       ['classify-owner-message', 'shadow', false], ['flag-owner-question', 'shadow', false], ['match-standing-order', 'shadow', false],
+      ['reshape-question', 'shadow', false],
     ]);
   });
 
@@ -181,7 +182,7 @@ describe('shadow calls (ADR-0038 §2)', () => {
     expect(appended[0].text).not.toContain('use AEDT');
     await vi.waitFor(async () => expect((await service.readCuratorStatus()).tasks[0].shadowSince).toBeGreaterThan(0));
     const status = await service.readCuratorStatus();
-    expect(status.tasks.map((t) => t.shadowSince === null)).toEqual([false, true, true]);
+    expect(status.tasks.map((t) => t.shadowSince === null)).toEqual([false, true, true, true]);
     expect(status.liveSince).toBeGreaterThan(0);
   });
 
@@ -455,5 +456,51 @@ describe('the kodit rule (AC 7)', () => {
     expect(status.kodit!.drop).toBeGreaterThan(0.2);
     expect(status.rateLimitMs).toBe(10_000);
     vi.useRealTimers();
+  });
+});
+
+describe('owner-message routing in the server (story 23 AC 1, AC 2)', () => {
+  it('AC 1: the hook returns at once while the curator call is still pending: delivery never waits on it', async () => {
+    let answer: (r: Response) => void = () => undefined;
+    fetchMock.mockImplementation(async (url: string) => (String(url).endsWith('/api/tags')
+      ? json({ models: [{ name: 'gemma4:26b', digest: digestNow.value }] })
+      : new Promise<Response>((resolve) => { answer = resolve; })));
+    const service = await load();
+    await service.startCurator();
+    const started = Date.now();
+    expect(service.curatorOnOwnerMessage('ws-a', 'm1', 'the board must show AEDT')).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(50);
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/chat'))).toBe(true));
+    expect(appended).toHaveLength(0);
+    answer(json({ message: { content: JSON.stringify({ label: 'one-off', span: 'AEDT' }) } }));
+    await vi.waitFor(() => expect(appended).toHaveLength(1));
+  });
+
+  it('routing on the promoted version in an opted-in workspace: a product rule lands in the spec queue and one routing row is logged, with no text', async () => {
+    serveTags('product-rule');
+    writeState({ version: 1, liveSince: 1, tasks: { 'classify-owner-message': { state: 'routing', promotedAt: 2, promotedPromptVersion: COM } }, kodit: null, rateLimitMs: 0 });
+    await setFleet('curator.routing.workspaces', 'ws-a');
+    const service = await load();
+    await service.startCurator();
+    service.curatorOnOwnerMessage('ws-a', 'm7', 'The board must show AEDT times', Date.parse('2026-11-03T04:00:00Z'));
+    await vi.waitFor(() => expect(appended.map((a) => a.kind)).toEqual(['curator', 'curator-route']));
+    expect(JSON.parse(appended[1].text)).toEqual({
+      task: 'classify-owner-message', sourceId: 'ws-a/m7', label: 'product-rule', promptVersion: COM, action: 'spec-queued', target: 'spec-queue.md',
+    });
+    expect(appended[1].text).not.toContain('AEDT times');
+    const queue = fs.readFileSync(path.join(directory, '.purplemux/workspaces/ws-a/spec-queue.md'), 'utf-8');
+    expect(queue).toContain('## m7\n- at: 2026-11-03T04:00:00Z\n- source: owner message ws-a/m7\n\n> The board must show AEDT times');
+  });
+
+  it('in shadow (no promotion) nothing is queued and only the call record is written', async () => {
+    serveTags('product-rule');
+    await setFleet('curator.routing.workspaces', 'ws-a');
+    const service = await load();
+    await service.startCurator();
+    service.curatorOnOwnerMessage('ws-a', 'm8', 'The board must show AEDT times');
+    await vi.waitFor(() => expect(appended).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(appended.map((a) => a.kind)).toEqual(['curator']);
+    expect(fs.existsSync(path.join(directory, '.purplemux/workspaces/ws-a/spec-queue.md'))).toBe(false);
   });
 });

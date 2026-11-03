@@ -1,4 +1,7 @@
-export type TCuratorTask = 'classify-owner-message' | 'flag-owner-question' | 'match-standing-order';
+/** The classifiers: each scored on a labelled set by the Clopper-Pearson gate (ADR-0038 §5). */
+export type TCuratorLabelTask = 'classify-owner-message' | 'flag-owner-question' | 'match-standing-order';
+/** Every curator task; `reshape-question` proposes a question draft and has its own gate (ADR-HFL-11 rule 3). */
+export type TCuratorTask = TCuratorLabelTask | 'reshape-question';
 
 /** `shadow`: labels are logged and nothing routes. `routing`: the label routes, in a workspace that opts in (ADR-0038 §5). */
 export type TCuratorTaskState = 'shadow' | 'routing';
@@ -46,12 +49,16 @@ export interface ICuratorCallRecord {
   /** Where the label that would route came from. */
   source: 'curator' | 'rules';
   error?: string;
+  /** reshape-question: the sha256 of the reshaped draft, never its text. */
+  draftSha?: string;
 }
 
 export interface ICuratorResult {
   record: ICuratorCallRecord;
   /** The label to route: the model's when `labelled`, else the rules'. */
   routed: string;
+  /** What the task's reader returned beside the label (reshape-question: the verdict and the draft); never recorded. */
+  payload?: unknown;
 }
 
 export interface ICuratorTaskStatus {
@@ -123,7 +130,7 @@ export interface ICuratorScore {
 }
 
 export interface ICuratorEvalResult {
-  task: TCuratorTask;
+  task: TCuratorLabelTask;
   promptVersion: string;
   model: string;
   split: 'holdout' | 'train' | 'all';
@@ -199,7 +206,7 @@ export type TSpotCheckVerdict =
   | { state: 'answered'; disputed: string[]; unjudged: string[]; wrongShare: number; judged: number; answeredAt?: number };
 
 export interface ISpotCheckFile {
-  task: TCuratorTask;
+  task: TCuratorLabelTask;
   itemId: string;
   workspaceId: string;
   openedAt: number;

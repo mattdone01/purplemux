@@ -130,7 +130,7 @@ describe('purplemux curator (ADR-0038)', { timeout: 30_000 }, () => {
     expect((await cli(['promote', '--task', 'flag-owner-question'])).stdout).toBe('flag-owner-question: routing (every gate condition met)\n');
     expect((await cli(['demote', '--task', 'flag-owner-question'])).stdout).toBe('flag-owner-question: shadow (was routing)\n');
     expect(requests.map((r) => r.body)).toEqual([{ task: 'flag-owner-question' }, { task: 'flag-owner-question', demote: true }]);
-    const bad = await cli(['promote', '--task', 'reshape-question']);
+    const bad = await cli(['promote', '--task', 'summarise-board']);
     expect(bad.code).toBe(2);
     expect(requests).toHaveLength(2);
   });
@@ -225,5 +225,36 @@ describe('purplemux curator (ADR-0038)', { timeout: 30_000 }, () => {
       itemId: 'curator-spot-check-2026-11-06', workspaceId: 'ws-a', verdict: { state: 'answered', disputed: ['a', 'b'], unjudged: ['c'], judged: 29, wrongShare: 2 / 29 },
     } });
     expect((await cli(['spot-check', 'show'])).stdout).toBe('spot check curator-spot-check-2026-11-06 in ws-a: answered: 2 wrong of 29 judged (6.9%), 1 not judged\n');
+  });
+
+  it('eval --task reshape-question prints the reshape gate on the run alone (story 23 AC 4)', async () => {
+    const reshapeResult = {
+      task: 'reshape-question', runId: 'run-1', promptVersion: 'rsq-v1-x~y', model: 'gemma4:26b', startedAt: 1000, finishedAt: 2000, target: 100, candidates: 250,
+      replied: 100, clean: 98, nonReplies: 3, unresolved: 0, unreshapable: 1, labels: { reshaped: 98, invalid: 2 }, outcomes: { labelled: 100, timeout: 3 },
+      latency: { p50: 4000, p90: 9000 }, refused: null, rows: [],
+    };
+    routes['POST /api/cli/curator/eval'] = () => ({ status: 202, body: { progress: { task: 'reshape-question', running: true, done: 0, total: 100, startedAt: 1000, error: null } } });
+    routes['GET /api/cli/curator/eval'] = () => ({ status: 200, body: { progress: { running: false, done: 100, total: 100, startedAt: 1000, error: null }, result: reshapeResult } });
+    const res = await cli(['eval', '--task', 'reshape-question']);
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stdout).toContain('replies 100/100 of 250 held-out ids · non-replies 3 · unresolved 0 · not reshapable 1');
+    expect(res.stdout).toContain('FAIL schema-valid and preservation-clean 98/100 (needs 100/100)');
+    expect(res.stdout).toContain('promote also needs the judge');
+  });
+
+  it('reshape-pairs prints the server\'s JSON; judge-import sends the run and the verdicts; message reads one owner message', async () => {
+    routes['GET /api/cli/curator/reshape-pairs'] = () => ({ status: 200, body: { runId: 'run-1', promptVersion: 'v', pairs: [{ id: 'ws-a/mc/q', sha: 'abc', original: {}, reshaped: {} }] } });
+    expect(JSON.parse((await cli(['reshape-pairs'])).stdout)).toMatchObject({ runId: 'run-1', pairs: [{ id: 'ws-a/mc/q', sha: 'abc' }] });
+    routes['POST /api/cli/curator/judge-import'] = (r) => ({ status: 200, body: { echo: r.body } });
+    const file = path.join(home, 'verdicts.json');
+    await fs.writeFile(file, JSON.stringify({ runId: 'run-1', verdicts: [{ id: 'ws-a/mc/q', sha: 'abc', verdict: 'same' }] }));
+    expect(JSON.parse((await cli(['judge-import', '--file', file, '--judge', 'opus high'])).stdout)).toEqual({
+      echo: { runId: 'run-1', verdicts: [{ id: 'ws-a/mc/q', sha: 'abc', verdict: 'same' }], judge: 'opus high' },
+    });
+    expect((await cli(['judge-import'])).code).toBe(2);
+    routes['GET /api/cli/curator/message'] = (r) => ({ status: 200, body: { workspaceId: 'ws-a', entryId: 'm1', sentAt: '2026-11-03T04:00:00Z', message: `read ${r.url}` } });
+    const msg = await cli(['message', '-w', 'ws-a', 'm1']);
+    expect(msg.stdout).toBe('ws-a/m1 at 2026-11-03T04:00:00Z:\nread /api/cli/curator/message?workspaceId=ws-a&entryId=m1\n');
+    expect((await cli(['message', '-w', 'ws-a'])).code).toBe(2);
   });
 });

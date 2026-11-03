@@ -21,7 +21,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
     try {
       const entry = await addMessageHistory(wsId, message);
-      curatorOnOwnerMessage(wsId, entry.id, message);
+      curatorOnOwnerMessage(wsId, entry.id, message, Date.parse(entry.sentAt) || Date.now());
       return res.status(201).json({ entry });
     } catch (e) {
       log.error({ err: e }, 'write failed');

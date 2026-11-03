@@ -148,6 +148,18 @@ const OriginalWording = ({ source }: { source: Record<string, unknown> }) => {
   );
 };
 
+/** Owner messages the curator read as an answer (story 23): a pointer to answer here, never an answer. */
+const SuggestedAnswers = ({ suggestions }: { suggestions: NonNullable<IMissionAttentionItem['suggestedAnswers']> }) => (
+  <div className="space-y-1 rounded-md border border-dashed border-foreground/15 px-3 py-2 text-sm" data-suggested-answers>
+    {suggestions.map((suggestion) => (
+      <p key={suggestion.entryId} className="break-words text-muted-foreground select-text">
+        Your message {formatMissionAge(suggestion.at)} may answer this
+        {suggestion.span ? <>: <q className="text-foreground">{suggestion.span}</q></> : null}. It is not an answer: choose below.
+      </p>
+    ))}
+  </div>
+);
+
 const QuestionContext = ({ context }: { context: string }) => {
   const [expanded, setExpanded] = useState(false);
   const collapsible = isContextCollapsible(context);
@@ -409,6 +421,7 @@ const MissionControlAnswerCard = ({
 
         {view.context && <QuestionContext context={view.context} />}
         {view.source && <OriginalWording source={view.source} />}
+        {item.suggestedAnswers && item.suggestedAnswers.length > 0 && <SuggestedAnswers suggestions={item.suggestedAnswers} />}
 
         {item.storyIds.length > 0 && (
           <div className="flex flex-wrap gap-1.5">

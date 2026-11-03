@@ -321,4 +321,10 @@ describe('the curator section (story 16 AC 8)', () => {
       .toContain('Curator not probed yet.');
     expect(boardWith(null)).toContain('Not measured: curator state unreadable.');
   });
+
+  it('the question reshape names its gate instead of a rules agreement it does not have (story 23)', () => {
+    const reshape = { ...tasks('shadow')[0], task: 'reshape-question' as const };
+    expect(boardWith({ health: { state: 'up', reason: null, since: 1, checkedAt: null }, tasks: [reshape], agreement: [] }))
+      .toContain('Question reshape: shadow (labels logged, nothing routed) · 72 h shadow ends Fri 6 Nov 16:30 AEDT · gated by its evaluation and judge, not by agreement');
+  });
 });

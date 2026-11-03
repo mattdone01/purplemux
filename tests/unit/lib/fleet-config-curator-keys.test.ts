@@ -30,6 +30,8 @@ describe('curator fleet keys', () => {
     ['curator.routing.workspaces', 'ws-L7eUOX,ws-o9gb_Q'],
     ['curator.min-interval-ms', '10000'],
     ['curator.enabled', 'off'],
+    ['curator.standing-order.candidates', 'ws-ldhziO=v2-scrum-master'],
+    ['curator.standing-order.candidates', 'none'],
   ])('the admin token sets %s = %j', async (key, value) => {
     const { putValue } = await import('@/lib/fleet-config-http');
     expect(await putValue(admin, key, { value }, authority)).toMatchObject({ key, changed: true });
@@ -41,9 +43,17 @@ describe('curator fleet keys', () => {
     ['curator.min-interval-ms', '700000', 'must be whole milliseconds 0..600000'],
     ['curator.enabled', 'yes', 'must be on or off, got "yes"'],
     ['curator.model', 'qwen', 'is not a curator key'],
+    ['curator.standing-order.candidates', 'v2-scrum-master', 'takes ws-...=<tab name> pairs, comma-separated, or none: v2-scrum-master'],
+    ['curator.standing-order.candidates', 'ws-ldhziO=', 'takes ws-...=<tab name> pairs'],
+    ['curator.standing-order.candidates', 'ws-ldhziO', 'A value replaces the default ws-ldhziO=v2-scrum-master: keep that pair in it'],
   ])('%s = %j is refused: %s', async (key, value, message) => {
     const { putValue } = await import('@/lib/fleet-config-http');
     await expect(putValue(admin, key, { value }, authority)).rejects.toMatchObject({ code: 'config-invalid', message: expect.stringContaining(message) });
+  });
+
+  it('a workspace orchestrator cannot move a workspace off the candidate route (story 23)', async () => {
+    const { putValue } = await import('@/lib/fleet-config-http');
+    await expect(putValue(orchestrator, 'curator.standing-order.candidates', { value: 'none' }, authority)).rejects.toMatchObject({ code: 'forbidden' });
   });
 
   it("a workspace orchestrator cannot opt a workspace into routing", async () => {

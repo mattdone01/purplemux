@@ -4,7 +4,7 @@
 Accepted (2026-11-03, epic `harness-flow-loop`, story 16; architecture ADR-HFL-06). Routing is per workspace and opt-in
 (consult `HFL-consult-v2-open-points.md` point 6). The spot-check item's shape is the story's architect consult of
 2026-11-03. The gate's statistical form, the per-version shadow and the set's durability are consult
-`reviews/16-promote-gate-consult.md` (review r1 F3-F5). Story 23 adds `reshape-question` and the routing actions;
+`reviews/16-promote-gate-consult.md` (review r1 F3-F5). Story 23 adds `reshape-question` and the routing actions (ADR-0042);
 this ADR only labels, logs and gates.
 
 ## Context

@@ -3,7 +3,7 @@ import { COVERED, NOT_COVERED } from '@/lib/curator-tasks';
 
 export { replySchema } from '@/lib/curator-tasks';
 import type {
-  ICuratorClassScore, ICuratorEvalResult, ICuratorEvalRow, ICuratorGateCheck, ICuratorScore, TCuratorTask, TSpotCheckVerdict,
+  ICuratorClassScore, ICuratorEvalResult, ICuratorEvalRow, ICuratorGateCheck, ICuratorScore, TCuratorLabelTask, TSpotCheckVerdict,
 } from '@/types/curator';
 
 // The curator's pure rules (ADR-0038): input bounds, the reply contract, the evaluation gate and promotion.
@@ -77,7 +77,7 @@ export interface IGateThreshold {
 }
 
 /** ADR-0038 §5. */
-export const CURATOR_GATES: Readonly<Record<TCuratorTask, readonly IGateThreshold[]>> = {
+export const CURATOR_GATES: Readonly<Record<TCuratorLabelTask, readonly IGateThreshold[]>> = {
   'classify-owner-message': [
     { label: 'standing-order', metric: 'precision', threshold: 0.9 },
     { label: 'standing-order', metric: 'recall', threshold: 0.8 },
@@ -145,7 +145,7 @@ export interface ICuratorClassCount {
  * precision. For match-standing-order the classes are covered / not-covered, and a covered prediction is a true
  * positive only when it names the gold order.
  */
-export const countRows = (task: TCuratorTask, labels: readonly string[], rows: readonly Pick<ICuratorEvalRow, 'gold' | 'predicted'>[]): ICuratorClassCount[] =>
+export const countRows = (task: TCuratorLabelTask, labels: readonly string[], rows: readonly Pick<ICuratorEvalRow, 'gold' | 'predicted'>[]): ICuratorClassCount[] =>
   labels.map((label) => {
     let support = 0;
     let predicted = 0;
@@ -174,7 +174,7 @@ export const addCounts = (a: readonly ICuratorClassCount[], b: readonly ICurator
   });
 
 /** Each check passes only when its 95% lower bound reaches the threshold (consult 16-promote-gate, ruling 1). */
-export const scoreCounts = (task: TCuratorTask, counts: readonly ICuratorClassCount[]): ICuratorScore => {
+export const scoreCounts = (task: TCuratorLabelTask, counts: readonly ICuratorClassCount[]): ICuratorScore => {
   const ratio = (num: number, den: number): number | null => (den === 0 ? null : num / den);
   const classes: ICuratorClassScore[] = counts.map((c) => ({ ...c, precision: ratio(c.truePositives, c.predicted), recall: ratio(c.truePositives, c.support) }));
   const checks: ICuratorGateCheck[] = CURATOR_GATES[task].map((gate) => {
@@ -190,7 +190,7 @@ export const scoreCounts = (task: TCuratorTask, counts: readonly ICuratorClassCo
   return { classes, checks, pass: checks.every((check) => check.pass) };
 };
 
-export const scoreRows = (task: TCuratorTask, labels: readonly string[], rows: readonly Pick<ICuratorEvalRow, 'gold' | 'predicted'>[]): ICuratorScore =>
+export const scoreRows = (task: TCuratorLabelTask, labels: readonly string[], rows: readonly Pick<ICuratorEvalRow, 'gold' | 'predicted'>[]): ICuratorScore =>
   scoreCounts(task, countRows(task, labels, rows));
 
 export const percentile = (values: readonly number[], p: number): number | null => {
@@ -207,7 +207,7 @@ export interface ICuratorShadowRow {
 }
 
 export interface IPromoteInput {
-  task: TCuratorTask;
+  task: TCuratorLabelTask;
   now: number;
   promptVersion: string;
   labels: readonly string[];

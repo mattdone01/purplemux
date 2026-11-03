@@ -810,6 +810,13 @@ Keys in use:
   curator.enabled
                on (the default) or off: off makes no curator call at all and the board shows the
                curator down, switched off. Admin token only.
+  curator.standing-order.candidates
+               Workspaces whose owner messages labelled standing-order file no SO-n: the label goes
+               as one digest line to the named tab, a candidate for its own decision record (story
+               23; consult v2 point 6). ws-...=<tab name> pairs, comma-separated, or none. Unset means
+               ws-ldhziO=v2-scrum-master. A value REPLACES that default: keep the pair in it, or
+               treasury-v2's workspace files SO-n. It applies once classify-owner-message routes,
+               whether or not the workspace is in curator.routing.workspaces. Admin token only.
   flow.window-minutes  flow.lock-busy-percent  flow.queue-length  flow.oldest-minutes
                The flow-flag thresholds (ADR-0026): the busy-share window in minutes 10..10080
                (default 360), the busy percent 1..100 (80), the queue length, a whole number
@@ -1380,8 +1387,25 @@ any prompt edit, re-pull of the tag or order edit is a new version, with its own
 with no digest known, calls wait for a probe, routing reads shadow and promote refuses.
 Tasks: classify-owner-message (standing-order, product-rule, answer, status-ping, one-off),
 flag-owner-question (an unmarked turn ending whose last 3 lines hold a '?'), match-standing-order
-(SO-n or not-covered; also every MC ask whose review needs approval or decision). Each is shadow
-(logged, nothing routes) until promoted.
+(SO-n or not-covered; also every MC ask whose review needs approval or decision), reshape-question
+(a refused question draft reworded; label reshaped | not-preserved | invalid and the draft's sha256,
+never its text). Each is shadow (logged, nothing routes) until promoted.
+
+Routing (story 23, ADR-0042). Only a curator label (never the rules') of the version the task was
+promoted on routes, and only in a workspace in curator.routing.workspaces; elsewhere the call record
+is the log. An owner message labelled standing-order is filed as SO-n (active at once) with one
+keep-or-strike MC item (curator-so-<n>, format 2 confirm, class bookkeeping, default keep), only when
+no active workspace or fleet order says the same (else already-filed SO-k) and the item can open (an
+orchestrator with a bound run; else not-filed). The curator-so- item prefix is the server's: an
+event that opens or revises one from anyone else is 400 invalid-request. Strike strikes the order
+only when it is that workspace's order and its source names the curator and the item's message; product-rule is appended to ~/.purplemux/workspaces/<ws>/spec-queue.md under its
+message id; answer adds a suggested link (suggestedAnswers on the item, never an answer) to the latest
+open item awaiting the owner; status-ping and one-off are counted. A workspace in
+curator.standing-order.candidates (default ws-ldhziO=v2-scrum-master) files no SO-n: once the task
+routes, the label is one digest line to that tab naming the message id and span. Each decision is a
+tab_events row, class log, kind curator-route: { task, sourceId, label, promptVersion, action,
+target | null, reason? }, never the text. More than 2% of a week's filed orders struck sends
+classify-owner-message back to shadow.
 
 GET  /api/cli/curator                       (purplemux curator status [--json])
   Any scope: { model, health, queued, liveSince | null, rateLimitMs, kodit | null, evals: [...],
@@ -1420,6 +1444,25 @@ GET  /api/cli/curator/spot-check?task=T                                     (cur
   curator-refused) while the task's last item stands. The matcher's opens only once its pool passes
   everything else. Options: all-right | some-wrong (numbers) | cant-judge (numbers); both lists:
   "wrong: 3,7; unsure: 12". GET reads the answer: unanswered | unreadable (reason) | answered.
+  label-queue, label-import and spot-check refuse reshape-question (400 curator-task-invalid).
+  curator eval --task reshape-question scores the first 100 replies over the held-out ids of
+  ~/.purplemux/curator/eval/reshape-question.json (Mission Control item ids, built by
+  scripts/curator/reshape-set.ts); only timeout, down and dropped are non-replies (unparsable and
+  error are failed replies; a draft over 6,000 tokens is not reshapable), and more than 10
+  non-replies first refuses the run. Promote needs
+  that run of the live version with 100 of 100 schema-valid and preservation-clean, the judge's
+  verdicts on it at >= 95% same (a missing verdict is different), 72 h since the version's first
+  live mc ask --fix call, and every live reply of it clean.
+GET  /api/cli/curator/reshape-pairs   (purplemux curator reshape-pairs)
+  Admin token only. { runId, promptVersion, pairs: [{ id, sha, original, reshaped }] } of the last
+  reshape run, from this server's memory (409 curator-refused after a restart): the judge's input on
+  stdout, never written to disk.
+POST /api/cli/curator/judge-import  { runId, verdicts: [{ id, sha, verdict: "same" | "different" }], judge? }
+  (purplemux curator judge-import --file F [--judge NAME]) Admin token only, the only writer of the
+  verdict file. Every id must be a replied row of that run with its sha256 (else 409, nothing written).
+GET  /api/cli/curator/message?workspaceId=WS&entryId=ID   (purplemux curator message -w WS ID)
+  A tab of WS, or admin. One owner message by its history id: { workspaceId, entryId, sentAt, message };
+  a credential-shaped message is refused (409 curator-refused), never shown.
 
 ## Board goal (ADR-0034 §10)
 
@@ -1792,15 +1835,24 @@ Question format v2 (ADR-0037):
 POST /api/cli/mission-control/questions/check?workspaceId=WS   { "question": { ... } }
   Any valid token. The events route's question check without the write: 200 { "ok", "formatVersion",
   "minVersion", "defects", "lint", "question" (normalized, null when refused), "reshape": {
-  "enabled": false, "reason" } }. The curator reshape is not enabled until harness-flow-loop
-  story 23 lands.
+  "enabled", "reason" | null } }: enabled only where reshape-question routes in WS.
+
+POST /api/cli/mission-control/questions/reshape?workspaceId=WS   { "question": { ... } }
+  A tab of WS, or admin. The curator's reshape of a refused draft (story 23). It posts nothing. 200 {
+  "outcome": "reshaped", "question" (format 2, the original in "source"), "promptVersion" } only where
+  reshape-question routes; elsewhere { "outcome": "shadow", "reason" } at once, the reshape queued
+  and logged. Otherwise "refused" (label not-preserved | invalid, defects), "no-reply" (reason),
+  "not-reshapable" (structural defects a wording change cannot fix), "not-a-draft" or "off". A
+  reshape keeps option ids, count and order, recommended, needsText, answerType, kind, class, the
+  default, story ids, blocking fields and every evidence URL, and fields already within their limit.
 
 CLI equivalents:
   purplemux mc ask -w WS --json @DRAFT [--fix]
   DRAFT is one attention.opened or attention.updated event (or { "events": [that event] }). The
   CLI checks its question, prints every defect (field: measured, limit) and exits 2 with nothing
-  posted, or prints any lint and posts the event. --fix asks for the curator reshape; while it is
-  not enabled the CLI prints the defects and the reason and exits 2. "mc" is "mission".
+  posted, or prints any lint and posts the event. --fix asks the curator reshape route: a
+  "reshaped" draft is checked again and posted in the same command; any other outcome prints with
+  the defects and exits 2. "mc" is "mission".
   purplemux mission snapshot -w WS
   purplemux mission bootstrap -w WS
   purplemux mission events -w WS --json '{"events":[...]}'

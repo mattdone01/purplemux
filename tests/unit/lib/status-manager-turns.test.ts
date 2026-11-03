@@ -22,6 +22,8 @@ vi.mock('@/lib/workspace-store', () => ({
   getWorkspaces: vi.fn(async () => ({ workspaces: [] })),
   getWorkspacesCached: vi.fn(async () => ({ workspaces: [] })),
 }));
+// The curator's turn-end hook is fire-and-forget; its module chain must not load after this file's environment is gone.
+vi.mock('@/lib/curator-service', () => ({ curatorOnUnmarkedTurnEnd: vi.fn() }));
 vi.mock('@/lib/liveness-manager', () => ({ getLivenessManager: () => ({ statusForTab: vi.fn(), removeTab: vi.fn() }) }));
 vi.mock('@/lib/tmux', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/tmux')>()),

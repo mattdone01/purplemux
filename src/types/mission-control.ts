@@ -200,8 +200,18 @@ export interface IMissionAttentionItem extends Omit<IMissionQuestion, 'evidence'
   /** The latest `attention.updated` record (ADR-0037 §4); null when the item was never updated since ADR-0037. */
   changes: IMissionQuestionChanges | null;
   blocked?: IMissionBlockedCost;
+  /** Owner messages the curator read as an answer to this item (story 23): links, never answers. Absent when none. */
+  suggestedAnswers?: IMissionAnswerSuggestion[];
   createdAt: number;
   updatedAt: number;
+}
+
+export interface IMissionAnswerSuggestion {
+  /** The message-history entry id of the owner's message. */
+  entryId: string;
+  /** The curator's quote from it; null when it gave none or it was withheld. */
+  span: string | null;
+  at: number;
 }
 
 /** Where an owner answer was made (story 33, the epic's Measure). */

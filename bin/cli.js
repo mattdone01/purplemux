@@ -946,6 +946,29 @@ const missionAsk = async (rest, wsId) => {
   return out(await postAsk(event, wsId, rest.includes('--fix')));
 };
 
+// `--fix` (story 23 AC 3): the curator's reshape, accepted only past the preservation check and the format-2 validator.
+// The reshaped event goes back through the check and is posted in this same command; the original is in `source`.
+const RESHAPE_OUTCOME_TEXT = {
+  off: (r) => r.reason,
+  'not-a-draft': (r) => `not reshaped: ${r.reason}`,
+  'not-reshapable': (r) => `not reshaped: a reshape changes wording only, and these need a structural fix:\n${defectLines(r.defects)}`,
+  shadow: (r) => r.reason,
+  'no-reply': (r) => `the curator gave no reshape (${r.reason}); fix the defects in the draft`,
+  refused: (r) => `the curator's reshape was refused (${r.label === 'not-preserved' ? 'it moved a fixed field' : 'still invalid'}):\n${defectLines(r.defects)}`,
+};
+
+const reshapeAsk = async (event, question, query) => {
+  const { body: reshape } = await api('POST', `/api/cli/mission-control/questions/reshape?${query}`, { question });
+  if (reshape.outcome === 'reshaped') {
+    process.stderr.write(`--fix: the curator reshaped the draft (prompt ${reshape.promptVersion}); the original is kept in question_json.source\n`);
+    const { itemId, humanReview } = event.payload;
+    return { ...event, payload: { itemId, ...(humanReview ? { humanReview } : {}), ...reshape.question } };
+  }
+  const text = Object.hasOwn(RESHAPE_OUTCOME_TEXT, reshape.outcome) ? RESHAPE_OUTCOME_TEXT[reshape.outcome](reshape) : 'the curator answered an outcome this CLI does not know';
+  process.stderr.write(`--fix: ${text}\n`);
+  return null;
+};
+
 // The question check, then the event: what `mc ask` does with a draft, and what `curator spot-check open` posts.
 const postAsk = async (event, wsId, fix) => {
   const { itemId: _itemId, humanReview: _humanReview, ...question } = event.payload;
@@ -954,8 +977,8 @@ const postAsk = async (event, wsId, fix) => {
   if (!check.ok) {
     process.stderr.write(`question defects (${check.defects.length}, min-version ${check.minVersion}):\n${defectLines(check.defects)}\n`);
     if (fix) {
-      const reshape = check.reshape || {};
-      process.stderr.write(`--fix: ${reshape.enabled ? 'the curator reshape is enabled, but this CLI cannot call it yet' : reshape.reason || 'the curator reshape is not enabled'}; fix the defects in the draft\n`);
+      const reshaped = await reshapeAsk(event, question, query);
+      if (reshaped) return postAsk(reshaped, wsId, false);
     }
     return fail('question-invalid', `${check.defects.length} defect${check.defects.length === 1 ? '' : 's'}; nothing was posted`);
   }
@@ -2481,6 +2504,7 @@ const boardText = (board) => {
   }
   if (board.curator) {
     const agree = (task) => {
+      if (task.task === 'reshape-question') return 'gated by its evaluation and judge';
       const a = (board.curator.agreement || []).find((x) => x.task === task.task);
       return a && a.compared ? `${a.agreed}/${a.compared} agree` : 'no labels in 72 h';
     };
@@ -2596,9 +2620,10 @@ const cmdBoard = async (args) => {
 };
 
 // ── curator (ADR-0038) ───────────────────────────────────────────────────────
-const CURATOR_TASKS = ['classify-owner-message', 'flag-owner-question', 'match-standing-order'];
+const CURATOR_TASKS = ['classify-owner-message', 'flag-owner-question', 'match-standing-order', 'reshape-question'];
 const CURATOR_USAGE = 'usage: curator status [--json] | eval --task T [--split holdout|train|all] [--no-wait] [--json] | promote|demote --task T'
-  + ' | label-queue --task T [--json] | label-import --task T --file F | spot-check open -w WS [--task T] [--run RUN] | spot-check show [--task T] [--json]';
+  + ' | label-queue --task T [--json] | label-import --task T --file F | spot-check open -w WS [--task T] [--run RUN] | spot-check show [--task T] [--json]'
+  + ' | reshape-pairs | judge-import --file F [--judge NAME] | message -w WS ID';
 const CURATOR_EVAL_POLL_MS = 5000;
 const { spotCheckEvent } = require('./curator-spot-check-event.js');
 const CURATOR_SPLITS = ['holdout', 'train', 'all'];
@@ -2643,6 +2668,22 @@ const curatorEvalText = (result) => {
     + `${result.task === 'flag-owner-question' ? '' : ', and the owner\'s spot check'})\n`);
 };
 
+// The reshape gate on this run alone (story 23 AC 4): 100 replies, every one valid and preserved; the judge and 72 h follow.
+const reshapeEvalText = (result) => {
+  const kv = (o) => Object.entries(o || {}).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+  process.stdout.write(`reshape-question · prompt ${result.promptVersion} · ${result.model} · run ${result.runId} · ran ${boardTime(result.startedAt)} to ${boardTime(result.finishedAt)}\n`);
+  if (result.refused) {
+    process.stdout.write(`REFUSED: ${result.refused} — promote reads this as no evaluation\n`);
+    return;
+  }
+  process.stdout.write(`replies ${result.replied}/${result.target} of ${result.candidates} held-out ids · non-replies ${result.nonReplies}`
+    + ` · unresolved ${result.unresolved} · not reshapable ${result.unreshapable} · latency p50 ${result.latency.p50 ?? '—'} ms, p90 ${result.latency.p90 ?? '—'} ms\n`);
+  process.stdout.write(`labels: ${kv(result.labels)} · outcomes: ${kv(result.outcomes)}\n`);
+  const pass = result.replied >= result.target && result.clean === result.replied;
+  process.stdout.write(`${pass ? 'PASS' : 'FAIL'} schema-valid and preservation-clean ${result.clean}/${result.replied} (needs ${result.target}/${result.target})\n`);
+  process.stdout.write('promote also needs the judge (curator reshape-pairs, then curator judge-import: >= 95% same decision, same options) and 72 h of clean live replies\n');
+};
+
 const curatorEval = async (rest) => {
   const task = curatorTask(rest);
   const split = flagValue(rest, '--split') || (rest.includes('--all') ? 'all' : 'holdout');
@@ -2656,7 +2697,7 @@ const curatorEval = async (rest) => {
     if (body.progress && body.progress.error) fail('curator-unavailable', `evaluation failed: ${body.progress.error}`);
     if (body.progress && !body.progress.running && body.result && body.result.startedAt >= since) {
       if (rest.includes('--json')) return out(body.result);
-      return curatorEvalText(body.result);
+      return task === 'reshape-question' ? reshapeEvalText(body.result) : curatorEvalText(body.result);
     }
     if (body.progress && process.stderr.isTTY) process.stderr.write(`\r${task}: ${body.progress.done}/${body.progress.total || '?'}`);
     await new Promise((resolve) => setTimeout(resolve, CURATOR_EVAL_POLL_MS));
@@ -2673,6 +2714,11 @@ const curatorStatusText = (body) => {
   for (const t of body.tasks) {
     const gate = t.gate || {};
     process.stdout.write(`${t.task} gate:\n`);
+    if (t.task === 'reshape-question') {
+      for (const r of gate.refusals || []) process.stdout.write(`  FAIL ${r}\n`);
+      if (!(gate.refusals || []).length) process.stdout.write('  PASS every condition\n');
+      continue;
+    }
     if (gate.checks) for (const check of gate.checks) process.stdout.write(`  pool ${curatorCheckText(check)}\n`);
     else process.stdout.write('  pool: no usable held-out evaluation of this prompt\n');
     for (const c of gate.shadow || []) process.stdout.write(`  shadow ${c.label} ${c.metric} ${c.successes}/${c.trials} (needs n >= 30, >= ${c.threshold.toFixed(2)}): ${c.pass ? 'PASS' : 'FAIL'}\n`);
@@ -2735,6 +2781,31 @@ const cmdCurator = async (args) => {
     return;
   }
   if (sub === 'label-import') return curatorLabelImport(rest);
+  if (sub === 'reshape-pairs') {
+    // The judge's input, one JSON document on stdout: nothing is written to disk (consult C2 (iii)).
+    requireEnv();
+    const { body } = await api('GET', '/api/cli/curator/reshape-pairs');
+    return out(body);
+  }
+  if (sub === 'judge-import') {
+    const file = flagValue(rest, '--file');
+    if (!file) die('--file is required: { "runId", "verdicts": [{ "id", "sha", "verdict": "same" | "different" }] }');
+    let doc;
+    try { doc = JSON.parse(require('fs').readFileSync(file, 'utf-8')); } catch (e) { die(`--file ${file}: ${e.message}`); }
+    requireEnv();
+    const { body } = await api('POST', '/api/cli/curator/judge-import', { runId: doc.runId, verdicts: doc.verdicts, judge: flagValue(rest, '--judge') || doc.judge });
+    return out(body);
+  }
+  if (sub === 'message') {
+    const wsId = missionWorkspace(rest);
+    const entryId = rest.filter((a, i) => !a.startsWith('-') && rest[i - 1] !== '-w' && rest[i - 1] !== '--workspace')[0];
+    if (!entryId) die('usage: curator message -w WS ID');
+    requireEnv();
+    const { body } = await api('GET', `/api/cli/curator/message?workspaceId=${encodeURIComponent(wsId)}&entryId=${encodeURIComponent(entryId)}`);
+    if (rest.includes('--json')) return out(body);
+    process.stdout.write(`${body.workspaceId}/${body.entryId} at ${body.sentAt}:\n${body.message}\n`);
+    return;
+  }
   if (sub === 'promote' || sub === 'demote') {
     const task = curatorTask(rest);
     requireEnv();
@@ -3222,8 +3293,11 @@ Commands:
   mc ask -w WS --json @DRAFT [--fix]      Check one attention.opened/attention.updated event's question against the
                                            server's format rules (ADR-0037), then post it. Defects print one per line
                                            (field: measured, limit) and exit 2 with nothing posted; lint on an accepted
-                                           v1 question prints to stderr. --fix asks for the curator reshape; until it
-                                           is enabled it prints the defects and exits 2. "mc" is "mission".
+                                           v1 question prints to stderr. --fix asks the curator to reshape a refused
+                                           draft: where reshape-question routes, a reshape that keeps every option id,
+                                           count, order, recommended, answerType, class and evidence URL is checked and
+                                           posted (the original kept in question_json.source); elsewhere it is logged,
+                                           the defects print and it exits 2. "mc" is "mission".
   portfolio board --workspaces WS,WS       Scoped release blockers for the explicitly selected workspaces (current manager tab and read grants)
   portfolio report -w WS --json '{...}'    Current orchestrator reports a revisioned blocker; see API guide for schema
   portfolio applied -w WS --json '{...}'   Current orchestrator records application of a routed note, not blocker resolution
@@ -3256,6 +3330,12 @@ Commands:
                                            import their gold labels (admin)
   curator spot-check open -w WS [--task T] [--run RUN] | spot-check show [--task T] [--json]
                                            Open the owner's spot check as one Mission Control item; read it
+  curator reshape-pairs | judge-import --file F [--judge NAME]
+                                           The reshape gate's judge (story 23): print the last evaluation's
+                                           original and reshaped drafts with their sha256 to stdout (admin);
+                                           import the verdicts, bound to that run and each sha256 (admin)
+  curator message -w WS ID [--json]        One owner message by its history id (a standing-order candidate
+                                           names the id, never the text); a tab reads its own workspace's
   pool show [--json]                       The compute pool (ADR-0039): per host threads, load, free memory, disk,
                                            GPU and slots used/cap; an unknown host shows no figures, never 0
   pool acquire --kind gate|build|tab [--mem GB] [--ttl 60m] [--panel-type T] [--role R]

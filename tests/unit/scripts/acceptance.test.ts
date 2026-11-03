@@ -721,7 +721,7 @@ describe('checks-wip-cap.cjs (story 20)', () => {
   });
 
   it('parseArgs accepts --only-wave 1..WAVE_COUNT only, naming the range', () => {
-    expect(checks.WAVE_COUNT).toBe(14);
+    expect(checks.WAVE_COUNT).toBe(15);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '1']).onlyWave).toBe(1);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '9']).onlyWave).toBe(9);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '10']).onlyWave).toBe(10);
@@ -729,10 +729,11 @@ describe('checks-wip-cap.cjs (story 20)', () => {
     expect(checks.parseArgs(['--state', 's', '--only-wave', '12']).onlyWave).toBe(12);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '13']).onlyWave).toBe(13);
     expect(checks.parseArgs(['--state', 's', '--only-wave', '14']).onlyWave).toBe(14);
-    for (const bad of ['0', '15', '1.5', '-1', 'x', '']) {
-      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..14, not ${JSON.stringify(bad)}`);
+    expect(checks.parseArgs(['--state', 's', '--only-wave', '15']).onlyWave).toBe(15);
+    for (const bad of ['0', '16', '1.5', '-1', 'x', '']) {
+      expect(() => checks.parseArgs(['--state', 's', '--only-wave', bad])).toThrow(`--only-wave takes an integer 1..15, not ${JSON.stringify(bad)}`);
     }
-    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..14, not null');
+    expect(() => checks.parseArgs(['--state', 's', '--only-wave'])).toThrow('--only-wave takes an integer 1..15, not null');
   });
 
 
@@ -800,9 +801,9 @@ process.exit(1);
     });
 
     it('an out-of-range --only-wave is refused with exit 2 and runs nothing', () => {
-      const r = runChecks('ok', ['--only-wave', '15']);
+      const r = runChecks('ok', ['--only-wave', '16']);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('--only-wave takes an integer 1..14, not "15"');
+      expect(r.stderr).toContain('--only-wave takes an integer 1..15, not "16"');
       expect(r.calls).toEqual([]);
     });
 
@@ -864,9 +865,9 @@ describe('checks-mc-question-v2.cjs (ADR-0037)', () => {
     expect(refused.ok ? [] : refused.defects.map((entry: { message: string }) => entry.message)).toEqual([wave8.ONE_OPTION_DEFECT]);
   });
 
-  it('expects the reshape reason the check route serves', () => {
-    const route = fs.readFileSync(path.join(ROOT, 'src/pages/api/cli/mission-control/questions/check.ts'), 'utf8');
-    expect(route).toContain(wave8.RESHAPE_REASON);
+  it('expects the reason the CLI prints for a draft no reshape can fix (story 23)', () => {
+    const cli = fs.readFileSync(path.join(ROOT, 'bin/cli.js'), 'utf8');
+    expect(cli).toContain(wave8.RESHAPE_REASON);
   });
 });
 
@@ -1443,13 +1444,22 @@ describe('wave 12: one attention alert per item that becomes owner-visible (stor
 
   it('runs twelfth, after the context lifecycle wave and before the effects wave (story 15 merge, M2)', () => {
     expect(fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks.cjs'), 'utf8'))
-      .toMatch(/\(\) => wave11\(inst, helpers\), \(\) => waveAttentionAlert\(inst, helpers\),\n {2}\(\) => wave13\(inst, helpers\), \(\) => wave14\(inst, helpers\)\];/);
+      .toMatch(/\(\) => wave11\(inst, helpers\), \(\) => waveAttentionAlert\(inst, helpers\),\n {2}\(\) => wave13\(inst, helpers\), \(\) => wave14\(inst, helpers\),/);
   });
 
-  it('the local curator runs fourteenth, last, after the effects wave (story 16 merge, M3)', () => {
+  it('the local curator runs fourteenth, after the effects wave (story 16 merge, M3)', () => {
     const text = fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks.cjs'), 'utf8');
-    expect(text).toMatch(/\(\) => wave13\(inst, helpers\), \(\) => wave14\(inst, helpers\)\];/);
+    expect(text).toMatch(/\(\) => wave13\(inst, helpers\), \(\) => wave14\(inst, helpers\),/);
     expect(text).toContain("const { wave14 } = require('./checks-curator.cjs');");
     expect(fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks-curator.cjs'), 'utf8')).toMatch(/^\/\/ Wave-14 acceptance checks/m);
+  });
+
+  it('curator routing runs fifteenth, last, after the curator wave (story 23)', () => {
+    const text = fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks.cjs'), 'utf8');
+    expect(text).toMatch(/\(\) => wave14\(inst, helpers\),\n {2}\(\) => wave15\(inst, helpers\)\];/);
+    expect(text).toContain("const { wave15 } = require('./checks-curator-routing.cjs');");
+    const wave = createRequire(import.meta.url)(path.join(ROOT, 'scripts/acceptance/checks-curator-routing.cjs'));
+    expect(fs.readFileSync(path.join(ROOT, 'scripts/acceptance/checks-curator-routing.cjs'), 'utf8')).toMatch(/^\/\/ Wave-15 acceptance checks/m);
+    expect(wave.RESHAPE_DRAFT('ws-a').payload.options.map((o: { id: string }) => o.id)).toEqual(['friday', 'tonight']);
   });
 });

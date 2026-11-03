@@ -1,7 +1,12 @@
-import type { TCuratorTask } from '@/types/curator';
+import {
+  RESHAPE_LABELS, RESHAPE_RULES_LABEL, RESHAPE_SYSTEM, contextNeedsReshape, judgeReshape, parseReshapeReply, reshapeReplySchema, reshapeUserPrompt,
+  type TLiftedDraft,
+} from '@/lib/curator-reshape';
+import type { TCuratorLabelTask, TCuratorTask } from '@/types/curator';
 
-// The curator's tasks (ADR-0038 §2): free-text classification only. Each task carries its prompt (versioned:
-// the gate passes on one version), the labels the model may answer, and the rules that route when it does not.
+// The curator's tasks (ADR-0038 §2): free-text classification, and the question reshape (ADR-HFL-11 rule 3). Each
+// task carries its prompt (versioned: the gate passes on one version), the labels the model may answer, and the rules
+// that route when it does not.
 
 export interface ICuratorStandingOrderRef {
   id: string;
@@ -12,7 +17,13 @@ export interface ICuratorTaskInput {
   text: string;
   /** match-standing-order: the orders in force for the asking tab's workspace. */
   orders?: readonly ICuratorStandingOrderRef[];
+  /** reshape-question: the draft lifted to the format-2 shape, and the draft as the agent wrote it. */
+  draft?: TLiftedDraft;
+  source?: Record<string, unknown>;
 }
+
+/** A parsed reply: the label the call record carries, the quoted span, and (reshape) what the caller needs beside it. */
+export type TCuratorReplyParse = { ok: true; label: string; span: string | null; payload?: unknown } | { ok: false; error: string };
 
 export interface ICuratorPrompt {
   system: string;
@@ -27,6 +38,14 @@ export interface ICuratorTaskSpec {
   labels: readonly string[];
   prompt: (input: ICuratorTaskInput) => ICuratorPrompt;
   rules: (input: ICuratorTaskInput) => string;
+  /** The JSON schema Ollama constrains the reply to; a label enum of the offered labels when absent. */
+  schema?: (prompt: ICuratorPrompt, input: ICuratorTaskInput) => object;
+  /** The reply's reader; the label reader (`parseCuratorReply`) when absent. */
+  parse?: (content: string, prompt: ICuratorPrompt, input: ICuratorTaskInput) => TCuratorReplyParse;
+  /** False: the input is a structure that a cut would break, so a long one is refused, never cut. */
+  cut?: boolean;
+  /** The proposed draft inside a parsed payload: the client records its sha256, never its text. */
+  draftOf?: (payload: unknown) => unknown;
 }
 
 export const OWNER_MESSAGE_CLASSES = ['standing-order', 'product-rule', 'answer', 'status-ping', 'one-off'] as const;
@@ -46,12 +65,17 @@ export const CURATOR_LABEL_NAMES: Readonly<Record<string, string>> = {
   'not-a-question': 'Not a question',
   [COVERED]: 'Covered by a standing order',
   [NOT_COVERED]: 'Not covered',
+  reshaped: 'Reshaped and valid',
+  'not-preserved': 'Reshape moved a fixed field',
+  invalid: 'Reshape still invalid',
+  [RESHAPE_RULES_LABEL]: 'Not reshaped',
 };
 
 export const CURATOR_TASK_NAMES: Readonly<Record<TCuratorTask, string>> = {
   'classify-owner-message': 'Owner message class',
   'flag-owner-question': 'Unmarked question flag',
   'match-standing-order': 'Standing-order match',
+  'reshape-question': 'Question reshape',
 };
 
 export const curatorTaskName = (task: string): string =>
@@ -159,7 +183,15 @@ const fnv1a = (text: string): string => {
   return hash.toString(16).padStart(8, '0');
 };
 
-const PLACEHOLDER: ICuratorTaskInput = { text: '\u0000TEXT\u0000', orders: [{ id: '\u0000ID\u0000', text: '\u0000ORDER\u0000' }] };
+const PLACEHOLDER_DRAFT: TLiftedDraft = {
+  formatVersion: 2, kind: 'question', answerType: 'single', evidence: [], context: '\u0000CONTEXT\u0000',
+  options: [{ id: '\u0000ID\u0000', label: '\u0000LABEL\u0000', recommended: false, needsText: false }],
+};
+const PLACEHOLDER: ICuratorTaskInput = {
+  text: '\u0000TEXT\u0000', orders: [{ id: '\u0000ID\u0000', text: '\u0000ORDER\u0000' }], draft: PLACEHOLDER_DRAFT, source: PLACEHOLDER_DRAFT,
+};
+/** The same draft with a context over the limit: the reshape asks for the context only then, so both prompts are hashed. */
+const PLACEHOLDER_LONG: ICuratorTaskInput = { ...PLACEHOLDER, draft: { ...PLACEHOLDER_DRAFT, context: '\u0000'.repeat(4001) } };
 
 /**
  * A prompt's identity: the model, the request options, the template rendered on placeholders, its labels and the reply
@@ -171,21 +203,56 @@ export const promptHash = (
   labels: readonly string[],
   model: string = CURATOR_MODEL,
   request: object = CURATOR_REQUEST_OPTIONS,
+  schema: ICuratorTaskSpec['schema'] = (rendered) => replySchema(rendered.labels),
 ): string => {
-  const rendered = prompt(PLACEHOLDER);
+  const render = (input: ICuratorTaskInput) => {
+    const rendered = prompt(input);
+    return { system: rendered.system, user: rendered.user, offered: rendered.labels, schema: schema(rendered, input) };
+  };
+  const short = render(PLACEHOLDER);
+  const long = render(PLACEHOLDER_LONG);
+  // The classifiers' identity is the object story 16 hashed, key for key: their versions, clocks and evidence carry over.
   return fnv1a(JSON.stringify({
-    model, request, system: rendered.system, user: rendered.user, labels, offered: rendered.labels, schema: replySchema(rendered.labels),
+    model, request, system: short.system, user: short.user, labels, offered: short.offered, schema: short.schema,
+    ...(JSON.stringify(long) === JSON.stringify(short) ? {} : { long }),
   }));
 };
 
-const spec = (task: TCuratorTask, base: string, labels: readonly string[], prompt: ICuratorTaskSpec['prompt'], rules: ICuratorTaskSpec['rules']): ICuratorTaskSpec =>
-  ({ task, promptVersion: `${base}-${promptHash(prompt, labels)}`, labels, prompt, rules });
+type TSpecExtras = Pick<ICuratorTaskSpec, 'schema' | 'parse' | 'cut' | 'draftOf'>;
+
+const spec = (
+  task: TCuratorTask, base: string, labels: readonly string[], prompt: ICuratorTaskSpec['prompt'], rules: ICuratorTaskSpec['rules'], extras: TSpecExtras = {},
+): ICuratorTaskSpec =>
+  ({ task, promptVersion: `${base}-${promptHash(prompt, labels, CURATOR_MODEL, CURATOR_REQUEST_OPTIONS, extras.schema)}`, labels, prompt, rules, ...extras });
+
+const reshapePrompt = (input: ICuratorTaskInput): ICuratorPrompt => {
+  const draft = input.draft ?? PLACEHOLDER_DRAFT;
+  return { system: RESHAPE_SYSTEM, user: reshapeUserPrompt(input.source ?? draft, contextNeedsReshape(draft)), labels: [...RESHAPE_LABELS] };
+};
+
+/** The reshape's reply: the model's text merged into the draft, then the preservation check and the format-2 validator. */
+const reshapeParse = (content: string, _prompt: ICuratorPrompt, input: ICuratorTaskInput): TCuratorReplyParse => {
+  if (!input.draft) return { ok: false, error: 'no draft to reshape' };
+  const parsed = parseReshapeReply(content, input.draft);
+  if (!parsed.ok) return parsed;
+  const verdict = judgeReshape(input.draft, parsed.reply, input.source ?? input.draft);
+  return { ok: true, label: verdict.label, span: null, payload: verdict };
+};
 
 export const CURATOR_TASKS: Readonly<Record<TCuratorTask, ICuratorTaskSpec>> = {
   'classify-owner-message': spec('classify-owner-message', 'com-v1', OWNER_MESSAGE_CLASSES, ownerMessagePrompt, ownerMessageRules),
   'flag-owner-question': spec('flag-owner-question', 'foq-v1', QUESTION_FLAGS, questionPrompt, questionRules),
   // The rules never cover a permission question: a standing-order answer comes only from a gated model (ADR-0038 §4).
   'match-standing-order': spec('match-standing-order', 'mso-v1', [COVERED, NOT_COVERED], matchPrompt, () => NOT_COVERED),
+  'reshape-question': spec('reshape-question', 'rsq-v1', RESHAPE_LABELS, reshapePrompt, () => RESHAPE_RULES_LABEL, {
+    schema: (_prompt, input) => {
+      const draft = input.draft ?? PLACEHOLDER_DRAFT;
+      return reshapeReplySchema(draft, contextNeedsReshape(draft));
+    },
+    parse: reshapeParse,
+    cut: false,
+    draftOf: (payload) => (payload as { candidate?: unknown } | null)?.candidate ?? null,
+  }),
 };
 
 /**
@@ -203,6 +270,10 @@ export const servedVersion = (task: TCuratorTask, digest: string | null, orders?
 };
 
 export const CURATOR_TASK_IDS = Object.keys(CURATOR_TASKS) as TCuratorTask[];
+/** The classifiers: the tasks with a labelled set, a label queue and the Clopper-Pearson gate. */
+export const CURATOR_LABEL_TASK_IDS = CURATOR_TASK_IDS.filter((task): task is TCuratorLabelTask => task !== 'reshape-question');
 
 export const isCuratorTask = (value: unknown): value is TCuratorTask =>
   typeof value === 'string' && Object.hasOwn(CURATOR_TASKS, value);
+
+export const isLabelTask = (task: TCuratorTask): task is TCuratorLabelTask => task !== 'reshape-question';
