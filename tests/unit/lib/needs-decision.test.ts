@@ -30,7 +30,7 @@ vi.mock('@/lib/curator-service', () => ({ curatorOnMissionEvents: curator.onMiss
 import { MissionControlStore } from '@/lib/mission-control-store';
 import { validateMissionQuestion } from '@/lib/mission-question-format';
 import { buildNeedsDecisionQuestion, needsDecisionPushDetail, parseNeedsDecisionLine } from '@/lib/needs-decision';
-import { needsDecisionAskerNotice, needsDecisionDeps, needsDecisionItemId, openNeedsDecisionItem, type INeedsDecisionStop } from '@/lib/needs-decision-opener';
+import { needsDecisionAskerNotice, needsDecisionDeps, needsDecisionItemId, needsDecisionLineKey, openNeedsDecisionItem, type INeedsDecisionStop } from '@/lib/needs-decision-opener';
 import { extractTurnMarker, lastTurnLine, TURN_TAIL_CHARS } from '@/lib/turn-end';
 
 const ORCH: Omit<IMissionBinding, 'generation'> = { tabId: 'tab-orch', providerId: 'claude', sessionId: 'sess-orch', runtimeGeneration: 'launch-1' };
@@ -124,6 +124,7 @@ describe('the server opens the item (story 14 AC 4)', () => {
     live.identity = ORCH;
     live.orchestratorTabId = 'tab-orch';
     attention.alert.mockClear();
+    delete (globalThis as { __ptNeedsDecisionItemIds?: unknown }).__ptNeedsDecisionItemIds;
   });
   afterEach(() => {
     store.close();
@@ -301,6 +302,74 @@ describe('the server opens the item (story 14 AC 4)', () => {
     expect(input.openerTabId).toBe('tab-w');
     expect([...input.fresh]).toEqual([eventId]);
     expect(input.events.map((e) => [e.id, e.entityId])).toEqual([[eventId, (first as { itemId: string }).itemId]]);
+  });
+
+  // Review r1 finding 1: one id per line key inside 24 h, so "its id would be" is true and a later open takes that id.
+  it('not opened, then opened, for one line: the same id', async () => {
+    const deps = await needsDecisionDeps();
+    const first = await openNeedsDecisionItem(deps, stop({ stopSeq: 1, stopAt: 1_000 }));
+    expect(first).toMatchObject({ opened: false, reason: 'no-orchestrator-run' });
+    startRun();
+    const second = await openNeedsDecisionItem(deps, stop({ stopSeq: 2, stopAt: 2_000, turnStartedAt: Date.now() + 1 }));
+    expect(second).toEqual({ opened: true, itemId: (first as { itemId: string }).itemId, runId: 'run-a' });
+    expect(items().map((item) => item.id)).toEqual([(first as { itemId: string }).itemId]);
+    expect(await openNeedsDecisionItem(deps, stop({ stopSeq: 3, stopAt: 3_000, turnStartedAt: Date.now() + 2 })))
+      .toEqual({ opened: false, reason: 'already-open', itemId: (first as { itemId: string }).itemId });
+  });
+
+  it('a refused or failed stop, then an opened stop: the same id', async () => {
+    startRun();
+    const deps = await needsDecisionDeps();
+    const refused = await openNeedsDecisionItem({ ...deps, apply: async () => { throw new Error('store said no'); } }, stop({ stopSeq: 1, stopAt: 1_000 }));
+    const failed = await openNeedsDecisionItem({ ...deps, openRuns: () => { throw new Error('SQLITE_BUSY'); } }, stop({ stopSeq: 2, stopAt: 2_000 }));
+    expect(refused).toMatchObject({ reason: 'refused' });
+    expect(failed).toMatchObject({ reason: 'error', itemId: (refused as { itemId: string }).itemId });
+    expect(await openNeedsDecisionItem(deps, stop({ stopSeq: 3, stopAt: 3_000 }))).toMatchObject({ opened: true, itemId: (refused as { itemId: string }).itemId });
+  });
+
+  it('the remembered id lasts 24 h: past it, a stop takes its own id', async () => {
+    const deps = await needsDecisionDeps();
+    const first = await openNeedsDecisionItem(deps, stop({ stopSeq: 1, stopAt: 1_000 }));
+    const later = await openNeedsDecisionItem({ ...deps, now: () => Date.now() + 24 * 60 * 60_000 + 1 }, stop({ stopSeq: 2, stopAt: 2_000 }));
+    expect((later as { itemId: string }).itemId).not.toBe((first as { itemId: string }).itemId);
+    expect((later as { itemId: string }).itemId.slice(0, 19)).toBe((first as { itemId: string }).itemId.slice(0, 19));
+  });
+
+  // Finding 2: path (i) tells the orchestrator to open the id; the worker's repeats never make a second item.
+  it('path (i): the worker\'s repeats name the one id and open no second item, before and after the orchestrator opens it', async () => {
+    const deps = await needsDecisionDeps();
+    const line = 'NEEDS-DECISION: Ship the export now? (a) yes (b) no';
+    const first = await openNeedsDecisionItem(deps, stop({ line, stopSeq: 1, stopAt: 1_000 }));
+    const itemId = (first as { itemId: string }).itemId;
+    expect(await openNeedsDecisionItem(deps, stop({ line, stopSeq: 2, stopAt: 2_000 }))).toMatchObject({ reason: 'no-orchestrator-run', itemId });
+    startRun();
+    const { applyMissionEventBatch } = await import('@/lib/mission-control-events');
+    await applyMissionEventBatch('ws-a', [{
+      eventId: 'orch-open-i', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
+      type: 'attention.opened', payload: {
+        itemId, ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line }),
+        humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
+      },
+    }], { tabId: 'tab-orch', identity: 'launch' });
+    expect(await openNeedsDecisionItem(deps, stop({ line, stopSeq: 3, stopAt: 3_000, turnStartedAt: Date.now() + 1 })))
+      .toEqual({ opened: false, reason: 'already-open', itemId });
+    expect(items()).toHaveLength(1);
+  });
+
+  // Finding 3: an asker that quotes the item id in its repeat keeps the line's key, so it finds the same item.
+  it('the line key ignores a quoted nd- id, bare or in brackets', async () => {
+    const id = `nd-${'0123456789abcdef'.repeat(2)}`;
+    const key = needsDecisionLineKey('ws-a', 'tab-w', 'NEEDS-DECISION: Ship it? (a) yes (b) no');
+    expect(needsDecisionLineKey('ws-a', 'tab-w', `NEEDS-DECISION: Ship it? ${id} (a) yes (b) no`)).toBe(key);
+    expect(needsDecisionLineKey('ws-a', 'tab-w', `NEEDS-DECISION: Ship it? (${id}) (a) yes (b) no`)).toBe(key);
+    expect(needsDecisionLineKey('ws-a', 'tab-w', `NEEDS-DECISION: Ship it? [${id}] (a) yes (b) no`)).toBe(key);
+    expect(needsDecisionLineKey('ws-a', 'tab-w', 'NEEDS-DECISION: Ship it now? (a) yes (b) no')).not.toBe(key);
+    startRun();
+    const deps = await needsDecisionDeps();
+    const opened = await openNeedsDecisionItem(deps, stop({ line: 'NEEDS-DECISION: Ship it? (a) yes (b) no' }));
+    const quoted = `NEEDS-DECISION: Ship it? (${(opened as { itemId: string }).itemId}) (a) yes (b) no`;
+    expect(await openNeedsDecisionItem(deps, stop({ line: quoted, stopSeq: 9, stopAt: 9_000, turnStartedAt: Date.now() + 1 })))
+      .toEqual({ opened: false, reason: 'already-open', itemId: (opened as { itemId: string }).itemId });
   });
 
   it('a producer cannot take the server opener\'s event namespace', async () => {

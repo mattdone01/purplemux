@@ -97,25 +97,36 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   `[no MC item (<reason>): owner push for this line already dispatched at <UTC ISO time>]`. Not the inbox: an inbox
   line carries no caller text (ADR-0012) and addresses a tab. Seed SO-6 says exactly this.
 
-- **Amendment (story 36, 2026-11-04): the asking tab hears what became of its line.** The note above rides only the
-  nudge to the tab's escalation target, so a tab with none — the orchestrator itself, or a tab in a workspace with no
-  orchestrator and no `reportsTo` — never learned that its line opened no item (D1: an orchestrator with no run ended
-  on its line four times; the owner push went out each time, and the asker heard nothing). Now, after the stop is recorded, the asking tab gets one
-  urgent event of wake kind `mission`: `[needs-decision] item-not-opened: <reason>[ (<detail>, one line, at most 200
-  chars)]. Your NEEDS-DECISION line opened no Mission Control item; <fate>. Its id would be <id>.` for every outcome that
-  opens no item (`no-orchestrator`, `no-orchestrator-run`, `refused`, `error`), whoever else is told. The fate is what
-  the server did: `the orchestrator <tab> is told to open it` for (i), or the (ii) push text. An asker that is the
-  configured orchestrator also reads `You are the orchestrator: resume or start your Mission Control run, then open item
-  <id> from your line with your human review.` When an item opened or is already open and the tab has no escalation
-  target, it gets `[needs-decision] [MC item <id> opened for the owner by the server: do not open another] …` (or
-  `already open for the owner`), so it can name the item. A tab whose target exists is told nothing itself: its target
-  holds the note. One notice per workspace, tab and normalized line in 24 h, in memory like the push (at most 2,000
-  keys; a restart may send one more), so the line the tab repeats while it waits never wakes it in a loop. The key is
-  the line, not the outcome: a later outcome of the same line inside the window is not sent, and the not-opened notice
-  already names the id the item would take. The (ii) push is unchanged, and it means "no item opened": it goes out only
-  when no item opened, so it never carries an `itemId`, and the phone opens the tab for it (an `nd-` id on a
-  `needs-decision` alert would open that item; the server sends none). Its body is `needsDecisionPushDetail`
-  (`needs-decision.ts`), exported so the phone's fixtures are built by the server's own function.
+- **Amendment (story 36, 2026-11-04; review r1): the asking tab hears what became of its line.** The note above rides
+  only the nudge to the tab's escalation target, so a tab with none — the orchestrator itself, or a tab in a workspace
+  with no orchestrator and no `reportsTo` — never learned that its line opened no item (D1: an orchestrator with no run
+  ended on its line four times; the owner push went out each time, and the asker heard nothing).
+  - **One id per line key for 24 h.** The server remembers the first id it mints for a line key (workspace, tab and the
+    normalized line) and gives that id to every stop of the line for 24 h from then, unless an item of that id has
+    closed (answered, resolved, cancelled), when the line asks anew under the stop's own id. So "its id would be <id>"
+    is true: a later server open, or the orchestrator's open from the (i) note, takes that id, and a second open meets
+    the same id (`already-open`). In memory, at most 2,000 keys; a restart may mint one more. The id shape above is
+    unchanged; only its second half is now the first stop's.
+  - **The line key ignores a quoted id.** `nd-<32 hex>`, bare or in `()`/`[]`, is removed before the line is
+    normalized, so an asker that quotes its item id in the repeat keeps the key and finds the same item.
+  - **The notice.** After the stop is recorded, the asking tab gets one urgent event of wake kind `mission`. For every
+    outcome that opens no item (`no-orchestrator`, `no-orchestrator-run`, `refused`, `error`), whoever else is told:
+    `[needs-decision] item-not-opened: <reason>[ (<detail>, one line, at most 200 chars)]. Your NEEDS-DECISION line
+    opened no Mission Control item; <fate>. Its id would be <id>.` The fate is what the server did: for (i), `your
+    orchestrator <tab> was told to open it and holds the line now: do not repeat the line`; for (ii), the push text. An
+    asker that is the configured orchestrator also reads `You are the orchestrator: resume or start your Mission Control
+    run, then open item <id> from your line with your human review.` When an item opened or is already open and the
+    nudge that carries the note does not go out — no escalation target, or the tab's `reportOn` holds the marker back —
+    it gets `[needs-decision] [MC item <id> opened for the owner by the server: do not open another] …` (or `already
+    open for the owner`), so it can name the item. When that nudge goes out, the target holds the note and the asker is
+    told nothing itself.
+  - **Once a day per line, notice and id.** Keyed by line key, notice kind (not opened / item) and id, 24 h, in memory
+    like the push (at most 2,000 keys; a restart may send one more). The line the tab repeats while it waits never wakes
+    it in a loop, while the open that follows a not-opened stop is still told; a repeat after the open sends nothing new.
+  - **The (ii) push is unchanged, and it means "no item opened".** It goes out only when no item opened, so it never
+    carries an `itemId`, and the phone opens the tab for it (an `nd-` id on a `needs-decision` alert would open that
+    item; the server sends none). Its body is `needsDecisionPushDetail` (`needs-decision.ts`), exported so the phone's
+    fixtures are built by the server's own function.
 
 ### 3. Auth waits
 - Watch kind `auth`, target `aws-sso:<profile>`, until `signed-in`, interval 60 s by default; CLI

@@ -10,6 +10,15 @@ import { buildNeedsDecisionQuestion, isNeedsDecisionLine } from '@/lib/needs-dec
 
 const log = createLogger('needs-decision');
 
+/** One item id per line key for 24 h (story 36 review r1, finding 1); in memory, so a restart may mint one more. */
+export const NEEDS_DECISION_ID_WINDOW_MS = 24 * 60 * 60_000;
+const NEEDS_DECISION_ID_MEMORY = 2_000;
+const g = globalThis as unknown as { __ptNeedsDecisionItemIds?: Map<string, { itemId: string; at: number }> };
+const rememberedIds = (): Map<string, { itemId: string; at: number }> => {
+  if (!g.__ptNeedsDecisionItemIds) g.__ptNeedsDecisionItemIds = new Map();
+  return g.__ptNeedsDecisionItemIds;
+};
+
 export interface INeedsDecisionStop {
   workspaceId: string;
   tabId: string;
@@ -43,13 +52,18 @@ export interface INeedsDecisionDeps {
   itemsOpenedByTab: (workspaceId: string, tabId: string, since: number) => string[];
   /** Still-open items (candidate or open) whose id starts with the prefix, whoever opened them (confirm C3). */
   openItemsWithIdPrefix: (workspaceId: string, prefix: string) => string[];
+  /** The item's state, or null when no item has that id. */
+  itemState: (itemId: string) => string | null;
   apply: (workspaceId: string, events: unknown[], opener: IMissionItemOpener, options: { serverPrefix: string }) => Promise<unknown>;
 }
 
 const digest = (...parts: Array<string | number>): string =>
   createHash('sha256').update(parts.join('\0')).digest('hex');
 
-const normalized = (line: string): string => line.trim().replace(/\s+/g, ' ');
+// An item id the asker quotes in its repeat, bare or in brackets, is not part of the question (review r1, finding 3).
+const QUOTED_ITEM_ID = /[([]?\bnd-[0-9a-f]{32}\b[)\]]?/g;
+
+const normalized = (line: string): string => line.replace(QUOTED_ITEM_ID, ' ').trim().replace(/\s+/g, ' ');
 
 export const needsDecisionLineKey = (workspaceId: string, tabId: string, line: string): string =>
   digest(workspaceId, tabId, normalized(line)).slice(0, 16);
@@ -66,10 +80,44 @@ export const needsDecisionItemId = (
   return { lineKey, itemId: `nd-${lineKey}${digest(lineKey, stop.stopAt, stop.stopSeq).slice(0, 16)}` };
 };
 
+/**
+ * The line's id for this stop (review r1, finding 1): the id first minted for the line key within 24 h, unless an item
+ * of that id has closed (answered, resolved, cancelled: the same line then asks anew); otherwise this stop's own id,
+ * remembered. So every not-opened outcome names the id a later open takes, and a second open meets the same id.
+ * `closed` reports an item of that id that exists and is no longer open; a failing read counts as not closed.
+ */
+export const stableNeedsDecisionItemId = (
+  stop: Pick<INeedsDecisionStop, 'workspaceId' | 'tabId' | 'line' | 'stopSeq' | 'stopAt'>,
+  now: number,
+  closed: (itemId: string) => boolean,
+): { itemId: string; lineKey: string } => {
+  const fresh = needsDecisionItemId(stop);
+  const ids = rememberedIds();
+  const held = ids.get(fresh.lineKey);
+  if (held && now - held.at < NEEDS_DECISION_ID_WINDOW_MS) {
+    let isClosed = false;
+    try {
+      isClosed = closed(held.itemId);
+    } catch {
+      isClosed = false;
+    }
+    if (!isClosed) return { itemId: held.itemId, lineKey: fresh.lineKey };
+  }
+  ids.delete(fresh.lineKey);
+  ids.set(fresh.lineKey, { itemId: fresh.itemId, at: now });
+  while (ids.size > NEEDS_DECISION_ID_MEMORY) ids.delete(ids.keys().next().value!);
+  return fresh;
+};
+
+const OPEN_STATES = new Set(['candidate', 'open']);
+
 /** Never throws: a failing dependency is the `error` outcome, so the stop always takes a path (confirm D2, C4). */
 export const openNeedsDecisionItem = async (deps: INeedsDecisionDeps, stop: INeedsDecisionStop): Promise<TNeedsDecisionOutcome> => {
   if (!isNeedsDecisionLine(stop.line)) return { opened: false, reason: 'not-needs-decision' };
-  const { itemId, lineKey } = needsDecisionItemId(stop);
+  const { itemId, lineKey } = stableNeedsDecisionItemId(stop, deps.now(), (id) => {
+    const state = deps.itemState(id);
+    return state !== null && !OPEN_STATES.has(state);
+  });
   try {
     return await openItem(deps, stop, itemId, lineKey);
   } catch (err) {
@@ -153,6 +201,7 @@ export const needsDecisionDeps = async (): Promise<INeedsDecisionDeps> => {
     openRuns: (workspaceId) => getMissionControlStore().listOpenRunBindings(workspaceId),
     itemsOpenedByTab: (workspaceId, tabId, since) => getMissionControlStore().itemsOpenedByTab(workspaceId, tabId, since),
     openItemsWithIdPrefix: (workspaceId, prefix) => getMissionControlStore().openItemsWithIdPrefix(workspaceId, prefix),
+    itemState: (itemId) => getMissionControlStore().itemStates([itemId]).get(itemId) ?? null,
     apply: (workspaceId, events, opener, options) => applyMissionEventBatch(workspaceId, events, opener, options),
   };
 };

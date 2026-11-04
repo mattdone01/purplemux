@@ -92,10 +92,10 @@ import { syncRemoteTranscript } from '@/lib/remote-transcript';
 import { needsDecisionPushDetail } from '@/lib/needs-decision';
 import {
   needsDecisionDeps,
-  needsDecisionItemId,
   needsDecisionLineKey,
   needsDecisionAskerNotice,
   openNeedsDecisionItem,
+  stableNeedsDecisionItemId,
   type TNeedsDecisionAskerNotice,
   type TNeedsDecisionOutcome,
 } from '@/lib/needs-decision-opener';
@@ -248,8 +248,11 @@ interface INeedsDecisionResult {
   note: string;
   /** The nudge goes out whatever the tab's reportOn. */
   mustReach: boolean;
-  /** What the asking tab itself is told, once per line a day; null when its escalation target is told instead. */
-  asker: { lineKey: string; notice: TNeedsDecisionAskerNotice } | null;
+  /**
+   * What the asking tab itself is told, once per line, notice and id a day. `ifUnheard`: only when the nudge carrying
+   * the note does not go out (no escalation target, or its reportOn holds the marker back).
+   */
+  asker: { lineKey: string; notice: TNeedsDecisionAskerNotice; ifUnheard: boolean } | null;
 }
 
 export class StatusManager {
@@ -2828,6 +2831,10 @@ export class StatusManager {
     const nudge = forwarded && turnEnd.kind === 'turn-marker'
       ? { kind: 'turn-marker' as const, detail: `${turnEnd.lines.join('\n')}${decision.note}` }
       : null;
+    // The note reached a tab only if this nudge goes out to a target (review r1, finding 4).
+    const askerHeard = decision.asker?.ifUnheard && nudge !== null
+      && await this.hasEscalationTarget(tabId, entry);
+    if (this.tabs.get(tabId) !== entry || entry.lastEvent?.name !== 'stop' || entry.lastEvent.seq !== stopSeq) return;
     if (entry.cliState !== 'ready-for-review') {
       this.applyCliState(tabId, entry, 'ready-for-review', { nudge });
       this.persistToLayout(entry);
@@ -2840,17 +2847,23 @@ export class StatusManager {
     this.persistTurnEnd(entry);
     this.broadcastUpdate(tabId, entry);
     // After the stop is recorded: the notice starts a turn, whose prompt-submit must not race this stop (story 36).
-    if (decision.asker) this.tellAsker(tabId, entry, decision.asker.lineKey, decision.asker.notice);
+    if (decision.asker && !askerHeard) this.tellAsker(tabId, entry, decision.asker.lineKey, decision.asker.notice);
+  }
+
+  private async hasEscalationTarget(tabId: string, entry: ITabStatusEntry): Promise<boolean> {
+    const ws = await getWorkspaceByIdCached(entry.workspaceId);
+    return !!ws && this.escalationTarget(tabId, entry, ws) !== null;
   }
 
   /**
    * The asking tab hears of its own NEEDS-DECISION line as an urgent Mission Control event (story 36, D1): the item
-   * that opened when no other tab gets its nudge, or why none opened. Once per line a day, so the line the tab repeats
-   * while it waits (SO-6) never wakes it in a loop.
+   * that opened when no nudge carries the note, or why none opened. Once per line, notice and id a day, so the line the
+   * tab repeats while it waits (SO-6) never wakes it in a loop, while the open that follows a not-opened is still told.
    */
   private tellAsker(tabId: string, entry: ITabStatusEntry, lineKey: string, notice: TNeedsDecisionAskerNotice): void {
     if (this.isRetired(tabId)) return;
-    if (onceADay(needsDecisionAskerNotices(), lineKey, Date.now()) !== null) return;
+    const key = `${lineKey}:${notice.kind === 'item' ? 'item' : 'not-opened'}:${notice.itemId}`;
+    if (onceADay(needsDecisionAskerNotices(), key, Date.now()) !== null) return;
     void this.tabEvents.route({
       workspaceId: entry.workspaceId, tabId, kind: 'mission', text: needsDecisionAskerNotice(notice), class: classifyWake('mission'),
     }).catch((err) => log.warn(`NEEDS-DECISION notice to ${tabId} failed: ${err instanceof Error ? err.message : err}`));
@@ -2874,15 +2887,14 @@ export class StatusManager {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       log.error(`NEEDS-DECISION opener unavailable for ${tabId}: ${detail}`);
-      outcome = { opened: false, reason: 'error', itemId: needsDecisionItemId(stop).itemId, detail };
+      outcome = { opened: false, reason: 'error', itemId: stableNeedsDecisionItemId(stop, Date.now(), () => false).itemId, detail };
     }
     if (!outcome.opened && outcome.reason === 'not-needs-decision') return { note: '', mustReach: false, asker: null };
     const lineKey = needsDecisionLineKey(entry.workspaceId, tabId, line);
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
-    // The note rides the nudge to the escalation target; a tab with none would never hear what became of its line.
-    const unheard = !ws || !this.escalationTarget(tabId, entry, ws);
+    // The note rides the nudge to the escalation target; when that nudge does not go out, the asker hears it itself.
     const itemNotice = (state: 'opened' | 'already-open', itemId: string): INeedsDecisionResult['asker'] =>
-      (unheard ? { lineKey, notice: { kind: 'item', state, itemId } } : null);
+      ({ lineKey, notice: { kind: 'item', state, itemId }, ifUnheard: true });
     if (outcome.opened) {
       return {
         note: ` [MC item ${outcome.itemId} opened for the owner by the server: do not open another]`,
@@ -2899,6 +2911,7 @@ export class StatusManager {
     const orchestratorTabId = ws?.orchestration?.orchestratorTabId ?? null;
     const notOpened = (fate: string): INeedsDecisionResult['asker'] => ({
       lineKey,
+      ifUnheard: false,
       notice: {
         kind: 'not-opened', reason: outcome.reason, itemId: outcome.itemId, detail: outcome.detail, fate,
         askerIsOrchestrator: orchestratorTabId === tabId,
@@ -2910,7 +2923,7 @@ export class StatusManager {
       return {
         note: ` [no MC item (${outcome.reason}): open it yourself: resume or start your Mission Control run, then open item ${outcome.itemId} from this line with your human review. The owner has not been told.]`,
         mustReach: true,
-        asker: notOpened(`the orchestrator ${orchestratorTabId} is told to open it`),
+        asker: notOpened(`your orchestrator ${orchestratorTabId} was told to open it and holds the line now: do not repeat the line`),
       };
     }
     // (ii) No tab can act: one push per line a day, never awaited.

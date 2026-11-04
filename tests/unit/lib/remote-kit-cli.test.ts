@@ -43,6 +43,26 @@ describe('the remote kit\'s CLI modules (story 36)', () => {
     }
   });
 
+  // Review r1 finding 6: `require('./x')` without .js, and a require inside a function, are the kit's modules too.
+  it('takes extensionless, lazy and template-literal requires, transitively, and the fixture kit runs from a bare directory', async () => {
+    expect(cliLocalRequires("require('./a'); const b = () => require(\"./b.js\"); require(`./c`); require('./d.json'); require('fs');"))
+      .toEqual(['a.js', 'b.js', 'c.js', 'd.json']);
+    const fixture = path.resolve('tests/fixtures/remote-kit-cli');
+    const cli = await readRemoteCliModules((name) => fs.readFile(path.join(fixture, name), 'utf-8'));
+    expect(Object.keys(cli ?? {}).sort()).toEqual(['cli.js', 'deep.js', 'greet.js', 'late.js', 'lazy-helper.js']);
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-kit-fixture-'));
+    try {
+      for (const file of remoteKitFiles({ tmuxConf: '', cli, prompt: null }).filter((f) => f.path.startsWith('bin/'))) {
+        await fs.mkdir(path.dirname(path.join(dir, file.path)), { recursive: true });
+        await fs.writeFile(path.join(dir, file.path), file.content);
+      }
+      const { stdout } = await run(process.execPath, [path.join(dir, 'bin/cli.js')], { env: { NODE_ENV: 'test', PATH: process.env.PATH ?? '', HOME: dir } });
+      expect(stdout).toBe('hello cli.js! lazy late\n');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ships no CLI when cli.js cannot be read', () => {
     expect(remoteKitFiles({ tmuxConf: '', cli: null, prompt: null }).some((file) => file.path.startsWith('bin/'))).toBe(false);
   });

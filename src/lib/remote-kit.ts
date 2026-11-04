@@ -66,10 +66,13 @@ export interface IRemoteKitFile {
 
 const SAFE_RELATIVE = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 
-const LOCAL_REQUIRE = /require\(\s*['"]\.\/([A-Za-z0-9._-]+\.js)['"]\s*\)/g;
+// `require('./x.js')`, `require("./x")` or require(`./x`), anywhere in the source: a lazy require in a function counts.
+const LOCAL_REQUIRE = /require\(\s*(['"`])\.\/([A-Za-z0-9._-]+)\1\s*\)/g;
+const HAS_EXTENSION = /\.(?:c?js|json)$/;
 
-/** The sibling modules (`require('./x.js')`) a CLI source loads. */
-export const cliLocalRequires = (source: string): string[] => [...new Set([...source.matchAll(LOCAL_REQUIRE)].map((m) => m[1]))];
+/** The sibling modules a CLI source loads, by file name; an extensionless one resolves as Node does first, to `.js`. */
+export const cliLocalRequires = (source: string): string[] =>
+  [...new Set([...source.matchAll(LOCAL_REQUIRE)].map((m) => (HAS_EXTENSION.test(m[2]) ? m[2] : `${m[2]}.js`)))];
 
 /**
  * `bin/cli.js` and every sibling module it requires, transitively, by file name (story 36): the kit's CLI runs from

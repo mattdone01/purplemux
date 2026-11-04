@@ -239,7 +239,12 @@ describe('stop classification (ADR-0018)', () => {
       expect(needsDecision.open.mock.calls[0]).toEqual([{}, {
         workspaceId: 'ws-1', tabId: 'worker', tabName: 'w1', line, lineComplete: true, stopSeq: entry.turnEnd!.seq, stopAt: entry.turnEnd!.at, turnStartedAt: 1234,
       }]);
-      expect(paste).not.toHaveBeenCalled();
+      // Review r1 finding 4: the marker is held back from root, so the asker itself learns the item.
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+      expect(sentTo(paste, 'tmux-root')).toEqual([]);
+      expect(sentTo(paste, 'tmux-worker')).toEqual([
+        '[needs-decision] [MC item nd-0123456789abcdef0123456789abcdef opened for the owner by the server: do not open another] Name this id while you wait; the owner\'s answer arrives through Mission Control.',
+      ]);
       expect(manager.getReportOnFilteredCount()).toBe(1);
     });
 
@@ -298,7 +303,7 @@ describe('stop classification (ADR-0018)', () => {
       manager.registerTab('worker', { ...worker('claude-code', await writeLines('claude/nd5.jsonl', [claudeEnd(`Ok.\n\n${line}`)])), reportOn: ['DONE'] as TTurnMarkerName[] });
       manager.updateTabFromHook('tmux-worker', 'stop');
       await waitFor(() => expect(paste).toHaveBeenCalledTimes(2));
-      expect(sentTo(paste, 'tmux-worker')).toEqual([notOpened('no-orchestrator-run (root)', 'the orchestrator root is told to open it')]);
+      expect(sentTo(paste, 'tmux-worker')).toEqual([notOpened('no-orchestrator-run (root)', 'your orchestrator root was told to open it and holds the line now: do not repeat the line')]);
       expect(sentTo(paste, 'tmux-root')[0]).toBe(`[orchestrator-watchdog] worker worker (w1) ended: ${line} [no MC item (no-orchestrator-run): open it yourself: resume or start your Mission Control run, then open item ${ID} from this line with your human review. The owner has not been told.] — read with: purplemux tab result -w ws-1 worker`);
       expect(pushes()).toEqual([]);
     });
@@ -310,7 +315,7 @@ describe('stop classification (ADR-0018)', () => {
       manager.registerTab('worker', worker('claude-code', await writeLines('claude/nd5e.jsonl', [claudeEnd(`Ok.\n\n${line}`)])));
       manager.updateTabFromHook('tmux-worker', 'stop');
       await waitFor(() => expect(paste).toHaveBeenCalledTimes(2));
-      expect(sentTo(paste, 'tmux-worker')[0]).toMatch(/^\[needs-decision\] item-not-opened: error \(store unavailable\)\. Your NEEDS-DECISION line opened no Mission Control item; the orchestrator root is told to open it\. Its id would be nd-[0-9a-f]{32}\.$/);
+      expect(sentTo(paste, 'tmux-worker')[0]).toMatch(/^\[needs-decision\] item-not-opened: error \(store unavailable\)\. Your NEEDS-DECISION line opened no Mission Control item; your orchestrator root was told to open it and holds the line now: do not repeat the line\. Its id would be nd-[0-9a-f]{32}\.$/);
       expect(sentTo(paste, 'tmux-root')[0]).toMatch(/ \[no MC item \(error\): open it yourself: resume or start your Mission Control run, then open item nd-[0-9a-f]{32} from this line with your human review\. The owner has not been told\.\] — read with/);
       expect(needsDecision.open).not.toHaveBeenCalled();
     });
@@ -430,6 +435,30 @@ describe('stop classification (ADR-0018)', () => {
       await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
       expect(paste).toHaveBeenCalledWith('tmux-worker',
         notOpened(`${reason} (the store said no)`, 'owner push dispatched, delivery not confirmed', ORCH_TAIL));
+    });
+
+    it.each(['no-orchestrator-run', 'refused', 'error'])('D1 (e): %s, then opened, for one line: both notices go out; a repeat after the open sends nothing new', async (reason) => {
+      askerIsOrchestrator();
+      needsDecision.open
+        .mockResolvedValueOnce({ opened: false, reason, itemId: ID, detail: 'worker' })
+        .mockResolvedValueOnce({ opened: true, itemId: ID, runId: 'run-a' })
+        .mockResolvedValueOnce({ opened: false, reason: 'already-open', itemId: ID });
+      const { manager, paste } = await managerWithPaste();
+      const line = 'NEEDS-DECISION: Ship it?';
+      manager.registerTab('worker', worker('claude-code', await writeLines(`claude/nd14-${reason}.jsonl`, [claudeEnd(`Ok.\n\n${line}`)])));
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(1));
+      for (const count of [2, 3]) {
+        manager.updateTabFromHook('tmux-worker', 'prompt-submit');
+        manager.updateTabFromHook('tmux-worker', 'stop');
+        await waitFor(() => expect(needsDecision.open).toHaveBeenCalledTimes(count));
+        await settle();
+      }
+      const told = sentTo(paste, 'tmux-worker');
+      expect(told).toHaveLength(2);
+      expect(told[0]).toContain(`item-not-opened: ${reason}`);
+      expect(told[0]).toContain(`Its id would be ${ID}.`);
+      expect(told[1]).toBe(`[needs-decision] [MC item ${ID} opened for the owner by the server: do not open another] Name this id while you wait; the owner's answer arrives through Mission Control.`);
     });
 
     it('D1 (d): the same line again inside 24 h tells the asker nothing new; after 24 h it is told again', async () => {
