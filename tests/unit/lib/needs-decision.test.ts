@@ -29,8 +29,8 @@ vi.mock('@/lib/curator-service', () => ({ curatorOnMissionEvents: curator.onMiss
 
 import { MissionControlStore } from '@/lib/mission-control-store';
 import { validateMissionQuestion } from '@/lib/mission-question-format';
-import { buildNeedsDecisionQuestion, parseNeedsDecisionLine } from '@/lib/needs-decision';
-import { needsDecisionDeps, needsDecisionItemId, openNeedsDecisionItem, type INeedsDecisionStop } from '@/lib/needs-decision-opener';
+import { buildNeedsDecisionQuestion, needsDecisionPushDetail, parseNeedsDecisionLine } from '@/lib/needs-decision';
+import { needsDecisionAskerNotice, needsDecisionDeps, needsDecisionItemId, openNeedsDecisionItem, type INeedsDecisionStop } from '@/lib/needs-decision-opener';
 import { extractTurnMarker, lastTurnLine, TURN_TAIL_CHARS } from '@/lib/turn-end';
 
 const ORCH: Omit<IMissionBinding, 'generation'> = { tabId: 'tab-orch', providerId: 'claude', sessionId: 'sess-orch', runtimeGeneration: 'launch-1' };
@@ -310,5 +310,35 @@ describe('the server opens the item (story 14 AC 4)', () => {
       eventId: 'system:needs-decision:forged', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
       type: 'attention.opened', payload: { itemId: 'forged', ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line: 'NEEDS-DECISION: x?' }) },
     }], null)).rejects.toThrow('event ID uses a reserved namespace');
+  });
+});
+
+describe('the asking tab\'s notice (story 36, D1)', () => {
+  const ID = 'nd-0123456789abcdef0123456789abcdef';
+
+  it('names the item that opened, or the reason none did, the fate and the id it would have had', () => {
+    expect(needsDecisionAskerNotice({ kind: 'item', state: 'opened', itemId: ID }))
+      .toBe(`[needs-decision] [MC item ${ID} opened for the owner by the server: do not open another] Name this id while you wait; the owner's answer arrives through Mission Control.`);
+    expect(needsDecisionAskerNotice({ kind: 'not-opened', reason: 'no-orchestrator', itemId: ID, fate: 'owner push dispatched, delivery not confirmed', askerIsOrchestrator: false }))
+      .toBe(`[needs-decision] item-not-opened: no-orchestrator. Your NEEDS-DECISION line opened no Mission Control item; owner push dispatched, delivery not confirmed. Its id would be ${ID}.`);
+  });
+
+  it('collapses a refusal detail to one line of at most 200 chars, and tells an orchestrator how to open the item itself', () => {
+    const notice = needsDecisionAskerNotice({
+      kind: 'not-opened', reason: 'refused', itemId: ID, detail: `bad\n review ${'x'.repeat(400)}`, fate: 'f', askerIsOrchestrator: true,
+    });
+    const detail = /\(([^)]*)\)/.exec(notice)![1];
+    expect(detail.startsWith('bad review x')).toBe(true);
+    expect(detail).toHaveLength(200);
+    expect(notice.endsWith(`You are the orchestrator: resume or start your Mission Control run, then open item ${ID} from your line with your human review.`)).toBe(true);
+  });
+});
+
+describe('the owner push detail (story 36; the phone fixture generator calls it)', () => {
+  it('is `<tab name or id> · <workspace name or id>: <line without marker and tag, whitespace collapsed>`', () => {
+    expect(needsDecisionPushDetail({ tabId: 'tab-w', tabName: 'w1', workspaceId: 'ws-a', workspaceName: 'alpha', line: 'NEEDS-DECISION: [money]  Pay the\n vendor? (a) yes (b) no' }))
+      .toBe('w1 · alpha: Pay the vendor? (a) yes (b) no');
+    expect(needsDecisionPushDetail({ tabId: 'tab-w', tabName: '', workspaceId: 'ws-a', workspaceName: undefined, line: 'NEEDS-DECISION: Ship it?' }))
+      .toBe('tab-w · ws-a: Ship it?');
   });
 });

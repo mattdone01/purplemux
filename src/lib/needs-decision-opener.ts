@@ -121,6 +121,25 @@ const openItem = async (deps: INeedsDecisionDeps, stop: INeedsDecisionStop, item
   return { opened: true, itemId, runId: run.runId };
 };
 
+/** What the asking tab itself is told of its line (story 36, D1); `fate` says what the server did instead. */
+export type TNeedsDecisionAskerNotice =
+  | { kind: 'item'; state: 'opened' | 'already-open'; itemId: string }
+  | { kind: 'not-opened'; reason: TNeedsDecisionNoItemReason; itemId: string; detail?: string; fate: string; askerIsOrchestrator: boolean };
+
+const NOTICE_DETAIL_MAX = 200;
+
+export const needsDecisionAskerNotice = (notice: TNeedsDecisionAskerNotice): string => {
+  if (notice.kind === 'item') {
+    const state = notice.state === 'opened' ? 'opened for the owner by the server' : 'already open for the owner';
+    return `[needs-decision] [MC item ${notice.itemId} ${state}: do not open another] Name this id while you wait; the owner's answer arrives through Mission Control.`;
+  }
+  const detail = notice.detail ? ` (${notice.detail.replace(/\s+/g, ' ').trim().slice(0, NOTICE_DETAIL_MAX)})` : '';
+  const own = notice.askerIsOrchestrator
+    ? ` You are the orchestrator: resume or start your Mission Control run, then open item ${notice.itemId} from your line with your human review.`
+    : '';
+  return `[needs-decision] item-not-opened: ${notice.reason}${detail}. Your NEEDS-DECISION line opened no Mission Control item; ${notice.fate}. Its id would be ${notice.itemId}.${own}`;
+};
+
 /** The runtime wiring: the Mission Control store and the events route's own batch function. */
 export const needsDecisionDeps = async (): Promise<INeedsDecisionDeps> => {
   const [{ getMissionControlStore }, { applyMissionEventBatch }, { getWorkspaceById }] = await Promise.all([

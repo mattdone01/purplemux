@@ -761,7 +761,10 @@ tail, the stop's seq and time, and the turn's start (the previous stop's `at`, e
 `openNeedsDecisionItem`, which opens nothing when an item for the same line is still open or the tab already opened one
 this turn. The nudge's end line then carries the item note. With no item, a live orchestrator that receives the tab's
 escalations is told to open it (the nudge is forwarded even past `reportOn`); otherwise one `needs-decision` push goes
-to the owner, never awaited, at most once a day per line. A changed
+to the owner, never awaited, at most once a day per line. After the stop is recorded, `tellAsker` routes the asking tab
+its own notice (kind `mission`, class urgent; story 36): `item-not-opened: <reason>` for every outcome that opened no
+item, and the `[MC item <id> …]` note when an item is open but the tab has no escalation target to carry it. Once a day
+per line (`__ptNeedsDecisionAskerNotices`), so the line the tab repeats while it waits never wakes it in a loop. A changed
 standing order reaches each live agent tab (`liveAgentTabs`) as one `standing-order` event, class urgent.
 
 ### Turn rows and effect counts (story 15, ADR-0035 §7)
