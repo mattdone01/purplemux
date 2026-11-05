@@ -62,14 +62,25 @@ const CMD_TIMEOUT = 5000;
 /** A remote close waits out the reap script's 3 s grace and settle on top of the ssh round trip. */
 const REMOTE_REAP_TIMEOUT = 20_000;
 
+/** tmux commands that only read: a remote one is retried on any ssh exit 255 (story 11 consult ruling). */
+const TMUX_READ_COMMANDS: ReadonlySet<string> = new Set(['has-session', 'list-panes', 'display-message', 'capture-pane']);
+
 /**
  * One tmux call for a session, wherever it runs (ADR-0022): the local `purple`
- * socket, or `ssh <host> tmux -L pmux-<origin>` with the same arguments.
+ * socket, or `ssh <host> tmux -L pmux-<origin>` with the same arguments. A
+ * remote call that ssh fails (after `runSsh`'s one retry) throws
+ * `RemoteHostError`, so a route answers 503 `remote-host-unreachable`, never a
+ * raw 500 (story 11); tmux's own failure keeps its exit status and stderr.
  */
 const runTmux = async (sessionName: string, args: string[]): Promise<{ stdout: string; stderr: string }> => {
   const host = await sessionHostOf(sessionName);
-  if (host) return runSsh(host, remoteTmuxCommand(args), { timeoutMs: CMD_TIMEOUT });
-  return execFile('tmux', ['-L', TMUX_SOCKET, ...args], { timeout: CMD_TIMEOUT });
+  if (!host) return execFile('tmux', ['-L', TMUX_SOCKET, ...args], { timeout: CMD_TIMEOUT });
+  try {
+    return await runSsh(host, remoteTmuxCommand(args), { timeoutMs: CMD_TIMEOUT, retry: TMUX_READ_COMMANDS.has(args[0]) ? 'read' : 'connect' });
+  } catch (err) {
+    if (isSshFailure(err)) throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${describeRemoteFailure(err)}); tmux ${args[0]} for ${sessionName} not confirmed`);
+    throw err;
+  }
 };
 
 export const listSessions = async (): Promise<string[]> => {
@@ -497,7 +508,7 @@ export const sessionPresence = async (name: string): Promise<TSessionPresence> =
   const host = await sessionHostOf(name);
   if (!host) return (await hasSession(name)) ? 'present' : 'absent';
   try {
-    await runSsh(host, remoteTmuxCommand(['has-session', '-t', `=${name}`]), { timeoutMs: CMD_TIMEOUT });
+    await runSsh(host, remoteTmuxCommand(['has-session', '-t', `=${name}`]), { timeoutMs: CMD_TIMEOUT, retry: 'read' });
     return 'present';
   } catch (err) {
     return isTmuxAbsence(err) ? 'absent' : 'unknown';
@@ -533,6 +544,7 @@ export const observeRemoteProviderProcess = async (
     ({ stdout } = await runSsh(host, ['sh', '-s', '--', remoteSocketName(), sessionName, provider].map(shQuote).join(' '), {
       timeoutMs: CMD_TIMEOUT,
       input: REMOTE_PROVIDER_SCRIPT,
+      retry: 'read',
     }));
   } catch (err) {
     return { state: 'unknown', reason: `remote host ${host} did not answer (${describeRemoteFailure(err)})` };
@@ -559,7 +571,7 @@ export const assertRemoteHostsAnswer = async (sessionNames: readonly string[]): 
   for (const host of hosts) {
     if (registered && !registered.includes(host)) continue;
     try {
-      await runSsh(host, 'true', { timeoutMs: CMD_TIMEOUT });
+      await runSsh(host, 'true', { timeoutMs: CMD_TIMEOUT, retry: 'read' });
     } catch (err) {
       throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${describeRemoteFailure(err)}); nothing was closed`);
     }
@@ -727,7 +739,7 @@ interface IRemoteScan {
 const remotePanes = async (host: string): Promise<IRemoteScan> => {
   if ((scanBackoff.get(host) ?? 0) > Date.now()) return { panes: new Map(), answered: false };
   try {
-    const { stdout } = await runSsh(host, remoteTmuxCommand(['list-panes', '-a', '-F', ALL_PANES_FORMAT]), { timeoutMs: CMD_TIMEOUT });
+    const { stdout } = await runSsh(host, remoteTmuxCommand(['list-panes', '-a', '-F', ALL_PANES_FORMAT]), { timeoutMs: CMD_TIMEOUT, retry: 'read' });
     scanBackoff.delete(host);
     return { panes: parsePanes(stdout, host), answered: true };
   } catch (err) {

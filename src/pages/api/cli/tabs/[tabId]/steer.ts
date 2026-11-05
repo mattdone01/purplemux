@@ -2,7 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
 import { steerSession } from '@/lib/agent-steer';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
-import { TAB_NOT_FOUND_BODY, targetChangedBody } from '@/lib/cli-error';
+import { TAB_NOT_FOUND_BODY, remoteHostUnreachableBody, targetChangedBody } from '@/lib/cli-error';
 import { STEER_NO_REASON, decideSteerInterrupt, resolveSteerCaller } from '@/lib/steer-policy';
 import { parseRawFlag, rawRefusalText, terminalInputRefusal } from '@/lib/terminal-command-line';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
@@ -15,7 +15,9 @@ import { appendCoordinationAudit } from '@/lib/coordination-audit';
  * not interrupt unless it sends `interrupt: true` with a reason; any other caller, identified or not,
  * interrupts by default, as before. The classification is advisory: every steer that interrupts
  * writes one `steer-interrupt` audit line, which is the record. A terminal target refuses
- * multi-line text unless `raw: true` (D30, `@/lib/terminal-command-line`).
+ * multi-line text unless `raw: true` (D30, `@/lib/terminal-command-line`). A remote tab's host that
+ * does not answer over ssh is 503 `remote-host-unreachable` (retryable), never `session-not-running`
+ * (harness-flow-loop-2 story 11).
  */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== 'POST') {
@@ -89,6 +91,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     }
     if (!policy.ok) return res.status(409).json(policy);
     if (!result.ok) {
+      if (result.unreachable) return res.status(503).json(remoteHostUnreachableBody(result.unreachable));
       if (result.reason === 'session not found') {
         return res.status(409).json({ error: result.reason, code: 'session-not-running' });
       }

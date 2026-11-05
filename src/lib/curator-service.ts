@@ -140,7 +140,7 @@ const checkKodit = async (now: number): Promise<void> => {
   const state = await readCuratorState();
   if (state.liveSince === null || (state.kodit?.after && state.kodit.after.docsPerHour !== null)) return;
   const { runSsh } = await import('@/lib/remote-host');
-  const { stdout } = await runSsh(KODIT_LOG_HOST, `cat ${KODIT_LOG_PATH}`, { timeoutMs: 10_000 });
+  const { stdout } = await runSsh(KODIT_LOG_HOST, `cat ${KODIT_LOG_PATH}`, { timeoutMs: 10_000, retry: 'read' });
   const samples = parseKoditLog(stdout);
   const before = koditRate(samples, state.liveSince - KODIT_WINDOW_MS, state.liveSince);
   const after = now >= state.liveSince + KODIT_WINDOW_MS ? koditRate(samples, state.liveSince, state.liveSince + KODIT_WINDOW_MS) : null;

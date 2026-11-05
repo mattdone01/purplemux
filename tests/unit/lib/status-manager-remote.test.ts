@@ -127,12 +127,31 @@ describe('status of a remote terminal tab (ADR-0022 §11)', () => {
       expect(entry.cliState).toBe('ready-for-review');
     });
 
-    it('an answered scan without the session is real absence: the busy tab is forced idle as a local one would be', async () => {
+    it('an answered scan without the session, twice in a row, is real absence: the busy tab is forced idle as a local one would be', async () => {
       state.pane = false;
       state.answered = true;
       const { manager, entry } = await setupAgent('busy');
       await manager.poll();
+      // One scan that misses the agent is unknown (story 11 CARRY): the tab keeps busy.
+      expect(entry.cliState).toBe('busy');
+      await manager.poll();
       expect(entry.cliState).toBe('idle');
+    });
+
+    it('one scan that misses a live agent never flips a tab: a sighting between two misses starts the count again (story 11 CARRY)', async () => {
+      state.tab = { id: 'tab-r', name: 'r', order: 0, sessionName: 'pt-ws-1-pane-a-tab-r', panelType: 'claude-code', host: 'ai-server' };
+      const { manager, entry } = await setupAgent('ready-for-review');
+      vi.setSystemTime(T0 + 60_000);
+      state.answered = true;
+      for (const seen of [false, true, false]) {
+        state.pane = seen;
+        state.command = 'claude';
+        await manager.poll();
+        expect(entry.cliState).toBe('ready-for-review');
+      }
+      state.pane = false;
+      await manager.poll();
+      expect(entry.cliState).toBe('inactive');
     });
 
     it('resolveUnknown keeps a remote tab unknown while its host is unread, and resolves it once the pane reads', async () => {

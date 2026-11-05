@@ -2,7 +2,10 @@ import { execFile } from 'child_process';
 import os from 'os';
 import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { readServerPort } from '@/lib/server-port';
+import { createLogger } from '@/lib/logger';
 import type { IReapedProcess, IReapResult } from '@/lib/tab-reaper';
+
+const log = createLogger('remote-host');
 
 /**
  * Remote tabs (ADR-0022): a tab whose tmux session runs on another host, driven
@@ -184,10 +187,50 @@ export const isSshFailure = (err: unknown): boolean => {
 };
 
 /**
- * Run one command on `host`. Rejects like `execFile`: `code` is the remote exit
- * status, or 255 when ssh itself failed; `stdout`/`stderr` are attached.
+ * Which ssh failures `runSsh` retries (harness-flow-loop-2 story 11, consult ruling (c)). ControlMaster stays off
+ * (ADR-0022 §5), so a transient refusal at connect (OpenSSH PerSourcePenalties, MaxStartups) fails one call.
+ * - `connect` (every call): only a failure that proves the remote command never started. A 255 alone proves
+ *   nothing: a connection lost after the command started also ends in 255, and a second `send-keys` or create
+ *   would run twice.
+ * - `read`: the call site declares the command idempotent, so any exit 255 is retried as well.
  */
-export const runSsh = (
+export type TSshRetry = 'connect' | 'read';
+
+/** stderr line starts that prove ssh never reached the remote command (measured on OpenSSH 10.2p1). */
+const SSH_NEVER_CONNECTED = ['ssh: connect to host ', 'ssh: Could not resolve hostname ', 'kex_exchange_identification:', 'Connection timed out during banner exchange'];
+/** Failures that do not clear on their own; a repeated auth failure adds to a PerSourcePenalties penalty. */
+const SSH_NEVER_CLEARS = /: Permission denied \(|^Host key verification failed/;
+
+/**
+ * Whether one more attempt is safe and useful. Never a timeout (`killed`), a signal, a maxBuffer overflow (a string
+ * `code` without a spawn `syscall`: the command ran) or a remote exit other than 255 (tmux's absence, 17, the kit
+ * exit): those are answers, not transport failures.
+ */
+export const isRetryableSshFailure = (err: unknown, retry: TSshRetry): boolean => {
+  const e = err as (IRemoteExecError & { syscall?: unknown }) | null;
+  if (!e || e.killed || e.signal) return false;
+  if (typeof e.code === 'string') return typeof e.syscall === 'string' && e.syscall.startsWith('spawn');
+  if (e.code !== SSH_FAILURE_EXIT) return false;
+  const lines = (e.stderr ?? '').split('\n').map((line) => line.trim());
+  if (lines.some((line) => SSH_NEVER_CLEARS.test(line))) return false;
+  return retry === 'read' || lines.some((line) => SSH_NEVER_CONNECTED.some((start) => line.startsWith(start)));
+};
+
+/** The wait before the one retry. */
+export const SSH_RETRY_DELAY_MS = 2_000;
+
+let sshRetryDelayMs = SSH_RETRY_DELAY_MS;
+
+/** Tests only: the wait before the retry, so a fake execFile does not sleep 2 s per refusal. */
+export const configureSshRetryForTests = (opts: { delayMs: number }): void => {
+  sshRetryDelayMs = opts.delayMs;
+};
+
+export const resetSshRetryForTests = (): void => {
+  sshRetryDelayMs = SSH_RETRY_DELAY_MS;
+};
+
+const runSshOnce = (
   host: string,
   command: string,
   opts: { timeoutMs: number; input?: string },
@@ -208,6 +251,28 @@ export const runSsh = (
     child?.stdin?.on('error', () => {});
     child?.stdin?.end(opts.input ?? '');
   });
+
+/**
+ * Run one command on `host`. Rejects like `execFile`: `code` is the remote exit
+ * status, or 255 when ssh itself failed; `stdout`/`stderr` are attached. A
+ * transport failure that `isRetryableSshFailure` accepts for `opts.retry`
+ * (default `connect`) is retried once after 2 s, with its own timeout and the
+ * same input, and logged on one line; the second failure is the answer.
+ */
+export const runSsh = async (
+  host: string,
+  command: string,
+  opts: { timeoutMs: number; input?: string; retry?: TSshRetry },
+): Promise<{ stdout: string; stderr: string }> => {
+  try {
+    return await runSshOnce(host, command, opts);
+  } catch (err) {
+    if (!isRetryableSshFailure(err, opts.retry ?? 'connect')) throw err;
+    log.warn({ host, failure: describeRemoteFailure(err), retryInMs: sshRetryDelayMs }, 'ssh transport failed; retrying once');
+    await new Promise((resolve) => setTimeout(resolve, sshRetryDelayMs));
+    return runSshOnce(host, command, opts);
+  }
+};
 
 /** `runSsh` with stdout as bytes: a transcript chunk can end inside a multi-byte character. */
 export const runSshBuffer = (
@@ -391,7 +456,7 @@ export const reapCommand = (session: string, tabId: string | undefined, keepProc
 /** Whether `dir` is a directory on `host`. Throws `RemoteHostError` when ssh fails. */
 export const remoteDirExists = async (host: string, dir: string): Promise<boolean> => {
   try {
-    await runSsh(host, `test -d ${shQuote(dir)}`, { timeoutMs: 10_000 });
+    await runSsh(host, `test -d ${shQuote(dir)}`, { timeoutMs: 10_000, retry: 'read' });
     return true;
   } catch (err) {
     if (isSshFailure(err)) throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${describeRemoteFailure(err)})`);

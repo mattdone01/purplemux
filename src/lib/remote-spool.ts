@@ -72,7 +72,8 @@ export interface IRemoteSpoolPull {
 
 const pullHost = async (host: string, spoolDir: string): Promise<IRemoteSpoolPull> => {
   const result: IRemoteSpoolPull = { host, taken: 0, dropped: 0, quarantined: 0 };
-  const { stdout } = await runSsh(host, 'sh -s', { timeoutMs: REMOTE_SPOOL_TIMEOUT_MS, input: remoteSpoolListScript() });
+  // A rerun of the list script ends where the first run ended (story 11): it may be retried on any ssh exit 255.
+  const { stdout } = await runSsh(host, 'sh -s', { timeoutMs: REMOTE_SPOOL_TIMEOUT_MS, input: remoteSpoolListScript(), retry: 'read' });
   const done: string[] = [];
   for (const line of stdout.split('\n')) {
     const [kind, name, value] = line.split('\t');

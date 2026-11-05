@@ -180,6 +180,12 @@ const BUSY_STUCK_MS = 10 * 60 * 1000;
 const STOP_SETTLE_MS = 500;
 const PROCESS_START_CACHE_MS = 60_000;
 const AGENT_LAUNCH_GRACE_MS = 5_000;
+/**
+ * Scans in a row that must read a remote tab's agent as gone before a transition acts on it (harness-flow-loop-2
+ * story 11). On 2026-11-05 at 08:18Z one poll read five live ai-lan agents as gone and flipped them all to inactive;
+ * no ssh failure was logged. One scan that misses the agent is `unknown`, never `inactive`.
+ */
+const REMOTE_AGENT_GONE_SCANS = 2;
 // A Claude or Grok tab whose SessionStart hook never fired stays `inactive` with
 // its prompt up, and `tab send` refuses it (L8: W1, 2026-09-26 01:06Z). After this
 // long inactive with the agent running, the poll looks at the pane (story 17).
@@ -334,6 +340,8 @@ export class StatusManager {
   private stuckNudgedTabs = new Map<string, number>();
   /** Tab → when it last became `inactive` (runtime only; the fleet panel times the dead agent from it). */
   private inactiveSince = new Map<string, number>();
+  /** Remote tab → scans in a row that read its agent as gone (see REMOTE_AGENT_GONE_SCANS). */
+  private remoteAgentGoneScans = new Map<string, number>();
   private transcriptFallbackLogged = new Set<string>();
   /** When the poll first saw each tab `inactive` (the pane-probe clock). */
   private inactiveSeenAt = new Map<string, number>();
@@ -687,6 +695,26 @@ export class StatusManager {
         }
       }
     }
+  }
+
+  /**
+   * A remote agent reads gone only when REMOTE_AGENT_GONE_SCANS scans in a row say so; until then the reading is
+   * `null` ("cannot tell"), on which no transition acts. A scan that sees the agent resets the count; a scan that
+   * did not read the host (`null`) leaves it as it is. A local tab's reading passes through.
+   */
+  private confirmRemoteAgentGone(tabId: string, host: string | null, running: boolean | null): boolean | null {
+    if (!host || running === null) return running;
+    if (running) {
+      this.remoteAgentGoneScans.delete(tabId);
+      return true;
+    }
+    const scans = (this.remoteAgentGoneScans.get(tabId) ?? 0) + 1;
+    this.remoteAgentGoneScans.set(tabId, scans);
+    if (scans < REMOTE_AGENT_GONE_SCANS) {
+      log.info({ tabId, host, scans }, 'remote agent not seen by this scan; unknown until the next scan agrees');
+      return null;
+    }
+    return false;
   }
 
   private async resolveUnknown(tabId: string): Promise<void> {
@@ -1158,7 +1186,9 @@ export class StatusManager {
 
         let agentRunningCache: boolean | null | undefined;
         const agentRunningNow = async (): Promise<boolean | null> => {
-          if (agentRunningCache === undefined) agentRunningCache = await agentRunningIn(paneInfo, provider, tab.host ?? null, hostAnswered);
+          if (agentRunningCache === undefined) {
+            agentRunningCache = this.confirmRemoteAgentGone(tab.id, tab.host ?? null, await agentRunningIn(paneInfo, provider, tab.host ?? null, hostAnswered));
+          }
           return agentRunningCache;
         };
         const checkAgentRunning = async (): Promise<boolean> => (await agentRunningNow()) === true;
@@ -1247,6 +1277,7 @@ export class StatusManager {
         this.modelWatch.forget(tabId);
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
+        this.remoteAgentGoneScans.delete(tabId);
         this.transcriptFallbackLogged.delete(tabId);
         this.inactiveSeenAt.delete(tabId);
         this.inactiveSince.delete(tabId);
