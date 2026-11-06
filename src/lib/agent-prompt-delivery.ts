@@ -1,6 +1,7 @@
 import { recordOrchestrationSubmission } from '@/lib/orchestration-activity';
 import { findTabBySessionName } from '@/lib/layout-store';
 import { sendBracketedPasteText, sendTypedText, submitComposer } from '@/lib/tmux';
+import { outcomeUnknownAfter } from '@/lib/remote-host';
 import type { TPanelType } from '@/types/terminal';
 
 /**
@@ -45,7 +46,11 @@ export const deliverPromptText = async (
   await deps.pasteText(sessionName, content);
 };
 
-/** Put a prompt in the agent's composer and submit it. */
+/**
+ * Put a prompt in the agent's composer and submit it. A remote failure of the
+ * submit, after the text landed, is outcome-unknown: a retry would type the
+ * prompt a second time over the first (story 11 review r1, finding 1).
+ */
 export const deliverPrompt = async (
   sessionName: string,
   content: string,
@@ -53,5 +58,7 @@ export const deliverPrompt = async (
 ): Promise<void> => {
   await deps.beforeSubmit?.(sessionName);
   await deliverPromptText(sessionName, content, deps);
-  await deps.submit(sessionName);
+  await deps.submit(sessionName).catch((err: unknown) => {
+    throw outcomeUnknownAfter(err, 'the prompt text');
+  });
 };

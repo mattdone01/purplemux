@@ -212,6 +212,27 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
+  it('an ssh failure while the prompt is typed (deliverPrompt) is 503 remote-host-unreachable, never a raw 500 (story 11)', async () => {
+    const { RemoteHostError } = await import('@/lib/remote-host');
+    delivery.deliverPrompt.mockRejectedValueOnce(new RemoteHostError('ai-lan', 'remote host ai-lan did not answer over ssh (exit 255: ssh: connect to host ai-lan port 22: Connection refused); tmux send-keys for x not confirmed'));
+    const response = await call({ content: 'run the tests' });
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toMatchObject({ code: 'remote-host-unreachable', host: 'ai-lan', error: expect.stringContaining('tmux send-keys') });
+  });
+
+  it('a delivery that fails after part of the prompt landed (typed chunk 2 of 3) is 503 remote-write-outcome-unknown: read the pane, never retry blind (review r1, finding 1)', async () => {
+    const { RemoteHostError, outcomeUnknownAfter } = await import('@/lib/remote-host');
+    const refused = new RemoteHostError('ai-lan', 'remote host ai-lan did not answer over ssh (exit 255: ssh: connect to host ai-lan port 22: Connection refused); tmux send-keys for x did not run');
+    delivery.deliverPrompt.mockRejectedValueOnce(outcomeUnknownAfter(refused, '1 of 3 typed chunks'));
+    const response = await call({ content: 'run the tests' });
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toEqual({
+      error: expect.stringContaining('1 of 3 typed chunks went through first, so the input may have been delivered; read the pane before retrying'),
+      code: 'remote-write-outcome-unknown',
+      host: 'ai-lan',
+    });
+  });
+
   it('never pastes an automated prompt after a model mismatch', async () => {
     dispatchPolicy.mockResolvedValue({ ok: false, error: 'agent-model-mismatch' });
     const response = await call({ content: 'implement story' });

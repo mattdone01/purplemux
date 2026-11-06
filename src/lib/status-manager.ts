@@ -29,7 +29,7 @@ import { runtimeHandleFor, runtimeProviderId } from '@/lib/agent-runtime-handle'
 import { findCodexSessionById } from '@/lib/providers/codex/session-detection';
 import { cacheCodexRateLimitsFromJsonl } from '@/lib/codex-rate-limits-cache';
 import { parsePermissionOptions } from '@/lib/permission-prompt';
-import type { IPaneInfo } from '@/lib/tmux';
+import type { IPaneInfo, IPaneMap } from '@/lib/tmux';
 import type { ITab, IWorkspace, TPanelType } from '@/types/terminal';
 import type { TCliState, TStartupPrompt } from '@/types/timeline';
 import type { IStartupPromptReading, ITurnErrorEpisode, ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
@@ -135,6 +135,9 @@ const agentRunningIn = async (
 
 const log = createLogger('status');
 
+/** What a reader is told: `unknown` while the tab's remote host goes unread (story 11 review r1, finding 3). */
+const servedCliState = (entry: ITabStatusEntry): TCliState => (entry.remoteUnreachable ? 'unknown' : entry.cliState);
+
 /** A `tab_events` row with a source tab is a watchdog nudge (ADR-0035 §4). */
 const nudgeFromEvent = (row: ITabEvent): IOrchestrationNudge => ({
   id: `te-${row.seq}`,
@@ -180,6 +183,23 @@ const BUSY_STUCK_MS = 10 * 60 * 1000;
 const STOP_SETTLE_MS = 500;
 const PROCESS_START_CACHE_MS = 60_000;
 const AGENT_LAUNCH_GRACE_MS = 5_000;
+/**
+ * Scans in a row that must read a remote tab's agent as gone before a transition acts on it (harness-flow-loop-2
+ * story 11). On 2026-11-05 at 08:18Z one poll read five live ai-lan agents as gone and flipped them all to inactive;
+ * no ssh failure was logged. One scan that misses the agent is `unknown`, never `inactive`.
+ */
+const REMOTE_AGENT_GONE_SCANS = 2;
+/**
+ * Polls in a row a remote host must go unread before its agent tabs serve `unknown` with the ssh error, in place of
+ * the state they last showed (story 11 review r1, finding 3). One unread poll is a blip; two is a host down.
+ */
+const REMOTE_HOST_UNREAD_POLLS = 2;
+/**
+ * Answered scans in a row that may hold none of the sessions a host showed before, while their tabs still exist,
+ * before the drop is believed (story 11 review r1, finding 4). Until then the scan reads as unread, not as "every
+ * agent gone": tmux exits when its last session ends, so a running server that lists none of them is suspect.
+ */
+const REMOTE_DROPPED_ALL_SCANS = 3;
 // A Claude or Grok tab whose SessionStart hook never fired stays `inactive` with
 // its prompt up, and `tab send` refuses it (L8: W1, 2026-09-26 01:06Z). After this
 // long inactive with the agent running, the poll looks at the pane (story 17).
@@ -334,6 +354,14 @@ export class StatusManager {
   private stuckNudgedTabs = new Map<string, number>();
   /** Tab → when it last became `inactive` (runtime only; the fleet panel times the dead agent from it). */
   private inactiveSince = new Map<string, number>();
+  /** Remote tab → scans in a row that read its agent as gone (see REMOTE_AGENT_GONE_SCANS). */
+  private remoteAgentGoneScans = new Map<string, number>();
+  /** Remote host → polls in a row its scan was not read, the latest ssh error, and since when (finding 3). */
+  private remoteHostUnread = new Map<string, { polls: number; failure: string; since: number }>();
+  /** Remote host → the sessions of tracked tabs its last believed answered scan showed (finding 4). */
+  private remoteHostSeenSessions = new Map<string, Set<string>>();
+  /** Remote host → answered scans in a row that held none of those sessions (finding 4). */
+  private remoteHostDroppedAllScans = new Map<string, number>();
   private transcriptFallbackLogged = new Set<string>();
   /** When the poll first saw each tab `inactive` (the pane-probe clock). */
   private inactiveSeenAt = new Map<string, number>();
@@ -689,6 +717,84 @@ export class StatusManager {
     }
   }
 
+  /**
+   * A remote agent reads gone only when REMOTE_AGENT_GONE_SCANS scans in a row say so; until then the reading is
+   * `null` ("cannot tell"), on which no transition acts. A scan that sees the agent resets the count; a scan that
+   * did not read the host (`null`) leaves it as it is. A local tab's reading passes through.
+   */
+  private confirmRemoteAgentGone(tabId: string, host: string | null, running: boolean | null): boolean | null {
+    if (!host || running === null) return running;
+    if (running) {
+      this.remoteAgentGoneScans.delete(tabId);
+      return true;
+    }
+    const scans = (this.remoteAgentGoneScans.get(tabId) ?? 0) + 1;
+    this.remoteAgentGoneScans.set(tabId, scans);
+    if (scans < REMOTE_AGENT_GONE_SCANS) {
+      log.info({ tabId, host, scans }, 'remote agent not seen by this scan; unknown until the next scan agrees');
+      return null;
+    }
+    return false;
+  }
+
+  /**
+   * Two corrections to one poll's remote reading, made before any tab reads it (story 11 review r1).
+   * 1. Finding 4: an answered scan that lists none of the sessions the host showed before, while their tabs still
+   *    exist, reads as unread until REMOTE_DROPPED_ALL_SCANS scans in a row agree. tmux's "no server" answer is
+   *    believed at once: the server exits with its last session, so it proves them all gone.
+   * 2. Finding 3: count the polls in a row each host goes unread, with its ssh error.
+   */
+  private reviewRemoteScan(panes: IPaneMap, now: number): void {
+    const answered = new Set(panes.answeredRemoteHosts ?? []);
+    const unread = new Map(panes.unreadRemoteHosts ?? []);
+    const tracked = new Set([...this.tabs.values()].map((entry) => entry.tmuxSession));
+    for (const host of [...answered]) {
+      const before = [...(this.remoteHostSeenSessions.get(host) ?? [])].filter((session) => tracked.has(session));
+      if (before.length === 0 || panes.serverAbsentRemoteHosts?.has(host) || before.some((session) => panes.has(session))) {
+        this.remoteHostDroppedAllScans.delete(host);
+        continue;
+      }
+      const scans = (this.remoteHostDroppedAllScans.get(host) ?? 0) + 1;
+      if (scans >= REMOTE_DROPPED_ALL_SCANS) {
+        log.warn({ host, sessions: before.length, scans }, 'remote scan dropped every session it showed before, scan after scan; the drop is believed');
+        this.remoteHostDroppedAllScans.delete(host);
+        continue;
+      }
+      this.remoteHostDroppedAllScans.set(host, scans);
+      answered.delete(host);
+      unread.set(host, `the scan answered without any of the ${before.length} sessions it showed before (${scans} of ${REMOTE_DROPPED_ALL_SCANS} scans before the drop is believed)`);
+      log.warn({ host, sessions: before.length, scans }, 'remote scan dropped every session it showed before; read as unread');
+    }
+    for (const [host, failure] of unread) {
+      const prev = this.remoteHostUnread.get(host);
+      this.remoteHostUnread.set(host, { polls: (prev?.polls ?? 0) + 1, failure, since: prev?.since ?? now });
+    }
+    for (const host of [...this.remoteHostUnread.keys()]) if (!unread.has(host)) this.remoteHostUnread.delete(host);
+    panes.answeredRemoteHosts = answered;
+    panes.unreadRemoteHosts = unread;
+  }
+
+  /**
+   * Finding 3: an agent tab whose host went unread REMOTE_HOST_UNREAD_POLLS polls in a row serves `unknown` with the
+   * ssh error, never the `busy` it last showed; the next poll that reads its pane serves its own state again. Only
+   * what is served changes: the state underneath, and every transition on it, is as it was.
+   */
+  private markRemoteReachability(tabId: string, host: string | null, entry: ITabStatusEntry, paneUnread: boolean, agent: boolean): void {
+    const unread = host && paneUnread && agent ? this.remoteHostUnread.get(host) : undefined;
+    if (host && unread && unread.polls >= REMOTE_HOST_UNREAD_POLLS) {
+      if (entry.remoteUnreachable) return;
+      entry.remoteUnreachable = { host, error: unread.failure, since: unread.since };
+      log.warn({ tabId, host, polls: unread.polls, error: unread.failure, cliState: entry.cliState }, 'remote host unread; the tab serves unknown');
+      this.broadcastUpdate(tabId, entry);
+      return;
+    }
+    if (!paneUnread && entry.remoteUnreachable) {
+      entry.remoteUnreachable = null;
+      log.info({ tabId, host, cliState: entry.cliState }, 'remote host read again; the tab serves its own state');
+      this.broadcastUpdate(tabId, entry);
+    }
+  }
+
   private async resolveUnknown(tabId: string): Promise<void> {
     const entry = this.tabs.get(tabId);
     if (!entry || entry.cliState !== 'unknown') return;
@@ -983,6 +1089,8 @@ export class StatusManager {
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
     const now = Date.now();
+    this.reviewRemoteScan(panesInfo, now);
+    const seenRemoteSessions = new Map<string, Set<string>>();
     for (const [tabId, retirement] of this.retiredTabs) {
       if (retirement.until <= now) this.retiredTabs.delete(tabId);
     }
@@ -1040,6 +1148,12 @@ export class StatusManager {
         // A remote tab whose host this scan did not read keeps what it showed (review r3 B1).
         const hostAnswered = !!tab.host && !!panesInfo.answeredRemoteHosts?.has(tab.host);
         const paneUnread = !!tab.host && !paneInfo && !hostAnswered;
+        if (tab.host && hostAnswered && paneInfo) {
+          const seen = seenRemoteSessions.get(tab.host) ?? new Set<string>();
+          seen.add(tab.sessionName);
+          seenRemoteSessions.set(tab.host, seen);
+        }
+        if (existing) this.markRemoteReachability(tab.id, tab.host ?? null, existing, paneUnread, !!provider);
 
         const { terminalStatus, listeningPorts } = paneUnread && existing
           ? { terminalStatus: existing.terminalStatus ?? 'idle', listeningPorts: existing.listeningPorts ?? [] }
@@ -1158,7 +1272,9 @@ export class StatusManager {
 
         let agentRunningCache: boolean | null | undefined;
         const agentRunningNow = async (): Promise<boolean | null> => {
-          if (agentRunningCache === undefined) agentRunningCache = await agentRunningIn(paneInfo, provider, tab.host ?? null, hostAnswered);
+          if (agentRunningCache === undefined) {
+            agentRunningCache = this.confirmRemoteAgentGone(tab.id, tab.host ?? null, await agentRunningIn(paneInfo, provider, tab.host ?? null, hostAnswered));
+          }
           return agentRunningCache;
         };
         const checkAgentRunning = async (): Promise<boolean> => (await agentRunningNow()) === true;
@@ -1238,6 +1354,8 @@ export class StatusManager {
       }
     }
 
+    for (const host of panesInfo.answeredRemoteHosts ?? []) this.remoteHostSeenSessions.set(host, seenRemoteSessions.get(host) ?? new Set());
+
     for (const tabId of tabsBeforePoll) {
       if (!knownTabIds.has(tabId) && this.tabs.has(tabId)) {
         this.stopJsonlWatch(tabId);
@@ -1247,6 +1365,7 @@ export class StatusManager {
         this.modelWatch.forget(tabId);
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
+        this.remoteAgentGoneScans.delete(tabId);
         this.transcriptFallbackLogged.delete(tabId);
         this.inactiveSeenAt.delete(tabId);
         this.inactiveSince.delete(tabId);
@@ -1732,7 +1851,7 @@ export class StatusManager {
     const result: Record<string, IClientTabStatusEntry> = {};
     for (const [tabId, entry] of this.tabs) {
       result[tabId] = {
-        cliState: entry.cliState,
+        cliState: servedCliState(entry),
         workspaceId: entry.workspaceId,
         tabName: entry.tabName,
         currentProcess: entry.currentProcess,
@@ -1755,6 +1874,7 @@ export class StatusManager {
         lastEvent: entry.lastEvent,
         eventSeq: entry.eventSeq,
         turnEnd: entry.turnEnd ?? null,
+        remoteUnreachable: entry.remoteUnreachable ?? null,
       };
     }
     return result;
@@ -3580,7 +3700,7 @@ export class StatusManager {
     const msg: IStatusUpdateMessage = {
       type: 'status:update',
       tabId,
-      cliState: entry.cliState,
+      cliState: servedCliState(entry),
       workspaceId: entry.workspaceId,
       tabName: entry.tabName,
       currentProcess: entry.currentProcess,
@@ -3602,6 +3722,7 @@ export class StatusManager {
       startupPrompt: entry.startupPrompt ?? null,
       lastEvent: entry.lastEvent,
       eventSeq: entry.eventSeq,
+      remoteUnreachable: entry.remoteUnreachable ?? null,
     };
     this.broadcast(msg, exclude);
   }

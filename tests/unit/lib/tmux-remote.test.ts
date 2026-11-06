@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ADR-0022: every tmux call for a remote tab runs `ssh <host> tmux -L pmux-<origin> …`
 // with the arguments a local call would use; no remote pid or path reaches local code.
@@ -7,7 +7,7 @@ interface ICall { cmd: string; args: string[]; input?: string }
 
 const calls = vi.hoisted(() => ({ list: [] as ICall[] }));
 const replies = vi.hoisted(() => ({
-  fn: (_cmd: string, _args: string[]): { stdout?: string; stderr?: string; code?: number } => ({ stdout: '' }),
+  fn: (_cmd: string, _args: string[]): { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; signal?: string; syscall?: string } => ({ stdout: '' }),
 }));
 const hostOf = vi.hoisted(() => ({ map: new Map<string, string>() }));
 
@@ -20,8 +20,9 @@ vi.mock('child_process', async (importOriginal) => {
     calls.list.push(call);
     const reply = replies.fn(cmd, args);
     queueMicrotask(() => {
-      if (reply.code !== undefined) {
-        cb(Object.assign(new Error('failed'), { code: reply.code, stdout: reply.stdout ?? '', stderr: reply.stderr ?? '' }), reply.stdout ?? '', reply.stderr ?? '');
+      if (reply.code !== undefined || reply.killed || reply.signal) {
+        const fields = { code: reply.code, killed: reply.killed, signal: reply.signal ?? null, syscall: reply.syscall, stdout: reply.stdout ?? '', stderr: reply.stderr ?? '' };
+        cb(Object.assign(new Error('failed'), fields), reply.stdout ?? '', reply.stderr ?? '');
       } else {
         cb(null, reply.stdout ?? '', reply.stderr ?? '');
       }
@@ -62,10 +63,21 @@ vi.mock('@/lib/workspace-home', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/workspace-home')>()),
   workspaceDirectories: async (wsId: string) => workspaceDirs.map.get(wsId) ?? [],
 }));
+const logged = vi.hoisted(() => ({ warn: [] as { module: string; fields: unknown; msg: unknown }[] }));
+vi.mock('@/lib/logger', () => ({
+  createLogger: (module: string) => {
+    const logger = {
+      trace: () => {}, debug: () => {}, info: () => {}, error: () => {}, fatal: () => {},
+      warn: (fields: unknown, msg?: unknown) => { logged.warn.push({ module, fields, msg }); },
+      child: () => logger,
+    };
+    return logger;
+  },
+}));
 const audit = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock('@/lib/coordination-audit', () => ({ appendCoordinationAudit: audit }));
 
-const scanBackoff = () => (globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff;
+const scanBackoff = () => (globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, unknown> }).__ptRemoteScanBackoff;
 
 const REMOTE = 'pt-ws-r-pane-p-tab-remote1';
 const LOCAL = 'pt-ws-l-pane-p-tab-local1';
@@ -87,6 +99,10 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     workspaceDirs.map = new Map();
     scanBackoff()?.clear();
   });
+
+  // runSsh retries a transport failure once after 2 s (story 11); these tests do not wait for it.
+  beforeEach(async () => (await import('@/lib/remote-host')).configureSshRetryForTests({ delayMs: 0 }));
+  afterEach(async () => (await import('@/lib/remote-host')).resetSshRetryForTests());
 
   it('session presence: tmux\'s own "no such session" is absent; ssh failing or timing out is unknown, never absent', async () => {
     const { sessionPresence, hasSessionOrUnreachable } = await import('@/lib/tmux');
@@ -119,7 +135,8 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     replies.fn = (cmd) => (cmd === 'tmux' ? { stdout: '' } : { code: 255, stderr: 'timed out' });
     await getAllPanesInfo();
     await getAllPanesInfo();
-    expect(calls.list.filter((c) => c.cmd === 'ssh')).toHaveLength(1);
+    // The failed scan and its one retry (a scan is a read, story 11); the second scan is skipped.
+    expect(calls.list.filter((c) => c.cmd === 'ssh')).toHaveLength(2);
     hostOf.map = new Map();
     calls.list = [];
     scanBackoff()?.clear();
@@ -144,7 +161,8 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     replies.fn = (cmd) => {
       if (cmd === 'tmux') return { stdout: '' };
       n += 1;
-      return n === 1 ? { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection timed out' } : { stdout: `${REMOTE}\tclaude\t/home/r\t999\t7\n` };
+      // Call 2 is the second scan; calls 1 and 3 are the first scan and its retry (story 11).
+      return n !== 2 ? { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection timed out' } : { stdout: `${REMOTE}\tclaude\t/home/r\t999\t7\n` };
     };
     const { getAllPanesInfo } = await import('@/lib/tmux');
     const [failed, answered] = await Promise.all([getAllPanesInfo(), getAllPanesInfo()]);
@@ -439,5 +457,310 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     await createSession(REMOTE, 120, 40, undefined, { workspaceId: 'ws-r', tabId: 'tab-remote1' });
     await createSession(REMOTE, 120, 40, '/home/mdone/code/nomupay-other', { workspaceId: 'ws-r', tabId: 'tab-remote1' });
     for (const call of calls.list) expect(call.input ?? '').not.toContain('trust-seed.py');
+  });
+});
+
+// Story 11: runSsh retries one ssh transport failure (consult ruling (c)); the routes answer the right verdict.
+describe('a remote call retries one ssh transport failure, and only one that is safe to repeat (story 11)', () => {
+  const CONNECT_REFUSALS = [
+    'ssh: connect to host ai-server port 22: Connection refused',
+    'ssh: connect to host ai-server port 22: Connection timed out',
+    'ssh: Could not resolve hostname ai-server: Temporary failure in name resolution',
+    'kex_exchange_identification: read: Connection reset by peer\nConnection reset by 192.168.1.155 port 22',
+    'Connection timed out during banner exchange\nConnection to 192.168.1.155 port 22 timed out',
+  ];
+
+  /** Fail the first `failures` ssh calls with `reply`; answer the rest with `ok`. */
+  const failFirst = (failures: number, reply: { code?: number; stderr?: string }, ok: { stdout?: string } = { stdout: 'ok\n' }) => {
+    let n = 0;
+    replies.fn = (cmd) => {
+      if (cmd !== 'ssh') return { stdout: '' };
+      n += 1;
+      return n <= failures ? reply : ok;
+    };
+  };
+  const sshCalls = () => calls.list.filter((c) => c.cmd === 'ssh');
+
+  beforeEach(async () => {
+    calls.list = [];
+    logged.warn = [];
+    hostOf.map = new Map([[REMOTE, 'ai-server']]);
+    fleet.hosts = 'ai-server';
+    scanBackoff()?.clear();
+    (await import('@/lib/remote-host')).configureSshRetryForTests({ delayMs: 0 });
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    (await import('@/lib/remote-host')).resetSshRetryForTests();
+  });
+
+  it.each(CONNECT_REFUSALS)('a refusal before the command ran is retried once, with the same input, and logged on one line: %s', async (stderr) => {
+    const { runSsh } = await import('@/lib/remote-host');
+    failFirst(1, { code: 255, stderr });
+    await expect(runSsh('ai-server', 'sh -s', { timeoutMs: 5000, input: 'echo hi' })).resolves.toEqual({ stdout: 'ok\n', stderr: '' });
+    expect(sshCalls()).toHaveLength(2);
+    expect(sshCalls().map((c) => c.input)).toEqual(['echo hi', 'echo hi']);
+    expect(logged.warn).toEqual([{
+      module: 'remote-host',
+      fields: { host: 'ai-server', failure: `exit 255: ${stderr.split('\\n').join('\n')}`, retryInMs: 0 },
+      msg: 'ssh transport failed; retrying once',
+    }]);
+  });
+
+  it('a spawn error (ssh could not start) is retried once; a string code without a spawn syscall (maxBuffer: the command ran) is not', async () => {
+    const { runSsh } = await import('@/lib/remote-host');
+    let n = 0;
+    replies.fn = () => (++n === 1 ? { code: 'EAGAIN', syscall: 'spawn ssh' } : { stdout: 'ok' });
+    await expect(runSsh('ai-server', 'true', { timeoutMs: 5000 })).resolves.toEqual({ stdout: 'ok', stderr: '' });
+    expect(sshCalls()).toHaveLength(2);
+    calls.list = [];
+    replies.fn = () => ({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+    await expect(runSsh('ai-server', 'cat big', { timeoutMs: 5000, retry: 'read' })).rejects.toMatchObject({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+    expect(sshCalls()).toHaveLength(1);
+  });
+
+  it('waits 2 s before the retry', async () => {
+    const { runSsh, resetSshRetryForTests } = await import('@/lib/remote-host');
+    resetSshRetryForTests();
+    vi.useFakeTimers();
+    failFirst(1, { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' });
+    const running = runSsh('ai-server', 'true', { timeoutMs: 5000 });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(sshCalls()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(running).resolves.toEqual({ stdout: 'ok\n', stderr: '' });
+    expect(sshCalls()).toHaveLength(2);
+  });
+
+  it('a failure that survives the retry is the answer: two calls, never a third', async () => {
+    const { runSsh } = await import('@/lib/remote-host');
+    failFirst(5, { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' });
+    await expect(runSsh('ai-server', 'true', { timeoutMs: 5000 })).rejects.toMatchObject({ code: 255 });
+    expect(sshCalls()).toHaveLength(2);
+  });
+
+  it.each<[string, { code?: number; stderr?: string; killed?: boolean; signal?: string }]>([
+    ['tmux absence (exit 1)', { code: 1, stderr: "can't find session: x" }],
+    ['the create guard (exit 17)', { code: 17, stderr: 'pmux: session x already exists' }],
+    ['the kit verdict (exit 18, 502)', { code: 18, stderr: 'pmux-kit-probe: kit probe timed out after 4 s' }],
+    ['a timeout', { code: undefined, killed: true, signal: 'SIGTERM' }],
+    ['a signal', { code: undefined, signal: 'SIGKILL' }],
+    ['a connection lost after the command started', { code: 255, stderr: 'Connection to ai-server closed by remote host.' }],
+    ['a bare close line', { code: 255, stderr: 'Connection closed by 192.168.1.155 port 22' }],
+    ['a 255 with no stderr', { code: 255, stderr: '' }],
+  ])('a write is never retried on %s', async (_label, failure) => {
+    const { isRetryableSshFailure } = await import('@/lib/remote-host');
+    expect(isRetryableSshFailure(failure, 'connect')).toBe(false);
+  });
+
+  it.each<[string, { code?: number; stderr?: string; killed?: boolean; signal?: string }, boolean]>([
+    ['a connection lost after the command started', { code: 255, stderr: 'Connection to ai-server closed by remote host.' }, true],
+    ['a 255 with no stderr', { code: 255, stderr: '' }, true],
+    ['a timeout', { killed: true, signal: 'SIGTERM' }, false],
+    ['tmux absence (exit 1)', { code: 1, stderr: 'no server running on /tmp/tmux-1000/pmux-mdserver1' }, false],
+    ['an auth refusal', { code: 255, stderr: 'mdone@ai-server: Permission denied (publickey).' }, false],
+    ['a host key refusal', { code: 255, stderr: 'Host key verification failed.' }, false],
+  ])('a read retries any other exit 255 but still not %s → %s', async (_label, failure, retried) => {
+    const { isRetryableSshFailure } = await import('@/lib/remote-host');
+    expect(isRetryableSshFailure(failure, 'read')).toBe(retried);
+  });
+
+  it('send-keys (tab send, tab steer) is retried only on a refusal before it ran; a failure that survives is RemoteHostError, never a raw error', async () => {
+    const { sendKeys, sendEscape } = await import('@/lib/tmux');
+    /** Fail the first `failures` send-keys calls with `reply`; copy-mode and the rest answer. */
+    const failSendKeys = (failures: number, reply: { code?: number; stderr?: string }) => {
+      let n = 0;
+      replies.fn = (cmd, args) => (cmd === 'ssh' && args.at(-1)?.includes("'send-keys'") && ++n <= failures ? reply : { stdout: '' });
+    };
+    const sendKeyCalls = () => sshCalls().filter((c) => remoteCommand(c).includes("'send-keys'"));
+
+    failSendKeys(1, { code: 255, stderr: 'kex_exchange_identification: read: Connection reset by peer' });
+    await sendKeys(REMOTE, 'ls');
+    expect(sendKeyCalls()).toHaveLength(2);
+
+    calls.list = [];
+    failSendKeys(1, { code: 255, stderr: 'Connection to ai-server closed by remote host.' });
+    await expect(sendEscape(REMOTE)).rejects.toMatchObject({ name: 'RemoteHostError', host: 'ai-server' });
+    expect(sendKeyCalls()).toHaveLength(1);
+
+    calls.list = [];
+    failSendKeys(5, { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' });
+    await expect(sendKeys(REMOTE, 'ls')).rejects.toThrow(/remote host ai-server did not answer over ssh \(exit 255: ssh: connect to host .*\); tmux send-keys for /);
+    expect(sendKeyCalls()).toHaveLength(2);
+
+    calls.list = [];
+    failSendKeys(5, { code: 1, stderr: "can't find session: x" });
+    await expect(sendEscape(REMOTE)).rejects.not.toMatchObject({ name: 'RemoteHostError' });
+    expect(sendKeyCalls()).toHaveLength(1);
+  });
+
+  it('the session check of send and steer retries a lost read, throws RemoteHostError when ssh keeps failing, and is false only for tmux\'s own absence', async () => {
+    const { hasSessionOrUnreachable } = await import('@/lib/tmux');
+    failFirst(1, { code: 255, stderr: 'Connection to ai-server closed by remote host.' });
+    expect(await hasSessionOrUnreachable(REMOTE)).toBe(true);
+    expect(sshCalls()).toHaveLength(2);
+    failFirst(5, { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' });
+    await expect(hasSessionOrUnreachable(REMOTE)).rejects.toMatchObject({ name: 'RemoteHostError', host: 'ai-server' });
+    replies.fn = () => ({ killed: true, signal: 'SIGTERM' });
+    await expect(hasSessionOrUnreachable(REMOTE)).rejects.toMatchObject({ name: 'RemoteHostError' });
+    replies.fn = () => ({ code: 1, stderr: `can't find session: ${REMOTE}` });
+    expect(await hasSessionOrUnreachable(REMOTE)).toBe(false);
+  });
+
+  it('a create is retried only when ssh never reached the host; a kit timeout stays a kit verdict (502), never unreachable', async () => {
+    const { createSession } = await import('@/lib/tmux');
+    failFirst(1, { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' }, { stdout: '' });
+    await createSession(REMOTE, 80, 24, undefined, { workspaceId: 'ws-r', tabId: 'tab-remote1' });
+    expect(sshCalls().map(remoteCommand)).toEqual(['sh -s', 'sh -s']);
+    expect(sshCalls()[1].input).toBe(sshCalls()[0].input);
+
+    calls.list = [];
+    replies.fn = (_cmd, args) => (args.at(-1) === 'sh -s' ? { code: 18, stderr: 'pmux-kit-probe: kit probe timed out after 4 s\n' } : { stdout: '' });
+    const creating = createSession(REMOTE, 80, 24, undefined, { workspaceId: 'ws-r', tabId: 'tab-remote1' });
+    await expect(creating).rejects.toMatchObject({ name: 'RemoteKitBrokenError', line: 'kit probe timed out after 4 s' });
+    expect(sshCalls().filter((c) => remoteCommand(c) === 'sh -s')).toHaveLength(1);
+
+    calls.list = [];
+    failFirst(1, { code: 255, stderr: 'Connection to ai-server closed by remote host.' }, { stdout: '' });
+    await expect(createSession(REMOTE, 80, 24, undefined, { workspaceId: 'ws-r', tabId: 'tab-remote1' })).rejects.toMatchObject({ name: 'RemoteHostError' });
+    expect(sshCalls().filter((c) => remoteCommand(c) === 'sh -s')).toHaveLength(1);
+  });
+
+  describe('a remote write whose ssh failure does not prove it never ran is outcome-unknown (story 11 review r1, finding 1)', () => {
+    const REFUSED = 'ssh: connect to host ai-server port 22: Connection refused';
+    const CLOSED = 'Connection to ai-server closed by remote host.';
+    /** Answer every ssh call; fail the send-keys calls numbered in `failing` (1-based) with `reply`. */
+    const failSendKeysAt = (failing: number[], reply: { code?: number; stderr?: string; killed?: boolean; signal?: string }) => {
+      let n = 0;
+      replies.fn = (cmd, args) => (cmd === 'ssh' && args.at(-1)?.includes("'send-keys'") && failing.includes(++n) ? reply : { stdout: '' });
+    };
+
+    it.each<[string, { code?: number; stderr?: string; killed?: boolean; signal?: string }, boolean]>([
+      ['a connection lost after the command started', { code: 255, stderr: CLOSED }, true],
+      ['a 255 with no stderr', { code: 255, stderr: '' }, true],
+      ['a timeout', { killed: true, signal: 'SIGTERM' }, true],
+      ['a connect refusal on both attempts', { code: 255, stderr: REFUSED }, false],
+      ['an auth refusal', { code: 255, stderr: 'mdone@ai-server: Permission denied (publickey).' }, false],
+    ])('an Escape that fails on %s (%j): outcomeUnknown=%s', async (_label, reply, unknown) => {
+      const { sendEscape } = await import('@/lib/tmux');
+      const { remoteHostUnreachableBody } = await import('@/lib/cli-error');
+      failSendKeysAt([1, 2], reply);
+      const err = await sendEscape(REMOTE).then(() => null, (e: unknown) => e as { name: string; outcomeUnknown: boolean; message: string; host: string });
+      expect(err).toMatchObject({ name: 'RemoteHostError', host: 'ai-server', outcomeUnknown: unknown });
+      expect(remoteHostUnreachableBody(err!).code).toBe(unknown ? 'remote-write-outcome-unknown' : 'remote-host-unreachable');
+      expect(err!.message.includes('the input may have been delivered; read the pane before retrying')).toBe(unknown);
+    });
+
+    it('typed chunk 2 of 3 fails (even on a refusal before it ran): outcome-unknown, naming what landed; a refusal before chunk 1 is unreachable', async () => {
+      const { sendTypedText } = await import('@/lib/tmux');
+      failSendKeysAt([2, 3], { code: 255, stderr: REFUSED });
+      await expect(sendTypedText(REMOTE, 'first\nsecond')).rejects.toMatchObject({
+        name: 'RemoteHostError',
+        outcomeUnknown: true,
+        message: expect.stringContaining('1 of 3 typed chunks went through first, so the input may have been delivered; read the pane before retrying'),
+      });
+      calls.list = [];
+      failSendKeysAt([1, 2], { code: 255, stderr: REFUSED });
+      await expect(sendTypedText(REMOTE, 'first\nsecond')).rejects.toMatchObject({ name: 'RemoteHostError', outcomeUnknown: false });
+      expect(sshCalls().filter((c) => remoteCommand(c).includes("'send-keys'"))).toHaveLength(2);
+    });
+
+    it('the Enter after the text, or the second Enter, that fails is outcome-unknown', async () => {
+      const { sendKeysSeparated, submitComposer } = await import('@/lib/tmux');
+      failSendKeysAt([2, 3], { code: 255, stderr: REFUSED });
+      await expect(sendKeysSeparated(REMOTE, 'claude')).rejects.toMatchObject({ outcomeUnknown: true, message: expect.stringContaining('the text went through first') });
+      vi.useFakeTimers();
+      failSendKeysAt([2, 3], { code: 255, stderr: REFUSED });
+      const submitting = submitComposer(REMOTE).then(() => null, (e: unknown) => e);
+      // The 600 ms gap, then the retry's own (0 ms) wait: both are timers.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await submitting).toMatchObject({ outcomeUnknown: true, message: expect.stringContaining('the first Enter went through first') });
+    });
+
+    it('deliverPrompt: a submit that fails after the prompt text landed is outcome-unknown; a text that never landed stays unreachable', async () => {
+      const { deliverPrompt } = await import('@/lib/agent-prompt-delivery');
+      const { RemoteHostError } = await import('@/lib/remote-host');
+      const refused = new RemoteHostError('ai-server', 'remote host ai-server did not answer over ssh (exit 255); tmux send-keys for x did not run');
+      const deps = { usesTyped: async () => true, typeText: vi.fn(async () => {}), pasteText: vi.fn(async () => {}), submit: vi.fn(async () => { throw refused; }) };
+      await expect(deliverPrompt(REMOTE, 'hello', deps)).rejects.toMatchObject({ outcomeUnknown: true, message: expect.stringContaining('the prompt text went through first') });
+      deps.typeText.mockRejectedValueOnce(refused);
+      await expect(deliverPrompt(REMOTE, 'hello', deps)).rejects.toBe(refused);
+    });
+
+    it('a create that may have run, with a cleanup that did not answer, is outcome-unknown; with a cleanup that answered, unreachable', async () => {
+      const { createSession } = await import('@/lib/tmux');
+      replies.fn = () => ({ code: 255, stderr: CLOSED });
+      await expect(createSession(REMOTE, 80, 24, undefined, { workspaceId: 'ws-r', tabId: 'tab-remote1' })).rejects.toMatchObject({
+        name: 'RemoteHostError', outcomeUnknown: true, message: expect.stringContaining('may exist there: read the tab list before retrying'),
+      });
+      failFirst(1, { code: 255, stderr: CLOSED }, { stdout: '' });
+      await expect(createSession(REMOTE, 80, 24, undefined, { workspaceId: 'ws-r', tabId: 'tab-remote1' })).rejects.toMatchObject({ name: 'RemoteHostError', outcomeUnknown: false });
+    });
+
+    it('a close whose reap may have started is outcome-unknown; a refusal before it ran keeps the retryable message', async () => {
+      const { killSession } = await import('@/lib/tmux');
+      replies.fn = () => ({ killed: true, signal: 'SIGTERM' });
+      await expect(killSession(REMOTE, { tabId: 'tab-remote1' })).rejects.toMatchObject({
+        name: 'RemoteHostError', outcomeUnknown: true, message: expect.stringContaining('the session may or may not still run there: read the tab before retrying'),
+      });
+      replies.fn = () => ({ code: 255, stderr: REFUSED });
+      await expect(killSession(REMOTE, { tabId: 'tab-remote1' })).rejects.toMatchObject({ name: 'RemoteHostError', outcomeUnknown: false, message: expect.stringContaining('retry when the host answers') });
+    });
+  });
+
+  it('a maxBuffer overflow is its own error, never "did not answer over ssh", and not retried (story 11 review r1, finding 6)', async () => {
+    const { sendRawKeys } = await import('@/lib/tmux');
+    const { isSshFailure } = await import('@/lib/remote-host');
+    replies.fn = (cmd, args) => (cmd === 'ssh' && args.at(-1)?.includes("'send-keys'") ? { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' } : { stdout: '' });
+    const err = await sendRawKeys(REMOTE, 'q').then(() => null, (e: unknown) => e as Error);
+    expect(err?.name).toBe('Error');
+    expect(err?.message).toBe(`tmux send-keys for ${REMOTE} on ai-server wrote more than the 16 MiB ssh buffer; the answer was cut off (ssh answered)`);
+    expect(sshCalls().filter((c) => remoteCommand(c).includes("'send-keys'"))).toHaveLength(1);
+    expect(isSshFailure({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' })).toBe(false);
+    expect(isSshFailure({ code: 'EAGAIN', syscall: 'spawn ssh' })).toBe(true);
+  });
+
+  it('the pane map names each unread host with its ssh error (the backoff keeps it), and the hosts whose tmux answered "no server" (findings 3, 4)', async () => {
+    const { getAllPanesInfo } = await import('@/lib/tmux');
+    replies.fn = (cmd) => (cmd === 'tmux' ? { stdout: '' } : { code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' });
+    const failed = await getAllPanesInfo();
+    expect([...(failed.unreadRemoteHosts ?? [])]).toEqual([['ai-server', 'exit 255: ssh: connect to host ai-server port 22: Connection refused']]);
+    const skipped = await getAllPanesInfo();
+    expect(skipped.unreadRemoteHosts?.get('ai-server')).toBe('skipped after exit 255: ssh: connect to host ai-server port 22: Connection refused');
+    scanBackoff()?.clear();
+    replies.fn = (cmd) => (cmd === 'tmux' ? { stdout: '' } : { code: 1, stderr: 'no server running on /tmp/tmux-1000/pmux-mdserver1' });
+    const absent = await getAllPanesInfo();
+    expect([...(absent.answeredRemoteHosts ?? [])]).toEqual(['ai-server']);
+    expect([...(absent.serverAbsentRemoteHosts ?? [])]).toEqual(['ai-server']);
+    expect(absent.unreadRemoteHosts?.size).toBe(0);
+  });
+
+  it('the remote agent probe: a failure and a timeout are unknown with the ssh error, never absent; a timeout is not retried', async () => {
+    const { observeRemoteProviderProcess } = await import('@/lib/tmux');
+    replies.fn = () => ({ code: 255, stderr: 'ssh: connect to host ai-server port 22: Connection refused' });
+    expect(await observeRemoteProviderProcess(REMOTE, 'claude')).toEqual({
+      state: 'unknown', reason: 'remote host ai-server did not answer (exit 255: ssh: connect to host ai-server port 22: Connection refused)',
+    });
+    expect(sshCalls()).toHaveLength(2);
+    calls.list = [];
+    replies.fn = () => ({ killed: true, signal: 'SIGTERM' });
+    expect(await observeRemoteProviderProcess(REMOTE, 'claude')).toEqual({ state: 'unknown', reason: 'remote host ai-server did not answer (timed out)' });
+    expect(sshCalls()).toHaveLength(1);
+  });
+
+  it('a pane scan that times out is not read (no retry, logged with the failure); one lost read is retried and answers', async () => {
+    const { getAllPanesInfo } = await import('@/lib/tmux');
+    replies.fn = (cmd) => (cmd === 'tmux' ? { stdout: '' } : { killed: true, signal: 'SIGTERM' });
+    const timedOut = await getAllPanesInfo();
+    expect([...(timedOut.answeredRemoteHosts ?? [])]).toEqual([]);
+    expect(sshCalls()).toHaveLength(1);
+    expect(logged.warn).toContainEqual({ module: 'terminal', fields: { host: 'ai-server', failure: 'timed out' }, msg: 'remote pane scan failed; host skipped for 30 s' });
+
+    scanBackoff()?.clear();
+    calls.list = [];
+    failFirst(1, { code: 255, stderr: 'Connection to ai-server closed by remote host.' }, { stdout: `${REMOTE}\tclaude\t/home/r\t999\t7\n` });
+    const answered = await getAllPanesInfo();
+    expect([...(answered.answeredRemoteHosts ?? [])]).toEqual(['ai-server']);
+    expect(answered.get(REMOTE)?.command).toBe('claude');
   });
 });

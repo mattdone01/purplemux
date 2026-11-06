@@ -28,7 +28,8 @@ vi.mock('@/lib/cli-utils', () => ({
   }),
 }));
 vi.mock('@/lib/caller', () => callers);
-vi.mock('@/lib/tmux', () => tmux);
+// The route checks the session with hasSessionOrUnreachable (story 11): one mock serves both names.
+vi.mock('@/lib/tmux', () => Object.assign(tmux, { hasSessionOrUnreachable: tmux.hasSession }));
 vi.mock('@/lib/agent-prompt-delivery', () => delivery);
 vi.mock('@/lib/coordination-audit', () => audit);
 vi.mock('@/lib/agent-dispatch-policy', () => ({
@@ -243,6 +244,79 @@ describe('POST /api/cli/tabs/[tabId]/steer (story 14)', { timeout: 15_000 }, () 
 
     it('refuses a raw value that is not a boolean', async () => {
       expect(await call({ content: 'x', raw: 1 })).toEqual({ status: 400, body: { error: 'raw: saw number; expected true or false', code: 'invalid-request' } });
+    });
+  });
+
+  describe('story 11: a remote host that does not answer over ssh is 503, never session-not-running', () => {
+    const unreachable = async () => {
+      const { RemoteHostError } = await import('@/lib/remote-host');
+      return new RemoteHostError('ai-lan', 'remote host ai-lan did not answer over ssh (exit 255: Connection closed by 192.168.1.155 port 22)');
+    };
+
+    it('the session check fails on ssh: 503 remote-host-unreachable (exit 6), no Escape, nothing typed, the interrupt audited', async () => {
+      tmux.hasSession.mockRejectedValue(await unreachable());
+      const result = await call({ content: 'correct course' });
+      expect(result).toEqual({
+        status: 503,
+        body: { error: expect.stringContaining('did not answer over ssh'), code: 'remote-host-unreachable', host: 'ai-lan' },
+      });
+      expect(tmux.sendEscape).not.toHaveBeenCalled();
+      expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+      expect(audit.appendCoordinationAudit).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'steer-interrupt', interrupted: false, ok: false, failure: expect.stringContaining('did not answer over ssh'),
+      }));
+    });
+
+    it('the delivery fails on ssh after the Escape: 503, and the line says the turn was interrupted', async () => {
+      delivery.deliverPrompt.mockRejectedValueOnce(await unreachable());
+      const result = await call({ content: 'correct course' });
+      expect(result.status).toBe(503);
+      expect(result.body).toMatchObject({ code: 'remote-host-unreachable', host: 'ai-lan' });
+      expect(tmux.sendEscape).toHaveBeenCalledTimes(1);
+      expect(audit.appendCoordinationAudit).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'steer-interrupt', interrupted: true, ok: false,
+      }));
+    });
+
+    it('the second session check (after a failed Escape) fails on ssh: 503, not a 500', async () => {
+      tmux.sendEscape.mockRejectedValue(await unreachable());
+      tmux.hasSession.mockResolvedValueOnce(true).mockRejectedValueOnce(await unreachable());
+      const result = await call({ content: 'x' });
+      expect(result.status).toBe(503);
+      expect(result.body).toMatchObject({ code: 'remote-host-unreachable' });
+      expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+    });
+
+    it('an Escape whose ssh failure leaves its outcome unknown is audited interrupted: "unknown" with the ssh error, never false (review r1, finding 2)', async () => {
+      const { RemoteHostError } = await import('@/lib/remote-host');
+      const lost = 'ssh to ai-lan failed during tmux send-keys for x (exit 255: Connection to ai-lan closed by remote host.) after the command may have started; the input may have been delivered; read the pane before retrying';
+      tmux.sendEscape.mockRejectedValue(new RemoteHostError('ai-lan', lost, { outcomeUnknown: true }));
+      const result = await call({ content: 'correct course' });
+      expect(result).toEqual({ status: 200, body: { status: 'steered', interrupted: 'unknown' } });
+      expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
+      expect(audit.appendCoordinationAudit).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'steer-interrupt', interrupted: 'unknown', interruptFailure: lost, ok: true,
+      }));
+    });
+
+    it('an Escape refused before it ran stays interrupted: false, with the ssh error beside it', async () => {
+      tmux.sendEscape.mockRejectedValue(await unreachable());
+      await call({ content: 'correct course' });
+      expect(audit.appendCoordinationAudit).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'steer-interrupt', interrupted: false, interruptFailure: expect.stringContaining('did not answer over ssh'),
+      }));
+    });
+
+    it('a delivery whose outcome is unknown is 503 remote-write-outcome-unknown, never the retryable code', async () => {
+      const { RemoteHostError } = await import('@/lib/remote-host');
+      delivery.deliverPrompt.mockRejectedValueOnce(new RemoteHostError('ai-lan', 'lost; the input may have been delivered; read the pane before retrying', { outcomeUnknown: true }));
+      const result = await call({ content: 'correct course' });
+      expect(result).toEqual({ status: 503, body: { error: expect.stringContaining('read the pane before retrying'), code: 'remote-write-outcome-unknown', host: 'ai-lan' } });
+    });
+
+    it('a session tmux reports absent stays 409 session-not-running', async () => {
+      tmux.hasSession.mockResolvedValue(false);
+      expect(await call({ content: 'x', interrupt: false })).toEqual({ status: 409, body: { error: 'session not found', code: 'session-not-running' } });
     });
   });
 
