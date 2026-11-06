@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getMissionControlStore } from '@/lib/mission-control-store';
 import { requireMissionHuman, sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
-import { parseMissionCursor, parseMissionLimit } from '@/lib/mission-control-validation';
+import { parseIncludeTest, parseMissionCursor, parseMissionLimit } from '@/lib/mission-control-validation';
 
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   setMissionHeaders(res);
@@ -13,7 +13,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     await requireMissionHuman(req);
     const after = parseMissionCursor(req.query.after, 0);
     const limit = parseMissionLimit(req.query.limit, 100, 200);
-    return res.status(200).json(getMissionControlStore().eventsAfter(after, limit));
+    const includeTest = parseIncludeTest(req.query.includeTest);
+    return res.status(200).json(getMissionControlStore().eventsAfter(after, limit, undefined, { hideTest: !includeTest }));
   } catch (error) {
     sendMissionError(res, error);
   }

@@ -48,7 +48,10 @@ const base = {
 };
 
 const eventSchema = z.discriminatedUnion('type', [
-  z.object({ ...base, type: z.literal('run.started'), payload: z.object({ objective: shortText, epic: epic.optional().nullable(), tabId: id }).strict() }).strict(),
+  // `test` (story 57): the producer's declaration that the run is test-only; only a scratch workspace may make it.
+  z.object({ ...base, type: z.literal('run.started'), payload: z.object({
+    objective: shortText, epic: epic.optional().nullable(), tabId: id, test: z.boolean().optional(),
+  }).strict() }).strict(),
   z.object({ ...base, type: z.literal('run.resumed'), payload: z.object({ tabId: id, transferPendingAnswers: z.boolean() }).strict() }).strict(),
   z.object({ ...base, type: z.literal('progress.updated'), payload: z.object({
     objective: shortText.optional(),
@@ -62,7 +65,9 @@ const eventSchema = z.discriminatedUnion('type', [
   z.object({ ...base, type: z.literal('run.finished'), payload: z.object({ state: z.enum(['completed', 'cancelled']), summary: z.string().trim().min(1).max(8000), closeoutPending: z.boolean() }).strict() }).strict(),
   // The question fields are checked by validateMissionQuestion (ADR-0037), which names every defect.
   // `followsUp` (ADR-0037 amendment D2) rides beside the question, as `itemId` and `humanReview` do; it is not a question field.
-  z.object({ ...base, type: z.literal('attention.opened'), payload: z.object({ itemId: id, humanReview: humanReview.optional(), followsUp: id.optional() }).loose() }).strict(),
+  z.object({ ...base, type: z.literal('attention.opened'), payload: z.object({
+    itemId: id, humanReview: humanReview.optional(), followsUp: id.optional(), test: z.boolean().optional(),
+  }).loose() }).strict(),
   z.object({ ...base, type: z.literal('attention.updated'), payload: z.object({ itemId: id, humanReview: humanReview.optional() }).loose() }).strict(),
   z.object({ ...base, type: z.literal('attention.resolved'), payload: z.object({ itemId: id, resolution: z.string().trim().min(1).max(8000) }).strict() }).strict(),
   z.object({ ...base, type: z.literal('attention.cancelled'), payload: z.object({ itemId: id, reason: z.string().trim().min(1).max(8000) }).strict() }).strict(),
@@ -109,11 +114,14 @@ export const CURATOR_ORDER_EVENT_PREFIX = 'system:curator-so:';
 export const SO_PROPOSAL_EVENT_PREFIX = 'system:so-proposal:';
 /** The `attention.resolved` the store writes when a follow-up resolves its target (ADR-0037 amendment D2): no request takes one. */
 export const FOLLOW_UP_EVENT_PREFIX = 'system:follow-up:';
+/** The `attention.cancelled` the store writes for each open item of a deleted workspace (story 57 AC 2): no request takes one. */
+export const WORKSPACE_DELETED_EVENT_PREFIX = 'system:workspace-deleted:';
 const RESERVED_EVENT_ID_PREFIXES = [
   'system:migration:', 'system:rebind:', 'answer:auto:', NEEDS_DECISION_EVENT_PREFIX, CURATOR_ORDER_EVENT_PREFIX, SO_PROPOSAL_EVENT_PREFIX,
-  FOLLOW_UP_EVENT_PREFIX,
+  FOLLOW_UP_EVENT_PREFIX, WORKSPACE_DELETED_EVENT_PREFIX,
 ];
 export const FOLLOW_UP_UPDATE_REFUSAL = 'followsUp is set when an item opens; a link never changes';
+export const TEST_UPDATE_REFUSAL = 'test is declared on run.started or attention.opened; an update never changes it';
 /**
  * Item ids only a server producer opens or revises, by the producer's event prefix: a `strike` answer on a
  * `curator-so-<n>` item strikes an order, so no tab or token may open one (story 23 review r1 F1).
@@ -144,7 +152,7 @@ const checkQuestions = (events: TParsedEvent[], minVersion: 1 | 2): IMissionEven
   const lint: IMissionEventLint[] = [];
   const checked = events.map((event) => {
     if (event.type !== 'attention.opened' && event.type !== 'attention.updated') return event;
-    const { itemId, humanReview: review, followsUp, ...question } = event.payload as typeof event.payload & { followsUp?: string };
+    const { itemId, humanReview: review, followsUp, test, ...question } = event.payload as typeof event.payload & { followsUp?: string; test?: boolean };
     // AC 3 refuses a NEW v1 question; an update of a v1 item stays v1 with lint (the store refuses a v2 -> v1 downgrade).
     const verdict = validateMissionQuestion(question, event.type === 'attention.opened' ? minVersion : 1);
     if (!verdict.ok) {
@@ -153,7 +161,10 @@ const checkQuestions = (events: TParsedEvent[], minVersion: 1 | 2): IMissionEven
     }
     const findings = [...verdict.lint, ...reviewLint(verdict.question, review)];
     if (findings.length) lint.push({ eventId: event.eventId, itemId, findings });
-    return { ...event, payload: { itemId, ...verdict.question, ...(review ? { humanReview: review } : {}), ...(followsUp !== undefined ? { followsUp } : {}) } };
+    return { ...event, payload: {
+      itemId, ...verdict.question, ...(review ? { humanReview: review } : {}), ...(followsUp !== undefined ? { followsUp } : {}),
+      ...(test !== undefined ? { test } : {}),
+    } };
   });
   if (defects.length) {
     const refused = new Set(defects.map((entry) => entry.eventId)).size;
@@ -179,6 +190,9 @@ export const parseMissionEventBatch = (
     // ADR-0037 amendment D2 rule 1: a link is written once, when the item opens; and an item cannot follow itself up.
     if (event.type === 'attention.updated' && Object.hasOwn(event.payload, 'followsUp')) {
       throw new MissionControlError(400, 'invalid-request', FOLLOW_UP_UPDATE_REFUSAL);
+    }
+    if (event.type === 'attention.updated' && Object.hasOwn(event.payload, 'test')) {
+      throw new MissionControlError(400, 'invalid-request', TEST_UPDATE_REFUSAL);
     }
     if (event.type === 'attention.opened' && event.payload.followsUp === event.payload.itemId) {
       throw new MissionControlError(400, 'invalid-request', `followsUp names the item itself (${event.payload.itemId}); it must name an earlier, answered item`);
@@ -217,6 +231,23 @@ export const parseMissionCursor = (value: unknown, fallback: number): number => 
     throw new MissionControlError(400, 'invalid-request', 'cursor must be a safe integer');
   }
   return parsed;
+};
+
+/**
+ * `?includeTest=1` (story 57): the explicit read that serves test-only runs, for the acceptance app. Absent is false;
+ * any other value is refused, so a typo never reads as the owner's view.
+ */
+export const parseIncludeTest = (value: unknown): boolean => {
+  if (value === undefined) return false;
+  if (value === '1') return true;
+  throw new MissionControlError(400, 'invalid-request', 'includeTest: expected 1, or absent for the owner view');
+};
+
+/** The owner's board and pulse never serve test-only runs (story 57): `includeTest` is refused there, not ignored. */
+export const refuseIncludeTest = (value: unknown, view: string): void => {
+  if (value !== undefined) {
+    throw new MissionControlError(403, 'forbidden', `includeTest is refused on the ${view}: the owner's ${view} never shows a test-only run. Read GET /api/mission-control?includeTest=1`);
+  }
 };
 
 export const parseMissionLimit = (value: unknown, fallback: number, maximum: number): number => {

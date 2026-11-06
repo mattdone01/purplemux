@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getMissionSnapshot } from '@/lib/mission-control-runtime';
 import { getWorkspaceById } from '@/lib/workspace-store';
-import { canAccessWorkspace } from '@/lib/cli-utils';
+import { canAccessWorkspace, isOwnWorkspace } from '@/lib/cli-utils';
 import { resolveCliScope } from '@/lib/workspace-token';
 import { MissionControlError } from '@/lib/mission-control-errors';
 import { sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
@@ -21,7 +21,9 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     if (!(await canAccessWorkspace(scope, workspaceId))) throw new MissionControlError(403, 'forbidden', 'Workspace is outside this token scope');
     if (!(await getWorkspaceById(workspaceId))) throw new MissionControlError(404, 'not-found', 'Workspace not found');
     return res.status(200).json({
-      ...await getMissionSnapshot(workspaceId),
+      // A workspace's own token reads its test-only runs (story 57); a portfolio read, which a manager may relay to the
+      // owner, never does.
+      ...await getMissionSnapshot(workspaceId, { includeTest: isOwnWorkspace(scope, workspaceId) }),
       humanInboxPolicy: getMissionControlStore().humanInboxPolicy(workspaceId),
     });
   } catch (error) {

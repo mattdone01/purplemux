@@ -1752,6 +1752,20 @@ POST /api/cli/mission-control/events?workspaceId=WS
     "expectedRevision":0,"producerAt":1700000000000,"bindingGeneration":0,"type":"run.started",
     "payload":{"objective":"Ship Mission Control","tabId":"tab-orchestrator"}}]}
 
+  Test-only runs (story 57): no test opens an attention item that a human sees on the live server.
+  A test uses a test-only run or a scratch server. Only a scratch workspace runs test-only: the
+  human creates one with POST /api/workspace { ..., "scratch": true }, and nothing changes the
+  field after. Every run of a scratch workspace is test-only, so the owner's board, pulse, push and
+  the default GET /api/mission-control and /api/mission-control/events never show its items.
+  A producer declares it with "test": true on run.started and on attention.opened. "test": true
+  from any other workspace is refused with 403 forbidden, "test": false in a scratch workspace with
+  400, and "test" on attention.updated with 400. The acceptance app reads test-only runs with
+  GET /api/mission-control?includeTest=1 (also /api/mission-control/events?includeTest=1); the
+  board and the pulse refuse includeTest with 403. A workspace's own token reads its test-only
+  runs on GET /api/cli/mission-control; a portfolio read does not. A workspace delete cancels its
+  open and candidate items (state "cancelled", resolution "workspace deleted"). The server also
+  sweeps at start and every 60 s: it cancels the same way any open item whose workspace is gone.
+
   Record a workspace issue (the run binding generation must still be current):
   {"events":[{"eventId":"evt-question-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",
     "expectedRevision":0,"producerAt":1700000000001,"bindingGeneration":1,"type":"attention.opened",

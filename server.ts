@@ -14,7 +14,7 @@ import { handleSyncConnection, gracefulSyncShutdown } from './src/lib/sync-serve
 import { handleStatusConnection, gracefulStatusShutdown } from './src/lib/status-server';
 import { getStatusManager } from './src/lib/status-manager';
 import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
-import { startAutoAnswerTick, stopAutoAnswerTick } from './src/lib/mission-control-auto-answer-tick';
+import { runOrphanSweepPass, startAutoAnswerTick, stopAutoAnswerTick } from './src/lib/mission-control-auto-answer-tick';
 import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
 import { startNotes, stopNotes } from './src/lib/notes-service';
 import { startGrants, stopGrants } from './src/lib/grant-service';
@@ -421,6 +421,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await getMissionControlRuntime().start();
   // The bookkeeping auto-answer rule: off until the admin sets its fleet-config key (ADR-0031).
   startAutoAnswerTick();
+  // One orphan sweep at start (story 57): a deleted workspace's open items close now, not 60 s on; the tick takes the rest.
+  void runOrphanSweepPass().catch((err) => log.error({ err }, 'orphan sweep at start failed'));
   // The constraint finder's 60 s tick caches each workspace's board; its breached anomalies reach the flag tick (ADR-0034).
   startConstraintFinder();
   // One raise-edge flag tick per process; its first tick, 60 s on, is the no-replay baseline (ADR-0032).

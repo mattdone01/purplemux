@@ -25,7 +25,11 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   if (req.method === 'POST') {
-    const { directory, name, resumeSessionId, panelType, mkdir } = req.body ?? {};
+    const { directory, name, resumeSessionId, panelType, mkdir, scratch } = req.body ?? {};
+    // Story 57: a scratch workspace runs test-only Mission Control runs. Only this human route sets it, at create.
+    if (scratch !== undefined && typeof scratch !== 'boolean') {
+      return res.status(400).json({ error: 'scratch: expected true or false' });
+    }
     const provider = resumeSessionId ? getProviderByPanelType(panelType ?? 'claude-code') : null;
     if (resumeSessionId) {
       if (!provider) {
@@ -44,7 +48,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
     try {
       const layoutOptions = provider ? { panelType: provider.panelType } : undefined;
-      const workspace = await createWorkspace(resolvedDirectory, name, layoutOptions, { mkdir: mkdir === true });
+      const workspace = await createWorkspace(resolvedDirectory, name, layoutOptions, { mkdir: mkdir === true, ...(scratch === true ? { scratch: true } : {}) });
 
       const defaultTab = await readDefaultTab(workspace.id);
 

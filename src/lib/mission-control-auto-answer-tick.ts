@@ -99,9 +99,13 @@ export const runAutoAnswerPass = async (deps: IAutoAnswerDeps = defaultDeps): Pr
   return outcomes;
 };
 
+/** The orphan sweep's pass (story 57): imported here, so the tick module never carries the workspace store. */
+export const runOrphanSweepPass = async (): Promise<unknown> => (await import('@/lib/mission-control-orphan-sweep')).runOrphanSweep();
+
 /**
- * The tick's two passes: the bookkeeping rule, then the fleet standing-order proposals (ADR-0041 §1 amendment D7),
- * which run whatever the auto-answer key holds, so a crash or a restart after the owner's answer cannot lose a Yes.
+ * The tick's passes. First the orphan sweep (story 57), so no pass acts on an item of a deleted workspace. Then the
+ * bookkeeping rule, then the fleet standing-order proposals (ADR-0041 §1 amendment D7), which run whatever the
+ * auto-answer key holds, so a crash or a restart after the owner's answer cannot lose a Yes.
  */
 export const runTickPasses = async (
   autoAnswer: () => Promise<unknown> = () => runAutoAnswerPass(),
@@ -109,7 +113,9 @@ export const runTickPasses = async (
     const m = await import('@/lib/so-proposal-service');
     return m.runSoProposalPass(await m.soProposalDeps());
   },
+  orphans: () => Promise<unknown> = runOrphanSweepPass,
 ): Promise<void> => {
+  await orphans().catch((err) => log.error({ err }, 'orphan sweep pass failed'));
   await autoAnswer().catch((err) => log.error({ err }, 'auto-answer pass failed'));
   await proposals().catch((err) => log.error({ err }, 'standing-order proposal pass failed'));
 };

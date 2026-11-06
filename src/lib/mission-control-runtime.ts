@@ -524,9 +524,10 @@ export class MissionControlRuntime {
     }
   }
 
-  async snapshot(workspaceId?: string): Promise<IMissionSnapshot> {
+  /** `includeTest` (story 57): serve test-only runs too; the owner's views leave them out. */
+  async snapshot(workspaceId?: string, options: { includeTest?: boolean } = {}): Promise<IMissionSnapshot> {
     const views = await this.deps.workspaceViews();
-    return this.deps.getStore().snapshot(views, workspaceId);
+    return this.deps.getStore().snapshot(views, workspaceId, { hideTest: options.includeTest !== true });
   }
 
   async bootstrap(input: { bootstrapId: string; reconcile: boolean }): Promise<IMissionBootstrap> {
@@ -892,8 +893,9 @@ export const rebindMissionRunsToOrchestrator = (
   cause: TMissionRebindCause,
 ): Promise<IMissionEvent[]> => getMissionControlRuntime().rebindToOrchestrator(workspaceId, tabId, cause);
 
-export const getMissionSnapshot = (workspaceId?: string): Promise<IMissionSnapshot> =>
-  getMissionControlRuntime().snapshot(workspaceId);
+/** A served snapshot: without test-only runs unless `includeTest` (story 57). */
+export const getMissionSnapshot = (workspaceId?: string, options: { includeTest?: boolean } = {}): Promise<IMissionSnapshot> =>
+  getMissionControlRuntime().snapshot(workspaceId, options);
 
 export const runMissionControlBootstrap = (input: {
   bootstrapId: string;

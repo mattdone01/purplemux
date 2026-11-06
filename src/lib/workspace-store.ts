@@ -423,6 +423,8 @@ export interface ICreateWorkspaceOptions {
   uniqueName?: boolean;
   /** Navigation directories after the primary, stored in the same write. */
   extraDirectories?: string[];
+  /** A scratch workspace (story 57): its Mission Control runs are test-only. Only the human create route passes it. */
+  scratch?: boolean;
 }
 
 export const WORKSPACE_NAME_TAKEN_CODE = 'WORKSPACE_NAME_TAKEN';
@@ -480,7 +482,9 @@ export const createWorkspace = async (
     await fs.mkdir(resolveLayoutDir(wsId), { recursive: true });
     await writeLayoutFile(layout, resolveLayoutFile(wsId));
 
-    const workspace: IWorkspace = { id: wsId, name: wsName, directories: [directory, ...(options?.extraDirectories ?? [])] };
+    const workspace: IWorkspace = {
+      id: wsId, name: wsName, directories: [directory, ...(options?.extraDirectories ?? [])], ...(options?.scratch === true ? { scratch: true } : {}),
+    };
     data.workspaces.push(workspace);
     await writeWorkspacesFile(data);
     await writeWorkspacePrompts(workspace);
@@ -488,6 +492,21 @@ export const createWorkspace = async (
     log.debug(`Created: ${wsId} (${wsName}, ${directory})`);
     return workspace;
   });
+
+/**
+ * A deleted workspace's open and candidate Mission Control items close as `cancelled`, reason `workspace deleted`
+ * (story 57 AC 2): no agent is left to act on an answer. The workspace is already gone, so a Mission Control failure
+ * is logged, never thrown; the orphan sweep on the next tick cancels what this missed. Imported here, so Mission
+ * Control never sits in this module's graph.
+ */
+const cancelDeletedWorkspaceItems = async (workspaceId: string): Promise<void> => {
+  try {
+    const { itemIds } = await (await import('@/lib/mission-control-orphan-sweep')).cancelDeletedWorkspace(workspaceId);
+    if (itemIds.length) log.info(`Deleted ${workspaceId}: cancelled ${itemIds.length} open Mission Control item(s): ${itemIds.join(', ')}`);
+  } catch (err) {
+    log.error(`Deleted ${workspaceId}: its open Mission Control items were not cancelled; the orphan sweep closes them: ${err instanceof Error ? err.message : String(err)}`);
+  }
+};
 
 export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
   withOrchestrationMappingWrite(workspaceId, async () => {
@@ -541,6 +560,7 @@ export const deleteWorkspace = async (workspaceId: string): Promise<boolean> =>
     revokeWorkspaceToken(workspaceId);
     await revokeWorkspaceTabTokens(workspaceId);
     if (layout) for (const tab of collectAllTabs(layout.root)) forgetSessionHost(tab.sessionName);
+    await cancelDeletedWorkspaceItems(workspaceId);
     log.info(`Deleted: ${workspaceId} (${ws.name})`);
     return true;
     });

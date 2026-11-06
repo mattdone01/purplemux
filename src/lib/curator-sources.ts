@@ -108,8 +108,11 @@ export const readMissionAsks = (ids: readonly string[] | null): Array<{ id: stri
     return [];
   }
   try {
+    // Never a test-only run's ask (story 57). A store that no release with mission_test_runs has opened holds no test run.
+    const testRuns = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mission_test_runs'`).get() !== undefined;
     const rows = db.prepare(`SELECT id, workspace_id, question_json, created_at, json_extract(human_review_json, '$.humanNeed') AS need
-      FROM attention_items ORDER BY created_at, id`).all() as Array<{ id: string; workspace_id: string; question_json: string; created_at: number; need: string | null }>;
+      FROM attention_items item${testRuns ? ' WHERE NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = item.run_id)' : ''}
+      ORDER BY created_at, id`).all() as Array<{ id: string; workspace_id: string; question_json: string; created_at: number; need: string | null }>;
     const wanted = ids ? new Set(ids) : null;
     // The curator's own spot-check items are never an agent's ask (review r2 F6).
     return rows.filter((row) => !row.id.startsWith('curator-spot-check-') && (!wanted || wanted.has(row.id))).flatMap((row) => {
