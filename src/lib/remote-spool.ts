@@ -72,7 +72,10 @@ export interface IRemoteSpoolPull {
 
 const pullHost = async (host: string, spoolDir: string): Promise<IRemoteSpoolPull> => {
   const result: IRemoteSpoolPull = { host, taken: 0, dropped: 0, quarantined: 0 };
-  // A rerun of the list script ends where the first run ended (story 11): it may be retried on any ssh exit 255.
+  // The list script may be retried on any ssh exit 255 (story 11): a rerun lists the same files, and deletes or
+  // moves nothing a pull needs. One loss is possible: a first run cut off after it moved an oversize file to bad/
+  // never sends that file's `oversize` line, and the rerun no longer sees the file, so its warn and audit line are
+  // lost (review r1, finding 5). Without the retry the same cut-off loses them as well.
   const { stdout } = await runSsh(host, 'sh -s', { timeoutMs: REMOTE_SPOOL_TIMEOUT_MS, input: remoteSpoolListScript(), retry: 'read' });
   const done: string[] = [];
   for (const line of stdout.split('\n')) {

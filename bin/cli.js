@@ -223,6 +223,7 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'target-changed': 'permanent — the tab was replaced while the command waited; do not retry',
   'routes-absent': 'no such route on this server (an older server, a foreign server, or a malformed id) — retrying cannot help',
   'remote-host-unreachable': 'the remote host did not answer over ssh — retry, bounded, once it answers',
+  'remote-write-outcome-unknown': 'ssh failed after the write may have reached the pane — read the pane (tab result) before any retry; a blind retry may type the input twice',
   'remote-kit-broken': "the CLI kit does not run on the remote host; no agent started — a retry fails the same way until a person repairs the kit or the host",
   'wip-cap': "refused by state — close an agent tab first; only the workspace's orchestrator may pass --over-cap --reason",
   'tab-busy': 'the tab is mid-turn — retry when it is idle, or restart with --interrupt to abandon the turn',

@@ -108,11 +108,20 @@ describe('purplemux tab create --host (ADR-0022)', { timeout: 30_000 }, () => {
     [503, 'remote-host-unreachable', 6],
     // Story 12: the kit's CLI does not run on the host; unmapped, so exit 1 (ADR-0016 item 10). Story 40 reads it.
     [502, 'remote-kit-broken', 1],
+    // Story 11 review r1: a remote write that may have run is never the retryable exit 6 (ADR-0016 item 11).
+    [503, 'remote-write-outcome-unknown', 1],
   ])('HTTP %i %s exits %i', async (status, code, exit) => {
     reply = { status, body: { error: 'refused', code } };
     const result = await cli(['tab', 'create', '-w', 'ws-a', '--host', 'ai-server']);
     expect(result.code).toBe(exit);
     expect(result.stderr).toContain(code);
+  });
+
+  it('remote-write-outcome-unknown tells the caller to read the pane before any retry (tab send)', async () => {
+    reply = { status: 503, body: { error: 'ssh to ai-server failed during tmux send-keys', code: 'remote-write-outcome-unknown', host: 'ai-server' } };
+    const result = await cli(['tab', 'send', '-w', 'ws-a', 'tab-x', 'hello']);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('read the pane (tab result) before any retry; a blind retry may type the input twice');
   });
 
   it('remote-kit-broken tells the caller a retry fails until the kit or the host is repaired', async () => {

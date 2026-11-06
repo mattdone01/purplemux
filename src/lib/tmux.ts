@@ -21,9 +21,13 @@ import { appendCoordinationAudit } from '@/lib/coordination-audit';
 import {
   REMOTE_SESSION_EXISTS_EXIT,
   RemoteHostError,
+  WRITE_OUTCOME_UNKNOWN_ADVICE,
   describeRemoteFailure,
+  isOutputOverflow,
   isSshFailure,
   isTmuxAbsence,
+  outcomeUnknownAfter,
+  sshNeverStarted,
   remoteKillIfTagged,
   parseRemoteReap,
   reapCommand,
@@ -69,17 +73,33 @@ const TMUX_READ_COMMANDS: ReadonlySet<string> = new Set(['has-session', 'list-pa
  * One tmux call for a session, wherever it runs (ADR-0022): the local `purple`
  * socket, or `ssh <host> tmux -L pmux-<origin>` with the same arguments. A
  * remote call that ssh fails (after `runSsh`'s one retry) throws
- * `RemoteHostError`, so a route answers 503 `remote-host-unreachable`, never a
- * raw 500 (story 11); tmux's own failure keeps its exit status and stderr.
+ * `RemoteHostError`, so a route answers 503, never a raw 500 (story 11): a read,
+ * or a write that provably never started, is `remote-host-unreachable`; a write
+ * that may have run is outcome-unknown (review r1, finding 1). tmux's own
+ * failure keeps its exit status and stderr; an answer over the buffer is its
+ * own error, not an ssh failure (finding 6).
  */
 const runTmux = async (sessionName: string, args: string[]): Promise<{ stdout: string; stderr: string }> => {
   const host = await sessionHostOf(sessionName);
   if (!host) return execFile('tmux', ['-L', TMUX_SOCKET, ...args], { timeout: CMD_TIMEOUT });
+  const command = args[0];
+  const read = TMUX_READ_COMMANDS.has(command);
   try {
-    return await runSsh(host, remoteTmuxCommand(args), { timeoutMs: CMD_TIMEOUT, retry: TMUX_READ_COMMANDS.has(args[0]) ? 'read' : 'connect' });
+    return await runSsh(host, remoteTmuxCommand(args), { timeoutMs: CMD_TIMEOUT, retry: read ? 'read' : 'connect' });
   } catch (err) {
-    if (isSshFailure(err)) throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${describeRemoteFailure(err)}); tmux ${args[0]} for ${sessionName} not confirmed`);
-    throw err;
+    if (isOutputOverflow(err)) {
+      throw new Error(`tmux ${command} for ${sessionName} on ${host} wrote more than the 16 MiB ssh buffer; the answer was cut off (ssh answered)`);
+    }
+    if (!isSshFailure(err)) throw err;
+    const failure = describeRemoteFailure(err);
+    if (read || sshNeverStarted(err)) {
+      throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${failure}); tmux ${command} for ${sessionName} ${read ? 'not confirmed' : 'did not run'}`);
+    }
+    throw new RemoteHostError(
+      host,
+      `ssh to ${host} failed during tmux ${command} for ${sessionName} (${failure}) after the command may have started; ${WRITE_OUTCOME_UNKNOWN_ADVICE}`,
+      { outcomeUnknown: true },
+    );
   }
 };
 
@@ -283,9 +303,17 @@ const createRemoteSession = async (
       remoteKillIfTagged(name, nonce),
       ...(tabEnv ? [`rm -f ${remoteKitPath(remoteTabEnvRelative(tabEnv.tabId))}`] : []),
     ].join('; ');
-    await runSsh(host, cleanup, { timeoutMs: CMD_TIMEOUT }).catch(() => {});
+    const cleaned = await runSsh(host, cleanup, { timeoutMs: CMD_TIMEOUT }).then(() => true, () => false);
     // The kit probe runs before new-session (story 12): no session and no agent started.
     if ((err as { code?: unknown }).code === REMOTE_KIT_BROKEN_EXIT) throw kitProbeFailure(host, err);
+    // A create that may have run and a cleanup that did not answer leave the session's existence unknown (story 11 r1, finding 1).
+    if (isSshFailure(err) && !sshNeverStarted(err) && !cleaned) {
+      throw new RemoteHostError(
+        host,
+        `ssh to ${host} failed during the create of ${name} (${describeRemoteFailure(err)}) and the cleanup did not answer; ${name} may exist there: read the tab list before retrying`,
+        { outcomeUnknown: true },
+      );
+    }
     if (isSshFailure(err)) throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${describeRemoteFailure(err)})`);
     throw new Error(`remote session ${name} on ${host} was not created (${describeRemoteFailure(err)})`);
   }
@@ -364,6 +392,14 @@ const killRemoteSession = async (host: string, name: string, opts: IKillSessionO
       log.warn({ host, session: name, failure: describeRemoteFailure(err) }, 'unregistered remote host did not answer; tab closed without a reap');
       if (opts.tabId) await appendCoordinationAudit({ event: 'tab-reap-skipped', tabId: opts.tabId, session: name, host, reason: 'host-unregistered-and-unreachable' });
       return { reaper: 'remote-skipped', envMarker: 'unknown', killed: [], survivors: [] };
+    }
+    // A reap that may have started is not retried blind (story 11 r1, finding 1): the caller reads the tab first.
+    if (isSshFailure(err) && !sshNeverStarted(err)) {
+      throw new RemoteHostError(
+        host,
+        `ssh to ${host} failed during the close of ${name} (${describeRemoteFailure(err)}) after the reap may have started; the session may or may not still run there: read the tab before retrying, or remove ${host} from remote.hosts to drop the tab without a reap`,
+        { outcomeUnknown: true },
+      );
     }
     throw new RemoteHostError(host, `could not close ${name} on ${host} (${describeRemoteFailure(err)}). The session may still run there; retry when the host answers, or remove ${host} from remote.hosts to drop the tab without a reap`);
   }
@@ -725,7 +761,7 @@ const localPanes = async (): Promise<Map<string, IPaneInfo>> => {
 /** After a host fails to answer a pane scan, the scans skip it this long (review r1 nit 2). */
 const REMOTE_SCAN_BACKOFF_MS = 30_000;
 
-const gScan = globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, number> };
+const gScan = globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, { until: number; failure: string }> };
 if (!gScan.__ptRemoteScanBackoff) gScan.__ptRemoteScanBackoff = new Map();
 const scanBackoff = gScan.__ptRemoteScanBackoff;
 
@@ -733,11 +769,16 @@ interface IRemoteScan {
   panes: Map<string, IPaneInfo>;
   /** tmux on the host answered (with panes, or with "no server"): a session missing from it is gone. */
   answered: boolean;
+  /** Why the host was not read: the ssh error, or the backoff it started. Set only when `answered` is false. */
+  failure?: string;
+  /** tmux answered "no server": every session on the host is gone (tmux exits with its last session). */
+  serverAbsent?: boolean;
 }
 
 /** A host that does not answer contributes nothing: its tabs read as not running, never as local. */
 const remotePanes = async (host: string): Promise<IRemoteScan> => {
-  if ((scanBackoff.get(host) ?? 0) > Date.now()) return { panes: new Map(), answered: false };
+  const backoff = scanBackoff.get(host);
+  if (backoff && backoff.until > Date.now()) return { panes: new Map(), answered: false, failure: `skipped after ${backoff.failure}` };
   try {
     const { stdout } = await runSsh(host, remoteTmuxCommand(['list-panes', '-a', '-F', ALL_PANES_FORMAT]), { timeoutMs: CMD_TIMEOUT, retry: 'read' });
     scanBackoff.delete(host);
@@ -745,11 +786,12 @@ const remotePanes = async (host: string): Promise<IRemoteScan> => {
   } catch (err) {
     if (isTmuxAbsence(err)) {
       scanBackoff.delete(host);
-      return { panes: new Map(), answered: true };
+      return { panes: new Map(), answered: true, serverAbsent: true };
     }
-    scanBackoff.set(host, Date.now() + REMOTE_SCAN_BACKOFF_MS);
-    log.warn({ host, failure: describeRemoteFailure(err) }, 'remote pane scan failed; host skipped for 30 s');
-    return { panes: new Map(), answered: false };
+    const failure = describeRemoteFailure(err);
+    scanBackoff.set(host, { until: Date.now() + REMOTE_SCAN_BACKOFF_MS, failure });
+    log.warn({ host, failure }, 'remote pane scan failed; host skipped for 30 s');
+    return { panes: new Map(), answered: false, failure };
   }
 };
 
@@ -761,6 +803,10 @@ const remotePanes = async (host: string): Promise<IRemoteScan> => {
  */
 export interface IPaneMap extends Map<string, IPaneInfo> {
   answeredRemoteHosts?: ReadonlySet<string>;
+  /** Each remote host this scan did not read, with the ssh error (story 11 review r1, finding 3). */
+  unreadRemoteHosts?: ReadonlyMap<string, string>;
+  /** Answered hosts whose tmux answered "no server": no session runs there (finding 4 believes this drop at once). */
+  serverAbsentRemoteHosts?: ReadonlySet<string>;
 }
 
 export const getAllPanesInfo = async (): Promise<IPaneMap> => {
@@ -768,11 +814,15 @@ export const getAllPanesInfo = async (): Promise<IPaneMap> => {
   const hosts = await remoteHostsInUse().catch(() => knownRemoteHosts());
   const [local, ...remote] = await Promise.all([localPanes(), ...hosts.map(remotePanes)]);
   const answered = new Set<string>();
+  const unread = new Map<string, string>();
+  const serverAbsent = new Set<string>();
   remote.forEach((scan, i) => {
     if (scan.answered) answered.add(hosts[i]);
+    else unread.set(hosts[i], scan.failure ?? 'not read');
+    if (scan.serverAbsent) serverAbsent.add(hosts[i]);
     for (const [session, info] of scan.panes) if (!local.has(session)) local.set(session, info);
   });
-  return Object.assign(local, { answeredRemoteHosts: answered });
+  return Object.assign(local, { answeredRemoteHosts: answered, unreadRemoteHosts: unread, serverAbsentRemoteHosts: serverAbsent });
 };
 
 export const SAFE_SHELLS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash']);
@@ -832,7 +882,9 @@ export const sendKeysSeparated = async (
   await exitCopyMode(sessionName);
   await runTmux(sessionName, ['send-keys', '-t', sessionName, text]);
   await sleep(50);
-  await runTmux(sessionName, ['send-keys', '-t', sessionName, 'Enter']);
+  await runTmux(sessionName, ['send-keys', '-t', sessionName, 'Enter']).catch((err: unknown) => {
+    throw outcomeUnknownAfter(err, 'the text');
+  });
 };
 
 export const sendRawKeys = async (
@@ -864,9 +916,15 @@ export const sendTypedText = async (
   content: string,
 ): Promise<void> => {
   await exitCopyMode(sessionName);
-  for (const step of planTypedInput(content)) {
+  const steps = planTypedInput(content);
+  let landed = 0;
+  for (const step of steps) {
     const keys = step.kind === 'newline' ? ['C-j'] : ['-l', '--', step.text];
-    await runTmux(sessionName, ['send-keys', '-t', sessionName, ...keys]);
+    // Once a chunk landed, the composer holds part of the prompt: a later failure is outcome-unknown (story 11 r1).
+    await runTmux(sessionName, ['send-keys', '-t', sessionName, ...keys]).catch((err: unknown) => {
+      throw landed ? outcomeUnknownAfter(err, `${landed} of ${steps.length} typed chunks`) : err;
+    });
+    landed += 1;
     await sleep(TYPED_CHUNK_GAP_MS);
   }
 };
@@ -880,7 +938,9 @@ export const pressEnter = async (sessionName: string): Promise<void> => {
 export const submitComposer = async (sessionName: string): Promise<void> => {
   await runTmux(sessionName, ['send-keys', '-t', sessionName, 'Enter']);
   await sleep(600);
-  await runTmux(sessionName, ['send-keys', '-t', sessionName, 'Enter']);
+  await runTmux(sessionName, ['send-keys', '-t', sessionName, 'Enter']).catch((err: unknown) => {
+    throw outcomeUnknownAfter(err, 'the first Enter');
+  });
 };
 
 /** Send text via bracketed paste mode and submit it */

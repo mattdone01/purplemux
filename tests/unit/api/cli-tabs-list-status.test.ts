@@ -99,6 +99,14 @@ describe('GET /api/cli/tabs status fields', () => {
     expect(body.tabs[1]).toMatchObject({ tabId: 'tab-new', cliState: 'busy', lastEvent: null, busySince: null });
   });
 
+  it('a tab whose remote host went unread serves unknown with the ssh error; a read tab carries no such field (story 11 r1, finding 3)', async () => {
+    const remoteUnreachable = { host: 'ai-lan', error: 'exit 255: ssh: connect to host ai-lan port 22: Connection refused', since: 7 };
+    statuses.value = { 'tab-busy': { cliState: 'unknown', remoteUnreachable, lastEvent: null, busySince: null } };
+    const { body } = await listTabs();
+    expect(body.tabs[0]).toMatchObject({ tabId: 'tab-busy', cliState: 'unknown', remoteUnreachable });
+    expect(body.tabs[1]).not.toHaveProperty('remoteUnreachable');
+  });
+
   it('shows each tab\'s identity: launch, hook (story 36) or none', async () => {
     const { body } = await listTabs();
     expect(body.tabs.map((t) => [t.tabId, t.identity])).toEqual([['tab-busy', 'launch'], ['tab-new', 'hook'], ['tab-sh', 'none']]);

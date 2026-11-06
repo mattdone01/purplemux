@@ -65,6 +65,20 @@ export interface ITabStatusEntry {
   turnEnd?: ITurnEndRecord | null;
   /** The provider-error episode this tab is in; a clean stop ends it (story 26). Runtime only. */
   turnError?: ITurnErrorEpisode | null;
+  /**
+   * The tab's remote host went unread for consecutive polls (harness-flow-loop-2 story 11 review r1, finding 3): the
+   * tab serves `cliState: 'unknown'` with this reason while it is set, and its own state again on the next read pane.
+   * Runtime only; the state machine underneath is not changed.
+   */
+  remoteUnreachable?: IRemoteUnreachable | null;
+}
+
+export interface IRemoteUnreachable {
+  host: string;
+  /** The ssh error of the scan (or why the scan was not believed). */
+  error: string;
+  /** The first poll in the run that did not read the host. */
+  since: number;
 }
 
 export interface IStartupPromptReading {
@@ -142,6 +156,7 @@ export interface IStatusUpdateMessage {
   startupPrompt?: IStartupPromptReading | null;
   lastEvent?: ILastEvent | null;
   eventSeq?: number;
+  remoteUnreachable?: IRemoteUnreachable | null;
 }
 
 export interface IRateLimitWindow {

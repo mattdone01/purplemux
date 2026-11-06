@@ -29,19 +29,28 @@ const log = createLogger('steer');
 /** Time for the CLI to unwind its turn and redraw a prompt before we type. */
 const INTERRUPT_SETTLE_MS = 900;
 
+/**
+ * Whether the Escape went out: `unknown` when ssh failed after a remote Escape may have reached the pane (story 11
+ * review r1, finding 2). The audit line is the record, so a possible interrupt is never written as `false`.
+ */
+export type TSteerInterrupted = boolean | 'unknown';
+
 export interface ISteerResult {
   ok: boolean;
-  interrupted: boolean;
+  interrupted: TSteerInterrupted;
   reason?: string;
+  /** Why the Escape failed (the ssh error for a remote tab); set only when it failed. */
+  interruptFailure?: string;
   /** The remote host did not answer over ssh: whether the session lives is not known. */
-  unreachable?: { host: string; message: string };
+  unreachable?: { host: string; message: string; outcomeUnknown: boolean };
 }
 
-const unreachable = (err: RemoteHostError, interrupted: boolean): ISteerResult => ({
+const unreachable = (err: RemoteHostError, interrupted: TSteerInterrupted, interruptFailure: string | undefined): ISteerResult => ({
   ok: false,
   interrupted,
   reason: err.message,
-  unreachable: { host: err.host, message: err.message },
+  ...(interruptFailure ? { interruptFailure } : {}),
+  unreachable: { host: err.host, message: err.message, outcomeUnknown: err.outcomeUnknown },
 });
 
 export const steerSession = async (
@@ -50,7 +59,8 @@ export const steerSession = async (
   opts: { interrupt: boolean; beforeDeliver?: () => Promise<boolean> },
 ): Promise<ISteerResult> => {
   if (!message.trim()) return { ok: false, interrupted: false, reason: 'empty message' };
-  let interrupted = false;
+  let interrupted: TSteerInterrupted = false;
+  let interruptFailure: string | undefined;
   try {
     if (!(await hasSessionOrUnreachable(sessionName))) {
       return { ok: false, interrupted: false, reason: 'session not found' };
@@ -63,13 +73,15 @@ export const steerSession = async (
       } catch (err) {
         // An interrupt that fails is not fatal — deliver the message anyway and
         // let it queue, which is still better than dropping the correction.
-        log.warn(`interrupt failed for ${sessionName}: ${err instanceof Error ? err.message : err}`);
-        return { ok: await deliver(sessionName, message, opts.beforeDeliver), interrupted: false, reason: 'interrupt failed' };
+        interruptFailure = err instanceof Error ? err.message : String(err);
+        if (err instanceof RemoteHostError && err.outcomeUnknown) interrupted = 'unknown';
+        log.warn({ interrupted, failure: interruptFailure }, `interrupt failed for ${sessionName}`);
+        return { ok: await deliver(sessionName, message, opts.beforeDeliver), interrupted, reason: 'interrupt failed', interruptFailure };
       }
     }
     return { ok: await deliver(sessionName, message, opts.beforeDeliver), interrupted };
   } catch (err) {
-    if (err instanceof RemoteHostError) return unreachable(err, interrupted);
+    if (err instanceof RemoteHostError) return unreachable(err, interrupted, interruptFailure);
     throw err;
   }
 };

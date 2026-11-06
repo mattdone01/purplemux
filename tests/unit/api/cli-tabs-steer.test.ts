@@ -287,6 +287,33 @@ describe('POST /api/cli/tabs/[tabId]/steer (story 14)', { timeout: 15_000 }, () 
       expect(delivery.deliverPrompt).not.toHaveBeenCalled();
     });
 
+    it('an Escape whose ssh failure leaves its outcome unknown is audited interrupted: "unknown" with the ssh error, never false (review r1, finding 2)', async () => {
+      const { RemoteHostError } = await import('@/lib/remote-host');
+      const lost = 'ssh to ai-lan failed during tmux send-keys for x (exit 255: Connection to ai-lan closed by remote host.) after the command may have started; the input may have been delivered; read the pane before retrying';
+      tmux.sendEscape.mockRejectedValue(new RemoteHostError('ai-lan', lost, { outcomeUnknown: true }));
+      const result = await call({ content: 'correct course' });
+      expect(result).toEqual({ status: 200, body: { status: 'steered', interrupted: 'unknown' } });
+      expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
+      expect(audit.appendCoordinationAudit).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'steer-interrupt', interrupted: 'unknown', interruptFailure: lost, ok: true,
+      }));
+    });
+
+    it('an Escape refused before it ran stays interrupted: false, with the ssh error beside it', async () => {
+      tmux.sendEscape.mockRejectedValue(await unreachable());
+      await call({ content: 'correct course' });
+      expect(audit.appendCoordinationAudit).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'steer-interrupt', interrupted: false, interruptFailure: expect.stringContaining('did not answer over ssh'),
+      }));
+    });
+
+    it('a delivery whose outcome is unknown is 503 remote-write-outcome-unknown, never the retryable code', async () => {
+      const { RemoteHostError } = await import('@/lib/remote-host');
+      delivery.deliverPrompt.mockRejectedValueOnce(new RemoteHostError('ai-lan', 'lost; the input may have been delivered; read the pane before retrying', { outcomeUnknown: true }));
+      const result = await call({ content: 'correct course' });
+      expect(result).toEqual({ status: 503, body: { error: expect.stringContaining('read the pane before retrying'), code: 'remote-write-outcome-unknown', host: 'ai-lan' } });
+    });
+
     it('a session tmux reports absent stays 409 session-not-running', async () => {
       tmux.hasSession.mockResolvedValue(false);
       expect(await call({ content: 'x', interrupt: false })).toEqual({ status: 409, body: { error: 'session not found', code: 'session-not-running' } });

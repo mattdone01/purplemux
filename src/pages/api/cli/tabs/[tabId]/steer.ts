@@ -85,6 +85,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
         explicit: decision.explicit,
         reason: decision.reason ?? STEER_NO_REASON,
         interrupted: result.interrupted,
+        ...(result.interruptFailure ? { interruptFailure: result.interruptFailure } : {}),
         ok: result.ok && policy.ok,
         ...(result.reason ? { failure: result.reason } : !policy.ok ? { failure: 'policy-refused' } : {}),
       });

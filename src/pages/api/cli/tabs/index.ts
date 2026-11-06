@@ -22,7 +22,7 @@ import path from 'path';
 import type { TPanelType, TTabRole } from '@/types/terminal';
 import type { TCliState, TStartupPrompt } from '@/types/timeline';
 import { startupPromptBody } from '@/lib/startup-prompt';
-import type { ILastEvent } from '@/types/status';
+import type { IClientTabStatusEntry, ILastEvent, IRemoteUnreachable } from '@/types/status';
 import { remoteHostUnreachableBody, remoteKitBrokenBody } from '@/lib/cli-error';
 import { RemoteKitBrokenError } from '@/lib/remote-kit';
 import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
@@ -37,6 +37,10 @@ const log = createLogger('api:cli:tabs');
 const VALID_PANEL_TYPES: TPanelType[] = ['terminal', 'claude-code', 'codex-cli', 'grok-cli', 'agent-sessions', 'web-browser', 'diff'];
 
 type TRemoteHostCheck = { ok: true; host: string } | { ok: false; status: number; body: Record<string, unknown> };
+
+/** A tab whose remote host went unread names the ssh error beside its `unknown` state (story 11 review r1, finding 3). */
+const remoteUnreachableField = (live: IClientTabStatusEntry | undefined): { remoteUnreachable?: IRemoteUnreachable } =>
+  live?.remoteUnreachable ? { remoteUnreachable: live.remoteUnreachable } : {};
 
 /** Why each type cannot run on a remote host (ADR-0022). */
 const REMOTE_TYPE_REFUSAL: Partial<Record<TPanelType, string>> = {
@@ -124,6 +128,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       identity: 'launch' | 'hook' | 'none';
       /** The remote host that runs the tab (ADR-0022); absent for a local tab. */
       host?: string;
+      /** The host went unread for consecutive polls: `cliState` is `unknown` and this names the ssh error (story 11). */
+      remoteUnreachable?: IRemoteUnreachable;
       /** The tab's fixed tool configuration (ADR-0040); absent for an ordinary tab. */
       role?: TTabRole;
       previewOrigin?: string;
@@ -171,6 +177,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
             reportOn: tab.reportOn ?? null,
             identity: tab.panelType === 'web-browser' ? 'none' : tabIdentityOf(id, tab.id),
             ...(tab.host ? { host: tab.host } : {}),
+            ...remoteUnreachableField(liveStatus[tab.id]),
             ...(tab.role ? { role: tab.role } : {}),
             ...(tab.previewOrigin ? { previewOrigin: tab.previewOrigin } : {}),
             ...(tab.pgService ? { pgService: tab.pgService } : {}),

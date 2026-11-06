@@ -14,10 +14,14 @@ export const FOREIGN_MUTATION_HINT = 'Use coordinator notes for cross-workspace 
 
 export const TAB_NOT_FOUND_BODY = Object.freeze({ error: 'Tab not found', code: 'tab-not-found' as const });
 
-/** A remote tab's host did not answer over ssh (ADR-0022): retryable, never "the tab is gone". */
-export const remoteHostUnreachableBody = (err: { message: string; host: string }) => ({
+/**
+ * A remote tab's host did not answer over ssh (ADR-0022): `remote-host-unreachable`, retryable (exit 6), never "the
+ * tab is gone". A write that may have run before ssh failed is `remote-write-outcome-unknown` (exit 1): the caller
+ * reads the pane before any retry, because a blind retry may type the prompt twice (story 11 review r1, finding 1).
+ */
+export const remoteHostUnreachableBody = (err: { message: string; host: string; outcomeUnknown?: boolean }) => ({
   error: err.message,
-  code: 'remote-host-unreachable' as const,
+  code: err.outcomeUnknown ? ('remote-write-outcome-unknown' as const) : ('remote-host-unreachable' as const),
   host: err.host,
 });
 
