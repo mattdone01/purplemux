@@ -82,6 +82,18 @@ describe('resolving a labelled id', () => {
     expect(missionAskText('not json')).toBeNull();
   });
 
+  it('never reads a test-only run\'s ask (story 57), and reads a store without the test-run table as before', () => {
+    const db = new Database(path.join(directory, '.purplemux/mission-control.sqlite'));
+    db.exec(`ALTER TABLE attention_items ADD COLUMN run_id TEXT;
+      CREATE TABLE mission_test_runs (run_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+    db.prepare("UPDATE attention_items SET run_id = 'run-live'").run();
+    db.prepare('INSERT INTO attention_items VALUES (?, ?, ?, ?, ?, ?)').run('mc-test', 'ws-scratch',
+      JSON.stringify({ title: 'Pair the Pixel?', decision: 'Pair the Pixel?', context: 'Fixture.' }), JSON.stringify({ humanNeed: 'decision' }), 3, 'run-test');
+    db.prepare('INSERT INTO mission_test_runs VALUES (?, ?, ?)').run('run-test', 'ws-scratch', 3);
+    db.close();
+    expect(readMissionAsks(null).map((a) => a.id)).toEqual(['mc-1']);
+  });
+
   it('a malformed or foreign id is never read', async () => {
     expect(await resolveLabelledText('../../etc/passwd')).toBeNull();
     expect(await resolveLabelledText('ws-a/not-a-session/u1')).toBeNull();

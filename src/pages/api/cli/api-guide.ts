@@ -1761,7 +1761,8 @@ POST /api/cli/mission-control/events?workspaceId=WS
   GET /api/mission-control?includeTest=1 (also /api/mission-control/events?includeTest=1); the
   board and the pulse refuse includeTest with 403. A workspace's own token reads its test-only
   runs on GET /api/cli/mission-control; a portfolio read does not. A workspace delete cancels its
-  open and candidate items (state "cancelled", resolution "workspace deleted").
+  open and candidate items (state "cancelled", resolution "workspace deleted"). The server also
+  sweeps at start and every 60 s: it cancels the same way any open item whose workspace is gone.
 
   Record a workspace issue (the run binding generation must still be current):
   {"events":[{"eventId":"evt-question-1","schemaVersion":1,"workspaceId":"WS","runId":"run-1",

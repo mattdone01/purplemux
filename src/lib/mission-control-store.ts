@@ -171,6 +171,15 @@ export interface IMissionOpenItemOpener {
   opener: IMissionItemOpener | null;
 }
 
+/**
+ * What one workspace-deleted cancel closed (story 57): the item ids, and each fleet standing-order proposal record it
+ * closed as `withdrawn` in the same transaction, so the caller writes the audit row the 60 s pass would have written.
+ */
+export interface IMissionDeletedWorkspaceCancel {
+  itemIds: string[];
+  withdrawnProposals: IMissionSoProposalRecord[];
+}
+
 export interface IMissionRebindInput {
   workspaceId: string;
   identity: TMissionIdentity;
@@ -1178,27 +1187,51 @@ export class MissionControlStore {
       AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = answer.run_id) ORDER BY created_at`)
       .pluck().all(workspaceId, since) as number[];
 
-  /** Whether a run is test-only (story 57): a run of a scratch workspace. */
-  isTestRun = (runId: string): boolean =>
-    this.database.prepare('SELECT 1 FROM mission_test_runs WHERE run_id = ?').get(runId) !== undefined;
-
   /**
    * Close every open or candidate item of a deleted workspace (story 57 AC 2): state `cancelled`, resolution
-   * `workspace deleted`, one server `attention.cancelled` per item. An answered item keeps its answer. Answers the
-   * cancelled item ids; a second call cancels nothing.
+   * `workspace deleted`, one server `attention.cancelled` per item. An answered item keeps its answer. A second call
+   * cancels nothing.
    */
-  cancelWorkspaceItems = (workspaceId: string, now = Date.now()): string[] => {
-    const transaction = this.database.transaction((): string[] => {
-      const rows = this.database.prepare(`SELECT * FROM attention_items WHERE workspace_id = ? AND state IN ('open','candidate')
-        ORDER BY created_at, id`).all(workspaceId) as IItemRow[];
+  cancelWorkspaceItems = (workspaceId: string, now = Date.now()): IMissionDeletedWorkspaceCancel =>
+    this.cancelDeletedWorkspaceRows(() => this.database.prepare(`SELECT * FROM attention_items WHERE workspace_id = ?
+      AND state IN ('open','candidate') ORDER BY created_at, id`).all(workspaceId) as IItemRow[], now);
+
+  /**
+   * The orphan sweep (story 57 review r1 findings 2 and 3): cancel, as `workspace deleted`, at most `limit` open or
+   * candidate items whose workspace is not in `liveWorkspaceIds`, oldest first. It closes the items of a delete whose
+   * own cancel failed, and of workspaces deleted before the delete cancelled anything. An empty live list cancels
+   * nothing: a registry with no workspace is not evidence that every workspace is gone.
+   */
+  cancelOrphanedItems = (liveWorkspaceIds: readonly string[], limit: number, now = Date.now()): IMissionDeletedWorkspaceCancel => {
+    if (!liveWorkspaceIds.length || limit < 1) return { itemIds: [], withdrawnProposals: [] };
+    return this.cancelDeletedWorkspaceRows(() => this.database.prepare(`SELECT * FROM attention_items WHERE state IN ('open','candidate')
+      AND workspace_id NOT IN (SELECT value FROM json_each(?)) ORDER BY created_at, id LIMIT ?`)
+      .all(JSON.stringify(liveWorkspaceIds), limit) as IItemRow[], now);
+  };
+
+  /**
+   * One transaction for both cancels. Each item closes the way an `attention.cancelled` closes it (a queued delivery of
+   * an answer is held), with the reserved event id `system:workspace-deleted:<itemId>`. A fleet standing-order
+   * proposal's open record closes as `withdrawn` with the same reason, as the 60 s pass closes the record of any item
+   * cancelled with no answer (settleProposal); a record whose item carries an answer stays open, because that answer
+   * decides (D7 rule 6).
+   */
+  private cancelDeletedWorkspaceRows = (select: () => IItemRow[], now: number): IMissionDeletedWorkspaceCancel => {
+    const transaction = this.database.transaction((): IMissionDeletedWorkspaceCancel => {
+      const rows = select();
+      const withdrawnProposals: IMissionSoProposalRecord[] = [];
       for (const row of rows) {
         const item = this.item(row);
         const revision = item.revision + 1;
         this.database.prepare(`UPDATE attention_items SET revision=?, state='cancelled', resolution=?, updated_at=? WHERE id=?`)
           .run(revision, WORKSPACE_DELETED_REASON, now, item.id);
+        if (item.answerId) {
+          this.database.prepare(`UPDATE deliveries SET state='held', next_attempt_at=NULL, last_error='attention item cancelled', updated_at=? WHERE answer_id=? AND state IN ('queued','dispatching')`)
+            .run(now, item.answerId);
+        }
         this.insertServerEvent({
           id: `${WORKSPACE_DELETED_EVENT_PREFIX}${item.id}`,
-          workspaceId,
+          workspaceId: item.workspaceId,
           runId: item.runId,
           entityId: item.id,
           revision,
@@ -1206,8 +1239,12 @@ export class MissionControlStore {
           payload: this.eventPayloadWithRouting({ itemId: item.id, reason: WORKSPACE_DELETED_REASON, actor: 'system:workspace-deleted' },
             'cancelled', item.candidateReason, item.humanReview),
         }, now);
+        if (!item.answerId && this.database.prepare(`UPDATE mission_so_proposals SET state='withdrawn', reason=?, decided_at=?
+          WHERE item_id=? AND state='open'`).run(WORKSPACE_DELETED_REASON, now, item.id).changes === 1) {
+          withdrawnProposals.push(soProposalFromRow(this.proposalRow(item.id)!));
+        }
       }
-      return rows.map((row) => row.id);
+      return { itemIds: rows.map((row) => row.id), withdrawnProposals };
     });
     try {
       return transaction();
@@ -1299,12 +1336,17 @@ export class MissionControlStore {
     }
   };
 
-  /** Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). */
+  /**
+   * Every open workspace item (candidate or open) with its recorded opener, if any (ADR-0023). Never a test-only run's
+   * (story 57): it feeds the fleet view's inbox counts and the owner's UNANSWERED flag push.
+   */
   openItemOpeners = (): IMissionOpenItemOpener[] => {
     const rows = this.database.prepare(`SELECT a.id AS item_id, a.workspace_id, a.created_at,
         a.human_review_json IS NOT NULL AS reviewed, o.tab_id, o.identity
       FROM attention_items a LEFT JOIN mission_item_openers o ON o.item_id = a.id
-      WHERE a.state IN ('candidate','open') ORDER BY a.created_at, a.id`).all() as Array<{
+      WHERE a.state IN ('candidate','open')
+        AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = a.run_id)
+      ORDER BY a.created_at, a.id`).all() as Array<{
         item_id: string; workspace_id: string; created_at: number; reviewed: number; tab_id: string | null; identity: string | null;
       }>;
     return rows.map((row) => ({

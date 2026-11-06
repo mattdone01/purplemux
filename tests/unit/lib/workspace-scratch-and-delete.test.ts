@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // candidate Mission Control items, and a Mission Control failure never fails the delete.
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
-const mission = vi.hoisted(() => ({ cancelWorkspaceItems: vi.fn() }));
+const mission = vi.hoisted(() => ({ cancelDeletedWorkspace: vi.fn() }));
 
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
@@ -30,7 +30,7 @@ vi.mock('@/lib/layout-store', () => ({
   collectAllTabs: () => [],
   updateTabAgentSessionId: vi.fn(),
 }));
-vi.mock('@/lib/mission-control-store', () => ({ getMissionControlStore: () => mission }));
+vi.mock('@/lib/mission-control-orphan-sweep', () => mission);
 
 const importStore = async () => {
   vi.resetModules();
@@ -41,7 +41,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-ws-scratch-'));
   await fs.mkdir(path.join(mockHome.value, '.purplemux'), { recursive: true });
-  mission.cancelWorkspaceItems.mockReturnValue([]);
+  mission.cancelDeletedWorkspace.mockResolvedValue({ itemIds: [], withdrawnProposals: [] });
 });
 
 describe('scratch workspaces (story 57)', () => {
@@ -60,16 +60,16 @@ describe('workspace delete closes its Mission Control items (story 57 AC 2)', ()
   it('cancels the deleted workspace items after the workspace is gone', async () => {
     const store = await importStore();
     const ws = await store.createWorkspace(mockHome.value, 'acceptance-scratch-2', undefined, { scratch: true });
-    mission.cancelWorkspaceItems.mockImplementation(() => ['item-1']);
+    mission.cancelDeletedWorkspace.mockResolvedValue({ itemIds: ['item-1'], withdrawnProposals: [] });
     expect(await store.deleteWorkspace(ws.id)).toBe(true);
-    expect(mission.cancelWorkspaceItems).toHaveBeenCalledWith(ws.id);
+    expect(mission.cancelDeletedWorkspace).toHaveBeenCalledWith(ws.id);
     expect(await store.getWorkspaceById(ws.id)).toBeUndefined();
   });
 
   it('still deletes the workspace when Mission Control cannot cancel its items', async () => {
     const store = await importStore();
     const ws = await store.createWorkspace(mockHome.value, 'acceptance-scratch-3', undefined, {});
-    mission.cancelWorkspaceItems.mockImplementation(() => { throw new Error('storage unavailable'); });
+    mission.cancelDeletedWorkspace.mockRejectedValue(new Error('storage unavailable'));
     expect(await store.deleteWorkspace(ws.id)).toBe(true);
     expect(await store.getWorkspaceById(ws.id)).toBeUndefined();
   });
@@ -77,6 +77,6 @@ describe('workspace delete closes its Mission Control items (story 57 AC 2)', ()
   it('cancels nothing for a workspace that does not exist', async () => {
     const store = await importStore();
     expect(await store.deleteWorkspace('ws-none')).toBe(false);
-    expect(mission.cancelWorkspaceItems).not.toHaveBeenCalled();
+    expect(mission.cancelDeletedWorkspace).not.toHaveBeenCalled();
   });
 });

@@ -496,14 +496,15 @@ export const createWorkspace = async (
 /**
  * A deleted workspace's open and candidate Mission Control items close as `cancelled`, reason `workspace deleted`
  * (story 57 AC 2): no agent is left to act on an answer. The workspace is already gone, so a Mission Control failure
- * is logged, never thrown. Imported here, so Mission Control never sits in this module's graph.
+ * is logged, never thrown; the orphan sweep on the next tick cancels what this missed. Imported here, so Mission
+ * Control never sits in this module's graph.
  */
 const cancelDeletedWorkspaceItems = async (workspaceId: string): Promise<void> => {
   try {
-    const cancelled = (await import('@/lib/mission-control-store')).getMissionControlStore().cancelWorkspaceItems(workspaceId);
-    if (cancelled.length) log.info(`Deleted ${workspaceId}: cancelled ${cancelled.length} open Mission Control item(s): ${cancelled.join(', ')}`);
+    const { itemIds } = await (await import('@/lib/mission-control-orphan-sweep')).cancelDeletedWorkspace(workspaceId);
+    if (itemIds.length) log.info(`Deleted ${workspaceId}: cancelled ${itemIds.length} open Mission Control item(s): ${itemIds.join(', ')}`);
   } catch (err) {
-    log.error(`Deleted ${workspaceId}: its open Mission Control items were not cancelled: ${err instanceof Error ? err.message : String(err)}`);
+    log.error(`Deleted ${workspaceId}: its open Mission Control items were not cancelled; the orphan sweep closes them: ${err instanceof Error ? err.message : String(err)}`);
   }
 };
 

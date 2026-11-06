@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { buildFleetView, type IFleetDeps } from '@/lib/fleet-status-snapshot';
 import { MissionControlStore, WORKSPACE_DELETED_REASON } from '@/lib/mission-control-store';
 import { parseMissionEventBatch, WORKSPACE_DELETED_EVENT_PREFIX } from '@/lib/mission-control-validation';
 import type { IMissionBinding, IMissionQuestion, TMissionProducerEvent } from '@/types/mission-control';
@@ -61,9 +62,8 @@ describe('test-only runs (story 57)', () => {
     const undeclared = start('ws-scratch', 'run-undeclared');
     store.applyEvents([undeclared], new Map([[undeclared.eventId, identity]]), { testWorkspace: true });
 
-    expect(store.isTestRun('run-test')).toBe(true);
-    expect(store.isTestRun('run-undeclared')).toBe(true);
-    expect(store.isTestRun('run-live')).toBe(false);
+    expect(store.snapshot([], undefined, { hideTest: true }).runs.map((run) => run.id)).toEqual(['run-live']);
+    expect(store.snapshot().runs.map((run) => run.id).sort()).toEqual(['run-live', 'run-test', 'run-undeclared']);
     store.close();
   });
 
@@ -100,6 +100,9 @@ describe('test-only runs (story 57)', () => {
     expect(store.openItemTitles('ws-live').map((item) => item.id)).toEqual(['item-live']);
     store.submitAnswer('item-test', { submissionId: 'answer-test', expectedRevision: 1, optionIds: ['a'], text: '', actionCompleted: false }, 'user');
     expect(store.answerTimes('ws-scratch', 0)).toEqual([]);
+    // The fleet view's inbox counts and the UNANSWERED flag read openItemOpeners (review r1 finding 1).
+    store.applyEvents([open('ws-scratch', 'run-test', 'item-test-candidate', { review: false })], new Map(), { testWorkspace: true });
+    expect(store.openItemOpeners().map((entry) => entry.itemId)).toEqual(['item-live']);
 
     const hiddenFeed = store.eventsAfter(0, 200, undefined, { hideTest: true });
     expect(hiddenFeed.events.length).toBeGreaterThan(0);
@@ -120,6 +123,44 @@ describe('test-only runs (story 57)', () => {
   });
 });
 
+describe("the fleet view and the owner's UNANSWERED flag never count a test-only item (story 57 review r1 finding 1)", () => {
+  it('a scratch candidate gives no inbox count, no unattributed line and no UNANSWERED flag; a live one gives all three', async () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const opener = { tabId: 'tab-agent', identity: 'launch' as const };
+    for (const [workspaceId, runId, testWorkspace] of [['ws-live', 'run-live', false], ['ws-scratch', 'run-test', true]] as const) {
+      // One candidate the agent tab opened (its row's inbox) and one with no recorded opener (the workspace's line).
+      const attributed = open(workspaceId, runId, `${workspaceId}-attributed`, { review: false });
+      store.applyEvents([attributed], new Map([[attributed.eventId, { resolvedIdentity: null, configuredOrchestratorTabId: null, opener }]]), { testWorkspace });
+      store.applyEvents([open(workspaceId, runId, `${workspaceId}-unattributed`, { review: false })], new Map(), { testWorkspace });
+    }
+    const now = Date.now() + 2 * 60 * 60_000;
+    const deps: IFleetDeps = {
+      workspaces: async () => [{ id: 'ws-live', name: 'Live' }, { id: 'ws-scratch', name: 'Scratch' }],
+      agentTabs: async () => [{ id: 'tab-agent', sessionName: 'pt-tab-agent', name: 'agent', order: 0, panelType: 'claude-code' } as never],
+      statuses: () => ({}),
+      serverFacts: () => ({ jsonlPath: null, stallReportedAt: null, inactiveSince: null }),
+      watches: async () => [],
+      liveJobs: async () => [],
+      leases: async () => [],
+      openers: () => store.openItemOpeners(),
+      capture: async () => null,
+      mtime: async () => now,
+      config: async () => null,
+      providerId: () => 'claude',
+    };
+    const view = await buildFleetView(deps, now);
+    const rowOf = (workspaceId: string) => view.rows.find((entry) => entry.workspaceId === workspaceId)!;
+    expect(rowOf('ws-scratch').inbox).toEqual({ open: 0, unanswered: 0, oldestAt: null });
+    expect(rowOf('ws-scratch').flags.some((flag) => flag.flag === 'unanswered')).toBe(false);
+    expect(rowOf('ws-live').inbox).toMatchObject({ open: 1, unanswered: 1 });
+    expect(rowOf('ws-live').flags.some((flag) => flag.flag === 'unanswered')).toBe(true);
+    expect(view.unattributed.map((line) => line.workspaceId)).toEqual(['ws-live']);
+    expect(view.unattributed[0].flags.map((flag) => flag.flag)).toEqual(['unanswered']);
+    store.close();
+  });
+});
+
 describe('workspace delete cancels its items (story 57 AC 2)', () => {
   it('cancels every open and candidate item with reason workspace deleted, once, and leaves the rest', () => {
     const store = new MissionControlStore(databasePath());
@@ -130,7 +171,7 @@ describe('workspace delete cancels its items (story 57 AC 2)', () => {
     store.applyEvents([answered], new Map([[answered.eventId, reviewAuthority]]), { testWorkspace: true });
     store.submitAnswer('item-answered', { submissionId: 'answer-1', expectedRevision: 1, optionIds: ['a'], text: '', actionCompleted: false }, 'user');
 
-    expect(store.cancelWorkspaceItems('ws-scratch', 1_800_000_000_000).sort()).toEqual(['item-candidate', 'item-test']);
+    expect(store.cancelWorkspaceItems('ws-scratch', 1_800_000_000_000).itemIds.sort()).toEqual(['item-candidate', 'item-test']);
 
     for (const id of ['item-candidate', 'item-test']) {
       expect(store.attentionItem(id)).toMatchObject({ state: 'cancelled', resolution: WORKSPACE_DELETED_REASON, revision: 2 });
@@ -141,8 +182,65 @@ describe('workspace delete cancels its items (story 57 AC 2)', () => {
     expect(store.attentionItem('item-live')?.state).toBe('open');
     // A second delete finds nothing to cancel and writes no event.
     const cursor = store.eventsAfter(0, 1).cursor;
-    expect(store.cancelWorkspaceItems('ws-scratch')).toEqual([]);
+    expect(store.cancelWorkspaceItems('ws-scratch')).toEqual({ itemIds: [], withdrawnProposals: [] });
     expect(store.eventsAfter(0, 1).cursor).toBe(cursor);
+    store.close();
+  });
+});
+
+describe('the orphan sweep cancels the items of workspaces that no longer exist (story 57 review r1 findings 2 and 3)', () => {
+  it('cancels open and candidate items outside the live registry, oldest first and bounded, and leaves live and closed items', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    // ws-gone: deleted before this change, or a delete whose own cancel failed. Its answered item keeps its answer.
+    const started = start('ws-gone', 'run-gone');
+    store.applyEvents([started], new Map([[started.eventId, identity]]));
+    store.applyEvents([open('ws-gone', 'run-gone', 'item-gone-candidate', { review: false })], new Map());
+    for (const id of ['item-gone-open', 'item-gone-answered']) {
+      const opened = open('ws-gone', 'run-gone', id);
+      store.applyEvents([opened], new Map([[opened.eventId, reviewAuthority]]));
+    }
+    store.submitAnswer('item-gone-answered', { submissionId: 'answer-gone', expectedRevision: 1, optionIds: ['a'], text: '', actionCompleted: false }, 'user');
+
+    expect(store.cancelOrphanedItems(['ws-live', 'ws-scratch'], 1).itemIds).toEqual(['item-gone-candidate']);
+    expect(store.cancelOrphanedItems(['ws-live', 'ws-scratch'], 50).itemIds).toEqual(['item-gone-open']);
+    for (const id of ['item-gone-candidate', 'item-gone-open']) {
+      expect(store.attentionItem(id)).toMatchObject({ state: 'cancelled', resolution: WORKSPACE_DELETED_REASON });
+      expect(store.eventsAfter(0, 200).events.some((event) => event.id === `${WORKSPACE_DELETED_EVENT_PREFIX}${id}`)).toBe(true);
+    }
+    expect(store.attentionItem('item-gone-answered')?.state).toBe('answered');
+    expect(store.attentionItem('item-live')?.state).toBe('open');
+    expect(store.attentionItem('item-test')?.state).toBe('open');
+    // Idempotent: a second pass finds nothing and writes no event.
+    const cursor = store.eventsAfter(0, 1).cursor;
+    expect(store.cancelOrphanedItems(['ws-live', 'ws-scratch'], 50)).toEqual({ itemIds: [], withdrawnProposals: [] });
+    expect(store.eventsAfter(0, 1).cursor).toBe(cursor);
+    store.close();
+  });
+
+  it('cancels nothing when the registry lists no workspace or the bound is zero', () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    expect(store.cancelOrphanedItems([], 50).itemIds).toEqual([]);
+    expect(store.cancelOrphanedItems(['ws-other'], 0).itemIds).toEqual([]);
+    expect(store.attentionItem('item-live')?.state).toBe('open');
+    store.close();
+  });
+
+  it("closes an unanswered fleet proposal's open record as withdrawn in the same transaction, and returns it for the audit", () => {
+    const store = new MissionControlStore(databasePath());
+    seed(store);
+    const proposal = { proposerTabId: binding.tabId, text: 'Always X.', scope: 'fleet', checkName: 'prose', cites: null };
+    const opened = open('ws-live', 'run-live', 'so-proposal-1');
+    store.applyEvents([opened], new Map([[opened.eventId, reviewAuthority]]), { soProposals: new Map([[opened.eventId, proposal]]) });
+
+    const cancel = store.cancelWorkspaceItems('ws-live', 1_800_000_000_000);
+    expect(cancel.itemIds.sort()).toEqual(['item-live', 'so-proposal-1']);
+    expect(cancel.withdrawnProposals).toEqual([expect.objectContaining({
+      itemId: 'so-proposal-1', state: 'withdrawn', reason: WORKSPACE_DELETED_REASON, decidedAt: 1_800_000_000_000,
+    })]);
+    expect(store.soProposal('so-proposal-1')?.state).toBe('withdrawn');
+    expect(store.openSoProposals()).toEqual([]);
     store.close();
   });
 });

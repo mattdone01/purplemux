@@ -75,9 +75,10 @@ export const applyMissionEventBatch = async (
   // A scratch workspace's items are test-only (story 57): they never reach the owner's devices.
   if (!scratch) void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null, previousStates });
   // An ask the owner must approve or decide, a server-opened NEEDS-DECISION one too, is matched against the standing
-  // orders in shadow (ADR-0038 §2); a replay never is. Imported here so the curator never sits in this module's graph.
+  // orders in shadow (ADR-0038 §2); a replay never is, and a test-only ask never is (story 57). Imported here so the
+  // curator never sits in this module's graph.
   const fresh = events.filter((event) => unreplayed.has(event.eventId));
-  if (fresh.length) void import('@/lib/curator-service').then((curator) => curator.curatorOnMissionEvents(fresh)).catch(() => undefined);
+  if (fresh.length && !scratch) void import('@/lib/curator-service').then((curator) => curator.curatorOnMissionEvents(fresh)).catch(() => undefined);
   // The SM withdraws a fleet standing-order proposal with attention.cancelled (ADR-0041 §1 amendment D7): settle it now,
   // not at the next 60 s pass. An answer that came first still decides.
   const withdrawn = fresh.flatMap((event) => (event.type === 'attention.cancelled' && event.payload.itemId.startsWith(SO_PROPOSAL_ITEM_PREFIX)

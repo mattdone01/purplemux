@@ -598,14 +598,22 @@ describe('the tick: once per process, on globalThis', () => {
 describe('the tick also settles fleet standing-order proposals (ADR-0041 §1 amendment D7)', () => {
   it('runs the proposal pass after the rule\'s pass, whatever the rule holds: off, or a pass that failed', async () => {
     const order: string[] = [];
-    await runTickPasses(async () => { order.push('auto'); return []; }, async () => { order.push('proposals'); return []; });
-    await runTickPasses(async () => { order.push('auto-failed'); throw new Error('rule unreadable'); }, async () => { order.push('proposals'); return []; });
+    await runTickPasses(async () => { order.push('auto'); return []; }, async () => { order.push('proposals'); return []; }, async () => []);
+    await runTickPasses(async () => { order.push('auto-failed'); throw new Error('rule unreadable'); }, async () => { order.push('proposals'); return []; }, async () => []);
     expect(order).toEqual(['auto', 'proposals', 'auto-failed', 'proposals']);
     expect(log.error).toHaveBeenCalled();
   });
 
   it('a failed proposal pass is logged and never stops the tick', async () => {
-    await expect(runTickPasses(async () => [], async () => { throw new Error('store down'); })).resolves.toBeUndefined();
+    await expect(runTickPasses(async () => [], async () => { throw new Error('store down'); }, async () => [])).resolves.toBeUndefined();
+  });
+
+  it('runs the orphan sweep first (story 57), and a failed sweep never stops the other passes', async () => {
+    const order: string[] = [];
+    await runTickPasses(async () => { order.push('auto'); return []; }, async () => { order.push('proposals'); return []; },
+      async () => { order.push('orphans'); throw new Error('registry unreadable'); });
+    expect(order).toEqual(['orphans', 'auto', 'proposals']);
+    expect(log.error).toHaveBeenCalled();
   });
 });
 
@@ -615,6 +623,9 @@ describe('server wiring (pinned in server.ts)', () => {
     const boot = server.slice(server.indexOf('await getMissionControlRuntime().start();'));
     expect(boot.indexOf('startAutoAnswerTick();')).toBeGreaterThan(-1);
     expect(boot.indexOf('startAutoAnswerTick();')).toBeLessThan(boot.indexOf('await startSpend();'));
+    // Story 57: one orphan sweep at start, beside the tick that runs it every 60 s.
+    expect(boot.indexOf('void runOrphanSweepPass()')).toBeGreaterThan(boot.indexOf('startAutoAnswerTick();'));
+    expect(boot.indexOf('void runOrphanSweepPass()')).toBeLessThan(boot.indexOf('await startSpend();'));
     const shutdown = server.slice(server.indexOf('const shutdownWs = async'), server.indexOf('// --- Production'));
     expect(shutdown.indexOf('await stopAutoAnswerTick();')).toBeGreaterThan(-1);
     expect(shutdown.indexOf('await stopAutoAnswerTick();')).toBeLessThan(shutdown.indexOf('await getMissionControlRuntime().stop();'));

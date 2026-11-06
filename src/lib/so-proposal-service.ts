@@ -183,6 +183,26 @@ const twice = async (what: string, itemId: string, write: () => Promise<boolean>
   log.warn({ itemId }, `${what} failed twice (${failure})`);
 };
 
+/** The audit row of one closed record: one shape, whichever step closed it. */
+const auditEntry = (record: IMissionSoProposalRecord, outcome: IClose): Record<string, unknown> => ({
+  event: `so-proposal-${outcome.state}`, itemId: record.itemId, workspaceId: record.workspaceId, tabId: record.proposerTabId,
+  // Only a launch-verified tab passes the selection check, so every proposer is a launch identity.
+  identity: 'launch', answerId: outcome.answer?.id ?? null, answerActor: outcome.answer?.actor ?? null,
+  orderId: outcome.orderId ?? null, reason: outcome.reason ?? null, textSha256: textSha256(record.text),
+  ...(outcome.reasonCode ? { reasonCode: outcome.reasonCode, message: outcome.message ?? null } : {}),
+});
+
+// `appendCoordinationAudit` resolves false when the write failed; anything but false counts as written.
+const writeAudit = (audit: ISoProposalDeps['audit'], record: IMissionSoProposalRecord, outcome: IClose): Promise<void> =>
+  twice('proposal audit row', record.itemId, async () => (await audit(auditEntry(record, outcome))) !== false);
+
+/**
+ * The audit row of a record that a workspace-deleted cancel closed as `withdrawn` in its own transaction (story 57):
+ * the row the 60 s pass writes for any item cancelled with no answer. A withdrawal sends the proposer no line.
+ */
+export const auditWithdrawnProposal = (audit: ISoProposalDeps['audit'], record: IMissionSoProposalRecord): Promise<void> =>
+  writeAudit(audit, record, { state: 'withdrawn', reason: record.reason });
+
 /** Close the record once; only the step that closed it writes the audit row and the proposer's line. */
 const close = async (deps: ISoProposalDeps, record: IMissionSoProposalRecord, outcome: IClose, now: number, closed?: boolean): Promise<TSettleOutcome> => {
   const won = closed ?? deps.store().settleSoProposal(record.itemId, {
@@ -190,15 +210,7 @@ const close = async (deps: ISoProposalDeps, record: IMissionSoProposalRecord, ou
     reasonCode: outcome.reasonCode ?? null, decidedAt: now,
   });
   if (!won) return 'none';
-  const entry = {
-    event: `so-proposal-${outcome.state}`, itemId: record.itemId, workspaceId: record.workspaceId, tabId: record.proposerTabId,
-    // Only a launch-verified tab passes the selection check, so every proposer is a launch identity.
-    identity: 'launch', answerId: outcome.answer?.id ?? null, answerActor: outcome.answer?.actor ?? null,
-    orderId: outcome.orderId ?? null, reason: outcome.reason ?? null, textSha256: textSha256(record.text),
-    ...(outcome.reasonCode ? { reasonCode: outcome.reasonCode, message: outcome.message ?? null } : {}),
-  };
-  // `appendCoordinationAudit` resolves false when the write failed; anything but false counts as written.
-  await twice('proposal audit row', record.itemId, async () => (await deps.audit(entry)) !== false);
+  await writeAudit(deps.audit, record, outcome);
   if (outcome.state === 'expired' || outcome.state === 'not-filed') {
     const text = proposalOutcomeLine(record.itemId, outcome.state === 'expired' ? { expired: true } : { notFiled: outcome.reason ?? notFiledReason('') });
     await twice('proposal line to the proposer', record.itemId, async () => {

@@ -18,6 +18,7 @@ const scope = vi.hoisted(() => ({ resolveCliScope: vi.fn(), isOwnWorkspace: vi.f
 const workspace = vi.hoisted(() => ({ getWorkspaceById: vi.fn(), getWorkspaces: vi.fn() }));
 const alerts = vi.hoisted(() => ({ alertOpenedAttention: vi.fn() }));
 const views = vi.hoisted(() => ({ readBoard: vi.fn(), readPulse: vi.fn() }));
+const curator = vi.hoisted(() => ({ curatorOnMissionEvents: vi.fn() }));
 
 vi.mock('@/lib/mission-control-store', () => ({ getMissionControlStore: () => store }));
 vi.mock('@/lib/mission-control-runtime', () => runtime);
@@ -29,6 +30,7 @@ vi.mock('@/lib/workspace-store', () => workspace);
 vi.mock('@/lib/attention-alerts', () => alerts);
 vi.mock('@/lib/board', () => ({ readBoard: views.readBoard }));
 vi.mock('@/lib/pulse-service', () => ({ readPulse: views.readPulse }));
+vi.mock('@/lib/curator-service', () => curator);
 
 const fakeResponse = () => {
   const state = { statusCode: 0, body: undefined as unknown };
@@ -106,6 +108,9 @@ describe('who may run test-only (POST /api/cli/mission-control/events)', () => {
       expect(store.applyEvents).toHaveBeenLastCalledWith(expect.any(Array), expect.any(Map), expect.objectContaining({ testWorkspace: true }));
     }
     expect(alerts.alertOpenedAttention).not.toHaveBeenCalled();
+    // Nor does the curator match a test-only ask against the standing orders (review r1 finding 6).
+    await vi.dynamicImportSettled();
+    expect(curator.curatorOnMissionEvents).not.toHaveBeenCalled();
   });
 
   it('applies a live workspace batch as before, with its push', async () => {
@@ -113,6 +118,8 @@ describe('who may run test-only (POST /api/cli/mission-control/events)', () => {
     expect(r.statusCode).toBe(200);
     expect(store.applyEvents.mock.calls[0][2]).not.toHaveProperty('testWorkspace');
     expect(alerts.alertOpenedAttention).toHaveBeenCalledTimes(1);
+    await vi.dynamicImportSettled();
+    expect(curator.curatorOnMissionEvents).toHaveBeenCalledTimes(1);
   });
 
   it('treats a stored scratch value other than true as a live workspace', async () => {

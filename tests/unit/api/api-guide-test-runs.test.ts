@@ -28,6 +28,7 @@ describe('api-guide: test-only runs (story 57)', () => {
       'GET /api/mission-control?includeTest=1',
       'the board and the pulse refuse includeTest with 403',
       'resolution "workspace deleted"',
+      'it cancels the same way any open item whose workspace is gone',
     ]) expect(text).toContain(phrase);
   });
 });
