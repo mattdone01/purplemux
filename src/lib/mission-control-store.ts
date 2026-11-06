@@ -65,13 +65,17 @@ import {
   autoAnswerSubmissionId,
   type IAutoAnswerRule,
 } from '@/lib/mission-control-auto-answer';
-import { FOLLOW_UP_EVENT_PREFIX, needsDecisionLinePrefix, SO_PROPOSAL_EVENT_PREFIX, SO_PROPOSAL_ITEM_PREFIX } from '@/lib/mission-control-validation';
+import {
+  FOLLOW_UP_EVENT_PREFIX, needsDecisionLinePrefix, SO_PROPOSAL_EVENT_PREFIX, SO_PROPOSAL_ITEM_PREFIX, WORKSPACE_DELETED_EVENT_PREFIX,
+} from '@/lib/mission-control-validation';
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.purplemux', 'mission-control.sqlite');
 const SCHEMA_VERSION = 4;
 const DAY_MS = 86_400_000;
 const ANSWER_CLASS_WINDOW_DAYS = 7;
 const AUTO_ANSWERED_WINDOW_MS = 7 * DAY_MS;
+/** The resolution of an item its workspace's delete cancelled (story 57 AC 2). */
+export const WORKSPACE_DELETED_REASON = 'workspace deleted';
 const HUMAN_INBOX_POLICY_GUIDANCE = 'On your next ordinary turn, the configured orchestrator should review legacy candidates: record workspace handling or explicitly identify the human-exclusive need. Reuse item IDs. Do not rerun bootstrap.';
 
 type TMissionIdentity = Omit<IMissionBinding, 'generation'>;
@@ -585,7 +589,21 @@ export class MissionControlStore {
     this.ensureSuggestionTable();
     this.ensureSoProposalTable();
     this.ensureLinkTable();
+    this.ensureTestRunTable();
   }
+
+  /**
+   * Test-only runs (story 57, D35): every run of a scratch workspace. The owner's views (the snapshot's default, the
+   * board, the pulse) never serve a test run's items, and the row outlives the workspace, so a deleted scratch
+   * workspace's items stay hidden. An unversioned side table like the openers.
+   */
+  private ensureTestRunTable = (): void => {
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS mission_test_runs (
+        run_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+    `);
+  };
 
   /**
    * A fleet standing-order proposal (ADR-0041 §1 amendment D7): an unversioned side table like the openers, written in
@@ -861,11 +879,20 @@ export class MissionControlStore {
     return eventFromRow(this.database.prepare('SELECT * FROM events WHERE id = ?').get(event.id) as IEventRow);
   };
 
-  snapshot = (workspaces: IMissionWorkspaceView[] = [], workspaceId?: string): IMissionSnapshot => {
+  /**
+   * `hideTest` (story 57): leave out test-only runs and everything of theirs, as the owner's views must. Internal callers
+   * (delivery, bootstrap, sync) read everything.
+   */
+  snapshot = (workspaces: IMissionWorkspaceView[] = [], workspaceId?: string, options: { hideTest?: boolean } = {}): IMissionSnapshot => {
     const read = this.database.transaction((): IMissionSnapshot => {
       const where = workspaceId ? ' WHERE workspace_id = ?' : '';
       const args = workspaceId ? [workspaceId] : [];
-      const runs = (this.database.prepare(`SELECT * FROM runs${where} ORDER BY updated_at DESC`).all(...args) as IRunRow[]).map(runFromRow);
+      const hideTest = options.hideTest === true;
+      // `NOT EXISTS` keeps a row whose run_id is NULL, where `NOT IN` would drop it.
+      const notTest = (column: string): string => (hideTest
+        ? `${where ? ' AND' : ' WHERE'} NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = ${column})`
+        : '');
+      const runs = (this.database.prepare(`SELECT * FROM runs${where}${notTest('runs.id')} ORDER BY updated_at DESC`).all(...args) as IRunRow[]).map(runFromRow);
       const generatedAt = Date.now();
       const autoAnswerByItem = new Map((this.database.prepare(`SELECT * FROM mission_auto_answers${where} ORDER BY at, answer_id`)
         .all(...args) as IAutoAnswerRow[]).map((row) => [row.item_id, autoAnswerFromRow(row)]));
@@ -877,21 +904,22 @@ export class MissionControlStore {
       }
       const proposalByItem = new Map((this.database.prepare(`SELECT * FROM mission_so_proposals${where}`).all(...args) as ISoProposalRow[])
         .map((row) => [row.item_id, soProposalView(row)]));
-      const itemRows = this.database.prepare(`SELECT * FROM attention_items${where} ORDER BY updated_at DESC`).all(...args) as IItemRow[];
-      const answerRows = this.database.prepare(`SELECT * FROM answers${where} ORDER BY created_at DESC`).all(...args) as IAnswerRow[];
+      const itemRows = this.database.prepare(`SELECT * FROM attention_items${where}${notTest('attention_items.run_id')} ORDER BY updated_at DESC`).all(...args) as IItemRow[];
+      const answerRows = this.database.prepare(`SELECT * FROM answers${where}${notTest('answers.run_id')} ORDER BY created_at DESC`).all(...args) as IAnswerRow[];
       const linksByItem = this.snapshotLinks(itemRows, answerRows, workspaceId);
       const items = itemRows.map((row) => itemFromRow(row, autoAnswerByItem.get(row.id) ?? null, changesByItem.get(row.id) ?? null,
         suggestionsByItem.get(row.id) ?? [], proposalByItem.get(row.id) ?? null, linksByItem.get(row.id) ?? NO_LINKS));
-      const answersByClass = this.answersByClass(generatedAt, workspaceId);
-      const autoAnswered = this.autoAnswered(generatedAt, workspaceId);
+      const answersByClass = this.answersByClass(generatedAt, workspaceId, hideTest);
+      const autoAnswered = this.autoAnswered(generatedAt, workspaceId, hideTest);
       const answers = answerRows.map(answerFromRow);
-      const deliveries = (this.database.prepare(`SELECT * FROM deliveries${where} ORDER BY updated_at DESC`).all(...args) as IDeliveryRow[]).map(deliveryFromRow);
+      const deliveries = (this.database.prepare(`SELECT * FROM deliveries${where}${notTest('deliveries.run_id')} ORDER BY updated_at DESC`).all(...args) as IDeliveryRow[]).map(deliveryFromRow);
       const eventWhere = workspaceId ? 'WHERE workspace_id = ?' : '';
-      const recentEvents = (this.database.prepare(`SELECT * FROM events ${eventWhere} ORDER BY seq DESC LIMIT 100`).all(...args) as IEventRow[]).reverse().map(eventFromRow);
+      const recentEvents = (this.database.prepare(`SELECT * FROM events ${eventWhere}${notTest('events.run_id')} ORDER BY seq DESC LIMIT 100`).all(...args) as IEventRow[]).reverse().map(eventFromRow);
       const cursor = Number((this.database.prepare(`SELECT COALESCE(MAX(seq), 0) AS cursor FROM events ${eventWhere}`).get(...args) as { cursor: number }).cursor);
       const latestBootstrap = this.database.prepare('SELECT * FROM bootstrap ORDER BY created_at DESC, rowid DESC LIMIT 1').get() as IBootstrapRow | undefined;
       const pendingBootstrapEntries = (this.database.prepare(`SELECT * FROM bootstrap_entries
-        WHERE state IN ('queued','dispatching','submitted')${workspaceId ? ' AND workspace_id = ?' : ''}
+        WHERE state IN ('queued','dispatching','submitted')${workspaceId ? ' AND workspace_id = ?' : ''}${hideTest
+          ? ' AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = bootstrap_entries.run_id)' : ''}
         ORDER BY updated_at, bootstrap_id, workspace_id, run_id`).all(...args) as IBootstrapEntryRow[])
         .map((row) => ({ bootstrapId: row.bootstrap_id, entry: bootstrapEntryFromRow(row) }));
       const fullBootstrap = latestBootstrap ? this.bootstrapById(latestBootstrap.id) : null;
@@ -1017,13 +1045,14 @@ export class MissionControlStore {
   };
 
   /** ADR-0031 §3: answers of the last 7 UTC days (today included) per day, item class and actor kind. */
-  private answersByClass = (now: number, workspaceId?: string): IMissionAnswerClassCount[] => {
+  private answersByClass = (now: number, workspaceId?: string, hideTest = false): IMissionAnswerClassCount[] => {
     const tomorrow = (Math.floor(now / DAY_MS) + 1) * DAY_MS;
     const since = tomorrow - ANSWER_CLASS_WINDOW_DAYS * DAY_MS;
     const rows = this.database.prepare(`SELECT strftime('%Y-%m-%d', answer.created_at / 1000, 'unixepoch') AS day,
         json_extract(item.question_json, '$.class') AS class, answer.actor = ? AS rule, COUNT(*) AS count
       FROM answers answer JOIN attention_items item ON item.id = answer.item_id
-      WHERE answer.created_at >= ? AND answer.created_at < ?${workspaceId ? ' AND answer.workspace_id = ?' : ''}
+      WHERE answer.created_at >= ? AND answer.created_at < ?${workspaceId ? ' AND answer.workspace_id = ?' : ''}${hideTest
+        ? ' AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = item.run_id)' : ''}
       GROUP BY day, class, rule`)
       .all(MISSION_AUTO_ANSWER_ACTOR, since, tomorrow, ...(workspaceId ? [workspaceId] : [])) as Array<{
         day: string; class: unknown; rule: number; count: number;
@@ -1047,10 +1076,11 @@ export class MissionControlStore {
   };
 
   /** ADR-0031 §7: the rule's answers of the last 7 days, newest first, at most 100. */
-  private autoAnswered = (now: number, workspaceId?: string): IMissionAutoAnsweredItem[] => {
+  private autoAnswered = (now: number, workspaceId?: string, hideTest = false): IMissionAutoAnsweredItem[] => {
     const rows = this.database.prepare(`SELECT record.*, item.run_id, item.state AS item_state, item.question_json
       FROM mission_auto_answers record JOIN attention_items item ON item.id = record.item_id
-      WHERE record.at >= ?${workspaceId ? ' AND record.workspace_id = ?' : ''}
+      WHERE record.at >= ?${workspaceId ? ' AND record.workspace_id = ?' : ''}${hideTest
+        ? ' AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = item.run_id)' : ''}
       ORDER BY record.at DESC, record.answer_id LIMIT ?`)
       .all(now - AUTO_ANSWERED_WINDOW_MS, ...(workspaceId ? [workspaceId] : []), AUTO_ANSWERED_LIMIT) as Array<IAutoAnswerRow & {
         run_id: string; item_state: IMissionAttentionItem['state']; question_json: string;
@@ -1079,8 +1109,10 @@ export class MissionControlStore {
       WHERE state = 'open' AND json_extract(question_json, '$.class') = 'bookkeeping' ORDER BY updated_at, id`)
       .all() as IItemRow[]).map(this.item);
 
-  eventsAfter = (after: number, limit: number, workspaceId?: string): IMissionEventsResponse => {
-    const where = workspaceId ? 'seq > ? AND workspace_id = ?' : 'seq > ?';
+  /** `hideTest` (story 57): leave out the events of test-only runs, as the owner's views must. */
+  eventsAfter = (after: number, limit: number, workspaceId?: string, options: { hideTest?: boolean } = {}): IMissionEventsResponse => {
+    const where = (workspaceId ? 'seq > ? AND workspace_id = ?' : 'seq > ?')
+      + (options.hideTest === true ? ' AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = events.run_id)' : '');
     const args = workspaceId ? [after, workspaceId, limit + 1] : [after, limit + 1];
     const rows = this.database.prepare(`SELECT * FROM events WHERE ${where} ORDER BY seq LIMIT ?`).all(...args) as IEventRow[];
     const hasMore = rows.length > limit;
@@ -1099,7 +1131,8 @@ export class MissionControlStore {
 
   /** The board's "needs you" (ADR-0034): a workspace's open items, oldest first: id, title and when it opened. */
   openItemTitles = (workspaceId: string): Array<{ id: string; title: string; createdAt: number }> =>
-    (this.database.prepare(`SELECT id, question_json, created_at FROM attention_items WHERE workspace_id = ? AND state = 'open'
+    (this.database.prepare(`SELECT id, question_json, created_at FROM attention_items item WHERE workspace_id = ? AND state = 'open'
+      AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = item.run_id)
       ORDER BY created_at, id`).all(workspaceId) as Array<{ id: string; question_json: string; created_at: number }>)
       .map((row) => ({
         id: row.id, title: String((JSON.parse(row.question_json) as { title?: unknown }).title ?? ''), createdAt: row.created_at,
@@ -1139,10 +1172,51 @@ export class MissionControlStore {
     return row ? answerFromRow(row) : null;
   };
 
-  /** The pulse (ADR-0034 §9): when each answer to a workspace's items was recorded, since `since`. */
+  /** The pulse (ADR-0034 §9): when each answer to a workspace's items was recorded, since `since`; never a test-only run's (story 57). */
   answerTimes = (workspaceId: string, since: number): number[] =>
-    this.database.prepare('SELECT created_at FROM answers WHERE workspace_id = ? AND created_at >= ? ORDER BY created_at')
+    this.database.prepare(`SELECT created_at FROM answers answer WHERE workspace_id = ? AND created_at >= ?
+      AND NOT EXISTS (SELECT 1 FROM mission_test_runs test WHERE test.run_id = answer.run_id) ORDER BY created_at`)
       .pluck().all(workspaceId, since) as number[];
+
+  /** Whether a run is test-only (story 57): a run of a scratch workspace. */
+  isTestRun = (runId: string): boolean =>
+    this.database.prepare('SELECT 1 FROM mission_test_runs WHERE run_id = ?').get(runId) !== undefined;
+
+  /**
+   * Close every open or candidate item of a deleted workspace (story 57 AC 2): state `cancelled`, resolution
+   * `workspace deleted`, one server `attention.cancelled` per item. An answered item keeps its answer. Answers the
+   * cancelled item ids; a second call cancels nothing.
+   */
+  cancelWorkspaceItems = (workspaceId: string, now = Date.now()): string[] => {
+    const transaction = this.database.transaction((): string[] => {
+      const rows = this.database.prepare(`SELECT * FROM attention_items WHERE workspace_id = ? AND state IN ('open','candidate')
+        ORDER BY created_at, id`).all(workspaceId) as IItemRow[];
+      for (const row of rows) {
+        const item = this.item(row);
+        const revision = item.revision + 1;
+        this.database.prepare(`UPDATE attention_items SET revision=?, state='cancelled', resolution=?, updated_at=? WHERE id=?`)
+          .run(revision, WORKSPACE_DELETED_REASON, now, item.id);
+        this.insertServerEvent({
+          id: `${WORKSPACE_DELETED_EVENT_PREFIX}${item.id}`,
+          workspaceId,
+          runId: item.runId,
+          entityId: item.id,
+          revision,
+          type: 'attention.cancelled',
+          payload: this.eventPayloadWithRouting({ itemId: item.id, reason: WORKSPACE_DELETED_REASON, actor: 'system:workspace-deleted' },
+            'cancelled', item.candidateReason, item.humanReview),
+        }, now);
+      }
+      return rows.map((row) => row.id);
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      if (isMissionControlError(error)) throw error;
+      if (isSqliteFailure(error)) throw new MissionControlError(503, 'storage-unavailable', 'Mission Control storage unavailable');
+      throw error;
+    }
+  };
 
   /** Items the tab opened at or after `since`, any state: a NEEDS-DECISION turn that already asked opens none (ADR-0041). */
   itemsOpenedByTab = (workspaceId: string, tabId: string, since: number): string[] =>
@@ -1271,7 +1345,12 @@ export class MissionControlStore {
   applyEvents = (
     events: TMissionProducerEvent[],
     resolvedBindings: ReadonlyMap<string, TMissionIdentity | IMissionEventAuthority | null> = new Map(),
-    options: { questionMinVersion?: 1 | 2; soProposals?: ReadonlyMap<string, TMissionSoProposalInput> } = {},
+    options: {
+      questionMinVersion?: 1 | 2;
+      soProposals?: ReadonlyMap<string, TMissionSoProposalInput>;
+      /** The batch's workspace is a scratch workspace (story 57): every run it touches is test-only. */
+      testWorkspace?: boolean;
+    } = {},
   ): IMissionApplyEventsResult => {
     const transaction = this.database.transaction(() => {
       const committed: IMissionEvent[] = [];
@@ -1290,6 +1369,11 @@ export class MissionControlStore {
           ? suppliedAuthority
           : { resolvedIdentity: suppliedAuthority, configuredOrchestratorTabId: null };
         committed.push(this.applyOneEvent(event, requestHash, authority, options.questionMinVersion ?? 1, options.soProposals?.get(event.eventId) ?? null));
+        // In the event's own transaction, so no reader sees a scratch run before it is test-only.
+        if (options.testWorkspace === true) {
+          this.database.prepare('INSERT OR IGNORE INTO mission_test_runs (run_id, workspace_id, created_at) VALUES (?,?,?)')
+            .run(event.runId, event.workspaceId, Date.now());
+        }
       }
       const cursor = Number((this.database.prepare('SELECT COALESCE(MAX(seq), 0) AS cursor FROM events').get() as { cursor: number }).cursor);
       // A replay rebuilds the same answer from the stored link, so the asker reads it either way.
@@ -1431,8 +1515,10 @@ export class MissionControlStore {
         invalidMissionRequest(`a ${SO_PROPOSAL_ITEM_PREFIX} item opens only with its proposal record, and a record only with that item`);
       }
       // `followsUp` is not a question field (ADR-0037 amendment D2, rule 1): it never reaches question_json or the hash.
-      const { itemId: ignored, humanReview: reviewInput, followsUp, ...question } = event.payload;
+      // `test` (story 57) is a run declaration, recorded in mission_test_runs; like `followsUp`, never a question field.
+      const { itemId: ignored, humanReview: reviewInput, followsUp, test: testDeclared, ...question } = event.payload;
       void ignored;
+      void testDeclared;
       const target = followsUp === undefined ? null : this.requireFollowUp({
         workspaceId: event.workspaceId, runId: event.runId, itemId, followsUp, humanReview: reviewInput,
       });

@@ -27,6 +27,20 @@ export const applyMissionEventBatch = async (
   }
   const store = getMissionControlStore();
   const unreplayed = store.unreplayedEventIds(events);
+  // Story 57 (D35): only a scratch workspace, which only the human makes, runs test-only; so no live agent can hide a
+  // question from the owner by declaring it a test. An identical replay was checked when it first applied, and a
+  // workspace is scratch from its create, so a replay rereads nothing.
+  const workspace = unreplayed.size ? await getWorkspaceById(workspaceId) : null;
+  const scratch = workspace?.scratch === true;
+  const declared = events.flatMap((event) => (unreplayed.has(event.eventId) && (event.type === 'run.started' || event.type === 'attention.opened')
+    ? [event.payload.test].filter((value): value is boolean => value !== undefined) : []));
+  if (!scratch && declared.includes(true)) {
+    throw new MissionControlError(403, 'forbidden',
+      `test: true is refused: ${workspaceId} is not a scratch workspace, so its runs reach the owner. A test opens items only in a scratch workspace (POST /api/workspace with scratch: true) or on a scratch server.`);
+  }
+  if (scratch && declared.includes(false)) {
+    throw new MissionControlError(400, 'invalid-request', `test: false contradicts the workspace: every run of scratch workspace ${workspaceId} is test-only`);
+  }
   const identities = new Map<string, Awaited<ReturnType<typeof resolveMissionTargetIdentity>>>();
   await Promise.all(events.map(async (event) => {
     if (!unreplayed.has(event.eventId)) return;
@@ -40,9 +54,7 @@ export const applyMissionEventBatch = async (
   const needsReviewAuthority = events.some((event) => unreplayed.has(event.eventId)
     && (event.type === 'attention.opened' || event.type === 'attention.updated')
     && event.payload.humanReview !== undefined);
-  const configuredOrchestratorTabId = needsReviewAuthority
-    ? (await getWorkspaceById(workspaceId))?.orchestration?.orchestratorTabId ?? null
-    : null;
+  const configuredOrchestratorTabId = needsReviewAuthority ? workspace?.orchestration?.orchestratorTabId ?? null : null;
   const authorities = new Map<string, IMissionEventAuthority>();
   for (const event of events) {
     if (!unreplayed.has(event.eventId)) continue;
@@ -58,9 +70,10 @@ export const applyMissionEventBatch = async (
     (event.type === 'attention.updated' && unreplayed.has(event.eventId) ? [event.payload.itemId] : [])));
   // A proposal record rides only its own server producer's events (ADR-0041 §1 amendment D7).
   const soProposals = options.serverPrefix && options.soProposals ? options.soProposals : undefined;
-  const applied = store.applyEvents(events, authorities, { questionMinVersion, soProposals });
+  const applied = store.applyEvents(events, authorities, { questionMinVersion, soProposals, ...(scratch ? { testWorkspace: true } : {}) });
   // An item that first becomes owner-visible alerts once (ADR-0032 channels), a server-opened one too; a replayed event never does.
-  void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null, previousStates });
+  // A scratch workspace's items are test-only (story 57): they never reach the owner's devices.
+  if (!scratch) void alertOpenedAttention({ events: applied.events, fresh: unreplayed, openerTabId: opener?.tabId ?? null, previousStates });
   // An ask the owner must approve or decide, a server-opened NEEDS-DECISION one too, is matched against the standing
   // orders in shadow (ADR-0038 §2); a replay never is. Imported here so the curator never sits in this module's graph.
   const fresh = events.filter((event) => unreplayed.has(event.eventId));

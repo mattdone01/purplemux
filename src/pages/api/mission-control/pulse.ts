@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { readPulse } from '@/lib/pulse-service';
 import { invalidMissionRequest, missionNotFound } from '@/lib/mission-control-errors';
 import { requireMissionHuman, sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
+import { refuseIncludeTest } from '@/lib/mission-control-validation';
 import { getWorkspaceById, getWorkspaces } from '@/lib/workspace-store';
 import type { IMissionPulseListResponse } from '@/types/pulse';
 
@@ -14,6 +15,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       res.setHeader('Allow', 'GET');
       return res.status(405).json({ error: 'Method not allowed' });
     }
+    refuseIncludeTest(req.query.includeTest, 'pulse');
     const now = Date.now();
     const { workspaceId = 'all' } = req.query;
     if (typeof workspaceId !== 'string' || !workspaceId) return invalidMissionRequest('workspaceId: expected all or one workspace id');

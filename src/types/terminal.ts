@@ -220,6 +220,11 @@ export interface IWorkspace {
    * token is confined to the workspace whose tab it runs in.
    */
   allowedPeers?: string[];
+  /**
+   * A scratch workspace (story 57): every Mission Control run in it is test-only, so the owner's board, push and pulse
+   * never show its items. Only the human's `POST /api/workspace` sets it, at create; nothing changes it after.
+   */
+  scratch?: true;
 }
 
 export interface IWorkspaceGroup {

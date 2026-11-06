@@ -396,11 +396,11 @@ export interface IMissionEventBase {
 }
 
 export type TMissionProducerEvent = IMissionEventBase & (
-  | { type: 'run.started'; payload: { objective: string; epic?: IMissionEpic | null; tabId: string } }
+  | { type: 'run.started'; payload: { objective: string; epic?: IMissionEpic | null; tabId: string; test?: boolean } }
   | { type: 'run.resumed'; payload: { tabId: string; transferPendingAnswers: boolean } }
   | { type: 'progress.updated'; payload: { objective?: string; epic?: IMissionEpic | null; phase?: string | null; state?: 'running' | 'waiting'; nextStep?: string | null; storyCounts?: IMissionRun['storyCounts']; closeoutPending?: boolean } }
   | { type: 'run.finished'; payload: { state: 'completed' | 'cancelled'; summary: string; closeoutPending: boolean } }
-  | { type: 'attention.opened'; payload: IMissionQuestion & IMissionAttentionClassInput & { itemId: string; humanReview?: TMissionHumanReviewInput; followsUp?: string } }
+  | { type: 'attention.opened'; payload: IMissionQuestion & IMissionAttentionClassInput & { itemId: string; humanReview?: TMissionHumanReviewInput; followsUp?: string; test?: boolean } }
   | { type: 'attention.updated'; payload: IMissionQuestion & IMissionAttentionClassInput & { itemId: string; humanReview?: TMissionHumanReviewInput } }
   | { type: 'attention.resolved'; payload: { itemId: string; resolution: string } }
   | { type: 'attention.cancelled'; payload: { itemId: string; reason: string } }
