@@ -104,6 +104,7 @@ import {
   needsDecisionLineKey,
   needsDecisionAskerNotice,
   needsDecisionDeliveryText,
+  needsDecisionItemNotice,
   openNeedsDecisionItem,
   stableNeedsDecisionItemId,
   type TNeedsDecisionAskerNotice,
@@ -3082,44 +3083,49 @@ export class StatusManager {
       };
     }
     const ws = await getWorkspaceByIdCached(entry.workspaceId);
+    const askerIsOrchestrator = (ws?.orchestration?.orchestratorTabId ?? null) === tabId;
     // The note rides the nudge to the escalation target; when that nudge does not go out, the asker hears it itself.
-    const itemNotice = (state: 'opened' | 'already-open', itemId: string): INeedsDecisionResult['asker'] =>
-      ({ lineKey, notice: { kind: 'item', state, itemId }, ifUnheard: true });
+    // `ifUnheard: false`: the asker hears it even when the nudge goes out, because only the asker can act on it.
+    const itemNotice = (ifUnheard: boolean): INeedsDecisionResult['asker'] => {
+      const notice = needsDecisionItemNotice(outcome, askerIsOrchestrator);
+      return notice ? { lineKey, notice, ifUnheard } : null;
+    };
     if (outcome.opened) {
       return {
         note: ` [MC item ${outcome.itemId} opened for the owner by the server: do not open another]`,
         mustReach: false,
-        asker: itemNotice('opened', outcome.itemId),
+        asker: itemNotice(true),
       };
     }
-    const askerIsOrchestrator = (ws?.orchestration?.orchestratorTabId ?? null) === tabId;
     switch (outcome.reason) {
       case 'already-open':
-        return {
-          note: ` [MC item ${outcome.itemId} already open for the owner: do not open another]`,
-          mustReach: false,
-          asker: { lineKey, notice: { kind: 'item', state: 'already-open', itemId: outcome.itemId, ...(outcome.openIds ? { openIds: outcome.openIds } : {}) }, ifUnheard: !outcome.openIds },
-        };
+        // PM-2 round 2: a held `[new]` line is a question outside Mission Control, so the orchestrator must hear it.
+        if (outcome.heldNew) {
+          return {
+            note: ` [MC item ${outcome.itemId} already open for the owner: do not open another; this [new] line is held and is not in Mission Control: the tab's [new] question ${outcome.itemId} is still open]`,
+            mustReach: true,
+            asker: itemNotice(false),
+          };
+        }
+        return { note: ` [MC item ${outcome.itemId} already open for the owner: do not open another]`, mustReach: false, asker: itemNotice(!outcome.openIds) };
       case 'asked-this-turn': return { note: ` [MC item ${outcome.itemId} opened by the tab this turn: handle it as any worker item]`, mustReach: false, asker: null };
       // Story PM-2 (D50): the tab's open item now asks this line. Only the asker can add `[new]`, so it always hears.
       case 'revised':
         return {
           note: ` [MC item ${outcome.itemId} revised for the owner by the server (revision ${outcome.revision}): do not open another]`,
           mustReach: false,
-          asker: { lineKey, notice: { kind: 'revised', itemId: outcome.itemId, replaced: outcome.replaced }, ifUnheard: false },
+          asker: itemNotice(false),
         };
       // Story PM-2 (D51): the owner already answered; nothing opens, and the asker gets the answer again.
       case 'answered': {
         const delivered = outcome.answer.delivery.state === 'submitted' || outcome.answer.delivery.state === 'acknowledged';
         const tail = delivered ? 'relay the answer' : needsDecisionDeliveryText(outcome.answer, false).replace(/^D/, 'd');
+        // PM-2 round 2: a `[new]` line held until this answered `[new]` question's answer is acknowledged.
+        const held = outcome.heldNew ? ' this [new] line is held until that answer is acknowledged;' : '';
         return {
-          note: ` [MC item ${outcome.itemId} already answered by the owner: no new item; ${tail}]`,
-          mustReach: false,
-          asker: {
-            lineKey,
-            notice: { kind: 'answered', itemId: outcome.itemId, answer: outcome.answer, differs: outcome.differs, question: outcome.question, askerIsOrchestrator },
-            ifUnheard: false,
-          },
+          note: ` [MC item ${outcome.itemId} already answered by the owner: no new item;${held} ${tail}]`,
+          mustReach: !!outcome.heldNew,
+          asker: itemNotice(false),
         };
       }
     }

@@ -182,7 +182,7 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   second item 22.2 min after the owner's answer, and after the ack (D51, the Portfolio SM). The server now copes.
   - **How a line is recognised.** The line key is unchanged, except that the `[new]` marker is removed before the key is
     made, so `[new] Q` and `Q` have one key. A side table, `mission_nd_lines` (item, line key, workspace, tab, revision,
-    `[new]` flag), records each line key an `nd-` item took. The store writes the row in the event's own transaction,
+    `[new]` flag, text key), records each line key an `nd-` item took. The store writes the row in the event's own transaction,
     from a batch side input that only the server opener's `system:needs-decision:` events carry; it refuses a row on an
     item that is not `nd-` or that another tab owns. Revision 0 rows record a key outside an event: the id the server
     handed to the orchestrator (it counts once that item exists), and a line that met its item in a race. The tab's
@@ -194,11 +194,28 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   - **The decision table.** The first row that holds wins:
     1. An OPEN item of the tab took this key at any time: `already-open`. No write, so a line that goes A, B, A does not
        revise the item again.
-    2. An ANSWERED item took this key: outcome `answered`. This is true before and after the ack, and with `[new]` too,
-       because an asker repeats a `[new]` line while it waits.
+    2. An ANSWERED item took this key, or this text key: outcome `answered`, and the line does not differ. This is true
+       before and after the ack, and with `[new]` too, because an asker repeats a `[new]` line while it waits. The text
+       key (round 2, review r1 finding 2) is the question text without the marker, `[new]`, the class tag and quoted ids,
+       whitespace collapsed and letter case folded; the options stay. So `[scope] Q?` after `[money] Q?` was answered
+       is the same question. Row 1 stays exact, so a tag change while the item is open revises it (row 5) and the new
+       class reaches the owner. Rows written before the `text_key` column have none and match by line key only.
     3. The tab itself opened an item since the turn began (`asked-this-turn`). The server's own `nd-` item of the
        previous stop does not count.
-    4. The line has no effective `[new]`: either it carries none, or a `[new]` item of the tab is still open. Then:
+    4. **One `[new]` question per tab at a time; a `[new]` line never revises** (round 2, ruling A, which replaces
+       consult change 3). The tab's waiting `[new]` question is its newest item opened by a `[new]` line (the
+       revision-1 row, else the revision-0 reservation of an id handed to the orchestrator) that is OPEN, or ANSWERED
+       with an answer that is not acknowledged. A `[new]` line opens (row 5) only when there is none. Otherwise the line
+       is held: it opens nothing and writes nothing. If the waiting question is OPEN, the outcome is `already-open` for
+       it with `heldNew`. If it is ANSWERED, the outcome is `answered` for it with `heldNew`. The hold lifts when that
+       answer is acknowledged, when the item is resolved or cancelled, or when the answer passes the window; an OPEN
+       waiting question has no time limit. Why one, not N: SO-6 tells the asker to repeat its line while it waits, so
+       a reworded repeat of a `[new]` line has a new key. With N waiting `[new]` questions allowed, each reworded
+       repeat opens another item, which is D50 again through the marker (N = 3 gives the three items of R140). The cost
+       is two questions from one tab at once; in the record, all 9 follow-up questions came after the ack. A held line
+       is a question outside Mission Control, so its nudge goes out whatever the tab's `reportOn` (`mustReach`), and
+       the asker hears its notice too.
+    5. The line has no `[new]`. Then:
        - If the tab has exactly one OPEN item and its state is `open`, the server revises it. It sends `attention.updated`
          on the item's own run, with the orchestrator's review again and the new question; the revision goes up by
          one. The event id is `system:needs-decision:<32 hex>:r<revision>`. The outcome is `revised`.
@@ -206,10 +223,10 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
          written, and the notice lists the open ids.
        - If the tab has an ANSWERED item whose delivery is not acknowledged, the outcome is `answered`, and the line
          differs from the question.
-    5. Otherwise the line opens an item by the path above.
-  - **What opens a new item.** Only row 5: a `[new]` line that matches no OPEN item and no ANSWERED item; a line
-    without the marker when the tab has no OPEN item and no unacknowledged ANSWERED item; any line after the answer
-    window or after a cancel.
+    6. Otherwise the line opens an item by the path above.
+  - **What opens a new item.** Only row 6, or row 4 with no waiting `[new]` question: a `[new]` line that matches no
+    OPEN item and no ANSWERED item, while the tab has no waiting `[new]` question; a line without the marker when the
+    tab has no OPEN item and no unacknowledged ANSWERED item; any line after the answer window or after a cancel.
   - **A failed revise opens nothing.** The item's state after the failure decides. If it is still OPEN, the outcome is
     `already-open`. If it was answered in the race, the outcome is `answered`, and the line key is recorded on the item.
     If it was cancelled, the line opens anew. A failed revise is never `refused`, because that would send an "open it
@@ -217,16 +234,42 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   - **The answer goes to the asker again.** No delivery is queued again: the delivery goes to the run binding (the
     orchestrator), and a held row can be a paste that happened. The asking tab gets one urgent `mission` event:
     `[needs-decision] [MC item <id> answered by the owner at <UTC ISO>: do not open another] The answer: (<id>) <label>;
-    "<text, at most 200 chars>". <delivery>. A different question: end on NEEDS-DECISION: [new] <question>?`. The
-    delivery part is "It went to <tab> (delivery <state>), which relays it", or "It was delivered to you" for an
-    orchestrator, or "Delivery held: <reason>". A clipped answer says so. A line that differs also quotes the answered
-    question. The nudge note is `[MC item <id> already answered by the owner: no new item; relay the answer]` (or
-    `…; delivery held: <reason>`).
+    "<text, at most 200 chars>". <delivery>. <next>`. The delivery part is "It went to <tab> (delivery <state>), which
+    relays it", or "It was delivered to you" for an orchestrator, or "Delivery held: <reason>". A clipped answer says
+    so. A line that differs also quotes the answered question. For the same question (round 2, finding 4), `<next>` is
+    `Act on this answer: this question opens no new item until <UTC ISO of the answer + 24 h>, with or without [new].`
+    and then the `[new]` sentence below, or, with no waiting `[new]` question, `If something has changed since the
+    answer, ask a new question that says what changed: end on NEEDS-DECISION: [new] <question>?`. For a line that
+    differs, `<next>` is the `[new]` sentence. The nudge note is `[MC item <id> already answered by the owner: no new
+    item; relay the answer]` (or `…; delivery held: <reason>`).
+  - **The `[new]` sentence (round 2).** One helper builds it for every notice that offers the marker (already-open with
+    the open ids, revised, answered), from the same waiting `[new]` question the table reads, so no notice offers
+    `[new]` while the table would hold it. With none: `A different question: end on NEEDS-DECISION: [new] <question>?`.
+    With an OPEN one, P: `A different question cannot open yet: this tab's [new] question <P> is still open, and a tab
+    has one [new] question at a time. End on your [new] line again after <P> is answered and its answer
+    acknowledged.` With an ANSWERED one: `… the owner answered this tab's [new] question <P>, and the answer is not yet
+    acknowledged. End on your [new] line again once it is (your orchestrator acknowledges it when it relays it).` No
+    notice tells the asker to cancel an item: a cancel is an event on the item's run, which the asker does not hold.
+  - **The held notices (round 2).** P open: the note is `[MC item <P> already open for the owner: do not open another;
+    this [new] line is held and is not in Mission Control: the tab's [new] question <P> is still open]`; the asker
+    hears `[needs-decision] [MC item <P> already open for the owner: do not open another] Your [new] line opened
+    nothing and changed nothing. This tab's [new] question <P> is still open ("<P's decision>"), and a tab has one
+    [new] question at a time. If your line rewords that question, end on that item's line unchanged. If it is a
+    different question, it is not in Mission Control yet: end on it again with [new] after <P> is answered and its
+    answer acknowledged.` P answered and unacknowledged: the note is `[MC item <P> already answered by the owner: no
+    new item; this [new] line is held until that answer is acknowledged; <relay the answer | delivery held: …>]`; the
+    asker hears the answered notice, which says `Your [new] line opened nothing: the owner answered this tab's [new]
+    question "<question>", and its answer is not yet acknowledged.` before the answer, and ends on the `[new]`
+    sentence.
   - **The revise notice.** The note is `[MC item <id> revised for the owner by the server (revision <n>): do not open
     another]`. The asker always gets it, even when the nudge goes out, because only the asker can add `[new]`. It says:
-    `… Your line replaced the question "<old decision>". If yours is a different question, end on NEEDS-DECISION: [new]
-    <question>? to open its own item.` The notice key holds the notice kind, so an earlier `opened` notice of the same
-    id does not mute it.
+    `… Your line replaced the question "<old decision>"; the owner no longer sees it. If yours is a different question,
+    ask the replaced one again in its own item: end on NEEDS-DECISION: [new] <the replaced question, in new words>?
+    (its old line stays item <X>'s).` With a waiting `[new]` question, the last sentence is the `[new]` sentence. It
+    names the replaced question, not the new line (round 2): the revise recorded the new line's key on the item, and
+    the replaced line's key is the item's too (row 1, and the store's prefix refusal), so `[new]` with either line
+    finds the item again. The notice key holds the notice kind, so an earlier `opened` notice of the same id does not
+    mute it.
   - **The owner's answer and a revision.** An answer typed against the old revision gets a 409 only when the revision
     is incompatible (the decision, the answer type, or a removed option). A changed label or context keeps the answer
     (ADR-0037 §4).

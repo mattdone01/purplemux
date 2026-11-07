@@ -32,9 +32,10 @@ import { validateMissionQuestion } from '@/lib/mission-question-format';
 import {
   buildNeedsDecisionQuestion, needsDecisionIsNew, needsDecisionPushDetail, needsDecisionText, parseNeedsDecisionLine, withoutNewMark,
 } from '@/lib/needs-decision';
+import Database from 'better-sqlite3';
 import {
-  NEEDS_DECISION_ANSWER_WINDOW_MS, needsDecisionAskerNotice, needsDecisionDeps, needsDecisionItemId, needsDecisionLineKey, openNeedsDecisionItem,
-  stableNeedsDecisionItemId, type INeedsDecisionStop,
+  NEEDS_DECISION_ANSWER_WINDOW_MS, needsDecisionAskerNotice, needsDecisionDeps, needsDecisionItemId, needsDecisionItemNotice, needsDecisionLineKey,
+  needsDecisionNewHint, needsDecisionTextKey, openNeedsDecisionItem, stableNeedsDecisionItemId, type INeedsDecisionStop, type TNeedsDecisionOutcome,
 } from '@/lib/needs-decision-opener';
 import { extractTurnMarker, lastTurnLine, TURN_TAIL_CHARS } from '@/lib/turn-end';
 
@@ -601,6 +602,26 @@ describe('one item per question (story PM-2, D50 and D51)', () => {
     store.applyEvents([event], new Map([[event.eventId, ORCH]]));
   };
   const restart = () => { delete (globalThis as { __ptNeedsDecisionItemIds?: unknown }).__ptNeedsDecisionItemIds; };
+  const cancel = (itemId: string) => {
+    const item = items().find((entry) => entry.id === itemId)!;
+    const event = {
+      eventId: `cancel-${itemId}`, schemaVersion: 1 as const, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: item.revision, producerAt: 3,
+      bindingGeneration: 1, type: 'attention.cancelled' as const, payload: { itemId, reason: 'superseded' },
+    };
+    store.applyEvents([event], new Map([[event.eventId, ORCH]]));
+  };
+  const idOf = (outcome: TNeedsDecisionOutcome): string => {
+    if (!outcome.opened) throw new Error(`not opened: ${JSON.stringify(outcome)}`);
+    return outcome.itemId;
+  };
+  /** The asker notice the status manager sends for the outcome (one shared mapping). */
+  const noticeOf = (outcome: TNeedsDecisionOutcome): string => needsDecisionAskerNotice(needsDecisionItemNotice(outcome, false)!);
+  const tabItem = (itemId: string, tabId = 'tab-w') => store.needsDecisionItemsOfTab('ws-a', tabId, '0'.repeat(16), 0).find((item) => item.id === itemId);
+  // Round 2 lines: Q2 opens the tab's [new] question, Q2R rewords it with [new], Q3 is a genuinely third question.
+  const Q2 = 'NEEDS-DECISION: [new] [money] Pay the vendor today? (a) pay (b) wait';
+  const Q2R = 'NEEDS-DECISION: [new] Pay the vendor now? (a) pay (b) wait';
+  const Q3 = 'NEEDS-DECISION: [new] Which bank file wins? (a) BC (b) Kyriba';
+  const PLAIN_NEW = 'end on NEEDS-DECISION: [new] <question>?';
 
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-nd-pm2-'));
@@ -669,22 +690,231 @@ describe('one item per question (story PM-2, D50 and D51)', () => {
     expect(items().map((item) => item.id).sort()).toEqual([first.itemId, (next as { itemId: string }).itemId].sort());
   });
 
-  it('[new] while open opens a second item; its repeat finds it; a reword while two are open revises neither (consult 2, 3)', async () => {
-    const first = await ask(LINE);
-    if (!first.opened) throw new Error('not opened');
-    const second = await ask('NEEDS-DECISION: [new] [money] Pay the vendor today? (a) pay (b) wait');
-    expect(second).toMatchObject({ opened: true });
-    const secondId = (second as { itemId: string }).itemId;
-    expect(items().find((item) => item.id === secondId)).toMatchObject({ state: 'open' });
-    expect(await ask('NEEDS-DECISION: [new] [money] Pay the vendor today? (a) pay (b) wait')).toEqual({ opened: false, reason: 'already-open', itemId: secondId });
+  it('[new] while open opens a second item; its repeat finds it; a third [new] question is held and nothing is revised (r2 ruling A, test 1)', async () => {
+    const first = idOf(await ask(LINE));
+    const second = idOf(await ask(Q2));
+    expect(items().find((item) => item.id === second)).toMatchObject({ state: 'open' });
+    expect(await ask(Q2)).toEqual({ opened: false, reason: 'already-open', itemId: second });
     // The same line without the marker is the same line key: the marker is removed, the class tag is kept.
-    expect(await ask('NEEDS-DECISION: [money] Pay the vendor today? (a) pay (b) wait')).toEqual({ opened: false, reason: 'already-open', itemId: secondId });
-    // A reworded [new] line while a [new] item is open counts as unmarked: two open, so no revision and no third item.
-    expect(await ask('NEEDS-DECISION: [new] Pay the vendor now? (a) pay (b) wait')).toEqual({
-      opened: false, reason: 'already-open', itemId: secondId, openIds: [first.itemId, secondId],
-    });
+    expect(await ask(Q2.replace('[new] ', ''))).toEqual({ opened: false, reason: 'already-open', itemId: second });
+    const newHeldBy = { itemId: second, answered: false, question: 'Pay the vendor today?' };
+    const held = await ask(Q3);
+    expect(held).toEqual({ opened: false, reason: 'already-open', itemId: second, heldNew: true, newHeldBy });
+    expect(noticeOf(held)).not.toContain(PLAIN_NEW);
+    expect(noticeOf(held)).toContain('Your [new] line opened nothing and changed nothing.');
+    // An unmarked reword while two are open revises neither; its notice says [new] cannot open yet.
+    const reword = await ask('NEEDS-DECISION: Pay the vendor this week? (a) pay (b) wait');
+    expect(reword).toEqual({ opened: false, reason: 'already-open', itemId: second, openIds: [first, second], newHeldBy });
+    expect(noticeOf(reword)).not.toContain(PLAIN_NEW);
+    expect(noticeOf(reword)).toContain(needsDecisionNewHint(newHeldBy));
     expect(items()).toHaveLength(2);
     expect(items().map((item) => item.revision)).toEqual([1, 1]);
+  });
+
+  it('with only a [new] item open, a [new] line never revises it: a third question and a reword are held; the unmarked reword revises (tests 2, 3)', async () => {
+    const first = idOf(await ask(LINE));
+    ack(first, answer(first).id);
+    const second = idOf(await ask(Q2));
+    expect(await ask(Q3)).toMatchObject({ opened: false, reason: 'already-open', itemId: second, heldNew: true, newHeldBy: { itemId: second } });
+    expect(await ask(Q2R)).toMatchObject({ opened: false, reason: 'already-open', itemId: second, heldNew: true });
+    // Q2 stays on the owner's screen: no revision, the same decision, and no attention.updated.
+    expect(items().find((item) => item.id === second)).toMatchObject({ revision: 1, decision: 'Pay the vendor today?' });
+    expect(store.snapshot([], 'ws-a').recentEvents.filter((event) => event.type === 'attention.updated')).toEqual([]);
+    // AC 1 kept: the reword without the marker revises the open item.
+    expect(await ask(Q2R.replace('[new] ', ''))).toMatchObject({
+      opened: false, reason: 'revised', itemId: second, revision: 2, replaced: 'Pay the vendor today?', newHeldBy: { itemId: second, answered: false },
+    });
+    expect(items()).toHaveLength(2);
+  });
+
+  it('a reworded [new] line after its answer opens nothing until the ack; after the ack a [new] question opens, marked new (finding 3, test 4)', async () => {
+    const first = idOf(await ask(LINE));
+    ack(first, answer(first).id);
+    const second = idOf(await ask(Q2));
+    const given = answer(second);
+    const held = await ask(Q2R);
+    expect(held).toMatchObject({
+      opened: false, reason: 'answered', itemId: second, differs: true, heldNew: true, question: 'Pay the vendor today?',
+      newHeldBy: { itemId: second, answered: true }, answer: { optionIds: ['a'] },
+    });
+    expect(noticeOf(held)).toContain('Your [new] line opened nothing: the owner answered this tab\'s [new] question "Pay the vendor today?", and its answer is not yet acknowledged.');
+    expect(noticeOf(held)).not.toContain(PLAIN_NEW);
+    expect(items()).toHaveLength(2);
+    ack(second, given.id);
+    const third = idOf(await ask(Q3));
+    expect(tabItem(third)).toMatchObject({ markedNew: true, state: 'open' });
+    expect(items()).toHaveLength(3);
+  });
+
+  it('the hold lifts when the [new] item is cancelled; across a restart the hold is read from the store (test 5)', async () => {
+    const second = idOf(await ask(Q2));
+    restart();
+    expect(await ask(Q3, { stopSeq: 1 })).toMatchObject({ reason: 'already-open', itemId: second, heldNew: true });
+    cancel(second);
+    restart();
+    expect(await ask(Q3, { stopSeq: 1 })).toMatchObject({ opened: true });
+  });
+
+  it('the hold lifts past the answer window: an unacked [new] answer older than 24 h holds nothing (test 5)', async () => {
+    const second = idOf(await ask(Q2));
+    const given = answer(second);
+    expect(await ask(Q3)).toMatchObject({ reason: 'answered', itemId: second, heldNew: true });
+    const deps = await needsDecisionDeps();
+    expect(await ask(Q3, {}, { ...deps, now: () => given.createdAt + NEEDS_DECISION_ANSWER_WINDOW_MS + 1 })).toMatchObject({ opened: true });
+  });
+
+  it('an item the orchestrator opened from a handed [new] id is the tab\'s waiting [new] question: its reworded [new] repeat is held (test 6)', async () => {
+    const deps = await needsDecisionDeps();
+    const handed = await ask(Q2, {}, { ...deps, openRuns: () => [] });
+    expect(handed).toMatchObject({ opened: false, reason: 'no-orchestrator-run' });
+    const handedId = (handed as { itemId: string }).itemId;
+    const { applyMissionEventBatch } = await import('@/lib/mission-control-events');
+    await applyMissionEventBatch('ws-a', [{
+      eventId: 'orch-open-new', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
+      type: 'attention.opened', payload: {
+        itemId: handedId, ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line: Q2 }),
+        humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
+      },
+    }], { tabId: 'tab-orch', identity: 'launch' });
+    expect(tabItem(handedId)).toMatchObject({ markedNew: true, serverOpened: false });
+    expect(await ask(Q2R)).toMatchObject({ opened: false, reason: 'already-open', itemId: handedId, heldNew: true });
+    expect(items()).toHaveLength(1);
+    expect(items()[0].revision).toBe(1);
+  });
+
+  it('an answered question matches its text whatever its tag or letter case; an open item still revises on a tag change (finding 2, test 7)', async () => {
+    const money = 'NEEDS-DECISION: [money] Release the hold? (a) yes (b) no';
+    const first = idOf(await ask(money));
+    ack(first, answer(first).id);
+    for (const line of [
+      'NEEDS-DECISION: [scope] Release the hold? (a) yes (b) no',
+      'NEEDS-DECISION: [MONEY] release the HOLD?  (a) yes (b) no',
+      'NEEDS-DECISION: [new] [scope] Release the hold? (a) yes (b) no',
+    ]) expect(await ask(line)).toMatchObject({ opened: false, reason: 'answered', itemId: first, differs: false });
+    expect(items()).toHaveLength(1);
+    // While open, the tag is part of the line key: the tag change revises the item, and the new class reaches the owner.
+    const refund = idOf(await ask('NEEDS-DECISION: [money] Wire the refund? (a) yes (b) no'));
+    expect(await ask('NEEDS-DECISION: [scope] Wire the refund? (a) yes (b) no')).toMatchObject({ reason: 'revised', itemId: refund, revision: 2 });
+    expect(items().find((item) => item.id === refund)).toMatchObject({ class: 'scope', revision: 2 });
+    expect(tabItem(refund)?.textKeys).toEqual([needsDecisionTextKey('ws-a', 'tab-w', 'NEEDS-DECISION: [scope] wire the refund? (a) yes (b) no')]);
+  });
+
+  it('a legacy item with no line rows matches its exact line key only (test 7)', async () => {
+    const first = idOf(await ask(LINE));
+    (store as unknown as { database: Database.Database }).database.prepare('DELETE FROM mission_nd_lines WHERE item_id = ?').run(first);
+    ack(first, answer(first).id);
+    expect(await ask(LINE)).toMatchObject({ reason: 'answered', itemId: first, differs: false });
+    expect(await ask(LINE.replace('[scope]', '[money]'))).toMatchObject({ opened: true });
+  });
+
+  it('a mission_nd_lines table from before text_key gains the column; its old rows match by line key (test 7)', async () => {
+    const legacy = path.join(dir, 'legacy.sqlite');
+    const raw = new Database(legacy);
+    raw.exec(`CREATE TABLE mission_nd_lines (
+      item_id TEXT NOT NULL, line_key TEXT NOT NULL, workspace_id TEXT NOT NULL, tab_id TEXT NOT NULL,
+      revision INTEGER NOT NULL, marked_new INTEGER NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (item_id, line_key));
+      INSERT INTO mission_nd_lines VALUES ('nd-old', 'abc', 'ws-a', 'tab-w', 1, 1, 5);`);
+    raw.close();
+    const reopened = new MissionControlStore(legacy);
+    try {
+      const db = (reopened as unknown as { database: Database.Database }).database;
+      expect((db.prepare('PRAGMA table_info(mission_nd_lines)').all() as Array<{ name: string }>).map((c) => c.name)).toContain('text_key');
+      expect(db.prepare('SELECT item_id, line_key, text_key, marked_new FROM mission_nd_lines').all())
+        .toEqual([{ item_id: 'nd-old', line_key: 'abc', text_key: null, marked_new: 1 }]);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('the revise limit: after X goes Q1 to Q3, [new] Q3 is X, and [new] Q1 in new words opens (test 10)', async () => {
+    const x = idOf(await ask(LINE));
+    const q3 = 'NEEDS-DECISION: [scope] Ship the export on Monday? (a) yes (b) no';
+    expect(await ask(q3)).toMatchObject({ reason: 'revised', itemId: x });
+    expect(await ask(q3.replace('NEEDS-DECISION: ', 'NEEDS-DECISION: [new] '))).toEqual({ opened: false, reason: 'already-open', itemId: x });
+    expect(await ask('NEEDS-DECISION: [new] [scope] Is the export part of this release? (a) yes (b) no')).toMatchObject({ opened: true });
+    expect(items()).toHaveLength(2);
+  });
+
+  it('notice truth: after a notice with the plain [new] hint a [new] line opens; after a notice with the held hint it is held (test 9)', async () => {
+    const PROBE = 'NEEDS-DECISION: [new] Which audit lane runs first? (a) bank (b) ledger';
+    const offersPlain = (text: string) => text.includes('end on NEEDS-DECISION: [new] <');
+    const holdsNew = (text: string) => text.includes('cannot open yet') || text.includes('Your [new] line opened nothing');
+    /** One scenario on its own tab: the outcome whose notice is judged, and the [new] line that notice offers. */
+    const scenarios: Array<{ name: string; plain: boolean; run: (tabId: string) => Promise<{ outcome: TNeedsDecisionOutcome; probe?: string }> }> = [
+      { name: 'opened', plain: true, run: async (tabId) => ({ outcome: await ask(LINE, { tabId }) }) },
+      {
+        name: 'revised', plain: true, run: async (tabId) => {
+          await ask(LINE, { tabId });
+          return { outcome: await ask(REWORD, { tabId }), probe: 'NEEDS-DECISION: [new] [scope] Is the export part of this release? (a) yes (b) no' };
+        },
+      },
+      {
+        name: 'answered, differs, unmarked', plain: true, run: async (tabId) => {
+          const x = idOf(await ask(LINE, { tabId }));
+          answer(x);
+          return { outcome: await ask(REWORD, { tabId }) };
+        },
+      },
+      {
+        name: 'answered, same question', plain: true, run: async (tabId) => {
+          const x = idOf(await ask(LINE, { tabId }));
+          answer(x);
+          return { outcome: await ask(LINE, { tabId }) };
+        },
+      },
+      {
+        name: 'already-open with openIds', plain: true, run: async (tabId) => {
+          await ask(LINE, { tabId });
+          const { applyMissionEventBatch } = await import('@/lib/mission-control-events');
+          await applyMissionEventBatch('ws-a', [{
+            eventId: `own-${tabId}`, schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
+            type: 'attention.opened', payload: {
+              itemId: `nd-${'7'.repeat(16)}${tabId.slice(-1).repeat(16)}`,
+              ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId, tabName: 'w', line: 'NEEDS-DECISION: own nd ask?' }),
+              humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
+            },
+          }], { tabId, identity: 'session' });
+          return { outcome: await ask(REWORD, { tabId, turnStartedAt: Date.now() + 1_000 }) };
+        },
+      },
+      {
+        name: 'already-open with openIds, [new] pending', plain: false, run: async (tabId) => {
+          await ask(LINE, { tabId });
+          await ask(Q2, { tabId });
+          return { outcome: await ask('NEEDS-DECISION: Pay the vendor this week?', { tabId }) };
+        },
+      },
+      { name: 'held, open', plain: false, run: async (tabId) => { await ask(Q2, { tabId }); return { outcome: await ask(Q3, { tabId }) }; } },
+      { name: 'revised, [new] pending', plain: false, run: async (tabId) => { await ask(Q2, { tabId }); return { outcome: await ask(Q2R.replace('[new] ', ''), { tabId }) }; } },
+      {
+        name: 'answered, differs, [new] pending', plain: false, run: async (tabId) => {
+          answer(idOf(await ask(Q2, { tabId })));
+          return { outcome: await ask('NEEDS-DECISION: Ship on Monday?', { tabId }) };
+        },
+      },
+      { name: 'answered, same, [new] pending', plain: false, run: async (tabId) => { answer(idOf(await ask(Q2, { tabId }))); return { outcome: await ask(Q2, { tabId }) }; } },
+      { name: 'held, answered', plain: false, run: async (tabId) => { answer(idOf(await ask(Q2, { tabId }))); return { outcome: await ask(Q2R, { tabId }) }; } },
+    ];
+    const judged: Array<[string, boolean, boolean]> = [];
+    const reached: string[] = [];
+    for (const [index, scenario] of scenarios.entries()) {
+      const tabId = `tab-s${index.toString(16)}`;
+      const { outcome, probe } = await scenario.run(tabId);
+      const text = noticeOf(outcome);
+      reached.push(`${scenario.name}=${outcome.opened ? 'opened' : outcome.reason}${'openIds' in outcome && outcome.openIds ? '+openIds' : ''}${'heldNew' in outcome && outcome.heldNew ? '+held' : ''}`);
+      expect(holdsNew(text), `${scenario.name}: ${text}`).toBe(!scenario.plain);
+      if (!scenario.plain) expect(offersPlain(text), `${scenario.name}: ${text}`).toBe(false);
+      const next = await ask(probe ?? PROBE, { tabId, turnStartedAt: Date.now() + 1_000 });
+      judged.push([scenario.name, scenario.plain, next.opened]);
+      if (!scenario.plain) expect(next, scenario.name).toMatchObject({ opened: false, heldNew: true });
+    }
+    expect(judged.filter(([, plain, opened]) => plain !== opened)).toEqual([]);
+    // Each scenario reached the outcome it names, so no row of the check passes on the wrong notice.
+    expect(reached).toEqual([
+      'opened=opened', 'revised=revised', 'answered, differs, unmarked=answered', 'answered, same question=answered',
+      'already-open with openIds=already-open+openIds', 'already-open with openIds, [new] pending=already-open+openIds', 'held, open=already-open+held',
+      'revised, [new] pending=revised', 'answered, differs, [new] pending=answered', 'answered, same, [new] pending=answered', 'held, answered=answered+held',
+    ]);
   });
 
   it('a new question after the ack opens; a [new] question while an answer is unacked opens', async () => {
@@ -808,7 +1038,7 @@ describe('one item per question (story PM-2, D50 and D51)', () => {
         itemId: 'tool-1', ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line: 'NEEDS-DECISION: tool?' }),
         humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
       },
-    }], { tabId: 'tab-w', identity: 'session' }, { ndLines: new Map([['tool-open-1', { tabId: 'tab-w', lineKey: 'f'.repeat(16), markedNew: false }]]) });
+    }], { tabId: 'tab-w', identity: 'session' }, { ndLines: new Map([['tool-open-1', { tabId: 'tab-w', lineKey: 'f'.repeat(16), textKey: 'f'.repeat(16), markedNew: false }]]) });
     expect(lines('tool-1')).toEqual([]);
     // The store itself refuses a line row on a non-nd item, or for a tab that does not own the item.
     const first = await ask(LINE, { turnStartedAt: Date.now() + 10 });
@@ -822,9 +1052,9 @@ describe('one item per question (story PM-2, D50 and D51)', () => {
     });
     const authority = (eventId: string) => new Map([[eventId, { resolvedIdentity: ORCH, configuredOrchestratorTabId: 'tab-orch' }]]);
     expect(() => store.applyEvents([update('u-1', first.itemId, 1) as never], authority('u-1'),
-      { ndLines: new Map([['u-1', { tabId: 'tab-intruder', lineKey: 'e'.repeat(16), markedNew: false }]]) })).toThrow('is not its own');
+      { ndLines: new Map([['u-1', { tabId: 'tab-intruder', lineKey: 'e'.repeat(16), textKey: 'e'.repeat(16), markedNew: false }]]) })).toThrow('is not its own');
     expect(() => store.applyEvents([update('u-2', 'tool-1', 1) as never], authority('u-2'),
-      { ndLines: new Map([['u-2', { tabId: 'tab-w', lineKey: 'e'.repeat(16), markedNew: false }]]) })).toThrow('needs an nd- item');
+      { ndLines: new Map([['u-2', { tabId: 'tab-w', lineKey: 'e'.repeat(16), textKey: 'e'.repeat(16), markedNew: false }]]) })).toThrow('needs an nd- item');
     expect(items().find((item) => item.id === first.itemId)?.revision).toBe(1);
     expect(lines(first.itemId)).toHaveLength(1);
   });
@@ -844,17 +1074,36 @@ describe('the asking tab\'s notice (story 36, D1)', () => {
     expect(needsDecisionAskerNotice({ kind: 'item', state: 'already-open', itemId: ID, openIds: ['nd-a', ID] })).toBe(
       `[needs-decision] [MC item ${ID} already open for the owner: do not open another] Name this id while you wait; the owner's answer arrives through Mission Control. Your open items: nd-a, ${ID}; your line revised none of them. A different question: end on NEEDS-DECISION: [new] <question>?`);
     expect(needsDecisionAskerNotice({ kind: 'revised', itemId: ID, replaced: 'Ship   it?' })).toBe(
-      `[needs-decision] [MC item ${ID} revised for the owner by the server: do not open another] Your line replaced the question "Ship it?". If yours is a different question, end on NEEDS-DECISION: [new] <question>? to open its own item.`);
+      `[needs-decision] [MC item ${ID} revised for the owner by the server: do not open another] Your line replaced the question "Ship it?"; the owner no longer sees it. If yours is a different question, ask the replaced one again in its own item: end on NEEDS-DECISION: [new] <the replaced question, in new words>? (its old line stays item ${ID}'s).`);
   });
 
   it('re-delivers the answer: the options and the text, the delivery, and to the orchestrator itself "delivered to you" (PM-2, D51)', () => {
     const answer = { answeredAt: Date.UTC(2026, 10, 7, 0, 0, 0), optionIds: ['a'], optionLabels: ['yes'], text: 'and tell v2', delivery: { state: 'submitted', reason: null, tabId: 'tab-orch' } };
     expect(needsDecisionAskerNotice({ kind: 'answered', itemId: ID, answer, differs: false, question: 'Ship?', askerIsOrchestrator: true })).toBe(
-      `[needs-decision] [MC item ${ID} answered by the owner at 2026-11-07T00:00:00.000Z: do not open another] The answer: (a) yes; "and tell v2". It was delivered to you (delivery submitted). A different question: end on NEEDS-DECISION: [new] <question>?`);
+      `[needs-decision] [MC item ${ID} answered by the owner at 2026-11-07T00:00:00.000Z: do not open another] The answer: (a) yes; "and tell v2". It was delivered to you (delivery submitted). Act on this answer: this question opens no new item until 2026-11-08T00:00:00.000Z, with or without [new]. If something has changed since the answer, ask a new question that says what changed: end on NEEDS-DECISION: [new] <question>?`);
     expect(needsDecisionAskerNotice({ kind: 'answered', itemId: ID, answer: { ...answer, delivery: { state: 'queued', reason: null, tabId: 'tab-orch' } }, differs: false, question: 'Ship?', askerIsOrchestrator: false }))
       .toContain('Delivery queued: on its way to tab-orch.');
     expect(needsDecisionAskerNotice({ kind: 'answered', itemId: ID, answer: { ...answer, optionIds: [], optionLabels: [], text: '', delivery: { state: null, reason: null, tabId: null } }, differs: false, question: 'Ship?', askerIsOrchestrator: false }))
       .toContain('The answer: (no option and no text). No delivery is recorded.');
+  });
+
+  it('the same question inside the window says until when, with or without [new]; a waiting [new] question replaces the hint (finding 4, test 8)', () => {
+    const answer = { answeredAt: Date.UTC(2026, 10, 7, 0, 0, 0), optionIds: ['a'], optionLabels: ['yes'], text: '', delivery: { state: 'submitted', reason: null, tabId: 'tab-orch' } };
+    const base = { kind: 'answered' as const, itemId: ID, answer, differs: false, question: 'Ship?', askerIsOrchestrator: false };
+    expect(needsDecisionAskerNotice(base)).toBe(
+      `[needs-decision] [MC item ${ID} answered by the owner at 2026-11-07T00:00:00.000Z: do not open another] The answer: (a) yes. It went to tab-orch (delivery submitted), which relays it. Act on this answer: this question opens no new item until 2026-11-08T00:00:00.000Z, with or without [new]. If something has changed since the answer, ask a new question that says what changed: end on NEEDS-DECISION: [new] <question>?`);
+    const open = { itemId: 'nd-p', answered: false, question: 'Pay?' };
+    expect(needsDecisionAskerNotice({ ...base, newHeldBy: open })).toBe(
+      `[needs-decision] [MC item ${ID} answered by the owner at 2026-11-07T00:00:00.000Z: do not open another] The answer: (a) yes. It went to tab-orch (delivery submitted), which relays it. Act on this answer: this question opens no new item until 2026-11-08T00:00:00.000Z, with or without [new]. A different question cannot open yet: this tab's [new] question nd-p is still open, and a tab has one [new] question at a time. End on your [new] line again after nd-p is answered and its answer acknowledged.`);
+    expect(needsDecisionNewHint({ ...open, answered: true })).toBe(
+      'A different question cannot open yet: the owner answered this tab\'s [new] question nd-p, and the answer is not yet acknowledged. End on your [new] line again once it is (your orchestrator acknowledges it when it relays it).');
+    expect(needsDecisionNewHint(undefined)).toBe('A different question: end on NEEDS-DECISION: [new] <question>?');
+    // The differs notice and the revise notice take the held hint too.
+    expect(needsDecisionAskerNotice({ ...base, differs: true, newHeldBy: open }).endsWith(`, which relays it. ${needsDecisionNewHint(open)}`)).toBe(true);
+    expect(needsDecisionAskerNotice({ kind: 'revised', itemId: ID, replaced: 'Ship?', newHeldBy: open })).toBe(
+      `[needs-decision] [MC item ${ID} revised for the owner by the server: do not open another] Your line replaced the question "Ship?"; the owner no longer sees it. ${needsDecisionNewHint(open)}`);
+    expect(needsDecisionAskerNotice({ kind: 'held', itemId: 'nd-p', question: 'Pay   the vendor?' })).toBe(
+      '[needs-decision] [MC item nd-p already open for the owner: do not open another] Your [new] line opened nothing and changed nothing. This tab\'s [new] question nd-p is still open ("Pay the vendor?"), and a tab has one [new] question at a time. If your line rewords that question, end on that item\'s line unchanged. If it is a different question, it is not in Mission Control yet: end on it again with [new] after nd-p is answered and its answer acknowledged.');
   });
 
   it('tells a line with no question that nothing opened (D28)', () => {

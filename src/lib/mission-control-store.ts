@@ -432,6 +432,8 @@ export type TMissionSoProposalInput = Pick<IMissionSoProposalRecord, 'proposerTa
 export interface IMissionNeedsDecisionLineInput {
   tabId: string;
   lineKey: string;
+  /** The question text's key: no marker, `[new]` or class tag, letter case folded (review r1 finding 2). */
+  textKey: string;
   markedNew: boolean;
 }
 
@@ -446,7 +448,9 @@ export interface IMissionNeedsDecisionTabItem {
   decision: string;
   /** Every line key the item took: its id's, each revision's, and any reservation or race record. */
   keys: string[];
-  /** The opening line carried `[new]`. */
+  /** Every text key the item took (rows written before the column have none). */
+  textKeys: string[];
+  /** The opening line carried `[new]`: the revision-1 row, else a revision-0 reservation row (consult r2). */
   markedNew: boolean;
   /** The server's NEEDS-DECISION opener opened it for this tab (opener row with a `system:needs-decision:` event). */
   serverOpened: boolean;
@@ -630,23 +634,29 @@ export class MissionControlStore {
    * The line keys of NEEDS-DECISION items (story PM-2): an unversioned side table like the openers, so a release from
    * before it still opens the file. One row per item and line key: the opening line (revision 1), each revision's line,
    * and revision 0 for a key the opener recorded outside an event (a reservation for an id it handed the orchestrator,
-   * or a line that met the item in a race). No foreign key, as for the openers.
+   * or a line that met the item in a race). `text_key`: the question text's key, which an answered item matches too
+   * (PM-2 round 2). No foreign key, as for the openers.
    */
   private ensureNeedsDecisionLineTable = (): void => {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS mission_nd_lines (
-        item_id TEXT NOT NULL, line_key TEXT NOT NULL, workspace_id TEXT NOT NULL, tab_id TEXT NOT NULL,
+        item_id TEXT NOT NULL, line_key TEXT NOT NULL, text_key TEXT, workspace_id TEXT NOT NULL, tab_id TEXT NOT NULL,
         revision INTEGER NOT NULL, marked_new INTEGER NOT NULL, at INTEGER NOT NULL,
         PRIMARY KEY (item_id, line_key)
       );
       CREATE INDEX IF NOT EXISTS mission_nd_lines_tab_idx ON mission_nd_lines(workspace_id, tab_id, line_key);
     `);
+    // A table made before `text_key` (PM-2 round 2) gains it; its old rows keep a null text key and match exactly only.
+    const columns = (this.database.prepare('PRAGMA table_info(mission_nd_lines)').all() as Array<{ name: string }>).map((c) => c.name);
+    if (!columns.includes('text_key')) this.database.exec('ALTER TABLE mission_nd_lines ADD COLUMN text_key TEXT');
   };
 
   /** Record a line key for an item outside an event (revision 0): a reservation, or a race record (story PM-2). */
-  recordNeedsDecisionLine = (workspaceId: string, tabId: string, lineKey: string, itemId: string, markedNew: boolean, at: number): void => {
-    this.database.prepare(`INSERT OR IGNORE INTO mission_nd_lines (item_id,line_key,workspace_id,tab_id,revision,marked_new,at)
-      VALUES (?,?,?,?,0,?,?)`).run(itemId, lineKey, workspaceId, tabId, Number(markedNew), at);
+  recordNeedsDecisionLine = (
+    workspaceId: string, tabId: string, lineKey: string, textKey: string, itemId: string, markedNew: boolean, at: number,
+  ): void => {
+    this.database.prepare(`INSERT OR IGNORE INTO mission_nd_lines (item_id,line_key,text_key,workspace_id,tab_id,revision,marked_new,at)
+      VALUES (?,?,?,?,?,0,?,?)`).run(itemId, lineKey, textKey, workspaceId, tabId, Number(markedNew), at);
   };
 
   /**
@@ -667,12 +677,13 @@ export class MissionControlStore {
       ORDER BY a.created_at, a.id`).all(workspaceId, workspaceId, tabId, workspaceId, tabId, workspaceId, prefix, prefix, since) as Array<{
         id: string; state: TMissionItemState; revision: number; run_id: string; created_at: number; question_json: string; answer_id: string | null;
       }>;
-    const lineRows = this.database.prepare('SELECT line_key, revision, marked_new FROM mission_nd_lines WHERE item_id = ?');
+    const lineRows = this.database.prepare('SELECT line_key, text_key, revision, marked_new FROM mission_nd_lines WHERE item_id = ?');
     const opener = this.database.prepare('SELECT tab_id, event_id FROM mission_item_openers WHERE item_id = ?');
     const answerRow = this.database.prepare('SELECT * FROM answers WHERE item_id = ? ORDER BY created_at DESC, id DESC LIMIT 1');
     const deliveryRow = this.database.prepare('SELECT * FROM deliveries WHERE answer_id = ?');
     return rows.map((row) => {
-      const lines = lineRows.all(row.id) as Array<{ line_key: string; revision: number; marked_new: number }>;
+      const lines = lineRows.all(row.id) as Array<{ line_key: string; text_key: string | null; revision: number; marked_new: number }>;
+      const opening = lines.filter((line) => line.revision === 1);
       const own = needsDecisionLinePrefix(row.id);
       const keys = [...new Set([...(own ? [own.slice(3)] : []), ...lines.map((line) => line.line_key)])];
       const openedBy = opener.get(row.id) as { tab_id: string; event_id: string } | undefined;
@@ -689,7 +700,9 @@ export class MissionControlStore {
         createdAt: row.created_at,
         decision: String(question.decision ?? ''),
         keys,
-        markedNew: lines.some((line) => line.revision === 1 && line.marked_new === 1),
+        textKeys: [...new Set(lines.flatMap((line) => (line.text_key ? [line.text_key] : [])))],
+        // An item the orchestrator opened from a handed id has no revision-1 row: its reservation says (consult r2).
+        markedNew: (opening.length ? opening : lines.filter((line) => line.revision === 0)).some((line) => line.marked_new === 1),
         serverOpened: openedBy?.tab_id === tabId && openedBy.event_id.startsWith(NEEDS_DECISION_EVENT_PREFIX),
         answer: parsed ? {
           id: parsed.id,
@@ -1888,8 +1901,8 @@ export class MissionControlStore {
   ): void => {
     if (!needsDecisionLinePrefix(itemId)) invalidMissionRequest(`a NEEDS-DECISION line record needs an nd- item, not ${itemId}`);
     if (owner !== line.tabId) invalidMissionRequest(`the NEEDS-DECISION line of ${line.tabId} cannot be recorded on ${itemId}: that item is not its own`);
-    this.database.prepare(`INSERT OR IGNORE INTO mission_nd_lines (item_id,line_key,workspace_id,tab_id,revision,marked_new,at)
-      VALUES (?,?,?,?,?,?,?)`).run(itemId, line.lineKey, workspaceId, line.tabId, revision, Number(line.markedNew), now);
+    this.database.prepare(`INSERT OR IGNORE INTO mission_nd_lines (item_id,line_key,text_key,workspace_id,tab_id,revision,marked_new,at)
+      VALUES (?,?,?,?,?,?,?,?)`).run(itemId, line.lineKey, line.textKey, workspaceId, line.tabId, revision, Number(line.markedNew), now);
   };
 
   /** The tab an `nd-` item belongs to: the tab of its line rows, else its opener; null when neither is recorded. */
