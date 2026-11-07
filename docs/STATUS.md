@@ -936,6 +936,7 @@ remain unchanged and no second warning toast is created.
 | `work-stalled` | Work Stalled | a liveness probe reports a stall or keeps failing (`handleLivenessEvent`); outside the alert policy |
 | `bg-job-died` | Background Job Died | a registered background job failed (`handleLivenessEvent`), except a `--notify self` failure its own tab carries on |
 | `bg-job-unknown` | Background Job Status Unknown | a registered background job vanished with no exit status (`handleLivenessEvent`) |
+| `bg-host-unreachable` | Background Job Host Unreachable | a remote job's host failed `REMOTE_JOB_UNREACHABLE_BOUND` probes in a row; the job is not known to have exited (`reportUnreachableJobHost`) |
 | `flag` | Flag Raised | the flag tick (`src/lib/flag-alerts.ts`), below |
 
 The idempotent guard at the top of `applyCliState` (`prevState === newState`) blocks duplicate calls, so callers don't have to track state.
@@ -1046,6 +1047,27 @@ Finishing one job does not clear unrelated freshness probes: the owner clears it
 completed task probe explicitly. Probe stdout must end in a complete finite,
 nonnegative number of seconds; labelled text and negative/NaN/infinite ages fail
 as probe errors instead of producing spurious huge stall durations.
+
+### A job on a remote host (D63)
+
+A job registered from a remote tab (ADR-0022) carries `host`: the verified caller tab's host, else the target
+tab's. Its pid, exit file and stderr tail are read on that host, never in this server's `/proc`. Each pass runs one
+`sh -s --` exec per host that has jobs (`remote-job-probe.ts`), every host at once; the reply is one frame keyed by a
+per-probe nonce, file bytes in base64, and anything else fails the probe. `statusForTab` and `reconcileJobs` read
+the last verdict only and never run ssh.
+
+- A failed probe (ssh, timeout, a refused reply, no procfs) makes the host's jobs `unknown`: never deleted, never
+  reported as an exit, and the exit-file grace stands. The host is skipped for `REMOTE_JOB_BACKOFF_MS` (30 s); a
+  skipped pass counts as neither success nor failure.
+- After `REMOTE_JOB_UNREACHABLE_BOUND` (3) failed passes, each job emits one `bg-host-unreachable`. It goes to the
+  reportsTo tab or the orchestrator even for `--notify self` (the registering tab is on the host that is down), is
+  urgent, pages, and has its own episode, so the real exit later is still reported. It re-arms only after the host
+  has answered for `REMOTE_JOB_REARM_MS` (10 min).
+- `IBackgroundJobStatus.state` is `alive | exited | unknown`; `alive` is true only when attested. Where a job holds
+  its tab's work (WAITING, long-wait, keeper, presence, fleet), `jobHoldsWork` counts `unknown` as holding.
+- A job saved before jobs named their host gets its tab's host from the layout at hydration; while the layout is
+  unreadable it is `unknown`, never judged here.
+
 # Mission Control observations and delivery
 
 Mission Control reads the existing StatusManager snapshot after the custom server initializes it. API imports never call `StatusManager.init()`, so the Next.js module graph cannot start a second poller, keeper, watcher, or notification channel. Discovery combines persisted workspace layouts, actual provider processes, current session identities, live CLI state, and bounded standup history. It does not inspect an epic board or crawl transcripts.
