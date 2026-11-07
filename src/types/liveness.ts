@@ -23,10 +23,11 @@ export interface IBackgroundJob {
   pid: number;
   /**
    * The ssh alias of the host the pid lives on: the registering tab's host
-   * (ADR-0022). Absent = this server's host. The pid and both files are read
-   * there, never here (D63).
+   * (ADR-0022). The pid and both files are read there, never here (D63).
+   * `null`: registered on this server's host. Absent in a saved record: written
+   * before jobs named their host, so the host is read from the layout.
    */
-  host?: string;
+  host?: string | null;
   label?: string;
   /** File the job's stderr was redirected to; its tail is included in the death notification. */
   stderrFile?: string;

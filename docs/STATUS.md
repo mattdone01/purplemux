@@ -1050,14 +1050,16 @@ as probe errors instead of producing spurious huge stall durations.
 
 ### A job on a remote host (D63)
 
-A job registered from a remote tab (ADR-0022) carries `host`: the verified caller tab's host, else the target
-tab's. Its pid, exit file and stderr tail are read on that host, never in this server's `/proc`. Each pass runs one
+A job carries `host`: the verified caller tab's host, else the target tab's; `null` when that tab is local. A
+verified caller tab that no longer exists is refused (409 `caller-tab-gone`): no host can be proven for its pid. A
+remote job's pid, exit file and stderr tail are read on its host, never in this server's `/proc`. Each pass runs one
 `sh -s --` exec per host that has jobs (`remote-job-probe.ts`), every host at once; the reply is one frame keyed by a
 per-probe nonce, file bytes in base64, and anything else fails the probe. `statusForTab` and `reconcileJobs` read
 the last verdict only and never run ssh.
 
 - A failed probe (ssh, timeout, a refused reply, no procfs) makes the host's jobs `unknown`: never deleted, never
-  reported as an exit, and the exit-file grace stands. The host is skipped for `REMOTE_JOB_BACKOFF_MS` (30 s); a
+  reported as an exit, and the exit-file grace stands. Each verdict keeps the time its probe began; a grace ends only
+  on bytes from a probe begun after the grace started, so `reconcileJobs` never ends it on the old reading. The host is skipped for `REMOTE_JOB_BACKOFF_MS` (30 s); a
   skipped pass counts as neither success nor failure.
 - After `REMOTE_JOB_UNREACHABLE_BOUND` (3) failed passes, each job emits one `bg-host-unreachable`. It goes to the
   reportsTo tab or the orchestrator even for `--notify self` (the registering tab is on the host that is down), is
@@ -1065,8 +1067,10 @@ the last verdict only and never run ssh.
   has answered for `REMOTE_JOB_REARM_MS` (10 min).
 - `IBackgroundJobStatus.state` is `alive | exited | unknown`; `alive` is true only when attested. Where a job holds
   its tab's work (WAITING, long-wait, keeper, presence, fleet), `jobHoldsWork` counts `unknown` as holding.
-- A job saved before jobs named their host gets its tab's host from the layout at hydration; while the layout is
-  unreadable it is `unknown`, never judged here.
+- A saved record with no `host` key (written before jobs named their host) gets its tab's host from the layout at
+  hydration; while the layout is unreadable it is `unknown`, never judged here, also in `isJobAlive` after a
+  restart takes it. A record with `host: null` is a local registration and is never filled in.
+- A file the host cannot read, or whose `tail` or `base64 -w0` fails, comes back as unreadable (`-`), not empty.
 
 # Mission Control observations and delivery
 

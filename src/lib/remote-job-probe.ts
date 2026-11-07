@@ -18,15 +18,20 @@ export const REMOTE_JOB_PROBE_TIMEOUT_MS = 10_000;
  * Arguments: NONCE, then PID EXIT_FILE STDERR_FILE per job (an empty file
  * argument names no file). Output: `begin\tNONCE`, then `<i>\talive` or
  * `<i>\texited\t<file>\t<file>` per job, where a file is `-` (not named or not
- * readable) or `b<base64 of its tail>`, then `end\tNONCE\t<count>`. A host
- * with no procfs answers `noproc` alone: there it cannot tell a live pid.
+ * readable, or `tail` or `base64 -w0` failed there: their status comes back on
+ * fd 3, so a failure never reads as an empty file) or `b<base64 of its
+ * tail>`, then `end\tNONCE\t<count>`. A host with no procfs answers `noproc`
+ * alone: there it cannot tell a live pid.
  */
 export const REMOTE_JOB_PROBE_SCRIPT = `nonce=$1; shift
 [ -d /proc/self ] || { printf 'noproc\\n'; exit 0; }
 printf 'begin\\t%s\\n' "$nonce"
 i=0
 tailof() {
-  if [ -n "$1" ] && [ -r "$1" ]; then printf 'b'; tail -c "$2" -- "$1" 2>/dev/null | base64 -w0; else printf '%s' -; fi
+  [ -n "$1" ] && [ -r "$1" ] || { printf '%s' -; return 0; }
+  r=$( { { tail -c "$2" -- "$1" 2>/dev/null; printf 't%s\\n' "$?" >&3; } | { d=$(base64 -w0 2>/dev/null) && printf 'd%s\\n' "$d" >&3 || printf 'x\\n' >&3; }; } 3>&1 )
+  t=$(printf '%s\\n' "$r" | sed -n 's/^t//p'); d=$(printf '%s\\n' "$r" | grep '^d')
+  if [ "$t" = 0 ] && [ -n "$d" ]; then printf 'b%s' "\${d#d}"; else printf '%s' -; fi
 }
 while [ $# -ge 3 ]; do
   pid=$1; ef=$2; sf=$3; shift 3

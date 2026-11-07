@@ -57,9 +57,9 @@ export interface ILivenessManagerDeps {
    */
   probeRemoteJobs?: (host: string, jobs: readonly IBackgroundJob[]) => Promise<TRemoteJobReading[]>;
   /**
-   * The host of a tab, for a saved job written before jobs named their host:
-   * the alias, or null for a local or unknown tab. Throws when the layout is
-   * unreadable. Absent: every such job is local.
+   * The host of a tab, for a saved job written before jobs named their host
+   * (no `host` key at all): the alias, or null for a local or unknown tab.
+   * Throws when the layout is unreadable. Absent: every such job is local.
    */
   resolveJobHost?: (workspaceId: string, tabId: string) => Promise<string | null>;
 }
@@ -103,8 +103,8 @@ interface IJobRuntime {
   deadSince: number | null;
   /** A remote job's last verdict; `pending` until its host first answers. */
   remote: 'pending' | 'unknown' | TRemoteJobReading;
-  /** A saved job whose tab's host could not be read: unknown, never judged here. */
-  hostUnresolved: boolean;
+  /** When the probe behind `remote` started: its file bytes were read no earlier. */
+  remoteReadAt: number;
   unreachableAlerted: boolean;
 }
 
@@ -115,7 +115,7 @@ interface IHostRuntime {
   probing: boolean;
 }
 
-const freshJobRuntime = (): IJobRuntime => ({ deadSince: null, remote: 'pending', hostUnresolved: false, unreachableAlerted: false });
+const freshJobRuntime = (): IJobRuntime => ({ deadSince: null, remote: 'pending', remoteReadAt: 0, unreachableAlerted: false });
 
 const freshRuntime = (): IProbeRuntime => ({
   lastRunAt: null,
@@ -137,6 +137,12 @@ export class LivenessManager {
   private probes = new Map<string, { probe: ILivenessProbe; runtime: IProbeRuntime }>();
   private jobs = new Map<string, { job: IBackgroundJob; runtime: IJobRuntime }>();
   private hosts = new Map<string, IHostRuntime>();
+  /**
+   * Saved jobs with no `host` key whose tab's host is not read yet: unknown,
+   * never judged here. Keyed by the job object, so a job `takeJobs` returned
+   * keeps it into `isJobAlive` and a re-registration.
+   */
+  private unresolvedHosts = new WeakSet<IBackgroundJob>();
   private hydrated: Promise<void> | null = null;
 
   constructor(private deps: ILivenessManagerDeps) {}
@@ -151,9 +157,9 @@ export class LivenessManager {
         }
         for (const job of jobs) {
           if (!this.jobs.has(jobKey(job))) {
-            const entry = { job, runtime: freshJobRuntime() };
-            this.jobs.set(jobKey(job), entry);
-            if (!job.host) entry.runtime.hostUnresolved = true;
+            this.jobs.set(jobKey(job), { job, runtime: freshJobRuntime() });
+            // Only a record with no host key is from before jobs named their host; `null` is a local registration.
+            if (job.host === undefined) this.unresolvedHosts.add(job);
           }
         }
         await this.resolveSavedHosts();
@@ -193,7 +199,7 @@ export class LivenessManager {
    */
   private async resolveSavedHosts(): Promise<void> {
     for (const [key, { job, runtime }] of [...this.jobs]) {
-      if (!runtime.hostUnresolved) continue;
+      if (!this.unresolvedHosts.has(job)) continue;
       let host: string | null;
       try {
         host = this.deps.resolveJobHost ? await this.deps.resolveJobHost(job.workspaceId, job.tabId) : null;
@@ -202,10 +208,10 @@ export class LivenessManager {
         continue;
       }
       if (this.jobs.get(key)?.runtime !== runtime) continue;
-      // In place, before the flag clears: a pass holding this entry must never see it hostless and resolved.
-      if (host) job.host = host;
-      runtime.hostUnresolved = false;
-      if (host) upsertJob(job).catch(() => {});
+      // In place, before it leaves the set: a pass holding this entry must never see it hostless and resolved.
+      job.host = host;
+      this.unresolvedHosts.delete(job);
+      upsertJob(job).catch(() => {});
     }
   }
 
@@ -225,6 +231,7 @@ export class LivenessManager {
    * have exited.
    */
   async isJobAlive(job: IBackgroundJob): Promise<boolean> {
+    if (this.unresolvedHosts.has(job)) return true;
     if (!job.host) return this.deps.isPidAlive(job.pid);
     if (!this.deps.probeRemoteJobs) return true;
     try {
@@ -237,7 +244,7 @@ export class LivenessManager {
 
   /** A job's state from what is known now: a remote job reads its last verdict, never this host's procfs. */
   private jobState(job: IBackgroundJob, runtime: IJobRuntime): TBackgroundJobState {
-    if (runtime.hostUnresolved) return 'unknown';
+    if (this.unresolvedHosts.has(job)) return 'unknown';
     if (!job.host) return this.deps.isPidAlive(job.pid) ? 'alive' : 'exited';
     return typeof runtime.remote === 'string' ? 'unknown' : runtime.remote.state;
   }
@@ -347,7 +354,7 @@ export class LivenessManager {
   private async probeRemoteHosts(emit: (event: TLivenessEvent) => void): Promise<void> {
     const byHost = new Map<string, Array<{ key: string; job: IBackgroundJob; runtime: IJobRuntime }>>();
     for (const [key, { job, runtime }] of this.jobs) {
-      if (!job.host || runtime.hostUnresolved) continue;
+      if (!job.host || this.unresolvedHosts.has(job)) continue;
       const list = byHost.get(job.host) ?? [];
       list.push({ key, job, runtime });
       byHost.set(job.host, list);
@@ -380,6 +387,7 @@ export class LivenessManager {
         listed.forEach((entry, i) => {
           if (!current.includes(entry)) return;
           entry.runtime.remote = answered[i];
+          entry.runtime.remoteReadAt = now;
           if (rearm) entry.runtime.unreachableAlerted = false;
         });
         return;
@@ -420,6 +428,8 @@ export class LivenessManager {
           const now = this.deps.now();
           runtime.deadSince ??= now;
           if (now - runtime.deadSince < BACKGROUND_EXIT_FILE_GRACE_MS) continue;
+          // A remote job's bytes are a probe's: only a probe begun after the grace started may end it.
+          if (remote && runtime.remoteReadAt <= runtime.deadSince) continue;
         }
       }
       let stderrTail: string | null = null;

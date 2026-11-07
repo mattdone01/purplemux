@@ -294,7 +294,78 @@ describe('a job saved before jobs named their host (the release itself)', () => 
   });
 });
 
+describe('a local registration and a legacy record are told apart (review r1, finding 1)', () => {
+  it('a caller-local pid registered against a remote tab (host null) is still judged here after a restart', async () => {
+    store.saved = [job({ tabId: 'tab-remote', host: null })];
+    const resolveJobHost = vi.fn(async () => REMOTE);
+    const h = harness({ resolveJobHost });
+    h.deps.isPidAlive.mockReturnValue(true);
+    await h.tick();
+    store.saved = [];
+    expect(resolveJobHost).not.toHaveBeenCalled();
+    expect(h.deps.probeRemoteJobs).not.toHaveBeenCalled();
+    expect(h.deps.isPidAlive).toHaveBeenCalledWith(157985);
+    expect(await h.statusOf('tab-remote')).toEqual([expect.objectContaining({ state: 'alive' })]);
+    expect((await h.statusOf('tab-remote'))[0]).not.toHaveProperty('host');
+  });
+
+  it('a legacy record with no host key still fills in from the layout, local included', async () => {
+    store.saved = [job({ tabId: 'tab-remote', pid: 1 }), job({ tabId: 'tab-local', pid: 2 })];
+    const h = harness({ resolveJobHost: async (_ws, tabId) => (tabId === 'tab-remote' ? REMOTE : null) });
+    h.deps.isPidAlive.mockReturnValue(true);
+    await h.tick();
+    const [remote, local] = store.saved;
+    store.saved = [];
+    expect(remote.host).toBe(REMOTE);
+    expect(local.host).toBeNull();
+    expect(h.deps.probeRemoteJobs.mock.calls.map(([host, jobs]) => [host, jobs.map((j) => j.pid)])).toEqual([[REMOTE, [1]]]);
+    expect(h.deps.isPidAlive.mock.calls.map(([pid]) => pid)).toEqual([2]);
+  });
+});
+
+describe('a remote exit-file grace ends only on a newer probe (review r1, finding 2)', () => {
+  it('a reconcile after the grace reports nothing from the old bytes; a later probe that sees the file reports the real code', async () => {
+    let exitRaw: string | null = null;
+    const h = harness({ probe: async (_host, jobs) => jobs.map(() => exited(exitRaw)) });
+    await h.manager.registerJob(job({ host: REMOTE, exitCodeFile: '/r/x.exit' }));
+    await h.tick();
+    h.advance(BACKGROUND_EXIT_FILE_GRACE_MS + 1_000);
+    expect(await h.manager.reconcileJobs('tab-1', (e) => h.events.push(e))).toEqual({ reported: 0, pendingDead: 1 });
+    expect(h.events).toEqual([]);
+    exitRaw = '7\n';
+    await h.tick();
+    expect(h.events).toEqual([expect.objectContaining({ kind: 'bg-failed', exitCode: 7 })]);
+  });
+});
+
+describe('one host\'s failures leave another host alone', () => {
+  it('counts, backs off and alerts per host', async () => {
+    const h = harness({ probe: async (host, jobs) => (host === REMOTE ? fail(host, jobs) : jobs.map(() => alive)) });
+    await h.manager.registerJob(job({ host: REMOTE, pid: 1 }));
+    await h.manager.registerJob(job({ host: 'gpu-1', pid: 2 }));
+    for (let pass = 0; pass < REMOTE_JOB_UNREACHABLE_BOUND; pass += 1) {
+      await h.tick();
+      h.advance(REMOTE_JOB_BACKOFF_MS);
+    }
+    expect(h.events.map((e) => [e.kind, 'job' in e && e.job.pid])).toEqual([['bg-host-unreachable', 1]]);
+    expect(h.deps.probeRemoteJobs.mock.calls.filter(([host]) => host === 'gpu-1')).toHaveLength(REMOTE_JOB_UNREACHABLE_BOUND);
+    expect((await h.statusOf()).map((s) => [s.pid, s.state])).toEqual([[1, 'unknown'], [2, 'alive']]);
+  });
+});
+
 describe('isJobAlive for a job taken by a restart', () => {
+  it('a legacy job whose host is still unresolved is alive, never judged by this server\'s procfs', async () => {
+    store.saved = [job()];
+    const h = harness({ resolveJobHost: async () => { throw new Error('EACCES'); } });
+    await h.tick();
+    store.saved = [];
+    const [taken] = await h.manager.takeJobs('ws-1', 'tab-1');
+    expect(await h.manager.isJobAlive(taken)).toBe(true);
+    expect(h.deps.isPidAlive).not.toHaveBeenCalled();
+    await h.manager.registerJob(taken);
+    expect((await h.statusOf())[0]).toMatchObject({ state: 'unknown' });
+  });
+
   it('asks a remote job\'s host: exited is dead, no answer keeps it', async () => {
     let reply: 'alive' | 'exited' | 'down' = 'exited';
     const h = harness({ probe: async (host, jobs) => (reply === 'down' ? fail(host, jobs) : jobs.map(() => (reply === 'alive' ? alive : exited(null)))) });
@@ -338,6 +409,24 @@ describe('parseRemoteJobProbe: only one complete frame with this nonce is a repl
 });
 
 describe('REMOTE_JOB_PROBE_SCRIPT on a real procfs', () => {
+  it.each(['tail', 'base64'])('reads a file as unreadable, not empty, when %s fails on the host', (tool) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-remote-job-'));
+    try {
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(bin);
+      fs.writeFileSync(path.join(bin, tool), '#!/bin/sh\ncat >/dev/null 2>&1\nexit 1\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(dir, 'exit'), '0\n');
+      const stdout = execFileSync('/bin/sh', ['-c', remoteJobProbeCommand('n9', [job({ pid: 2 ** 22 + 11, exitCodeFile: path.join(dir, 'exit') })])], {
+        input: REMOTE_JOB_PROBE_SCRIPT,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      }).toString();
+      expect(parseRemoteJobProbe(stdout, 'n9', 1)).toEqual({ ok: true, readings: [exited(null, null)] });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+
   it('reads a live pid, a dead pid\'s exit file and stderr tail, and treats hostile paths as data', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-remote-job-'));
     try {

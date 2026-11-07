@@ -31,6 +31,13 @@ describe('a saved job names its host (D63)', () => {
     ] } });
   });
 
+  it('round-trips host null, the local marker that hydration never fills in', async () => {
+    await upsertJob({ workspaceId: 'ws-n', tabId: 'tab-1', pid: 3, host: null, registeredAt: 1 });
+    expect(await readLivenessEvidence('ws-n')).toEqual({ known: true, data: { probes: [], jobs: [
+      { workspaceId: 'ws-n', tabId: 'tab-1', pid: 3, host: null, registeredAt: 1 },
+    ] } });
+  });
+
   it.each([['-oProxyCommand=x'], ['ai lan'], [42]])('refuses the file when a job names the host %j', async (host) => {
     const dir = path.join(baseDir, 'ws-bad');
     await fs.mkdir(dir, { recursive: true });

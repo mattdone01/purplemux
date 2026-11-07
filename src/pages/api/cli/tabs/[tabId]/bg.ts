@@ -48,16 +48,21 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     }
 
     // The pid was taken where the caller runs (D63): the verified caller tab's host, else the target tab's.
-    const caller = scope.type === 'workspace' && scope.tabVerified && scope.tabId && scope.tabId !== tabId
-      ? await findTab(workspaceId, scope.tabId)
-      : null;
-    const host = (caller ?? target).tab.host;
+    const callerTabId = scope.type === 'workspace' && scope.tabVerified && scope.tabId && scope.tabId !== tabId ? scope.tabId : null;
+    const caller = callerTabId ? await findTab(workspaceId, callerTabId) : null;
+    if (callerTabId && !caller) {
+      return res.status(409).json({
+        error: `the calling tab ${callerTabId} no longer exists, so no host can be proven for pid ${pid}; register it from a live tab`,
+        code: 'caller-tab-gone',
+      });
+    }
+    const host = (caller ?? target).tab.host ?? null;
 
     const job: IBackgroundJob = {
       workspaceId,
       tabId,
       pid,
-      ...(host ? { host } : {}),
+      host,
       ...(label !== undefined ? { label } : {}),
       ...(stderrFile !== undefined ? { stderrFile } : {}),
       ...(exitCodeFile !== undefined ? { exitCodeFile } : {}),

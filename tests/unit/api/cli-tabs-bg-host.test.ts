@@ -42,23 +42,29 @@ describe('tab bg add names the host the pid lives on (D63)', () => {
     cli.findTab.mockImplementation(async (ws: string, id: string) => (ws === 'ws-1' && id in hosts ? { workspaceId: ws, paneId: 'pane-a', tab: tab(id) } : null));
   });
 
-  it('a remote tab registering its own pid names its host; a local tab names none', async () => {
+  it('a remote tab registering its own pid names its host; a local tab marks itself local with host null', async () => {
     expect((await register('tab-remote', { tabId: 'tab-remote', tabVerified: true })).job).toMatchObject({ pid: 157985, host: 'ai-lan' });
     const local = await register('tab-local', { tabId: 'tab-local', tabVerified: true });
     expect(local.state.statusCode).toBe(200);
-    expect(local.job).not.toHaveProperty('host');
+    expect(local.job).toHaveProperty('host', null);
   });
 
   it('takes the verified caller tab\'s host over the target\'s: the pid was taken where the caller runs', async () => {
-    expect((await register('tab-remote', { tabId: 'tab-local', tabVerified: true })).job).not.toHaveProperty('host');
+    expect((await register('tab-remote', { tabId: 'tab-local', tabVerified: true })).job).toHaveProperty('host', null);
     expect((await register('tab-local', { tabId: 'tab-remote', tabVerified: true })).job).toMatchObject({ host: 'ai-lan' });
     expect((await register('tab-remote', { tabId: 'tab-other-remote', tabVerified: true })).job).toMatchObject({ host: 'gpu-1' });
   });
 
-  it('uses the target tab\'s host when the token is not a verified tab or its tab is gone', async () => {
+  it('uses the target tab\'s host when the token is not a verified tab', async () => {
     expect((await register('tab-remote', {})).job).toMatchObject({ host: 'ai-lan' });
     expect((await register('tab-remote', { tabId: 'tab-local' })).job).toMatchObject({ host: 'ai-lan' });
-    expect((await register('tab-remote', { tabId: 'tab-closed', tabVerified: true })).job).toMatchObject({ host: 'ai-lan' });
-    expect((await register('tab-local', { type: 'admin' })).job).not.toHaveProperty('host');
+    expect((await register('tab-local', { type: 'admin' })).job).toHaveProperty('host', null);
+  });
+
+  it('refuses a registration from a verified caller tab that no longer exists, saying why', async () => {
+    const { state } = await register('tab-remote', { tabId: 'tab-closed', tabVerified: true });
+    expect(state.statusCode).toBe(409);
+    expect(state.body).toMatchObject({ code: 'caller-tab-gone', error: expect.stringContaining('tab-closed no longer exists') });
+    expect(liveness.registerJob).not.toHaveBeenCalled();
   });
 });

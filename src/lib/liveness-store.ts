@@ -68,7 +68,7 @@ const isJob = (value: unknown): value is IBackgroundJob => {
     && Number.isSafeInteger(job.pid)
     && (job.pid as number) > 0
     && isFiniteNonnegative(job.registeredAt)
-    && (job.host === undefined || isValidRemoteHostName(job.host))
+    && (job.host === undefined || job.host === null || isValidRemoteHostName(job.host))
     && (job.label === undefined || typeof job.label === 'string')
     && (job.stderrFile === undefined || typeof job.stderrFile === 'string')
     && (job.exitCodeFile === undefined || typeof job.exitCodeFile === 'string')
