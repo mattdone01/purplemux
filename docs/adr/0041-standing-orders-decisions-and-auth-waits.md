@@ -58,8 +58,9 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   (the turn's start; `mission_item_openers.opened_at`). The item id is
   `nd-<16 hex of workspace, tab and the whitespace-normalized line><16 hex of the stop's time and seq>`: the first half
   names the question, and the store finds an open item by that id prefix (`openItemsWithIdPrefix`), from any opener;
-  the second half takes the stop's time as well as its seq, which restarts at 0 with the server, so an answered question
-  opens a new item after a restart too. Once the item is answered, resolved or cancelled, the same line opens a new one.
+  the second half takes the stop's time as well as its seq, which restarts at 0 with the server. What a line does once its
+  item is answered or resolved is the PM-2 amendment below: for 24 h after the answer it opens nothing. After a cancel,
+  the same line opens a new item.
 - The opener never throws: a failing dependency (an SQLite read, the workspace read, the module load) is the outcome
   `error`. Every outcome that opens no item (`no-orchestrator`, `no-orchestrator-run`, `refused`, `error`) carries the
   id the server would have used.
@@ -107,7 +108,8 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   ended on its line four times; the owner push went out each time, and the asker heard nothing).
   - **One id per line key for 24 h.** The server remembers the first id it mints for a line key (workspace, tab and the
     normalized line) and gives that id to every stop of the line for 24 h from then, unless an item of that id has
-    closed (answered, resolved, cancelled), when the line asks anew under the stop's own id. So "its id would be <id>"
+    closed (answered, resolved, cancelled), when the line takes the stop's own id. (The PM-2 amendment below decides
+    first whether such a line opens anything.) So "its id would be <id>"
     is true: a later server open, or the orchestrator's open from the (i) note, takes that id, and a second open meets
     the same id (`already-open`). In memory, at most 2,000 keys; after a restart the store gives the id back (story 03
     amendment of epic `harness-flow-loop-2`, below). The id shape above is unchanged; only its second half is now the
@@ -164,7 +166,8 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
     opener (server, orchestrator or worker). The response is HTTP 409 with the body
     `{"error": "an item for this NEEDS-DECISION line is already open: <open item id>", "code": "already-open", "current": <the open item>}`.
     The same id again stays the 409 `conflict` `attention item already exists`. Once the open item is answered,
-    resolved or cancelled, an `nd-` id of that line opens again.
+    resolved or cancelled, the store accepts an `nd-` id of that line again; the server opener does not use it while the
+    PM-2 amendment below holds.
   - **A racing open is `already-open`, not `refused` (review r1).** If another opener takes the line between the
     opener's dedupe and its own write, the opener reads the typed refusal: the outcome is `already-open` with the open
     item's id (`current.id`), and the line keeps that id. So no "open it yourself" note and no (ii) push go out for an
@@ -172,6 +175,68 @@ on reaches the orchestrator as a nudge, and the owner only when a seat copies it
   - **The asker hears a note that the repeat filter held back.** A tab already `ready-for-review` that ends on the same
     marker again sends no second nudge. The note of that stop then reaches no tab, so the asker gets it itself (the
     notice above): "the note rides the nudge" means the nudge that survives the repeat filter.
+
+- **Amendment (story PM-2 of epic `harness-flow-loop-2`, 2026-11-07; defects D50 and D51): one item per question.** SO-6
+  says "repeat the same line without changes", but an agent does not always obey it. Measured on the live store
+  (2026-11-07): a reworded line opened a second item 38 s after the first (D50, ws-o9gb_Q); the exact line opened a
+  second item 22.2 min after the owner's answer, and after the ack (D51, the Portfolio SM). The server now copes.
+  - **How a line is recognised.** The line key is unchanged, except that the `[new]` marker is removed before the key is
+    made, so `[new] Q` and `Q` have one key. A side table, `mission_nd_lines` (item, line key, workspace, tab, revision,
+    `[new]` flag), records each line key an `nd-` item took. The store writes the row in the event's own transaction,
+    from a batch side input that only the server opener's `system:needs-decision:` events carry; it refuses a row on an
+    item that is not `nd-` or that another tab owns. Revision 0 rows record a key outside an event: the id the server
+    handed to the orchestrator (it counts once that item exists), and a line that met its item in a race. The tab's
+    items are its line rows, its own `nd-` openers (items from before this table) and any item with the prefix
+    `nd-<lineKey>`. A restart loses nothing.
+  - **The states.** OPEN is `candidate` or `open`. An item is ANSWERED from the answer until the end of the answer
+    window: **24 h from the answer's time** (`NEEDS_DECISION_ANSWER_WINDOW_MS`), in state `answered` or `resolved`.
+    "Acked" is the answer's delivery row in state `acknowledged`. A cancelled item never matches.
+  - **The decision table.** The first row that holds wins:
+    1. An OPEN item of the tab took this key at any time: `already-open`. No write, so a line that goes A, B, A does not
+       revise the item again.
+    2. An ANSWERED item took this key: outcome `answered`. This is true before and after the ack, and with `[new]` too,
+       because an asker repeats a `[new]` line while it waits.
+    3. The tab itself opened an item since the turn began (`asked-this-turn`). The server's own `nd-` item of the
+       previous stop does not count.
+    4. The line has no effective `[new]`: either it carries none, or a `[new]` item of the tab is still open. Then:
+       - If the tab has exactly one OPEN item and its state is `open`, the server revises it. It sends `attention.updated`
+         on the item's own run, with the orchestrator's review again and the new question; the revision goes up by
+         one. The event id is `system:needs-decision:<32 hex>:r<revision>`. The outcome is `revised`.
+       - If the tab has more OPEN items, or a candidate, the outcome is `already-open` for the newest. Nothing is
+         written, and the notice lists the open ids.
+       - If the tab has an ANSWERED item whose delivery is not acknowledged, the outcome is `answered`, and the line
+         differs from the question.
+    5. Otherwise the line opens an item by the path above.
+  - **What opens a new item.** Only row 5: a `[new]` line that matches no OPEN item and no ANSWERED item; a line
+    without the marker when the tab has no OPEN item and no unacknowledged ANSWERED item; any line after the answer
+    window or after a cancel.
+  - **A failed revise opens nothing.** The item's state after the failure decides. If it is still OPEN, the outcome is
+    `already-open`. If it was answered in the race, the outcome is `answered`, and the line key is recorded on the item.
+    If it was cancelled, the line opens anew. A failed revise is never `refused`, because that would send an "open it
+    yourself" note and an owner push for an item the owner can already see.
+  - **The answer goes to the asker again.** No delivery is queued again: the delivery goes to the run binding (the
+    orchestrator), and a held row can be a paste that happened. The asking tab gets one urgent `mission` event:
+    `[needs-decision] [MC item <id> answered by the owner at <UTC ISO>: do not open another] The answer: (<id>) <label>;
+    "<text, at most 200 chars>". <delivery>. A different question: end on NEEDS-DECISION: [new] <question>?`. The
+    delivery part is "It went to <tab> (delivery <state>), which relays it", or "It was delivered to you" for an
+    orchestrator, or "Delivery held: <reason>". A clipped answer says so. A line that differs also quotes the answered
+    question. The nudge note is `[MC item <id> already answered by the owner: no new item; relay the answer]` (or
+    `…; delivery held: <reason>`).
+  - **The revise notice.** The note is `[MC item <id> revised for the owner by the server (revision <n>): do not open
+    another]`. The asker always gets it, even when the nudge goes out, because only the asker can add `[new]`. It says:
+    `… Your line replaced the question "<old decision>". If yours is a different question, end on NEEDS-DECISION: [new]
+    <question>? to open its own item.` The notice key holds the notice kind, so an earlier `opened` notice of the same
+    id does not mute it.
+  - **The owner's answer and a revision.** An answer typed against the old revision gets a 409 only when the revision
+    is incompatible (the decision, the answer type, or a removed option). A changed label or context keeps the answer
+    (ADR-0037 §4).
+  - **Known gap.** The ack comes from the orchestrator, not from the asker. So after the ack, a reworded repeat of an
+    answered question opens a new item. The AC permits this; the asker notice and SO-6 tell the asker not to do it.
+  - **Other producers do not change.** A tool's `attention.opened`, the improvement seat, and the Scrum Master's items do
+    not carry the side input. The store's prefix refusal (#521) is unchanged.
+  - **SO-6.** The seed text now says: "While you wait, repeat the same line without changes; a reworded line revises
+    your open item. A different question opens its own item only with the marker: NEEDS-DECISION: [new] <question>."
+    The seed is written only to an absent fleet file. The live SO-6 changes only by an owner amendment.
 
 ### 3. Auth waits
 - Watch kind `auth`, target `aws-sso:<profile>`, until `signed-in`, interval 60 s by default; CLI

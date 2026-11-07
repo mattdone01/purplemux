@@ -272,6 +272,54 @@ describe('stop classification (ADR-0018)', () => {
       expect([...sentTo(paste, 'tmux-worker'), ...sentTo(p2, 'tmux-worker'), ...sentTo(p3, 'tmux-worker')]).toEqual([]);
     });
 
+    it('a revised item: the nudge names it, and the asker hears what its line replaced even though the nudge went out (PM-2, D50)', async () => {
+      const ITEM = 'nd-0123456789abcdef0123456789abcdef';
+      needsDecision.open.mockResolvedValueOnce({ opened: false, reason: 'revised', itemId: ITEM, revision: 3, replaced: 'Is the export in scope?' });
+      const { manager, paste } = await managerWithPaste();
+      const line = 'NEEDS-DECISION: Does the export belong to this epic?';
+      manager.registerTab('worker', worker('claude-code', await writeLines('claude/pm2-rev.jsonl', [claudeEnd(`Reworded.\n\n${line}`)])));
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(2));
+      expect(sentTo(paste, 'tmux-root')).toEqual([
+        `[orchestrator-watchdog] worker worker (w1) ended: ${line} [MC item ${ITEM} revised for the owner by the server (revision 3): do not open another] — read with: purplemux tab result -w ws-1 worker`,
+      ]);
+      expect(sentTo(paste, 'tmux-worker')).toEqual([
+        `[needs-decision] [MC item ${ITEM} revised for the owner by the server: do not open another] Your line replaced the question "Is the export in scope?". If yours is a different question, end on NEEDS-DECISION: [new] <question>? to open its own item.`,
+      ]);
+    });
+
+    it('an answered item: nothing opens, the nudge says relay the answer, and the asker gets the answer again (PM-2, D51)', async () => {
+      const ITEM = 'nd-00112233445566778899aabbccddeeff';
+      const answeredAt = Date.UTC(2026, 10, 6, 23, 35, 23);
+      needsDecision.open.mockResolvedValueOnce({
+        opened: false, reason: 'answered', itemId: ITEM, differs: false, question: 'Keep QA bank lines fixed?',
+        answer: { answeredAt, optionIds: ['b'], optionLabels: ['keep'], text: '', delivery: { state: 'acknowledged', reason: null, tabId: 'root' } },
+      });
+      const { manager, paste } = await managerWithPaste();
+      const line = 'NEEDS-DECISION: Keep QA bank lines fixed? (a) reload (b) keep';
+      manager.registerTab('worker', worker('claude-code', await writeLines('claude/pm2-ans.jsonl', [claudeEnd(`Waiting.\n\n${line}`)])));
+      manager.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(paste).toHaveBeenCalledTimes(2));
+      expect(sentTo(paste, 'tmux-root')[0]).toContain(`${line} [MC item ${ITEM} already answered by the owner: no new item; relay the answer] — read with`);
+      expect(sentTo(paste, 'tmux-worker')).toEqual([
+        `[needs-decision] [MC item ${ITEM} answered by the owner at 2026-11-06T23:35:23.000Z: do not open another] The answer: (b) keep. It went to root (delivery acknowledged), which relays it. A different question: end on NEEDS-DECISION: [new] <question>?`,
+      ]);
+      expect(pushes()).toEqual([]);
+      // A held delivery, and a line that differs: the note and the notice say so, and quote the answered question.
+      needsDecision.open.mockResolvedValueOnce({
+        opened: false, reason: 'answered', itemId: ITEM, differs: true, question: 'Keep QA bank lines fixed?',
+        answer: { answeredAt, optionIds: [], optionLabels: [], text: 'x'.repeat(250), delivery: { state: 'held', reason: 'bound-agent-not-live', tabId: 'root' } },
+      });
+      const { manager: m2, paste: p2 } = await managerWithPaste();
+      m2.registerTab('worker', worker('claude-code', await writeLines('claude/pm2-ans2.jsonl', [claudeEnd('Waiting.\n\nNEEDS-DECISION: Freeze QA lines? (a) yes (b) no')])));
+      m2.updateTabFromHook('tmux-worker', 'stop');
+      await waitFor(() => expect(p2).toHaveBeenCalledTimes(2));
+      expect(sentTo(p2, 'tmux-root')[0]).toContain(`[MC item ${ITEM} already answered by the owner: no new item; delivery held: bound-agent-not-live]`);
+      const notice = sentTo(p2, 'tmux-worker')[0];
+      expect(notice).toContain('Your line differs from that item\'s question "Keep QA bank lines fixed?"; the owner answered that one.');
+      expect(notice).toContain(`(clipped; the whole answer is in item ${ITEM} and your orchestrator's relay). Delivery held: bound-agent-not-live.`);
+    });
+
     it('hands the opener the whole last line, not the marker line clipped at 300 chars (R2)', async () => {
       const { manager } = await managerWithPaste();
       const line = `NEEDS-DECISION: ${'which rule do we ship '.repeat(14)}? (a) base currency (b) transaction currency (c) defer`;

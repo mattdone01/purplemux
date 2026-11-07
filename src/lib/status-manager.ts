@@ -103,6 +103,7 @@ import {
   needsDecisionDeps,
   needsDecisionLineKey,
   needsDecisionAskerNotice,
+  needsDecisionDeliveryText,
   openNeedsDecisionItem,
   stableNeedsDecisionItemId,
   type TNeedsDecisionAskerNotice,
@@ -3008,6 +3009,7 @@ export class StatusManager {
    */
   private tellAsker(tabId: string, entry: ITabStatusEntry, lineKey: string, notice: TNeedsDecisionAskerNotice): void {
     if (this.isRetired(tabId)) return;
+    // The kind keeps an `answered` or `revised` notice apart from the `item` notice of the same id (story PM-2).
     const key = `${lineKey}:${notice.kind}:${'itemId' in notice ? notice.itemId : ''}`;
     if (onceADay(needsDecisionAskerNotices(), key, Date.now()) !== null) return;
     void this.tabEvents.route({
@@ -3090,10 +3092,36 @@ export class StatusManager {
         asker: itemNotice('opened', outcome.itemId),
       };
     }
+    const askerIsOrchestrator = (ws?.orchestration?.orchestratorTabId ?? null) === tabId;
     switch (outcome.reason) {
       case 'already-open':
-        return { note: ` [MC item ${outcome.itemId} already open for the owner: do not open another]`, mustReach: false, asker: itemNotice('already-open', outcome.itemId) };
+        return {
+          note: ` [MC item ${outcome.itemId} already open for the owner: do not open another]`,
+          mustReach: false,
+          asker: { lineKey, notice: { kind: 'item', state: 'already-open', itemId: outcome.itemId, ...(outcome.openIds ? { openIds: outcome.openIds } : {}) }, ifUnheard: !outcome.openIds },
+        };
       case 'asked-this-turn': return { note: ` [MC item ${outcome.itemId} opened by the tab this turn: handle it as any worker item]`, mustReach: false, asker: null };
+      // Story PM-2 (D50): the tab's open item now asks this line. Only the asker can add `[new]`, so it always hears.
+      case 'revised':
+        return {
+          note: ` [MC item ${outcome.itemId} revised for the owner by the server (revision ${outcome.revision}): do not open another]`,
+          mustReach: false,
+          asker: { lineKey, notice: { kind: 'revised', itemId: outcome.itemId, replaced: outcome.replaced }, ifUnheard: false },
+        };
+      // Story PM-2 (D51): the owner already answered; nothing opens, and the asker gets the answer again.
+      case 'answered': {
+        const delivered = outcome.answer.delivery.state === 'submitted' || outcome.answer.delivery.state === 'acknowledged';
+        const tail = delivered ? 'relay the answer' : needsDecisionDeliveryText(outcome.answer, false).replace(/^D/, 'd');
+        return {
+          note: ` [MC item ${outcome.itemId} already answered by the owner: no new item; ${tail}]`,
+          mustReach: false,
+          asker: {
+            lineKey,
+            notice: { kind: 'answered', itemId: outcome.itemId, answer: outcome.answer, differs: outcome.differs, question: outcome.question, askerIsOrchestrator },
+            ifUnheard: false,
+          },
+        };
+      }
     }
     log.warn({ tabId, ...outcome }, 'NEEDS-DECISION opened no Mission Control item');
     const orchestratorTabId = ws?.orchestration?.orchestratorTabId ?? null;
