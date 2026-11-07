@@ -782,6 +782,58 @@ describe('one item per question (story PM-2, D50 and D51)', () => {
     expect(items()[0].revision).toBe(1);
   });
 
+  // Review r2 nit (round 3): a revision-0 reservation of a stop that opened nothing must not decide the marker of the
+  // item a later stop of the same line key opens; the line key ignores [new], so the marker can toggle in between.
+  const reserveThenOpen = async (reserved: string, opening: string) => {
+    const deps = await needsDecisionDeps();
+    const reservation = await ask(reserved, {}, { ...deps, openRuns: () => [] });
+    expect(reservation).toMatchObject({ opened: false, reason: 'no-orchestrator-run' });
+    const itemId = (reservation as { itemId: string }).itemId;
+    expect(await ask(opening)).toEqual({ opened: true, itemId, runId: 'run-a' });
+    const row = (store as unknown as { database: Database.Database }).database
+      .prepare('SELECT revision, marked_new FROM mission_nd_lines WHERE item_id = ?').all(itemId);
+    return { itemId, row };
+  };
+
+  it('a reservation without [new], then an open with [new]: the item is markedNew and holds the next [new] line (round 3)', async () => {
+    const { itemId, row } = await reserveThenOpen(Q2.replace('[new] ', ''), Q2);
+    expect(row).toEqual([{ revision: 1, marked_new: 1 }]);
+    expect(tabItem(itemId)).toMatchObject({ markedNew: true });
+    expect(await ask(Q3)).toMatchObject({ opened: false, reason: 'already-open', itemId, heldNew: true });
+    expect(items()).toHaveLength(1);
+  });
+
+  it('a reservation with [new], then an open without [new]: the item is not markedNew and a [new] line opens (round 3)', async () => {
+    const { itemId, row } = await reserveThenOpen(Q2, Q2.replace('[new] ', ''));
+    expect(row).toEqual([{ revision: 1, marked_new: 0 }]);
+    expect(tabItem(itemId)).toMatchObject({ markedNew: false });
+    const third = await ask(Q3);
+    expect(third).toMatchObject({ opened: true });
+    expect(idOf(third)).not.toBe(itemId);
+    expect(items()).toHaveLength(2);
+  });
+
+  it('an orchestrator-opened [new] item stays markedNew after an unmarked revise: the next [new] line is held (round 3, consult r3)', async () => {
+    const deps = await needsDecisionDeps();
+    const handed = await ask(Q2, {}, { ...deps, openRuns: () => [] });
+    const handedId = (handed as { itemId: string }).itemId;
+    const { applyMissionEventBatch } = await import('@/lib/mission-control-events');
+    await applyMissionEventBatch('ws-a', [{
+      eventId: 'orch-open-new-r3', schemaVersion: 1, workspaceId: 'ws-a', runId: 'run-a', expectedRevision: 0, producerAt: 2, bindingGeneration: 1,
+      type: 'attention.opened', payload: {
+        itemId: handedId, ...buildNeedsDecisionQuestion({ workspaceId: 'ws-a', tabId: 'tab-w', tabName: 'w', line: Q2 }),
+        humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
+      },
+    }], { tabId: 'tab-orch', identity: 'launch' });
+    expect(await ask(Q2R.replace('[new] ', ''))).toMatchObject({ opened: false, reason: 'revised', itemId: handedId });
+    const rows = (store as unknown as { database: Database.Database }).database
+      .prepare('SELECT revision, marked_new FROM mission_nd_lines WHERE item_id = ? ORDER BY revision').all(handedId);
+    expect(rows).toEqual([{ revision: 0, marked_new: 1 }, { revision: 2, marked_new: 0 }]);
+    expect(tabItem(handedId)).toMatchObject({ markedNew: true, revision: 2 });
+    expect(await ask(Q3)).toMatchObject({ opened: false, itemId: handedId, heldNew: true });
+    expect(items()).toHaveLength(1);
+  });
+
   it('an answered question matches its text whatever its tag or letter case; an open item still revises on a tag change (finding 2, test 7)', async () => {
     const money = 'NEEDS-DECISION: [money] Release the hold? (a) yes (b) no';
     const first = idOf(await ask(money));

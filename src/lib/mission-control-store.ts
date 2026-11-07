@@ -450,7 +450,7 @@ export interface IMissionNeedsDecisionTabItem {
   keys: string[];
   /** Every text key the item took (rows written before the column have none). */
   textKeys: string[];
-  /** The opening line carried `[new]`: the revision-1 row, else a revision-0 reservation row (consult r2). */
+  /** The opening line carried `[new]`: the revision-1 row, else a revision-0 reservation row (consult r2, r3). */
   markedNew: boolean;
   /** The server's NEEDS-DECISION opener opened it for this tab (opener row with a `system:needs-decision:` event). */
   serverOpened: boolean;
@@ -701,7 +701,9 @@ export class MissionControlStore {
         decision: String(question.decision ?? ''),
         keys,
         textKeys: [...new Set(lines.flatMap((line) => (line.text_key ? [line.text_key] : [])))],
-        // An item the orchestrator opened from a handed id has no revision-1 row: its reservation says (consult r2).
+        // The opening row says: the revision-1 row, else the revision-0 rows, for an item the orchestrator opened from a
+        // handed id (consult r2). A revise row never counts: a `[new]` line never revises (consult r3). The revision-1 row
+        // replaces a revision-0 row of its key (writeNeedsDecisionLine), so a stale reservation never speaks for it.
         markedNew: (opening.length ? opening : lines.filter((line) => line.revision === 0)).some((line) => line.marked_new === 1),
         serverOpened: openedBy?.tab_id === tabId && openedBy.event_id.startsWith(NEEDS_DECISION_EVENT_PREFIX),
         answer: parsed ? {
@@ -1901,8 +1903,13 @@ export class MissionControlStore {
   ): void => {
     if (!needsDecisionLinePrefix(itemId)) invalidMissionRequest(`a NEEDS-DECISION line record needs an nd- item, not ${itemId}`);
     if (owner !== line.tabId) invalidMissionRequest(`the NEEDS-DECISION line of ${line.tabId} cannot be recorded on ${itemId}: that item is not its own`);
-    this.database.prepare(`INSERT OR IGNORE INTO mission_nd_lines (item_id,line_key,text_key,workspace_id,tab_id,revision,marked_new,at)
-      VALUES (?,?,?,?,?,?,?,?)`).run(itemId, line.lineKey, line.textKey, workspaceId, line.tabId, revision, Number(line.markedNew), now);
+    // An event row replaces a revision-0 row of the same key (a reservation or a race record), so the row the item opens
+    // with carries the event line's `marked_new` (review r2 nit). A row of an earlier event (revision 1 or later) stays.
+    this.database.prepare(`INSERT INTO mission_nd_lines (item_id,line_key,text_key,workspace_id,tab_id,revision,marked_new,at)
+      VALUES (?,?,?,?,?,?,?,?)
+      ON CONFLICT (item_id, line_key) DO UPDATE SET text_key = excluded.text_key, tab_id = excluded.tab_id,
+        revision = excluded.revision, marked_new = excluded.marked_new, at = excluded.at
+      WHERE mission_nd_lines.revision = 0`).run(itemId, line.lineKey, line.textKey, workspaceId, line.tabId, revision, Number(line.markedNew), now);
   };
 
   /** The tab an `nd-` item belongs to: the tab of its line rows, else its opener; null when neither is recorded. */
