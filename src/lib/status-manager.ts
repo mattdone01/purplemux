@@ -1,7 +1,7 @@
 import { acknowledgeOrchestrationActivity } from '@/lib/orchestration-activity';
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd } from '@/lib/layout-store';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd, findTabBySessionName } from '@/lib/layout-store';
 import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR, type IHookSpoolDrainResult } from '@/lib/hook-spool';
 import { HookFloorStore } from '@/lib/hook-floors';
 import { onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
@@ -83,6 +83,7 @@ import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtF
 import { DEFAULT_ROTATE_AT_TOKENS } from '@/lib/constraint';
 import { SERVER_PRODUCER } from '@/lib/ledger-store';
 import type { ISeatTab } from '@/types/context-lifecycle';
+import { createSeatHostIo } from '@/lib/seat-host-io';
 
 import type { IPendingDigest, ITabEvent } from '@/types/tab-events';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
@@ -437,14 +438,27 @@ export class StatusManager {
     return getProviderByPanelType(entry.panelType)?.id ?? entry.panelType ?? 'unknown';
   }
 
-  /** The tab as a seat (ADR-0036): a local agent tab created with `--handoff`. */
+  /** The tab as a seat (ADR-0036): an agent tab created with `--handoff`, local or remote (vel-D5). */
   private seatOf(tabId: string): ISeatTab | null {
     const entry = this.tabs.get(tabId);
     if (!entry?.handoffPath || !isAgentPanelType(entry.panelType)) return null;
-    return { workspaceId: entry.workspaceId, tabId, tabName: entry.tabName, handoffPath: entry.handoffPath, rotateAt: entry.rotateAt ?? null };
+    return {
+      workspaceId: entry.workspaceId, tabId, tabName: entry.tabName, handoffPath: entry.handoffPath, rotateAt: entry.rotateAt ?? null,
+      host: entry.host ?? null,
+    };
+  }
+
+  /** The host a seat runs on, from the session registry (ADR-0022), and its working directory there. */
+  private async seatPlace(seat: ISeatTab): Promise<{ host: string | null; cwd: string | null }> {
+    const session = this.tabs.get(seat.tabId)?.tmuxSession;
+    const host = session ? await sessionHostOf(session) : seat.host ?? null;
+    const tab = session ? await findTabBySessionName(session, seat.workspaceId).catch(() => null) : null;
+    const live = !host && session ? await getSessionCwd(session) : null;
+    return { host, cwd: live ?? tab?.cwd ?? null };
   }
 
   private contextLifecycleDeps(): IContextLifecycleDeps {
+    const hostIo = createSeatHostIo();
     return {
       now: () => Date.now(),
       seat: (tabId) => this.seatOf(tabId),
@@ -455,8 +469,18 @@ export class StatusManager {
       send: async (seat, text, whenReady) => (await this.tabEvents.route({
         workspaceId: seat.workspaceId, tabId: seat.tabId, kind: 'rotate', text, class: classifyWake('rotate'), whenReady,
       })).delivered,
-      // A BOM is kept, so the checker refuses it as v2's does (F6).
-      readHandoff: async (file) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await fs.readFile(file)),
+      readHandoff: async (file, seat) => hostIo.readFile((await this.seatPlace(seat)).host, file),
+      gitFacts: async (seat, expectedHead) => {
+        const { host, cwd } = await this.seatPlace(seat);
+        return hostIo.gitFacts(host, cwd, expectedHead);
+      },
+      placeCheckpoint: async (seat, checkpoint, restoreHandoff) => hostIo.placeCheckpoint((await this.seatPlace(seat)).host, checkpoint, restoreHandoff),
+      checkpoints: {
+        put: (checkpoint, at) => getLedgerStore().checkpoints.put(checkpoint, at),
+        get: (workspaceId, id) => getLedgerStore().checkpoints.get(workspaceId, id),
+        latest: (workspaceId, taskId) => getLedgerStore().checkpoints.latest(workspaceId, taskId),
+        mark: (workspaceId, id, from, to, at) => getLedgerStore().checkpoints.mark(workspaceId, id, from, to, at),
+      },
       restart: (seat) => this.restartSeat(seat),
       sessionId: (tabId) => this.tabs.get(tabId)?.agentSessionId ?? null,
       typeFirstMessage: (seat, text) => this.typeFirstMessage(seat.tabId, text),
@@ -673,6 +697,7 @@ export class StatusManager {
           reportOn: tab.reportOn ?? null,
           handoffPath: tab.handoffPath ?? null,
           rotateAt: tab.rotateAt ?? null,
+          host: tab.host ?? null,
           lastUserMessage: tab.lastUserMessage,
           lastAssistantMessage: detected.lastAssistantSnippet,
           currentAction: detected.currentAction,
@@ -1076,6 +1101,7 @@ export class StatusManager {
             reportOn: tab.reportOn ?? null,
             handoffPath: tab.handoffPath ?? null,
             rotateAt: tab.rotateAt ?? null,
+            host: tab.host ?? null,
             lastUserMessage: tab.lastUserMessage,
             lastAssistantMessage: detected.lastAssistantSnippet,
             currentAction: detected.currentAction,
@@ -1120,6 +1146,7 @@ export class StatusManager {
         existing.reportOn = tab.reportOn ?? null;
         existing.handoffPath = tab.handoffPath ?? null;
         existing.rotateAt = tab.rotateAt ?? null;
+        existing.host = tab.host ?? null;
         this.reconcileJsonlWatch(tab.id, existing);
 
         if (processChanged) {

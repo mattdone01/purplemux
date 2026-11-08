@@ -6,6 +6,7 @@ import path from 'path';
 import { brandCodedError } from '@/lib/coded-error';
 import { TabEventsTable } from '@/lib/tab-events-store';
 import { TabTurnsTable } from '@/lib/tab-turns-store';
+import { RotationCheckpointsTable } from '@/lib/rotation-checkpoint-store';
 import { foldLedgerEvent, isLanding, parseAttrs, PHASE_REPLAY_LOOKBACK_MS, silentFor } from '@/lib/ledger-fold';
 import type { ILedgerItemRow } from '@/lib/ledger-fold';
 import {
@@ -274,6 +275,8 @@ export class LedgerStore {
   readonly tabEvents: TabEventsTable;
   /** Each agent tab's finished turns and their acting tool calls (story 15, ADR-0035 §7). */
   readonly tabTurns: TabTurnsTable;
+  /** Each seat's rotation checkpoints (vel-D5): written and read back before a session is cleared. */
+  readonly checkpoints: RotationCheckpointsTable;
 
   constructor(databasePath = defaultDbPath()) {
     if (databasePath !== ':memory:') fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -289,6 +292,8 @@ export class LedgerStore {
       this.tabEvents.ensureShape();
       this.tabTurns = new TabTurnsTable(this.database);
       this.tabTurns.ensureShape();
+      this.checkpoints = new RotationCheckpointsTable(this.database);
+      this.checkpoints.ensureShape();
       this.ensureLandings();
       this.database.exec('CREATE INDEX IF NOT EXISTS events_ws_producer_received_idx ON events(workspace_id, producer, received_at)');
     } catch (error) {

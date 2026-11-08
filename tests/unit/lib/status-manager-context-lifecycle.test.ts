@@ -144,7 +144,7 @@ describe('the context lifecycle in the StatusManager (ADR-0036)', () => {
   });
 
   it('HANDOFF-READY at the stop: a passing file restarts the tab --clear and queues "Read <path>, then continue" (AC 3)', async () => {
-    const { manager, typed, seat, handoffPath, transcript, seatItem, internals } = await setup();
+    const { manager, typed, seat, handoffPath, transcript, seatItem, internals, store } = await setup();
     manager.recordContextReading('sess-kit', 320_000);
     await waitFor(() => expect(typed()).toHaveLength(1));
     await fs.writeFile(handoffPath, handoffText(new Date(Date.now() + 1_000).toISOString().replace(/\.\d{3}Z$/, 'Z')));
@@ -166,14 +166,18 @@ describe('the context lifecycle in the StatusManager (ADR-0036)', () => {
     // fresh session starts, in the order a real launch sends its events.
     (manager as unknown as { contextLifecycle: { onIdle: (id: string) => void } }).contextLifecycle.onIdle('seat');
     await new Promise((resolve) => setTimeout(resolve, 1_200));
-    expect(typed().filter((m) => m === firstLine)).toEqual([]);
+    const isFirst = (m: string) => m.startsWith(`${firstLine} RESTORE NOTICE (checkpoint seat:ws-1:kit#1)`);
+    expect(typed().filter(isFirst)).toEqual([]);
     // An urgent event for the rotating seat is held: the fresh session reads its handoff first.
     const urgent = await manager.routeTabEvent({ workspaceId: 'ws-1', tabId: 'seat', kind: 'turn-marker', class: 'urgent', text: 'worker ended: DONE: shipped' });
     expect(urgent.delivered).toBe(false);
     manager.updateTabFromHook('tmux-seat', 'session-start');
-    await waitFor(() => expect(typed().filter((m) => m === firstLine)).toHaveLength(1));
+    await waitFor(() => expect(typed().filter(isFirst)).toHaveLength(1));
     await waitFor(() => expect(seatItem()).toMatchObject({ state: 'watching' }));
-    await waitFor(() => expect(typed().indexOf('worker ended: DONE: shipped')).toBeGreaterThan(typed().indexOf(firstLine)));
+    await waitFor(() => expect(typed().indexOf('worker ended: DONE: shipped')).toBeGreaterThan(typed().findIndex(isFirst)));
+    // vel-D5: the durable row went the whole way, and its plain copy sits beside the handoff.
+    expect(store.checkpoints.latest('ws-1', 'seat:ws-1:kit')).toMatchObject({ status: 'delivered', checkpoint: { attempt: 1, intendedNextAction: '/v2-lane kit' } });
+    expect(JSON.parse(await fs.readFile(`${handoffPath}.checkpoint.json`, 'utf-8'))).toMatchObject({ id: 'seat:ws-1:kit#1' });
   });
 
   it('the server keeps a BOM in the handoff file and refuses it, as v2 does (F6)', async () => {
