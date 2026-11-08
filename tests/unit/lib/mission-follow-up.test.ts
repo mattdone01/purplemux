@@ -424,8 +424,7 @@ describe('cycles cannot form (property)', () => {
   // and a full snapshot for each read; under full-suite load it went past the 5 s default timeout. The same 40 seeded
   // sequences now run on an in-memory store (the property is about the link rows, not durability) and read one served
   // item, not the whole snapshot. For each seed, both forms leave the same items, links and events. About 270 ms
-  // alone. The explicit 20 s timeout is for a shared host under load; a hang still fails.
-  const PROPERTY_TIMEOUT_MS = 20_000;
+  // alone, at most 773 ms beside a full-suite run: the default 5 s timeout holds.
 
   it('random sequences of opens, follow-ups, answers, resolves and cancels leave chains only', () => {
     for (let run = 0; run < 40; run += 1) {
@@ -479,7 +478,7 @@ describe('cycles cannot form (property)', () => {
       for (const link of links) expect(ids.indexOf(link.item_id)).toBeGreaterThan(ids.indexOf(link.follows_up_item_id));
       store.close();
     }
-  }, PROPERTY_TIMEOUT_MS);
+  });
 });
 
 describe('rollback (ADR-0037 amendment D2, test 5)', () => {

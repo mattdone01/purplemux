@@ -789,7 +789,10 @@ describe('one item per question (story PM-2, D50 and D51)', () => {
         humanReview: { humanNeed: 'decision', humanReason: 'r', handling: 'h', reviewerTabId: 'tab-orch' },
       },
     }], { tabId: 'tab-orch', identity: 'launch' });
-    expect(tabItem(handedId)).toMatchObject({ markedNew: true, serverOpened: false });
+    expect(tabItem(handedId)).toMatchObject({ markedNew: true });
+    // The orchestrator's own open, not the server's: it is the orchestrator's ask, never tab-w's.
+    expect(store.itemsAskedByTab('ws-a', 'tab-orch', 0)).toEqual([handedId]);
+    expect(store.itemsAskedByTab('ws-a', 'tab-w', 0)).toEqual([]);
     expect(await ask(Q2R)).toMatchObject({ opened: false, reason: 'already-open', itemId: handedId, heldNew: true });
     expect(items()).toHaveLength(1);
     expect(items()[0].revision).toBe(1);
