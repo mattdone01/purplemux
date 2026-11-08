@@ -65,6 +65,13 @@ const detail = (raw: string): string => {
 
 const fail = (check: string, measured: string, expected: string): ICheckFailure => ({ check, measured, expected });
 
+/**
+ * A name inside a resolved directory. Not `path.join`: Next routes import this module, and
+ * Turbopack cannot scope a path joined from an argument, so it would trace the whole project into
+ * `.next/standalone` (the 46101d53 failure, refused by scripts/post-build.js).
+ */
+const inside = (dir: string, name: string): string => (dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`);
+
 const within = (real: string, roots: readonly string[]): boolean =>
   roots.some((root) => real === root || real.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`));
 
@@ -184,12 +191,12 @@ export const reviewFolderValidator: IEventValidator = {
     const dir = evidence.reviewDir!;
     const missing: string[] = [];
     for (const name of REVIEW_FOLDER_FILES) {
-      if ((await ctx.reader.kind(path.join(dir, name))) !== 'file') missing.push(name);
+      if ((await ctx.reader.kind(inside(dir, name))) !== 'file') missing.push(name);
     }
     if (missing.length) {
       return [fail('review-folder', `${dir} lacks ${missing.join(', ')}`, `${dir} holds ${REVIEW_FOLDER_FILES.join(', ')}`)];
     }
-    const idFile = await ctx.reader.realpath(path.join(dir, 'patch-id.txt'));
+    const idFile = await ctx.reader.realpath(inside(dir, 'patch-id.txt'));
     if (idFile === null || !within(idFile, ctx.roots)) {
       return [fail('review-folder', `${dir}/patch-id.txt resolves outside the evidence roots`, `a path under ${ctx.roots.join(', ')}`)];
     }

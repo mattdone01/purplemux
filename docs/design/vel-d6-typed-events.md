@@ -148,7 +148,7 @@ evidence, and they keep the coordinator path.
 
 Each row: the change made to the code, and the first test that failed. Each change was applied
 alone, its test file was run, and the change was reverted (`mutate.py`, kept outside the
-repository). Result: 38 of 38 mutations killed; no mutation survived.
+repository). Result: 39 of 39 mutations killed; no mutation survived.
 
 | # | Mutation | Failing test |
 |---|---|---|
@@ -190,3 +190,4 @@ repository). Result: 38 of 38 mutations killed; no mutation survived.
 | M36 | http: details dropped | `worker-events-route.test.ts`: answers event-invalid with 400 |
 | M37 | cli: event-no-recipient exits 3 | `cli-event.test.ts`: maps event-no-recipient (HTTP 503) to exit 5 |
 | M38 | cli: dependsOn not split | `cli-event.test.ts`: sets a scope with split dependencies and a numeric attempt |
+| M39 | validators: `path.join(dir, name)` back in the review-folder check (it made the first build trace the whole project) | `worker-events-trace-boundary.test.ts`: src/lib/worker-event-validators.ts builds no path with path.join or path.resolve |
