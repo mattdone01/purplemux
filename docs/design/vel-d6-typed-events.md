@@ -172,7 +172,10 @@ coordinator path.
 
 Each row: the change made to the code, and the first test that failed. Each change was applied
 alone, its test file was run, and the change was reverted (`mutate.py`, kept outside the
-repository). Result: 39 of 39 mutations killed; no mutation survived.
+repository). The whole set was run again after review round 1, on the round-1 tree. Result:
+64 of 64 mutations killed. In the first run after round 1, `R1-1b` (a missing verdict
+accepted) survived: its test gave no `SETTLED=yes` line, so the run failed on `SETTLED` alone.
+A case with `SETTLED=yes` and no `VERDICT=` was added, and `R1-1b` is now killed.
 
 | # | Mutation | Failing test |
 |---|---|---|
@@ -184,7 +187,7 @@ repository). Result: 39 of 39 mutations killed; no mutation survived.
 | M6 | evidence-paths: entry kind unchecked | `worker-event-validators.test.ts`: refuses a missing path, a FIFO-like entry and a file where a directory belongs |
 | M7 | range: branch tip unchecked | `worker-event-validators.test.ts`: refuses a stale head (the branch moved on) |
 | M8 | range: ancestry unchecked | `worker-event-validators.test.ts`: refuses an absent branch, a base that is no commit, and a base off the branch |
-| M9 | gate-tree: whole log read, not the last run | `worker-event-validators.test.ts`: refuses a log whose last run has no GIT_TREE_END, although an earlier run had the right one |
+| M9 | gate log: whole log read, not the last run | `worker-event-validators.test.ts`: refuses a log whose last run has no GIT_TREE_END, although an earlier run had the right one |
 | M10 | gate-tree: tree not compared | `worker-event-validators.test.ts`: refuses another tree, naming both |
 | M11 | patch-id: exit code ignored | `worker-event-validators.test.ts`: refuses a failed command with its first words of stderr, control characters removed |
 | M12 | patch-id: printed key not compared | `worker-event-validators.test.ts`: refuses another key, naming the command and what it printed |
@@ -193,7 +196,7 @@ repository). Result: 39 of 39 mutations killed; no mutation survived.
 | M15 | receipt: name unchecked | `worker-event-validators.test.ts`: refuses a receipt under another name |
 | M16 | receipt: BLOCK only on the first line, case-sensitive | `worker-event-validators.test.ts`: refuses <key>.md holding "# r\n  Verdict:   block — gate missing\n" |
 | M17 | runner: a throwing validator passes | `worker-event-validators.test.ts`: counts a validator that throws as a failure of that check, never a pass |
-| M18 | runner: stop after the first failure | `worker-event-validators.test.ts`: runs every check and lists every failure in one refusal |
+| M18 | runner: stop after the first failure | `worker-event-validators.test.ts`: refuses a head with no tree and an over-size log |
 | M19 | reader: caller environment passed to the command | `worker-event-validators.test.ts`: runs the command without a shell or the server token, in the repo |
 | M20 | scope: any verified tab declares | `worker-events-service.test.ts`: is the verified designated live coordinator only |
 | M21 | scope: epic of another workspace accepted | `worker-events-service.test.ts`: serves only an epic held by a live tab of the same workspace, for a live tab of that workspace |
@@ -214,4 +217,29 @@ repository). Result: 39 of 39 mutations killed; no mutation survived.
 | M36 | http: details dropped | `worker-events-route.test.ts`: answers event-invalid with 400 |
 | M37 | cli: event-no-recipient exits 3 | `cli-event.test.ts`: maps event-no-recipient (HTTP 503) to exit 5 |
 | M38 | cli: dependsOn not split | `cli-event.test.ts`: sets a scope with split dependencies and a numeric attempt |
-| M39 | validators: `path.join(dir, name)` back in the review-folder check (it made the first build trace the whole project) | `worker-events-trace-boundary.test.ts`: src/lib/worker-event-validators.ts builds no path with path.join or path.resolve |
+| M39 | validators: path.join(dir, name) back in the review-folder check | `worker-events-trace-boundary.test.ts`: src/lib/worker-event-validators.ts builds no path with path.join or path.resolve |
+| R1-1a | gate-verdict: any verdict accepted | `worker-event-validators.test.ts`: refuses a RED run whose tree is the head's tree |
+| R1-1b | gate-verdict: a missing verdict accepted | `worker-event-validators.test.ts`: refuses a run with no verdict, and a run with no SETTLED=yes |
+| R1-1c | gate-verdict: verdict read across runs (a RED run after a VALID run passes) | `worker-event-validators.test.ts`: refuses a log whose last run has no GIT_TREE_END, although an earlier run had the right one |
+| R1-1d | gate-verdict: first VERDICT= of the run, not the last | `worker-event-validators.test.ts`: reads the last run as gate-commit-check.sh does |
+| R1-1e | gate-verdict: SETTLED=yes not required | `worker-event-validators.test.ts`: refuses a run with no verdict, and a run with no SETTLED=yes |
+| R1-1f | gate-verdict: AFFECTED-VALID accepted | `worker-event-validators.test.ts`: refuses a subset run (AFFECTED-VALID) and a look-alike, and takes VALID with a note |
+| R1-1g | gate-verdict: not run for landed | `worker-event-validators.test.ts`: passes every check of review-ready, landed and blocked-on |
+| R1-2a | schema: receipt required on review-ready again | `worker-event-schema.test.ts`: takes review-ready without a receipt: the first hand-off for review has none yet (ruling R1-2) |
+| R1-2b | schema: gate log not required on landed | `worker-event-schema.test.ts`: accepts each type with exactly its fields and normalises paths |
+| R1-2c | receipt: checked when absent | `worker-events-service.test.ts`: delivers a first hand-off for review that names no receipt (R1-2) |
+| R1-2d | evidence-paths: a given receipt not resolved | `worker-event-validators.test.ts`: passes every check of review-ready, landed and blocked-on |
+| R1-3a | patch-id: unset variable falls back to the repo script | `worker-event-validators.test.ts`: has no command for PMUX_EVENT_PATCH_ID_CMD=undefined (ruling R1-3) |
+| R1-3b | patch-id: a relative program accepted | `worker-event-validators.test.ts`: has no command for PMUX_EVENT_PATCH_ID_CMD="[\"tools/patch-id.sh\", \"{base}\", \"{head}\"]" (ruling R1-3) |
+| R1-3c | patch-id: a program inside the sender repo executed | `worker-event-validators.test.ts`: never executes a program under the sender's repo, even when the server names one |
+| R1-3d | service: an unavailable check reported as event-refused | `worker-events-service.test.ts`: refuses as event-check-unavailable, naming the variable, when no patch-id command is configured (R1-3) |
+| R1-3e | cli: event-check-unavailable exits 1 | `cli-event.test.ts`: maps event-check-unavailable (HTTP 409) to exit 3 |
+| R1-4a | send: a remote tab accepted | `worker-events-service.test.ts`: refuses a remote tab, and a tab whose host is unknown, before reading any evidence (R1-4) |
+| R1-4b | send: a tab of unknown host accepted | `worker-events-service.test.ts`: refuses a remote tab, and a tab whose host is unknown, before reading any evidence (R1-4) |
+| R1-5a | notes: scope not re-read inside the lock | `worker-events-service.test.ts`: refuses a result whose scope was re-dispatched, cleared or narrowed while the evidence was checked (R1-5) |
+| R1-5b | recheck: attempt not compared | `worker-events-service.test.ts`: refuses a result whose scope was re-dispatched, cleared or narrowed while the evidence was checked (R1-5) |
+| R1-5c | recheck: narrowed scope not compared | `worker-events-service.test.ts`: refuses a result whose scope was re-dispatched, cleared or narrowed while the evidence was checked (R1-5) |
+| R1-6a | notes: an expired note still blocks a resend | `worker-events-service.test.ts`: lets an event be sent again once its note expired unacked, and says when it is still open or acked (R1-6) |
+| R1-6b | notes: the delivery line left behind when the status note fails | `worker-events-service.test.ts`: withdraws the delivery's queued line when the status note fails, and stores nothing (R1-6) |
+| R1-7a | reader: symlinks followed on open | `worker-event-validators.test.ts`: opens with O_NOFOLLOW and O_NONBLOCK: a symlink fails, and a FIFO is refused without blocking (ruling R1-7) |
+| R1-7b | reader: open blocks on a FIFO | `worker-event-validators.test.ts`: opens with O_NOFOLLOW and O_NONBLOCK: a symlink fails, and a FIFO is refused without blocking (ruling R1-7) |

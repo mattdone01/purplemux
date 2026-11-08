@@ -160,6 +160,8 @@ describe('gate-verdict: the last run is VALID and SETTLED (ruling R1-1)', () => 
   it('refuses a run with no verdict, and a run with no SETTLED=yes', async () => {
     gate(`START=1\nGIT_TREE_END=${TREE}\n`);
     expect((await checksOf()).failures).toEqual([verdictFailure('<none>', '<none>')]);
+    gate(`START=1\nGIT_TREE_END=${TREE}\nSETTLED=yes\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('<none>', 'yes')]);
     gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALID\nSETTLED=no\n`);
     expect((await checksOf()).failures).toEqual([verdictFailure('VALID', 'no')]);
   });
