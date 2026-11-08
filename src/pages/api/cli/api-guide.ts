@@ -763,13 +763,21 @@ POST /api/cli/worker-events
   workspace's directories or PMUX_EVENT_EVIDENCE_ROOTS), "branch", "head", "base" (full object
   ids), "attempt" (the scope's attempt). review-ready (the hand-off for review) adds "key",
   "gateLog", "reviewDir", and "receipt"? (absent on a first hand-off; checked when given); landed
-  adds "key", "gateLog"; blocked-on adds "reason", "clearInput" (≤ 500 characters). Unknown fields
-  are refused. Checks: evidence-paths (each path resolves under the roots, of the right kind);
-  range (refs/heads/<branch> is head; base is its ancestor); review-ready and landed also
+  adds "key", "gateLog", and "target"? (the branch it landed in, default main); blocked-on adds
+  "reason", "clearInput" (≤ 500 characters). Unknown fields are refused. Checks: evidence-paths
+  (each path resolves under the roots, of the right kind); range (refs/heads/<branch> is head, and
+  base is its ancestor; for landed, once the branch is gone or has moved on, head may instead be an
+  ancestor of refs/heads/<target> or refs/remotes/origin/<target>); review-ready and landed also
   gate-verdict (the last run says VERDICT=VALID and SETTLED=yes), gate-tree (the last run's
   GIT_TREE_END= is the tree of head), patch-id (the server's PMUX_EVENT_PATCH_ID_CMD, a JSON array
   whose first item is an absolute path outside the sender's repo, prints key; unset, the event is
-  event-check-unavailable); review-ready also review-folder (range.txt, diff.patch, status.txt,
+  event-check-unavailable). The command and the server's own git reads run in the sender's repo
+  with GIT_CONFIG_COUNT overrides that outrank its .git/config (core.fsmonitor, core.hooksPath,
+  diff.external, core.pager, core.editor, core.sshCommand, core.askPass, credential.helper,
+  core.alternateRefsCommand, gpg.program). Attribute drivers cannot be pinned that way, so the
+  script must use plumbing (git diff-tree, git patch-id) with --no-ext-diff --no-textconv, never
+  porcelain that a repo's diff or filter drivers can redirect. review-ready also review-folder
+  (range.txt, diff.patch, status.txt,
   patch-id.txt naming key, record.md) and receipt (named <key>.md; no verdict: BLOCK). The scope
   is read again inside the notes lock after the checks.
   Response: { "event": { "type", "toEpic", "state": "delivered", "checks", "noteId",

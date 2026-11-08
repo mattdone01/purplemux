@@ -60,7 +60,7 @@ export class FakeEvidence {
         return size > maxBytes ? { tooLarge: size } : { text };
       },
       revParse: async (_repo, rev) => {
-        if (rev.startsWith('refs/heads/')) return this.refs.get(rev) ?? null;
+        if (rev.startsWith('refs/')) return this.refs.get(rev) ?? null;
         const commit = /^([0-9a-f]+)\^\{commit\}$/.exec(rev);
         if (commit) return this.commits.has(commit[1]) ? commit[1] : null;
         const tree = /^([0-9a-f]+)\^\{tree\}$/.exec(rev);

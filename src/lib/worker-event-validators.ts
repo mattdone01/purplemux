@@ -121,7 +121,27 @@ export const resolveEvidence = async (
   return failures.length ? { evidence: null, failures } : { evidence: evidence as IResolvedEvidence, failures };
 };
 
-/** Every type: `head` is the tip of `branch` now, and `base` is an ancestor of `head` (a stale event is refused). */
+const landedTarget = (payload: ILandedPayload): string => payload.target ?? 'main';
+
+/**
+ * A landed head stays valid after its branch is gone: origin deletes a branch when its PR merges,
+ * and a branch may move on after the landing (review r2 N2). It must then be in the branch it landed
+ * in (`target`, default `main`), locally or as origin's copy.
+ */
+const landedInTarget = async (payload: ILandedPayload, evidence: IResolvedEvidence, ctx: IValidationContext): Promise<boolean> => {
+  const target = landedTarget(payload);
+  for (const ref of [`refs/heads/${target}`, `refs/remotes/origin/${target}`]) {
+    const tip = await ctx.reader.revParse(evidence.repo, ref);
+    if (tip !== null && await ctx.reader.isAncestor(evidence.repo, payload.head, tip)) return true;
+  }
+  return false;
+};
+
+/**
+ * Every type: `head` is the tip of `branch` now, and `base` is an ancestor of `head` (a stale event
+ * is refused). review-ready and blocked-on keep the exact-tip rule; landed may name a head that is
+ * in its target branch instead.
+ */
 export const rangeValidator: IEventValidator = {
   id: 'range',
   types: ['review-ready', 'landed', 'blocked-on'],
@@ -129,11 +149,18 @@ export const rangeValidator: IEventValidator = {
     const { branch, head, base } = event.payload;
     const failures: ICheckFailure[] = [];
     const tip = await ctx.reader.revParse(evidence.repo, `refs/heads/${branch}`);
-    if (tip !== head) failures.push(fail('range', `refs/heads/${branch}=${tip ?? '<absent>'}`, `head ${head} (the branch's current tip)`));
+    let current = tip === head;
+    if (!current && event.type === 'landed') current = await landedInTarget(event.payload, evidence, ctx);
+    if (!current) {
+      failures.push(event.type === 'landed'
+        ? fail('range', `refs/heads/${branch}=${tip ?? '<absent>'}, and head ${head} is in neither refs/heads/${landedTarget(event.payload)} nor refs/remotes/origin/${landedTarget(event.payload)}`,
+          `head ${head} is the tip of ${branch}, or an ancestor of ${landedTarget(event.payload)} (the branch it landed in)`)
+        : fail('range', `refs/heads/${branch}=${tip ?? '<absent>'}`, `head ${head} (the branch's current tip)`));
+    }
     const baseCommit = await ctx.reader.revParse(evidence.repo, `${base}^{commit}`);
     if (baseCommit === null) {
       failures.push(fail('range', `base ${base} is not a commit in ${evidence.repo}`, 'base names a commit'));
-    } else if (tip === head && !(await ctx.reader.isAncestor(evidence.repo, base, head))) {
+    } else if (current && !(await ctx.reader.isAncestor(evidence.repo, base, head))) {
       failures.push(fail('range', `base ${base} is not an ancestor of head ${head}`, 'base..head is a range of the branch'));
     }
     return failures;
@@ -321,9 +348,36 @@ export const validateWorkerEvent = async (
 const COMMAND_TIMEOUT_MS = 60_000;
 const COMMAND_OUTPUT_MAX = 1024 * 1024;
 
-/** No token, no caller environment: the command sees PATH, HOME, NODE_ENV and a locale only. */
-const commandEnv = (): NodeJS.ProcessEnv => ({
+/**
+ * Git config keys that make git run a program, pinned for every command the server runs in the
+ * sender's repo: its own reads and the configured patch-id command (review r2 N1). The
+ * `GIT_CONFIG_COUNT` environment config outranks the repo's `.git/config`, so a worker-set
+ * `diff.external` or `core.fsmonitor` never runs. Attribute drivers (`diff.<driver>.textconv`,
+ * `filter.<driver>.*`) cannot be pinned by name: the patch-id script must use plumbing with
+ * `--no-ext-diff --no-textconv` (the API guide says so).
+ */
+export const GIT_CONFIG_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
+  ['core.fsmonitor', 'false'],
+  ['core.hooksPath', '/dev/null'],
+  ['diff.external', ''],
+  ['core.pager', 'cat'],
+  ['core.editor', 'false'],
+  ['core.sshCommand', 'false'],
+  ['core.askPass', ''],
+  ['credential.helper', ''],
+  ['core.alternateRefsCommand', ''],
+  ['gpg.program', 'false'],
+];
+
+const gitConfigEnv = (): Record<string, string> => Object.fromEntries([
+  ['GIT_CONFIG_COUNT', String(GIT_CONFIG_OVERRIDES.length)],
+  ...GIT_CONFIG_OVERRIDES.flatMap(([key, value], i) => [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]]),
+]);
+
+/** No token, no caller environment: PATH, HOME, NODE_ENV, a locale and the git config overrides only. */
+export const commandEnv = (): NodeJS.ProcessEnv => ({
   NODE_ENV: process.env.NODE_ENV, PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '/', LANG: 'C.UTF-8',
+  GIT_TERMINAL_PROMPT: '0', ...gitConfigEnv(),
 });
 
 const runCommand = (argv: string[], cwd: string): Promise<ICommandResult> =>
@@ -338,9 +392,6 @@ const runCommand = (argv: string[], cwd: string): Promise<ICommandResult> =>
         resolve({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') || (err && code === null ? err.message : '') });
       });
   });
-
-/** No program the sender's repo configures runs from these reads (an fsmonitor hook, or any hook). */
-const GIT_SAFE = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
 
 export const fsEvidenceReader: IEvidenceReader = {
   realpath: (p) => fs.realpath(p).catch(() => null),
@@ -365,12 +416,12 @@ export const fsEvidenceReader: IEvidenceReader = {
     }
   },
   revParse: async (repo, rev) => {
-    const result = await runCommand(['git', ...GIT_SAFE, '-C', repo, 'rev-parse', '--verify', '--quiet', rev], repo);
+    const result = await runCommand(['git', '-C', repo, 'rev-parse', '--verify', '--quiet', rev], repo);
     const id = result.stdout.trim();
     return result.code === 0 && id ? id : null;
   },
   isAncestor: async (repo, ancestor, descendant) =>
-    (await runCommand(['git', ...GIT_SAFE, '-C', repo, 'merge-base', '--is-ancestor', ancestor, descendant], repo)).code === 0,
+    (await runCommand(['git', '-C', repo, 'merge-base', '--is-ancestor', ancestor, descendant], repo)).code === 0,
   run: runCommand,
 };
 

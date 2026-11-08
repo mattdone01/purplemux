@@ -22,14 +22,18 @@ terminal control.
 2. **Schema.** `event send --type T --to-epic SLUG --json PAYLOAD` (`POST /api/cli/worker-events`). Every type
    carries `repo`, `branch`, `head`, `base` (full object ids) and `attempt`. `review-ready` is the hand-off FOR
    review: it adds `key`, `gateLog`, `reviewDir`, and an optional `receipt` (absent on a first hand-off; when given
-   it must exist and is checked). `landed` adds `key` and `gateLog`. `blocked-on` adds `reason`, `clearInput`
+   it must exist and is checked). `landed` adds `key`, `gateLog` and an optional `target` (the branch it landed
+   in, default `main`). `blocked-on` adds `reason`, `clearInput`
    (≤ 500 characters, cleaned). An unknown field, a missing required field or a wrong form is `event-invalid`,
    which names every defect.
 3. **Validation** (`src/lib/worker-event-validators.ts`). Each check is an `IEventValidator` over an injected
    `IEvidenceReader`. First, `evidence-paths`: each path resolves (symlinks followed) under the sender workspace's
    `directories` or `PMUX_EVENT_EVIDENCE_ROOTS`, and is of the right kind; nothing outside is read. Files are opened
    with `O_NOFOLLOW | O_NONBLOCK` on the resolved path and checked with `fstat`. Then all of:
-   - `range` (every type): `refs/heads/<branch>` is `head`; `base` is an ancestor of `head`.
+   - `range` (every type): `refs/heads/<branch>` is `head`; `base` is an ancestor of `head`. For `landed` only,
+     when the branch is gone (origin deletes a branch when its PR merges) or has moved on, `head` may instead be an
+     ancestor of `refs/heads/<target>` or `refs/remotes/origin/<target>`. `review-ready` and `blocked-on` keep the
+     exact-tip rule.
    - `gate-verdict` (review-ready, landed): the gate log's last run (from the last `START=`) says `VERDICT=VALID`
      (or `VALID (…)`) and `SETTLED=yes`, taking the last such lines, as `gate-commit-check.sh` does. A RED,
      unsettled or `AFFECTED-VALID` run is refused.
@@ -43,8 +47,13 @@ terminal control.
    - `receipt` (review-ready, only when given): named `<key>.md`; no `verdict: BLOCK` line, which belongs at
      `<key>.block.md`.
 
-   The server's own git reads pass `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. A failure is
-   `event-refused` with each check's `measured` and `expected`.
+   Every command the server runs in the sender's repo (its own git reads and the patch-id command) gets
+   `GIT_CONFIG_COUNT` overrides, which outrank the repo's `.git/config`, for the keys that run a program:
+   `core.fsmonitor`, `core.hooksPath`, `diff.external`, `core.pager`, `core.editor`, `core.sshCommand`,
+   `core.askPass`, `credential.helper`, `core.alternateRefsCommand`, `gpg.program`. Attribute drivers
+   (`diff.<driver>.textconv`, `filter.<driver>.*`) cannot be pinned by name, so the patch-id script must use
+   plumbing (`git diff-tree`, `git patch-id`) with `--no-ext-diff --no-textconv`. A failure is `event-refused`
+   with each check's `measured` and `expected`.
 4. **Fencing.** The payload's `attempt` must equal the scope's attempt, else `event-stale`. After the checks, the
    scope is read again inside the notes lock: a re-dispatch, a cleared scope or a changed epic during validation is
    `event-stale`, and a target that left the scope is `event-out-of-scope`. The same event (type, target,

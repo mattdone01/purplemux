@@ -6,6 +6,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseWorkerEvent } from '@/lib/worker-event-schema';
 import {
   EVIDENCE_TEXT_MAX_BYTES,
+  GIT_CONFIG_OVERRIDES,
   GATE_LOG_MAX_BYTES,
   fsEvidenceReader,
   lastGateRun,
@@ -106,6 +107,55 @@ describe('range: head is the branch tip, base its ancestor', () => {
     ctx = { ...ctx, reader: f.reader() };
     f.ancestors.clear();
     expect((await checksOf()).failures).toContainEqual({ check: 'range', measured: `base ${BASE} is not an ancestor of head ${HEAD}`, expected: 'base..head is a range of the branch' });
+  });
+});
+
+describe('range for landed: a head in its target branch once the story branch is gone (review r2 N2)', () => {
+  const MAIN_TIP = '7'.repeat(40);
+  const landed = (change: Record<string, unknown> = {}) => validateWorkerEvent(parseWorkerEvent('landed', { ...landedPayload, ...change }), ctx);
+  const rangeFailures = async (change: Record<string, unknown> = {}) => (await landed(change)).failures.filter((x) => x.check === 'range');
+
+  beforeEach(() => {
+    f.refs.delete('refs/heads/story/x-1');
+    f.refs.set('refs/heads/main', MAIN_TIP);
+    f.ancestors.add(`${HEAD}..${MAIN_TIP}`);
+  });
+
+  it('passes a deleted branch whose head is in main', async () => {
+    await expect(landed()).resolves.toMatchObject({ failures: [] });
+  });
+
+  it('passes a branch that moved on, and a head that only origin\'s main holds', async () => {
+    f.refs.set('refs/heads/story/x-1', 'e'.repeat(40));
+    expect(await rangeFailures()).toEqual([]);
+    f.refs.delete('refs/heads/main');
+    f.refs.set('refs/remotes/origin/main', MAIN_TIP);
+    expect(await rangeFailures()).toEqual([]);
+  });
+
+  it('checks the named integration branch in place of main', async () => {
+    f.refs.set('refs/heads/feature/epic-x', MAIN_TIP);
+    f.refs.delete('refs/heads/main');
+    expect(await rangeFailures({ target: 'feature/epic-x' })).toEqual([]);
+    expect((await rangeFailures())[0].measured).toContain('is in neither refs/heads/main nor refs/remotes/origin/main');
+  });
+
+  it('refuses a head in neither its branch nor its target, naming both', async () => {
+    f.ancestors.delete(`${HEAD}..${MAIN_TIP}`);
+    expect(await rangeFailures()).toEqual([{
+      check: 'range',
+      measured: `refs/heads/story/x-1=<absent>, and head ${HEAD} is in neither refs/heads/main nor refs/remotes/origin/main`,
+      expected: `head ${HEAD} is the tip of story/x-1, or an ancestor of main (the branch it landed in)`,
+    }]);
+  });
+
+  it('still checks that base is an ancestor of a head found in main', async () => {
+    f.ancestors.delete(`${BASE}..${HEAD}`);
+    expect(await rangeFailures()).toEqual([expect.objectContaining({ measured: `base ${BASE} is not an ancestor of head ${HEAD}` })]);
+  });
+
+  it('keeps the exact-tip rule for review-ready', async () => {
+    expect((await checksOf()).failures).toContainEqual({ check: 'range', measured: 'refs/heads/story/x-1=<absent>', expected: `head ${HEAD} (the branch's current tip)` });
   });
 });
 
@@ -363,6 +413,25 @@ describe('the server reader against a real git repository', () => {
     await expect(fsEvidenceReader.revParse(real, 'refs/heads/absent')).resolves.toBeNull();
     await expect(fsEvidenceReader.isAncestor(real, base, head)).resolves.toBe(true);
     await expect(fsEvidenceReader.isAncestor(real, head, base)).resolves.toBe(false);
+  });
+
+  it('pins the git keys that run a program, above the repo\'s own config, for every command it runs (review r2 N1)', async () => {
+    const real = fs.realpathSync(dir);
+    git('config', 'diff.external', '/w/evil-diff');
+    git('config', 'core.fsmonitor', '/w/evil-monitor');
+    git('config', 'core.hooksPath', '/w/evil-hooks');
+    const env = await fsEvidenceReader.run(['/usr/bin/env'], real);
+    const lines = env.stdout.split('\n');
+    expect(lines).toContain(`GIT_CONFIG_COUNT=${GIT_CONFIG_OVERRIDES.length}`);
+    GIT_CONFIG_OVERRIDES.forEach(([key, value], i) => {
+      expect(lines).toContain(`GIT_CONFIG_KEY_${i}=${key}`);
+      expect(lines).toContain(`GIT_CONFIG_VALUE_${i}=${value}`);
+    });
+    expect(GIT_CONFIG_OVERRIDES.map(([key]) => key)).toEqual(expect.arrayContaining(['core.fsmonitor', 'core.hooksPath', 'diff.external']));
+    const seen = async (key: string) => (await fsEvidenceReader.run(['git', 'config', '--get', key], real)).stdout.trim();
+    await expect(seen('diff.external')).resolves.toBe('');
+    await expect(seen('core.fsmonitor')).resolves.toBe('false');
+    await expect(seen('core.hooksPath')).resolves.toBe('/dev/null');
   });
 
   it('runs the command without a shell or the server token, in the repo', async () => {

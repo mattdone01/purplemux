@@ -24,6 +24,8 @@ export interface IReviewReadyPayload extends IWorkerEventRange {
 export interface ILandedPayload extends IWorkerEventRange {
   key: string;
   gateLog: string;
+  /** The branch the range landed in (default `main`): a head in it stays valid once `branch` is gone. */
+  target?: string;
 }
 
 export interface IBlockedOnPayload extends IWorkerEventRange {

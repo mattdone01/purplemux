@@ -61,6 +61,13 @@ describe('typed worker event schema (ADR-0043 §2)', () => {
     expect(refusal(() => parseWorkerEvent('review-ready', { ...firstHandOff, receipt: 'r.md' })).message).toContain('receipt: expected an absolute path');
   });
 
+  it('takes an optional target branch on landed, in the branch grammar (review r2 N2)', () => {
+    expect(parseWorkerEvent('landed', { ...range, key: KEY, gateLog: '/w/gate.log', target: 'feature/epic-x' }).payload).toMatchObject({ target: 'feature/epic-x' });
+    expect(requiredFields('landed')).not.toContain('target');
+    expect(refusal(() => parseWorkerEvent('landed', { ...range, key: KEY, gateLog: '/w/gate.log', target: '-x' })).message).toContain('target: expected a branch name');
+    expect(refusal(() => parseWorkerEvent('review-ready', { ...reviewReady, target: 'main' })).message).toContain('target: not a review-ready field');
+  });
+
   it('keeps the gate log and the key mandatory on landed', () => {
     expect(requiredFields('landed')).toEqual(expect.arrayContaining(['key', 'gateLog']));
     const err = refusal(() => parseWorkerEvent('landed', range));

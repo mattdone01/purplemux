@@ -111,7 +111,10 @@ The scope declaration also had alternatives:
    absolute path that does not resolve inside the payload's repo; unset, the event is
    `event-check-unavailable`. It runs with `execFile` (no shell), `cwd` = the confined repo, a
    minimal environment (`PATH`, `HOME`, `LANG`; no `PMUX_TOKEN`), a 60 s timeout and a 1 MiB
-   output cap. The server's git reads pass `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. `head`, `base` and `key` must match
+   output cap. Every command run in the sender's repo gets `GIT_CONFIG_COUNT` overrides for the
+   git keys that run a program (`core.fsmonitor`, `core.hooksPath`, `diff.external` and seven
+   more), which outrank the repo's `.git/config` (review r2 N1). Attribute drivers cannot be
+   pinned by name, so the patch-id script must use plumbing with `--no-ext-diff --no-textconv`. `head`, `base` and `key` must match
    `^[0-9a-f]{40}$|^[0-9a-f]{64}$` before they reach an argument list, so `--upload-pack=…` or
    `HEAD~1` never reaches git. `branch` must match a ref grammar with no `..`, no leading `-`.
 3. **A stale or replayed result.** (a) A gate log with two runs, the first one green for the head
@@ -119,6 +122,9 @@ The scope declaration also had alternatives:
    and `SETTLED=`, as `gate-commit-check.sh` reads it), and it must say `VERDICT=VALID` and
    `SETTLED=yes`; a RED run whose tree matches is refused (review R1-1). (b) A head that is no longer the branch tip: `range` refuses
    it (`refs/heads/<branch>` must resolve to `head`, and `base` must be an ancestor of `head`).
+   A `landed` head whose branch origin deleted at merge, or that moved on, may instead be an
+   ancestor of its `target` (default `main`, local or origin's copy); `review-ready` keeps the
+   exact-tip rule (review r2 N2).
    (c) A restarted worker on an old attempt: the payload `attempt` must equal the scope's
    `attempt`, else `event-stale`. (d) The same event twice: a dedupe key, sha256 over
    (type, target, workspace, story or tab, the whole payload with its attempt), is refused as
@@ -175,7 +181,8 @@ alone, its test file was run, and the change was reverted (`mutate.py`, kept out
 repository). The whole set was run again after review round 1, on the round-1 tree. Result:
 64 of 64 mutations killed. In the first run after round 1, `R1-1b` (a missing verdict
 accepted) survived: its test gave no `SETTLED=yes` line, so the run failed on `SETTLED` alone.
-A case with `SETTLED=yes` and no `VERDICT=` was added, and `R1-1b` is now killed.
+A case with `SETTLED=yes` and no `VERDICT=` was added, and `R1-1b` is now killed. Review round 2 added eight
+mutations for its nits (`R2-*`), run on the round-2 tree: all eight killed, so 72 of 72.
 
 | # | Mutation | Failing test |
 |---|---|---|
@@ -243,3 +250,11 @@ A case with `SETTLED=yes` and no `VERDICT=` was added, and `R1-1b` is now killed
 | R1-6b | notes: the delivery line left behind when the status note fails | `worker-events-service.test.ts`: withdraws the delivery's queued line when the status note fails, and stores nothing (R1-6) |
 | R1-7a | reader: symlinks followed on open | `worker-event-validators.test.ts`: opens with O_NOFOLLOW and O_NONBLOCK: a symlink fails, and a FIFO is refused without blocking (ruling R1-7) |
 | R1-7b | reader: open blocks on a FIFO | `worker-event-validators.test.ts`: opens with O_NOFOLLOW and O_NONBLOCK: a symlink fails, and a FIFO is refused without blocking (ruling R1-7) |
+| R2-N1a | reader: no git config overrides in the command environment | `worker-event-validators.test.ts`: pins the git keys that run a program, above the repo's own config, for every command it runs (review r2 N1) |
+| R2-N1b | reader: diff.external not pinned | `worker-event-validators.test.ts`: pins the git keys that run a program, above the repo's own config, for every command it runs (review r2 N1) |
+| R2-N2a | range: landed never looks in its target branch | `worker-event-validators.test.ts`: passes a deleted branch whose head is in main |
+| R2-N2b | range: landed accepts a head in no branch | `worker-event-validators.test.ts`: checks the named integration branch in place of main |
+| R2-N2c | range: origin's copy of the target not read | `worker-event-validators.test.ts`: passes a branch that moved on, and a head that only origin's main holds |
+| R2-N2d | range: base ancestry skipped for a head found in the target | `worker-event-validators.test.ts`: still checks that base is an ancestor of a head found in main |
+| R2-N2e | range: review-ready also accepts a head in main | `worker-event-validators.test.ts`: keeps the exact-tip rule for review-ready |
+| R2-N2f | schema: target accepted on review-ready | `worker-event-schema.test.ts`: accepts each type with exactly its fields and normalises paths |

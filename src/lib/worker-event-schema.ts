@@ -27,7 +27,7 @@ const RANGE_FIELDS: Record<string, TFieldKind> = { repo: 'path', branch: 'branch
 
 const SCHEMAS: Record<TWorkerEventType, Record<string, TFieldKind>> = {
   'review-ready': { ...RANGE_FIELDS, key: 'oid', gateLog: 'path', reviewDir: 'path', receipt: 'path' },
-  landed: { ...RANGE_FIELDS, key: 'oid', gateLog: 'path' },
+  landed: { ...RANGE_FIELDS, key: 'oid', gateLog: 'path', target: 'branch' },
   'blocked-on': { ...RANGE_FIELDS, reason: 'text', clearInput: 'text' },
 };
 
@@ -37,7 +37,7 @@ const SCHEMAS: Record<TWorkerEventType, Record<string, TFieldKind>> = {
  */
 const OPTIONAL: Record<TWorkerEventType, ReadonlySet<string>> = {
   'review-ready': new Set(['receipt']),
-  landed: new Set(),
+  landed: new Set(['target']),
   'blocked-on': new Set(),
 };
 

@@ -3649,7 +3649,8 @@ Commands:
                                            server checks the evidence, then delivers it as a note to the epic's
                                            recipient. Every payload: repo, branch, head, base, attempt; review-ready adds
                                            key, gateLog, reviewDir, receipt? (absent on a first hand-off); landed adds key,
-                                           gateLog; blocked-on adds reason, clearInput. Exit 2 event-invalid; 3
+                                           gateLog, target? (default main); blocked-on adds reason, clearInput. Exit 2
+                                           event-invalid; 3
                                            event-refused (the failed checks), event-out-of-scope, event-stale,
                                            event-check-unavailable (a remote tab, or no PMUX_EVENT_PATCH_ID_CMD on the
                                            server); 5 event-no-recipient
