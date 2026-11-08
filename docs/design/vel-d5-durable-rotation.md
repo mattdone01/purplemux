@@ -139,10 +139,48 @@ default handoff path is a product decision that this measurement informs. Codex 
    phase after a durability failure and a restart. Two tests drop the seat item writes in the middle of a rotation,
    restart the server, and prove that the row alone resumes the right step.
 
+## Review round 1 (BLOCK) and its rulings
+
+1. **F1: a row belongs to one tab and one live rotation.** The task id is the seat name, so a closed tab and a new
+   tab with the same name share a key. Three rules close the gap:
+   - A row is live only when `checkpoint.tabId === seat.tabId`.
+   - `onClosed` marks every unfinished row of the tab `abandoned` (`abandonTab`, a new `tab_id` column).
+   - A `written` or `cleared` row that has not moved for `CHECKPOINT_LIVE_MS` is finished at the next server start
+     and never resumed: `written` becomes `abandoned`, `cleared` becomes `undelivered`.
+   - **The bound is 40 min:** the 30 min rotation deadline plus the 10 min first-message wait. A live rotation
+     writes its row inside its deadline, clears it seconds later, and waits at most 10 min for its first message. A
+     server outage longer than that is flagged as undelivered. It is not guessed at.
+   - The attempt number still comes from the task's newest row, so a new tab's first rotation is the next attempt.
+2. **F2: the restart hop is a wait.** `restartTab` answers `remote-host-unreachable` (503) or throws
+   `RemoteKitBrokenError` before it kills anything (ADR-0028 §4). Both map to `hostUnreachable`. The row stays
+   `written`, the stop is shown as a refusal, and the rotation retries inside its deadline. They are never a failed
+   check (`restartRefusalOutcome`).
+3. **F3: a remote seat never reads this host.** `resolveSeatPlace` uses the seat's own host when it is known.
+   - A known-local seat (`host: null`) reads its live cwd.
+   - A seat whose host is not known (`undefined`: an entry registered before its first layout poll) takes the host
+     from its layout. When the layout cannot be read, or does not name the tab, the seat waits.
+4. **F4: size, not network.** A remote handoff is read with `head -c 1048577`. Over 1 MiB, or a full buffer
+   (`ERR_CHILD_PROCESS_STDIO_MAXBUFFER`), the answer is the checker-shaped refusal `size over 1048576 bytes (expected
+   at most 12288, 12 KB)`, sent to the seat. It is never an ssh wait.
+5. **F5: the dirty count uses an exclude pathspec** (`git status --porcelain -- ':/'
+   ':(top,exclude,glob)**/*.checkpoint.json'`). The pathspec covers the whole tree from any subdirectory. It matches
+   the path, not the quoted output, so a path with a space is left out too.
+6. **F6: the gap after the awaits.** After the read, the git probe, the store write and the plain copy, the clear
+   goes ahead only while the seat is still `handoff-ready` for the same `rotateRequestedAt`. If a turn started and
+   ended in the gap, the pass stops, and the file is checked again against the new request.
+7. **F7: retention.** The daily pass deletes finished rows last moved before the 92-day ledger cutoff. It never
+   deletes a task's newest row, because the next attempt number is read from it.
+8. **F8: coverage totals** count every seat item the ledger keeps, closed ones too. A counter that no item ever wrote
+   is `null` (not measured), never 0. The per-seat rows still list open seats only.
+9. **Q1: a checkpoint taken with no bound session** cannot show whether its clear ran. At a server start such a
+   `written` row is frozen as `delivery-unknown`, the board flags it, and the seat is never cleared again for that
+   attempt.
+
 ## Mutation record
 
-Each mutation was applied to the committed tree, the named test file was run, and the file was restored
-(`/tmp/.../mutate.py`, which is not committed). All 27 were killed (the test file failed).
+Each mutation was applied to the committed tree, the named test file was run, and the file was restored. The
+runners are `/tmp/.../mutate.py` for M1-M27 and `mutate-d5.py` for M28-M47. Neither runner is committed. Every
+mutation listed was killed: the named test file failed.
 
 | # | Mutation (new branch) | Killed by |
 |---|---|---|
@@ -173,3 +211,23 @@ Each mutation was applied to the committed tree, the named test file was run, an
 | M25 | the checkpoint copy counted as dirty | `rotation-checkpoint.test.ts` (real git repo) |
 | M26 | a `/clear` keeps the old due time | durable (moot rotation) |
 | M27 | a due seat in `watching` shows no wait | `rotation-checkpoint.test.ts` |
+| M28 | F1: a row of another tab resumes | durable (close, then a new tab with the same name) |
+| M29 | F1: a closed tab leaves its rows live | durable (close, then recreate: the row is abandoned) |
+| M30 | F1: no age bound on a `written` or `cleared` row | durable (a cleared row older than 40 min; an aged written row) |
+| M31 | Q1: a sessionless checkpoint is not frozen | durable (Q1) |
+| M32 | F2: a restart that cannot reach the host is a failed check | durable F2, `status-manager-context-lifecycle.test.ts` |
+| M33 | F2: host and kit refusals not mapped to a wait | durable F2 (mapping), status-manager F2 |
+| M34 | F2: a thrown `RemoteKitBrokenError` is a failed check | status-manager F2 (`throws RemoteKitBrokenError`) |
+| M35 | F3: the layout wins over the seat's host | `seat-host-io.test.ts` (a remote seat keeps its host) |
+| M36 | F3: an unknown host falls back to local | `seat-host-io.test.ts`, status-manager F3 |
+| M37 | F4: a full buffer read as an ssh failure | `seat-host-io.test.ts` (F4) |
+| M38 | F4: a file over the cap is decoded | `seat-host-io.test.ts` (F4) |
+| M39 | F4: a pre-check refusal loses its reason | durable F4 |
+| M40 | F5: the dirty filter misses quoted paths | `rotation-checkpoint.test.ts` (a path with a space, real git) |
+| M41 | F6: no re-check after the checkpoint awaits | durable F6 |
+| M42 | F7: retention prunes a task's newest row | `rotation-checkpoint-store.test.ts` (F7) |
+| M43 | F7: retention prunes an unfinished row | `rotation-checkpoint-store.test.ts` (F7) |
+| M44 | F8: totals count open seats only | `rotation-checkpoint.test.ts` (coverage) |
+| M45 | F8: an unwritten counter reads 0 | `rotation-checkpoint.test.ts` (F8) |
+| M46 | F1: another tab's `written` row reused as this attempt | durable (the new tab's first rotation is attempt 2) |
+| M47 | F1: a first message from another tab's row is typed | durable (a row left by a tab closed while no server ran) |

@@ -158,6 +158,15 @@ Option 2.
    NOTICE. A match keeps the line `Read <path>, then continue: <resume command>` first. A mismatch lists each
    difference and asks for reconciliation before the resume command. Both say what the checkpoint does not restore.
    The fleet view (`rotation`) reports the covered workers, the rotations, the refusals and the wait-to-rotate time.
+   Its totals include closed seats. A counter that no seat item wrote is `null`, which means not measured.
+   Review round 1 adds these rules:
+   - A row is live only for its own tab id. Closing a tab abandons its unfinished rows.
+   - A `written` or `cleared` row that has not moved for 40 min is finished, never resumed. The 40 min is the 30
+     min deadline plus the 10 min first-message wait.
+   - A `written` row whose checkpoint has no session is frozen as `delivery-unknown`.
+   - A restart that cannot reach the remote host or its kit before it kills anything is a wait.
+   - A remote seat's host comes from the seat, else from its layout, and never defaults to this host.
+   - Retention deletes finished rows after 92 days, but never a task's newest row.
 
 ## Consequences
 - A seat restarts at its threshold, 300,000 tokens by default (amended by vel-D5: this line said 50-100k, which
