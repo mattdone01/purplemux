@@ -32,6 +32,18 @@ review folder). The checks must move into the server. They must not disappear.
    `note list`, because the sender workspace may list and show its notes.
 7. No terminal or tab control is granted. Nothing the worker wrote is typed into any tab.
 
+Inputs from the coordinator brief (external designs reviewed), and how they are used:
+
+- openharness: a coordinator that received every server copy got 486 messages a day, and the
+  copies were removed. So the coordinator gets a status notice only for a status change
+  (`landed`, `blocked-on`), not a copy of every event. A step result (`review-ready`) goes to
+  the task's owner.
+- A verdict counts only for the exact head and base it read: `head`, `base` and `branch` are
+  mandatory in every payload, and a head that is not the branch tip is refused (`range`).
+- openharness attempt fencing (`STALE_ATTEMPT`): the scope carries `attempt`; an event from
+  another attempt, or a duplicate, is `event-stale`.
+- trueforge `NoResponderError`: an event with no live recipient is refused at once.
+
 ## 2. The state machine
 
 ```
@@ -96,9 +108,10 @@ The scope declaration also had alternatives:
    `gate-commit-check.sh` reads it). (b) A head that is no longer the branch tip: `range` refuses
    it (`refs/heads/<branch>` must resolve to `head`, and `base` must be an ancestor of `head`).
    (c) A restarted worker on an old attempt: the payload `attempt` must equal the scope's
-   `attempt`, else `event-stale`. (d) The same event twice: a dedupe key over
-   (type, target, workspace, story, attempt, head, base, key) is refused as `event-stale`, naming
-   the note it already delivered.
+   `attempt`, else `event-stale`. (d) The same event twice: a dedupe key, sha256 over
+   (type, target, workspace, story or tab, the whole payload with its attempt), is refused as
+   `event-stale`, naming the note it already delivered. The check runs inside the notes lock, so
+   two concurrent sends cannot both pass it.
 
 Not defended: a worker that forges its own evidence files. The worker owns those files. The
 checks catch mistakes (the three found by hand), not forgery. Remote tabs (ADR-0022) keep their
@@ -133,8 +146,47 @@ evidence, and they keep the coordinator path.
 
 ## Mutation record
 
-Each row: the change made to the code, the test that failed, then the change reverted.
+Each row: the change made to the code, and the first test that failed. Each change was applied
+alone, its test file was run, and the change was reverted (`mutate.py`, kept outside the
+repository). Result: 38 of 38 mutations killed; no mutation survived.
 
 | # | Mutation | Failing test |
 |---|---|---|
-| (filled in after the tests exist) | | |
+| M1 | schema: unknown fields accepted | `worker-event-schema.test.ts`: names every defect: a missing field, a wrong form and an unknown field |
+| M2 | schema: abbreviated object ids accepted | `worker-event-schema.test.ts`: refuses an abbreviated head |
+| M3 | schema: text not cleaned of control characters | `worker-event-schema.test.ts`: accepts each type with exactly its fields and normalises paths |
+| M4 | evidence-paths: confinement off | `worker-event-validators.test.ts`: refuses a path that resolves outside the roots, and reads nothing at it |
+| M5 | evidence-paths: root prefix without separator | `worker-event-validators.test.ts`: refuses a root prefix that is not a parent (/w2 is not under /w) |
+| M6 | evidence-paths: entry kind unchecked | `worker-event-validators.test.ts`: refuses a missing path, a FIFO-like entry and a file where a directory belongs |
+| M7 | range: branch tip unchecked | `worker-event-validators.test.ts`: refuses a stale head (the branch moved on) |
+| M8 | range: ancestry unchecked | `worker-event-validators.test.ts`: refuses an absent branch, a base that is no commit, and a base off the branch |
+| M9 | gate-tree: whole log read, not the last run | `worker-event-validators.test.ts`: refuses a log whose last run has no GIT_TREE_END, although an earlier run had the right one |
+| M10 | gate-tree: tree not compared | `worker-event-validators.test.ts`: refuses another tree, naming both |
+| M11 | patch-id: exit code ignored | `worker-event-validators.test.ts`: refuses a failed command with its first words of stderr, control characters removed |
+| M12 | patch-id: printed key not compared | `worker-event-validators.test.ts`: refuses another key, naming the command and what it printed |
+| M13 | review-folder: record.md not required | `worker-event-validators.test.ts`: names every missing file |
+| M14 | review-folder: patch-id.txt key not compared | `worker-event-validators.test.ts`: refuses a folder that reviews another key |
+| M15 | receipt: name unchecked | `worker-event-validators.test.ts`: refuses a receipt under another name |
+| M16 | receipt: BLOCK only on the first line, case-sensitive | `worker-event-validators.test.ts`: refuses <key>.md holding "# r\n  Verdict:   block — gate missing\n" |
+| M17 | runner: a throwing validator passes | `worker-event-validators.test.ts`: counts a validator that throws as a failure of that check, never a pass |
+| M18 | runner: stop after the first failure | `worker-event-validators.test.ts`: runs every check and lists every failure in one refusal |
+| M19 | reader: caller environment passed to the command | `worker-event-validators.test.ts`: runs the command without a shell or the server token, in the repo |
+| M20 | scope: any verified tab declares | `worker-events-service.test.ts`: is the verified designated live coordinator only |
+| M21 | scope: epic of another workspace accepted | `worker-events-service.test.ts`: serves only an epic held by a live tab of the same workspace, for a live tab of that workspace |
+| M22 | scope: attempt may go down | `worker-events-service.test.ts`: keeps the attempt on a re-declare, raises it on a re-dispatch, and never lowers it |
+| M23 | scope: unknown-state tabs pruned | `worker-events-service.test.ts`: drops the scopes of closed tabs, but not of tabs whose state is unknown |
+| M24 | send: target outside the scope accepted | `worker-events-service.test.ts`: refuses a target outside the scope, a tab with no scope, and a scope whose epic was released |
+| M25 | send: old attempt accepted | `worker-events-service.test.ts`: refuses an old attempt as stale (attempt fencing) |
+| M26 | send: released served epic accepted | `worker-events-service.test.ts`: refuses a target outside the scope, a tab with no scope, and a scope whose epic was released |
+| M27 | send: unverified tab accepted | `worker-events-service.test.ts`: refuses an admin token, a workspace token and an unverified tab: no blanket authority |
+| M28 | status: review-ready copied to the coordinator | `worker-events-service.test.ts`: sent → validated → delivered: a worker reaches another workspace's coordinator without its own retyping it |
+| M29 | notes: duplicate delivered twice | `worker-events-service.test.ts`: refuses the same event twice as stale, naming the note that carried it |
+| M30 | notes: no-recipient event stored | `worker-events-service.test.ts`: refuses an event with no live recipient and stores nothing (no event sits unseen) |
+| M31 | notes: event admission not routed across workspaces | `worker-events-service.test.ts`: sent → validated → delivered: a worker reaches another workspace's coordinator without its own retyping it |
+| M32 | notes: status note to a coordinator that is the recipient | `worker-events-service.test.ts`: sends no status note when the source coordinator is the recipient, or is the sender |
+| M33 | notes: unverified sendEvent accepted | `worker-events-service.test.ts`: refuses an admin token, a workspace token and an unverified tab: no blanket authority |
+| M34 | notes: status note not counted in the cap | `worker-events-service.test.ts`: counts the delivery and its status note against the sender cap |
+| M35 | http: event-refused answered 400 | `worker-events-route.test.ts`: answers event-refused with 422 |
+| M36 | http: details dropped | `worker-events-route.test.ts`: answers event-invalid with 400 |
+| M37 | cli: event-no-recipient exits 3 | `cli-event.test.ts`: maps event-no-recipient (HTTP 503) to exit 5 |
+| M38 | cli: dependsOn not split | `cli-event.test.ts`: sets a scope with split dependencies and a numeric attempt |
