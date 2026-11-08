@@ -145,9 +145,11 @@ describe('purplemux pool (ADR-0039)', { timeout: 30_000 }, () => {
       free: { threads: 2, memBytes: 33 * GIB },
     };
     const queue = [{ ticket: 'pool-queue:tab-1', kind: 'tab', class: 'product', position: 1, envelope: { threads: 2, memGb: 4 }, hosts: ['mdserver1'], holder: 'ws-a/tab-o', queuedAt: '2026-11-03T06:59:00.000Z', expiresAt: null }];
-    reply = { status: 200, body: { ...VIEW, hosts: [{ ...md, budget }], queue } };
+    const wouldRefuse = { mode: 'shadow', total: 4, since: '2026-11-03T06:00:00.000Z', byHost: { mdserver1: { total: 4, byRefusal: { overloaded: 4 } } }, last: null };
+    reply = { status: 200, body: { ...VIEW, hosts: [{ ...md, budget }], queue, wouldRefuse } };
     const text = (await cli(['show'])).stdout;
     expect(text).toContain(', 1 queued');
+    expect(text).toContain('mode shadow: 4 admitted that enforce would refuse since 2026-11-03T06:00:00.000Z (mdserver1 4)');
     expect(text).toContain('    budget: workers 22/24 threads, 44.0/77.0 GiB (harness 2 threads, share 25%); control-plane reserve 4/8 threads, 8.0/14.0 GiB; max load 32');
     expect(text).toContain('  queued 1: pool-queue:tab-1 product 2 threads 4 GiB, hosts mdserver1, holder ws-a/tab-o, since 2026-11-03T06:59:00.000Z');
   });

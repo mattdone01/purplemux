@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   budgetOf, buildPoolView, freeSlotNumber, hostState, leaseClass, leaseEnvelope, memOfLease, orderQueue, parsePoolLeaseName, parsePoolQueueName,
-  parseTicket, placeWork, poolLeaseName, poolLeaseNote, poolNumberRefusal, poolQueueName, poolQueueNote, requestEnvelope, slotCountCapOf,
-  tabLocalOnly, type IPoolHostTabs, type IPoolTicket, type TConfigValue,
+  parseTicket, placeWork, poolLeaseName, poolLeaseNote, poolModeOf, poolNumberRefusal, poolQueueName, poolQueueNote, requestEnvelope, slotCountCapOf,
+  tabLocalOnly, wouldRefuseLine, type IPoolHostTabs, type IPoolTicket, type TConfigValue,
 } from '@/lib/pool';
 import type { ILease } from '@/types/lease';
-import type { IPoolMetrics, IPoolPlacementRequest, TPoolHostRead, TPoolKind } from '@/types/pool';
+import type { IPoolMetrics, IPoolPlacementRequest, IPoolWouldRefuse, TPoolHostRead, TPoolKind } from '@/types/pool';
 
 // ADR-0039 §2-§3 and vel-D4: the pool model and its admission, table-driven.
 // No test here places work anywhere: hosts are fakes.
@@ -39,17 +39,19 @@ const ticket = (kind: TPoolKind, n: number, req: Partial<IPoolPlacementRequest>,
   parseTicket(leaseWith(poolQueueName(kind, n), poolQueueNote({ kind, memGb: 0, ...req }), acquiredAt))!;
 
 const noConfig: TConfigValue = () => null;
-const cfg = (values: Record<string, string>): TConfigValue => (key) => values[key] ?? null;
+/** The refusal tests run in enforce mode; shadow mode, the default, has its own tests (review r1 F1). */
+const enforce: TConfigValue = (key) => (key === 'pool.mode' ? 'enforce' : null);
+const cfg = (values: Record<string, string>): TConfigValue => (key) => ({ 'pool.mode': 'enforce', ...values } as Record<string, string>)[key] ?? null;
 
 const tabsOf = (worker: number, controlPlane = 0): IPoolHostTabs => ({ worker, controlPlane });
 
-const states = (reads: TPoolHostRead[], leases: ILease[] = [], tabs: Record<string, number | IPoolHostTabs> = {}, config: TConfigValue = noConfig) =>
+const states = (reads: TPoolHostRead[], leases: ILease[] = [], tabs: Record<string, number | IPoolHostTabs> = {}, config: TConfigValue = enforce) =>
   reads.map((r) => {
     const t = tabs[r.host] ?? 0;
     return hostState(r, leases, typeof t === 'number' ? tabsOf(t) : t, config);
   });
 
-const place = (reads: TPoolHostRead[], req: IPoolPlacementRequest, leases: ILease[] = [], tabs: Record<string, number | IPoolHostTabs> = {}, config: TConfigValue = noConfig) =>
+const place = (reads: TPoolHostRead[], req: IPoolPlacementRequest, leases: ILease[] = [], tabs: Record<string, number | IPoolHostTabs> = {}, config: TConfigValue = enforce) =>
   placeWork(states(reads, leases, tabs, config), req);
 
 /** The measured hosts (vel-D4): mdserver1 32 threads / 91 GiB; ai-server 64 threads / 373 GiB. Quiet unless told. */
@@ -421,5 +423,91 @@ describe('placement (AC 3)', () => {
     expect(tabLocalOnly({ kind: 'tab', memGb: 0, class: 'control-plane' })).toContain('control-plane');
     expect(tabLocalOnly({ kind: 'tab', memGb: 0, localOnly: true })).toContain('local-only');
     expect(tabLocalOnly({ kind: 'gate', memGb: 0, panelType: 'codex-cli' })).toBeNull();
+  });
+});
+
+describe('pool.mode: shadow, the default, admits and logs; enforce refuses (review r1 F1, F2, F7)', () => {
+  const fullGates = [1, 2, 3, 4, 5, 6].map((n) => lease(`pool:ai-lan/gate-${n}`));
+
+  it('the mode reads shadow unless the fleet value is exactly enforce', () => {
+    expect(poolModeOf(noConfig)).toBe('shadow');
+    expect(poolModeOf(enforce)).toBe('enforce');
+    expect(poolModeOf(cfg({ 'pool.mode': ' enforce ' }))).toBe('enforce');
+    expect(poolModeOf(cfg({ 'pool.mode': 'ENFORCE' }))).toBe('shadow');
+    expect(poolModeOf(cfg({ 'pool.mode': 'on' }))).toBe('shadow');
+  });
+
+  it('shadow admits a budget refusal with the would-refuse figures; enforce refuses the same request', () => {
+    const shadow = place([ai()], { kind: 'gate', memGb: 0 }, fullGates, {}, noConfig);
+    expect(shadow).toMatchObject({
+      ok: true, host: 'ai-lan', reason: expect.stringContaining('shadow mode admitted what enforce would refuse (no-budget)'),
+      wouldRefuse: { host: 'ai-lan', kind: 'gate', class: 'product', refusals: ['no-budget'], workerUsed: { threads: 48 }, workerThreads: 48, envelope: { threads: 8, memGb: 8 } },
+    });
+    expect(place([ai()], { kind: 'gate', memGb: 0 }, fullGates, {}, enforce)).toMatchObject({ ok: false, refusal: 'no-budget' });
+  });
+
+  it('shadow admits a sustained overload and a measured-memory refusal; the log line carries the tuning figures', () => {
+    const reads = [md({ load1: 60, load5: 55, memAvailableBytes: 9 * GIB })];
+    const recent = { mdserver1: { worker: 12, controlPlane: 1, recentStarts: [{ at: NOW - 10_000, threads: 2, memBytes: 4 * GIB }] } };
+    const placed = place(reads, { kind: 'tab', memGb: 0, panelType: 'codex-cli' }, [], recent, noConfig);
+    expect(placed).toMatchObject({ ok: true, host: 'mdserver1', wouldRefuse: { refusals: ['no-budget', 'no-memory', 'overloaded'], minLoad: 55, pendingThreads: 2 } });
+    const line = wouldRefuseLine((placed as { wouldRefuse: IPoolWouldRefuse }).wouldRefuse);
+    expect(line).toMatch(/^pool would-refuse \(shadow, admitted\): host=mdserver1 kind=tab class=product refusals=no-budget,no-memory,overloaded /);
+    expect(line).toContain('min_load=55 pending_threads=2 envelope_threads=2 envelope_mem_gib=4 max_load=32 mem_free_gib=5');
+    expect(line).toContain('worker_threads=24/24');
+    expect(line).toContain('agent_tabs=worker:12,control-plane:1');
+    expect(line).toContain('sustained load 57 + 2 threads > max load 32');
+    expect(place(reads, { kind: 'tab', memGb: 0, panelType: 'codex-cli' }, [], recent, enforce)).toMatchObject({ ok: false, refusal: 'no-budget' });
+  });
+
+  it('shadow takes a host that passes every check before one that only shadow admits', () => {
+    // ai-server has the lower load per thread, so it would win the sort; its budget is full, so a clean host wins first.
+    const placed = place([md({ load1: 16, load5: 16, memAvailableBytes: 80 * GIB }), ai({ load1: 1, load5: 1 })], { kind: 'gate', memGb: 0 }, fullGates, {}, noConfig);
+    expect(placed).toMatchObject({ ok: true, host: 'mdserver1' });
+    expect(placed).not.toHaveProperty('wouldRefuse');
+  });
+
+  it('shadow still refuses every other check: unknown host, disk, count cap, harness share, an earlier ticket, too large', () => {
+    expect(place([unknown('ai-lan')], { kind: 'gate', memGb: 0 }, [], {}, noConfig)).toMatchObject({ ok: false, refusal: 'no-known-host' });
+    expect(place([ai({ disks: [{ path: '/', usedPct: 90, freeBytes: 1 }] })], { kind: 'gate', memGb: 0 }, [], {}, noConfig)).toMatchObject({ ok: false, refusal: 'disk-full' });
+    expect(place([ai()], { kind: 'gate', memGb: 0 }, [lease('pool:ai-lan/gate-1')], {}, (k) => (k === 'pool.slots.ai-lan.gate' ? '1' : null))).toMatchObject({ ok: false, refusal: 'no-free-slot' });
+    const harness = leaseWith('pool:ai-lan/build-1', poolLeaseNote({ threads: 8, memBytes: 8 * GIB }, 'harness'));
+    expect(place([ai()], { kind: 'build', memGb: 0, class: 'harness' }, [harness], {}, noConfig)).toMatchObject({ ok: false, refusal: 'harness-share' });
+    const s = states([ai()], fullGates, {}, noConfig);
+    expect(placeWork(s, { kind: 'gate', memGb: 0 }, { queue: [ticket('gate', 1, {}, NOW - 1_000)] })).toMatchObject({ ok: false, refusal: 'queued-ahead' });
+    expect(place([ai()], { kind: 'gate', memGb: 400 }, [], {}, noConfig)).toMatchObject({ ok: false, refusal: 'too-large' });
+  });
+});
+
+describe('a ticket holds back only a host it could run on (review r1 F5)', () => {
+  it('a 30-thread ticket does not block mdserver1 (24 worker threads); it still blocks ai-server', () => {
+    const big = ticket('gate', 1, { threads: 30 }, NOW - 5_000);
+    const s = states([md(), ai()]);
+    expect(placeWork(s, { kind: 'gate', memGb: 0 }, { queue: [big] })).toMatchObject({ ok: true, host: 'mdserver1' });
+    expect(placeWork(states([ai()]), { kind: 'gate', memGb: 0 }, { queue: [big] })).toMatchObject({ ok: false, refusal: 'queued-ahead' });
+  });
+
+  it('a harness ticket larger than a host\'s harness share does not block that host', () => {
+    const h = ticket('gate', 1, { class: 'harness', threads: 8 }, NOW - 5_000);
+    expect(placeWork(states([md()]), { kind: 'gate', memGb: 0 }, { queue: [h] })).toMatchObject({ ok: true, host: 'mdserver1' });
+  });
+});
+
+describe('tab starts the read cannot show yet (review r1 F6)', () => {
+  const burst = (at: number) => Array.from({ length: 5 }, () => ({ at, threads: 2, memBytes: 4 * GIB }));
+
+  it('a burst of 5 tab starts within LOAD_LAG_MS counts in the measured load and memory; older ones are in the read', () => {
+    const [fresh] = states([md({ load1: 16, load5: 16, memAvailableBytes: 40 * GIB })], [], { mdserver1: { worker: 5, controlPlane: 0, recentStarts: burst(NOW - 30_000) } });
+    expect(fresh).toMatchObject({ sustainedLoad: 26, pendingThreads: 10, memFreeBytes: 20 * GIB });
+    const [old] = states([md({ load1: 16, load5: 16, memAvailableBytes: 40 * GIB })], [], { mdserver1: { worker: 5, controlPlane: 0, recentStarts: burst(NOW - 61_000) } });
+    expect(old).toMatchObject({ sustainedLoad: 16, pendingThreads: 0, memFreeBytes: 40 * GIB });
+  });
+
+  it('with the burst counted, a gate on this host is refused as overloaded in enforce mode', () => {
+    const reads = [md({ load1: 16, load5: 16 })];
+    expect(place(reads, { kind: 'gate', memGb: 0 })).toMatchObject({ ok: true });
+    expect(place(reads, { kind: 'gate', memGb: 0 }, [], { mdserver1: { worker: 0, controlPlane: 0, recentStarts: burst(NOW - 1_000) } })).toMatchObject({
+      ok: false, refusal: 'overloaded', reason: expect.stringContaining('sustained load 26 + 8 threads > max load 32'),
+    });
   });
 });

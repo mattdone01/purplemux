@@ -6,7 +6,7 @@ vi.mock('@/lib/logger', () => {
   return { createLogger: () => logger };
 });
 
-const { AUTO_PLACE_TIMEOUT_MS, resolveAutoHost } = await import('@/lib/pool-tab-placement');
+const { AUTO_PLACE_TIMEOUT_MS, PoolTimeoutError, resolveAutoHost } = await import('@/lib/pool-tab-placement');
 
 const remote: TTabStart = { state: 'admitted', host: 'ai-lan', local: false, reason: 'most free memory', lease: 'pool:ai-lan/tab-1', envelope: { threads: 2, memGb: 4 } };
 const here: TTabStart = { state: 'admitted', host: 'mdserver1', local: true, reason: 'local-only: budget threads 4/24', lease: 'pool:mdserver1/tab-1', envelope: { threads: 2, memGb: 4 } };
@@ -92,5 +92,62 @@ describe('resolveAutoHost (ADR-0039 §4, vel-D4)', () => {
     await resolveAutoHost({ panelType: 'claude-code', role: 'evaluator', class: 'harness', ticket: 'pool-queue:tab-4', cwd: '/x' }, d);
     expect(d.start).toHaveBeenNthCalledWith(1, { panelType: 'claude-code', role: 'evaluator', class: 'harness', ticket: 'pool-queue:tab-4' });
     expect(d.start).toHaveBeenNthCalledWith(2, { panelType: 'claude-code', role: 'evaluator', class: 'harness', localOnly: true });
+  });
+});
+
+describe('resolveAutoHost: only a first-ask timeout falls back (review r1 F4)', () => {
+  const never = () => new Promise<never>(() => {});
+  const timed = async <T>(run: () => Promise<T>): Promise<T> => {
+    vi.useFakeTimers();
+    try {
+      const pending = run();
+      await vi.advanceTimersByTimeAsync(AUTO_PLACE_TIMEOUT_MS);
+      return await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  it.each([
+    ['a pool error (ticket gone)', Object.assign(new Error('pool-queue:tab-1 is not waiting'), { code: 'pool-ticket-gone' })],
+    ['an invalid request', Object.assign(new Error('class must be product, harness or control-plane'), { code: 'pool-invalid' })],
+    ['an unreadable store', new Error('leases.json is not valid JSON')],
+  ])('%s on a first ask is an answer, never a local create', async (_name, error) => {
+    const out = await resolveAutoHost({ panelType: 'claude-code' }, deps({ start: vi.fn(async () => { throw error; }) }));
+    expect(out).toEqual({ kind: 'failed', error });
+  });
+
+  it('a timeout on a re-ask with a ticket creates nothing', async () => {
+    const out = await timed(() => resolveAutoHost({ panelType: 'claude-code', ticket: 'pool-queue:tab-1' }, deps({ start: vi.fn(never) })));
+    expect(out).toMatchObject({ kind: 'failed', error: expect.any(PoolTimeoutError) });
+  });
+
+  it('a timeout on the local re-ask after a missing --cwd creates nothing', async () => {
+    const d = deps({ cwdOnHost: vi.fn(async () => false), start: vi.fn(async (input: ITabStartInput) => (input.localOnly ? never() : remote)) });
+    const out = await timed(() => resolveAutoHost({ panelType: 'claude-code', cwd: '/x' }, d));
+    expect(out).toMatchObject({ kind: 'failed', error: expect.any(PoolTimeoutError) });
+    expect(d.release).toHaveBeenCalledWith('pool:ai-lan/tab-1');
+  });
+
+  it('a late admission after a first-ask timeout gives its start lease back', async () => {
+    let answer: (v: TTabStart) => void = () => {};
+    const d = deps({ start: vi.fn(() => new Promise<TTabStart>((resolve) => { answer = resolve; })) });
+    const out = await timed(() => resolveAutoHost({ panelType: 'claude-code' }, d));
+    expect(out).toMatchObject({ kind: 'placed', placement: { fallback: true } });
+    answer(remote);
+    await vi.waitFor(() => expect(d.release).toHaveBeenCalledWith('pool:ai-lan/tab-1'));
+  });
+
+  it('a late ticket after a first-ask timeout is given back; a late queued re-ask keeps the waiter\'s own ticket', async () => {
+    let answer: (v: TTabStart) => void = () => {};
+    const first = deps({ start: vi.fn(() => new Promise<TTabStart>((resolve) => { answer = resolve; })) });
+    await timed(() => resolveAutoHost({ panelType: 'claude-code' }, first));
+    answer(waiting);
+    await vi.waitFor(() => expect(first.release).toHaveBeenCalledWith('pool-queue:tab-1'));
+    const reask = deps({ start: vi.fn(() => new Promise<TTabStart>((resolve) => { answer = resolve; })) });
+    await timed(() => resolveAutoHost({ panelType: 'claude-code', ticket: 'pool-queue:tab-1' }, reask));
+    answer(waiting);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(reask.release).not.toHaveBeenCalled();
   });
 });

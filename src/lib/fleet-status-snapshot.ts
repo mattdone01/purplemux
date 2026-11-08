@@ -10,6 +10,7 @@ import type {
   IFleetTabFacts, IFleetThresholds, IFleetUnattributed, IFleetView, IFleetWip, TComposerReading,
 } from '@/types/fleet-status';
 import type { ILease } from '@/types/lease';
+import type { IPoolWouldRefuseView } from '@/types/pool';
 import type { IClientTabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
 
@@ -37,6 +38,8 @@ export interface IFleetDeps {
   mtime: (file: string) => Promise<number | null>;
   config: (key: string) => Promise<string | null>;
   providerId: (tab: ITab) => string | null;
+  /** The pool's would-refuse counter; absent: the view carries none. */
+  poolWouldRefuse?: () => Promise<IPoolWouldRefuseView>;
 }
 
 export const FLEET_CONFIG_KEYS: Record<keyof IFleetThresholds, string> = {
@@ -105,13 +108,15 @@ const composerSince = (tab: ITab, status: IClientTabStatusEntry, reading: TCompo
 
 export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promise<IFleetView> => {
   const errors: IFleetView['errors'] = [];
-  const [workspaces, thresholds, watches, leases, openers] = await Promise.all([
+  const [workspaces, thresholds, watches, leases, openers, pool] = await Promise.all([
     deps.workspaces(),
     readThresholds(deps.config),
     settle(deps.watches),
     settle(deps.leases),
     settle(async () => deps.openers()),
+    deps.poolWouldRefuse ? settle(deps.poolWouldRefuse) : Promise.resolve(null),
   ]);
+  if (pool && !pool.ok) errors.push({ scope: 'pool', error: pool.error });
   // Each workspace's cap: its own key wins over the fleet key (story 17 AC 8).
   const tabCap = await settle(async () =>
     new Map(await Promise.all(workspaces.map(async (w) => [w.id, (await readTabCap(deps.config, w.id)).cap] as const))));
@@ -220,6 +225,7 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
     unattributed,
     errors,
     ...(wip ? { wip } : {}),
+    ...(pool?.ok ? { pool: pool.value } : {}),
   };
 };
 
@@ -262,6 +268,7 @@ const realDeps = async (): Promise<IFleetDeps> => {
     mtime: async (file) => (await fs.stat(file)).mtimeMs,
     config: async (key) => valueOf(await fleetConfig, key)?.value ?? null,
     providerId: (tab) => getProviderByPanelType(tab.panelType)?.id ?? null,
+    poolWouldRefuse: async () => (await import('@/lib/pool-service')).readPoolWouldRefuse(),
   };
 };
 

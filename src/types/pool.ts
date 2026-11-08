@@ -151,11 +151,52 @@ export interface IPoolQueueEntry {
   expiresAt: string | null;
 }
 
+/**
+ * `pool.mode` (vel-D4 review r1): `shadow`, the default, admits work the budget, the measured memory or the
+ * sustained load would refuse, and logs it; `enforce` refuses it. Every other check refuses in both modes.
+ */
+export type TPoolMode = 'shadow' | 'enforce';
+
+/** The admission checks that shadow mode logs and admits instead of refusing. */
+export type TPoolShadowedRefusal = 'no-budget' | 'no-memory' | 'overloaded';
+
+/** One admission that enforce mode would have refused, with the figures `max-load` is tuned from. */
+export interface IPoolWouldRefuse {
+  host: string;
+  kind: TPoolKind;
+  class: TPoolClass;
+  refusals: TPoolShadowedRefusal[];
+  /** min(load1, load5) of the read. */
+  minLoad: number;
+  /** Threads of the leases and tab starts the read cannot show yet. */
+  pendingThreads: number;
+  envelope: IPoolEnvelopeView;
+  maxLoad: number;
+  memFreeBytes: number;
+  workerUsed: IPoolUse;
+  workerThreads: number;
+  workerMemBytes: number;
+  /** The agent tabs the ledger counts on the host, from the layouts. */
+  agentTabs: { worker: number; controlPlane: number };
+  detail: string;
+}
+
+/** The would-refuse counter since the server started (the fleet view and the pool view carry it). */
+export interface IPoolWouldRefuseView {
+  mode: TPoolMode;
+  total: number;
+  since: string;
+  byHost: Record<string, { total: number; byRefusal: Partial<Record<TPoolShadowedRefusal, number>> }>;
+  /** The last log line, so a reader sees the figures without the server log. */
+  last: { at: string; line: string } | null;
+}
+
 export interface IPoolView {
   at: string;
   hosts: IPoolHostView[];
   totals: IPoolTotals;
   queue: IPoolQueueEntry[];
+  wouldRefuse: IPoolWouldRefuseView;
 }
 
 /**
@@ -188,7 +229,7 @@ export interface IPoolEnvelopeView {
 }
 
 export type TPoolPlacement =
-  | { ok: true; host: string; local: boolean; reason: string; envelope: IPoolEnvelopeView | null }
+  | { ok: true; host: string; local: boolean; reason: string; envelope: IPoolEnvelopeView | null; wouldRefuse?: IPoolWouldRefuse }
   | { ok: false; refusal: TPoolRefusalReason; reason: string; queueable: boolean };
 
 export interface IPoolAcquireResult {
@@ -203,6 +244,10 @@ export interface IPoolAcquireResult {
   class: TPoolClass;
   /** What the slot reserves; a launcher that supports limits passes it on (systemd-run, docker --cpus --memory). */
   envelope: IPoolEnvelopeView;
+  /** Shadow mode admitted what enforce mode would refuse (logged and counted). */
+  wouldRefuse?: IPoolWouldRefuse;
+  /** Set when the caller asked for class control-plane and is not the workspace's enabled orchestrator tab. */
+  downgrade?: string;
 }
 
 /** A queued request (vel-D4): re-ask with `ticket` before `expiresAt` to keep the place. */
@@ -218,4 +263,6 @@ export interface IPoolQueuedResult {
   expiresAt: string | null;
   retryAfterSeconds: number;
   envelope: IPoolEnvelopeView;
+  /** Set when the caller asked for class control-plane and is not the workspace's enabled orchestrator tab. */
+  downgrade?: string;
 }

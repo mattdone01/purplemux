@@ -232,11 +232,16 @@ POST /api/cli/pool/acquire   (a tab token, or the admin token)
   (pool.harness-share-pct, default 25 % of the worker budget); measured free memory, less the
   leases taken within 60 s of the read, keeps 4 GiB after the envelope; min(load1, load5) plus the
   unseen leases' threads plus the envelope stays at or under max-load (default the host's threads);
-  and no earlier ticket waits for that host. Jobs go to the lowest projected load per thread, then
+  and no earlier ticket that could run there (its envelope fits the host's worker budget and, for
+  harness, its share) waits for that host. Tab starts this server created within 60 s count as
+  unseen in the measured checks. In pool.mode shadow (the default) the budget, measured-memory and
+  sustained-load checks admit and log instead of refusing; the answer then carries "wouldRefuse". Jobs go to the lowest projected load per thread, then
   the most free memory; tabs to the most free memory. A tie stays on this host. Only a claude-code
   tab with no role may leave this host (codex-cli and grok-cli cannot run remote, ADR-0022 §13; a
   coordinator is never remote, §20). A control-plane tab runs here on the reserve: never queued or
-  refused, and its reason states the reserve use. A non-agent tab type is refused (no envelope).
+  refused, and its reason states the reserve use. Class control-plane is honoured only for the
+  workspace's enabled orchestrator tab, resolved from the caller's identity; any other caller runs
+  as product and the answer carries "downgrade" with the reason. A non-agent tab type is refused (no envelope).
   The slot is a lease "pool:<host>/<kind>-<n>" on the lease store (ADR-0011): the lowest free n,
   held by the caller's tab, default TTL 60m, at most 24h, note "pool mem=<GB> threads=<N>
   class=<C>". It ends with \`pool release\`, its TTL, or its holder tab (the lease sweeper).
@@ -391,8 +396,10 @@ POST /api/cli/tabs
   "reason", ... } and creates nothing: re-POST with "queueTicket" to keep the place (\`tab create
   --host auto\` waits and re-asks for you). A pool refusal is 409 pool-full. "poolClass":
   "control-plane" runs the tab here on the reserve, never queued. A "cwd" missing on the chosen
-  host gives that start back and asks this host alone. Only no pool answer in 2 s creates the tab
-  here without the budget. The answer adds "placement": { "host", "local", "reason", "fallback",
+  host gives that start back and asks this host alone. Only a first ask with no "queueTicket"
+  that the pool does not answer in 2 s creates the tab here without the budget; a late answer is
+  given back. Every other pool failure is an answer and creates nothing: 409 pool-ticket-gone,
+  409 pool-full, 400 pool-invalid, 503 pool-timeout (a re-ask), 503 pool-unreadable. The answer adds "placement": { "host", "local", "reason", "fallback",
   "envelope" }; "fallback" is true when the pool's first answer was not used.
   "cwd" is the tab's start directory, an absolute path that must exist on the tab's host,
   else 400 { "code": "cwd-missing" } (exit 2).
@@ -920,7 +927,8 @@ Keys in use:
                A pool host's one budget (vel-D4): threads 1..4096 and memory 1..65536 GiB (unset:
                the read), the control-plane reserve (unset: max(2, 25 % of threads) threads and
                max(4, 15 % of memory) GiB), and the sustained load that refuses new work (unset: the
-               host's threads). An invalid stored value keeps the default. Admin token only.
+               host's threads, a placeholder: tune it from the shadow would-refuse log before
+               pool.mode=enforce). An invalid stored value keeps the default. Admin token only.
   pool.envelope.<kind>.threads
   pool.envelope.<kind>.mem-gb
                What one job or tab of the kind reserves (vel-D4): threads 1..4096 and 0..4096 GiB.
@@ -930,6 +938,15 @@ Keys in use:
   pool.harness-share-pct
                The share of each worker budget harness work may hold (vel-D4), a whole percent
                0..100. Unset means 25. Admin token only.
+  pool.mode
+               shadow or enforce (vel-D4 review r1), checked when written. Unset, and a stored
+               value that is neither, mean shadow: the budget (no-budget), measured-memory
+               (no-memory) and sustained-load (overloaded) checks admit the work, log one
+               "pool would-refuse (shadow, admitted):" line with min_load, pending_threads,
+               envelope, max_load, memory and agent_tabs, and count it ("wouldRefuse" on GET
+               /api/cli/pool and "pool" on the fleet view). enforce refuses them. Every other
+               check refuses in both modes. Go-live runs shadow for a day, tunes
+               pool.budget.<host>.max-load from the log, then sets enforce. Admin token only.
   pool.fallback.<alias>
                The ssh alias the pool read tries once when <alias> fails (the tailnet alias
                behind a LAN alias, e.g. ai-server behind ai-lan). Unset means one try. Admin

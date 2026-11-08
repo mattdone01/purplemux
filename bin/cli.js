@@ -1756,6 +1756,11 @@ const waitInQueue = async (first, ask, waitSeconds) => {
 const printPool = (view) => {
   const t = view.totals;
   process.stdout.write(`pool ${t.knownHosts} known, ${t.unknownHosts} unknown: ${t.threads} threads, ${gib(t.memAvailableBytes)}/${gib(t.memTotalBytes)} GiB free, gate ${slotText(t.slots.gate)} build ${slotText(t.slots.build)} tab ${slotText(t.slots.tab)}${view.queue?.length ? `, ${view.queue.length} queued` : ''}\n`);
+  const w = view.wouldRefuse;
+  if (w) {
+    const hosts = Object.entries(w.byHost).map(([host, c]) => `${host} ${c.total}`).join(', ');
+    process.stdout.write(`mode ${w.mode === 'enforce' ? 'enforce' : 'shadow'}: ${w.total} admitted that enforce would refuse since ${w.since}${hosts ? ` (${hosts})` : ''}\n`);
+  }
   for (const h of view.hosts) {
     const name = `${h.host}${h.local ? ' (this host)' : ''}`;
     if (!h.metrics) {
@@ -3358,8 +3363,11 @@ Commands:
                                            900; 0 answers at once) runs out (exit 3 pool-queued, the ticket on
                                            stdout; re-run with --ticket TICKET within 120 s to keep the place).
                                            A pool refusal is exit 3 pool-full. --class control-plane runs a
-                                           coordinator here on the reserve, never queued. Only no pool answer in
-                                           2 s creates the tab here. The answer's "placement" says where and why
+                                           coordinator here on the reserve, never queued, but only when the caller
+                                           is the workspace's enabled orchestrator tab; any other caller runs as
+                                           product ("downgrade" says why). Only a first ask the pool does not
+                                           answer in 2 s creates the tab here; every other pool error creates
+                                           nothing. The answer's "placement" says where and why
              [--cwd DIR]                   Start the tab in DIR, an absolute directory that must exist on the
                                            tab's host (cwd-missing, exit 2). A remote worker works in its own
                                            checkout or worktree on that host

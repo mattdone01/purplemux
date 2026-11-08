@@ -1,7 +1,7 @@
 import { isAgentPanelType } from '@/lib/agent-panel-types';
 import { collectAllTabs } from '@/lib/layout-tree';
 import { LeasePolicyError, resolveTtl } from '@/lib/lease-policy';
-import { LeaseError, acquireChosenLease, listLeases, releaseLease, sameHolder, type ILeaseAuthority } from '@/lib/lease-store';
+import { LeaseError, acquireChosenLease, holderLabel, listLeases, releaseLease, sameHolder, type ILeaseAuthority } from '@/lib/lease-store';
 import { createLogger } from '@/lib/logger';
 import {
   NO_TABS,
@@ -24,6 +24,7 @@ import {
   parseTicket,
   placeWork,
   poolHostId,
+  poolModeOf,
   poolLeaseName,
   poolLeaseNote,
   poolQueueName,
@@ -31,10 +32,12 @@ import {
   requestEnvelope,
   type IPoolHostState,
   type IPoolHostTabs,
+  type IPoolRecentStart,
   type IPoolTicket,
   type TConfigValue,
 } from '@/lib/pool';
 import { getPoolReader } from '@/lib/pool-read';
+import { recentTabStarts, recordWouldRefuse, wouldRefuseView } from '@/lib/pool-runtime';
 import { isValidRemoteHostName } from '@/lib/remote-host';
 import type { ILease, ILeaseHolder } from '@/types/lease';
 import type {
@@ -69,6 +72,8 @@ export interface IPoolServiceDeps {
   /** Pool slots and queue tickets. */
   leases: () => Promise<ILease[]>;
   now: () => number;
+  /** Tab starts the reads cannot show yet, per pool host id; the server's own record when absent. */
+  recentStarts?: (now: number) => Map<string, IPoolRecentStart[]>;
 }
 
 const readAgentTabs = async (localHost: string): Promise<Map<string, IPoolHostTabs>> => {
@@ -116,7 +121,11 @@ interface IPoolFacts {
 const gatherFacts = async (deps: IPoolServiceDeps): Promise<IPoolFacts> => {
   const reads = await deps.reads();
   const localHost = reads.find((r) => r.local)?.host ?? '';
-  const [config, tabs] = await Promise.all([deps.config(), deps.agentTabs(localHost)]);
+  const [config, layoutTabs] = await Promise.all([deps.config(), deps.agentTabs(localHost)]);
+  const tabs = new Map(layoutTabs);
+  for (const [host, recentStarts] of (deps.recentStarts ?? recentTabStarts)(deps.now())) {
+    tabs.set(host, { ...(tabs.get(host) ?? NO_TABS), recentStarts });
+  }
   return { reads, config, tabs };
 };
 
@@ -132,13 +141,45 @@ const ticketsOf = (leases: readonly ILease[]): IPoolTicket[] =>
 /** The pool model: `pool show`, `GET /api/cli/pool`, and the owner board's pool section (story 12). */
 export const readPoolView = async (deps: IPoolServiceDeps = defaultPoolServiceDeps()): Promise<IPoolView> => {
   const [facts, leases] = await Promise.all([gatherFacts(deps), deps.leases()]);
-  return buildPoolView(statesOf(facts, leases), deps.now(), ticketsOf(leases));
+  return buildPoolView(statesOf(facts, leases), deps.now(), ticketsOf(leases), wouldRefuseView(poolModeOf(facts.config)));
+};
+
+/** The counter the fleet view carries (review r1 F1); a fleet config that cannot be read reports shadow, the default. */
+export const readPoolWouldRefuse = async (deps: Pick<IPoolServiceDeps, 'config'> = defaultPoolServiceDeps()): Promise<IPoolView['wouldRefuse']> => {
+  const config = await deps.config().catch(() => null);
+  return wouldRefuseView(config ? poolModeOf(config) : 'shadow');
+};
+
+const noteShadow = (placed: TPoolPlacement, now: number): void => {
+  if (placed.ok && placed.wouldRefuse) recordWouldRefuse(placed.wouldRefuse, now);
 };
 
 /** A placement only, no lease (a caller that cannot hold one); the waiting tickets still come first. */
 export const placeOnPool = async (req: IPoolPlacementRequest, deps: IPoolServiceDeps = defaultPoolServiceDeps()): Promise<TPoolPlacement> => {
   const [facts, leases] = await Promise.all([gatherFacts(deps), deps.leases()]);
-  return placeWork(statesOf(facts, leases), req, { queue: ticketsOf(leases) });
+  const placed = placeWork(statesOf(facts, leases), req, { queue: ticketsOf(leases) });
+  noteShadow(placed, deps.now());
+  return placed;
+};
+
+/**
+ * Class control-plane is honoured only for the workspace's enabled orchestrator tab, resolved here from the
+ * caller's own identity, never from the request (review r1 F3). Any other caller runs as product, and the answer
+ * says why.
+ */
+export const resolvePoolClass = async (
+  req: IPoolPlacementRequest,
+  holder: ILeaseHolder,
+  authority: Pick<ILeaseAuthority, 'isWorkspaceOrchestrator'>,
+): Promise<{ req: IPoolPlacementRequest; downgrade: string | null }> => {
+  if (req.class !== 'control-plane') return { req, downgrade: null };
+  const coordinator = !holder.admin && !!holder.tabId && !!holder.workspaceId
+    && await authority.isWorkspaceOrchestrator(holder.workspaceId, holder.tabId);
+  if (coordinator) return { req, downgrade: null };
+  return {
+    req: { ...req, class: 'product' },
+    downgrade: `class control-plane is only for the workspace's enabled orchestrator tab; ${holderLabel(holder)} is not, so it runs as product`,
+  };
 };
 
 export interface IPoolAcquireInput {
@@ -227,7 +268,9 @@ export const acquirePoolSlot = async (
   authority: ILeaseAuthority,
   deps: IPoolServiceDeps = defaultPoolServiceDeps(),
 ): Promise<IPoolAcquireResult | IPoolQueuedResult> => {
-  const asked = parsePoolRequest(input);
+  const resolved = await resolvePoolClass(parsePoolRequest(input), holder, authority);
+  const asked = resolved.req;
+  const downgrade = resolved.downgrade ? { downgrade: resolved.downgrade } : {};
   const ticketName = ticketInput(input.ticket);
   if (!absent(input.ttlSeconds) && typeof input.ttlSeconds !== 'number') throw new LeasePolicyError('ttlSeconds must be a number');
   const ttlSeconds = absent(input.ttlSeconds) ? undefined : resolveTtl(POOL_LEASE_KIND, input.ttlSeconds as number, holder) ?? undefined;
@@ -256,7 +299,15 @@ export const acquirePoolSlot = async (
         ttlSeconds,
         note: poolLeaseNote(envelope, cls),
         release: self ? [self.name] : [],
-        value: { queued: false, admitted: { host: placed.host, local: placed.local, slot: `${req.kind}-${n}`, reason: placed.reason, class: cls, envelope: envelopeView(envelope) } },
+        value: {
+          queued: false,
+          admitted: {
+            host: placed.host, local: placed.local, slot: `${req.kind}-${n}`, class: cls, envelope: envelopeView(envelope),
+            reason: resolved.downgrade ? `${resolved.downgrade}; ${placed.reason}` : placed.reason,
+            ...(placed.wouldRefuse ? { wouldRefuse: placed.wouldRefuse } : {}),
+            ...downgrade,
+          },
+        },
       };
     }
     if (!queue || !placed.queueable) throw new PoolError('pool-full', placed.reason, placed.refusal);
@@ -266,11 +317,12 @@ export const acquirePoolSlot = async (
     const position = ordered.findIndex((t) => t.name === name) + 1;
     const result: IPoolQueuedResult = {
       queued: true, ticket: name, kind: req.kind, class: cls, position, of: ordered.length,
-      reason: `queued: position ${position} of ${ordered.length}; ${placed.reason}`,
+      reason: `queued: position ${position} of ${ordered.length}; ${resolved.downgrade ? `${resolved.downgrade}; ` : ''}${placed.reason}`,
       refusal: placed.refusal,
       expiresAt: renew ? new Date(now + QUEUE_TTL_SECONDS * 1000).toISOString() : self!.lease.expiresAt,
       retryAfterSeconds: QUEUE_RETRY_SECONDS,
       envelope: envelopeView(envelope),
+      ...downgrade,
     };
     return renew
       ? { name, ttlSeconds: QUEUE_TTL_SECONDS, note: poolQueueNote(req), value: { queued: true, result } }
@@ -281,6 +333,7 @@ export const acquirePoolSlot = async (
     if (!ticketName) log.warn(`pool: ${value.result.ticket} ${value.result.reason}`);
     return value.result;
   }
+  if (value.admitted.wouldRefuse) recordWouldRefuse(value.admitted.wouldRefuse, deps.now());
   return {
     ...value.admitted,
     lease: lease!.name,
@@ -306,7 +359,7 @@ export interface ITabStartInput {
 }
 
 export type TTabStart =
-  | { state: 'admitted'; host: string; local: boolean; reason: string; lease: string | null; envelope: IPoolEnvelopeView | null }
+  | { state: 'admitted'; host: string; local: boolean; reason: string; lease: string | null; envelope: IPoolEnvelopeView | null; downgrade?: string }
   | { state: 'queued'; queued: IPoolQueuedResult }
   | { state: 'refused'; refusal: TPoolRefusalReason; reason: string };
 
@@ -331,14 +384,19 @@ export const startTabOnPool = async (
   try {
     const got = await acquirePoolSlot({ ...req, queue: true, ticket: input.ticket, ttlSeconds: TAB_START_TTL_SECONDS }, holder, authority, deps);
     if ('queued' in got) return { state: 'queued', queued: got };
-    return { state: 'admitted', host: got.host, local: got.local, reason: got.reason, lease: got.lease, envelope: got.envelope };
+    return { state: 'admitted', host: got.host, local: got.local, reason: got.reason, lease: got.lease, envelope: got.envelope, ...(got.downgrade ? { downgrade: got.downgrade } : {}) };
   } catch (err) {
     if (err instanceof PoolError && err.code === 'pool-full') return { state: 'refused', refusal: err.refusal ?? 'no-known-host', reason: err.message };
     if (!(err instanceof LeaseError) || err.code !== 'caller-unresolved') throw err;
   }
-  const placed = await placeOnPool(parsePoolRequest(req), deps);
-  if (!placed.ok) return { state: 'refused', refusal: placed.refusal, reason: `${placed.reason}; a queued start needs a tab or the admin token` };
-  return { state: 'admitted', host: placed.host, local: placed.local, reason: placed.reason, lease: null, envelope: placed.envelope };
+  const resolved = await resolvePoolClass(parsePoolRequest(req), holder, authority);
+  const why = resolved.downgrade ? `${resolved.downgrade}; ` : '';
+  const placed = await placeOnPool(resolved.req, deps);
+  if (!placed.ok) return { state: 'refused', refusal: placed.refusal, reason: `${why}${placed.reason}; a queued start needs a tab or the admin token` };
+  return {
+    state: 'admitted', host: placed.host, local: placed.local, reason: `${why}${placed.reason}`, lease: null, envelope: placed.envelope,
+    ...(resolved.downgrade ? { downgrade: resolved.downgrade } : {}),
+  };
 };
 
 /** Best effort: a tab start's lease that is not released here ends at its 300 s TTL. */

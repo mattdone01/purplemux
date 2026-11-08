@@ -29,6 +29,8 @@ import { WipCapError, admitAgentCreate, auditOverCap } from '@/lib/tab-cap';
 import { checkEvaluatorBrowser, checkTabRole } from '@/lib/tab-role';
 import { AUTO_HOST, resolveAutoHost, type IAutoPlacement } from '@/lib/pool-tab-placement';
 import { releaseTabStart, startTabOnPool } from '@/lib/pool-service';
+import { sendPoolError } from '@/lib/pool-http';
+import { recordTabStart } from '@/lib/pool-runtime';
 import { resolveCaller } from '@/lib/caller';
 import { leaseAuthority } from '@/lib/lease-http';
 import { holderFromCaller } from '@/lib/lease-store';
@@ -282,6 +284,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       // vel-D4: a start that fits no host waits in the pool's queue; nothing is created and nothing falls back here.
       if (auto.kind === 'queued') return res.status(202).json({ code: 'pool-queued', ...auto.queued });
       if (auto.kind === 'refused') return res.status(409).json({ code: 'pool-full', refusal: auto.refusal, error: auto.reason });
+      if (auto.kind === 'failed') return sendPoolError(res, auto.error);
       autoPlacement = auto.placement;
       requestedHost = auto.host;
       cwdCheckedOnHost = !!auto.cwdChecked;
@@ -337,6 +340,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           ...seat.options,
         });
         if (!tab) return res.status(500).json({ error: 'Failed to create tab' });
+        // The new tab is in its layout (the ledger) but not yet in the host read (review r1 F6).
+        if (autoPlacement?.envelope) recordTabStart(autoPlacement.host, autoPlacement.envelope);
         const wip = admission?.wip() ?? null;
         if (wip && admission?.passedCap() && wipCheck.overCapReason !== null && wipCheck.caller) {
           await auditOverCap({ workspaceId, tabId: tab.id, wip, reason: wipCheck.overCapReason, caller: wipCheck.caller });

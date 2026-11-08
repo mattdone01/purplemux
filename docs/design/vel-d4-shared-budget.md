@@ -20,6 +20,8 @@ Story `vel-d4-shared-budget`. Base commit `05d56b83`. Amends ADR-0039 §2-§5.
    and expected figures. The waiter re-asks with the ticket. The ticket becomes a slot lease in one lease transaction.
 7. `tab create --host auto` always queues. It never falls back to this host on a capacity answer.
 8. The budget comes from fleet config (`pool.budget.<host>.*`, `pool.envelope.<kind>.*`, `pool.harness-share-pct`).
+9. Review round 1 adds `pool.mode` (§9): `shadow`, the shipped default, admits what the budget, measured-memory and
+   sustained-load checks would refuse, and logs and counts it. `enforce` refuses. The release ships shadow.
 
 ## 2. Admission state machine
 
@@ -102,8 +104,8 @@ Other inputs and their answers:
 - A stored budget value that is not valid (hand-edited) keeps the default, as `pool.slots.*` does.
 - A ticket for a request larger than every allowed host is refused at once (`too-large`): a ticket that can never
   be admitted would block its hosts for every request behind it.
-- A pool that does not answer `tab create --host auto` in 2 s still creates the tab here (ADR-0039 §4), and logs it.
-  That answer is not about capacity. A tab lease that the late answer took expires in 300 s.
+- A pool that does not answer the first `tab create --host auto` ask (no ticket) in 2 s still creates the tab here
+  (ADR-0039 §4), and logs it. That answer is not about capacity. The late answer is given back (review r1 F4, §9).
 - A `--cwd` missing on the chosen remote host releases that host's tab lease and asks the pool again for this host
   only. This host is admitted or queued on its own budget. It is never a free fallback.
 
@@ -144,9 +146,12 @@ Reserve default: `max(2, ceil(25 % of threads))` threads and `max(4, ceil(15 % o
 | tab | 2 | 4 |
 
 A request's `--mem` raises the memory envelope; `--threads` sets the thread envelope. Neither host has a cgroup CPU
-limit (measured). ai-server reached load 147 on 64 threads; mdserver1 runs at load 55-67 on 32 threads. On those
-reads the measured CPU check refuses new work on both hosts until the load falls under the host's threads; the owner
-can raise `pool.budget.<host>.max-load` per host.
+limit (measured). ai-server reached load 147 on 64 threads; mdserver1 runs at load 55-93 on 32 threads.
+
+**`max-load` defaults to the host's threads, and that default is a placeholder.** The measured baseline load is 1.7
+to 2.9 times the thread count, so in enforce mode this default would refuse every pooled start. The release ships
+`pool.mode=shadow`. After one day the owner sets `pool.budget.<host>.max-load` per host from the would-refuse log
+(`min_load + pending_threads + envelope_threads` against `max_load` on each line), then sets `pool.mode=enforce`.
 
 ## 6. Launchers that must still migrate
 
@@ -168,8 +173,9 @@ measured check).
 ## 7. Mutation record
 
 Each mutation was applied to the final tree by a script (one at a time, exact-match replacement), the named test file
-was run, and the file was restored. All 26 were killed (the test file failed). Run on 2026-11-08 against the tree that
-this commit holds.
+was run, and the file was restored. Round 1 re-ran all 42 on the round-1 tree (M1-M26 still killed; M7's pattern now
+carries the mode). M29 first survived: its test had a clean host that also won the sort, so the test was changed to make
+the shadowed host win the sort, and M29 was then killed. All 42 are killed on the round-1 tree.
 
 | # | Branch proved | File | Mutation | Killed by (first failing test) |
 |---|---|---|---|---|
@@ -199,17 +205,52 @@ this commit holds.
 | M24 | the route releases the start lease | `tabs/index.ts` | no release in `finally` | cli-tabs-remote.test: a claude-code tab goes where the pool admits it |
 | M25 | budget keys are range-checked when written | `fleet-config-http.ts` | the numeric check is off | fleet-config-pool-keys.test: the admin sets pool.budget.ai-lan.threads=64 |
 | M26 | the CLI prints a queued line only on a change | `bin/cli.js` `waitInQueue` | a line on every ask | cli-tab-host.test: a queued --host auto start waits |
+| M27 | shadow admits the soft checks (r1 F1) | `pool.ts` `fitOn` | shadow refuses like enforce | pool.test: shadow admits a budget refusal with the would-refuse figures |
+| M28 | the default mode is shadow (r1 F1) | `pool.ts` | default enforce | pool.test: the mode reads shadow unless the fleet value is exactly enforce |
+| M29 | shadow prefers a host that passes every check | `pool.ts` `placeWork` | shadowed and clean hosts sorted together | pool.test: shadow takes a host that passes every check first |
+| M30 | a shadow admission is logged and counted (r1 F1, F7) | `pool-service.ts` | no record | pool-service.test: admits what enforce refuses, logs one line |
+| M31 | only the orchestrator keeps control-plane (r1 F3) | `pool-service.ts` `resolvePoolClass` | any caller keeps it | pool-service.test: a worker claiming control-plane is downgraded |
+| M32 | a ticket blocks only a host it fits (r1 F5) | `pool.ts` `ticketCouldRunOn` | every allowed host | pool.test: a 30-thread ticket does not block mdserver1 |
+| M33 | tab starts older than the lag are in the read (r1 F6) | `pool.ts` `hostState` | every recorded start pending | pool.test: a burst of 5 tab starts within LOAD_LAG_MS counts |
+| M34 | recent tab starts add pending threads (r1 F6) | `pool.ts` `hostState` | not added | pool.test: shadow admits a sustained overload ... tuning figures |
+| M35 | a re-ask timeout never creates (r1 F4) | `pool-tab-placement.ts` | a re-ask timeout falls back | pool-tab-placement.test: a timeout on a re-ask with a ticket creates nothing |
+| M36 | only a timeout falls back (r1 F4) | `pool-tab-placement.ts` | any first-ask error falls back | pool-tab-placement.test: a pool error on a first ask is an answer |
+| M37 | a late answer is given back (r1 F4) | `pool-tab-placement.ts` | no give-back | pool-tab-placement.test: a late admission gives its start lease back |
+| M38 | `pool.mode` is checked when written (r1 F1) | `fleet-config-http.ts` | no check | fleet-config-pool-keys.test: the admin sets pool.mode=shadow |
+| M39 | the route records a created tab start (r1 F6) | `tabs/index.ts` | no record | cli-tabs-remote.test: a created agent tab is recorded |
+| M40 | a pool timeout is 503 pool-timeout (r1 F4) | `pool-http.ts` | unmapped | cli-tabs-remote.test: a re-ask the pool does not answer in 2 s is 503 |
+| M41 | the fleet view carries the counter (r1 F1) | `fleet-status-snapshot.ts` | dropped | fleet-status-snapshot.test: carries the counter when it is read |
+| M42 | the panel never shows a raw mode token | `fleet-status-panel.tsx` | raw token | fleet-status-panel.test: shows the mode label, the total and each host |
 
 ## 8. Decisions taken without a consult, and residual risk
 
 - **Plain `tab create` does not ask the pool.** At create time nothing tells a coordinator from a worker (ADR-0039 §4:
   "no tab is a coordinator at create time"). Gating it would queue coordinators and change every existing caller.
   It is the first launcher in §6.
-- **The measured CPU check is on.** With the measured loads (mdserver1 55-67 on 32, ai-server up to 147 on 64), a
-  pooled start on either host waits until the load falls, unless the owner raises `pool.budget.<host>.max-load`.
-  This is the intended answer to "it does not refuse an overloaded host", but it can hold work back while
-  unpooled launchers keep the load high.
-- **A pool that does not answer in 2 s still creates the tab here.** That answer is not about capacity, and the
-  tab create must not fail when the pool is down (ADR-0039 §4).
+- **The measured CPU check ships in shadow mode** (review r1 F1, F2). Under enforce, with the measured loads, the
+  placeholder `max-load` would hold every pooled start. Shadow admits and logs, so nothing stalls at release.
+- **Only a first ask with no ticket that the pool does not answer in 2 s creates the tab here** (review r1 F4).
+  That answer is not about capacity, and the tab create must not fail when the pool is down (ADR-0039 §4). A late
+  answer is given back.
 - **No cgroup enforcement.** purplemux returns the envelope; the launcher must apply it (§3).
 - **The tab envelope (2 threads, 4 GiB) is an estimate**, not a measurement. Change it with `pool.envelope.tab.*`.
+
+## 9. Review round 1 (PR #45, BLOCK) and the rulings carried out
+
+| # | Ruling | What changed | Proved by |
+|---|---|---|---|
+| 1 | Add `pool.mode=shadow\|enforce`, default shadow, checked when written. Shadow admits and logs; a counter is on the pool view and the fleet view. | `fitOn` returns the no-budget, no-memory and overloaded checks as `shadowed` in shadow mode. `placeWork` prefers a host that passes every check. A shadow admission carries `wouldRefuse`. The service logs one line and counts it (`pool-runtime.ts`, on globalThis). The counter is `IPoolView.wouldRefuse`, `IFleetView.pool`, a Mission Control fleet line and a `pool show` line. Every other check still refuses. | M27-M30, M38, M41, M42 |
+| 2 | Keep the thread-count default for `max-load`; document it as a placeholder tuned from the shadow log. | The would-refuse line carries `min_load`, `pending_threads`, `envelope_threads`, `envelope_mem_gib`, `max_load`, the memory figures and `agent_tabs`. The text is in §5, the API guide and ADR-0039. | pool.test: the log line carries the tuning figures |
+| 3 | Honour control-plane only for a coordinator resolved server-side. | `resolvePoolClass` checks `isWorkspaceOrchestrator(caller.workspaceId, caller.tabId)`, from the caller's own identity. The admin token and a tabless caller do not count. Any other caller runs as product, and `downgrade` (with the reason) says why. This covers `tab create --host auto` and `pool acquire`. | M31 |
+| 4 | Fall back locally only on a timeout of a first ask with no ticket. Map the codes. A failed re-ask never creates. Give back a late answer. | `PoolTimeoutError` is the only failure that may fall back. Every other failure is `{kind: 'failed'}`, and the route answers it through `sendPoolError`: ticket-gone 409, invalid 400, full 409, timeout 503, unreadable 503 or 500. A late start lease is released. A late ticket is released when it came from a first ask. A late queued re-ask keeps the waiter's own ticket. | M35-M37, M40 |
+| 5 | A ticket counts against a host only if its envelope fits that host's worker budget and the harness share. | `ticketCouldRunOn`. | M32 |
+| 6 | Count tabs created within `LOAD_LAG_MS` as unseen. | The route records each created agent tab start (`recordTabStart`). `hostState` adds starts younger than the read lag to the pending threads and memory. | M33, M34, M39 |
+| 7 | Covered by shadow; log the ledger's agent-tab count per host. | `agent_tabs=worker:N,control-plane:M` on every would-refuse line. | pool.test: the log line |
+| 8 | Nit accepted, no change. | — | — |
+
+Residual risk:
+
+- The would-refuse counter and the recent tab starts are in memory and start empty when the server restarts. The
+  counter states its `since`. A tab start older than the read lag is in the next read anyway.
+- In shadow mode a queue still forms only on the checks that refuse in both modes (unknown host, disk, count cap,
+  harness share, an earlier ticket).

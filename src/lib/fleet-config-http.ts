@@ -18,7 +18,7 @@ import { LEDGER_WAIT_REASONS } from '@/lib/ledger';
 import { leaseAuthority } from '@/lib/lease-http';
 import { STANDUP_DUE_CONFIG_KEY, parseStandupDueMinutes } from '@/lib/standup';
 import { createLogger } from '@/lib/logger';
-import { isPoolNumberKey, poolNumberRefusal } from '@/lib/pool';
+import { POOL_MODE_KEY, isPoolMode, isPoolNumberKey, poolNumberRefusal } from '@/lib/pool';
 import type { IFleetConfigChange, IFleetConfigSetter, IFleetConfigState, IFleetConfigValue } from '@/types/fleet-config';
 import { REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_KEY, callbackUrlRefusal, isValidBareHostName, isValidRemoteHostName, parseCallbackAllowHosts } from '@/lib/remote-host';
 
@@ -74,6 +74,10 @@ const checkTabCapValue = (key: string, value: string): void => {
  */
 const checkPoolValue = (key: string, value: string): void => {
   if (!key.startsWith('pool.')) return;
+  if (key === POOL_MODE_KEY) {
+    if (!isPoolMode(value.trim())) throw new FleetConfigError('config-invalid', `${key} must be shadow or enforce, got ${JSON.stringify(value)}`);
+    return;
+  }
   if (isPoolNumberKey(key)) {
     const refusal = poolNumberRefusal(key, value);
     if (refusal) throw new FleetConfigError('config-invalid', refusal);
@@ -88,7 +92,7 @@ const checkPoolValue = (key: string, value: string): void => {
     return;
   }
   throw new FleetConfigError('config-invalid', `${key} is not a pool key: pool.slots.<host>.<kind>, pool.fallback.<alias>, pool.gate-host.<host>, `
-    + 'pool.budget.<host>.<threads|mem-gb|reserve-threads|reserve-mem-gb|max-load>, pool.envelope.<kind>.<threads|mem-gb> or pool.harness-share-pct');
+    + 'pool.budget.<host>.<threads|mem-gb|reserve-threads|reserve-mem-gb|max-load>, pool.envelope.<kind>.<threads|mem-gb>, pool.harness-share-pct or pool.mode');
 };
 
 /** Values the remote keys must hold, checked at write time so a bad one never reaches a create. */

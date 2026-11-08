@@ -29,7 +29,8 @@ const tabC = tab('tab-c');
 const noTab: ILeaseHolder = { workspaceId: 'ws1', tabId: null, tabName: null, verified: false, admin: false };
 
 let now = Date.parse('2026-11-03T07:00:00Z');
-const authority = { now: () => now, isWorkspaceOrchestrator: async () => false };
+const orchestratorTab = vi.hoisted(() => ({ id: 'tab-o' }));
+const authority = { now: () => now, isWorkspaceOrchestrator: async (_ws: string, tabId: string) => tabId === orchestratorTab.id };
 
 const metrics = (over: Partial<IPoolMetrics>): IPoolMetrics => ({
   threads: 32, load1: 16, load5: 16, memTotalBytes: 91 * GIB, memAvailableBytes: 40 * GIB,
@@ -72,7 +73,8 @@ beforeEach(async () => {
   mockHome.value = await makeHome();
   now = Date.parse('2026-11-03T07:00:00Z');
   reads = [{ ...md, readAt: now, metrics: metrics({}) }, aiRead()];
-  config = {};
+  config = { 'pool.mode': 'enforce' };
+  delete (globalThis as Record<string, unknown>).__ptPoolRuntime;
   tabs = new Map();
 });
 
@@ -114,7 +116,7 @@ describe('pool acquire / release (AC 2)', () => {
 
   it('a held slot counts; when every count cap is held the answer is pool-full with the counts', async () => {
     const { acquirePoolSlot } = await service();
-    config = { 'pool.slots.ai-lan.gate': '1', 'pool.slots.mdserver1.gate': '1' };
+    config = { 'pool.mode': 'enforce', 'pool.slots.ai-lan.gate': '1', 'pool.slots.mdserver1.gate': '1' };
     const d = await deps();
     expect(admitted(await acquirePoolSlot({ kind: 'gate' }, tabA, authority, d)).host).toBe('ai-lan');
     expect(admitted(await acquirePoolSlot({ kind: 'gate' }, tabA, authority, d)).host).toBe('mdserver1');
@@ -125,7 +127,7 @@ describe('pool acquire / release (AC 2)', () => {
 
   it('an expired lease frees its slot', async () => {
     const { acquirePoolSlot } = await service();
-    config = { 'pool.slots.ai-lan.gate': '1', 'pool.slots.mdserver1.gate': '0' };
+    config = { 'pool.mode': 'enforce', 'pool.slots.ai-lan.gate': '1', 'pool.slots.mdserver1.gate': '0' };
     const d = await deps();
     await acquirePoolSlot({ kind: 'gate', ttlSeconds: 60 }, tabA, authority, d);
     await expect(acquirePoolSlot({ kind: 'gate' }, tabB, authority, d)).rejects.toMatchObject({ code: 'pool-full' });
@@ -136,7 +138,7 @@ describe('pool acquire / release (AC 2)', () => {
 
   it('release frees the slot for the next caller; only the holder releases; a non-pool name is refused', async () => {
     const { acquirePoolSlot, releasePoolSlot } = await service();
-    config = { 'pool.slots.ai-lan.gate': '1', 'pool.slots.mdserver1.gate': '0' };
+    config = { 'pool.mode': 'enforce', 'pool.slots.ai-lan.gate': '1', 'pool.slots.mdserver1.gate': '0' };
     const d = await deps();
     const { lease } = admitted(await acquirePoolSlot({ kind: 'gate' }, tabA, authority, d));
     await expect(releasePoolSlot(lease, tabB, authority)).rejects.toMatchObject({ code: 'lease-held-by-other' });
@@ -164,7 +166,7 @@ describe('pool acquire / release (AC 2)', () => {
 
   it('a remote gate names the gate-host container mapped from gate.remote-hosts (pool.gate-host.<host>)', async () => {
     const { acquirePoolSlot } = await service();
-    config = { 'pool.gate-host.ai-lan': 'gatehost-replica' };
+    config = { 'pool.mode': 'enforce', 'pool.gate-host.ai-lan': 'gatehost-replica' };
     expect(await acquirePoolSlot({ kind: 'gate' }, tabA, authority, await deps())).toMatchObject({ host: 'ai-lan', gateHost: 'gatehost-replica' });
     expect(await acquirePoolSlot({ kind: 'build' }, tabA, authority, await deps())).toMatchObject({ host: 'ai-lan', gateHost: null });
   });
@@ -297,14 +299,39 @@ describe('tab starts (vel-D4 AC 3, design §4 input 3)', () => {
     expect(await startTabOnPool({ panelType: 'claude-code', ticket: head.ticket }, headHolder, authority, d)).toMatchObject({ state: 'admitted' });
   });
 
-  it('a control-plane start is admitted here when every worker budget is full', async () => {
+  it('a control-plane start from the workspace orchestrator is admitted here when every worker budget is full', async () => {
     const { startTabOnPool } = await service();
     tabs = new Map([['mdserver1', { worker: 12, controlPlane: 0 }], ['ai-lan', { worker: 24, controlPlane: 0 }]]);
     const d = await deps();
     expect(await startTabOnPool({ panelType: 'claude-code' }, tabA, authority, d)).toMatchObject({ state: 'queued' });
-    expect(await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, tabB, authority, d)).toMatchObject({
+    expect(await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, tab('tab-o'), authority, d)).toMatchObject({
       state: 'admitted', host: 'mdserver1', local: true, lease: 'pool:mdserver1/tab-1', reason: expect.stringContaining('control-plane reserve'),
     });
+  });
+
+  it('a worker claiming control-plane is downgraded to product and queued like any worker; the answer says why (r1 F3)', async () => {
+    const { startTabOnPool } = await service();
+    tabs = new Map([['mdserver1', { worker: 12, controlPlane: 0 }], ['ai-lan', { worker: 24, controlPlane: 0 }]]);
+    const d = await deps();
+    const got = await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, tabA, authority, d);
+    expect(got).toMatchObject({
+      state: 'queued',
+      queued: { class: 'product', downgrade: expect.stringContaining('only for the workspace\'s enabled orchestrator tab; ws1/tab-a (tab-a) is not'), reason: expect.stringContaining('runs as product') },
+    });
+    const admin: ILeaseHolder = { workspaceId: null, tabId: null, tabName: null, verified: false, admin: true };
+    expect(await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, admin, authority, d)).toMatchObject({ state: 'queued', queued: { class: 'product' } });
+    expect(await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, noTab, authority, d)).toMatchObject({
+      state: 'refused', reason: expect.stringContaining('runs as product'),
+    });
+  });
+
+  it('pool acquire downgrades the same claim; the orchestrator keeps it', async () => {
+    const { acquirePoolSlot } = await service();
+    const d = await deps();
+    expect(await acquirePoolSlot({ kind: 'tab', class: 'control-plane' }, tabA, authority, d)).toMatchObject({ class: 'product', host: 'ai-lan', downgrade: expect.stringContaining('runs as product') });
+    const kept = await acquirePoolSlot({ kind: 'tab', class: 'control-plane' }, tab('tab-o'), authority, d);
+    expect(kept).toMatchObject({ class: 'control-plane', host: 'mdserver1' });
+    expect(kept).not.toHaveProperty('downgrade');
   });
 
   it('a non-agent tab is placed here with no lease; a caller with no tab is placed without a lease and cannot queue', async () => {
@@ -320,8 +347,51 @@ describe('tab starts (vel-D4 AC 3, design §4 input 3)', () => {
 
   it('a start too large for any host is refused, not queued', async () => {
     const { startTabOnPool } = await service();
-    config = { 'pool.envelope.tab.threads': '64' };
+    config = { 'pool.mode': 'enforce', 'pool.envelope.tab.threads': '64' };
     expect(await startTabOnPool({ panelType: 'claude-code' }, tabA, authority, await deps())).toMatchObject({ state: 'refused', refusal: 'too-large' });
+  });
+});
+
+describe('shadow mode, the default (review r1 F1, F2, F7)', () => {
+  it('admits what enforce refuses, logs one line with the figures, and counts it on the pool view', async () => {
+    const { acquirePoolSlot, readPoolView, readPoolWouldRefuse } = await service();
+    config = { 'pool.mode': 'enforce' };
+    reads = [{ ...md, state: 'unknown', readAt: null, reason: 'not read', retryAt: now }, aiRead()];
+    const d = await deps();
+    for (let i = 0; i < 6; i += 1) await acquirePoolSlot({ kind: 'gate' }, tabA, authority, d);
+    await expect(acquirePoolSlot({ kind: 'gate' }, tabB, authority, d)).rejects.toMatchObject({ code: 'pool-full', refusal: 'no-budget' });
+    config = {};
+    const got = admitted(await acquirePoolSlot({ kind: 'gate' }, tabB, authority, d));
+    expect(got).toMatchObject({ host: 'ai-lan', wouldRefuse: { refusals: ['no-budget', 'overloaded'] }, reason: expect.stringContaining('shadow mode admitted') });
+    const lines = warnings.filter((w) => w.startsWith('pool would-refuse (shadow, admitted):'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('host=ai-lan kind=gate class=product refusals=no-budget,overloaded min_load=16 pending_threads=48 envelope_threads=8');
+    expect(lines[0]).toContain('agent_tabs=worker:0,control-plane:0');
+    const view = await readPoolView(d);
+    expect(view.wouldRefuse).toMatchObject({ mode: 'shadow', total: 1, byHost: { 'ai-lan': { total: 1, byRefusal: { 'no-budget': 1, overloaded: 1 } } }, last: { line: lines[0] } });
+    expect(await readPoolWouldRefuse(d)).toMatchObject({ mode: 'shadow', total: 1 });
+    config = { 'pool.mode': 'enforce' };
+    expect((await readPoolView(d)).wouldRefuse).toMatchObject({ mode: 'enforce', total: 1 });
+  });
+
+  it('a fleet config that cannot be read reports the counter in shadow, the default', async () => {
+    const { readPoolWouldRefuse } = await service();
+    expect(await readPoolWouldRefuse({ config: async () => { throw new Error('unreadable'); } })).toMatchObject({ mode: 'shadow', total: 0, last: null });
+  });
+});
+
+describe('tab starts the read cannot show yet (review r1 F6)', () => {
+  it('a tab created since the read counts in the measured memory until the read can show it', async () => {
+    const { placeOnPool } = await service();
+    const { recordTabStart } = await import('@/lib/pool-runtime');
+    reads = [{ ...md, state: 'unknown', readAt: null, reason: 'not read', retryAt: now }, aiRead({ memAvailableBytes: 250 * GIB })];
+    const d = await deps();
+    expect(await placeOnPool({ kind: 'gate', memGb: 0 }, d)).toMatchObject({ ok: true, host: 'ai-lan' });
+    recordTabStart('ai-lan', { threads: 2, memGb: 240 }, now - 1_000);
+    expect(await placeOnPool({ kind: 'gate', memGb: 0 }, d)).toMatchObject({ ok: false, refusal: 'no-memory', reason: expect.stringContaining('measured 10.0 GiB free') });
+    now += 61_000;
+    reads = [reads[0], aiRead({ memAvailableBytes: 250 * GIB })];
+    expect(await placeOnPool({ kind: 'gate', memGb: 0 }, d)).toMatchObject({ ok: true, host: 'ai-lan' });
   });
 });
 

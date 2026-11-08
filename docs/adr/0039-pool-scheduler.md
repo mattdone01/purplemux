@@ -116,6 +116,19 @@ has a hard timeout of about 5 s. A failed `ai-lan` read tries the tailnet alias 
    tickets, TTL 120 s, re-asked by the waiter). A tab start no longer falls back to this host on a refusal; only a
    pool that does not answer in 2 s still creates the tab here.
 6. The pool stays advisory: a plain `tab create` and the launchers in the design doc §6 do not ask it yet.
+7. Review round 1 (PR #45):
+   - `pool.mode` is `shadow` (the default, and what any value other than `enforce` reads as) or `enforce`, and is
+     checked when written. In shadow mode the `no-budget`, `no-memory` and `overloaded` checks admit, log one
+     `pool would-refuse (shadow, admitted):` line (host, kind, class, min(load1, load5), pending threads, envelope,
+     max-load, memory, agent tabs) and count it (`wouldRefuse` on the pool view, `pool` on the fleet view). The
+     default `max-load` (the host's threads) is a placeholder: go-live runs shadow for a day, tunes
+     `pool.budget.<host>.max-load` from the log, then sets `enforce`.
+   - Class `control-plane` is honoured only for the workspace's enabled orchestrator tab, resolved from the caller's
+     identity. Any other caller runs as `product`, and the answer says why.
+   - `tab create --host auto` falls back to this host only when a first ask with no ticket gets no answer in 2 s. A
+     late answer is given back. Every other pool failure is an answer and creates nothing.
+   - A ticket holds a host back only if its envelope fits that host's worker budget (and the harness share).
+   - Tab starts created within the read lag count as unseen in the measured checks.
 
 ## Consequences
 One placement call replaces the remote-gate rule sets, and v2's `tools/slot.sh` and `tools/gate-remote.sh` can ask it.

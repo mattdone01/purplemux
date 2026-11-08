@@ -7,7 +7,9 @@ const layout = vi.hoisted(() => ({ addTabToPane: vi.fn() }));
 const registry = vi.hoisted(() => ({ hosts: ['ai-server'] as string[] | Error }));
 const registerTab = vi.hoisted(() => vi.fn());
 const pool = vi.hoisted(() => ({ start: vi.fn(), release: vi.fn() }));
-vi.mock('@/lib/pool-service', () => ({ startTabOnPool: pool.start, releaseTabStart: pool.release }));
+vi.mock('@/lib/pool-service', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/pool-service')>()), startTabOnPool: pool.start, releaseTabStart: pool.release,
+}));
 vi.mock('@/lib/caller', () => ({
   resolveCaller: vi.fn(async () => ({ scope: { type: 'workspace', workspaceId: 'ws-a' }, workspaceId: 'ws-a', tabId: 'tab-o', tabName: 'o', verified: true, identity: 'launch', admin: false })),
 }));
@@ -286,12 +288,49 @@ describe('POST /api/cli/tabs with host auto (ADR-0039 §4; consult ruling, story
     expect(pool.start).toHaveBeenCalledWith({ panelType: 'claude-code', class: 'control-plane', ticket: 'pool-queue:tab-3' }, expect.anything(), expect.anything());
   });
 
-  it('a pool that fails places the tab here and logs it: no answer is not a capacity answer', async () => {
+  it('a pool that fails with an error that is not a timeout creates nothing (review r1 F4)', async () => {
     pool.start.mockRejectedValue(new Error('fleet-config.json is malformed'));
     const failed = await call('POST', { workspaceId: 'ws-a', host: 'auto', panelType: 'claude-code', launch: false });
-    expect(failed.statusCode).toBe(201);
-    expect(failed.body).not.toHaveProperty('host');
-    expect(failed.body).toMatchObject({ placement: { local: true, fallback: true, reason: expect.stringContaining('fleet-config.json is malformed') } });
+    expect(failed.statusCode).toBe(500);
+    expect(layout.addTabToPane).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['pool-ticket-gone', 409],
+    ['pool-invalid', 400],
+    ['pool-full', 409],
+  ] as const)('a %s answer is HTTP %i and creates nothing (review r1 F4)', async (code, status) => {
+    const { PoolError } = await import('@/lib/pool-service');
+    pool.start.mockRejectedValue(new PoolError(code, `${code} from the pool`));
+    const state = await call('POST', { workspaceId: 'ws-a', host: 'auto', panelType: 'claude-code', queueTicket: 'pool-queue:tab-1', launch: false });
+    expect(state.statusCode).toBe(status);
+    expect(state.body).toMatchObject({ code, error: `${code} from the pool` });
+    expect(layout.addTabToPane).not.toHaveBeenCalled();
+  });
+
+  it('a re-ask the pool does not answer in 2 s is 503 pool-timeout and creates nothing (review r1 F4)', async () => {
+    pool.start.mockImplementation(() => new Promise(() => {}));
+    vi.useFakeTimers();
+    try {
+      const pending = call('POST', { workspaceId: 'ws-a', host: 'auto', panelType: 'claude-code', queueTicket: 'pool-queue:tab-1', launch: false });
+      await vi.advanceTimersByTimeAsync(2_000);
+      const state = await pending;
+      expect(state.statusCode).toBe(503);
+      expect(state.body).toMatchObject({ code: 'pool-timeout', error: expect.stringContaining('nothing was created') });
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(layout.addTabToPane).not.toHaveBeenCalled();
+  });
+
+  it('a created agent tab is recorded as a tab start the next read cannot show yet (review r1 F6)', async () => {
+    const { recentTabStarts } = await import('@/lib/pool-runtime');
+    const before = recentTabStarts().get('ai-lan')?.length ?? 0;
+    await call('POST', { workspaceId: 'ws-a', host: 'auto', panelType: 'claude-code', launch: false });
+    expect(recentTabStarts().get('ai-lan')).toHaveLength(before + 1);
+    pool.start.mockResolvedValue(queuedStart);
+    await call('POST', { workspaceId: 'ws-a', host: 'auto', panelType: 'claude-code', launch: false });
+    expect(recentTabStarts().get('ai-lan')).toHaveLength(before + 1);
   });
 
   it('a --cwd missing on the chosen host gives that start back and creates the tab here on this host\'s budget', async () => {
