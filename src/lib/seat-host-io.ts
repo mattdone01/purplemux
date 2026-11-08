@@ -2,10 +2,13 @@ import { execFile } from 'child_process';
 import fs from 'fs/promises';
 import path from 'path';
 import { promisify } from 'util';
-import { SeatHostUnreachable } from '@/lib/context-lifecycle';
+import { HandoffRefused, SeatHostUnreachable } from '@/lib/context-lifecycle';
 import { describeRemoteFailure, isSshFailure, runSsh, runSshBuffer, shQuote } from '@/lib/remote-host';
 import { GIT_FACTS_SCRIPT, parseGitFacts, sha256 } from '@/lib/rotation-checkpoint';
+import { HANDOFF_MAX_BYTES } from '@/lib/handoff-check';
+import type { ISeatTab } from '@/types/context-lifecycle';
 import type { IGitFacts, IRotationCheckpoint } from '@/types/rotation-checkpoint';
+import type { ITab } from '@/types/terminal';
 
 // vel-D5: a seat's files and git facts on the host the tab runs on. A local seat reads this host; a remote seat
 // (ADR-0022) goes over ssh. Only the transport failing is `SeatHostUnreachable`; the rotation waits on it.
@@ -15,6 +18,49 @@ const IO_TIMEOUT_MS = 15_000;
 const MAX_FILE_BYTES = 1024 * 1024;
 
 export const checkpointCopyPath = (handoffPath: string): string => `${handoffPath}.checkpoint.json`;
+
+/** The checker's own size refusal (`handoff-check.ts`), for a remote file too long to read whole. */
+export class HandoffTooLarge extends HandoffRefused {
+  constructor() {
+    super(`size over ${MAX_FILE_BYTES} bytes (expected at most ${HANDOFF_MAX_BYTES}, 12 KB)`);
+    this.name = 'HandoffTooLarge';
+  }
+}
+
+const MAX_BUFFER = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+
+export interface ISeatPlaceDeps {
+  /** The tab in its workspace layout; null when the layout does not name it; throws when it cannot be read. */
+  findTab: (sessionName: string, workspaceId: string) => Promise<ITab | null>;
+  /** The live working directory of a local session. */
+  sessionCwd: (sessionName: string) => Promise<string | null>;
+}
+
+/**
+ * Where a seat runs and in which directory (review r1 F3). The seat's own host wins when it is known: a remote seat
+ * never falls back to this host because a layout read failed. A seat whose host is not known (`undefined`, an entry
+ * registered before its first poll) takes it from its layout; when that cannot be read the seat waits.
+ */
+export const resolveSeatPlace = async (seat: ISeatTab, sessionName: string | null, deps: ISeatPlaceDeps): Promise<{ host: string | null; cwd: string | null }> => {
+  let tab: ITab | null = null;
+  let layoutError: unknown = null;
+  if (sessionName) {
+    try {
+      tab = await deps.findTab(sessionName, seat.workspaceId);
+    } catch (err) {
+      layoutError = err;
+    }
+  }
+  let host: string | null;
+  if (seat.host !== undefined) host = seat.host;
+  else if (tab) host = tab.host ?? null;
+  else {
+    const why = layoutError instanceof Error ? layoutError.message : sessionName ? 'its layout does not name it' : 'it has no session';
+    throw new SeatHostUnreachable(`the host of seat ${seat.tabName} is not known (${why})`);
+  }
+  const live = !host && sessionName ? await deps.sessionCwd(sessionName) : null;
+  return { host, cwd: live ?? tab?.cwd ?? null };
+};
 
 export interface ISeatHostIoDeps {
   runSsh: typeof runSsh;
@@ -40,11 +86,15 @@ export const createSeatHostIo = (deps: ISeatHostIoDeps = realDeps) => {
     if (!host) return decode(await fs.readFile(file));
     let bytes: Buffer;
     try {
-      bytes = await deps.runSshBuffer(host, `cat -- ${shQuote(file)}`, { timeoutMs: IO_TIMEOUT_MS, maxBytes: MAX_FILE_BYTES });
+      // One byte past the cap tells a file that is too long from one that fits, and never fills the buffer.
+      bytes = await deps.runSshBuffer(host, `head -c ${MAX_FILE_BYTES + 1} -- ${shQuote(file)}`, { timeoutMs: IO_TIMEOUT_MS, maxBytes: MAX_FILE_BYTES + 1 });
     } catch (err) {
+      // A full buffer is the file's size, not the network (review r1 F4).
+      if ((err as { code?: unknown } | null)?.code === MAX_BUFFER) throw new HandoffTooLarge();
       if (isSshFailure(err)) throw unreachable(host, err);
       throw new Error(`${file} cannot be read on ${host} (${describeRemoteFailure(err)})`);
     }
+    if (bytes.length > MAX_FILE_BYTES) throw new HandoffTooLarge();
     return decode(bytes);
   };
 
@@ -69,10 +119,10 @@ export const createSeatHostIo = (deps: ISeatHostIoDeps = realDeps) => {
 
   const gitFacts = async (host: string | null, cwd: string | null, expectedHead: string | null): Promise<IGitFacts> => {
     const args = [cwd ?? '', expectedHead ?? ''];
-    if (!host) return parseGitFacts(await deps.runLocal(args), cwd);
+    if (!host) return { ...parseGitFacts(await deps.runLocal(args), cwd), host: null };
     try {
       const { stdout } = await deps.runSsh(host, `sh -s -- ${args.map(shQuote).join(' ')}`, { timeoutMs: IO_TIMEOUT_MS, input: GIT_FACTS_SCRIPT });
-      return parseGitFacts(stdout, cwd);
+      return { ...parseGitFacts(stdout, cwd), host };
     } catch (err) {
       if (isSshFailure(err)) throw unreachable(host, err);
       throw new Error(`git facts on ${host} failed (${describeRemoteFailure(err)})`);

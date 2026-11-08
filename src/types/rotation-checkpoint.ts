@@ -4,6 +4,8 @@
  */
 export interface IGitFacts {
   kind: 'ok' | 'no-repo' | 'no-cwd';
+  /** The ssh alias the facts were read on; null on the control host, absent when the reader did not say. */
+  host?: string | null;
   cwd: string | null;
   worktree: string | null;
   /** Null on a detached HEAD. */
@@ -76,10 +78,10 @@ export interface IRotationSeatRow {
   itemKey: string;
   holder: string | null;
   phase: string | null;
-  rotations: number;
-  handoffRefusals: number;
-  checkpointRefusals: number;
-  rotationTimeouts: number;
+  rotations: number | null;
+  handoffRefusals: number | null;
+  checkpointRefusals: number | null;
+  rotationTimeouts: number | null;
   checkpointRefused: string | null;
   checkpointMismatch: string | null;
   lastWaitToRotateMs: number | null;
@@ -88,18 +90,18 @@ export interface IRotationSeatRow {
 }
 
 export interface IRotationCoverage {
-  /** Agent tabs in every readable layout. */
+  /** Agent tabs in every readable layout. The rotation totals below count closed seats too. */
   workers: number;
   /** Agent tabs with a handoff path whose rotation is not off. */
   covered: number;
   /** covered / workers, or null with no worker. */
   coverage: number | null;
-  rotations: number;
-  handoffRefusals: number;
-  checkpointRefusals: number;
-  rotationTimeouts: number;
-  /** Rotation due to the clear, summed over the rotations that recorded it. */
-  waitToRotateTotalMs: number;
+  rotations: number | null;
+  handoffRefusals: number | null;
+  checkpointRefusals: number | null;
+  rotationTimeouts: number | null;
+  /** Rotation due to the clear, summed over the rotations that recorded it. A null counter was never written: not measured. */
+  waitToRotateTotalMs: number | null;
   waitToRotateMeanMs: number | null;
   seats: IRotationSeatRow[];
 }

@@ -60,6 +60,43 @@ describe('rotation_checkpoints', () => {
     expect(store.checkpoints.mark('ws-a', 'seat:ws-a:nope#1', ['written'], 'cleared', 9)).toBe(false);
   });
 
+  it('review r1 F1: a closed tab\'s unfinished rows become abandoned; finished rows and other tabs stay', () => {
+    const store = new LedgerStore(':memory:');
+    store.checkpoints.put(cp(1), 5);
+    store.checkpoints.mark('ws-a', 'seat:ws-a:kit#1', ['written'], 'delivered', 6);
+    store.checkpoints.put(cp(2), 7);
+    store.checkpoints.mark('ws-a', 'seat:ws-a:kit#2', ['written'], 'cleared', 8);
+    store.checkpoints.put({ ...cp(3), tabId: 'tab-other' }, 9);
+    expect(store.checkpoints.abandonTab('tab-kit', 10)).toBe(1);
+    expect(store.checkpoints.get('ws-a', 'seat:ws-a:kit#1')?.status).toBe('delivered');
+    expect(store.checkpoints.get('ws-a', 'seat:ws-a:kit#2')).toMatchObject({ status: 'abandoned', updatedAt: 10 });
+    expect(store.checkpoints.get('ws-a', 'seat:ws-a:kit#3')?.status).toBe('written');
+    expect(store.checkpoints.abandonTab('tab-kit', 11)).toBe(0);
+  });
+
+  it('review r1 F7: retention prunes finished rows past the 92-day window, never a task\'s newest row or an open one', async () => {
+    const DAY = 24 * 60 * 60_000;
+    const now = 200 * DAY;
+    const old = now - 93 * DAY;
+    const store = new LedgerStore(':memory:');
+    store.checkpoints.put(cp(1), old);
+    store.checkpoints.mark('ws-a', 'seat:ws-a:kit#1', ['written'], 'delivered', old);
+    store.checkpoints.put(cp(2), old);
+    store.checkpoints.mark('ws-a', 'seat:ws-a:kit#2', ['written'], 'cleared', old);
+    store.checkpoints.put(cp(3), old);
+    store.checkpoints.mark('ws-a', 'seat:ws-a:kit#3', ['written'], 'abandoned', old);
+    const other = buildCheckpoint({ ...cp(1), taskId: 'seat:ws-a:lane', tabId: 'tab-lane', tabName: 'lane', handoffPath: '/h/l.md', handoffText: 'x', attempt: 1 });
+    store.checkpoints.put(other, old);
+    store.checkpoints.mark('ws-a', other.id, ['written'], 'delivered', old);
+    const result = await store.runRetention(now);
+    expect(result.checkpoints).toBe(1);
+    expect(store.checkpoints.get('ws-a', 'seat:ws-a:kit#1')).toBeNull();
+    expect(store.checkpoints.get('ws-a', 'seat:ws-a:kit#2')?.status).toBe('cleared');
+    expect(store.checkpoints.get('ws-a', 'seat:ws-a:kit#3')?.status).toBe('abandoned');
+    expect(store.checkpoints.get('ws-a', other.id)?.status).toBe('delivered');
+    expect(store.checkpoints.latest('ws-a', 'seat:ws-a:kit')?.checkpoint.attempt).toBe(3);
+  });
+
   it('latest is the task\'s highest attempt, per workspace', () => {
     const store = new LedgerStore(':memory:');
     expect(store.checkpoints.latest('ws-a', 'seat:ws-a:kit')).toBeNull();

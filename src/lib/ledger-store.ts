@@ -150,6 +150,8 @@ export interface ILedgerRetentionResult {
   landings: number;
   tabEvents: number;
   tabTurns: number;
+  /** Finished rotation checkpoints past the retention window, a task's newest row kept (vel-D5). */
+  checkpoints: number;
   items: number;
   rollups: number;
   rolledUpDays: string[];
@@ -887,7 +889,8 @@ export class LedgerStore {
 
   /**
    * The daily job: roll up (see rollUpRange), then delete events and intervals older than 92 days,
-   * tab events and tab turns older than 30 days, items closed before then, and rollups older than 400 days. Each day's rollup is one
+   * tab events and tab turns older than 30 days, items closed before then, finished rotation checkpoints last moved
+   * before the 92-day cutoff (never a task's newest), and rollups older than 400 days. Each day's rollup is one
    * transaction and each delete runs in chunks of RETENTION_CHUNK rows, yielding to the event loop
    * between them, so the server keeps answering while it runs.
    */
@@ -913,6 +916,7 @@ export class LedgerStore {
       tabEvents: await this.deleteInChunks('DELETE FROM tab_events WHERE seq IN (SELECT seq FROM tab_events WHERE at < ? LIMIT ?)',
         [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
       tabTurns: await this.deleteInChunks(TabTurnsTable.RETENTION_DELETE, [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
+      checkpoints: await this.deleteInChunks(RotationCheckpointsTable.RETENTION_DELETE, [cutoff]),
       items: await this.deleteInChunks(`DELETE FROM items WHERE (workspace_id, item_key) IN (SELECT workspace_id, item_key FROM items
         WHERE closed_at IS NOT NULL AND closed_at < ? LIMIT ?)`, [cutoff]),
       rollups: await this.deleteInChunks(`DELETE FROM rollups_daily WHERE (workspace_id, day, item_type, reason) IN

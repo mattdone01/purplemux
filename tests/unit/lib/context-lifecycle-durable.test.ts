@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ContextLifecycle, FIRST_MESSAGE_TTL_MS, ROTATION_DEADLINE_MS, SeatHostUnreachable, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
+import {
+  CHECKPOINT_LIVE_MS, ContextLifecycle, FIRST_MESSAGE_TTL_MS, HandoffRefused, ROTATION_DEADLINE_MS, SeatHostUnreachable, restartRefusalOutcome,
+  type IContextLifecycleDeps, type TRestartOutcome,
+} from '@/lib/context-lifecycle';
 import { LedgerStore, SERVER_PRODUCER } from '@/lib/ledger-store';
 import type { ISeatTab } from '@/types/context-lifecycle';
 import type { IGitFacts, TCheckpointStatus } from '@/types/rotation-checkpoint';
@@ -74,12 +77,14 @@ interface IWorld {
   crash: TCrash;
   placed: number;
   seq: number;
+  /** The next restart answers 503 remote-host-unreachable, before anything is killed. */
+  restartHostDown: boolean;
   storeFails: { put?: boolean; readBack?: 'missing' | 'tampered'; record?: boolean };
 }
 
 const world = (): IWorld => ({
   clock: { now: T0 }, store: new LedgerStore(':memory:'), session: 'sess-1', files: new Map(), facts: FACTS, atPrompt: true,
-  jobLive: false, hostDown: false, clears: 0, typed: [], rotates: [], crash: 'none', placed: 0, seq: 0, storeFails: {},
+  jobLive: false, hostDown: false, clears: 0, typed: [], rotates: [], crash: 'none', placed: 0, seq: 0, storeFails: {}, restartHostDown: false,
 });
 
 const SEAT: ISeatTab = { workspaceId: 'ws-a', tabId: 'tab-kit', tabName: 'kit', handoffPath: PATH, rotateAt: null, host: 'ai-server' };
@@ -135,9 +140,14 @@ const lifecycle = (w: IWorld, overrides: Partial<IContextLifecycleDeps>): Contex
     },
     latest: (workspaceId, taskId) => w.store.checkpoints.latest(workspaceId, taskId),
     mark: (workspaceId, id, from, to, at) => w.store.checkpoints.mark(workspaceId, id, from, to, at),
+    abandonTab: (tabId, at) => w.store.checkpoints.abandonTab(tabId, at),
   },
   restart: async (): Promise<TRestartOutcome> => {
     if (w.crash === 'after-write') return never();
+    if (w.restartHostDown) {
+      w.restartHostDown = false;
+      return restartRefusalOutcome('remote-host-unreachable', 'remote host ai-server did not answer over ssh (exit 255)');
+    }
     w.clears += 1;
     w.session = null;
     if (w.crash === 'after-clear') return never();
@@ -276,6 +286,169 @@ describe('a durable checkpoint gates the clear (AC1)', () => {
     await handoffReady(w, life, POINTS[2]);
     expect(latest(w)).toMatchObject({ status: 'cleared', checkpoint: { attempt: 2, id: `${TASK}#2`, sessionBefore: 'sess-2' } });
     expect(w.store.checkpoints.get('ws-a', `${TASK}#1`)?.status).toBe('delivered');
+  });
+});
+
+describe('review r1: a checkpoint row belongs to one tab and one live rotation (F1, Q1)', () => {
+  const NEW: ISeatTab = { ...SEAT, tabId: 'tab-kit-2' };
+  const recreated = (w: IWorld) => server(w, { seat: (tabId) => (tabId === NEW.tabId ? NEW : null), seats: () => [NEW] });
+
+  it('close, then a new tab with the same name: the old row is abandoned and nothing resumes into the new tab', async () => {
+    const w = world();
+    let life = server(w);
+    await request(w, life);
+    w.crash = 'after-clear';
+    await handoffReady(w, life, POINTS[0]);
+    expect(latest(w)?.status).toBe('written');
+    w.crash = 'none';
+    life = server(w);
+    life.onClosed(SEAT.tabId, SEAT);
+    expect(latest(w)?.status).toBe('abandoned');
+    w.session = 'sess-new';
+    life = recreated(w);
+    life.register(NEW.tabId);
+    await life.advance(NEW.tabId);
+    await life.tick();
+    expect(life.view(NEW.tabId)).toMatchObject({ phase: 'watching', rotations: 0 });
+    expect(w.typed).toEqual([]);
+    expect(w.placed).toBe(1);
+  });
+
+  it('a row left by a tab closed while no server ran is never this tab\'s; the new tab\'s first rotation is the next attempt', async () => {
+    const w = world();
+    let life = server(w);
+    await request(w, life);
+    w.crash = 'after-clear';
+    await handoffReady(w, life, POINTS[0]);
+    w.crash = 'none';
+    w.session = 'sess-new';
+    life = recreated(w);
+    life.register(NEW.tabId);
+    await life.advance(NEW.tabId);
+    expect(life.view(NEW.tabId)?.phase).toBe('watching');
+    expect(w.typed).toEqual([]);
+    life.onContext(NEW.tabId, 320_000, 'sess-new');
+    await life.advance(NEW.tabId);
+    w.clock.now += 30_000;
+    w.files.set(PATH, handoff(POINTS[2], stampOf(w.clock.now)));
+    life.onTurnEnd(NEW.tabId, 'HANDOFF-READY');
+    await flush();
+    expect(w.clears).toBe(2);
+    expect(latest(w)?.checkpoint).toMatchObject({ attempt: 2, tabId: NEW.tabId, sessionBefore: 'sess-new' });
+    expect(w.store.checkpoints.get('ws-a', `${TASK}#1`)).toMatchObject({ status: 'written', checkpoint: { tabId: SEAT.tabId } });
+  });
+
+  it(`a cleared row older than ${CHECKPOINT_LIVE_MS / 60_000} min (the 30 min deadline + the 10 min first-message wait) is finished, not resumed`, async () => {
+    const w = world();
+    let life = server(w);
+    await request(w, life);
+    w.crash = 'after-clear';
+    await handoffReady(w, life, POINTS[0]);
+    w.crash = 'none';
+    w.store.checkpoints.mark('ws-a', `${TASK}#1`, ['written'], 'cleared', w.clock.now);
+    w.clock.now += CHECKPOINT_LIVE_MS + 1;
+    w.session = 'sess-2';
+    life = server(w);
+    life.register(SEAT.tabId);
+    await life.advance(SEAT.tabId);
+    await life.advance(SEAT.tabId);
+    expect(latest(w)?.status).toBe('undelivered');
+    expect(w.typed).toEqual([]);
+    expect(w.clears).toBe(1);
+  });
+
+  it('an aged written row with the same session is abandoned, and the seat item resume runs as before', async () => {
+    const w = world();
+    let life = server(w);
+    await request(w, life);
+    w.crash = 'after-write';
+    await handoffReady(w, life, POINTS[0]);
+    w.crash = 'none';
+    w.clock.now += CHECKPOINT_LIVE_MS + 1;
+    life = server(w);
+    life.register(SEAT.tabId);
+    expect(latest(w)?.status).toBe('abandoned');
+    expect(w.clears).toBe(0);
+  });
+
+  it('Q1: a checkpoint taken with no bound session cannot show its clear ran: frozen, flagged, never cleared again', async () => {
+    const w = world();
+    let life = server(w);
+    await request(w, life);
+    w.session = null;
+    w.crash = 'after-write';
+    await handoffReady(w, life, POINTS[0]);
+    expect(latest(w)?.checkpoint.sessionBefore).toBeNull();
+    w.crash = 'none';
+    life = server(w);
+    life.register(SEAT.tabId);
+    await life.advance(SEAT.tabId);
+    await life.tick();
+    expect(latest(w)?.status).toBe('delivery-unknown');
+    expect(life.view(SEAT.tabId)).toMatchObject({ phase: 'watching', handoffUndeliveredAt: w.clock.now });
+    expect({ clears: w.clears, typed: w.typed.length }).toEqual({ clears: 0, typed: 0 });
+    expect(seatItem(w)?.attrs.handoffUndeliveredAt).toBe(w.clock.now);
+  });
+});
+
+describe('review r1: the restart hop and the gap after the checkpoint (F2, F4, F6)', () => {
+  it('F2: host up at the check, down at the restart: a wait, the row stays written, no failed check; then it clears', async () => {
+    const w = world();
+    const life = server(w);
+    await request(w, life);
+    w.restartHostDown = true;
+    await handoffReady(w, life, POINTS[0]);
+    expect(w.clears).toBe(0);
+    expect(latest(w)?.status).toBe('written');
+    expect(life.view(SEAT.tabId)).toMatchObject({ phase: 'handoff-ready', failures: 0, handoffRefusals: 0, pendingMessage: null });
+    expect(life.view(SEAT.tabId)?.checkpointRefused).toContain("the restart could not reach the seat's host: remote-host-unreachable");
+    expect(w.rotates).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flush();
+    expect(w.clears).toBe(1);
+    expect(latest(w)).toMatchObject({ status: 'cleared', checkpoint: { attempt: 1 } });
+  });
+
+  it('F2: the restart refusals map to outcomes: busy retries, a host or kit that did not answer waits, others fail', () => {
+    expect(restartRefusalOutcome('tab-busy', 'mid-turn')).toEqual({ ok: false, busy: true, error: 'tab-busy: mid-turn' });
+    expect(restartRefusalOutcome('remote-host-unreachable', 'x')).toMatchObject({ busy: false, hostUnreachable: true });
+    expect(restartRefusalOutcome('remote-kit-broken', 'x')).toMatchObject({ busy: false, hostUnreachable: true });
+    expect(restartRefusalOutcome('restart-not-confirmed', 'x')).toEqual({ ok: false, busy: false, error: 'restart-not-confirmed: x' });
+  });
+
+  it('F4: a remote file over the size cap is the checker\'s size refusal, not a wait', async () => {
+    const w = world();
+    const life = server(w, { readHandoff: async () => { throw new HandoffRefused('size over 1048576 bytes (expected at most 12288, 12 KB)'); } });
+    await request(w, life);
+    await handoffReady(w, life, POINTS[0]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flush();
+    expect(w.clears).toBe(0);
+    expect(life.view(SEAT.tabId)).toMatchObject({ handoffRefusals: 1, checkpointRefused: null });
+    expect(w.rotates.at(-1)).toBe(`HANDOFF CHECK FAILED: ${PATH}: size over 1048576 bytes (expected at most 12288, 12 KB). Fix the file, then end your turn with HANDOFF-READY.`);
+  });
+
+  it('F6: a turn that starts and ends while the checkpoint is written stops the clear; the stale file is checked again', async () => {
+    const w = world();
+    let mid = false;
+    const life: ContextLifecycle = server(w, {
+      gitFacts: async () => {
+        if (!mid) {
+          mid = true;
+          w.clock.now += 2_000;
+          life.onPromptSubmit(SEAT.tabId);
+          life.onTurnEnd(SEAT.tabId, 'HANDOFF-READY');
+        }
+        return w.facts;
+      },
+    });
+    await request(w, life);
+    await handoffReady(w, life, POINTS[0]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flush();
+    expect(w.clears).toBe(0);
+    expect(w.rotates.at(-1)).toContain('HANDOFF CHECK FAILED');
+    expect(w.rotates.at(-1)).toContain('is older than the rotate request');
   });
 });
 

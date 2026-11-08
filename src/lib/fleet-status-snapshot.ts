@@ -39,7 +39,10 @@ export interface IFleetDeps {
   mtime: (file: string) => Promise<number | null>;
   config: (key: string) => Promise<string | null>;
   providerId: (tab: ITab) => string | null;
-  /** The open seat items of a workspace (ADR-0036), for the rotation coverage (vel-D5 AC6); absent: no section. */
+  /**
+   * The seat items of a workspace (ADR-0036), open and closed, for the rotation coverage (vel-D5 AC6); throws when
+   * the ledger holds more than it answers, so a total is never silently partial. Absent: no section.
+   */
   seatItems?: (workspaceId: string) => Promise<ILedgerItem[]>;
 }
 
@@ -239,6 +242,9 @@ export const buildFleetView = async (deps: IFleetDeps, now = Date.now()): Promis
   };
 };
 
+/** Seat items are one per tab name, kept 92 days after close; far more than this is not a fleet this view serves. */
+const SEAT_ITEMS_LIMIT = 5_000;
+
 const realDeps = async (): Promise<IFleetDeps> => {
   const [
     { getWorkspaces }, { collectAllTabs, readLayoutFile, resolveLayoutFile }, { isAgentPanelType },
@@ -280,7 +286,9 @@ const realDeps = async (): Promise<IFleetDeps> => {
     providerId: (tab) => getProviderByPanelType(tab.panelType)?.id ?? null,
     seatItems: async (workspaceId) => {
       const { getLedgerStore } = await import('@/lib/ledger-store');
-      return getLedgerStore().items(workspaceId, { open: true, type: 'seat' }, Date.now()).items;
+      const read = getLedgerStore().items(workspaceId, { type: 'seat', limit: SEAT_ITEMS_LIMIT }, Date.now());
+      if (read.truncated) throw new Error(`more than ${SEAT_ITEMS_LIMIT} seat items in ${workspaceId}: the rotation totals would be partial`);
+      return read.items;
     },
   };
 };

@@ -145,6 +145,22 @@ describe('the git probe', () => {
     fs.rmSync(path.join(wt, 'seats', 'notes.txt'));
   });
 
+  it('review r1 F5: a checkpoint copy under a path with a space is left out too, from a subdirectory as well', () => {
+    const wt = path.join(root, 'wt');
+    const dir = path.join(wt, 'my seats', 'kit one');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'handoff.md'), 'h\n');
+    git(wt, 'add', '--', 'my seats/kit one/handoff.md');
+    git(wt, 'commit', '-q', '-m', 'spaced handoff');
+    const before = probe(wt).dirty;
+    fs.writeFileSync(path.join(dir, 'handoff.md.checkpoint.json'), '{}\n');
+    expect(probe(wt).dirty).toBe(before);
+    expect(probe(dir).dirty).toBe(before);
+    fs.writeFileSync(path.join(dir, 'notes two.txt'), 'n\n');
+    expect(probe(dir).dirty).toBe((before ?? 0) + 1);
+    fs.rmSync(path.join(dir, 'notes two.txt'));
+  });
+
   it('a directory outside git and a missing directory are answers, not failures', () => {
     const plain = path.join(root, 'plain');
     fs.mkdirSync(plain);
@@ -229,8 +245,9 @@ describe('rotation coverage (AC6)', () => {
       seatItem('seat:ws-a:busy', 'watching', { rotationDueAt: 900_000 }),
     ];
     const coverage = rotationCoverage(tabs, items, 1_000_000);
+    // Review r1 F8: the closed seat's 9 rotations count; its row is not listed.
     expect(coverage).toMatchObject({
-      workers: 4, covered: 2, coverage: 0.5, rotations: 4, handoffRefusals: 1, checkpointRefusals: 2, rotationTimeouts: 1,
+      workers: 4, covered: 2, coverage: 0.5, rotations: 13, handoffRefusals: 1, checkpointRefusals: 2, rotationTimeouts: 1,
       waitToRotateTotalMs: 120_000, waitToRotateMeanMs: 30_000,
     });
     expect(coverage.seats.map((s) => [s.itemKey, s.waitingMs, s.checkpointRefused])).toEqual([
@@ -242,5 +259,14 @@ describe('rotation coverage (AC6)', () => {
 
   it('with no worker the coverage is unknown, not zero', () => {
     expect(rotationCoverage([], [], 0)).toMatchObject({ workers: 0, covered: 0, coverage: null, waitToRotateMeanMs: null });
+  });
+
+  it('review r1 F8: a counter no seat item wrote is not measured (null), never 0', () => {
+    const coverage = rotationCoverage([{ workspaceId: 'ws-a', handoffPath: '/h/a.md' }], [seatItem('seat:ws-a:a', 'watching', { rotations: 2 })], 0);
+    expect(coverage).toMatchObject({
+      rotations: 2, handoffRefusals: null, checkpointRefusals: null, rotationTimeouts: null, waitToRotateTotalMs: null, waitToRotateMeanMs: null,
+    });
+    expect(coverage.seats[0]).toMatchObject({ rotations: 2, handoffRefusals: null, checkpointRefusals: null, rotationTimeouts: null });
+    expect(rotationCoverage([], [seatItem('seat:ws-a:a', 'watching', { checkpointRefusals: 0 })], 0).checkpointRefusals).toBe(0);
   });
 });

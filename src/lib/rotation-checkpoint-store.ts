@@ -6,6 +6,7 @@ interface ICheckpointRow {
   workspace_id: string;
   checkpoint_id: string;
   task_id: string;
+  tab_id: string;
   attempt: number;
   status: TCheckpointStatus;
   digest: string;
@@ -13,6 +14,11 @@ interface ICheckpointRow {
   created_at: number;
   updated_at: number;
 }
+
+/** A row in one of these states is finished: nothing moves it again. */
+export const TERMINAL_CHECKPOINT_STATES: readonly TCheckpointStatus[] = ['delivered', 'abandoned', 'undelivered', 'delivery-unknown'];
+
+const IN_TERMINAL = TERMINAL_CHECKPOINT_STATES.map((status) => `'${status}'`).join(', ');
 
 export class CheckpointConflictError extends Error {
   constructor(message: string) {
@@ -32,11 +38,12 @@ export class RotationCheckpointsTable {
   ensureShape = (): void => {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS rotation_checkpoints (
-        workspace_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, attempt INTEGER NOT NULL,
-        status TEXT NOT NULL, digest TEXT NOT NULL, body_json TEXT NOT NULL, created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL, PRIMARY KEY (workspace_id, checkpoint_id)
+        workspace_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, tab_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL, status TEXT NOT NULL, digest TEXT NOT NULL, body_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (workspace_id, checkpoint_id)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS rotation_checkpoints_task_idx ON rotation_checkpoints(workspace_id, task_id, attempt);
+      CREATE INDEX IF NOT EXISTS rotation_checkpoints_tab_idx ON rotation_checkpoints(tab_id, status);
     `);
   };
 
@@ -52,12 +59,12 @@ export class RotationCheckpointsTable {
       if (existing && existing.status !== 'written') {
         throw new CheckpointConflictError(`checkpoint ${checkpoint.id} is already ${existing.status} with another body (digest ${existing.digest.slice(0, 12)}, new ${digest.slice(0, 12)})`);
       }
-      this.database.prepare(`INSERT INTO rotation_checkpoints (workspace_id, checkpoint_id, task_id, attempt, status, digest,
-          body_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'written', ?, ?, ?, ?)
-        ON CONFLICT (workspace_id, checkpoint_id) DO UPDATE SET status = 'written', digest = excluded.digest,
+      this.database.prepare(`INSERT INTO rotation_checkpoints (workspace_id, checkpoint_id, task_id, tab_id, attempt, status, digest,
+          body_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'written', ?, ?, ?, ?)
+        ON CONFLICT (workspace_id, checkpoint_id) DO UPDATE SET status = 'written', tab_id = excluded.tab_id, digest = excluded.digest,
           body_json = excluded.body_json, updated_at = excluded.updated_at`)
-        .run(checkpoint.workspaceId, checkpoint.id, checkpoint.taskId, checkpoint.attempt, digest, JSON.stringify(checkpoint),
-          checkpoint.createdAt, at);
+        .run(checkpoint.workspaceId, checkpoint.id, checkpoint.taskId, checkpoint.tabId, checkpoint.attempt, digest,
+          JSON.stringify(checkpoint), checkpoint.createdAt, at);
     })();
   };
 
@@ -77,6 +84,20 @@ export class RotationCheckpointsTable {
   mark = (workspaceId: string, checkpointId: string, from: readonly TCheckpointStatus[], to: TCheckpointStatus, at: number): boolean =>
     this.database.prepare(`UPDATE rotation_checkpoints SET status = ?, updated_at = ? WHERE workspace_id = ? AND checkpoint_id = ?
       AND status IN (${from.map(() => '?').join(', ')})`).run(to, at, workspaceId, checkpointId, ...from).changes === 1;
+
+  /** A closed tab's rotations are over (review r1 F1): every row of it not yet finished becomes `abandoned`. */
+  abandonTab = (tabId: string, at: number): number =>
+    this.database.prepare(`UPDATE rotation_checkpoints INDEXED BY rotation_checkpoints_tab_idx SET status = 'abandoned', updated_at = ?
+      WHERE tab_id = ? AND status NOT IN (${IN_TERMINAL})`).run(at, tabId).changes;
+
+  /**
+   * The retention statement's shape (`LedgerStore.deleteInChunks`): finished rows last moved before the cutoff,
+   * never a task's newest row, because the next attempt number is read from it.
+   */
+  static readonly RETENTION_DELETE = `DELETE FROM rotation_checkpoints WHERE (workspace_id, checkpoint_id) IN (
+    SELECT c.workspace_id, c.checkpoint_id FROM rotation_checkpoints c WHERE c.status IN (${IN_TERMINAL}) AND c.updated_at < ?
+      AND c.attempt < (SELECT MAX(n.attempt) FROM rotation_checkpoints n WHERE n.workspace_id = c.workspace_id AND n.task_id = c.task_id)
+    LIMIT ?)`;
 
   private row = (workspaceId: string, checkpointId: string): ICheckpointRow | undefined =>
     this.database.prepare('SELECT * FROM rotation_checkpoints WHERE workspace_id = ? AND checkpoint_id = ?')

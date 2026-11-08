@@ -85,7 +85,7 @@ const setup = async () => {
   await fs.writeFile(transcript, `${claudeEnd('Working.')}\n`);
   const seat: ITabStatusEntry = {
     cliState: 'idle', workspaceId: 'ws-1', tabName: 'kit', tmuxSession: 'tmux-seat', panelType: 'claude-code',
-    agentProviderId: 'claude', agentSessionId: 'sess-kit', jsonlPath: transcript, handoffPath, rotateAt: null,
+    agentProviderId: 'claude', agentSessionId: 'sess-kit', jsonlPath: transcript, handoffPath, rotateAt: null, host: null,
     lastEvent: { name: 'stop', at: Date.now(), seq: 1 }, eventSeq: 1,
   };
   manager.registerTab('seat', seat);
@@ -141,6 +141,43 @@ describe('the context lifecycle in the StatusManager (ADR-0036)', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(paste).not.toHaveBeenCalled();
     expect(seatItem()?.attrs.contextTokens).toBe(800_000);
+  });
+
+  it('review r1 F3: a seat whose host is not known and whose layout cannot say waits; it is never read as local', async () => {
+    const { manager, typed, seat, handoffPath, transcript, seatItem } = await setup();
+    delete seat.host;
+    manager.recordContextReading('sess-kit', 320_000);
+    await waitFor(() => expect(typed()).toHaveLength(1));
+    await fs.writeFile(handoffPath, handoffText(new Date(Date.now() + 1_000).toISOString().replace(/\.\d{3}Z$/, 'Z')));
+    await fs.appendFile(transcript, `${claudeEnd('HANDOFF-READY')}\n`);
+    seat.cliState = 'busy';
+    seat.lastEvent = { name: 'prompt-submit', at: Date.now(), seq: 2 };
+    seat.eventSeq = 2;
+    manager.updateTabFromHook('tmux-seat', 'stop');
+    await waitFor(() => expect(seatItem()?.attrs.checkpointRefused).toEqual(expect.stringContaining('the host of seat kit is not known')));
+    expect(restart.restartTab).not.toHaveBeenCalled();
+    expect(seatItem()).toMatchObject({ state: 'handoff-ready', attrs: { rotationFailures: 0, handoffRefusals: 0 } });
+    expect(typed()).toHaveLength(1);
+  });
+
+  it.each([
+    ['answers 503 remote-host-unreachable', () => restart.restartTab.mockResolvedValueOnce({ status: 503, body: { code: 'remote-host-unreachable', error: 'remote host ai-server did not answer over ssh (exit 255)' } })],
+    ['throws RemoteKitBrokenError', () => restart.restartTab.mockRejectedValueOnce(Object.assign(new Error('the CLI kit does not run on ai-server'), { name: 'RemoteKitBrokenError' }))],
+  ])('review r1 F2: the restart %s: a wait, no failed check; the next pass clears', async (_label, refuse) => {
+    const { manager, typed, seat, handoffPath, transcript, seatItem, store } = await setup();
+    refuse();
+    manager.recordContextReading('sess-kit', 320_000);
+    await waitFor(() => expect(typed()).toHaveLength(1));
+    await fs.writeFile(handoffPath, handoffText(new Date(Date.now() + 1_000).toISOString().replace(/\.\d{3}Z$/, 'Z')));
+    await fs.appendFile(transcript, `${claudeEnd('HANDOFF-READY')}\n`);
+    seat.cliState = 'busy';
+    seat.lastEvent = { name: 'prompt-submit', at: Date.now(), seq: 2 };
+    seat.eventSeq = 2;
+    manager.updateTabFromHook('tmux-seat', 'stop');
+    await vi.waitFor(() => expect(restart.restartTab).toHaveBeenCalledTimes(2), { timeout: 12_000 });
+    expect(store.checkpoints.latest('ws-1', 'seat:ws-1:kit')).toMatchObject({ status: 'cleared', checkpoint: { attempt: 1 } });
+    expect(seatItem()!.attrs).toMatchObject({ rotationFailures: 0, handoffRefusals: 0, checkpointRefusals: 1 });
+    expect(typed().some((m) => m.startsWith('HANDOFF CHECK FAILED'))).toBe(false);
   });
 
   it('HANDOFF-READY at the stop: a passing file restarts the tab --clear and queues "Read <path>, then continue" (AC 3)', async () => {

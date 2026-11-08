@@ -70,7 +70,8 @@ export const buildCheckpoint = (input: ICheckpointInput): IRotationCheckpoint =>
 /**
  * `sh -s -- <cwd> <expected head>` on the tab's host: one `key<TAB>value` line per fact. A missing directory and a
  * directory outside git are answers, not failures; only the transport (ssh) can fail. The dirty count leaves out
- * the server's own `<handoff>.checkpoint.json` copy, written after the checkpoint's probe and before the resume's.
+ * the server's own `<handoff>.checkpoint.json` copy, written after the checkpoint's probe and before the resume's,
+ * by an exclude pathspec over the whole tree, so a quoted path (one with a space) is left out too (review r1 F5).
  */
 export const GIT_FACTS_SCRIPT = `cwd=$1; want=$2
 if [ -z "$cwd" ] || ! cd -- "$cwd" 2>/dev/null; then printf 'kind\\tno-cwd\\n'; exit 0; fi
@@ -82,7 +83,7 @@ printf 'head\\t%s\\n' "$(git rev-parse -q --verify HEAD 2>/dev/null)"
 ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) || ref=$(git rev-parse -q --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || ref=
 printf 'baseRef\\t%s\\n' "$ref"
 if [ -n "$ref" ]; then printf 'base\\t%s\\n' "$(git merge-base HEAD "$ref" 2>/dev/null)"; fi
-printf 'dirty\\t%s\\n' "$(git status --porcelain 2>/dev/null | grep -cv '\\.checkpoint\\.json$')"
+printf 'dirty\\t%s\\n' "$(git status --porcelain -- ':/' ':(top,exclude,glob)**/*.checkpoint.json' 2>/dev/null | wc -l | tr -d ' ')"
 if [ -n "$want" ]; then
   if git merge-base --is-ancestor "$want" HEAD 2>/dev/null; then printf 'contains\\t1\\n'; else printf 'contains\\t0\\n'; fi
 fi
@@ -176,11 +177,6 @@ export const firstMessageWithNotice = (checkpoint: IRotationCheckpoint, check: I
     + `${checkpoint.intendedNextAction} ${covers(checkpoint)} ${NOT_RESTORED}`);
 };
 
-const count = (attrs: Record<string, TLedgerAttrValue>, key: string): number => {
-  const value = attrs[key];
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-};
-
 const numberOrNull = (attrs: Record<string, TLedgerAttrValue>, key: string): number | null => {
   const value = attrs[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -211,10 +207,10 @@ export const rotationCoverage = (tabs: readonly ICoverageTab[], seatItems: reado
         itemKey: item.itemKey,
         holder: item.holder,
         phase: item.state,
-        rotations: count(item.attrs, 'rotations'),
-        handoffRefusals: count(item.attrs, 'handoffRefusals'),
-        checkpointRefusals: count(item.attrs, 'checkpointRefusals'),
-        rotationTimeouts: count(item.attrs, 'rotationTimeouts'),
+        rotations: numberOrNull(item.attrs, 'rotations'),
+        handoffRefusals: numberOrNull(item.attrs, 'handoffRefusals'),
+        checkpointRefusals: numberOrNull(item.attrs, 'checkpointRefusals'),
+        rotationTimeouts: numberOrNull(item.attrs, 'rotationTimeouts'),
         checkpointRefused: textOrNull(item.attrs, 'checkpointRefused'),
         checkpointMismatch: textOrNull(item.attrs, 'checkpointMismatch'),
         lastWaitToRotateMs: numberOrNull(item.attrs, 'lastWaitToRotateMs'),
@@ -222,7 +218,12 @@ export const rotationCoverage = (tabs: readonly ICoverageTab[], seatItems: reado
       };
     })
     .sort((a, b) => a.workspaceId.localeCompare(b.workspaceId) || a.itemKey.localeCompare(b.itemKey));
-  const sum = (key: string) => seatItems.filter((item) => item.closedAt === null).reduce((total, item) => total + count(item.attrs, key), 0);
+  // Totals count every seat item the ledger keeps, closed ones too: a closed tab's rotations happened (r1 F8). A
+  // counter no item ever wrote is not measured (null), never 0.
+  const sum = (key: string): number | null => {
+    const values = seatItems.filter((item) => item.itemType === 'seat').map((item) => numberOrNull(item.attrs, key)).filter((v): v is number => v !== null);
+    return values.length ? values.reduce((total, value) => total + value, 0) : null;
+  };
   const waited = sum('waitToRotateCount');
   const waitTotal = sum('waitToRotateTotalMs');
   return {
@@ -234,7 +235,7 @@ export const rotationCoverage = (tabs: readonly ICoverageTab[], seatItems: reado
     checkpointRefusals: sum('checkpointRefusals'),
     rotationTimeouts: sum('rotationTimeouts'),
     waitToRotateTotalMs: waitTotal,
-    waitToRotateMeanMs: waited ? Math.round(waitTotal / waited) : null,
+    waitToRotateMeanMs: waited && waitTotal !== null ? Math.round(waitTotal / waited) : null,
     seats,
   };
 };

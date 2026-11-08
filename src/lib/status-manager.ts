@@ -79,11 +79,11 @@ import type { TabTurnsTable } from '@/lib/tab-turns-store';
 import { TurnTracker, isActingTool } from '@/lib/turn-tracker';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
-import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
+import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, restartRefusalOutcome, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
 import { DEFAULT_ROTATE_AT_TOKENS } from '@/lib/constraint';
 import { SERVER_PRODUCER } from '@/lib/ledger-store';
 import type { ISeatTab } from '@/types/context-lifecycle';
-import { createSeatHostIo } from '@/lib/seat-host-io';
+import { createSeatHostIo, resolveSeatPlace } from '@/lib/seat-host-io';
 
 import type { IPendingDigest, ITabEvent } from '@/types/tab-events';
 import type { IAgentSignal, IToolActivity } from '@/types/signals';
@@ -444,17 +444,17 @@ export class StatusManager {
     if (!entry?.handoffPath || !isAgentPanelType(entry.panelType)) return null;
     return {
       workspaceId: entry.workspaceId, tabId, tabName: entry.tabName, handoffPath: entry.handoffPath, rotateAt: entry.rotateAt ?? null,
-      host: entry.host ?? null,
+      // Undefined until the layout poll mirrors it: `resolveSeatPlace` reads the layout then, never assumes local.
+      host: entry.host,
     };
   }
 
-  /** The host a seat runs on, from the session registry (ADR-0022), and its working directory there. */
-  private async seatPlace(seat: ISeatTab): Promise<{ host: string | null; cwd: string | null }> {
-    const session = this.tabs.get(seat.tabId)?.tmuxSession;
-    const host = session ? await sessionHostOf(session) : seat.host ?? null;
-    const tab = session ? await findTabBySessionName(session, seat.workspaceId).catch(() => null) : null;
-    const live = !host && session ? await getSessionCwd(session) : null;
-    return { host, cwd: live ?? tab?.cwd ?? null };
+  /** The host a seat runs on and its working directory there (`resolveSeatPlace`: a remote seat never reads local). */
+  private seatPlace(seat: ISeatTab): Promise<{ host: string | null; cwd: string | null }> {
+    return resolveSeatPlace(seat, this.tabs.get(seat.tabId)?.tmuxSession ?? null, {
+      findTab: (session, workspaceId) => findTabBySessionName(session, workspaceId),
+      sessionCwd: (session) => getSessionCwd(session),
+    });
   }
 
   private contextLifecycleDeps(): IContextLifecycleDeps {
@@ -480,6 +480,7 @@ export class StatusManager {
         get: (workspaceId, id) => getLedgerStore().checkpoints.get(workspaceId, id),
         latest: (workspaceId, taskId) => getLedgerStore().checkpoints.latest(workspaceId, taskId),
         mark: (workspaceId, id, from, to, at) => getLedgerStore().checkpoints.mark(workspaceId, id, from, to, at),
+        abandonTab: (tabId, at) => getLedgerStore().checkpoints.abandonTab(tabId, at),
       },
       restart: (seat) => this.restartSeat(seat),
       sessionId: (tabId) => this.tabs.get(tabId)?.agentSessionId ?? null,
@@ -512,8 +513,10 @@ export class StatusManager {
         by: { kind: 'server', reason: 'context-rotation' },
       });
       if (result.status === 200) return { ok: true };
-      return { ok: false, busy: result.body.code === 'tab-busy', error: `${result.body.code}: ${result.body.error}` };
+      return restartRefusalOutcome(result.body.code, result.body.error);
     } catch (err) {
+      // The remote kit probe runs before the kill and throws past the restart's own answers (tab-restart.ts).
+      if (err instanceof Error && err.name === 'RemoteKitBrokenError') return restartRefusalOutcome('remote-kit-broken', err.message);
       return { ok: false, busy: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
