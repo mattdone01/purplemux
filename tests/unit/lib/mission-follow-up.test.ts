@@ -420,10 +420,23 @@ describe('cycles cannot form (property)', () => {
     return seed / 2_147_483_648;
   };
 
+  // Run time (measured 2026-11-08, this test alone): about 500 ms for the 40 runs with a file store (1,396 fsync calls)
+  // and a full snapshot for each read; under full-suite load it went past the 5 s default timeout. The same 40 seeded
+  // sequences now run on an in-memory store (the property is about the link rows, not durability) and read one served
+  // item, not the whole snapshot. For each seed, both forms leave the same items, links and events. About 270 ms
+  // alone. The explicit 20 s timeout is for a shared host under load; a hang still fails.
+  const PROPERTY_TIMEOUT_MS = 20_000;
+
   it('random sequences of opens, follow-ups, answers, resolves and cancels leave chains only', () => {
     for (let run = 0; run < 40; run += 1) {
       const next = random(run + 1);
-      const { store } = open();
+      const store = new MissionControlStore(':memory:');
+      start(store, 'run-a', 'ws-a');
+      const read = (itemId: string) => {
+        const found = store.attentionItem(itemId);
+        if (!found) throw new Error(`no item ${itemId}`);
+        return found;
+      };
       const ids: string[] = [];
       for (let step = 0; step < 30; step += 1) {
         const roll = next();
@@ -435,13 +448,13 @@ describe('cycles cannot form (property)', () => {
             ask(store, id, followsUp === undefined ? {} : { followsUp });
             ids.push(id);
           } else if (roll < 0.8) {
-            const target = item(store, pick());
-            if (target.state === 'open') answer(store, target.id);
+            const target = read(pick());
+            if (target.state === 'open') store.submitAnswer(target.id, answerOf(target.revision), 'owner');
           } else if (roll < 0.9) {
-            const target = item(store, pick());
+            const target = read(pick());
             apply(store, [{ ...envelope(`e-cancel-${run}-${step}`, target.revision), type: 'attention.cancelled', payload: { itemId: target.id, reason: 'R' } }]);
           } else {
-            const target = item(store, pick());
+            const target = read(pick());
             if (target.answerId) {
               apply(store, [{ ...envelope(`e-ack-${run}-${step}`, target.revision), type: 'answer.acknowledged', payload: { answerId: target.answerId } }]);
               apply(store, [{ ...envelope(`e-res-${run}-${step}`, target.revision), type: 'attention.resolved', payload: { itemId: target.id, resolution: 'R' } }]);
@@ -466,7 +479,7 @@ describe('cycles cannot form (property)', () => {
       for (const link of links) expect(ids.indexOf(link.item_id)).toBeGreaterThan(ids.indexOf(link.follows_up_item_id));
       store.close();
     }
-  });
+  }, PROPERTY_TIMEOUT_MS);
 });
 
 describe('rollback (ADR-0037 amendment D2, test 5)', () => {
