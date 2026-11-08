@@ -69,7 +69,8 @@ export const buildCheckpoint = (input: ICheckpointInput): IRotationCheckpoint =>
 
 /**
  * `sh -s -- <cwd> <expected head>` on the tab's host: one `key<TAB>value` line per fact. A missing directory and a
- * directory outside git are answers, not failures; only the transport (ssh) can fail.
+ * directory outside git are answers, not failures; only the transport (ssh) can fail. The dirty count leaves out
+ * the server's own `<handoff>.checkpoint.json` copy, written after the checkpoint's probe and before the resume's.
  */
 export const GIT_FACTS_SCRIPT = `cwd=$1; want=$2
 if [ -z "$cwd" ] || ! cd -- "$cwd" 2>/dev/null; then printf 'kind\\tno-cwd\\n'; exit 0; fi
@@ -81,7 +82,7 @@ printf 'head\\t%s\\n' "$(git rev-parse -q --verify HEAD 2>/dev/null)"
 ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) || ref=$(git rev-parse -q --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || ref=
 printf 'baseRef\\t%s\\n' "$ref"
 if [ -n "$ref" ]; then printf 'base\\t%s\\n' "$(git merge-base HEAD "$ref" 2>/dev/null)"; fi
-printf 'dirty\\t%s\\n' "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+printf 'dirty\\t%s\\n' "$(git status --porcelain 2>/dev/null | grep -cv '\\.checkpoint\\.json$')"
 if [ -n "$want" ]; then
   if git merge-base --is-ancestor "$want" HEAD 2>/dev/null; then printf 'contains\\t1\\n'; else printf 'contains\\t0\\n'; fi
 fi
@@ -203,7 +204,8 @@ export const rotationCoverage = (tabs: readonly ICoverageTab[], seatItems: reado
     .filter((item) => item.itemType === 'seat' && item.closedAt === null)
     .map((item) => {
       const dueAt = numberOrNull(item.attrs, 'rotationDueAt');
-      const waiting = dueAt !== null && item.state !== 'watching' && item.state !== 'rotation-alarm';
+      // A due rotation waits in `watching` too, while the seat is busy or holds background work.
+      const waiting = dueAt !== null && item.state !== 'rotation-alarm';
       return {
         workspaceId: item.workspaceId,
         itemKey: item.itemKey,

@@ -544,6 +544,8 @@ export class ContextLifecycle {
     state.contextTokens = null;
     state.contextAt = null;
     state.contextSessionId = null;
+    // A fresh context owes no rotation: a due one that never started stops counting its wait.
+    if (state.phase === 'watching') state.rotationDueAt = null;
     if (state.phase === 'rotating' && state.restartedAt !== null && this.deps.now() >= state.restartedAt) state.freshSession = true;
     this.schedule(tabId);
   }

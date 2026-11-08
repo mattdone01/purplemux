@@ -131,6 +131,20 @@ describe('the git probe', () => {
     expect(probe(wt, before).containsExpected).toBe(false);
   });
 
+  it('the server\'s own checkpoint copy beside a tracked handoff is no uncommitted file', () => {
+    const wt = path.join(root, 'wt');
+    fs.mkdirSync(path.join(wt, 'seats'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'seats', 'handoff.md'), 'h\n');
+    git(wt, 'add', 'seats/handoff.md');
+    git(wt, 'commit', '-q', '-m', 'handoff');
+    const before = probe(wt).dirty;
+    fs.writeFileSync(path.join(wt, 'seats', 'handoff.md.checkpoint.json'), '{}\n');
+    expect(probe(wt).dirty).toBe(before);
+    fs.writeFileSync(path.join(wt, 'seats', 'notes.txt'), 'n\n');
+    expect(probe(wt).dirty).toBe((before ?? 0) + 1);
+    fs.rmSync(path.join(wt, 'seats', 'notes.txt'));
+  });
+
   it('a directory outside git and a missing directory are answers, not failures', () => {
     const plain = path.join(root, 'plain');
     fs.mkdirSync(plain);
@@ -212,6 +226,7 @@ describe('rotation coverage (AC6)', () => {
       seatItem('seat:ws-a:a', 'watching', { rotations: 3, handoffRefusals: 1, checkpointRefusals: 0, rotationTimeouts: 1, waitToRotateTotalMs: 90_000, waitToRotateCount: 3, lastWaitToRotateMs: 20_000 }),
       seatItem('seat:ws-a:c', 'handoff-ready', { rotations: 1, checkpointRefusals: 2, checkpointRefused: 'checkpoint seat:ws-a:c#2 is not durable: disk full', rotationDueAt: 400_000, waitToRotateTotalMs: 30_000, waitToRotateCount: 1 }),
       seatItem('seat:ws-a:gone', 'watching', { rotations: 9 }, 5),
+      seatItem('seat:ws-a:busy', 'watching', { rotationDueAt: 900_000 }),
     ];
     const coverage = rotationCoverage(tabs, items, 1_000_000);
     expect(coverage).toMatchObject({
@@ -220,6 +235,7 @@ describe('rotation coverage (AC6)', () => {
     });
     expect(coverage.seats.map((s) => [s.itemKey, s.waitingMs, s.checkpointRefused])).toEqual([
       ['seat:ws-a:a', null, null],
+      ['seat:ws-a:busy', 100_000, null],
       ['seat:ws-a:c', 600_000, 'checkpoint seat:ws-a:c#2 is not durable: disk full'],
     ]);
   });

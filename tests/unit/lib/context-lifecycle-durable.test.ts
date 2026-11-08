@@ -417,7 +417,26 @@ describe('telemetry lost, then a server restart: the checkpoint row decides (rev
   });
 });
 
-const CRASHES: TCrash[] =['before-checkpoint', 'after-write', 'after-clear', 'during-delivery', 'after-delivery'];
+describe('a due rotation that a /clear made moot (AC6)', () => {
+  it('stops counting its wait: the next rotation measures from its own due time', async () => {
+    const w = world();
+    const life = server(w);
+    w.atPrompt = false;
+    await request(w, life);
+    expect(life.view(SEAT.tabId)?.rotationDueAt).toBe(w.clock.now);
+    w.clock.now += 60 * 60_000;
+    w.session = 'sess-h';
+    life.onSessionStart(SEAT.tabId);
+    expect(life.view(SEAT.tabId)?.rotationDueAt).toBeNull();
+    w.atPrompt = true;
+    life.onContext(SEAT.tabId, 320_000, 'sess-h');
+    await life.advance(SEAT.tabId);
+    await handoffReady(w, life, POINTS[0]);
+    expect(seatItem(w)?.attrs.lastWaitToRotateMs).toBe(30_000);
+  });
+});
+
+const CRASHES: TCrash[] = ['before-checkpoint', 'after-write', 'after-clear', 'during-delivery', 'after-delivery'];
 
 describe('restart at each workflow point and each crash point (AC7)', () => {
   const cases = POINTS.flatMap((point) => CRASHES.map((crash) => [point.name, crash, point] as const));
