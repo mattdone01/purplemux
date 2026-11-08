@@ -5,6 +5,10 @@ Accepted (2026-11-03, epic `harness-flow-loop`, story 17; architecture ADR-HFL-0
 the ruling of the story's architect consult. Story 11 set up the hosts: the LAN aliases, `remote.hosts=ai-lan`, the
 sccache backend and its sweep timer.
 
+Amended 2026-11-08 by vel-D4 (`docs/design/vel-d4-shared-budget.md`): §3's per-kind slot caps, the tab rule "the pool
+never refuses a tab" and the local fallback of `tab create --host auto` on a refusal are replaced. See "Amendment
+vel-D4" below.
+
 ## Context
 mdserver1 (32 threads, 91 GB) runs every Claude tab, worktree and local gate at load 34.5-42, above its thread count.
 ai-server (64 threads, 373 GB) runs at load 18-28. v2 has its own remote-gate rules (`tools/slot.sh`,
@@ -95,6 +99,23 @@ has a hard timeout of about 5 s. A failed `ai-lan` read tries the tailnet alias 
    logged (review r2 F5). Workspace ids are
    `ws-` plus nanoid (upper case, `_`), so the fleet key grammar widens to `^[a-z][A-Za-z0-9._-]{1,63}$` (ADR-0019
    amended). Every `pool.*` key, like `tabs.*`, is written by the admin token only and checked when it is written.
+
+## Amendment vel-D4: one shared budget per host (2026-11-08)
+1. Each known host has one budget: threads and memory (`pool.budget.<host>.threads|mem-gb`, else the read), less a
+   control-plane reserve (`reserve-threads`, `reserve-mem-gb`; default max(2, 25 %) threads and max(4, 15 %) GiB).
+   mdserver1 (32 threads, 91 GiB) keeps 8 threads and 14 GiB; ai-server (64, 373 GiB) keeps 16 and 56.
+2. Kinds are `gate`, `build`, `mutation`, `browser`, `test-service` and `tab`. Each reserves an envelope
+   (`pool.envelope.<kind>.threads|mem-gb`) from the one worker budget for the life of its lease. The default caps of
+   threads / 8 per kind are gone; `pool.slots.<host>.<kind>` stays as an optional count cap.
+3. Admission adds, per host: the ledger check against the budget (every held lease, any age), the harness share
+   (`pool.harness-share-pct`, default 25 %), the measured memory floor after the envelope, and a sustained-overload
+   refusal (`min(load1, load5)` + unseen threads + envelope over `max-load`, default the host's threads).
+4. Classes: `product` (default), `harness` (bounded share), and `control-plane` (a tab only, here, on the reserve,
+   never queued or refused).
+5. `pool acquire --queue` and `tab create --host auto` queue a start that fits no host (`pool-queue:<kind>-<n>`
+   tickets, TTL 120 s, re-asked by the waiter). A tab start no longer falls back to this host on a refusal; only a
+   pool that does not answer in 2 s still creates the tab here.
+6. The pool stays advisory: a plain `tab create` and the launchers in the design doc §6 do not ask it yet.
 
 ## Consequences
 One placement call replaces the remote-gate rule sets, and v2's `tools/slot.sh` and `tools/gate-remote.sh` can ask it.

@@ -158,7 +158,7 @@ measured check).
 | plain `tab create` (no `--host`) | creates the tab here, no pool | worker tabs move to `--host auto`; coordinators to `--host auto --class control-plane` |
 | `engineering/skills/scripts/gate.sh` (`gate.route`, `gate.remote-repos`, `gate.slots`) | its own semaphore and routing (ADR-0039 §6) | `pool acquire --kind gate --queue --class product` |
 | `remote-gate.sh` (`gate.remote-hosts`, api-slot queue) | its own host queue | `pool.gate-host.<host>` + `pool.slots.<host>.gate` |
-| treasury-v2 `tools/slot.sh`, `tools/gate-remote.sh` | own slots | `pool acquire --kind gate|build --queue` |
+| treasury-v2 `tools/slot.sh`, `tools/gate-remote.sh` | own slots | `pool acquire --kind gate --queue` or `--kind build --queue` |
 | mutation runs (mutmut / Stryker in story workers) | run in the worker tab, unbudgeted | `pool acquire --kind mutation` |
 | evaluator Chrome (ADR-0040), chrome-devtools MCP | started by the tab | `pool acquire --kind browser` |
 | local-dev-stack / test containers (Postgres, LocalStack) | `docker compose up` in the tab | `pool acquire --kind test-service`, and pass the envelope to `docker --cpus --memory` |
@@ -167,7 +167,49 @@ measured check).
 
 ## 7. Mutation record
 
-Filled in by the TDD pass: each mutation was applied by hand to the final tree, the named test failed, and the
-mutation was reverted.
+Each mutation was applied to the final tree by a script (one at a time, exact-match replacement), the named test file
+was run, and the file was restored. All 26 were killed (the test file failed). Run on 2026-11-08 against the tree that
+this commit holds.
 
-(see below)
+| # | Branch proved | File | Mutation | Killed by (first failing test) |
+|---|---|---|---|---|
+| M1 | the reserve is never given to workers | `pool.ts` `fitOn` | ledger CPU check against all threads, not worker threads | pool.test: gates and builds share one CPU budget |
+| M2 | every held lease reserves from the one budget | `pool.ts` `hostState` | leases not added to the ledger | pool.test: gates and builds share one CPU budget |
+| M3 | a lease holds its declared peak memory | `pool.ts` `leaseEnvelope` | the kind default memory only | pool.test: a note written before vel-D4 reads as the kind envelope |
+| M4 | no double count of measured memory | `pool.ts` `hostState` | every lease subtracted from the read, not only the unseen ones | pool.test: (5 tests; first: gates and builds share one CPU budget) |
+| M5 | harness holds at most its share | `pool.ts` `fitOn` | the share check is off | pool.test: harness work holds at most its share |
+| M6 | harness over its share ranks last | `pool.ts` `rankOf` | every ticket rank 0 | pool.test: queue order |
+| M7 | an earlier ticket keeps its host | `pool.ts` `placeWork` | no ticket blocks a host | pool.test: a waiting harness ticket under its share is admitted first |
+| M8 | a sustained overload refuses | `pool.ts` `fitOn` | the overload check is off | pool.test: a sustained overload refuses new work |
+| M9 | a momentary spike does not refuse | `pool.ts` `hostState` | load1 in place of min(load1, load5) | pool.test: a sustained overload refuses new work; a momentary load1 spike does not |
+| M10 | a control-plane tab runs here on the reserve | `pool.ts` `placeWork` | the control-plane path removed | pool.test: a control-plane tab is admitted here on the reserve |
+| M11 | too-large is refused, not queued | `pool.ts` `placeWork` | the too-large refusal is off | pool.test: an envelope larger than every allowed host is refused at once |
+| M12 | orchestrator tabs draw on the reserve | `pool.ts` `hostState` | orchestrator tabs counted as workers | pool.test: a control-plane tab is admitted here on the reserve |
+| M13 | a local-only re-ask stays here | `pool.ts` `tabLocalOnly` | the localOnly clause removed | pool.test: a local-only re-ask is judged on this host alone |
+| M14 | the refusal names the furthest check | `pool.ts` `placeWork` | the nearest check wins | pool.test: the furthest check names the refusal |
+| M15 | old lease notes read as the kind envelope | `pool.ts` `leaseEnvelope` | an old note reads as 0 threads | pool.test: a note written before vel-D4 reads as the kind envelope |
+| M16 | same-millisecond tickets keep distinct positions | `pool.ts` `orderQueue` | tie-break by name only | pool-service.test: a burst of 20 starts ... distinct positions |
+| M17 | a ticket renews at half its TTL, not on every ask | `pool-service.ts` | renew on every re-ask | pool-service.test: a ticket is renewed at half its TTL |
+| M18 | an admitted ticket leaves the queue in the same transaction | `pool-service.ts` | the ticket is not released | pool-service.test: a request that fits nowhere queues ... and is admitted |
+| M19 | no `--queue`: refused as before | `pool-service.ts` | every no-fit queues | pool-service.test: a held slot counts ... pool-full |
+| M20 | only the holder re-asks with a ticket | `pool-service.ts` | the holder check is off | pool-service.test: only its holder re-asks with a ticket |
+| M21 | a refused tab start never falls back here | `pool-tab-placement.ts` | a refusal creates the tab here | pool-tab-placement.test: a start that fits no host is queued |
+| M22 | a cwd-missing start gives its lease back | `pool-tab-placement.ts` | no release | pool-tab-placement.test: a cwd missing on the chosen host gives that start back |
+| M23 | a queued start creates no tab | `tabs/index.ts` | the 202 path is off | cli-tabs-remote.test: a start that fits no host answers 202 pool-queued |
+| M24 | the route releases the start lease | `tabs/index.ts` | no release in `finally` | cli-tabs-remote.test: a claude-code tab goes where the pool admits it |
+| M25 | budget keys are range-checked when written | `fleet-config-http.ts` | the numeric check is off | fleet-config-pool-keys.test: the admin sets pool.budget.ai-lan.threads=64 |
+| M26 | the CLI prints a queued line only on a change | `bin/cli.js` `waitInQueue` | a line on every ask | cli-tab-host.test: a queued --host auto start waits |
+
+## 8. Decisions taken without a consult, and residual risk
+
+- **Plain `tab create` does not ask the pool.** At create time nothing tells a coordinator from a worker (ADR-0039 §4:
+  "no tab is a coordinator at create time"). Gating it would queue coordinators and change every existing caller.
+  It is the first launcher in §6.
+- **The measured CPU check is on.** With the measured loads (mdserver1 55-67 on 32, ai-server up to 147 on 64), a
+  pooled start on either host waits until the load falls, unless the owner raises `pool.budget.<host>.max-load`.
+  This is the intended answer to "it does not refuse an overloaded host", but it can hold work back while
+  unpooled launchers keep the load high.
+- **A pool that does not answer in 2 s still creates the tab here.** That answer is not about capacity, and the
+  tab create must not fail when the pool is down (ADR-0039 §4).
+- **No cgroup enforcement.** purplemux returns the envelope; the launcher must apply it (§3).
+- **The tab envelope (2 threads, 4 GiB) is an estimate**, not a measurement. Change it with `pool.envelope.tab.*`.
