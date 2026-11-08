@@ -104,6 +104,8 @@ export interface IFleetView {
   wip?: Record<string, IFleetWip>;
   /** The pool's shadow-mode would-refuse counter (vel-D4 review r1 F1); absent when it could not be read. */
   pool?: IPoolWouldRefuseView;
+  /** Rotation coverage (vel-D5): workers that rotate, rotations and refusals, wait-to-rotate; absent when unread. */
+  rotation?: import('@/types/rotation-checkpoint').IRotationCoverage;
 }
 
 export type TComposerReading = 'empty' | 'text' | 'unreadable';

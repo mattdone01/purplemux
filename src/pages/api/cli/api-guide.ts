@@ -133,6 +133,12 @@ to an exit code through one table:
                                                  open-proposal or no-orchestrator-run)
      2  usage error (steer and send, story 14)   steer-reason-invalid,                      fix the command
                                                  terminal-not-command-line
+     2  usage error (typed events, ADR-0043)     event-invalid,                             fix the command
+                                                 event-scope-invalid
+     3  refused by state (events, ADR-0043)      event-refused (each failed check),         after the evidence, scope
+                                                 event-out-of-scope,                        or attempt changes
+                                                 event-stale, event-check-unavailable
+     5  not ready (typed events, ADR-0043)       event-no-recipient                         yes, bounded
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -771,6 +777,59 @@ POST /api/cli/notes/<id>/ack
   comment itself is pulled with note show.
   Response: { "note" } in state "acked". 404 note-not-found (exit 7); 403 forbidden (exit 3),
   also for a note that is not delivered.
+
+## Typed worker events (ADR-0043)
+
+A verified worker tab announces a routine result without its orchestrator retyping it. The server
+checks the evidence first, then delivers the event as a note (admission mode "event") to the target
+epic's recipient by the note rules above. Nothing is typed but the notes' fixed line, and no tab
+or terminal control is granted. landed and blocked-on also send one short status note to the
+sender's own coordinator (not when it is the recipient); review-ready does not, and the coordinator
+reads it with note list.
+
+PUT /api/cli/worker-events/scope
+  The workspace's verified, designated live coordinator only (else 403 forbidden, exit 3).
+  Body: { "tabId" (a live tab of this workspace), "epic" (held as epic:<slug> by a live tab of this
+  workspace), "story"?, "dependsOn"? (≤ 16 epic slugs), "attempt"? (≥ 1; default the previous
+  attempt, else 1; never lower) }. Response: { "scope" }. 400 event-scope-invalid (exit 2).
+
+GET /api/cli/worker-events/scope
+  The scopes of the caller's workspace (admin: all). Response: { "scopes": [...] }.
+
+DELETE /api/cli/worker-events/scope?tabId=TAB
+  The coordinator clears one tab's scope. Response: { "cleared": true|false }.
+
+POST /api/cli/worker-events
+  A verified tab with a scope, on this server's host (a remote tab, ADR-0022, is refused as
+  event-check-unavailable). Body: { "type": "review-ready"|"landed"|"blocked-on", "toEpic" (the
+  scope's epic or one of its dependsOn), "payload" }. Every payload: "repo" (absolute; under the
+  workspace's directories or PMUX_EVENT_EVIDENCE_ROOTS), "branch", "head", "base" (full object
+  ids), "attempt" (the scope's attempt). review-ready (the hand-off for review) adds "key",
+  "gateLog", "reviewDir", and "receipt"? (absent on a first hand-off; checked when given); landed
+  adds "key", "gateLog", and "target"? (the branch it landed in, default main); blocked-on adds
+  "reason", "clearInput" (≤ 500 characters). Unknown fields are refused. Checks: evidence-paths
+  (each path resolves under the roots, of the right kind); range (refs/heads/<branch> is head, and
+  base is its ancestor; for landed, once the branch is gone or has moved on, head may instead be an
+  ancestor of refs/heads/<target> or refs/remotes/origin/<target>); review-ready and landed also
+  gate-verdict (the last run says VERDICT=VALID and SETTLED=yes), gate-tree (the last run's
+  GIT_TREE_END= is the tree of head), patch-id (the server's PMUX_EVENT_PATCH_ID_CMD, a JSON array
+  whose first item is an absolute path outside the sender's repo, prints key; unset, the event is
+  event-check-unavailable). The command and the server's own git reads run in the sender's repo
+  with GIT_CONFIG_COUNT overrides that outrank its .git/config (core.fsmonitor, core.hooksPath,
+  diff.external, core.pager, core.editor, core.sshCommand, core.askPass, credential.helper,
+  core.alternateRefsCommand, gpg.program). Attribute drivers cannot be pinned that way, so the
+  script must use plumbing (git diff-tree, git patch-id) with --no-ext-diff --no-textconv, never
+  porcelain that a repo's diff or filter drivers can redirect. review-ready also review-folder
+  (range.txt, diff.patch, status.txt,
+  patch-id.txt naming key, record.md) and receipt (named <key>.md; no verdict: BLOCK). The scope
+  is read again inside the notes lock after the checks.
+  Response: { "event": { "type", "toEpic", "state": "delivered", "checks", "noteId",
+  "statusNoteId" }, "note", "status" }. 400 event-invalid (exit 2); 422 event-refused with
+  "failures": [{ "check", "measured", "expected" }] (exit 3); 403 event-out-of-scope or forbidden
+  (exit 3); 409 event-stale (exit 3): an old attempt, a scope changed during the checks, or an
+  event already sent whose note has not expired ("noteId", "noteState"); 409
+  event-check-unavailable (exit 3); 409 note-cap (exit 3); 503 event-no-recipient (exit 5): no
+  live holder or coordinator, nothing stored.
 
 ## Harness watches (ADR-0015)
 
@@ -1696,8 +1755,9 @@ GET /api/mission-control/pulse[?workspaceId=all|WS]  (human session; all answers
 
 A seat is an agent tab created with a handoff file: POST /api/cli/tabs with "handoff": "/abs/path.md"
 and optionally "rotateAt": <50000..900000> | "off"   (purplemux tab create ... --handoff PATH [--rotate-at N|off]).
-The path is absolute (the CLI resolves it against its cwd) and need not exist yet; a remote tab, a
-relative path, or rotateAt without handoff is 400 invalid-request. The tab answers and lists
+The path is absolute (the CLI resolves it against its cwd) and need not exist yet; a relative path,
+or rotateAt without handoff, is 400 invalid-request. A remote tab (--host) is a seat too: the path
+names the file on its host, read over ssh; a host that does not answer is a wait. The tab answers and lists
 "handoffPath" and "rotateAt". Paths by convention: v2 seats .v2/seats/<seat>/handoff.md; other
 workspaces ~/.purplemux/workspaces/<ws>/seats/<tab-name>/handoff.md. Only seats rotate.
 Context: the Claude statusline's last request (input + cache writes + cache reads), per session.
@@ -1711,10 +1771,16 @@ A turn whose last line is HANDOFF-READY (or starts "HANDOFF-READY:") gets the fi
 next idle with the checker below, against the request time (whole seconds). Any other turn end, or a
 new submission after HANDOFF-READY, asks ROTATE again with a new request time: the file is checked
 only as of the seat's last turn. While a rotation is owed or under way the seat's digests are held.
-Pass: the tab restarts --clear under the same id (ADR-0028: leases, watches, probes, notes and
+Pass: the server first writes a durable checkpoint (vel-D5: git worktree, branch, head and base from
+the tab's host, the handoff's fields, key seat:<ws>:<tab-name>#<attempt>) to the ledger file and reads
+it back; a write that fails stops the rotation before the clear (seat item attr checkpointRefused).
+Then the tab restarts --clear under the same id (ADR-0028: leases, watches, probes, notes and
 reportsTo stay; a seat waiting only on watches restarts with interrupt, decided inside the restart
 lock) and its first message, typed once a session newer than the restart is idle at its prompt, is
-"Read <path>, then continue: <resume command>". The seat item stays "rotating" until then, so a
+"Read <path>, then continue: <resume command>" and a RESTORE NOTICE: what the checkpoint verified,
+what it covers and what it does not restore; when the worktree, branch, head or uncommitted files
+differ from the checkpoint it lists the differences and asks for reconciliation before the resume
+command. The seat item stays "rotating" until then, so a
 server restart resumes the rotation. Fail: one message
 "HANDOFF CHECK FAILED: <path>: <reasons>. Fix the file, then end your turn with HANDOFF-READY.";
 a second failure raises the rotation alarm and leaves the session as it is (a later HANDOFF-READY
