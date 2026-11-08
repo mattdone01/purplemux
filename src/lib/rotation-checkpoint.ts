@@ -71,7 +71,8 @@ export const buildCheckpoint = (input: ICheckpointInput): IRotationCheckpoint =>
  * `sh -s -- <cwd> <expected head>` on the tab's host: one `key<TAB>value` line per fact. A missing directory and a
  * directory outside git are answers, not failures; only the transport (ssh) can fail. The dirty count leaves out
  * the server's own `<handoff>.checkpoint.json` copy, written after the checkpoint's probe and before the resume's,
- * by an exclude pathspec over the whole tree, so a quoted path (one with a space) is left out too (review r1 F5).
+ * by an exclude pathspec over the whole tree, so a quoted path (one with a space) is left out too (review r1 F5). A
+ * `git status` that fails gives `?`: the count is not measured, never 0 (review r2 N3).
  */
 export const GIT_FACTS_SCRIPT = `cwd=$1; want=$2
 if [ -z "$cwd" ] || ! cd -- "$cwd" 2>/dev/null; then printf 'kind\\tno-cwd\\n'; exit 0; fi
@@ -83,7 +84,11 @@ printf 'head\\t%s\\n' "$(git rev-parse -q --verify HEAD 2>/dev/null)"
 ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) || ref=$(git rev-parse -q --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || ref=
 printf 'baseRef\\t%s\\n' "$ref"
 if [ -n "$ref" ]; then printf 'base\\t%s\\n' "$(git merge-base HEAD "$ref" 2>/dev/null)"; fi
-printf 'dirty\\t%s\\n' "$(git status --porcelain -- ':/' ':(top,exclude,glob)**/*.checkpoint.json' 2>/dev/null | wc -l | tr -d ' ')"
+if st=$(git status --porcelain -- ':/' ':(top,exclude,glob)**/*.checkpoint.json' 2>/dev/null); then
+  if [ -z "$st" ]; then printf 'dirty\\t0\\n'; else printf 'dirty\\t%s\\n' "$(printf '%s\\n' "$st" | wc -l | tr -d ' ')"; fi
+else
+  printf 'dirty\\t?\\n'
+fi
 if [ -n "$want" ]; then
   if git merge-base --is-ancestor "$want" HEAD 2>/dev/null; then printf 'contains\\t1\\n'; else printf 'contains\\t0\\n'; fi
 fi
@@ -139,7 +144,7 @@ export const compareFacts = (expected: IGitFacts, actual: IGitFacts): string[] =
     else if (actual.containsExpected === false) differences.push(`head ${from} → ${to}, and ${from} is not in its history (rewritten or reset)`);
     else differences.push(`head ${from} → ${to}`);
   }
-  if (expected.dirty !== actual.dirty) differences.push(`uncommitted files ${expected.dirty ?? 'unknown'} → ${actual.dirty ?? 'unknown'}`);
+  if (expected.dirty !== actual.dirty) differences.push(`uncommitted files ${expected.dirty ?? 'not measured'} → ${actual.dirty ?? 'not measured'}`);
   return differences;
 };
 

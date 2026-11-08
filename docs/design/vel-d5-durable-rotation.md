@@ -176,10 +176,17 @@ default handoff path is a product decision that this measurement informs. Codex 
    `written` row is frozen as `delivery-unknown`, the board flags it, and the seat is never cleared again for that
    attempt.
 
+## Review round 2 (PASS-WITH-NITS, LOGIC CONFIRM)
+
+- N1: the `rotation_checkpoints` schema changed in round 1 (a `tab_id` column) with no migration. That is safe
+  because the table never shipped: main at `05d56b83` has no such table, so no ledger file holds the old shape.
+- N3: a `git status` that fails gives the dirty count `?`, which the parser reads as not measured (`null`), never
+  0. The resume notice then says `uncommitted files 0 → not measured`.
+
 ## Mutation record
 
 Each mutation was applied to the committed tree, the named test file was run, and the file was restored. The
-runners are `/tmp/.../mutate.py` for M1-M27 and `mutate-d5.py` for M28-M47. Neither runner is committed. Every
+runners are `/tmp/.../mutate.py` for M1-M27, `mutate-d5.py` for M28-M47 and `mutate-d5-r2.py` for M48-M49. Neither runner is committed. Every
 mutation listed was killed: the named test file failed.
 
 | # | Mutation (new branch) | Killed by |
@@ -231,3 +238,5 @@ mutation listed was killed: the named test file failed.
 | M45 | F8: an unwritten counter reads 0 | `rotation-checkpoint.test.ts` (F8) |
 | M46 | F1: another tab's `written` row reused as this attempt | durable (the new tab's first rotation is attempt 2) |
 | M47 | F1: a first message from another tab's row is typed | durable (a row left by a tab closed while no server ran) |
+| M48 | N3: a failed `git status` counts 0 | `rotation-checkpoint.test.ts` (a corrupt index, real git) |
+| M49 | N3: an unmeasured count reads "unknown" | `rotation-checkpoint.test.ts` (N3) |

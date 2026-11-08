@@ -161,6 +161,18 @@ describe('the git probe', () => {
     fs.rmSync(path.join(dir, 'notes two.txt'));
   });
 
+  it('review r2 N3: a git status that fails gives a dirty count that is not measured, never 0', () => {
+    const broken = path.join(root, 'broken');
+    git(root, 'clone', '-q', path.join(root, 'origin.git'), broken);
+    expect(probe(broken).dirty).toBe(0);
+    fs.writeFileSync(path.join(broken, '.git', 'index'), 'not an index');
+    expect(() => execFileSync('git', ['status', '--porcelain'], { cwd: broken, stdio: 'pipe' })).toThrow();
+    const facts = probe(broken);
+    expect(facts).toMatchObject({ kind: 'ok', dirty: null });
+    expect(compareFacts({ ...facts, dirty: 0 }, facts)).toEqual(['uncommitted files 0 → not measured']);
+    expect(parseGitFacts('kind\tok\nworktree\t/w\ndirty\t?\n', null).dirty).toBeNull();
+  });
+
   it('a directory outside git and a missing directory are answers, not failures', () => {
     const plain = path.join(root, 'plain');
     fs.mkdirSync(plain);
