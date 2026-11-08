@@ -164,8 +164,8 @@ export const placeOnPool = async (req: IPoolPlacementRequest, deps: IPoolService
 
 /**
  * Class control-plane is honoured only for the workspace's enabled orchestrator tab, resolved here from the
- * caller's own identity, never from the request (review r1 F3). Any other caller runs as product, and the answer
- * says why.
+ * caller's own verified identity, never from the request (review r1 F3, r2 N1). Any other caller runs as
+ * product, and the answer says why.
  */
 export const resolvePoolClass = async (
   req: IPoolPlacementRequest,
@@ -173,12 +173,13 @@ export const resolvePoolClass = async (
   authority: Pick<ILeaseAuthority, 'isWorkspaceOrchestrator'>,
 ): Promise<{ req: IPoolPlacementRequest; downgrade: string | null }> => {
   if (req.class !== 'control-plane') return { req, downgrade: null };
-  const coordinator = !holder.admin && !!holder.tabId && !!holder.workspaceId
+  // Verified only, as the WIP-cap override (`isOverCapCaller`): an asserted session identity does not claim the reserve.
+  const coordinator = !holder.admin && holder.verified && !!holder.tabId && !!holder.workspaceId
     && await authority.isWorkspaceOrchestrator(holder.workspaceId, holder.tabId);
   if (coordinator) return { req, downgrade: null };
   return {
     req: { ...req, class: 'product' },
-    downgrade: `class control-plane is only for the workspace's enabled orchestrator tab; ${holderLabel(holder)} is not, so it runs as product`,
+    downgrade: `class control-plane is only for the workspace's verified, enabled orchestrator tab; ${holderLabel(holder)} is not, so it runs as product`,
   };
 };
 

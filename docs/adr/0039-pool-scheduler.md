@@ -124,9 +124,13 @@ has a hard timeout of about 5 s. A failed `ai-lan` read tries the tailnet alias 
      default `max-load` (the host's threads) is a placeholder: go-live runs shadow for a day, tunes
      `pool.budget.<host>.max-load` from the log, then sets `enforce`.
    - Class `control-plane` is honoured only for the workspace's enabled orchestrator tab, resolved from the caller's
-     identity. Any other caller runs as `product`, and the answer says why.
+     verified identity (review r2 N1, as `isOverCapCaller`). Any other caller runs as `product`, and the answer says
+     why.
    - `tab create --host auto` falls back to this host only when a first ask with no ticket gets no answer in 2 s. A
      late answer is given back. Every other pool failure is an answer and creates nothing.
+     Known limit (review r2 N2): a re-ask that is admitted after the 2 s timeout loses its place. The admission
+     consumed the ticket, the give-back releases the slot, and the next re-ask gets `pool-ticket-gone`. It is safe
+     (nothing is created or left behind) and happens only when the pool is slow.
    - A ticket holds a host back only if its envelope fits that host's worker budget (and the harness share).
    - Tab starts created within the read lag count as unseen in the measured checks.
 

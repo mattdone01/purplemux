@@ -221,6 +221,7 @@ the shadowed host win the sort, and M29 was then killed. All 42 are killed on th
 | M40 | a pool timeout is 503 pool-timeout (r1 F4) | `pool-http.ts` | unmapped | cli-tabs-remote.test: a re-ask the pool does not answer in 2 s is 503 |
 | M41 | the fleet view carries the counter (r1 F1) | `fleet-status-snapshot.ts` | dropped | fleet-status-snapshot.test: carries the counter when it is read |
 | M42 | the panel never shows a raw mode token | `fleet-status-panel.tsx` | raw token | fleet-status-panel.test: shows the mode label, the total and each host |
+| M43 | control-plane needs a verified holder (r2 N1) | `pool-service.ts` `resolvePoolClass` | the verified check dropped | pool-service.test: an unverified session asserting the orchestrator tab's identity is downgraded |
 
 ## 8. Decisions taken without a consult, and residual risk
 
@@ -254,3 +255,11 @@ Residual risk:
   counter states its `since`. A tab start older than the read lag is in the next read anyway.
 - In shadow mode a queue still forms only on the checks that refuse in both modes (unknown host, disk, count cap,
   harness share, an earlier ticket).
+- A re-ask that the pool admits after the 2 s timeout loses its place (review r2 N2). The admission takes the slot and
+  releases the ticket in one transaction. The late-answer give-back then releases the slot, and the waiter gets
+  `503 pool-timeout`. Its next re-ask gets `pool-ticket-gone`, and it must ask again at the back of the queue. This is
+  safe, because no lease and no ticket is left behind and nothing is created. It is unfair to that one waiter, and it
+  happens only when the pool takes more than 2 s to answer.
+- Class control-plane needs a verified holder (review r2 N1), as the WIP-cap override does (`isOverCapCaller`). A
+  workspace-token caller that asserts the orchestrator's session through `X-Pmux-Session` is unverified and runs as
+  product.

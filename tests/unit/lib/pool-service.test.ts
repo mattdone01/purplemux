@@ -316,12 +316,20 @@ describe('tab starts (vel-D4 AC 3, design §4 input 3)', () => {
     const got = await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, tabA, authority, d);
     expect(got).toMatchObject({
       state: 'queued',
-      queued: { class: 'product', downgrade: expect.stringContaining('only for the workspace\'s enabled orchestrator tab; ws1/tab-a (tab-a) is not'), reason: expect.stringContaining('runs as product') },
+      queued: { class: 'product', downgrade: expect.stringContaining('only for the workspace\'s verified, enabled orchestrator tab; ws1/tab-a (tab-a) is not'), reason: expect.stringContaining('runs as product') },
     });
     const admin: ILeaseHolder = { workspaceId: null, tabId: null, tabName: null, verified: false, admin: true };
     expect(await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, admin, authority, d)).toMatchObject({ state: 'queued', queued: { class: 'product' } });
     expect(await startTabOnPool({ panelType: 'claude-code', class: 'control-plane' }, noTab, authority, d)).toMatchObject({
       state: 'refused', reason: expect.stringContaining('runs as product'),
+    });
+  });
+
+  it('an unverified session asserting the orchestrator tab\'s identity is downgraded (r2 N1)', async () => {
+    const { acquirePoolSlot } = await service();
+    const asserted: ILeaseHolder = { ...tab('tab-o'), verified: false, identity: 'session' };
+    expect(await acquirePoolSlot({ kind: 'tab', class: 'control-plane' }, asserted, authority, await deps())).toMatchObject({
+      class: 'product', downgrade: expect.stringContaining('ws1/tab-o (tab-o) unverified is not'),
     });
   });
 
