@@ -1279,10 +1279,15 @@ export class MissionControlStore {
     this.database.prepare('SELECT created_at FROM answers WHERE workspace_id = ? AND created_at >= ? ORDER BY created_at')
       .pluck().all(workspaceId, since) as number[];
 
-  /** Items the tab opened at or after `since`, any state: a NEEDS-DECISION turn that already asked opens none (ADR-0041). */
-  itemsOpenedByTab = (workspaceId: string, tabId: string, since: number): string[] =>
+  /**
+   * Items the tab itself opened at or after `since`, any state: a NEEDS-DECISION turn that already asked opens none
+   * (ADR-0041). An item the server opened from the tab's own end line never counts, whatever its age or state: the
+   * previous stop's item opens at or after the turn's start, and only its event id tells it apart.
+   */
+  itemsAskedByTab = (workspaceId: string, tabId: string, since: number): string[] =>
     (this.database.prepare(`SELECT item_id FROM mission_item_openers INDEXED BY mission_item_openers_tab_idx
-      WHERE workspace_id = ? AND tab_id = ? AND opened_at >= ? ORDER BY opened_at, item_id`).all(workspaceId, tabId, since) as Array<{ item_id: string }>)
+      WHERE workspace_id = ? AND tab_id = ? AND opened_at >= ? AND substr(event_id, 1, length(?)) <> ?
+      ORDER BY opened_at, item_id`).all(workspaceId, tabId, since, NEEDS_DECISION_EVENT_PREFIX, NEEDS_DECISION_EVENT_PREFIX) as Array<{ item_id: string }>)
       .map((row) => row.item_id);
 
   /** Still-open items (candidate or open) whose id starts with the prefix, whoever opened them (ADR-0041 §2). */
