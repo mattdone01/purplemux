@@ -13,15 +13,17 @@ export interface IWorkerEventRange {
   attempt: number;
 }
 
+/** The hand-off FOR review: the review's receipt is absent on a first hand-off, and checked when given. */
 export interface IReviewReadyPayload extends IWorkerEventRange {
   key: string;
   gateLog: string;
   reviewDir: string;
-  receipt: string;
+  receipt?: string;
 }
 
 export interface ILandedPayload extends IWorkerEventRange {
   key: string;
+  gateLog: string;
 }
 
 export interface IBlockedOnPayload extends IWorkerEventRange {
@@ -81,6 +83,8 @@ export interface ICheckFailure {
   check: string;
   measured: string;
   expected: string;
+  /** The check could not run here (server configuration, or another host): `event-check-unavailable`, not `event-refused`. */
+  unavailable?: true;
 }
 
 export type TWorkerEventErrorCode =
@@ -89,5 +93,6 @@ export type TWorkerEventErrorCode =
   | 'event-out-of-scope'
   | 'event-stale'
   | 'event-no-recipient'
+  | 'event-check-unavailable'
   | 'event-scope-invalid'
   | 'forbidden';

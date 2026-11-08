@@ -136,7 +136,7 @@ to an exit code through one table:
                                                  event-scope-invalid
      3  refused by state (events, ADR-0043)      event-refused (each failed check),         after the evidence, scope
                                                  event-out-of-scope,                        or attempt changes
-                                                 event-stale
+                                                 event-stale, event-check-unavailable
      5  not ready (typed events, ADR-0043)       event-no-recipient                         yes, bounded
 
 The CLI writes the code and its class to stderr, e.g.
@@ -757,22 +757,28 @@ DELETE /api/cli/worker-events/scope?tabId=TAB
   The coordinator clears one tab's scope. Response: { "cleared": true|false }.
 
 POST /api/cli/worker-events
-  A verified tab with a scope. Body: { "type": "review-ready"|"landed"|"blocked-on", "toEpic" (the
+  A verified tab with a scope, on this server's host (a remote tab, ADR-0022, is refused as
+  event-check-unavailable). Body: { "type": "review-ready"|"landed"|"blocked-on", "toEpic" (the
   scope's epic or one of its dependsOn), "payload" }. Every payload: "repo" (absolute; under the
   workspace's directories or PMUX_EVENT_EVIDENCE_ROOTS), "branch", "head", "base" (full object
-  ids), "attempt" (the scope's attempt). review-ready adds "key", "gateLog", "reviewDir", "receipt"
-  (absolute paths); landed adds "key"; blocked-on adds "reason", "clearInput" (≤ 500 characters).
-  Unknown fields are refused. Checks: evidence-paths (each path resolves under the roots, of the
-  right kind); range (refs/heads/<branch> is head; base is its ancestor); review-ready also
-  gate-tree (the last run's GIT_TREE_END= is the tree of head), patch-id (PMUX_EVENT_PATCH_ID_CMD,
-  default tools/patch-id.sh <base> <head>, prints key), review-folder (range.txt, diff.patch,
-  status.txt, patch-id.txt naming key, record.md), receipt (named <key>.md; no verdict: BLOCK).
+  ids), "attempt" (the scope's attempt). review-ready (the hand-off for review) adds "key",
+  "gateLog", "reviewDir", and "receipt"? (absent on a first hand-off; checked when given); landed
+  adds "key", "gateLog"; blocked-on adds "reason", "clearInput" (≤ 500 characters). Unknown fields
+  are refused. Checks: evidence-paths (each path resolves under the roots, of the right kind);
+  range (refs/heads/<branch> is head; base is its ancestor); review-ready and landed also
+  gate-verdict (the last run says VERDICT=VALID and SETTLED=yes), gate-tree (the last run's
+  GIT_TREE_END= is the tree of head), patch-id (the server's PMUX_EVENT_PATCH_ID_CMD, a JSON array
+  whose first item is an absolute path outside the sender's repo, prints key; unset, the event is
+  event-check-unavailable); review-ready also review-folder (range.txt, diff.patch, status.txt,
+  patch-id.txt naming key, record.md) and receipt (named <key>.md; no verdict: BLOCK). The scope
+  is read again inside the notes lock after the checks.
   Response: { "event": { "type", "toEpic", "state": "delivered", "checks", "noteId",
   "statusNoteId" }, "note", "status" }. 400 event-invalid (exit 2); 422 event-refused with
   "failures": [{ "check", "measured", "expected" }] (exit 3); 403 event-out-of-scope or forbidden
-  (exit 3); 409 event-stale (exit 3): an old attempt, or an event already delivered ("noteId");
-  409 note-cap (exit 3); 503 event-no-recipient (exit 5): no live holder or coordinator, nothing
-  stored.
+  (exit 3); 409 event-stale (exit 3): an old attempt, a scope changed during the checks, or an
+  event already sent whose note has not expired ("noteId", "noteState"); 409
+  event-check-unavailable (exit 3); 409 note-cap (exit 3); 503 event-no-recipient (exit 5): no
+  live holder or coordinator, nothing stored.
 
 ## Harness watches (ADR-0015)
 

@@ -5,18 +5,17 @@ import path from 'path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseWorkerEvent } from '@/lib/worker-event-schema';
 import {
-  DEFAULT_PATCH_ID_COMMAND,
   EVIDENCE_TEXT_MAX_BYTES,
   GATE_LOG_MAX_BYTES,
   fsEvidenceReader,
-  lastGateTree,
+  lastGateRun,
   patchIdCommandFrom,
   resolveEvidence,
   validateWorkerEvent,
   type IEventValidator,
   type IValidationContext,
 } from '@/lib/worker-event-validators';
-import { BASE, FakeEvidence, HEAD, KEY, REPO, TREE, range, reviewReadyPayload } from './worker-event-fakes';
+import { BASE, FakeEvidence, HEAD, KEY, PATCH_ID_ENV_VALUE, PATCH_ID_PROGRAM, REPO, TREE, landedPayload, range, reviewReadyPayload } from './worker-event-fakes';
 
 // ADR-0043 §3: each evidence check against a fake file system and git; then the real reader once.
 
@@ -28,17 +27,17 @@ const checksOf = async (event = reviewReady()) => validateWorkerEvent(event, ctx
 
 beforeEach(() => {
   f = new FakeEvidence();
-  ctx = { reader: f.reader(), roots: ['/w'], patchIdCommand: patchIdCommandFrom(undefined) };
+  ctx = { reader: f.reader(), roots: ['/w'], patchIdCommand: patchIdCommandFrom(PATCH_ID_ENV_VALUE) };
 });
 
 describe('a complete evidence set', () => {
   it('passes every check of review-ready, landed and blocked-on', async () => {
     await expect(checksOf()).resolves.toEqual({
-      passed: ['evidence-paths', 'range', 'gate-tree', 'patch-id', 'review-folder', 'receipt'], failures: [],
+      passed: ['evidence-paths', 'range', 'gate-verdict', 'gate-tree', 'patch-id', 'review-folder', 'receipt'], failures: [],
     });
-    expect(f.runs).toEqual([{ argv: ['tools/patch-id.sh', BASE, HEAD], cwd: REPO }]);
-    await expect(validateWorkerEvent(parseWorkerEvent('landed', { ...range, key: KEY }), ctx))
-      .resolves.toEqual({ passed: ['evidence-paths', 'range'], failures: [] });
+    expect(f.runs).toEqual([{ argv: [PATCH_ID_PROGRAM, BASE, HEAD], cwd: REPO }]);
+    await expect(validateWorkerEvent(parseWorkerEvent('landed', landedPayload), ctx))
+      .resolves.toEqual({ passed: ['evidence-paths', 'range', 'gate-verdict', 'gate-tree', 'patch-id'], failures: [] });
     await expect(validateWorkerEvent(parseWorkerEvent('blocked-on', { ...range, reason: 'r', clearInput: 'c' }), ctx))
       .resolves.toEqual({ passed: ['evidence-paths', 'range'], failures: [] });
   });
@@ -59,7 +58,7 @@ describe('evidence-paths (confinement before any read)', () => {
   it('refuses a root prefix that is not a parent (/w2 is not under /w)', async () => {
     f.dirs.add('/w2');
     f.dirs.add('/w2/repo');
-    const result = await validateWorkerEvent(parseWorkerEvent('landed', { ...range, key: KEY, repo: '/w2/repo' }), ctx);
+    const result = await validateWorkerEvent(parseWorkerEvent('landed', { ...landedPayload, repo: '/w2/repo' }), ctx);
     expect(result.failures[0]).toMatchObject({ check: 'evidence-paths', measured: 'repo=/w2/repo resolves to /w2/repo' });
   });
 
@@ -112,14 +111,14 @@ describe('range: head is the branch tip, base its ancestor', () => {
 
 describe('gate-tree: the last run of the gate log gated the tree of head', () => {
   it('refuses another tree, naming both', async () => {
-    f.files.set('/w/gate.log', `START=1\nGIT_TREE_END=${'9'.repeat(40)}\n`);
+    f.files.set('/w/gate.log', `START=1\nGIT_TREE_END=${'9'.repeat(40)}\nVERDICT=VALID\nSETTLED=yes\n`);
     expect((await checksOf()).failures).toEqual([{
       check: 'gate-tree', measured: `GIT_TREE_END=${'9'.repeat(40)}`, expected: `GIT_TREE_END=${TREE} (the tree of head ${HEAD})`,
     }]);
   });
 
   it('refuses a log whose last run has no GIT_TREE_END, although an earlier run had the right one', async () => {
-    f.files.set('/w/gate.log', `START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALID\nSTART=2\nrunning\n`);
+    f.files.set('/w/gate.log', `START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALID\nSTART=2\nrunning\nVERDICT=VALID\nSETTLED=yes\n`);
     expect((await checksOf()).failures).toEqual([expect.objectContaining({ check: 'gate-tree', measured: 'the last run of the gate log has no GIT_TREE_END= line' })]);
   });
 
@@ -136,11 +135,52 @@ describe('gate-tree: the last run of the gate log gated the tree of head', () =>
   });
 
   it('reads the last run as gate-commit-check.sh does', () => {
-    expect(lastGateTree('GIT_TREE_END=t1\nGIT_TREE_END=t2\n')).toBe('t2');
-    expect(lastGateTree('START=1\nGIT_TREE_END=t1\nSTART=2\nGIT_TREE_END=t3\n')).toBe('t3');
-    expect(lastGateTree('START=1\nGIT_TREE_END=t1\nSTART=2\n')).toBeNull();
-    expect(lastGateTree('GIT_TREE_END= t4 \r\n')).toBe('t4');
-    expect(lastGateTree(' GIT_TREE_END=t5\n')).toBeNull();
+    expect(lastGateRun('GIT_TREE_END=t1\nGIT_TREE_END=t2\n').tree).toBe('t2');
+    expect(lastGateRun('START=1\nGIT_TREE_END=t1\nSTART=2\nGIT_TREE_END=t3\n').tree).toBe('t3');
+    expect(lastGateRun('START=1\nGIT_TREE_END=t1\nSTART=2\n').tree).toBeNull();
+    expect(lastGateRun('GIT_TREE_END= t4 \r\n').tree).toBe('t4');
+    expect(lastGateRun(' GIT_TREE_END=t5\n').tree).toBeNull();
+    expect(lastGateRun('START=1\nVERDICT=RED\nVERDICT=VALID\nSETTLED=no\nSETTLED=yes\n')).toEqual({ tree: null, verdict: 'VALID', settled: 'yes' });
+    expect(lastGateRun('START=1\nVERDICT=VALID\nSETTLED=yes\nSTART=2\nVERDICT=RED\n')).toEqual({ tree: null, verdict: 'RED', settled: null });
+  });
+});
+
+describe('gate-verdict: the last run is VALID and SETTLED (ruling R1-1)', () => {
+  const gate = (body: string) => f.files.set('/w/gate.log', body);
+  const verdictFailure = (verdict: string, settled: string) => ({
+    check: 'gate-verdict', measured: `VERDICT=${verdict} SETTLED=${settled} in the last run of the gate log`,
+    expected: 'VERDICT=VALID and SETTLED=yes in the last run (a red, unsettled or subset run is no hand-off)',
+  });
+
+  it('refuses a RED run whose tree is the head\'s tree', async () => {
+    gate(`START=1\nGIT_TREE_END=${TREE}\nEXIT=1\nVERDICT=RED\nSETTLED=yes\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('RED', 'yes')]);
+  });
+
+  it('refuses a run with no verdict, and a run with no SETTLED=yes', async () => {
+    gate(`START=1\nGIT_TREE_END=${TREE}\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('<none>', '<none>')]);
+    gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALID\nSETTLED=no\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('VALID', 'no')]);
+  });
+
+  it('refuses a RED run after an earlier VALID run in the same log', async () => {
+    gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALID\nSETTLED=yes\nSTART=2\nGIT_TREE_END=${TREE}\nVERDICT=RED\nSETTLED=yes\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('RED', 'yes')]);
+  });
+
+  it('refuses a subset run (AFFECTED-VALID) and a look-alike, and takes VALID with a note', async () => {
+    gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=AFFECTED-VALID\nSETTLED=yes\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('AFFECTED-VALID', 'yes')]);
+    gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALIDX\nSETTLED=yes\n`);
+    expect((await checksOf()).failures).toEqual([verdictFailure('VALIDX', 'yes')]);
+    gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=VALID (3 retried)\nSETTLED=yes\n`);
+    expect((await checksOf()).failures).toEqual([]);
+  });
+
+  it('applies to landed too', async () => {
+    gate(`START=1\nGIT_TREE_END=${TREE}\nVERDICT=RED\nSETTLED=yes\n`);
+    expect((await validateWorkerEvent(parseWorkerEvent('landed', landedPayload), ctx)).failures).toEqual([verdictFailure('RED', 'yes')]);
   });
 });
 
@@ -148,26 +188,60 @@ describe('patch-id: the key recomputes from base..head', () => {
   it('refuses another key, naming the command and what it printed', async () => {
     f.command = () => ({ code: 0, stdout: `noise\n${'f'.repeat(40)}\n\n`, stderr: '' });
     expect((await checksOf()).failures).toEqual([{
-      check: 'patch-id', measured: `tools/patch-id.sh ${BASE} ${HEAD} printed ${'f'.repeat(40)}`, expected: `key ${KEY}`,
+      check: 'patch-id', measured: `${PATCH_ID_PROGRAM} ${BASE} ${HEAD} printed ${'f'.repeat(40)}`, expected: `key ${KEY}`,
     }]);
   });
 
   it('refuses a failed command with its first words of stderr, control characters removed', async () => {
     f.command = () => ({ code: 1, stdout: KEY, stderr: 'FAIL: patch-id: no diff\u001b[31m\n' });
     expect((await checksOf()).failures).toEqual([expect.objectContaining({
-      check: 'patch-id', measured: `tools/patch-id.sh ${BASE} ${HEAD} exited 1: FAIL: patch-id: no diff [31m`,
+      check: 'patch-id', measured: `${PATCH_ID_PROGRAM} ${BASE} ${HEAD} exited 1: FAIL: patch-id: no diff [31m`,
     })]);
-    f.command = () => ({ code: null, stdout: '', stderr: 'spawn tools/patch-id.sh ENOENT' });
-    expect((await checksOf()).failures[0].measured).toContain('exited abnormally: spawn tools/patch-id.sh ENOENT');
+    f.command = () => ({ code: null, stdout: '', stderr: 'spawn x ENOENT' });
+    expect((await checksOf()).failures[0].measured).toContain('exited abnormally: spawn x ENOENT');
   });
 
   it('runs the configured command with base and head in place', () => {
-    expect(patchIdCommandFrom(undefined)('B', 'H')).toEqual(['tools/patch-id.sh', 'B', 'H']);
-    expect(DEFAULT_PATCH_ID_COMMAND).toEqual(['tools/patch-id.sh', '{base}', '{head}']);
-    expect(patchIdCommandFrom('["scripts/key", "--range", "{base}..{head}"]')('B', 'H')).toEqual(['scripts/key', '--range', 'B..H']);
-    expect(patchIdCommandFrom('not json')('B', 'H')).toEqual(['tools/patch-id.sh', 'B', 'H']);
-    expect(patchIdCommandFrom('[]')('B', 'H')).toEqual(['tools/patch-id.sh', 'B', 'H']);
-    expect(patchIdCommandFrom('["ok", 3]')('B', 'H')).toEqual(['tools/patch-id.sh', 'B', 'H']);
+    const command = patchIdCommandFrom('["/opt/key", "--range", "{base}..{head}"]');
+    expect('argv' in command && command.argv('B', 'H')).toEqual(['/opt/key', '--range', 'B..H']);
+  });
+
+  it.each([
+    [undefined, 'PMUX_EVENT_PATCH_ID_CMD is unset on the server'],
+    ['  ', 'PMUX_EVENT_PATCH_ID_CMD is unset on the server'],
+    ['not json', 'PMUX_EVENT_PATCH_ID_CMD is not JSON'],
+    ['[]', 'PMUX_EVENT_PATCH_ID_CMD is not a non-empty JSON array of strings'],
+    ['["/opt/ok", 3]', 'PMUX_EVENT_PATCH_ID_CMD is not a non-empty JSON array of strings'],
+    ['["tools/patch-id.sh", "{base}", "{head}"]', 'PMUX_EVENT_PATCH_ID_CMD starts with "tools/patch-id.sh", not an absolute path'],
+    ['["{base}", "x"]', 'PMUX_EVENT_PATCH_ID_CMD starts with "{base}", not an absolute path'],
+  ])('has no command for PMUX_EVENT_PATCH_ID_CMD=%j (ruling R1-3)', (raw, why) => {
+    expect(patchIdCommandFrom(raw)).toEqual({ unavailable: why });
+  });
+
+  it('refuses as unavailable, naming the variable, and runs nothing when no command is configured', async () => {
+    const { failures } = await validateWorkerEvent(reviewReady(), { ...ctx, patchIdCommand: patchIdCommandFrom(undefined) });
+    expect(failures).toEqual([{
+      check: 'patch-id', measured: 'PMUX_EVENT_PATCH_ID_CMD is unset on the server', unavailable: true,
+      expected: "PMUX_EVENT_PATCH_ID_CMD set on the server to a JSON array of strings whose first item is an absolute path outside the sender's repo",
+    }]);
+    expect(f.runs).toEqual([]);
+  });
+
+  it('never executes a program under the sender\'s repo, even when the server names one', async () => {
+    f.files.set('/w/repo/tools/patch-id.sh', '#!/bin/sh\necho any-key\n');
+    const inRepo = patchIdCommandFrom('["/w/repo/tools/patch-id.sh", "{base}", "{head}"]');
+    expect((await validateWorkerEvent(reviewReady(), { ...ctx, patchIdCommand: inRepo })).failures).toEqual([expect.objectContaining({
+      check: 'patch-id', unavailable: true,
+      measured: "PMUX_EVENT_PATCH_ID_CMD names /w/repo/tools/patch-id.sh, which resolves inside the sender's repo /w/repo",
+    })]);
+    f.links.set('/opt/link.sh', '/w/repo/tools/patch-id.sh');
+    const linked = patchIdCommandFrom('["/opt/link.sh"]');
+    expect((await validateWorkerEvent(reviewReady(), { ...ctx, patchIdCommand: linked })).failures[0]).toMatchObject({ unavailable: true });
+    const absent = patchIdCommandFrom('["/opt/absent.sh"]');
+    expect((await validateWorkerEvent(reviewReady(), { ...ctx, patchIdCommand: absent })).failures[0]).toMatchObject({
+      unavailable: true, measured: 'PMUX_EVENT_PATCH_ID_CMD names /opt/absent.sh, which does not exist',
+    });
+    expect(f.runs).toEqual([]);
   });
 });
 
@@ -200,6 +274,19 @@ describe('review-folder: the five files, reviewing this key', () => {
 });
 
 describe('receipt: <key>.md, never a BLOCK', () => {
+  it('passes a first hand-off for review that names no receipt, and checks nothing for it (ruling R1-2)', async () => {
+    const { receipt: _receipt, ...firstHandOff } = reviewReadyPayload;
+    f.files.delete(`/w/receipts/${KEY}.md`);
+    await expect(validateWorkerEvent(parseWorkerEvent('review-ready', firstHandOff), ctx)).resolves.toEqual({
+      passed: ['evidence-paths', 'range', 'gate-verdict', 'gate-tree', 'patch-id', 'review-folder'], failures: [],
+    });
+  });
+
+  it('refuses a named receipt that does not exist', async () => {
+    f.files.delete(`/w/receipts/${KEY}.md`);
+    expect((await checksOf()).failures).toEqual([expect.objectContaining({ check: 'evidence-paths', measured: `receipt=/w/receipts/${KEY}.md does not exist` })]);
+  });
+
   it('refuses a receipt under another name', async () => {
     f.files.set('/w/receipts/lane.md', 'verdict: PASS\n');
     expect((await checksOf(reviewReady({ receipt: '/w/receipts/lane.md' }))).failures).toEqual([{
@@ -229,22 +316,22 @@ describe('receipt: <key>.md, never a BLOCK', () => {
 describe('running the validators', () => {
   it('runs every check and lists every failure in one refusal', async () => {
     f.refs.set('refs/heads/story/x-1', 'e'.repeat(40));
-    f.files.set('/w/gate.log', 'GIT_TREE_END=0\n');
+    f.files.set('/w/gate.log', 'GIT_TREE_END=0\nVERDICT=VALID\nSETTLED=yes\n');
     f.files.set(`/w/receipts/${KEY}.md`, 'verdict: BLOCK');
     const { passed, failures } = await checksOf();
-    expect(passed).toEqual(['evidence-paths', 'patch-id', 'review-folder']);
+    expect(passed).toEqual(['evidence-paths', 'gate-verdict', 'patch-id', 'review-folder']);
     expect(failures.map((x) => x.check)).toEqual(['range', 'gate-tree', 'receipt']);
   });
 
   it('counts a validator that throws as a failure of that check, never a pass', async () => {
     const throwing: IEventValidator = { id: 'boom', types: ['landed'], check: async () => { throw new Error('disk\ngone'); } };
-    const result = await validateWorkerEvent(parseWorkerEvent('landed', { ...range, key: KEY }), ctx, [throwing]);
+    const result = await validateWorkerEvent(parseWorkerEvent('landed', landedPayload), ctx, [throwing]);
     expect(result).toEqual({ passed: ['evidence-paths'], failures: [{ check: 'boom', measured: 'the check could not run: disk gone', expected: 'a check that runs' }] });
   });
 
   it('runs only the validators of the event type (a plugged-in validator is honoured)', async () => {
     const extra: IEventValidator = { id: 'extra', types: ['blocked-on'], check: async () => [{ check: 'extra', measured: 'm', expected: 'e' }] };
-    await expect(validateWorkerEvent(parseWorkerEvent('landed', { ...range, key: KEY }), ctx, [extra])).resolves.toEqual({ passed: ['evidence-paths'], failures: [] });
+    await expect(validateWorkerEvent(parseWorkerEvent('landed', landedPayload), ctx, [extra])).resolves.toEqual({ passed: ['evidence-paths'], failures: [] });
   });
 });
 
@@ -298,5 +385,16 @@ describe('the server reader against a real git repository', () => {
     await expect(fsEvidenceReader.kind(path.join(dir, 'absent'))).resolves.toBeNull();
     await expect(fsEvidenceReader.realpath(path.join(dir, 'absent'))).resolves.toBeNull();
     await expect(fsEvidenceReader.readText(dir, 100)).rejects.toThrow();
+  });
+
+  it('opens with O_NOFOLLOW and O_NONBLOCK: a symlink fails, and a FIFO is refused without blocking (ruling R1-7)', async () => {
+    const link = path.join(dir, 'link.txt');
+    fs.symlinkSync(path.join(dir, 'a.txt'), link);
+    await expect(fsEvidenceReader.readText(link, 100)).rejects.toMatchObject({ code: 'ELOOP' });
+    const fifo = path.join(dir, 'pipe');
+    execFileSync('mkfifo', [fifo]);
+    const started = Date.now();
+    await expect(fsEvidenceReader.readText(fifo, 100)).rejects.toThrow(`${fifo} is not a regular file`);
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });

@@ -117,6 +117,8 @@ export interface IEventNoteInput {
   record: INoteEventRecord;
   /** The short status note to the source coordinator (ADR-0043 §4); absent for a step result. */
   status?: { subject: string; body: string; record: INoteEventRecord };
+  /** Runs first inside the notes lock; a throw refuses the event before anything is routed (ADR-0043 §4). */
+  recheck?: () => Promise<void>;
 }
 
 export interface IListFilter {
@@ -700,10 +702,15 @@ export class NotesService {
     };
     const delivery = make(to, input.subject, input.body, input.record);
     const result = await this.withOperation(() => this.deps.mutate(async (state) => {
+      await input.recheck?.();
+      // An expired note was never acked: the same event may be sent again. Any other earlier note stands.
       const earlier = state.notes.find((n) => n.event?.role === 'delivery' && n.event.dedupeKey === input.record.dedupeKey
-        && n.from.workspaceId === sender.workspaceId);
+        && n.from.workspaceId === sender.workspaceId && n.state !== 'expired');
       if (earlier) {
-        throw new WorkerEventError('event-stale', `this event was already delivered as note ${earlier.id}; it is not delivered twice`, { noteId: earlier.id });
+        const said = earlier.state === 'acked' ? 'acked' : `${earlier.state}, not yet acked`;
+        throw new WorkerEventError('event-stale',
+          `this event was already sent as note ${earlier.id} (${said}); it is not delivered twice — it may be sent again once that note expires unacked`,
+          { noteId: earlier.id, noteState: earlier.state });
       }
       const mine = state.notes.filter((n) => OPEN_STATES.has(n.state)
         && n.from.workspaceId === sender.workspaceId && n.from.tabId === sender.tabId && n.from.humanActor === undefined).length;
@@ -722,8 +729,16 @@ export class NotesService {
         && routedDelivery.deliveredTo.tabId === coordinator;
       let status: INote | null = null;
       if (input.status && !coordinatorIsRecipient && coordinator !== sender.tabId) {
-        status = await this.route(make({ epic: null, workspaceId: sender.workspaceId }, input.status.subject, input.status.body,
-          { ...input.status.record, deliveryNoteId: routedDelivery.id }), now, reads);
+        try {
+          status = await this.route(make({ epic: null, workspaceId: sender.workspaceId }, input.status.subject, input.status.body,
+            { ...input.status.record, deliveryNoteId: routedDelivery.id }), now, reads);
+        } catch (err) {
+          // Nothing is stored when this throws, so the delivery's queued line must not stay behind (review R1-6).
+          if (routedDelivery.inboxItemId) {
+            await this.deps.withdraw(routedDelivery.inboxItemId, 'event-not-stored').catch(() => false);
+          }
+          throw err;
+        }
       }
       const added = status ? [routedDelivery, status] : [routedDelivery];
       return { state: { notes: [...state.notes, ...added] }, value: { delivery: routedDelivery, status } };

@@ -203,6 +203,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'event-out-of-scope': EXIT.CONFLICT,
   'event-stale': EXIT.CONFLICT,
   'event-no-recipient': EXIT.NOT_READY,
+  'event-check-unavailable': EXIT.CONFLICT,
   'pool-invalid': EXIT.USAGE,
   'pool-full': EXIT.CONFLICT,
   'pool-unreadable': EXIT.CONFLICT,
@@ -3647,9 +3648,11 @@ Commands:
                                            A verified worker tab announces a result inside its scope (ADR-0043). The
                                            server checks the evidence, then delivers it as a note to the epic's
                                            recipient. Every payload: repo, branch, head, base, attempt; review-ready adds
-                                           key, gateLog, reviewDir, receipt; landed adds key; blocked-on adds reason,
-                                           clearInput. Exit 2 event-invalid; 3 event-refused (the failed checks),
-                                           event-out-of-scope, event-stale; 5 event-no-recipient
+                                           key, gateLog, reviewDir, receipt? (absent on a first hand-off); landed adds key,
+                                           gateLog; blocked-on adds reason, clearInput. Exit 2 event-invalid; 3
+                                           event-refused (the failed checks), event-out-of-scope, event-stale,
+                                           event-check-unavailable (a remote tab, or no PMUX_EVENT_PATCH_ID_CMD on the
+                                           server); 5 event-no-recipient
   event scope set --tab TAB --epic SLUG [--story KEY] [--depends-on A,B] [--attempt N]
                                            The workspace's verified coordinator declares what TAB may announce: its
                                            served epic (held in this workspace) and the story's dependency epics

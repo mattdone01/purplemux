@@ -9,7 +9,7 @@ import { WorkerEventsService, type IWorkerEventsDeps } from '@/lib/worker-events
 import type { IInboxItem } from '@/types/inbox';
 import type { INotesState } from '@/types/note';
 import type { IEventScopesState } from '@/types/worker-event';
-import { FakeEvidence, KEY, range, reviewReadyPayload } from './worker-event-fakes';
+import { FakeEvidence, KEY, PATCH_ID_ENV_VALUE, landedPayload, range, reviewReadyPayload } from './worker-event-fakes';
 
 // ADR-0043 end to end over fakes: the real events service and the real notes service, with an
 // in-memory note store, scope store, lease table, live tabs, orchestrators, inbox and evidence.
@@ -41,6 +41,11 @@ class World {
   sent: Array<IEnqueueRequest<'note'> & { line: string; id: string }> = [];
   audit: Array<Record<string, unknown>> = [];
   evidence = new FakeEvidence();
+  /** `ws/tab` → the ssh alias of its host; absent = local; `unknown` = the layout cannot say. */
+  hosts = new Map<string, string>();
+  patchIdEnv: string | undefined = PATCH_ID_ENV_VALUE;
+  /** Fail the n-th enqueue (1-based), to show nothing is left behind. */
+  failEnqueue = 0;
   private seq = 0;
 
   private holder = async (slug: string) => {
@@ -70,6 +75,7 @@ class World {
       workspaceExists: async (ws) => ['ws-1', 'ws-2'].includes(ws),
       liveTabs: this.liveTabs,
       enqueue: async (req) => {
+        if (this.failEnqueue && this.sent.length + 1 === this.failEnqueue) throw new Error('inbox write failed');
         const id = `i-item${this.sent.length + 1}`;
         this.sent.push({ ...req, line: renderInboxLine('note', req.fields).line, id });
         const item = { id, kind: 'note', dedupeKey: req.dedupeKey, state: 'queued', targetWorkspaceId: req.targetWorkspaceId,
@@ -102,7 +108,11 @@ class World {
       workspaceDirectories: async (ws) => (ws === 'ws-1' ? ['/w'] : []),
       extraRoots: () => [],
       reader: this.evidence.reader(),
-      patchIdCommand: patchIdCommandFrom(undefined),
+      patchIdCommand: patchIdCommandFrom(this.patchIdEnv),
+      tabHost: async (ws, tabId) => {
+        const host = this.hosts.get(`${ws}/${tabId}`);
+        return host === 'unknown' ? undefined : host ?? null;
+      },
       notes,
       audit: async (entry) => { this.audit.push(entry); },
     };
@@ -211,7 +221,7 @@ describe('the event states (ADR-0043 §2)', () => {
     const result = await reviewReady();
     expect(result.event).toEqual({
       type: 'review-ready', toEpic: 'beta', state: 'delivered',
-      checks: ['evidence-paths', 'range', 'gate-tree', 'patch-id', 'review-folder', 'receipt'],
+      checks: ['evidence-paths', 'range', 'gate-verdict', 'gate-tree', 'patch-id', 'review-folder', 'receipt'],
       noteId: 'n-note1', statusNoteId: null,
     });
     const stored = world.notes.notes[0];
@@ -243,12 +253,12 @@ describe('the event states (ADR-0043 §2)', () => {
   });
 
   it('delivers a dependency held inside the same workspace to its holder tab', async () => {
-    const result = await events.send(W1, { type: 'landed', toEpic: 'gamma', payload: { ...range, key: KEY } });
+    const result = await events.send(W1, { type: 'landed', toEpic: 'gamma', payload: landedPayload });
     expect(world.notes.notes.find((n) => n.id === result.event.noteId)!.deliveredTo).toEqual({ workspaceId: 'ws-1', tabId: 'tab-w2' });
   });
 
   it('landed and blocked-on send one short status note to the source coordinator', async () => {
-    const landed = await events.send(W1, { type: 'landed', toEpic: 'beta', payload: { ...range, key: KEY } });
+    const landed = await events.send(W1, { type: 'landed', toEpic: 'beta', payload: landedPayload });
     expect(landed.event.statusNoteId).toBe('n-note2');
     const status = world.notes.notes.find((n) => n.id === 'n-note2')!;
     expect(status).toMatchObject({
@@ -263,11 +273,11 @@ describe('the event states (ADR-0043 §2)', () => {
   });
 
   it('sends no status note when the source coordinator is the recipient, or is the sender', async () => {
-    const own = await events.send(W1, { type: 'landed', toEpic: 'alpha', payload: { ...range, key: KEY } });
+    const own = await events.send(W1, { type: 'landed', toEpic: 'alpha', payload: landedPayload });
     expect(own.status).toBeNull();
     expect(world.notes.notes).toHaveLength(1);
     await events.declareScope(O1, { tabId: 'tab-o1', epic: 'alpha', dependsOn: ['beta'] });
-    const fromCoordinator = await events.send(O1, { type: 'landed', toEpic: 'beta', payload: { ...range, key: KEY } });
+    const fromCoordinator = await events.send(O1, { type: 'landed', toEpic: 'beta', payload: landedPayload });
     expect(fromCoordinator.status).toBeNull();
   });
 
@@ -290,7 +300,7 @@ describe('the event states (ADR-0043 §2)', () => {
 
   it('refuses a target outside the scope, a tab with no scope, and a scope whose epic was released', async () => {
     expect((await refused(reviewReady('omega'), 'event-out-of-scope')).message).toBe('epic:omega is outside this tab\'s scope (allowed: alpha, beta, gamma, delta)');
-    expect((await refused(events.send(W2, { type: 'landed', toEpic: 'beta', payload: { ...range, key: KEY } }), 'event-out-of-scope')).message)
+    expect((await refused(events.send(W2, { type: 'landed', toEpic: 'beta', payload: landedPayload }), 'event-out-of-scope')).message)
       .toContain('ws-1/tab-w2 has no event scope');
     world.epics.delete('alpha');
     expect((await refused(reviewReady(), 'event-out-of-scope')).message).toContain('no longer held by a live tab of ws-1');
@@ -302,7 +312,7 @@ describe('the event states (ADR-0043 §2)', () => {
     await refused(events.send({ ...W1, tabId: null } as ICaller, { type: 'landed', toEpic: 'beta', payload: {} }), 'forbidden');
     await refused(events.send(tab('ws-1', 'tab-w1', false), { type: 'landed', toEpic: 'beta', payload: {} }), 'forbidden');
     await expect(notes.sendEvent(tab('ws-1', 'tab-w1', false), { toEpic: 'beta', subject: 's', body: 'b',
-      record: { type: 'landed', role: 'delivery', payload: { ...range, key: KEY }, scope: { epic: 'alpha', story: null, dependsOn: [], attempt: 1 }, checks: [], dedupeKey: 'k' } }))
+      record: { type: 'landed', role: 'delivery', payload: landedPayload, scope: { epic: 'alpha', story: null, dependsOn: [], attempt: 1 }, checks: [], dedupeKey: 'k' } }))
       .rejects.toMatchObject({ code: 'forbidden' });
   });
 
@@ -315,7 +325,7 @@ describe('the event states (ADR-0043 §2)', () => {
   it('refuses the same event twice as stale, naming the note that carried it', async () => {
     await reviewReady();
     const err = await refused(reviewReady(), 'event-stale');
-    expect(err.details).toEqual({ noteId: 'n-note1' });
+    expect(err.details).toEqual({ noteId: 'n-note1', noteState: 'delivered' });
     expect(world.notes.notes).toHaveLength(1);
     expect(world.sent).toHaveLength(1);
     await expect(reviewReady('gamma')).resolves.toMatchObject({ event: { state: 'delivered' } });
@@ -336,7 +346,90 @@ describe('the event states (ADR-0043 §2)', () => {
       ...({} as INotesState['notes'][number]), id: `n-old${i}aa`, state: 'delivered', from: { workspaceId: 'ws-1', tabId: 'tab-w1', verified: true, epic: null },
       to: { epic: 'beta', workspaceId: null }, subject: 's', body: 'b',
     }));
-    await refused(events.send(W1, { type: 'landed', toEpic: 'beta', payload: { ...range, key: KEY } }), 'note-cap');
+    await refused(events.send(W1, { type: 'landed', toEpic: 'beta', payload: landedPayload }), 'note-cap');
     await expect(reviewReady()).resolves.toMatchObject({ event: { state: 'delivered' } });
+  });
+});
+
+describe('review round 1 rulings', () => {
+  beforeEach(async () => {
+    await declare();
+  });
+
+  it('delivers a first hand-off for review that names no receipt (R1-2)', async () => {
+    const { receipt: _receipt, ...firstHandOff } = reviewReadyPayload;
+    world.evidence.files.delete(`/w/receipts/${KEY}.md`);
+    const result = await events.send(W1, { type: 'review-ready', toEpic: 'beta', payload: firstHandOff });
+    expect(result.event).toMatchObject({ state: 'delivered', checks: ['evidence-paths', 'range', 'gate-verdict', 'gate-tree', 'patch-id', 'review-folder'] });
+    expect(world.notes.notes[0].event?.payload).not.toHaveProperty('receipt');
+  });
+
+  it('refuses a RED gate as event-refused, naming the verdict (R1-1)', async () => {
+    world.evidence.files.set('/w/gate.log', `START=1\nGIT_TREE_END=${'d'.repeat(40)}\nVERDICT=RED\nSETTLED=yes\n`);
+    const err = await refused(reviewReady(), 'event-refused');
+    expect(err.message).toContain('gate-verdict: measured VERDICT=RED SETTLED=yes in the last run of the gate log');
+    expect(world.notes.notes).toEqual([]);
+  });
+
+  it('refuses as event-check-unavailable, naming the variable, when no patch-id command is configured (R1-3)', async () => {
+    world.patchIdEnv = undefined;
+    events = new WorkerEventsService(world.eventsDeps(notes));
+    world.evidence.files.set('/w/gate.log', 'START=1\nVERDICT=RED\n');
+    const err = await refused(reviewReady(), 'event-check-unavailable');
+    expect(err.message).toContain('PMUX_EVENT_PATCH_ID_CMD is unset on the server');
+    expect(err.details.failures).toEqual([expect.objectContaining({ check: 'patch-id', unavailable: true })]);
+    expect(world.evidence.runs).toEqual([]);
+    expect(world.notes.notes).toEqual([]);
+    world.patchIdEnv = '["tools/patch-id.sh", "{base}", "{head}"]';
+    events = new WorkerEventsService(world.eventsDeps(notes));
+    expect((await refused(reviewReady(), 'event-check-unavailable')).message).toContain('not an absolute path');
+  });
+
+  it('refuses a remote tab, and a tab whose host is unknown, before reading any evidence (R1-4)', async () => {
+    world.hosts.set('ws-1/tab-w1', 'ai-lan');
+    expect((await refused(reviewReady(), 'event-check-unavailable')).message)
+      .toBe('ws-1/tab-w1 runs on host ai-lan (ADR-0022); the server reads evidence on its own host only, so a remote tab reports through the coordinator');
+    world.hosts.set('ws-1/tab-w1', 'unknown');
+    expect((await refused(reviewReady(), 'event-check-unavailable')).message).toContain('cannot be read from its layout');
+    expect(world.evidence.runs).toEqual([]);
+    expect(world.notes.notes).toEqual([]);
+  });
+
+  it('refuses a result whose scope was re-dispatched, cleared or narrowed while the evidence was checked (R1-5)', async () => {
+    const during = (change: () => void) => {
+      world.evidence.command = () => {
+        change();
+        return { code: 0, stdout: `${KEY}\n`, stderr: '' };
+      };
+    };
+    during(() => { world.scopes = { scopes: world.scopes.scopes.map((sc) => ({ ...sc, attempt: 2 })) }; });
+    expect((await refused(reviewReady(), 'event-stale')).message).toContain('attempt 1 → 2');
+    await declare({ attempt: 3 });
+    during(() => { world.scopes = { scopes: [] }; });
+    expect((await refused(reviewReady('beta', { attempt: 3 }), 'event-stale')).message).toContain('the scope was cleared');
+    await declare({ attempt: 3 });
+    during(() => { world.scopes = { scopes: world.scopes.scopes.map((sc) => ({ ...sc, dependsOn: ['gamma'] })) }; });
+    await refused(reviewReady('beta', { attempt: 3 }), 'event-out-of-scope');
+    expect(world.notes.notes).toEqual([]);
+    expect(world.sent).toEqual([]);
+  });
+
+  it('lets an event be sent again once its note expired unacked, and says when it is still open or acked (R1-6)', async () => {
+    await reviewReady();
+    expect((await refused(reviewReady(), 'event-stale')).message).toContain('already sent as note n-note1 (delivered, not yet acked)');
+    world.notes = { notes: world.notes.notes.map((n) => ({ ...n, state: 'acked' as const })) };
+    expect((await refused(reviewReady(), 'event-stale')).message).toContain('(acked)');
+    world.notes = { notes: world.notes.notes.map((n) => ({ ...n, state: 'expired' as const })) };
+    const again = await reviewReady();
+    expect(again.event.state).toBe('delivered');
+    expect(again.event.noteId).not.toBe('n-note1');
+    expect(world.notes.notes.map((n) => n.state)).toEqual(['expired', 'delivered']);
+  });
+
+  it('withdraws the delivery\'s queued line when the status note fails, and stores nothing (R1-6)', async () => {
+    world.failEnqueue = 2;
+    await expect(events.send(W1, { type: 'landed', toEpic: 'beta', payload: landedPayload })).rejects.toThrow('inbox write failed');
+    expect(world.notes.notes).toEqual([]);
+    expect([...world.inbox.values()].map((item) => item.state)).toEqual(['dropped']);
   });
 });

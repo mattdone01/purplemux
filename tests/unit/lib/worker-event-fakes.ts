@@ -8,6 +8,9 @@ export const KEY = 'c'.repeat(40);
 export const TREE = 'd'.repeat(40);
 export const ROOT = '/w';
 export const REPO = '/w/repo';
+/** The server-configured patch-id command (ADR-0043 §3): outside every sender's repo. */
+export const PATCH_ID_PROGRAM = '/opt/pmux/patch-id.sh';
+export const PATCH_ID_ENV_VALUE = JSON.stringify([PATCH_ID_PROGRAM, '{base}', '{head}']);
 
 export class FakeEvidence {
   files = new Map<string, string>();
@@ -28,7 +31,8 @@ export class FakeEvidence {
     this.dirs.add('/w/review/x-r1');
     for (const name of ['range.txt', 'diff.patch', 'status.txt', 'record.md']) this.files.set(`/w/review/x-r1/${name}`, `${name}\n`);
     this.files.set('/w/review/x-r1/patch-id.txt', `${KEY}\n`);
-    this.files.set('/w/gate.log', `START=1\nSELECTION=full\nGIT_TREE_START=${TREE}\nok\nGIT_TREE_END=${TREE}\nVERDICT=VALID\n`);
+    this.files.set('/w/gate.log', `START=1\nSELECTION=full\nGIT_TREE_START=${TREE}\nok\nGIT_TREE_END=${TREE}\nVERDICT=VALID\nSETTLED=yes\n`);
+    this.files.set(PATCH_ID_PROGRAM, '#!/bin/sh\n');
     this.dirs.add('/w/receipts');
     this.files.set(`/w/receipts/${KEY}.md`, '# v2 review receipt\nverdict: PASS\n');
   }
@@ -72,6 +76,7 @@ export class FakeEvidence {
 }
 
 export const range = { repo: REPO, branch: 'story/x-1', head: HEAD, base: BASE, attempt: 1 };
+export const landedPayload = { ...range, key: KEY, gateLog: '/w/gate.log' };
 export const reviewReadyPayload = {
   ...range, key: KEY, gateLog: '/w/gate.log', reviewDir: '/w/review/x-r1', receipt: `/w/receipts/${KEY}.md`,
 };

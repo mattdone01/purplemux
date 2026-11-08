@@ -48,6 +48,7 @@ describe('POST /api/cli/worker-events', () => {
     ['event-out-of-scope', 403],
     ['event-stale', 409],
     ['event-no-recipient', 503],
+    ['event-check-unavailable', 409],
     ['forbidden', 403],
   ] as const)('answers %s with %i', async (code, status) => {
     service.send.mockRejectedValue(new WorkerEventError(code, `why ${code}`, { failures: [{ check: 'x' }], code: 'not-this' }));

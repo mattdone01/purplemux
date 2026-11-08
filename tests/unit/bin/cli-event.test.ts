@@ -100,6 +100,7 @@ describe('event send', () => {
     ['event-out-of-scope', 403, 3],
     ['event-stale', 409, 3],
     ['event-no-recipient', 503, 5],
+    ['event-check-unavailable', 409, 3],
   ])('maps %s (HTTP %i) to exit %i', async (code, status, exit) => {
     reply = (res) => json(res, status, { error: `refused: ${code}`, code });
     const result = await cli(['event', 'send', '--type', 'landed', '--to-epic', 'beta', '--json', JSON.stringify(PAYLOAD)]);

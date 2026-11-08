@@ -27,8 +27,18 @@ const RANGE_FIELDS: Record<string, TFieldKind> = { repo: 'path', branch: 'branch
 
 const SCHEMAS: Record<TWorkerEventType, Record<string, TFieldKind>> = {
   'review-ready': { ...RANGE_FIELDS, key: 'oid', gateLog: 'path', reviewDir: 'path', receipt: 'path' },
-  landed: { ...RANGE_FIELDS, key: 'oid' },
+  landed: { ...RANGE_FIELDS, key: 'oid', gateLog: 'path' },
   'blocked-on': { ...RANGE_FIELDS, reason: 'text', clearInput: 'text' },
+};
+
+/**
+ * Fields a sender may leave out. `review-ready` is the hand-off FOR review, so the review's own
+ * receipt does not exist yet on a first hand-off; given, it is checked (ADR-0043 §3, ruling R1-2).
+ */
+const OPTIONAL: Record<TWorkerEventType, ReadonlySet<string>> = {
+  'review-ready': new Set(['receipt']),
+  landed: new Set(),
+  'blocked-on': new Set(),
 };
 
 export const isWorkerEventType = (value: unknown): value is TWorkerEventType =>
@@ -86,7 +96,7 @@ export const parseWorkerEvent = (type: unknown, payload: unknown): TWorkerEvent 
   const out: Record<string, unknown> = {};
   for (const [name, kind] of Object.entries(schema)) {
     if (!Object.hasOwn(input, name)) {
-      defects.push(`${name}: missing`);
+      if (!OPTIONAL[type].has(name)) defects.push(`${name}: missing`);
       continue;
     }
     const result = checkField(kind, input[name]);
@@ -104,3 +114,6 @@ export const parseWorkerEvent = (type: unknown, payload: unknown): TWorkerEvent 
 
 /** The fields of a type's schema, for the CLI help and the API guide. */
 export const schemaFields = (type: TWorkerEventType): string[] => Object.keys(SCHEMAS[type]);
+
+/** The fields a type requires. */
+export const requiredFields = (type: TWorkerEventType): string[] => schemaFields(type).filter((name) => !OPTIONAL[type].has(name));

@@ -20,9 +20,12 @@ review folder). The checks must move into the server. They must not disappear.
 2. A worker sends `event send --type T --to-epic SLUG --json PAYLOAD`. The target must be the
    scope's epic or one of its `dependsOn` epics, else `event-out-of-scope`.
 3. The payload has a fixed, strict schema per type. Every type carries `repo`, `branch`, `head`,
-   `base` and `attempt`. Unknown fields are refused.
+   `base` and `attempt`. Unknown fields are refused. `review-ready` is the hand-off FOR review,
+   so its `receipt` is optional; `landed` requires the gate log and the key.
 4. Pluggable validators run over an injected `IEvidenceReader` (files, git, one command). All
-   validators run, and a refusal lists every failure as `measured / expected`.
+   validators run, and a refusal lists every failure as `measured / expected`. The one command is
+   the server's (`PMUX_EVENT_PATCH_ID_CMD`); nothing under the payload's repo is executed.
+   A remote tab is refused before any evidence is read: the server reads its own host only.
 5. A validated event becomes a note with the new admission mode `event`. The notes service routes
    it like a coordinator note: to the live epic holder in the same workspace, else to the holder
    workspace's live orchestrator. Inbox line, ack, reminder and expiry are the notes' own.
@@ -49,13 +52,17 @@ Inputs from the coordinator brief (external designs reviewed), and how they are 
 ```
             send (HTTP POST /api/cli/worker-events)
                          |
-                       [sent]  ---- caller not a verified tab, no scope, target not in scope,
-                         |          attempt != scope attempt, schema invalid --------> [refused]
+                       [sent]  ---- caller not a verified tab, a remote tab, no scope, target
+                         |          not in scope, attempt != scope attempt, schema invalid -> [refused]
                     validators
+                         |  no server patch-id command (event-check-unavailable) ----> [refused]
                          |  any validator fails ------------------------------------> [refused]
                     [validated]
-                         |  duplicate dedupe key (same attempt, range, key) --------> [refused]
+                         |  inside the notes lock: scope re-read; attempt, epic or
+                         |  target changed during the checks ------------------------> [refused]
+                         |  duplicate dedupe key, earlier note not expired ----------> [refused]
                          |  no live recipient (epic unowned, coordinator not live) -> [refused]
+                         |  status note fails: the delivery line is withdrawn ------> [refused]
                          v
                     [delivered]  (note `delivered`; its inbox line is queued, then typed)
                          |
@@ -98,25 +105,35 @@ The scope declaration also had alternatives:
    (plus `PMUX_EVENT_EVIDENCE_ROOTS`); it reads only regular files under a byte cap (gate log
    32 MiB, others 1 MiB). The `repo` obeys the same roots. A refusal names the path, never the
    contents.
-2. **A key or command that is not what it seems.** The patch-id command runs with `execFile` (no
-   shell), `cwd` = the confined repo, a minimal environment (`PATH`, `HOME`, `LANG`; no
-   `PMUX_TOKEN`), a 60 s timeout and a 1 MiB output cap. `head`, `base` and `key` must match
+2. **A key or command that is not what it seems.** The first build ran `tools/patch-id.sh` from
+   the payload's repo, so a worker could supply the script that judged its own key (review R1-3).
+   Now the command is the server's `PMUX_EVENT_PATCH_ID_CMD`, whose first item must be an
+   absolute path that does not resolve inside the payload's repo; unset, the event is
+   `event-check-unavailable`. It runs with `execFile` (no shell), `cwd` = the confined repo, a
+   minimal environment (`PATH`, `HOME`, `LANG`; no `PMUX_TOKEN`), a 60 s timeout and a 1 MiB
+   output cap. The server's git reads pass `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. `head`, `base` and `key` must match
    `^[0-9a-f]{40}$|^[0-9a-f]{64}$` before they reach an argument list, so `--upload-pack=…` or
    `HEAD~1` never reaches git. `branch` must match a ref grammar with no `..`, no leading `-`.
 3. **A stale or replayed result.** (a) A gate log with two runs, the first one green for the head
-   tree: only the last run counts (from the last `START=`, the last `GIT_TREE_END=`, exactly as
-   `gate-commit-check.sh` reads it). (b) A head that is no longer the branch tip: `range` refuses
+   tree: only the last run counts (from the last `START=`, the last `GIT_TREE_END=`, `VERDICT=`
+   and `SETTLED=`, as `gate-commit-check.sh` reads it), and it must say `VERDICT=VALID` and
+   `SETTLED=yes`; a RED run whose tree matches is refused (review R1-1). (b) A head that is no longer the branch tip: `range` refuses
    it (`refs/heads/<branch>` must resolve to `head`, and `base` must be an ancestor of `head`).
    (c) A restarted worker on an old attempt: the payload `attempt` must equal the scope's
    `attempt`, else `event-stale`. (d) The same event twice: a dedupe key, sha256 over
    (type, target, workspace, story or tab, the whole payload with its attempt), is refused as
-   `event-stale`, naming the note it already delivered. The check runs inside the notes lock, so
-   two concurrent sends cannot both pass it.
+   `event-stale`, naming the note and its state; a note that expired unacked does not block a
+   resend. The check runs inside the notes lock, so two concurrent sends cannot both pass it.
+   (e) A re-dispatch while the checks run (up to 60 s): the scope is read again inside the notes
+   lock, and a changed attempt or epic is `event-stale` (review R1-5).
+   Reads open the resolved path with `O_NOFOLLOW | O_NONBLOCK` and `fstat` the descriptor, so a
+   swap to a symlink or a FIFO after `realpath` is refused, not followed or blocked on (R1-7).
 
 Not defended: a worker that forges its own evidence files. The worker owns those files. The
 checks catch mistakes (the three found by hand), not forgery. Remote tabs (ADR-0022) keep their
-evidence on another host, so the server cannot read it: their events are refused as missing
-evidence, and they keep the coordinator path.
+evidence on another host, so the server cannot read it: a tab whose layout names a host, or
+whose host cannot be read, is refused at send with `event-check-unavailable`, and it keeps the
+coordinator path.
 
 ## 5. Acceptance criteria
 
@@ -125,12 +142,14 @@ evidence, and they keep the coordinator path.
   routed to the target's recipient by the ADR-0013 rules. No coordinator re-types it.
 - AC2: each payload schema is strict: a missing field, a wrong form, or an unknown field is
   `event-invalid` (exit 2), and the message names every defect.
-- AC3: `review-ready` runs four validators, each refusing with `measured` beside `expected`:
-  `gate-tree` (last-run `GIT_TREE_END=` equals `git rev-parse <head>^{tree}`), `patch-id` (the
-  configured command over `base..head` prints `key`; default `tools/patch-id.sh <base> <head>`),
-  `review-folder` (the folder holds `range.txt`, `diff.patch`, `status.txt`, `patch-id.txt`,
-  `record.md`), `receipt` (named `<key>.md`; holds no `verdict: BLOCK`, which belongs at
-  `<key>.block.md`). Every type also runs `range` (head is the branch tip; base is its ancestor).
+- AC3: each validator refuses with `measured` beside `expected`. Every type runs `range` (head
+  is the branch tip; base is its ancestor). `review-ready` and `landed` run `gate-verdict` (the
+  last run says `VERDICT=VALID` and `SETTLED=yes`), `gate-tree` (last-run `GIT_TREE_END=`
+  equals `git rev-parse <head>^{tree}`) and `patch-id` (the server's command over `base..head`
+  prints `key`). `review-ready` also runs `review-folder` (the folder holds `range.txt`,
+  `diff.patch`, `status.txt`, `patch-id.txt`, `record.md`) and, when a receipt is given,
+  `receipt` (it exists, is named `<key>.md`, and holds no `verdict: BLOCK`, which belongs at
+  `<key>.block.md`). A first hand-off with no receipt is delivered.
 - AC4: a validator failure is `event-refused` (exit 3) and lists every failed check.
 - AC5: a target outside the scope, a tab with no scope, an unverified caller, or an admin token is
   refused (`event-out-of-scope` or `forbidden`, exit 3). Only the workspace's verified designated
@@ -138,8 +157,13 @@ evidence, and they keep the coordinator path.
 - AC6: the receiving recipient gets the notes' fixed inbox line and acks with `note ack`.
   `landed` and `blocked-on` also send one status note to the source coordinator, except when the
   coordinator is the delivery recipient. `review-ready` sends the coordinator no line.
-- AC7: an old attempt or a duplicate is `event-stale` (exit 3); an event with no live recipient is
-  `event-no-recipient` (exit 5) and stores nothing.
+- AC7: an old attempt, a scope changed during the checks, or a duplicate whose note has not
+  expired is `event-stale` (exit 3); an event with no live recipient is `event-no-recipient`
+  (exit 5) and stores nothing; a failed status note withdraws the delivery's line and stores
+  nothing.
+- AC7b: a remote tab, a tab whose host is unknown, and a server with no usable
+  `PMUX_EVENT_PATCH_ID_CMD` are `event-check-unavailable` (exit 3); the refusal names the host or
+  the variable, and nothing under the payload's repo runs.
 - AC8: every validator has a hermetic test over a fake reader, and every state above has a test.
   Each test is proven by the mutation recorded below.
 - AC9: `pnpm lint && pnpm test && pnpm build` pass.

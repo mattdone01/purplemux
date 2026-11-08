@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EVENT_PAYLOAD_MAX_BYTES, WorkerEventError, parseWorkerEvent, schemaFields } from '@/lib/worker-event-schema';
+import { EVENT_PAYLOAD_MAX_BYTES, WorkerEventError, parseWorkerEvent, requiredFields, schemaFields } from '@/lib/worker-event-schema';
 
 // ADR-0043 §2: one strict schema per type; every defect is named in one refusal.
 
@@ -24,7 +24,7 @@ describe('typed worker event schema (ADR-0043 §2)', () => {
     expect(parseWorkerEvent('review-ready', { ...reviewReady, gateLog: '/w/x/../gate.log' })).toEqual({
       type: 'review-ready', payload: { ...reviewReady, gateLog: '/w/gate.log' },
     });
-    expect(parseWorkerEvent('landed', { ...range, key: KEY }).payload).toEqual({ ...range, key: KEY });
+    expect(parseWorkerEvent('landed', { ...range, key: KEY, gateLog: '/w/gate.log' }).payload).toEqual({ ...range, key: KEY, gateLog: '/w/gate.log' });
     expect(parseWorkerEvent('blocked-on', { ...range, reason: ' waits\non‮ epic b ', clearInput: 'merge of b#12' }).payload)
       .toMatchObject({ reason: 'waits on epic b', clearInput: 'merge of b#12' });
     expect(parseWorkerEvent('review-ready', { ...reviewReady, head: 'd'.repeat(64), base: 'e'.repeat(64) }).payload).toMatchObject({ head: 'd'.repeat(64) });
@@ -32,7 +32,7 @@ describe('typed worker event schema (ADR-0043 §2)', () => {
 
   it('makes head, base, branch, repo and attempt mandatory in every type', () => {
     for (const type of ['review-ready', 'landed', 'blocked-on'] as const) {
-      expect(schemaFields(type)).toEqual(expect.arrayContaining(['repo', 'branch', 'head', 'base', 'attempt']));
+      expect(requiredFields(type)).toEqual(expect.arrayContaining(['repo', 'branch', 'head', 'base', 'attempt']));
     }
     const err = refusal(() => parseWorkerEvent('blocked-on', { reason: 'r', clearInput: 'c' }));
     expect(err.code).toBe('event-invalid');
@@ -43,14 +43,28 @@ describe('typed worker event schema (ADR-0043 §2)', () => {
   });
 
   it('names every defect: a missing field, a wrong form and an unknown field', () => {
-    const { receipt: _receipt, ...withoutReceipt } = reviewReady;
-    const err = refusal(() => parseWorkerEvent('review-ready', { ...withoutReceipt, head: 'HEAD~1', gateLog: 'gate.log', extra: 1 }));
+    const { reviewDir: _reviewDir, ...withoutFolder } = reviewReady;
+    const err = refusal(() => parseWorkerEvent('review-ready', { ...withoutFolder, head: 'HEAD~1', gateLog: 'gate.log', extra: 1 }));
     expect(err.details.defects).toEqual([
       'head: expected a full object id (40 or 64 lower-case hex)',
       'gateLog: expected an absolute path of at most 4096 characters',
-      'receipt: missing',
+      'reviewDir: missing',
       'extra: not a review-ready field',
     ]);
+  });
+
+  it('takes review-ready without a receipt: the first hand-off for review has none yet (ruling R1-2)', () => {
+    const { receipt: _receipt, ...firstHandOff } = reviewReady;
+    expect(parseWorkerEvent('review-ready', firstHandOff).payload).toEqual(firstHandOff);
+    expect(requiredFields('review-ready')).not.toContain('receipt');
+    expect(schemaFields('review-ready')).toContain('receipt');
+    expect(refusal(() => parseWorkerEvent('review-ready', { ...firstHandOff, receipt: 'r.md' })).message).toContain('receipt: expected an absolute path');
+  });
+
+  it('keeps the gate log and the key mandatory on landed', () => {
+    expect(requiredFields('landed')).toEqual(expect.arrayContaining(['key', 'gateLog']));
+    const err = refusal(() => parseWorkerEvent('landed', range));
+    expect(err.details.defects).toEqual(['key: missing', 'gateLog: missing']);
   });
 
   it.each([
@@ -79,13 +93,13 @@ describe('typed worker event schema (ADR-0043 §2)', () => {
     expect(refusal(() => parseWorkerEvent('merged', reviewReady)).message).toContain('type must be one of review-ready, landed, blocked-on');
     expect(refusal(() => parseWorkerEvent('landed', [range])).message).toBe('payload must be a JSON object');
     expect(refusal(() => parseWorkerEvent('landed', null)).message).toBe('payload must be a JSON object');
-    const big = { ...range, key: KEY, pad: 'x'.repeat(EVENT_PAYLOAD_MAX_BYTES) };
+    const big = { ...range, key: KEY, gateLog: '/w/gate.log', pad: 'x'.repeat(EVENT_PAYLOAD_MAX_BYTES) };
     expect(refusal(() => parseWorkerEvent('landed', big)).message).toContain(`the limit is ${EVENT_PAYLOAD_MAX_BYTES}`);
   });
 
   it('reads only own fields: an inherited field is missing, not taken', () => {
     const inherited = Object.create({ key: KEY }) as Record<string, unknown>;
-    Object.assign(inherited, range);
+    Object.assign(inherited, range, { gateLog: '/w/gate.log' });
     expect(refusal(() => parseWorkerEvent('landed', inherited)).message).toContain('key: missing');
   });
 });

@@ -9,6 +9,7 @@ import {
   validateWorkerEvent,
   type IEvidenceReader,
   type IEventValidator,
+  type TPatchIdCommand,
 } from '@/lib/worker-event-validators';
 import type { INoteView } from '@/types/note';
 import type { IEventScope, IEventScopesState, INoteEventRecord, TWorkerEvent, TWorkerEventType } from '@/types/worker-event';
@@ -40,7 +41,13 @@ export interface IWorkerEventsDeps {
   /** Further evidence roots for every workspace (`PMUX_EVENT_EVIDENCE_ROOTS`). */
   extraRoots: () => string[];
   reader: IEvidenceReader;
-  patchIdCommand: (base: string, head: string) => string[];
+  patchIdCommand: TPatchIdCommand;
+  /**
+   * The ssh alias of the host that runs the tab (ADR-0022), null for this server's host, or
+   * undefined when the layout cannot say. Only a tab known to be local may send: the server reads
+   * evidence on its own host.
+   */
+  tabHost: (workspaceId: string, tabId: string) => Promise<string | null | undefined>;
   validators?: readonly IEventValidator[];
   notes: Pick<NotesService, 'sendEvent'>;
   audit?: (entry: Record<string, unknown>) => Promise<unknown>;
@@ -178,6 +185,12 @@ export class WorkerEventsService {
     if (caller.admin || !caller.verified || !workspaceId || !tabId) {
       throw new WorkerEventError('forbidden', 'a typed event is sent from a verified tab, never from a workspace or admin token');
     }
+    const host = await this.deps.tabHost(workspaceId, tabId);
+    if (host !== null) {
+      throw new WorkerEventError('event-check-unavailable', host === undefined
+        ? `the host of ${workspaceId}/${tabId} cannot be read from its layout, so its evidence cannot be checked here; report through the coordinator`
+        : `${workspaceId}/${tabId} runs on host ${host} (ADR-0022); the server reads evidence on its own host only, so a remote tab reports through the coordinator`);
+    }
     const { toEpic } = input;
     if (!isEpicSlug(toEpic)) throw new WorkerEventError('event-invalid', `toEpic must be an epic slug, got ${JSON.stringify(toEpic)}`);
     const scope = (await this.deps.readScopes()).scopes.find((s) => s.workspaceId === workspaceId && s.tabId === tabId);
@@ -202,11 +215,18 @@ export class WorkerEventsService {
     const { passed, failures } = await validateWorkerEvent(event, {
       reader: this.deps.reader, roots, patchIdCommand: this.deps.patchIdCommand,
     }, this.deps.validators ?? DEFAULT_VALIDATORS);
+    const unavailable = failures.filter((f) => f.unavailable);
+    if (unavailable.length) {
+      throw new WorkerEventError('event-check-unavailable',
+        `${event.type} cannot be checked on this server: ${unavailable.map((f) => `${f.check}: ${f.measured}; expected ${f.expected}`).join(' | ')}`,
+        { failures: unavailable });
+    }
     if (failures.length) {
       const lines = failures.map((f) => `${f.check}: measured ${f.measured}; expected ${f.expected}`);
       throw new WorkerEventError('event-refused', `${event.type} refused by ${failures.length} check(s): ${lines.join(' | ')}`, { failures });
     }
-    const sent = await this.deps.notes.sendEvent(caller, this.noteInput(caller, scope, event, toEpic, passed));
+    const noteInput = this.noteInput(caller, scope, event, toEpic, passed);
+    const sent = await this.deps.notes.sendEvent(caller, { ...noteInput, recheck: () => this.recheckScope(scope, workspaceId, tabId, toEpic) });
     await this.audit({
       event: 'typed-event-delivered', type: event.type, toEpic, noteId: sent.note.id, statusNoteId: sent.status?.id ?? null,
       from: { workspaceId, tabId }, checks: passed,
@@ -216,6 +236,22 @@ export class WorkerEventsService {
       note: sent.note,
       status: sent.status,
     };
+  }
+
+  /**
+   * Inside the notes lock, after the slow checks: a re-dispatch (a new attempt), a cleared scope or
+   * a changed epic during validation makes the result stale (ruling R1-5).
+   */
+  private async recheckScope(checked: IEventScope, workspaceId: string, tabId: string, toEpic: string): Promise<void> {
+    const now = (await this.deps.readScopes()).scopes.find((s) => s.workspaceId === workspaceId && s.tabId === tabId);
+    if (!now || now.attempt !== checked.attempt || now.epic !== checked.epic) {
+      throw new WorkerEventError('event-stale', now
+        ? `the scope changed while the evidence was checked (attempt ${checked.attempt} → ${now.attempt}, epic ${checked.epic} → ${now.epic}); the old attempt's result is not delivered`
+        : 'the scope was cleared while the evidence was checked; the result is not delivered');
+    }
+    if (toEpic !== now.epic && !now.dependsOn.includes(toEpic)) {
+      throw new WorkerEventError('event-out-of-scope', `epic:${toEpic} left this tab's scope while the evidence was checked`);
+    }
   }
 
   private async roots(workspaceId: string): Promise<string[]> {
@@ -264,7 +300,7 @@ const evidenceRoots = (): string[] =>
 
 export const getWorkerEventsService = async (): Promise<WorkerEventsService> => {
   if (g.__ptWorkerEventsService) return g.__ptWorkerEventsService;
-  const [scopeStore, workspaceStore, tabLifecycle, notesService, leaseStore, leaseHttp, validators, audit] = await Promise.all([
+  const [scopeStore, workspaceStore, tabLifecycle, notesService, leaseStore, leaseHttp, validators, audit, layoutStore] = await Promise.all([
     import('@/lib/event-scope-store'),
     import('@/lib/workspace-store'),
     import('@/lib/tab-lifecycle'),
@@ -273,6 +309,7 @@ export const getWorkerEventsService = async (): Promise<WorkerEventsService> => 
     import('@/lib/lease-http'),
     import('@/lib/worker-event-validators'),
     import('@/lib/coordination-audit'),
+    import('@/lib/layout-store'),
   ]);
   const notes = await notesService.getNotesService();
   g.__ptWorkerEventsService = new WorkerEventsService({
@@ -293,7 +330,16 @@ export const getWorkerEventsService = async (): Promise<WorkerEventsService> => 
     workspaceDirectories: async (workspaceId) => (await workspaceStore.getWorkspaceById(workspaceId))?.directories ?? [],
     extraRoots: evidenceRoots,
     reader: validators.fsEvidenceReader,
-    patchIdCommand: validators.patchIdCommandFrom(process.env.PMUX_EVENT_PATCH_ID_CMD),
+    patchIdCommand: validators.patchIdCommandFrom(process.env[validators.PATCH_ID_ENV]),
+    tabHost: async (workspaceId, tabId) => {
+      try {
+        const layout = await layoutStore.readLayoutFile(layoutStore.resolveLayoutFile(workspaceId));
+        const tab = layout ? layoutStore.collectAllTabs(layout.root).find((t) => t.id === tabId) : undefined;
+        return tab ? tab.host ?? null : undefined;
+      } catch {
+        return undefined;
+      }
+    },
     notes,
     audit: audit.appendCoordinationAudit,
   });

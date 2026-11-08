@@ -11,6 +11,7 @@ const STATUS: Record<TWorkerEventErrorCode, number> = {
   'event-out-of-scope': 403,
   'event-stale': 409,
   'event-no-recipient': 503,
+  'event-check-unavailable': 409,
   forbidden: 403,
 };
 
