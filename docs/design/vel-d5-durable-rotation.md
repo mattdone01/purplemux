@@ -122,6 +122,54 @@ Ordinary tabs without a handoff path still do not rotate. AC6 measures coverage 
 default handoff path is a product decision that this measurement informs. Codex and Grok still cannot run remotely
 (ADR-0022).
 
+## Decisions made during implementation
+
+1. **A session id that is gone since the checkpoint counts as a clear.** A restart unbinds the session
+   (`markAgentLaunch`). At a server start, a row that is still `written` and a bound session that differs from
+   `sessionBefore`, null included, resume as `rotating`. The risk goes in one direction. If the restart never ran
+   and the old session binds again, the first message never goes, the row becomes `undelivered` after 10 min, and
+   the board flags it. The rotation is then asked again. A second clear never runs. The other reading would risk
+   a second clear.
+2. **The dirty count leaves out `*.checkpoint.json`.** The server writes the plain copy after the checkpoint's
+   probe and before the resume probe. Without this rule, every v2 seat (its handoff lives in the worktree) would
+   report a false "uncommitted files N → N+1" mismatch (mutation M25).
+3. **A `/clear` clears the due time.** A rotation that a human `/clear` made moot stops its wait, so the next
+   rotation does not report hours of wait that it never had (M26).
+4. **Telemetry tests make the seat item fail and keep the checkpoint working.** The review's finding was a lost
+   phase after a durability failure and a restart. Two tests drop the seat item writes in the middle of a rotation,
+   restart the server, and prove that the row alone resumes the right step.
+
 ## Mutation record
 
-Filled in after implementation: each row names a mutation of a new branch and the test that fails on it.
+Each mutation was applied to the committed tree, the named test file was run, and the file was restored
+(`/tmp/.../mutate.py`, which is not committed). All 27 were killed (the test file failed).
+
+| # | Mutation (new branch) | Killed by |
+|---|---|---|
+| M1 | read-back digest comparison skipped | `context-lifecycle-durable.test.ts` (read-back differs) |
+| M2 | a missing read-back row accepted | durable (read-back finds no row) |
+| M3 | the refusal not recorded on the seat | durable (refusal visible and counted) |
+| M4 | an unreachable host counted as a failed check | durable (remote seat waits) |
+| M5 | no freeze of a row stopped in `delivering` | durable (AC7 `during-delivery` × 4 points) |
+| M6 | a moved session not read as a clear | durable (telemetry lost, then a restart) |
+| M7 | a `delivered` row not settled quietly | durable (seat item missed the delivery) |
+| M8 | no `delivering` mark before the paste | durable (AC7 `during-delivery`: typed twice) |
+| M9 | the attempt always new | durable (refused, then recovered, same attempt) |
+| M10 | timeouts not counted | durable (deadline ends a refused checkpoint) |
+| M11 | wait-to-rotate not counted | durable (AC6 counts) |
+| M12 | the resume comparison skipped | durable (worktree moved on) |
+| M13 | the handoff never written back at resume | durable (handoff lost on the host) |
+| M14 | `undelivered` not marked at the first-message timeout | durable (host unreachable past the TTL) |
+| M15 | the seat check refuses a remote host again | `cli-tabs-remote.test.ts` |
+| M16 | "moved on" and "rewritten" heads read the same | `rotation-checkpoint.test.ts` |
+| M17 | the dirty count not compared | `rotation-checkpoint.test.ts`, durable |
+| M18 | the mismatch notice puts the resume command first | `rotation-checkpoint.test.ts`, durable |
+| M19 | coverage counts tabs whose rotation is off | `rotation-checkpoint.test.ts` |
+| M20 | the notice may carry a line break | `rotation-checkpoint.test.ts` |
+| M21 | an applied row takes a new body | `rotation-checkpoint-store.test.ts` |
+| M22 | a step moves from any state | `rotation-checkpoint-store.test.ts` |
+| M23 | an ssh failure read as a plain refusal | `seat-host-io.test.ts` |
+| M24 | the handoff rewritten even when equal | `seat-host-io.test.ts` |
+| M25 | the checkpoint copy counted as dirty | `rotation-checkpoint.test.ts` (real git repo) |
+| M26 | a `/clear` keeps the old due time | durable (moot rotation) |
+| M27 | a due seat in `watching` shows no wait | `rotation-checkpoint.test.ts` |
