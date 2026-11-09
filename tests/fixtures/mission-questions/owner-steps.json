@@ -1,5 +1,5 @@
 {
-  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named.",
+  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named. r4 (PR #60): shapes from a counts-and-shapes-only run over the real store; how the owner answers and what the agent does are not owner steps, and an option label is read for owner-addressed phrases only.",
   "positive": [
     {
       "name": "paste into",
@@ -188,8 +188,7 @@
         "context": "Merge the PR once CI is green. Reply with the merge time."
       },
       "expect": [
-        "'Merge the'",
-        "'Reply with'"
+        "'Merge the'"
       ]
     },
     {
@@ -253,6 +252,66 @@
       },
       "expect": [
         "'Run this'"
+      ]
+    },
+    {
+      "name": "r4 miss: 'you <verb>' after a label, not at a sentence start",
+      "question": {
+        "kind": "question",
+        "context": "Two ways to load the rates. (1) The agent waits for the nightly job. (2) A one-off: you run the load script with your own sign-in. Which way?"
+      },
+      "expect": [
+        "'you <do>'"
+      ]
+    },
+    {
+      "name": "r4 miss: 'please <verb>' on a third party",
+      "question": {
+        "kind": "question",
+        "context": "The vendor holds the refund. Please ask the vendor's support desk to release it today, then choose the refund date."
+      },
+      "expect": [
+        "'please <do>'"
+      ]
+    },
+    {
+      "name": "r4 miss: a paste-to-a-party message inside a line",
+      "question": {
+        "kind": "question",
+        "context": "One outside step - paste to the partner's onboarding contact: \"We need our sandbox key reissued.\" Then pick the go-live week."
+      },
+      "expect": [
+        "'Paste to <party>:'"
+      ]
+    },
+    {
+      "name": "r4 miss: an owner step in an option label",
+      "question": {
+        "kind": "question",
+        "context": "The nightly schedule fails until the fix lands.",
+        "options": [
+          {
+            "id": "a",
+            "label": "You disable the nightly schedule until the fix lands, then re-enable"
+          },
+          {
+            "id": "b",
+            "label": "Leave it on"
+          }
+        ]
+      },
+      "expect": [
+        "'you <do>'"
+      ]
+    },
+    {
+      "name": "r4 miss: steps announced as 'steps from you'",
+      "question": {
+        "kind": "question",
+        "context": "We need two short steps from you, at two times: tonight before 22:00 and tomorrow after the deploy. Which evening suits?"
+      },
+      "expect": [
+        "'steps from you'"
       ]
     }
   ],
@@ -457,6 +516,44 @@
       "question": {
         "kind": "question",
         "context": "The UI test log shows:\n2026-11-09T04:44:10Z ui: click Save -> 500 (timeout)\nand `click handler bound twice` on retry. Ship the fix tonight or wait for the full suite?"
+      }
+    },
+    {
+      "name": "r4 false positive: how the owner answers (reply with, type in the text box)",
+      "question": {
+        "kind": "question",
+        "context": "Three hosts can stay on the old build. Reply with the host names, one per line. Type the host names in the text box below if the list is long."
+      }
+    },
+    {
+      "name": "r4 false positive: agent steps after Fix: and Plan:, and a capability list",
+      "question": {
+        "kind": "question",
+        "context": "The nightly job fails on an empty batch. Fix: add the P3 label, add a test, open the PR.\nPlan:\n1. add the retry\n2. open the PR\nThe new role lets the agent read the secret, open a tunnel, pause and restart the worker. Grant the role now or after the review?"
+      }
+    },
+    {
+      "name": "r4 guard: 'you' as a question's subject or a condition",
+      "question": {
+        "kind": "question",
+        "context": "If you run the import twice, the second run is a no-op. Do you run it from the console or the command line?"
+      }
+    },
+    {
+      "name": "r4 guard: an imperative option label is the choice",
+      "question": {
+        "kind": "question",
+        "context": "CI is green on the release branch.",
+        "options": [
+          {
+            "id": "a",
+            "label": "Merge the PR now"
+          },
+          {
+            "id": "b",
+            "label": "Wait for the freeze"
+          }
+        ]
       }
     }
   ]

@@ -182,16 +182,36 @@ export const questionLint = (question: TMissionStoredQuestion): IMissionQuestion
   return findings;
 };
 
-const STEP_VERBS = 'click|tap|press|paste|copy|run|open|go|navigate|sign|log|enter|type|select|upload|download|install|rotate|add|set|update|create|merge|restart|reset|grant|send|reply|connect|plug|unplug|approve|visit';
+const STEP_VERBS = 'click|tap|press|paste|copy|run|open|go|navigate|sign|log|enter|type|select|upload|download|install|rotate|add|set|update|create|merge|restart|reset|grant|send|connect|plug|unplug|approve|visit';
+/** What the owner does to a third party or an item ("Please ask the vendor to ...", "please cancel it"), PR #60 r4. */
+const PARTY_VERBS = 'ask|tell|email|message|contact|call|forward|share|cancel|disable|enable|re-enable|delete|remove|pay|book|schedule';
+/** "you <verb>" outside a question (PR #60 r4): the owner named as the one who acts. */
+const YOU_VERBS = `${STEP_VERBS}|${PARTY_VERBS}|check|edit|change|accept`;
 
-/** Phrases that address the owner's own steps, anywhere in the text. */
-const OWNER_STEP_PHRASES: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\b(?:your|owner|manual)\s+steps?\b/i, "'Your steps'"],
-  [/\bsteps\s+for\s+you\b/i, "'steps for you'"],
-  [/^\s*steps\s*:/im, "'Steps:'"],
-  [new RegExp(`\\bplease\\s+(?:${STEP_VERBS})\\b`, 'i'), "'please <do>'"],
-  [new RegExp(`\\byou(?:'ll|\\s+will)?\\s+(?:need|have)\\s+to\\s+(?:${STEP_VERBS})\\b`, 'i'), "'you need to <do>'"],
-  [new RegExp(`\\byou\\s+must\\s+(?:${STEP_VERBS})\\b`, 'i'), "'you must <do>'"],
+interface IStepPhrase { pattern: RegExp; name: string; inQuestion: boolean }
+/**
+ * Phrases that address the owner's own steps, read per sentence. `inQuestion: false` skips a sentence that asks ("Do
+ * you run it nightly?"): there "you <verb>" is the question's subject, not a step.
+ */
+const OWNER_STEP_PHRASES: readonly IStepPhrase[] = [
+  { pattern: /\b(?:your|owner|manual)\s+steps?\b/i, name: "'Your steps'", inQuestion: true },
+  { pattern: /\bsteps\s+for\s+you\b/i, name: "'steps for you'", inQuestion: true },
+  { pattern: /^\s*steps\s*:/i, name: "'Steps:'", inQuestion: true },
+  { pattern: new RegExp(`\\bplease\\s+(?:${STEP_VERBS}|${PARTY_VERBS})\\b`, 'i'), name: "'please <do>'", inQuestion: true },
+  { pattern: new RegExp(`\\byou(?:'ll|\\s+will)?\\s+(?:need|have)\\s+to\\s+(?:${STEP_VERBS})\\b`, 'i'), name: "'you need to <do>'", inQuestion: true },
+  { pattern: new RegExp(`\\byou\\s+must\\s+(?:${STEP_VERBS})\\b`, 'i'), name: "'you must <do>'", inQuestion: true },
+  // "we need two short steps from you", "one action from you" (PR #60 r4).
+  { pattern: /\b(?:steps?|actions?)\s+from\s+you\b/i, name: "'steps from you'", inQuestion: true },
+  { pattern: new RegExp(`\\bneed\\s+you\\s+to\\s+(?:${YOU_VERBS})\\b`, 'i'), name: "'need you to <do>'", inQuestion: true },
+  // "A one-off: you run the script with your sign-in" (PR #60 r4); not after a conditional or an auxiliary ("if you
+  // run it", "do you run it").
+  {
+    pattern: new RegExp(`(?<!\\b(?:if|when|whenever|whether|unless|do|did|can|could|would|should|will|may|might|than|as)\\s+)\\byou\\s+(?:then\\s+)?(?:${YOU_VERBS})\\b(?!-)`, 'i'),
+    name: "'you <do>'",
+    inQuestion: false,
+  },
+  // A message for an outside party: "Paste this to the vendor's desk:", "Send to the bank contact:" (PR #60 r4).
+  { pattern: /\b(?:paste|send|forward|post)\s+(?:this\s+|the\s+(?:following|text\s+below)\s+)?to\s+[^.:?\n]{1,60}:/i, name: "'Paste to <party>:'", inQuestion: true },
 ];
 
 /**
@@ -203,7 +223,7 @@ const OBJECT = String.raw`(?:(?:the|your|it|this|that|these|a|an)\b|https?:|` + 
 const OWNER_STEP_IMPERATIVES: readonly RegExp[] = [
   new RegExp(String.raw`^(?:paste|copy|enter|type|select|upload|download|install|rotate|visit|add|set|update|create|merge|restart|reset|grant|send|connect|unplug|approve)\s+${OBJECT}`, 'i'),
   new RegExp(String.raw`^(?:click|tap)\s+(?:on\s+)?${OBJECT}`, 'i'),
-  new RegExp(String.raw`^(?:plug\s+in|reply\s+with|paste\s+(?:to|into))\b`, 'i'),
+  new RegExp(String.raw`^(?:plug\s+in|paste\s+(?:to|into))\b`, 'i'),
   // A UI label after click, tap or press ("Click Approve", "Press Enter"); not a capitalised heading ("Press Coverage:").
   /^(?:[Cc]lick|[Tt]ap|[Pp]ress)\s+(?![\w-]+\s*:)[A-Z]/,
   /^(?:[Gg]o|[Nn]avigate)\s+to\s+(?:the\b|your\b|https?:|`|[A-Z])/,
@@ -213,27 +233,71 @@ const OWNER_STEP_IMPERATIVES: readonly RegExp[] = [
 ];
 const LEADING_CONNECTIVE = /^(?:then|and|now|next|first|finally|after\s+that|once\s+(?:that\s+is\s+|it\s+is\s+)?done)[,\s]+/i;
 
+/**
+ * How the owner answers is not a step (PR #60 r4, the real-store false positives): "Reply with the names", "reply
+ * with them", "Type the hosts in the text box", "Tick the ones that apply", "Tap Done when ...". The answer IS that
+ * action.
+ */
+const ANSWER_CHANNEL: readonly RegExp[] = [
+  /^(?:please\s+)?reply\b/i,
+  /\b(?:type|enter|write|list|put|paste)\b[^.?!]*\b(?:in|into)\s+(?:the\s+)?(?:text|free-text|free\s+text|answer|reply)\s+(?:box|field)\b/i,
+  /^(?:please\s+)?tick\b/i,
+  /^(?:please\s+)?tap\s+Done\b/,
+  /^(?:please\s+)?(?:pick|choose|select)\s+(?:an?\s+|one\s+)?(?:option|answer)\b/i,
+];
+
+/**
+ * Agent steps and capability lists are not owner steps (PR #60 r4): a sentence after "Fix:" or "Plan:", a sentence
+ * whose subject is we, I, the agent or a role and whose verb is a step, and a list of what a grant lets the agent do
+ * ("The role lets the agent read the secret, open a tunnel, pause and restart").
+ */
+const AGENT_LABEL = /^(?:fix|plan|next\s+steps?\s+for\s+(?:me|us|the\s+agents?)|agent\s+steps|what\s+(?:i|we)\s+(?:will\s+)?do)\s*:/i;
+const AGENT_SUBJECT = new RegExp(String.raw`^(?:we|i|the\s+(?:agents?|orchestrator|worker|bot|role|grant|token|policy)|agents?|it)` +
+  String.raw`(?:'ll|\s+will|\s+would|\s+can|\s+then|\s+also|\s+first)?\s+(?:${STEP_VERBS}|${PARTY_VERBS}|read|write|lets|allows|enables)\b`, 'i');
+const CAPABILITY = /\b(?:lets|allows|permits|enables)\s+(?:the\s+)?(?:agents?|orchestrator|worker|bot|role|us|me|it)\b/i;
+const isAgentSentence = (sentence: string): boolean =>
+  AGENT_LABEL.test(sentence) || AGENT_SUBJECT.test(sentence.replace(LEADING_CONNECTIVE, '')) || CAPABILITY.test(sentence);
+
 /** The owner step a clause starts with, by its first words; null when it is not one. */
 const ownerStepOf = (clause: string): string | null => {
   const text = clause.replace(LEADING_CONNECTIVE, '');
   if (!OWNER_STEP_IMPERATIVES.some((pattern) => pattern.test(text))) return null;
   return text.split(/\s+/).slice(0, 2).join(' ').replace(/[`:"',.]+$/, '');
 };
-const LIST_MARKER = /^\s*(?:[-*•]|\d{1,2}[.):]|step\s+\d{1,2}[.):]?)\s+/i;
+const LIST_MARKER = /^\s*(?:[-*•]|\d{1,2}[.):]|\(\d{1,2}\)|\([a-z]\)|step\s+\d{1,2}[.):]?)\s+/i;
+const BLANK = /^\s*$/;
 
 /**
- * Sentences, lines and list items, each without its list marker, then each sentence's comma clauses ("In the billing
- * page, click Upgrade"). A sentence that asks ("Run this migration tonight, or wait?") is dropped whole: a question is
- * not a step.
+ * The sentences that can hold an owner step, each without its list marker. A "Fix:" or "Plan:" heading on its own
+ * line opens an agent block: its list items are agent steps, until a blank line, a line that is not a list item, or
+ * an owner-steps heading. An answer-channel sentence and an agent sentence are dropped.
  */
-const clauses = (text: string): string[] =>
-  text.split('\n')
-    .flatMap((line) => line.replace(LIST_MARKER, '').split(/(?<=[.!?;])\s+/))
-    .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence && !sentence.endsWith('?'))
-    .flatMap((sentence) => sentence.split(/,\s+/))
-    .map((part) => part.trim())
-    .filter(Boolean);
+const stepSentences = (text: string): Array<{ sentence: string; asks: boolean }> => {
+  const out: Array<{ sentence: string; asks: boolean }> = [];
+  let agentBlock = false;
+  for (const line of text.split('\n')) {
+    const isItem = LIST_MARKER.test(line);
+    const body = line.replace(LIST_MARKER, '').trim();
+    if (agentBlock && (BLANK.test(line) || !isItem || /^(?:your|owner|manual)\s+steps?\b|^steps\s*:/i.test(body))) agentBlock = false;
+    if (agentBlock) continue;
+    if (AGENT_LABEL.test(body) && body.replace(AGENT_LABEL, '').trim() === '') {
+      agentBlock = true;
+      continue;
+    }
+    for (const raw of body.split(/(?<=[.!?;])\s+/)) {
+      const sentence = raw.trim();
+      if (!sentence || ANSWER_CHANNEL.some((p) => p.test(sentence.replace(LEADING_CONNECTIVE, ''))) || isAgentSentence(sentence)) continue;
+      out.push({ sentence, asks: sentence.endsWith('?') });
+    }
+  }
+  return out;
+};
+
+/**
+ * Each sentence's comma clauses ("In the billing page, click Upgrade"). A sentence that asks ("Run this migration
+ * tonight, or wait?") gives none: a question is not a step.
+ */
+const clausesOf = (sentence: string): string[] => sentence.split(/,\s+/).map((part) => part.trim()).filter(Boolean);
 
 /** The question's own words: never `title` (v1 title IS the decision), code blocks dropped (quoted text, not a step). */
 const ownerStepTexts = (question: Record<string, unknown>): Array<[string, string]> => {
@@ -248,6 +312,7 @@ const ownerStepTexts = (question: Record<string, unknown>): Array<[string, strin
     question.options.forEach((option: unknown, index: number) => {
       if (option && typeof option === 'object') {
         const o = option as Record<string, unknown>;
+        add(`options[${index}].label`, o.label);
         add(`options[${index}].consequence`, o.consequence);
         add(`options[${index}].description`, o.description);
       }
@@ -256,23 +321,34 @@ const ownerStepTexts = (question: Record<string, unknown>): Array<[string, strin
   return texts;
 };
 
+/** Fields that name a choice: an imperative there is the choice ("Select the rollout path", "Merge now"), not a step. */
+const PHRASES_ONLY = /^(?:decision|options\[\d+\]\.label)$/;
+
 /**
  * Owner steps inside a question (vel-MC-ACT, a recurrence the owner raised): an action the owner must take, written into
  * a question, closes with the question when he answers it, undone. A warning, never a refusal: it names what it found,
  * where, and the split, one kind=action item per step. A kind=action item is not read: it is the step.
  *
  * A heuristic, tuned on a fixture set (tests/fixtures/mission-questions/owner-steps.json and the served question
- * fixtures): an imperative owner verb starting a sentence, line or list item, or a phrase that addresses the owner's
- * steps. A plain decision ("Should I run this migration?", "1. Ship staged", "click-through rate") is not a step.
+ * fixtures) and, by counts and shapes only, on the real store (PR #60 r4): an imperative owner verb starting a
+ * sentence, line or list item, or a phrase that addresses the owner's steps. A plain decision ("Should I run this
+ * migration?", "1. Ship staged", "click-through rate"), how the owner answers ("Reply with ..."), and what the agent
+ * does ("Fix: add a test", "the role lets the agent open a tunnel") are not steps.
  */
 export const ownerStepsLint = (question: Record<string, unknown>): IMissionQuestionDefect[] => {
   if (question.kind !== 'question') return [];
   const found: string[] = [];
   const fields: string[] = [];
   for (const [field, text] of ownerStepTexts(question)) {
-    const phrases = OWNER_STEP_PHRASES.filter(([pattern]) => pattern.test(text)).map(([, name]) => name);
-    // A v2 decision is often imperative ("Select the rollout path"): there only an explicit owner-step phrase counts.
-    const steps = field === 'decision' ? [] : clauses(text).map(ownerStepOf).filter((step): step is string => step !== null);
+    const sentences = stepSentences(text);
+    const phrases = OWNER_STEP_PHRASES
+      .filter(({ pattern, inQuestion }) => sentences.some(({ sentence, asks }) => (inQuestion || !asks) && pattern.test(sentence)))
+      .map(({ name }) => name);
+    const steps = PHRASES_ONLY.test(field) ? [] : sentences
+      .filter(({ asks }) => !asks)
+      .flatMap(({ sentence }) => clausesOf(sentence))
+      .map(ownerStepOf)
+      .filter((step): step is string => step !== null);
     if (!phrases.length && !steps.length) continue;
     fields.push(field);
     found.push(...phrases.filter((name) => !found.includes(name)));
