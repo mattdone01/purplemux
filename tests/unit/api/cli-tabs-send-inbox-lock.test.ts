@@ -61,10 +61,6 @@ vi.mock('@/lib/status-manager', () => ({
 }));
 vi.mock('@/lib/ledger-store', () => ({ getLedgerStore: () => ({ tabEvents: {} }) }));
 vi.mock('@/lib/tab-event-router', () => ({ appendDelivered: () => {} }));
-vi.mock('@/lib/fleet-config-store', () => ({
-  readFleetConfig: async () => ({ values: {}, versions: {}, history: [] }),
-  valueOf: () => null,
-}));
 
 const fakeResponse = () => {
   const state = { statusCode: 0, body: undefined as unknown };

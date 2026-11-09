@@ -4,7 +4,6 @@ import { getStatusManager } from '@/lib/status-manager';
 import {
   awaitSendReadiness,
   MAX_SEND_READY_TIMEOUT_MS,
-  REMOTE_CALL_DEFAULT_MS,
   resolveSendWaitMs,
   resolveTabCliState,
 } from '@/lib/tab-send';
@@ -12,7 +11,7 @@ import { capturePaneContent, hasSessionOrUnreachable, isContentPendingInComposer
 import { readComposerScreen } from '@/lib/composer-readiness';
 import { confirmSubmission, type ISubmitConfirmRequest, type TSubmitResult } from '@/lib/send-confirmation';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
-import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
+import { remoteTimeoutMs } from '@/lib/remote-timeouts';
 import { withAgentDispatchThen } from '@/lib/agent-dispatch-policy';
 import { TAB_NOT_FOUND_BODY, remoteHostUnreachableBody, targetChangedBody } from '@/lib/cli-error';
 import { RemoteHostError } from '@/lib/remote-host';
@@ -25,30 +24,6 @@ import { startupPromptFix, startupPromptLabel } from '@/lib/startup-prompt';
 import { parseRawFlag, rawRefusalText, terminalInputRefusal } from '@/lib/terminal-command-line';
 
 const log = createLogger('tab-send');
-
-const REMOTE_TIMEOUT_KEY = 'remote.timeout-ms';
-
-/** Whole milliseconds, 5000..120000, as `remote.timeout-ms` takes them (vel-D61); anything else is unset. */
-const parseRemoteTimeoutMs = (raw: string | undefined): number | null => {
-  if (!raw || !/^\d{4,6}$/.test(raw.trim())) return null;
-  const ms = Number(raw.trim());
-  return ms >= REMOTE_CALL_DEFAULT_MS && ms <= 120_000 ? ms : null;
-};
-
-/**
- * The host's ssh budget: `remote.timeout-ms.<host>`, else `remote.timeout-ms`, else the 5 s default. Read only if
- * set (vel-D61 adds the keys); a store that cannot be read gives the default, never a shorter wait.
- */
-const remoteTimeoutMs = async (host: string): Promise<number> => {
-  try {
-    const state = await readFleetConfig();
-    return parseRemoteTimeoutMs(valueOf(state, `${REMOTE_TIMEOUT_KEY}.${host}`)?.value)
-      ?? parseRemoteTimeoutMs(valueOf(state, REMOTE_TIMEOUT_KEY)?.value)
-      ?? REMOTE_CALL_DEFAULT_MS;
-  } catch {
-    return REMOTE_CALL_DEFAULT_MS;
-  }
-};
 
 /** `submit` is null for a tab with no turn to prove (a terminal or browser tab). */
 interface IDelivered {

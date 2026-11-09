@@ -41,7 +41,7 @@ Ruling and options: `docs/design/vel-retro-r3-send-confirm.md`.
    submit-unconfirmed`, and the CLI exits 1 (ADR-0016): the text was typed, so a resend would type it twice.
 5. Review r1 (2026-11-09). The hook evidence is read again after every capture, so a hook that lands while a slow
    remote capture runs is proof, also past the deadline. A remote window scales with the host's `remote.timeout-ms`
-   (vel-D61, read only if set; at most 60 s), and a remote screen gate waits at least two ssh budgets, so one
+   (vel-D61's `remoteTimeoutMs`; at most 60 s), and a remote screen gate waits at least two ssh budgets, so one
    capture that runs the whole budget and fails is never the answer. The send reads its baseline before it types:
    with no status entry it refuses (409 `submit-unconfirmed`, `typed: false`) and types nothing. Every dispatch
    (the inbox and automated dispatchers, steer, restart, both send routes) takes the tab's send gate

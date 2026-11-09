@@ -63,14 +63,16 @@ vi.mock('@/lib/agent-dispatch-policy', () => ({
 }));
 
 const fleet = vi.hoisted(() => ({ values: {} as Record<string, string>, unreadable: false }));
-vi.mock('@/lib/fleet-config-store', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/lib/fleet-config-store')>();
+// The host's budget is vel-D61's reader (`remote-timeouts.ts`, its own tests cover the store); here it reads these
+// values through the same key rules.
+vi.mock('@/lib/remote-timeouts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/remote-timeouts')>();
   return {
     ...actual,
-    readFleetConfig: async () => {
-      if (fleet.unreadable) throw new Error('fleet config unreadable');
+    remoteTimeoutMs: async (host: string) => {
+      if (fleet.unreadable) return actual.REMOTE_TIMEOUT_DEFAULT_MS;
       const values = Object.fromEntries(Object.entries(fleet.values).map(([k, value]) => [k, { value, version: 1, setBy: { tabId: 't', workspaceId: 'w' } }]));
-      return { values, versions: {}, history: [] };
+      return actual.remoteTimeoutMsIn({ values, versions: {}, history: [] } as never, host);
     },
   };
 });
