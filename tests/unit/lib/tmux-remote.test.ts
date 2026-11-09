@@ -467,6 +467,17 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     ]);
   });
 
+  it('the seed gets the cwd as tmux does, unresolved: "<link>/.." is resolved on the host, never here (review r2 CONFIRM)', async () => {
+    workspaceDirs.map.set('ws-r', ['/srv/ws-one']);
+    const { createSession } = await import('@/lib/tmux');
+    const cwd = '/srv/data/a/link/..';
+    await createSession(REMOTE, 120, 40, cwd, { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: cwd });
+    const script = calls.list[0].input ?? '';
+    expect(script.split('\n').find((l) => l.startsWith('if command -v python3'))).toBe(
+      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/data/a/link/..' '/srv/ws-one' >/dev/null 2>&1 || :; fi`);
+    expect(script).not.toContain("'/srv/data/a'");
+  });
+
   it('a cwd that is not the named one (the pane moved, or none was named) is not named', async () => {
     workspaceDirs.map.set('ws-r', ['/srv/ws-one']);
     const { createSession, remoteTrustTarget } = await import('@/lib/tmux');

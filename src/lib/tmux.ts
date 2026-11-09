@@ -152,8 +152,9 @@ const tabEnv = async (sessionName: string, identity?: ITabIdentity): Promise<Rec
 };
 
 /**
- * What a remote create pre-trusts (D14, ruling R-05), or null for nothing. Compared as plain paths: the cwd is a
- * path on the remote host, so the remote script resolves symlinks and checks the containment again.
+ * What a remote create pre-trusts (D14, ruling R-05), or null for nothing. Compared here as plain paths only to pick
+ * the workspace directory and to match the named cwd; the seed receives the cwd unresolved, as tmux does, and
+ * resolves symlinks and checks the containment on the host.
  *
  * - The cwd inside a workspace directory: the D14 seed with that directory.
  * - The cwd the creator named (`trustCwd`, set once at create from `tab create --cwd`, vel-PMX-FU): `--named` with
@@ -180,8 +181,10 @@ export const remoteTrustTarget = async (
     }
   }
   const workspaceDirectory = nearestWorkspaceDirectory(resolved, directories);
-  if (named) return { cwd: resolved, workspaceDirectories: workspaceDirectory ? [workspaceDirectory] : directories, named: true };
-  return workspaceDirectory ? { cwd: resolved, workspaceDirectories: [workspaceDirectory], named: false } : null;
+  // The seed gets the cwd exactly as tmux does and resolves it with realpath on the host (review r2 CONFIRM): a lexical
+  // resolve here turns "<link>/.." into the link's parent, a directory the pane never runs in.
+  if (named) return { cwd, workspaceDirectories: workspaceDirectory ? [workspaceDirectory] : directories, named: true };
+  return workspaceDirectory ? { cwd, workspaceDirectories: [workspaceDirectory], named: false } : null;
 };
 
 const kitBroken = (host: string, line: string): RemoteKitBrokenError => {

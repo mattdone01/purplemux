@@ -261,6 +261,29 @@ describe('the named cwd pre-trust (vel-PMX-FU)', () => {
     expect(projects()).not.toHaveProperty(home);
   });
 
+  const hasTmux = spawnSync('tmux', ['-V']).status === 0;
+  it.skipIf(!hasTmux)('the create script\'s seed line with a "<link>/.." cwd keys the host realpath, the directory tmux runs in (review r2 CONFIRM)', () => {
+    const target = path.join(home, 'clones', 'deep', 'repo');
+    fs.mkdirSync(target, { recursive: true });
+    const holder = path.join(home, 'links');
+    fs.mkdirSync(holder);
+    fs.symlinkSync(target, path.join(holder, 'to-repo'));
+    const cwd = `${holder}/to-repo/..`;
+    const line = remoteTrustSeedLine({ cwd, workspaceDirectories: [workspace], named: true });
+    execFileSync('/bin/sh', ['-c', `d="${kit}"\n${line}`], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+    // Where the pane really runs: tmux's own `-c` (a chdir, which follows the link before the ".."), read back from tmux.
+    const socket = `pmux-trust-${process.pid}-${Date.now()}`;
+    let paneDirectory: string;
+    try {
+      execFileSync('tmux', ['-L', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'trust', '-c', cwd, 'exec sleep 30']);
+      paneDirectory = execFileSync('tmux', ['-L', socket, 'display-message', '-p', '-t', '=trust:', '#{pane_current_path}'], { encoding: 'utf-8' }).trim();
+    } finally {
+      spawnSync('tmux', ['-L', socket, 'kill-server']);
+    }
+    expect(paneDirectory).toBe(path.join(home, 'clones', 'deep'));
+    expect(Object.keys(projects())).toEqual([paneDirectory]);
+  });
+
   /**
    * Runs the seed's own functions with read_object wrapped: `races` other writes land on the file right after the
    * seed reads it, the lost-update window of an unlocked read-modify-write (review r1 C1).
