@@ -330,10 +330,19 @@ describe('owner steps inside a question (vel-MC-ACT)', () => {
     expect(store.applyEvents).toHaveBeenCalledTimes(1);
   });
 
-  it('an action item that is itself the step gets no such warning', async () => {
-    const action = { formatVersion: 2, kind: 'action', title: 'Rotate the token', decision: 'Rotate the token', answerType: 'action-done', context: 'Paste the new token to the repository secret.', storyIds: [], blockingScope: 'story', canContinue: true };
-    const r = await post([event('e-act', action)]);
+  const action = { formatVersion: 2, kind: 'action', title: 'Rotate the token', decision: 'Rotate the token', answerType: 'action-done', context: 'Paste the new token to the repository secret.', storyIds: [], blockingScope: 'story', canContinue: true };
+  const review = { humanNeed: 'external-action', humanReason: 'Only the owner holds the token.', handling: 'Opened for the owner.', reviewerTabId: 'tab-o' };
+
+  it('an action item that is itself the step gets no owner-steps warning', async () => {
+    const r = await post([event('e-act', { ...action, class: 'scope', humanReview: review })]);
     expect(r.status).toBe(200);
     expect(r.body.lint).toEqual([]);
+  });
+
+  it('an action opened with no human review is warned that only the orchestrator makes it visible (both routes)', async () => {
+    const r = await post([event('e-bare', action)]);
+    expect(r.status).toBe(200);
+    expect(r.body.lint).toEqual([{ eventId: 'e-bare', itemId: 'item-e-bare', findings: [expect.objectContaining({ field: 'humanReview', limit: expect.stringContaining('configured orchestrator') })] }]);
+    expect((await check(action)).body).toMatchObject({ ok: true, lint: [expect.objectContaining({ field: 'humanReview' })] });
   });
 });

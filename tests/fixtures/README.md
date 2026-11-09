@@ -58,3 +58,11 @@ scratch `CLAUDE_CONFIG_DIR` (onboarding marked done, no credentials) in a scratc
 | `claude-external-imports-accepted.ansi` | the same pane after Down Enter: the composer above 26 blank rows |
 
 The three 2026-11-04 incidents (ws-zOfVyu D14, hfl-37, hfl-38) kept no capture; these were made to stand for them.
+
+## `mission-questions/`
+
+`owner-steps.json` is the tuning set of the owner-steps lint (vel-MC-ACT, `ownerStepsLint` in
+`src/lib/mission-question-format.ts`). Its `positive` cases are owner steps written into a kind=question, each with the
+text the finding must carry; its `negative` cases are ordinary decision questions, among them every false positive the
+review of PR #60 named. Synthetic text in the shape of served questions; no owner text copied.
+`tests/unit/lib/mission-question-format.test.ts` reads it, and also requires that no `mc-question-v2` item is flagged.

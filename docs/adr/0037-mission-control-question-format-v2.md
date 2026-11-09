@@ -234,13 +234,26 @@ Then measure why the asker does not use the link. Do that before you add mechani
 A recurrence the owner raised. Two things went missing from Mission Control:
 
 1. An owner action written inside a question item closed, undone, when he answered the question.
-2. An open kind=action item did not show in his list, though the snapshot listed it as open.
+2. An open kind=action item did not show in his list, though it was listed as open work.
 
-- **Owner steps are lint, not a refusal.** Every attention.opened and attention.updated of a kind=question, v1 or v2, is read for owner steps in its `context`: "Paste … to/into", "Your steps", "run this", "click", or two or more numbered step lines. A match adds one finding, `context: owner steps in a question: <what was found>`, with the split as its limit: each owner step becomes its own kind=action item (answerType `action-done`, humanNeed `external-action`), and the question keeps to the decision.
-  - The finding reaches the asker on `mc ask`'s stderr, through the check route, and in the events route's 200 body, like the class lint.
-  - It never refuses. A phrase match cannot tell an owner step from evidence that quotes one, and a refused question would hide the decision too.
-  - A kind=action item is not read: it is the step.
-- **Every open owner item renders.** The owner's Needs you list counts every open item whose human review needs him, whatever its kind. It used to render a card only for an item the page already held a draft for, so an item that arrived before its draft was counted and not shown. The card now renders from a fresh draft when the page holds none.
-  - An action renders as an action: the "Action" label, and the "I've completed this action" control.
-  - The opener therefore keeps accepting kind=action with humanNeed `external-action`.
-- **Not established:** why the reported action stayed out of the owner's list for longer than one render. The item's stored JSON, and which view he read (the web Needs you list, the board, or a phone notification), were not available to this story. Every server and web path read here carries an open action item.
+**Case 2's cause.** An attention.opened with no `humanReview` is stored as a **candidate** (`candidateReason: workspace-issue`), whatever its kind. A candidate is the orchestrator's to review and never reaches the owner's Needs you list. That was measured before: an item needs a human review to show. An owner action opened without a review was therefore invisible to the owner until an attention.updated added one.
+
+- **Fix: the server stamps the orchestrator's own owner action.** When the configured orchestrator, on the run's bound session, opens a kind=action with no `humanReview`, the store stamps `humanNeed: external-action`:
+  - `humanReason` is "An action only the owner can take: <decision or title>." plus its whyNow;
+  - `handling` says the server stamped it;
+  - `reviewerTabId` is the orchestrator.
+  The item opens in the owner's list. Its opener is the reviewer, so nothing is skipped: the same checks as an explicit review apply.
+- **Anyone else's action is still a candidate.** A kind=action from any other tab, or with no configured orchestrator, stays a candidate for the orchestrator's review, as before. Both the events route and `mc ask` (the check route) warn the opener: `humanReview: absent on a kind=action`, with who makes it visible.
+- **The view.** The Needs you list also renders an open owner item the page holds no draft for yet, from a fresh draft. That closes a one-render gap only; it was not case 2's cause.
+
+**Owner steps are lint, not a refusal.**
+- **What is read:** every attention.opened and attention.updated of a kind=question, in its `context`, `decision`, `whyNow` and the options' `consequence` and `description`. Code blocks are dropped, since they hold quoted text.
+- **What counts as a step:**
+  - an owner verb that starts a sentence, a line or a list item, with what makes it a command: "Click Approve", "Paste it into", "Open the", "Go to", "Sign in to", "Run this", "Run the following", "Press Enter";
+  - or a phrase that addresses the owner's steps: "Your steps", "Steps:", "please <do>".
+- **The finding** names the steps, the fields they were found in, and the split. Each owner step becomes its own kind=action item (answerType `action-done`, humanNeed `external-action`), and the question keeps to the decision.
+- **The fixture set:** the patterns are tuned on `tests/fixtures/mission-questions/owner-steps.json`.
+  - Its positives are the owner-step forms.
+  - Its negatives include every false positive the review named: "click-through rate", "one-click rollback", "Should I run this migration?", numbered decision options. They also include nouns that look like verbs ("Run time", "Open question", "Copy of", "Press coverage", "Sign-in rates").
+  - No served question fixture (`mc-question-v2`) is flagged.
+- **A heuristic, so it never refuses.** A pattern cannot tell every step from a description of one, and a refused question would hide the decision too. A kind=action item is not read: it is the step.

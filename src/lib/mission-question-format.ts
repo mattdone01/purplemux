@@ -182,28 +182,103 @@ export const questionLint = (question: TMissionStoredQuestion): IMissionQuestion
   return findings;
 };
 
+/** Phrases that address the owner's own steps, anywhere in the text. */
 const OWNER_STEP_PHRASES: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\bpaste\b[^.\n]{0,40}?\b(?:to|into)\b/i, "'Paste to'"],
-  [/\byour steps?\b/i, "'Your steps'"],
-  [/\brun this\b/i, "'run this'"],
-  [/\bclick\b/i, "'click'"],
+  [/\b(?:your|owner|manual)\s+steps?\b/i, "'Your steps'"],
+  [/\bsteps\s+for\s+you\b/i, "'steps for you'"],
+  [/^\s*steps\s*:/im, "'Steps:'"],
+  [/\bplease\s+(?:click|tap|press|paste|copy|run|open|go\s+to|navigate|sign\s+in|log\s+in|enter|type|rotate|upload|install)\b/i, "'please <do>'"],
 ];
-const NUMBERED_STEP_LINE = /^\s*(?:step\s+)?\d{1,2}[.):]\s+\S/i;
+
+/**
+ * An owner step: an imperative verb at the start of a sentence, a line or a list item, followed by what makes it a
+ * command, since most of these verbs are also nouns or a question's own words ("Press coverage", "Run time", "Open
+ * question", "Copy of", "Type:", "Click rate", "Sign-in rate").
+ */
+const OBJECT = String.raw`(?:the|your|it|this|that|these|a|an|on|into|in|to|with|as|https?:|` + '`' + String.raw`|"|')`;
+const OWNER_STEP_IMPERATIVES: readonly RegExp[] = [
+  new RegExp(String.raw`^(?:click|tap|press|paste|copy|enter|type|select|upload|install|rotate|visit)\s+${OBJECT}`, 'i'),
+  // A UI label after click, tap or press: "Click Approve", "Press Enter" (case-sensitive: the label is capitalised).
+  /^(?:[Cc]lick|[Tt]ap|[Pp]ress)\s+[A-Z][\w-]*/,
+  new RegExp(String.raw`^(?:go|navigate)\s+to\s+`, 'i'),
+  new RegExp(String.raw`^(?:sign|log)\s+in\s+(?:to|with|as|again|using)\b`, 'i'),
+  new RegExp(String.raw`^open\s+(?!questions?\b|items?\b|issues?\b|risks?\b)${OBJECT}`, 'i'),
+  new RegExp(String.raw`^run\s+(?:this|these|the\s+following|the\s+command|the\s+script|` + '`' + String.raw`|:)`, 'i'),
+];
+const LEADING_CONNECTIVE = /^(?:then|and|now|next|first|finally)[,\s]+/i;
+
+/** The owner step a clause starts with, by its first words; null when it is not one. */
+const ownerStepOf = (clause: string): string | null => {
+  const text = clause.replace(LEADING_CONNECTIVE, '');
+  if (!OWNER_STEP_IMPERATIVES.some((pattern) => pattern.test(text))) return null;
+  return text.split(/\s+/).slice(0, 2).join(' ').replace(/[`:"',.]+$/, '');
+};
+const LIST_MARKER = /^\s*(?:[-*•]|\d{1,2}[.):]|step\s+\d{1,2}[.):]?)\s+/i;
+
+/** Sentences, lines and list items, each without its list marker. */
+const clauses = (text: string): string[] =>
+  text.split('\n').flatMap((line) => line.replace(LIST_MARKER, '').split(/(?<=[.!?;])\s+/)).map((part) => part.trim()).filter(Boolean);
+
+/** The question's own words: never `title` (v1 title IS the decision), code blocks dropped (quoted text, not a step). */
+const ownerStepTexts = (question: Record<string, unknown>): Array<[string, string]> => {
+  const texts: Array<[string, string]> = [];
+  const add = (field: string, value: unknown) => {
+    if (typeof value === 'string' && value.trim()) texts.push([field, value.replace(/```[\s\S]*?```/g, ' ')]);
+  };
+  add('context', question.context);
+  add('decision', question.decision);
+  add('whyNow', question.whyNow);
+  if (Array.isArray(question.options)) {
+    question.options.forEach((option: unknown, index: number) => {
+      if (option && typeof option === 'object') {
+        const o = option as Record<string, unknown>;
+        add(`options[${index}].consequence`, o.consequence);
+        add(`options[${index}].description`, o.description);
+      }
+    });
+  }
+  return texts;
+};
 
 /**
  * Owner steps inside a question (vel-MC-ACT, a recurrence the owner raised): an action the owner must take, written into
- * a question's context, closes with the question when he answers it, undone. A warning, never a refusal: it names the
- * phrases found and the split, one kind=action item per step. Only a kind=question item is read; an action is the step.
+ * a question, closes with the question when he answers it, undone. A warning, never a refusal: it names what it found,
+ * where, and the split, one kind=action item per step. A kind=action item is not read: it is the step.
+ *
+ * A heuristic, tuned on a fixture set (tests/fixtures/mission-questions/owner-steps.json and the served question
+ * fixtures): an imperative owner verb starting a sentence, line or list item, or a phrase that addresses the owner's
+ * steps. A plain decision ("Should I run this migration?", "1. Ship staged", "click-through rate") is not a step.
  */
-export const ownerStepsLint = (question: { kind?: unknown; context?: unknown }): IMissionQuestionDefect[] => {
-  if (question.kind !== 'question' || typeof question.context !== 'string') return [];
-  const found = OWNER_STEP_PHRASES.filter(([pattern]) => pattern.test(question.context as string)).map(([, name]) => name);
-  const numbered = question.context.split('\n').filter((line) => NUMBERED_STEP_LINE.test(line)).length;
-  if (numbered >= 2) found.push(`${numbered} numbered steps`);
+export const ownerStepsLint = (question: Record<string, unknown>): IMissionQuestionDefect[] => {
+  if (question.kind !== 'question') return [];
+  const found: string[] = [];
+  const fields: string[] = [];
+  for (const [field, text] of ownerStepTexts(question)) {
+    const phrases = OWNER_STEP_PHRASES.filter(([pattern]) => pattern.test(text)).map(([, name]) => name);
+    const steps = clauses(text).map(ownerStepOf).filter((step): step is string => step !== null);
+    if (!phrases.length && !steps.length) continue;
+    fields.push(field);
+    found.push(...phrases.filter((name) => !found.includes(name)));
+    if (steps.length) {
+      const named = [...new Set(steps.map((step) => `'${step}'`))];
+      found.push(`${steps.length} owner step${steps.length === 1 ? '' : 's'} (${named.join(', ')}) in ${field}`);
+    }
+  }
   if (!found.length) return [];
-  return [defect('context', `owner steps in a question: ${found.join(', ')}`,
+  return [defect(fields.join(', '), `owner steps in a question: ${found.join('; ')}`,
     'split them: open each owner step as its own kind=action item (answerType action-done, humanNeed external-action) and keep this question to the decision; answering a question closes it, and a step written inside it closes with it, undone')];
 };
+
+/**
+ * A kind=action opened with no human review (vel-MC-ACT): from the configured orchestrator the server stamps
+ * external-action and it reaches the owner; from any other tab it is a candidate the owner does not see until the
+ * orchestrator reviews it. A warning, never a refusal.
+ */
+export const actionReviewLint = (question: { kind?: unknown }, humanReview: unknown): IMissionQuestionDefect[] =>
+  question.kind === 'action' && (humanReview === undefined || humanReview === null)
+    ? [defect('humanReview', 'absent on a kind=action',
+      'the owner sees an action only with a review: opened by the configured orchestrator, the server stamps external-action; from any other tab it stays a candidate until the orchestrator sends attention.updated with humanReview external-action')]
+    : [];
 
 /**
  * A human-reviewed item with no class sorts as Unclassified on the owner's board (ADR-0031): a warning, never a refusal,

@@ -7,6 +7,7 @@ import {
   emptyMissionChanges,
   effectiveAnswerType,
   mergeMissionChanges,
+  actionReviewLint,
   ownerStepsLint,
   questionLint,
   questionOfItem,
@@ -328,38 +329,51 @@ describe('selectedOptionLabels (ADR-0037 amendment D2; review r1 finding 4)', ()
 });
 
 // vel-MC-ACT: an owner step written inside a question closes with the question when the owner answers it, undone (a
-// recurrence the owner raised). The lint warns and names the split; it never refuses.
+// recurrence the owner raised). The lint warns and names the split; it never refuses. Tuned on a fixture set (the
+// review of PR #60 named its false positives and misses) and on every served question fixture.
 describe('ownerStepsLint (vel-MC-ACT)', () => {
-  const context = (text: string) => ({ kind: 'question', context: text });
+  interface ICase { name: string; question: Record<string, unknown>; expect?: string[] }
+  const set = JSON.parse(fs.readFileSync(path.join(__dirname, '../../fixtures/mission-questions/owner-steps.json'), 'utf-8')) as { positive: ICase[]; negative: ICase[] };
 
-  it.each([
-    ['Paste to', 'Paste the new token to the repository secret.', "'Paste to'"],
-    ['Paste into', 'Then paste it into the settings page.', "'Paste to'"],
-    ['Your steps', 'Your steps: rotate the token, then confirm.', "'Your steps'"],
-    ['run this', 'Please run this on your laptop.', "'run this'"],
-    ['click', 'Click Approve on the pull request.', "'click'"],
-  ])('finds %s', (_name, text, found) => {
-    const [finding] = ownerStepsLint(context(text));
-    expect(finding.field).toBe('context');
-    expect(finding.measured).toContain(found);
-    expect(finding.limit).toContain('open each owner step as its own kind=action item');
-  });
-
-  it('counts numbered steps: two or more is a finding, one is not', () => {
-    expect(ownerStepsLint(context('1. Open the settings.\n2) Rotate the key.\nStep 3: confirm.'))[0].measured).toContain('3 numbered steps');
-    expect(ownerStepsLint(context('1. Only one numbered line here.'))).toEqual([]);
-  });
-
-  it('names every phrase found in one finding', () => {
-    const findings = ownerStepsLint(context('Your steps:\n1. click Save\n2. run this script'));
+  it.each(set.positive.map((c) => [c.name, c] as const))('finds an owner step: %s', (_name, c) => {
+    const findings = ownerStepsLint(c.question);
     expect(findings).toHaveLength(1);
-    expect(findings[0].measured).toBe("owner steps in a question: 'Your steps', 'run this', 'click', 2 numbered steps");
+    expect(findings[0].limit).toContain('open each owner step as its own kind=action item');
+    for (const part of c.expect ?? []) expect(findings[0].measured).toContain(part);
   });
 
-  it('a clean question, an action item, or no context: no finding', () => {
-    expect(ownerStepsLint(context('Pick the rollout: staged or all tenants at once.'))).toEqual([]);
-    expect(ownerStepsLint({ kind: 'action', context: 'Paste the token to the secret. 1. a 2. b' })).toEqual([]);
-    expect(ownerStepsLint({ kind: 'question' })).toEqual([]);
-    expect(ownerStepsLint(context('The clickstream report and the runtime of this job.'))).toEqual([]);
+  it.each(set.negative.map((c) => [c.name, c] as const))('an ordinary decision question is not flagged: %s', (_name, c) => {
+    expect(ownerStepsLint(c.question)).toEqual([]);
+  });
+
+  it('no served question fixture is flagged (tests/fixtures/mc-question-v2)', () => {
+    const dir = path.join(__dirname, '../../fixtures/mc-question-v2');
+    const flagged = fs.readdirSync(dir).filter((file) => file.endsWith('.json')).flatMap((file) => {
+      const item = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf-8')) as Record<string, unknown>;
+      return ownerStepsLint(item).length ? [file] : [];
+    });
+    expect(flagged).toEqual([]);
+  });
+
+  it('a kind=action is not read: it is the step', () => {
+    expect(ownerStepsLint({ kind: 'action', context: 'Click Approve. Paste the token into the secret.' })).toEqual([]);
+  });
+
+  it('names every field it found steps in, in one finding', () => {
+    const [finding] = ownerStepsLint({
+      kind: 'question', decision: 'Rotate the key now?', context: 'Your steps: click Save, then confirm.',
+      options: [{ id: 'a', label: 'Yes', consequence: 'Then sign in to the console.' }, { id: 'b', label: 'No' }],
+    });
+    expect(finding.field).toBe('context, decision, options[0].consequence');
+  });
+});
+
+describe('actionReviewLint (vel-MC-ACT)', () => {
+  it('warns on a kind=action with no human review, naming who makes it visible', () => {
+    const [finding] = actionReviewLint({ kind: 'action' }, undefined);
+    expect(finding.field).toBe('humanReview');
+    expect(finding.limit).toContain('configured orchestrator');
+    expect(actionReviewLint({ kind: 'action' }, { humanNeed: 'external-action' })).toEqual([]);
+    expect(actionReviewLint({ kind: 'question' }, undefined)).toEqual([]);
   });
 });
