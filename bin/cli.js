@@ -3105,6 +3105,9 @@ const curatorStatusText = (body) => {
     process.stdout.write(`kodit before: ${rate(k.before)}\nkodit after: ${k.after ? rate(k.after) : `waits for 72 h live (from ${body.liveSince ? boardTime(body.liveSince + 72 * 3600000) : '—'})`}`
       + `${k.drop === null ? '' : ` · change ${(-k.drop * 100).toFixed(1)}%`}\n`);
   }
+  // An older server sends no koditCheck: print nothing rather than guess.
+  if (body.koditCheck && body.koditCheck.state === 'not-configured') process.stdout.write(`kodit check: NOT CONFIGURED: ${body.koditCheck.reason}\n`);
+  else if (body.koditCheck && body.koditCheck.state === 'configured') process.stdout.write(`kodit check: reads the log on ${body.koditCheck.host}\n`);
   for (const e of body.evals || []) process.stdout.write(`eval ${e.task}: ${e.running ? `running ${e.done}/${e.total}` : e.error ? `failed: ${e.error}` : 'finished'}\n`);
 };
 

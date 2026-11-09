@@ -1709,7 +1709,9 @@ target | null, reason? }, never the text. More than 2% of a week's filed orders 
 classify-owner-message back to shadow.
 
 GET  /api/cli/curator                       (purplemux curator status [--json])
-  Any scope: { model, health, queued, liveSince | null, rateLimitMs, kodit | null, evals: [...],
+  Any scope: { model, health, queued, liveSince | null, rateLimitMs, kodit | null,
+  koditCheck: { state: "configured", host } | { state: "not-configured", reason } (PMUX_KODIT_LOG_HOST in
+  the server environment names the host whose kodit log the check reads; unset, the check does not run), evals: [...],
   tasks: [{ task, state, promptVersion, shadowSince | null (this version's first live call),
   shadowEndsAt | null, promotedAt, promotedPromptVersion, queue: { size, oldestAt },
   gate: { checks | null: [{ label, metric, threshold, measured, successes, trials, lowerBound,

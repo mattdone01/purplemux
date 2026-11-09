@@ -11,9 +11,14 @@ if [ ! -r "$envfile" ]; then
   exit 2
 fi
 host="$(sed -n 's/^CURATOR_TUNNEL_HOST=//p' "$envfile" | tail -n1)"
+# No default host: an unset host is a refusal, never a guess.
+if [ -z "$host" ]; then
+  echo "install-tunnel: CURATOR_TUNNEL_HOST is not set in $envfile; add one line CURATOR_TUNNEL_HOST=<ssh alias of the GPU host>, then run again" >&2
+  exit 2
+fi
 # The same host-name rule as sshArgv (src/lib/remote-host.ts): a letter or digit first, never an ssh option.
 if ! [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
-  echo "install-tunnel: $envfile has no valid CURATOR_TUNNEL_HOST=<ssh alias> line (read: ${host:-nothing})" >&2
+  echo "install-tunnel: CURATOR_TUNNEL_HOST in $envfile is not a valid ssh alias (read: $host); use letters, digits, '.', '_' or '-', starting with a letter or digit" >&2
   exit 2
 fi
 dest="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit"

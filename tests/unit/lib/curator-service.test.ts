@@ -467,11 +467,12 @@ describe('the kodit rule (AC 7)', () => {
     expect(status.kodit!.drop).toBeGreaterThan(0.2);
     expect(status.rateLimitMs).toBe(10_000);
     expect(sshHosts).toEqual(['host-b-lan']);
+    expect(status.koditCheck).toEqual({ state: 'configured', host: 'host-b-lan' });
     vi.unstubAllEnvs();
     vi.useRealTimers();
   });
 
-  it('with PMUX_KODIT_LOG_HOST unset, the check reads no host over ssh and records nothing', async () => {
+  it('with PMUX_KODIT_LOG_HOST unset, the check reads no host over ssh, and the status says it is not configured', async () => {
     const live = Date.parse('2026-11-03T12:00:00Z');
     vi.setSystemTime(live + 73 * HOUR);
     vi.stubEnv('PMUX_KODIT_LOG_HOST', '');
@@ -484,7 +485,9 @@ describe('the kodit rule (AC 7)', () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(sshHosts).toEqual([]);
-    expect((await service.readCuratorStatus()).kodit).toBeNull();
+    const status = await service.readCuratorStatus();
+    expect(status.kodit).toBeNull();
+    expect(status.koditCheck).toEqual({ state: 'not-configured', reason: expect.stringContaining('PMUX_KODIT_LOG_HOST is not set') });
     vi.unstubAllEnvs();
     vi.useRealTimers();
   });

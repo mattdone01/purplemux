@@ -7,7 +7,7 @@ import {
 import { CuratorClient, type ICuratorJob } from '@/lib/curator-client';
 import { isFiledOrderItem } from '@/lib/curator-filed-order';
 import { CURATOR_EVAL_WORKSPACE, runCuratorEval, scoreLabels, type TCuratorSplit } from '@/lib/curator-eval';
-import { KODIT_LOG_PATH, KODIT_WINDOW_MS, koditDrop, koditLogHost, koditNeedsRateLimit, koditRate, parseKoditLog } from '@/lib/curator-kodit';
+import { KODIT_LOG_PATH, KODIT_WINDOW_MS, KODIT_NOT_CONFIGURED, koditCheckConfig, koditDrop, koditLogHost, koditNeedsRateLimit, koditRate, parseKoditLog } from '@/lib/curator-kodit';
 import { queueAdditions, queueView, validateImport, type IShadowCall } from '@/lib/curator-labels';
 import { findTwin, missionAskText, resolveLabelledText, transcriptUserEntries, workspaceTranscripts } from '@/lib/curator-sources';
 import { SPOT_CHECK_ITEM_PREFIX, buildSpotCheckQuestion, drawMatchSpotCheck, drawSpotCheck, isSpotCheckItem, readSpotCheckAnswer } from '@/lib/curator-spot-check';
@@ -141,7 +141,8 @@ const checkKodit = async (now: number): Promise<void> => {
   if (state.liveSince === null || (state.kodit?.after && state.kodit.after.docsPerHour !== null)) return;
   const host = koditLogHost();
   if (host === null) {
-    log.debug('curator: kodit check skipped: PMUX_KODIT_LOG_HOST is not set');
+    // Visible twice: this warning, and `koditCheck` in the curator status (`purplemux curator status`).
+    log.warn(`curator: ${KODIT_NOT_CONFIGURED}`);
     return;
   }
   const { runSsh } = await import('@/lib/remote-host');
@@ -412,6 +413,7 @@ export const readCuratorStatus = async () => {
     liveSince: state.liveSince,
     rateLimitMs: state.rateLimitMs,
     kodit: state.kodit,
+    koditCheck: koditCheckConfig(),
     tasks,
     evals: [...g.__ptCuratorEvals!.values()],
   };

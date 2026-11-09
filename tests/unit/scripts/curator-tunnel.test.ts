@@ -58,10 +58,11 @@ describe('the curator tunnel unit', () => {
   });
 
   it.each([
-    ['no env file', null],
-    ['an env file with no host line', '# nothing here\n'],
-    ['a host that is an ssh option', 'CURATOR_TUNNEL_HOST=-oProxyCommand=x\n'],
-  ])('the installer refuses %s, names the file, and writes no unit and runs no systemctl', async (_case, envText) => {
+    ['no env file', null, 'is missing'],
+    ['an env file with no host line', '# nothing here\n', 'CURATOR_TUNNEL_HOST is not set'],
+    ['an empty host', 'CURATOR_TUNNEL_HOST=\n', 'CURATOR_TUNNEL_HOST is not set'],
+    ['a host that is an ssh option', 'CURATOR_TUNNEL_HOST=-oProxyCommand=x\n', 'is not a valid ssh alias'],
+  ])('the installer refuses %s, names the file, and writes no unit and runs no systemctl', async (_case, envText, says) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-curator-tunnel-'));
     try {
       const bin = path.join(home, 'bin');
@@ -76,6 +77,7 @@ describe('the curator tunnel unit', () => {
       const failed = await run('bash', [path.resolve('scripts/curator/install-tunnel.sh')], { env }).then(() => null, (err: { code: number; stderr: string }) => err);
       expect(failed?.code).toBe(2);
       expect(failed?.stderr).toContain(path.join(home, '.config/purplemux/curator-tunnel.env'));
+      expect(failed?.stderr).toContain(says);
       expect(fs.existsSync(calls)).toBe(false);
       expect(fs.existsSync(path.join(home, '.config/systemd/user/purplemux-curator-tunnel.service'))).toBe(false);
     } finally {
