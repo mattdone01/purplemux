@@ -71,11 +71,11 @@ describe('the remote ssh budget (vel-D61)', () => {
       versions: {},
       history: [],
     });
-    expect(remoteTimeoutMsIn(state({}), 'agent-exec-v2')).toBe(5000);
-    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000' }), 'agent-exec-v2')).toBe(20_000);
-    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.agent-exec-v2': '40000' }), 'agent-exec-v2')).toBe(40_000);
-    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.agent-exec-v2': '40000' }), 'ai-server')).toBe(20_000);
-    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.ai-server': '1000' }), 'ai-server')).toBe(20_000);
+    expect(remoteTimeoutMsIn(state({}), 'host-a')).toBe(5000);
+    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000' }), 'host-a')).toBe(20_000);
+    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.host-a': '40000' }), 'host-a')).toBe(40_000);
+    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.host-a': '40000' }), 'host-c')).toBe(20_000);
+    expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.host-c': '1000' }), 'host-c')).toBe(20_000);
   });
 
   it('scales a call budget by the ratio to the default; ConnectTimeout stays a second under the call budget (r1 F2)', async () => {
@@ -94,23 +94,23 @@ describe('the remote ssh budget (vel-D61)', () => {
 
   it('unset: runSsh and runSshBuffer keep the budgets ADR-0022 §5 names', async () => {
     const { runSsh, runSshBuffer } = await import('@/lib/remote-host');
-    await runSsh('agent-exec-v2', 'true', { timeoutMs: 5000 });
-    await runSsh('agent-exec-v2', 'sh -s', { timeoutMs: 20_000 });
-    await runSshBuffer('agent-exec-v2', 'cat x', { timeoutMs: 10_000, maxBytes: 16 });
+    await runSsh('host-a', 'true', { timeoutMs: 5000 });
+    await runSsh('host-a', 'sh -s', { timeoutMs: 20_000 });
+    await runSshBuffer('host-a', 'cat x', { timeoutMs: 10_000, maxBytes: 16 });
     expect(spawned.list.map((s) => s.timeout)).toEqual([5000, 20_000, 10_000]);
     expect(spawned.list.map((s) => connectTimeout(s.args))).toEqual(['ConnectTimeout=4', 'ConnectTimeout=19', 'ConnectTimeout=9']);
   });
 
   it('set for one host: that host scales, another keeps the default, at the next call with no restart', async () => {
     const { runSsh, runSshBuffer } = await import('@/lib/remote-host');
-    await set('remote.timeout-ms.agent-exec-harness', '30000');
-    await runSsh('agent-exec-harness', 'true', { timeoutMs: 5000 });
-    await runSshBuffer('agent-exec-harness', 'cat x', { timeoutMs: 10_000, maxBytes: 16 });
-    await runSsh('agent-exec-v2', 'true', { timeoutMs: 5000 });
+    await set('remote.timeout-ms.host-b', '30000');
+    await runSsh('host-b', 'true', { timeoutMs: 5000 });
+    await runSshBuffer('host-b', 'cat x', { timeoutMs: 10_000, maxBytes: 16 });
+    await runSsh('host-a', 'true', { timeoutMs: 5000 });
     expect(spawned.list.map((s) => [s.args[s.args.indexOf('--') + 1], s.timeout, connectTimeout(s.args)])).toEqual([
-      ['agent-exec-harness', 30_000, 'ConnectTimeout=29'],
-      ['agent-exec-harness', 60_000, 'ConnectTimeout=59'],
-      ['agent-exec-v2', 5000, 'ConnectTimeout=4'],
+      ['host-b', 30_000, 'ConnectTimeout=29'],
+      ['host-b', 60_000, 'ConnectTimeout=59'],
+      ['host-a', 5000, 'ConnectTimeout=4'],
     ]);
   });
 
@@ -118,29 +118,29 @@ describe('the remote ssh budget (vel-D61)', () => {
     fs.mkdirSync(path.join(directory, '.purplemux'), { recursive: true });
     fs.writeFileSync(path.join(directory, '.purplemux', 'fleet-config.json'), '{ not json');
     const { runSsh } = await import('@/lib/remote-host');
-    await expect(runSsh('agent-exec-v2', 'true', { timeoutMs: 5000 })).resolves.toEqual({ stdout: 'ok', stderr: '' });
+    await expect(runSsh('host-a', 'true', { timeoutMs: 5000 })).resolves.toEqual({ stdout: 'ok', stderr: '' });
     expect(spawned.list.map((s) => [s.timeout, connectTimeout(s.args)])).toEqual([[5000, 'ConnectTimeout=4']]);
   });
 
   it('reads the fleet store again only when the file changes (r1 F3)', async () => {
     const { remoteTimeoutMs } = await import('@/lib/remote-timeouts');
     reads.count = 0;
-    expect(await remoteTimeoutMs('agent-exec-v2')).toBe(5000);
+    expect(await remoteTimeoutMs('host-a')).toBe(5000);
     expect(reads.count).toBe(0);
     await set('remote.timeout-ms', '20000');
     reads.count = 0;
-    for (let i = 0; i < 5; i += 1) expect(await remoteTimeoutMs('agent-exec-v2')).toBe(20_000);
+    for (let i = 0; i < 5; i += 1) expect(await remoteTimeoutMs('host-a')).toBe(20_000);
     expect(reads.count).toBe(1);
-    await set('remote.timeout-ms.agent-exec-v2', '40000');
-    expect(await remoteTimeoutMs('agent-exec-v2')).toBe(40_000);
-    expect(await remoteTimeoutMs('ai-server')).toBe(20_000);
+    await set('remote.timeout-ms.host-a', '40000');
+    expect(await remoteTimeoutMs('host-a')).toBe(40_000);
+    expect(await remoteTimeoutMs('host-c')).toBe(20_000);
     expect(reads.count).toBe(2);
   });
 
   it('sshArgv keeps ConnectTimeout=5 when no budget is given (the attach)', async () => {
     const { sshArgv } = await import('@/lib/remote-host');
-    expect(connectTimeout(sshArgv('agent-exec-v2', 'x', { tty: true }))).toBe('ConnectTimeout=5');
-    expect(connectTimeout(sshArgv('agent-exec-v2', 'x', { connectTimeoutS: 25 }))).toBe('ConnectTimeout=25');
+    expect(connectTimeout(sshArgv('host-a', 'x', { tty: true }))).toBe('ConnectTimeout=5');
+    expect(connectTimeout(sshArgv('host-a', 'x', { connectTimeoutS: 25 }))).toBe('ConnectTimeout=25');
   });
 });
 
@@ -148,7 +148,7 @@ describe('the remote timeout keys are admin-only and checked at write time', () 
   it.each([
     ['remote.timeout-ms', '5000'],
     ['remote.timeout-ms', '30000'],
-    ['remote.timeout-ms.agent-exec-v2', '120000'],
+    ['remote.timeout-ms.host-a', '120000'],
     ['remote.timeout-ms.ai_server.tail', '25000'],
   ])('the admin sets %s=%s', async (key, value) => {
     const { putValue } = await import('@/lib/fleet-config-http');
@@ -164,7 +164,7 @@ describe('the remote timeout keys are admin-only and checked at write time', () 
     ['remote.timeout-ms', '4999', 'whole milliseconds 5000..120000'],
     ['remote.timeout-ms', '30s', 'whole milliseconds 5000..120000'],
     ['remote.timeout-ms', '120001', 'whole milliseconds 5000..120000'],
-    ['remote.timeout-ms.agent-exec-v2', '1000', 'whole milliseconds 5000..120000'],
+    ['remote.timeout-ms.host-a', '1000', 'whole milliseconds 5000..120000'],
     ['remote.timeout-ms.-oProxyCommand', '30000', 'not a timeout key'],
     ['remote.timeout-ms.', '30000', 'not a timeout key'],
   ])('%s=%j is refused (%s)', async (key, value, message) => {

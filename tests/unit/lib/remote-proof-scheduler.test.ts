@@ -4,7 +4,7 @@ import type { TStrictRuntimeObservation } from '@/lib/process-utils';
 
 // vel-D61 review r1 F1: what the scheduler keeps, for how long, and what it never keeps.
 
-const req = (tabId: string, key = 'k1', host = 'agent-exec-v2'): IRemoteProofRequest =>
+const req = (tabId: string, key = 'k1', host = 'host-a'): IRemoteProofRequest =>
   ({ tabId, host, sessionName: `pt-ws-1-pane-a-${tabId}`, want: 'claude', key });
 
 const make = (answer: () => TStrictRuntimeObservation | Promise<TStrictRuntimeObservation>) => {
@@ -38,7 +38,7 @@ describe('RemoteProofScheduler', () => {
     expect(scheduler.read(req('tab-a'))).toBeNull();
     expect(onUnknown).toHaveBeenCalledWith(expect.objectContaining({ tabId: 'tab-a' }), 'ssh died');
     await scheduler.schedule([req('tab-b')]);
-    await scheduler.schedule([req('tab-c', 'k1', 'agent-exec-harness')]);
+    await scheduler.schedule([req('tab-c', 'k1', 'host-b')]);
     expect(observe.mock.calls.map((c) => c[0])).toEqual(['pt-ws-1-pane-a-tab-a', 'pt-ws-1-pane-a-tab-c']);
     advance(30_000);
     await scheduler.schedule([req('tab-b')]);

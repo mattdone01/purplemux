@@ -9,8 +9,8 @@ import type { ITab } from '@/types/terminal';
 // process proof and the real ssh error classification run; only the ssh process itself is simulated.
 // Review r1 F1: the proofs never hold the poll. The poll reads what an earlier proof answered.
 
-const HOST = 'agent-exec-harness';
-const HOST2 = 'agent-exec-v2';
+const HOST = 'host-b';
+const HOST2 = 'host-a';
 const SESSION = 'pt-ws-1-pane-a-tab-r';
 const LOCAL_SESSION = 'pt-ws-1-pane-l-tab-local';
 
@@ -63,7 +63,7 @@ vi.mock('child_process', async (importOriginal) => {
 });
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
-  return { ...actual, default: { ...actual, hostname: () => 'mdserver1' }, hostname: () => 'mdserver1' };
+  return { ...actual, default: { ...actual, hostname: () => 'control-host' }, hostname: () => 'control-host' };
 });
 
 const state = vi.hoisted(() => ({ tabs: [] as ITab[] }));
@@ -109,7 +109,7 @@ await Promise.all([
 ]);
 
 const scanBackoff = () => (globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff;
-const paneLine = (session: string, command: string, pid = '4242'): string => `${session}\t${command}\t/home/agent\t${pid}\t1794200000\n`;
+const paneLine = (session: string, command: string, pid = '4242'): string => `${session}\t${command}\t/home/user\t${pid}\t1794200000\n`;
 const pane = (command: string): TReply => ({ stdout: paneLine(SESSION, command) });
 const TIMED_OUT: TReply = { killed: true, code: null, signal: 'SIGTERM' };
 const SSH_255: TReply = { code: 255, stderr: 'kex_exchange_identification: read: Connection reset by peer' };
@@ -154,7 +154,7 @@ const createManager = async (cliState: TCliState) => {
       lastEvent: { name: 'prompt-submit', at: T0 - 30 * 60_000, seq: 1 }, eventSeq: 1,
     });
     const entry = internals(manager).tabs.get(tab.id)!;
-    entry.paneTitle = 'claude|/home/agent';
+    entry.paneTitle = 'claude|/home/user';
     entry.currentProcess = 'claude';
   }
   const nudges = vi.spyOn(manager as unknown as { nudgeOrchestrator: (...a: unknown[]) => Promise<boolean> }, 'nudgeOrchestrator')
@@ -186,7 +186,7 @@ describe('a remote claude tab and a host that does not answer (vel-D61, ADR-0022
       const { entry, inactiveNudges, pollAndSettle } = await createManager(cliState);
       await pollAcrossBackoff(pollAndSettle);
       expect(entry().cliState).toBe(cliState);
-      expect(entry().paneTitle).toBe('claude|/home/agent');
+      expect(entry().paneTitle).toBe('claude|/home/user');
       expect(inactiveNudges()).toEqual([]);
       expect(scanCalls().length).toBeGreaterThan(0);
     });
@@ -263,11 +263,11 @@ describe('a remote claude tab and a host that does not answer (vel-D61, ADR-0022
     expect(detail).toContain('purplemux tab status -w ws-1 tab-r');
     expect(detail).toContain('agentProcess "absent"');
     const { buildNudgeMessage } = await import('@/lib/orchestration');
-    expect(buildNudgeMessage('inactive', 'tab-r', 'builder', 'ws-1', detail)).toMatch(/is INACTIVE \(agent process gone\)\. Respawn the tab or mark its task blocked\. It runs on agent-exec-harness/);
+    expect(buildNudgeMessage('inactive', 'tab-r', 'builder', 'ws-1', detail)).toContain(`is INACTIVE (agent process gone). Respawn the tab or mark its task blocked. It runs on ${HOST}`);
   });
 
   it('tmux on the host says no server: absence, inactive', async () => {
-    ssh.scan = () => ({ code: 1, stderr: 'no server running on /tmp/tmux-1002/pmux-mdserver1\n' });
+    ssh.scan = () => ({ code: 1, stderr: 'no server running on /tmp/tmux-1000/pmux-control-host\n' });
     const { entry, inactiveNudges, pollAndSettle } = await createManager('ready-for-review');
     await pollAndSettle();
     expect(entry().cliState).toBe('inactive');
@@ -432,7 +432,7 @@ describe('one poll at a time, coalesced, never wedged (review r1 F1 d, r2 M2 and
     };
     return release;
   };
-  const harnessScans = () => scanCalls().filter((c) => c.host === HOST);
+  const hostScans = () => scanCalls().filter((c) => c.host === HOST);
   /** A short real wait, for an assertion that something did NOT happen. */
   const quiet = () => new Promise<void>((resolve) => { setImmediate(() => setImmediate(() => resolve())); });
 
@@ -440,34 +440,34 @@ describe('one poll at a time, coalesced, never wedged (review r1 F1 d, r2 M2 and
     const release = holdFirstScan();
     const { manager } = await createManager('idle');
     const first = manager.poll();
-    await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    await vi.waitFor(() => expect(hostScans()).toHaveLength(1));
     const second = manager.poll();
     await quiet();
-    expect(harnessScans()).toHaveLength(1);
+    expect(hostScans()).toHaveLength(1);
     release.first(pane('claude'));
     await first;
     await second;
-    expect(harnessScans()).toHaveLength(2);
+    expect(hostScans()).toHaveLength(2);
     await manager.poll();
-    expect(harnessScans()).toHaveLength(3);
+    expect(hostScans()).toHaveLength(3);
   });
 
   it('the hook poll trigger and the 7 launch readiness timers during a slow poll: one follow-up serves all 8', async () => {
     const release = holdFirstScan();
     const { manager } = await createManager('idle');
     const first = manager.poll();
-    await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    await vi.waitFor(() => expect(hostScans()).toHaveLength(1));
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] });
     vi.setSystemTime(T0);
     const hookTrigger = manager.poll();
     (manager as unknown as { markAgentLaunch: (id: string) => void }).markAgentLaunch('tab-r');
     vi.advanceTimersByTime(12_000);
-    expect(harnessScans()).toHaveLength(1);
+    expect(hostScans()).toHaveLength(1);
     release.first(pane('claude'));
     await first;
     await hookTrigger;
     await quiet();
-    expect(harnessScans()).toHaveLength(2);
+    expect(hostScans()).toHaveLength(2);
   });
 
   it('a poll that throws frees the next one', async () => {
@@ -477,24 +477,24 @@ describe('one poll at a time, coalesced, never wedged (review r1 F1 d, r2 M2 and
     vi.mocked(getWorkspaces).mockRejectedValueOnce(new Error('workspace store unreadable'));
     await expect(manager.poll()).rejects.toThrow('workspace store unreadable');
     await manager.poll();
-    expect(harnessScans()).toHaveLength(1);
+    expect(hostScans()).toHaveLength(1);
   });
 
   it('a poll that hangs past 10 intervals is superseded: the next one runs, and the hung one applies nothing when it settles', async () => {
     const release = holdFirstScan();
     const { manager, entry } = await createManager('idle');
     const hung = manager.poll();
-    await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    await vi.waitFor(() => expect(hostScans()).toHaveLength(1));
     vi.setSystemTime(T0 + 299_000);
     const queued = manager.poll();
     await quiet();
-    expect(harnessScans()).toHaveLength(1);
+    expect(hostScans()).toHaveLength(1);
     vi.setSystemTime(T0 + 301_000);
     await manager.poll();
-    expect(harnessScans()).toHaveLength(2);
+    expect(hostScans()).toHaveLength(2);
     expect(entry().cliState).toBe('idle');
     await queued;
-    expect(harnessScans()).toHaveLength(3);
+    expect(hostScans()).toHaveLength(3);
     // The hung scan finally answers "no session" (an absence): the superseded poll must not act on it.
     release.first({ stdout: '' });
     await hung;

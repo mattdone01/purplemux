@@ -5,14 +5,14 @@ import type { TStrictRuntimeObservation } from '@/lib/process-utils';
 // vel-D61: an orchestrator proves a remote tab dead with one process check before it respawns it. `tab status`
 // of a live remote agent tab serves that check as `agentProcess`, walked on the tab's host.
 
-const REMOTE_AGENT = { id: 'tab-r', name: 'r', order: 0, sessionName: 'pt-ws-a-pane-p-tab-r', panelType: 'claude-code' as const, host: 'agent-exec-v2' };
+const REMOTE_AGENT = { id: 'tab-r', name: 'r', order: 0, sessionName: 'pt-ws-a-pane-p-tab-r', panelType: 'claude-code' as const, host: 'host-a' };
 const REMOTE_TERMINAL = { ...REMOTE_AGENT, panelType: 'terminal' as const };
 const LOCAL_AGENT = { id: 'tab-l', name: 'l', order: 1, sessionName: 'pt-ws-a-pane-p-tab-l', panelType: 'claude-code' as const };
 
 const fx = vi.hoisted(() => ({
   findTab: vi.fn(),
   hasSessionOrUnreachable: vi.fn(async (_name: string) => true),
-  observe: vi.fn(async (_tab: unknown): Promise<TStrictRuntimeObservation> => ({ state: 'present', identity: 'remote:agent-exec-v2:pt:%3:4242:4300:918273:claude' })),
+  observe: vi.fn(async (_tab: unknown): Promise<TStrictRuntimeObservation> => ({ state: 'present', identity: 'remote:host-a:pt:%3:4242:4300:918273:claude' })),
 }));
 
 vi.mock('@/lib/cli-utils', () => ({
@@ -54,14 +54,14 @@ describe('tab status: agentProcess of a remote agent tab (vel-D61)', () => {
   it('present: the state alone; the process identity and its pids stay on the host', async () => {
     const res = await status('tab-r');
     expect(res.statusCode).toBe(200);
-    expect(res.body).toMatchObject({ host: 'agent-exec-v2', alive: true, command: 'node', agentProcess: { state: 'present' } });
+    expect(res.body).toMatchObject({ host: 'host-a', alive: true, command: 'node', agentProcess: { state: 'present' } });
     expect(JSON.stringify(res.body)).not.toContain('4242');
     expect(fx.observe).toHaveBeenCalledWith(REMOTE_AGENT);
   });
 
   it.each([
     [{ state: 'absent', reason: 'no claude process in the pane' }],
-    [{ state: 'unknown', reason: 'remote host agent-exec-v2 did not answer (timed out)' }],
+    [{ state: 'unknown', reason: 'remote host host-a did not answer (timed out)' }],
   ] as const)('%j is served with its reason', async (observed) => {
     fx.observe.mockResolvedValueOnce(observed);
     expect((await status('tab-r')).body).toMatchObject({ alive: true, agentProcess: observed });
