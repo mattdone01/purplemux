@@ -5,7 +5,7 @@ import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, 
 import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR, type IHookSpoolDrainResult } from '@/lib/hook-spool';
 import { HookFloorStore } from '@/lib/hook-floors';
 import { onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
-import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid } from '@/lib/tmux';
+import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid, observeRemoteProviderProcess } from '@/lib/tmux';
 import { sessionHostOf } from '@/lib/session-host';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
@@ -42,7 +42,7 @@ import {
   parseStandupDueMinutes,
   standupDueBucketMs,
 } from '@/lib/standup';
-import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
+import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, remoteInactiveDetail, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import {
   IDLE_NUDGE_CONFIG_KEY,
@@ -116,22 +116,37 @@ import {
 const toAlertProvider = (providerId: string | undefined): TAlertProviderId =>
   providerId === 'codex' || providerId === 'grok' ? providerId : 'claude';
 
+/** A remote tab's session and whether the pane scan that produced its pane info read its host. */
+interface IRemotePaneRead {
+  sessionName: string;
+  answered: boolean;
+}
+
+const remoteProofName = (providerId: string): 'claude' | 'codex' | 'grok' | null =>
+  providerId === 'claude' || providerId === 'codex' || providerId === 'grok' ? providerId : null;
+
 /**
  * Whether the pane's agent runs. A remote pane has no pid here (ADR-0022): its
- * foreground command, which tmux reports over ssh, is the evidence. `null` is
- * "cannot tell": a remote tab whose host the last scan did not read (a failed
- * scan, the backoff). No transition may act on it (review r3 B1).
+ * foreground command, which tmux reports over ssh, is the cheap evidence. A
+ * foreground that is not the provider (a node launch, a version-named binary, a
+ * shell over a live agent) is proven on the host by the pane's process walk
+ * before it can read as gone (vel-D61): only an answered absence is false.
+ * `null` is "cannot tell": a host that the scan or the proof did not read (a
+ * failure, a timeout, the backoff). No transition may act on it (review r3 B1).
  */
 const agentRunningIn = async (
   paneInfo: IPaneInfo | undefined,
   provider: IAgentProvider | null,
-  remoteHost: string | null = null,
-  hostAnswered = false,
+  remote: IRemotePaneRead | null = null,
 ): Promise<boolean | null> => {
   if (!provider) return false;
-  if (remoteHost) {
-    if (paneInfo?.host) return provider.matchesProcess(paneInfo.command);
-    return hostAnswered ? false : null;
+  if (remote) {
+    if (!paneInfo?.host) return remote.answered ? false : null;
+    if (provider.matchesProcess(paneInfo.command)) return true;
+    const want = remoteProofName(provider.id);
+    if (!want) return false;
+    const proof = await observeRemoteProviderProcess(remote.sessionName, want);
+    return proof.state === 'present' ? true : proof.state === 'absent' ? false : null;
   }
   if (!paneInfo || !paneInfo.pid) return false;
   return provider.isAgentRunning(paneInfo.pid, await getChildPids(paneInfo.pid));
@@ -728,7 +743,9 @@ export class StatusManager {
     const panes = await getAllPanesInfo();
     const paneInfo = panes.get(entry.tmuxSession);
     const remoteHost = await sessionHostOf(entry.tmuxSession);
-    const agentRunning = await agentRunningIn(paneInfo, provider, remoteHost, !!remoteHost && !!panes.answeredRemoteHosts?.has(remoteHost));
+    const agentRunning = await agentRunningIn(paneInfo, provider, remoteHost
+      ? { sessionName: entry.tmuxSession, answered: !!panes.answeredRemoteHosts?.has(remoteHost) }
+      : null);
     // A remote host not read: the tab stays unknown until a hook or a read pane says (review r3 B1).
     if (agentRunning === null) return;
 
@@ -789,7 +806,9 @@ export class StatusManager {
     tab?: ITab,
   ): Promise<{ lastAssistantSnippet: string | null; currentAction: ICurrentAction | null; jsonlPath: string | null }> {
     const empty = { lastAssistantSnippet: null, currentAction: null, jsonlPath: null };
-    if (!(await agentRunningIn(paneInfo, provider, tab?.host ?? null)) || !paneInfo || !provider) return empty;
+    // The cheap foreground check only: this read changes no state, so it spends no ssh process proof.
+    const running = paneInfo?.host ? !!provider?.matchesProcess(paneInfo.command) : await agentRunningIn(paneInfo, provider);
+    if (!running || !paneInfo || !provider) return empty;
     // A remote tab's transcript is the local copy its hooks bound (ADR-0022); nothing else is local.
     if (paneInfo.host) {
       const copy = tab ? provider.readJsonlPath(tab) : null;
@@ -1191,7 +1210,9 @@ export class StatusManager {
 
         let agentRunningCache: boolean | null | undefined;
         const agentRunningNow = async (): Promise<boolean | null> => {
-          if (agentRunningCache === undefined) agentRunningCache = await agentRunningIn(paneInfo, provider, tab.host ?? null, hostAnswered);
+          if (agentRunningCache === undefined) {
+            agentRunningCache = await agentRunningIn(paneInfo, provider, tab.host ? { sessionName: tab.sessionName, answered: hostAnswered } : null);
+          }
           return agentRunningCache;
         };
         const checkAgentRunning = async (): Promise<boolean> => (await agentRunningNow()) === true;
@@ -1228,8 +1249,11 @@ export class StatusManager {
             const title = existing.paneTitle ?? '';
             const titleShellStyle = !!title && SHELL_TITLE_RE.test(title);
             if ((!title || titleShellStyle) && (await agentRunningNow()) === false) {
-              log.info({ tabId: tab.id, prevState: existing.cliState }, 'agent process gone — transitioning to inactive');
-              this.applyCliState(tab.id, existing, 'inactive', { silent: true });
+              log.info({ tabId: tab.id, prevState: existing.cliState, host: tab.host }, 'agent process gone — transitioning to inactive');
+              this.applyCliState(tab.id, existing, 'inactive', {
+                silent: true,
+                ...(tab.host ? { nudge: { kind: 'inactive' as const, detail: remoteInactiveDetail(tab.host, ws.id, tab.id) } } : {}),
+              });
               this.persistToLayout(existing);
               this.broadcastUpdate(tab.id, existing);
               continue;
@@ -1882,7 +1906,10 @@ export class StatusManager {
     if (newState === 'idle' || newState === 'ready-for-review') this.contextLifecycle.onIdle(tabId);
     const nudgeKind = opts.nudge === null ? null : nudgeKindForTransition(prevState, newState, !!opts.silent);
     if (nudgeKind) {
-      const nudge: { kind: TOrchestrationNudgeKind; detail?: string; target?: string } = opts.nudge && !opts.silent ? opts.nudge : { kind: nudgeKind };
+      // A silent transition keeps a detail its caller gave for the same kind (a remote tab's inactive, vel-D61).
+      const nudge: { kind: TOrchestrationNudgeKind; detail?: string; target?: string } = opts.nudge && (!opts.silent || opts.nudge.kind === nudgeKind)
+        ? opts.nudge
+        : { kind: nudgeKind };
       this.nudgeOrchestrator(tabId, entry, nudge.kind, nudge.detail, undefined, nudge.target).catch((err) => {
         log.warn(`orchestrator nudge failed: ${err instanceof Error ? err.message : err}`);
       });
