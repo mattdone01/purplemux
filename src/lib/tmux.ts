@@ -41,6 +41,7 @@ import {
 } from '@/lib/remote-host';
 import {
   REMOTE_KIT_BROKEN_EXIT,
+  REMOTE_CWD_FALLBACK_NOTE,
   REMOTE_CWD_MISSING_EXIT,
   RemoteCwdMissingError,
   RemoteKitBrokenError,
@@ -258,6 +259,7 @@ const createRemoteSession = async (
   cwd: string | undefined,
   identity: ITabIdentity | undefined,
   trustCwd: string | undefined,
+  revival: boolean,
 ): Promise<void> => {
   const env: Record<string, string> = {};
   let tabEnv: { tabId: string; content: string } | undefined;
@@ -290,9 +292,13 @@ const createRemoteSession = async (
     cwd,
     launch,
     ...(trust ? { trust } : {}),
+    // A fresh create of a named cwd refuses a cwd the host lacks; a revival keeps the HOME fallback (review r4).
+    cwdMissing: trust?.named && !revival ? 'refuse' : 'home',
   });
   try {
-    await runSsh(host, 'sh -s', { timeoutMs: CMD_TIMEOUT * 2, input: script });
+    const { stderr } = await runSsh(host, 'sh -s', { timeoutMs: CMD_TIMEOUT * 2, input: script });
+    const fallback = stderr.split('\n').find((line) => line.startsWith('pmux: cwd ') && line.endsWith(REMOTE_CWD_FALLBACK_NOTE));
+    if (fallback) log.warn(`remote ${revival ? 'revival' : 'create'} of ${name} on ${host}: ${fallback.slice('pmux: '.length)}`);
   } catch (err) {
     // The guard runs before any file is written: a name that exists leaves everything as it was.
     if ((err as { code?: unknown }).code === REMOTE_SESSION_EXISTS_EXIT) {
@@ -322,11 +328,14 @@ export const createSession = async (
   rows: number,
   cwd?: string,
   identity?: ITabIdentity,
-  /** A remote tab's creator-named cwd, for the pre-trust (vel-PMX-FU); ignored for a local session. */
-  opts?: { trustCwd?: string },
+  /**
+   * A remote tab's creator-named cwd, for the pre-trust (vel-PMX-FU), and whether this recreates an existing tab
+   * (a revival keeps the HOME fallback for a cwd the host lost); ignored for a local session.
+   */
+  opts?: { trustCwd?: string; revival?: boolean },
 ): Promise<void> => {
   const host = await sessionHostOf(name);
-  if (host) return createRemoteSession(host, name, cols, rows, cwd, identity, opts?.trustCwd);
+  if (host) return createRemoteSession(host, name, cols, rows, cwd, identity, opts?.trustCwd, !!opts?.revival);
   // tmux 서버 global env cache를 우회하기 위해 `env -i $SHELL -l`을 명령으로 직접 넘긴다.
   // execFile의 env 옵션은 tmux 서버가 이미 떠있는 경우 무시되므로 의존하지 않는다.
   const shellCmd = buildShellLaunchCommand(await workspaceEnv(name, identity, cwd));

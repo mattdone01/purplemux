@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_TRUST_SEED_RELATIVE, REMOTE_TRUST_SEED_SCRIPT, remoteCwdLines, remoteTrustSeedLine } from '@/lib/remote-kit';
 
 // D14 (story 05 AC 2): the remote half of the pre-trust, run for real against a fake remote host: a
@@ -262,16 +262,25 @@ describe('the named cwd pre-trust (vel-PMX-FU)', () => {
   });
 
   const hasTmux = spawnSync('tmux', ['-V']).status === 0;
-  /** The create script's own cwd, seed and session lines, run for real: the kit's `$d`, a throwaway tmux socket. */
-  const runCreateFragment = (cwd: string, socket: string) => spawnSync('/bin/sh', ['-c', [
+  /**
+   * The create script's own cwd, seed and session lines, run for real: the kit's `$d`, a throwaway tmux socket. The
+   * pane writes its own physical directory to a marker file. That, not tmux's pane_current_path, is the pane folder:
+   * pane_current_path read right after new-session can show the server's directory while the pane child is still
+   * between taking the terminal and its chdir (CI on PR #59; measured 6 of 200 immediate reads off under CPU load).
+   */
+  const runCreateFragment = (cwd: string, socket: string, marker: string, onMissing: 'refuse' | 'home') => spawnSync('/bin/sh', ['-c', [
     'set -e',
     `d="${kit}"`,
-    ...remoteCwdLines(cwd, true),
-    remoteTrustSeedLine({ cwd, workspaceDirectories: [workspace], named: true }, '"$pmux_cwd"'),
-    `tmux -L ${socket} -f /dev/null new-session -d -s trust -c "$pmux_cwd" 'exec sleep 30'`,
+    ...remoteCwdLines(cwd, onMissing),
+    `if [ -z "$pmux_cwd_fallback" ]; then ${remoteTrustSeedLine({ cwd, workspaceDirectories: [workspace], named: true }, '"$pmux_cwd"')}; fi`,
+    `tmux -L ${socket} -f /dev/null new-session -d -s trust -c "$pmux_cwd" 'pwd -P > ${marker}; exec sleep 30'`,
   ].join('\n')], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+  const paneFolder = async (marker: string): Promise<string> => {
+    await vi.waitFor(() => expect(fs.existsSync(marker) && fs.readFileSync(marker, 'utf-8').endsWith('\n')).toBe(true), { timeout: 10_000, interval: 25 });
+    return fs.readFileSync(marker, 'utf-8').trim();
+  };
 
-  it.skipIf(!hasTmux)('"<link>/..": the pane folder, the trusted key and the host realpath are one path (CI on PR #59)', () => {
+  it.skipIf(!hasTmux)('"<link>/..": the pane folder, the trusted key and the host realpath are one path (CI on PR #59)', async () => {
     const target = path.join(home, 'clones', 'deep', 'repo');
     fs.mkdirSync(target, { recursive: true });
     const holder = path.join(home, 'links');
@@ -279,26 +288,40 @@ describe('the named cwd pre-trust (vel-PMX-FU)', () => {
     fs.symlinkSync(target, path.join(holder, 'to-repo'));
     const cwd = `${holder}/to-repo/..`;
     const socket = `pmux-trust-${process.pid}-${Date.now()}`;
-    let paneDirectory: string;
+    const marker = path.join(root, 'pane-folder');
     try {
-      const run = runCreateFragment(cwd, socket);
+      const run = runCreateFragment(cwd, socket, marker, 'refuse');
       expect(run.status, run.stderr).toBe(0);
-      paneDirectory = execFileSync('tmux', ['-L', socket, 'display-message', '-p', '-t', '=trust:', '#{pane_current_path}'], { encoding: 'utf-8' }).trim();
+      const folder = await paneFolder(marker);
+      // Node's realpath collapses ".." before it follows the link; the host's, like the kernel's chdir, follows it first.
+      const hostRealpath = execFileSync('python3', ['-c', 'import os, sys; print(os.path.realpath(sys.argv[1]))', cwd], { encoding: 'utf-8' }).trim();
+      expect(hostRealpath).toBe(path.join(home, 'clones', 'deep'));
+      expect(folder).toBe(hostRealpath);
+      expect(Object.keys(projects())).toEqual([hostRealpath]);
     } finally {
       spawnSync('tmux', ['-L', socket, 'kill-server']);
     }
-    // Node's realpath collapses ".." before it follows the link; the host's, like the kernel's chdir, follows it first.
-    const hostRealpath = execFileSync('python3', ['-c', 'import os, sys; print(os.path.realpath(sys.argv[1]))', cwd], { encoding: 'utf-8' }).trim();
-    expect(hostRealpath).toBe(path.join(home, 'clones', 'deep'));
-    expect(paneDirectory).toBe(hostRealpath);
-    expect(Object.keys(projects())).toEqual([hostRealpath]);
   });
 
-  it('a named cwd that does not resolve refuses the create by name, exit 19, before the seed or tmux runs', () => {
-    const run = runCreateFragment(path.join(home, 'no-such-dir'), `pmux-trust-none-${process.pid}`);
+  it('a fresh create of a named cwd that does not resolve refuses by name, exit 19, before the seed or tmux runs', () => {
+    const run = runCreateFragment(path.join(home, 'no-such-dir'), `pmux-trust-none-${process.pid}`, path.join(root, 'unused'), 'refuse');
     expect(run.status).toBe(19);
     expect(run.stderr).toContain(`pmux: cwd ${path.join(home, 'no-such-dir')} is not a directory on this host`);
     expect(fs.existsSync(configFile())).toBe(false);
+  });
+
+  it.skipIf(!hasTmux)('a revival of a named cwd the host lost starts in HOME with a note, and trusts nothing (review r4)', async () => {
+    const socket = `pmux-trust-revive-${process.pid}-${Date.now()}`;
+    const marker = path.join(root, 'pane-folder-revived');
+    try {
+      const run = runCreateFragment(path.join(home, 'deleted-worktree'), socket, marker, 'home');
+      expect(run.status, run.stderr).toBe(0);
+      expect(run.stderr).toContain(`pmux: cwd ${path.join(home, 'deleted-worktree')} is not a directory on this host; the pane starts in HOME`);
+      expect(await paneFolder(marker)).toBe(home);
+      expect(fs.existsSync(configFile())).toBe(false);
+    } finally {
+      spawnSync('tmux', ['-L', socket, 'kill-server']);
+    }
   });
 
   /**

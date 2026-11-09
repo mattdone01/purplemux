@@ -308,6 +308,7 @@ describe('remote tabs in the layout store (ADR-0022)', () => {
 
     tmux.hasSessionOrUnreachable.mockResolvedValueOnce(false);
     expect(await restartTabSession('ws-a', 'pane-1', tab!.id)).toBe(true);
-    expect(tmux.createSession.mock.calls.at(-1)?.[5]).toEqual({ trustCwd: '/srv/elsewhere/repo' });
+    // A revival keeps the HOME fallback for a cwd the host lost (review r4).
+    expect(tmux.createSession.mock.calls.at(-1)?.[5]).toEqual({ trustCwd: '/srv/elsewhere/repo', revival: true });
   });
 });

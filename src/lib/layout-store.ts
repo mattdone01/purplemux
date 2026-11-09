@@ -583,8 +583,9 @@ export const restartTabSessionUnguarded = async (wsId: string, paneId: string, t
     const effectiveCwd = tab.host ? tab.cwd : await resolveExistingDir(tab.cwd);
     const cwdLost = Boolean(tab.cwd && tab.cwd !== effectiveCwd);
 
+    // A revival: a named cwd the host lost starts in HOME (logged), never a refusal (review r4).
     await (tab.trustCwd
-      ? createSession(tab.sessionName, 80, 24, effectiveCwd, { workspaceId: wsId, tabId: tab.id }, { trustCwd: tab.trustCwd })
+      ? createSession(tab.sessionName, 80, 24, effectiveCwd, { workspaceId: wsId, tabId: tab.id }, { trustCwd: tab.trustCwd, revival: true })
       : createSession(tab.sessionName, 80, 24, effectiveCwd, { workspaceId: wsId, tabId: tab.id }));
     if (command && !cwdLost) {
       prepareOrchestrationLaunch(tab);

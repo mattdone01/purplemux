@@ -520,17 +520,26 @@ export class RemoteCwdMissingError extends Error {
   }
 }
 
+/** What a create does when its cwd does not resolve on the host. */
+export type TRemoteCwdMissing = 'refuse' | 'home';
+
+/** The note a create prints when it starts the pane in HOME; the server logs it. */
+export const REMOTE_CWD_FALLBACK_NOTE = 'the pane starts in HOME';
+
 /**
- * The cwd resolved ON THE HOST, once, into `$pmux_cwd` (vel-PMX-FU, CI run on PR #59): the trust seed and tmux's
+ * The cwd resolved ON THE HOST, once, into `$pmux_cwd` (vel-PMX-FU, CI on PR #59): the trust seed and tmux's
  * `new-session -c` then get the same physical path, so they can never differ whatever tmux does with a symlink or a
- * "..". A named cwd that does not resolve refuses the create (exit 19) before any file is written; the workspace
- * default, a path on this server that a host often lacks, starts in the remote HOME, as tmux used to by itself.
+ * "..". When it does not resolve:
+ * - `refuse` (a fresh create of a cwd its creator named): exit 19 before any file is written.
+ * - `home` (a revival, or the workspace default, a path on this server that a host often lacks): the pane starts in
+ *   the remote HOME, as tmux used to by itself, with a note on stderr, and `$pmux_cwd_fallback` set so no seed runs.
  */
-export const remoteCwdLines = (cwd: string, named: boolean): string[] => [
+export const remoteCwdLines = (cwd: string, onMissing: TRemoteCwdMissing): string[] => [
   `pmux_cwd=$(cd -P -- ${shQuote(cwd)} 2>/dev/null && pwd -P) || pmux_cwd=''`,
-  named
+  "pmux_cwd_fallback=''",
+  onMissing === 'refuse'
     ? `if [ -z "$pmux_cwd" ]; then printf '%s\\n' ${shQuote(`pmux: cwd ${cwd} is not a directory on this host`)} >&2; exit ${REMOTE_CWD_MISSING_EXIT}; fi`
-    : 'if [ -z "$pmux_cwd" ]; then pmux_cwd="$HOME"; fi',
+    : `if [ -z "$pmux_cwd" ]; then printf '%s\\n' ${shQuote(`pmux: cwd ${cwd} is not a directory on this host; ${REMOTE_CWD_FALLBACK_NOTE}`)} >&2; pmux_cwd="$HOME"; pmux_cwd_fallback=1; fi`,
 ];
 
 // Story 12 AC 3: no script starts a pane, or answers for the kit, without a CLI that ran.
@@ -594,6 +603,8 @@ export const buildRemoteCreateScript = (opts: {
   launch: string;
   /** Pre-trust the cwd (D14, and a named cwd, vel-PMX-FU): the kit files must include the trust-seed script. */
   trust?: IRemoteTrustTarget;
+  /** When the cwd does not resolve on the host: refuse (a fresh named create) or start in HOME (default). */
+  cwdMissing?: TRemoteCwdMissing;
 }): string => {
   if (opts.trust && !opts.files.some((file) => file.path === REMOTE_TRUST_SEED_RELATIVE)) {
     throw new Error(`a pre-trust needs the kit file ${REMOTE_TRUST_SEED_RELATIVE}`);
@@ -603,10 +614,13 @@ export const buildRemoteCreateScript = (opts: {
   const lines = [
     'set -e',
     remoteSessionExistsGuard(opts.session),
-    ...(opts.cwd ? remoteCwdLines(opts.cwd, !!opts.trust?.named) : []),
+    ...(opts.cwd ? remoteCwdLines(opts.cwd, opts.cwdMissing ?? 'home') : []),
     ...kitWriteLines(opts.files, ['bin', 'tabs', 'hook-spool']),
     ...remoteKitProbeLines(cliModules),
-    ...(opts.trust ? [remoteTrustSeedLine(opts.trust, opts.cwd ? '"$pmux_cwd"' : undefined)] : []),
+    // No seed for a HOME fallback: the home is never trusted on a cwd's behalf (review r4).
+    ...(opts.trust
+      ? [opts.cwd ? `if [ -z "$pmux_cwd_fallback" ]; then ${remoteTrustSeedLine(opts.trust, '"$pmux_cwd"')}; fi` : remoteTrustSeedLine(opts.trust)]
+      : []),
     [
       shQuote('tmux'), shQuote('-u'), shQuote('-L'), sock, shQuote('-f'), '"$d/tmux.conf"',
       ...['new-session', '-d', '-s', opts.session, '-x', String(opts.cols), '-y', String(opts.rows)].map(shQuote),
