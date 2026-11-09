@@ -21,6 +21,7 @@ import { createRateLimitsWatcher } from '@/lib/rate-limits-watcher';
 import { createClaudeUsagePoller } from '@/lib/claude-usage-poller';
 import { createLogger } from '@/lib/logger';
 import { capturePaneAtWidth } from '@/lib/capture-at-width';
+import { readComposerScreen } from '@/lib/composer-readiness';
 import { paneShowsEmptyComposer, paneStartupPrompt } from '@/lib/composer-readiness';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
@@ -36,6 +37,7 @@ import type { ITab, IWorkspace, TPanelType } from '@/types/terminal';
 import type { TCliState, TStartupPrompt } from '@/types/timeline';
 import type { IStartupPromptReading, ITurnErrorEpisode, ICurrentAction, TTerminalStatus, ITabStatusEntry, IClientTabStatusEntry, ISubmitEvidence, IStatusUpdateMessage, IRateLimitsCache, TEventName, ILastEvent, IOrchestrationNudge, TOrchestrationNudgeKind, IWorkspaceStandup, TAlertKind, TAlertProviderId } from '@/types/status';
 import { addStandup, readAllLatestStandups, readLatestStandupEvidence } from '@/lib/standup-store';
+import { readEventScopes } from '@/lib/event-scope-store';
 import { buildNudgeMessage, buildHeartbeatMessage, nudgeKindForTransition, remoteInactiveDetail, MAX_NUDGE_HISTORY, KICKOFF_FALLBACK_DELAY_MS, ORCH_IDLE_HEARTBEAT_MS, ORCH_MAX_HEARTBEATS } from '@/lib/orchestration';
 import { getSignalEngine } from '@/lib/signal-engine';
 import {
@@ -44,6 +46,7 @@ import {
   WAIT_BACKSTOP_CONFIG_KEY,
   WAIT_BACKSTOP_DEFAULT_MS,
   classifyTurnEnd,
+  extractTurnMarker,
   lastTurnLine,
   holdsOffStall,
   idleNudgeDue,
@@ -73,6 +76,10 @@ import type { TabTurnsTable } from '@/lib/tab-turns-store';
 import { TurnTracker, isActingTool } from '@/lib/turn-tracker';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
 import { WINDOWED_INBOX_KINDS, configureCoordinatorWindow, getCoordinatorWindow } from '@/lib/coordinator-window';
+import { StopGate, type IStopPayload } from '@/lib/stop-gate';
+import { STOP_PAYLOAD_CONFIG_KEY, TURN_END_SOURCE_CONFIG_KEY, synthesizeLine, tailMarker, type TStopDecision } from '@/lib/turn-end-row';
+import type { TurnEndsTable } from '@/lib/turn-ends-store';
+import type { ITurnEndTab } from '@/lib/turn-end-service';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
 import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, restartRefusalOutcome, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
 import { DEFAULT_ROTATE_AT_TOKENS } from '@/lib/constraint';
@@ -355,6 +362,10 @@ export class StatusManager {
   // Scope/cwd are read from the layout file, which is far too slow to touch per
   // tool call. Cached with a short TTL and refreshed off the hot path.
   private tabScopeCache = new Map<string, { scope?: string[]; cwd?: string; at: number }>();
+  private readonly stopGate: StopGate;
+  /** Fleet kill switches (F10 steps 1-2), read by every status poll: `turn-end.source`, `hook.stop-payload`. */
+  private turnEndSourceRow = true;
+  private stopPayloadIsTail = true;
   private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean }>();
   /** Identical nudges within 60 s are dropped and counted (L49). */
   private nudgeDedupe = new NudgeDeduper();
@@ -434,8 +445,28 @@ export class StatusManager {
     updateAgentState = updateTabAgentState,
     tabEventTable: () => TabEventsTable = () => getLedgerStore().tabEvents,
     tabTurnTable: () => TabTurnsTable = () => getLedgerStore().tabTurns,
+    turnEndTable: () => TurnEndsTable = () => getLedgerStore().turnEnds,
   ) {
     this.automatedPrompts = automatedPrompts;
+    // F6 (F10 steps 1-2): the Claude stop's payload and its typed turn end.
+    this.stopGate = new StopGate({
+      now: () => Date.now(),
+      table: turnEndTable,
+      rowsAreSource: () => this.turnEndSourceRow,
+      payloadIsTail: () => this.stopPayloadIsTail,
+      isCoordinator: async (workspaceId, tabId) => {
+        const ws = await getWorkspaceByIdCached(workspaceId);
+        return !!ws?.orchestration?.enabled && ws.orchestration.orchestratorTabId === tabId;
+      },
+      isScoped: async (workspaceId, tabId) =>
+        (await readEventScopes()).scopes.some((scope) => scope.workspaceId === workspaceId && scope.tabId === tabId),
+      roleOf: async (workspaceId, tabId) => {
+        const layout = await readLayoutFile(resolveLayoutFile(workspaceId));
+        return (layout ? collectAllTabs(layout.root).find((tab) => tab.id === tabId)?.role : undefined) ?? null;
+      },
+      inRotation: (tabId) => this.contextLifecycle.holdsDigest(tabId),
+      openWork: (tabId) => this.openWorkForStop(tabId),
+    });
     // F6 change 3: one coordinator window, shared by this router and the inbox (getCoordinatorWindow).
     configureCoordinatorWindow({
       now: () => Date.now(),
@@ -2687,6 +2718,10 @@ export class StatusManager {
     }
     const idleMs = await this.fleetDurationMs(fleet, IDLE_NUDGE_CONFIG_KEY, parseIdleNudgeMinutes, IDLE_NUDGE_DEFAULT_MS);
     const waitMs = await this.fleetDurationMs(fleet, WAIT_BACKSTOP_CONFIG_KEY, parseWaitBackstopHours, WAIT_BACKSTOP_DEFAULT_MS);
+    // F6 kill switches: unset (or any other value) keeps rows and the payload tail on.
+    this.turnEndSourceRow = (fleet ? valueOf(fleet, TURN_END_SOURCE_CONFIG_KEY)?.value : null) !== 'classifier';
+    this.stopPayloadIsTail = (fleet ? valueOf(fleet, STOP_PAYLOAD_CONFIG_KEY)?.value : null) !== 'off';
+    await this.checkUndeliveredBlocks(now);
     for (const [tabId, entry] of [...this.tabs]) {
       if (this.isRetired(tabId)) continue;
       if (idleNudgeDue(entry.turnEnd, entry.lastEvent, entry.cliState, idleMs, now)) {
@@ -3058,6 +3093,68 @@ export class StatusManager {
     return tabId ? this.tabs.get(tabId)?.agentSessionId ?? null : null;
   }
 
+  /** The tab as `purplemux done` sees it (F6): its workspace, panel, host and bound agent session. */
+  turnEndTab(workspaceId: string, tabId: string): ITurnEndTab | null {
+    const entry = this.tabs.get(tabId);
+    if (!entry || entry.workspaceId !== workspaceId) return null;
+    return { workspaceId, panelType: entry.panelType, host: entry.host ?? undefined, agentSessionId: entry.agentSessionId };
+  }
+
+  /**
+   * Decide a live or replayed Claude stop before it is applied (F6, F10 steps 1-2). A `block` is not applied: the
+   * hook prints it and the agent continues the turn. Any other decision is applied by `applyStopTurnEnd`.
+   */
+  async decideClaudeStop(tmuxSession: string, payload: IStopPayload, replayed: boolean): Promise<TStopDecision> {
+    const tabId = this.findTabIdBySession(tmuxSession);
+    const entry = tabId ? this.tabs.get(tabId) : undefined;
+    if (!tabId || !entry) return { kind: 'classifier', why: 'no tab for the session' };
+    return this.stopGate.decide(tabId, {
+      workspaceId: entry.workspaceId,
+      agentSessionId: entry.agentSessionId,
+      host: entry.host,
+      providerId: getProviderByPanelType(entry.panelType)?.id ?? entry.panelType ?? 'unknown',
+    }, payload, replayed);
+  }
+
+  /** Open work that makes a markerless stop a WAITING one; null when any part of it cannot be read. */
+  private async openWorkForStop(tabId: string): Promise<number | null> {
+    const entry = this.tabs.get(tabId);
+    if (!entry) return null;
+    try {
+      const jobs = (await getLivenessManager().statusForTab(tabId)).backgroundJobs.filter(jobHoldsWork).length;
+      const watches = (await readWatches()).watches.filter((w) => w.workspaceId === entry.workspaceId && w.tabId === tabId).length;
+      if (jobs + watches > 0) return jobs + watches;
+      const provider = getProviderByPanelType(entry.panelType);
+      const handle = this.runtimeHandle(entry);
+      if (!provider || !handle) return null;
+      const snapshot = await provider.readRuntimeSnapshot(handle, {
+        force: true, tasksSince: await this.agentProcessStartedAt(tabId, entry), withBackground: true,
+      });
+      return snapshot.transcriptRead === false ? null : snapshot.openBackgroundTasks ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A held stop that no later hook event confirmed: if the pane shows the agent at an empty prompt, the block never
+   * reached it, and the stop is applied now as UNREPORTED `block-undelivered` (design check (2) ruling (3)).
+   */
+  private async checkUndeliveredBlocks(now: number): Promise<void> {
+    for (const tabId of this.stopGate.unconfirmed(now)) {
+      const entry = this.tabs.get(tabId);
+      if (!entry?.tmuxSession) {
+        this.stopGate.forget(tabId);
+        continue;
+      }
+      const screen = readComposerScreen(entry.panelType, await capturePaneAtWidth(entry.tmuxSession, 120, 50, { escapes: true }).catch(() => null));
+      if (!screen.ok) continue;
+      log.info({ tabId }, 'held stop never reached the agent: applying it as UNREPORTED block-undelivered');
+      this.stopGate.undelivered(tabId);
+      this.updateTabFromHook(entry.tmuxSession, 'stop');
+    }
+  }
+
   /**
    * Classify a `stop` before announcing it (ADR-0018). A marker line
    * (`DONE:` …) becomes a `turn-marker` nudge carrying it. No marker and open
@@ -3070,6 +3167,9 @@ export class StatusManager {
    */
   private async applyStopTurnEnd(tabId: string, entry: ITabStatusEntry, tmuxSession: string, replayedAt?: number): Promise<void> {
     const stopSeq = entry.lastEvent?.seq;
+    // F6 (F10 steps 1-2): taken before any await, so a later stop never applies this one's decision or message.
+    const stopDecision = this.stopGate.take(tabId);
+    const payloadTail = this.stopGate.takeTail(tabId, entry.agentSessionId);
     // A stop on a tab already ready-for-review makes no transition, so its end
     // line is sent here, unless it repeats the line the tab already reported
     // (a second stop event of the same turn).
@@ -3120,21 +3220,47 @@ export class StatusManager {
     // resume not yet typed is withdrawn: it would be stale.
     this.closeTurnErrorEpisode(entry, 'episode-closed');
 
-    const turnEnd = classifyTurnEnd({
-      tail: snapshot?.lastAssistantTail,
+    // F10 step 1: the stop's own message is the tail; the transcript read stays for the background counts, and a
+    // difference between the two is logged (the shadow that measures the transcript race).
+    const tail = payloadTail ?? snapshot?.lastAssistantTail;
+    if (payloadTail !== null && snapshot?.lastAssistantTail !== undefined
+      && extractTurnMarker(payloadTail)?.join('\n') !== extractTurnMarker(snapshot.lastAssistantTail)?.join('\n')) {
+      log.info({ tabId, payload: extractTurnMarker(payloadTail)?.at(-1) ?? null, transcript: extractTurnMarker(snapshot.lastAssistantTail)?.at(-1) ?? null },
+        'stop payload shadow: the transcript tail reads another end line');
+    }
+    const classified = classifyTurnEnd({
+      tail,
       // An empty snapshot from an unreadable transcript is not a read (story 37).
       transcript: snapshot !== null && snapshot.transcriptRead !== false,
       openBackgroundTasks: snapshot?.openBackgroundTasks ?? 0,
       liveRegisteredJobs,
       armedWatches,
     });
+    // F10 step 2: a row is the turn's verdict, its line synthesized; the classifier runs beside it in shadow (7 days).
+    let turnEnd = classified;
+    let decisionTail = tail;
+    if (stopDecision?.kind === 'row' && this.stopGate.consume(stopDecision.row)) {
+      const line = synthesizeLine(stopDecision.row);
+      const shadow = classified.kind === 'turn-marker' ? tailMarker(classified.lines.at(-1)) : null;
+      if (shadow !== stopDecision.row.verdict) {
+        log.info({ tabId, row: stopDecision.row.verdict, classifier: shadow ?? classified.kind }, 'turn-end shadow: the classifier reads another verdict than the row');
+      }
+      turnEnd = { kind: 'turn-marker', lines: [line] };
+      decisionTail = line;
+    } else if (stopDecision?.kind === 'unreported') {
+      try {
+        this.stopGate.writeUnreported(entry, tabId, stopDecision.reason);
+      } catch (err) {
+        log.warn({ tabId, err: err instanceof Error ? err.message : String(err) }, 'UNREPORTED turn-end row not written');
+      }
+    }
     if (turnEnd.kind !== 'turn-marker') {
       // One end line carries one marker (D28): a refused line opens nothing, and it is logged with its text.
-      const read = readTurnEnd(snapshot?.lastAssistantTail);
+      const read = readTurnEnd(tail);
       if (read?.kind === 'refused') log.warn({ tabId, line: read.line, reason: read.reason }, 'end line refused: it holds two turn markers, one of them NEEDS-DECISION, so it is no end line');
     }
     // HANDOFF-READY answers a ROTATE; the check itself waits for the prompt (ADR-0036 §2).
-    this.contextLifecycle.onTurnEnd(tabId, snapshot?.lastAssistantTail);
+    this.contextLifecycle.onTurnEnd(tabId, tail);
     // A replayed stop ended its turn when it happened, so the idle clocks start there.
     const at = replayedAt ?? Date.now();
     if (turnEnd.kind === 'waiting') {
@@ -3158,9 +3284,9 @@ export class StatusManager {
     const endLine = turnEnd.kind === 'turn-marker' ? turnEnd.lines.at(-1) : undefined;
     if (stopSeq !== undefined && endLine?.startsWith('NEEDS-DECISION:')) {
       const reportsTo = entry.reportsTo && entry.reportsTo !== tabId ? entry.reportsTo : null;
-      const routed = reportsTo ? await this.routeNeedsDecisionToReportsTo(tabId, entry, reportsTo, snapshot?.lastAssistantTail, endLine) : null;
+      const routed = reportsTo ? await this.routeNeedsDecisionToReportsTo(tabId, entry, reportsTo, decisionTail, endLine) : null;
       // A question never vanishes (review r1, 1): with no live tab to take it, it opens today's owner item.
-      decision = routed ?? await this.openNeedsDecision(tabId, entry, snapshot?.lastAssistantTail, endLine, stopSeq, at,
+      decision = routed ?? await this.openNeedsDecision(tabId, entry, decisionTail, endLine, stopSeq, at,
         previous?.at ?? entry.busySince ?? at, reportsTo ? `reports-to target unavailable: ${reportsTo} is gone or halted, and no live orchestrator can take it` : undefined);
       if (this.tabs.get(tabId) !== entry || entry.lastEvent?.name !== 'stop' || entry.lastEvent.seq !== stopSeq) return;
     }
@@ -3175,7 +3301,7 @@ export class StatusManager {
       };
       // A stop with no end line may still ask the owner something: the curator flags it, in shadow (ADR-0038 §2).
       const sourceId = entry.agentSessionId && snapshot?.lastAssistantUuid ? `${entry.workspaceId}/${entry.agentSessionId}/${snapshot.lastAssistantUuid}` : null;
-      void import('@/lib/curator-service').then((curator) => curator.curatorOnUnmarkedTurnEnd(entry.workspaceId, tabId, snapshot?.lastAssistantTail, sourceId))
+      void import('@/lib/curator-service').then((curator) => curator.curatorOnUnmarkedTurnEnd(entry.workspaceId, tabId, tail, sourceId))
         .catch((err: unknown) => log.warn({ tabId }, `curator turn-end hook not loaded: ${err instanceof Error ? err.message : String(err)}`));
       if (!turnEnd.transcript && !this.transcriptFallbackLogged.has(tabId)) {
         this.transcriptFallbackLogged.add(tabId);
@@ -3414,6 +3540,8 @@ export class StatusManager {
     }
     const now = this.admitHookEvent(tabId, event, replayedAt);
     if (now === null) return;
+    // Any hook event of the tab confirms that a held stop reached the agent (F6, design check (2) ruling (3)).
+    this.stopGate.onHookEvent(tabId);
 
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');
@@ -3455,6 +3583,14 @@ export class StatusManager {
     entry.eventSeq = seq;
     entry.lastEvent = { name: eventName, at: now, seq, ...(eventName === 'prompt-submit' && opts.fromTool ? { fromTool: true as const } : {}) };
     if (eventName === 'prompt-submit' && !opts.fromTool) entry.lastPromptSubmit = { seq, at: now };
+    // A live prompt-submit that no tool sent opens a new turn of the session for `purplemux done` rows (ruling (2)).
+    if (eventName === 'prompt-submit' && !opts.fromTool && replayedAt === undefined && entry.agentSessionId) {
+      try {
+        this.stopGate.onPromptSubmit(entry.agentSessionId);
+      } catch (err) {
+        log.warn({ tabId, err: err instanceof Error ? err.message : String(err) }, 'turn counter not bumped: the ledger write failed');
+      }
+    }
     if (eventName === 'session-start') {
       if (now >= (entry.lastResumeOrStartedAt ?? 0)) {
         this.orchestrationPendingLaunches.delete(tabId);
@@ -3657,6 +3793,7 @@ export class StatusManager {
   }
 
   removeTab(tabId: string): void {
+    this.stopGate.forget(tabId);
     this.contextLifecycle.onClosed(tabId, this.seatOf(tabId));
     this.turns.closed(tabId);
     const entry = this.tabs.get(tabId);

@@ -1,3 +1,4 @@
+import { STOP_PAYLOAD_CONFIG_KEY, TURN_END_SOURCE_CONFIG_KEY } from '@/lib/turn-end-row';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import type { ICaller } from '@/lib/caller';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
@@ -51,7 +52,7 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * not set for every other workspace (ADR-0027 ruling R2). `standup.` stays here: since F6 no such key is read,
  * and every write of one is refused.
  */
-export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end)\./;
 
 const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|mutation|browser|test-service|tab)$/;
 const POOL_ALIAS_KEY = /^pool\.(fallback|gate-host)\.[A-Za-z0-9._-]+$/;
@@ -159,6 +160,23 @@ const checkStandupValue = (key: string, _value: string): void => {
   throw new FleetConfigError('config-invalid', `${key} is not a key: the standup due line (standup.dueMin) was deleted by F6`);
 };
 
+/**
+ * The F6 kill switches (F10 steps 1-2), admin token only: `turn-end.source` is `row` or `classifier` (the classifier
+ * alone, nothing blocked); `hook.stop-payload` is `on` or `off` (the transcript tail again). Unset means row and on.
+ */
+const TURN_END_KEYS: Readonly<Record<string, readonly string[]>> = {
+  [TURN_END_SOURCE_CONFIG_KEY]: ['row', 'classifier'],
+  [STOP_PAYLOAD_CONFIG_KEY]: ['on', 'off'],
+};
+const checkTurnEndValue = (key: string, value: string): void => {
+  if (!key.startsWith('hook.') && !key.startsWith('turn-end.')) return;
+  const allowed = Object.hasOwn(TURN_END_KEYS, key) ? TURN_END_KEYS[key] : null;
+  if (!allowed) throw new FleetConfigError('config-invalid', `${key} is not a key: ${Object.keys(TURN_END_KEYS).join(' or ')}`);
+  if (!allowed.includes(value.trim())) {
+    throw new FleetConfigError('config-invalid', `${key} must be ${allowed.join(' or ')}, got ${JSON.stringify(value)}`);
+  }
+};
+
 /** The alarm keys (ADR-HFL-03 decision 1): a route table parses whole; a threshold names a producer reason and holds minutes or `off`. */
 const checkLedgerValue = (key: string, value: string): void => {
   if (key.startsWith(LEDGER_ALARM_KEYS.routePrefix)) {
@@ -214,6 +232,7 @@ export const putValue = async (
     checkLedgerValue(key, value);
     checkCuratorValue(key, value);
     checkStandupValue(key, value);
+    checkTurnEndValue(key, value);
     return setValue(s, { key, value, expectedVersion }, setterOf(caller), authority.now());
   });
   if (change) await audit(change, caller);

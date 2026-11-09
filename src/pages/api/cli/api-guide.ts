@@ -993,6 +993,13 @@ Keys in use:
   watchdog.wait-backstop-hours
                Hours (0, 168], decimals allowed, a tab may wait on a live registered job or armed
                watch before its one "has been WAITING" nudge. Unset or invalid means 4.
+  turn-end.source
+               row (unset) or classifier. With row, a worker seat's \`purplemux done\` row is its turn's verdict and
+               a scoped worker that stops a turn without one is held at most twice (F6). classifier turns
+               rows-as-source and every hold off: the end-line classifier alone, as before F6. Admin token only.
+  hook.stop-payload
+               on (unset) or off. On, the Claude stop's own last_assistant_message is the turn's tail; off, the
+               transcript tail is read again (F6). Admin token only.
   fleet-status.stall-minutes  fleet-status.waiting-long-minutes  fleet-status.unanswered-minutes
   fleet-status.composer-minutes
                The fleet flag thresholds (ADR-0023), in minutes (0, 10080], decimals allowed:

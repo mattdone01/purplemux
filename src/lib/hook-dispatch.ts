@@ -32,6 +32,8 @@ export interface IHookDelivery {
 export interface IHookOutcome {
   status: number;
   error?: string;
+  /** A JSON answer the hook script reads: the Claude stop route's `{}` or `{"decision":"block",...}` (F6). */
+  body?: Record<string, unknown>;
 }
 
 const NO_CONTENT: IHookOutcome = { status: 204 };
@@ -54,6 +56,28 @@ const handleClaudeToolHook = ({ query, body, replayedAt }: IHookDelivery): IHook
   }
   getStatusManager().handleToolActivity('claude', session, activity, replayedAt);
   return NO_CONTENT;
+};
+
+/**
+ * The Claude stop (F6, F10 steps 1-2): the script posts the hook's own JSON with `session=` in the query. The decision
+ * comes first (within 1 s); a `block` is answered and NOT applied, so the agent continues its turn. Any other decision
+ * is applied as the stop. A replayed stop is never blocked (ruling (4)), and one whose body was dropped applies as a
+ * plain stop.
+ */
+const handleClaudeStopHook = async ({ query, body, replayedAt, occurredAt }: IHookDelivery): Promise<IHookOutcome> => {
+  const session = queryString(query, 'session');
+  if (!session) return { status: 200, body: {} };
+  const payload = bodyRecord(body);
+  const statusManager = getStatusManager();
+  const decision = await statusManager.decideClaudeStop(session, {
+    hookEvent: typeof payload.hook_event_name === 'string' ? payload.hook_event_name : null,
+    sessionId: typeof payload.session_id === 'string' ? payload.session_id : null,
+    message: typeof payload.last_assistant_message === 'string' ? payload.last_assistant_message : null,
+  }, replayedAt !== undefined);
+  if (decision.kind === 'block') return { status: 200, body: { decision: 'block', reason: decision.reason } };
+  const workEvent = translateClaudeHookEvent('stop', undefined, undefined);
+  if (workEvent) statusManager.handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt);
+  return { status: 200, body: {} };
 };
 
 const handleClaudeHook = ({ body, replayedAt, occurredAt }: IHookDelivery): IHookOutcome => {
@@ -220,5 +244,6 @@ export const dispatchHook = async (delivery: IHookDelivery): Promise<IHookOutcom
   if (provider === 'codex') return handleCodexHook(delivery);
   if (provider === 'grok') return handleGrokHook(delivery);
   if (queryString(delivery.query, 'kind') === 'tool') return handleClaudeToolHook(delivery);
+  if (queryString(delivery.query, 'kind') === 'stop') return handleClaudeStopHook(delivery);
   return handleClaudeHook(delivery);
 };
