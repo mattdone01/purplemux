@@ -622,4 +622,17 @@ describe('the host pin and the ask token (vel-POOL-ENF)', () => {
     expect(s.view.slots.gate.used).toBe(0);
     expect(s.ledger.product).toEqual({ threads: 0, memBytes: 0 });
   });
+
+  it('a control-plane tab is pinned too: a pin without the server\'s host refuses it (review r1 of #64)', () => {
+    const cp = (pin: IPoolPlacementRequest['pin']): IPoolPlacementRequest => ({ kind: 'tab', memGb: 0, class: 'control-plane', pin });
+    expect(place([ctl(), wk()], cp({ hosts: ['worker-host'], local: false, gateHosts: [] }))).toMatchObject({ ok: false, refusal: 'no-pinned-host', queueable: false });
+    expect(place([ctl(), wk()], cp({ hosts: [], local: true, gateHosts: [] }))).toMatchObject({ ok: true, host: 'control-host', local: true });
+  });
+
+  it('a non-agent tab is pinned too: it runs on the server\'s host only when the pin allows it (review r1 of #64)', () => {
+    const term = (pin: IPoolPlacementRequest['pin']): IPoolPlacementRequest => ({ kind: 'tab', memGb: 0, panelType: 'terminal', pin });
+    expect(place([ctl(), wk()], term({ hosts: ['worker-host'], local: false, gateHosts: [] }))).toMatchObject({ ok: false, refusal: 'no-pinned-host', queueable: false });
+    expect(place([ctl(), wk()], term({ hosts: ['control-host'], local: false, gateHosts: [] }))).toMatchObject({ ok: true, host: 'control-host', envelope: null });
+    expect(place([ctl(), wk()], { kind: 'tab', memGb: 0, panelType: 'terminal' })).toMatchObject({ ok: true, host: 'control-host' });
+  });
 });

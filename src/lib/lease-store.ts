@@ -211,8 +211,12 @@ export const holderStateOf = (lease: ILease, facts: IViewFacts): THolderState =>
   return facts.agentInactive(tabId) ? 'agent-gone' : 'live';
 };
 
+/** An ask token in a note (`ask=<T>`, vel-POOL-ENF) is its asker's alone: every view shows a short prefix (review r1 of #64). */
+const viewNote = (note: string | null): string | null => (note === null ? null : note.replace(/(^|\s)ask=(\S{8})\S*/g, '$1ask=$2...'));
+
 export const toLeaseView = (lease: ILease, facts: IViewFacts): ILeaseView => ({
   ...lease,
+  note: viewNote(lease.note),
   holder: { ...lease.holder, workspaceName: lease.holder.workspaceId ? facts.workspaceName(lease.holder.workspaceId) : null },
   ageSeconds: Math.max(0, Math.floor((facts.now - Date.parse(lease.acquiredAt)) / 1000)),
   expiresInSeconds: lease.expiresAt === null ? null : Math.max(0, Math.floor((Date.parse(lease.expiresAt) - facts.now) / 1000)),

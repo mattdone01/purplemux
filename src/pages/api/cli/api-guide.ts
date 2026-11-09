@@ -306,9 +306,10 @@ POST /api/cli/pool/release   Body: { "lease": "pool:<host>/<kind>-<n>" | "pool-q
   is released (a reused slot name is never another ask's to free).
   Response: { "released": <lease view> }
   Body { "ask": "<T>" } alone (\`purplemux pool release --ask T\`) cancels the ask, in one
-  transaction: every slot and ticket of the caller that carries T is released, and the mark
-  "pool-cancel:<T>" (600 s, no budget) refuses an acquire with T that lands later (409
-  pool-ask-cancelled). A timed-out acquire is reclaimed this way, never by name.
+  transaction: every slot and ticket of the caller that carries T is released, and the caller's
+  mark "pool-cancel:<hash of the caller and T>" (600 s, no budget) refuses the caller's acquire
+  with T that lands later (409 pool-ask-cancelled). A timed-out acquire is reclaimed this way,
+  never by name. A lease view and a log show a token as its first 8 characters only.
   Response: { "released": [lease names], "cancelled": "<T>" }
 
 The engineering gate's keys map onto the pool (migration, ADR-0039 §6; gate.sh and remote-gate.sh

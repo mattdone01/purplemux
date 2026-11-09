@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { isAgentPanelType } from '@/lib/agent-panel-types';
 import { collectAllTabs } from '@/lib/layout-tree';
-import { LeasePolicyError, resolveTtl } from '@/lib/lease-policy';
+import { LeasePolicyError, NOTE_MAX, resolveTtl } from '@/lib/lease-policy';
 import { LeaseError, acquireChosenLease, holderLabel, listLeases, releaseLease, releaseLeaseWhere, sameHolder, type ILeaseAuthority } from '@/lib/lease-store';
 import { createLogger } from '@/lib/logger';
 import {
@@ -25,6 +26,7 @@ import {
   parseTicket,
   pathSlowMsOf,
   placeWork,
+  askLabel,
   poolCancelName,
   poolGateHostOf,
   poolHostId,
@@ -316,13 +318,23 @@ type TAdmitted = Omit<IPoolAcquireResult, 'lease' | 'expiresAt' | 'gateHost'>;
 
 const isSlotOrTicket = (lease: ILease): boolean => parsePoolLeaseName(lease.name) !== null || parsePoolQueueName(lease.name) !== null;
 
+const holderKey = (holder: ILeaseHolder): string => (holder.admin ? 'admin' : `${holder.workspaceId ?? ''}/${holder.tabId ?? ''}`);
+
+/**
+ * The cancel mark of one holder's ask (review r1 of #64): named by a hash of the holder and the token, so another tab
+ * that knows the token can neither take this holder's mark (and block its cancel) nor refuse its late ask, and no
+ * lease name carries the token.
+ */
+const cancelMark = (ask: string, holder: ILeaseHolder): string =>
+  poolCancelName(createHash('sha256').update(`${holderKey(holder)}\n${ask}`).digest('hex').slice(0, 32));
+
 /** Inside the lease lock: a cancelled ask takes nothing, and a token is one caller's (vel-POOL-ENF). */
 const checkAsk = (leases: readonly ILease[], ask: string, holder: ILeaseHolder): void => {
-  if (leases.some((l) => l.name === poolCancelName(ask))) {
-    throw new PoolError('pool-ask-cancelled', `ask ${ask} was cancelled by \`pool release --ask\`: this late ask takes nothing (the mark lives ${POOL_CANCEL_TTL_SECONDS} s)`);
+  if (leases.some((l) => l.name === cancelMark(ask, holder))) {
+    throw new PoolError('pool-ask-cancelled', `ask ${askLabel(ask)} was cancelled by \`pool release --ask\`: this late ask takes nothing (the mark lives ${POOL_CANCEL_TTL_SECONDS} s)`);
   }
   const other = leases.find((l) => isSlotOrTicket(l) && noteField(l.note, 'ask') === ask && !sameHolder(l.holder, holder));
-  if (other) throw new PoolError('pool-invalid', `ask ${ask} is another caller's token (${other.name}): send a fresh token per ask`);
+  if (other) throw new PoolError('pool-invalid', `ask ${askLabel(ask)} is another caller's token (${other.name}): send a fresh token per ask`);
 };
 type TChoice = { queued: false; admitted: TAdmitted } | { queued: true; result: IPoolQueuedResult };
 
@@ -342,6 +354,12 @@ export const acquirePoolSlot = async (
   const resolved = await resolvePoolClass(parsePoolRequest(input), holder, authority);
   const asked = resolved.req;
   const askToken = parseAskToken(input.ask);
+  // A ticket note holds the pin and the token; one that would pass the lease note limit is refused here, before the lock
+  // (review r1 of #64: the limit was unstated, and the failure came later as a lease-policy 400).
+  const queueNote = poolQueueNote(asked, askToken);
+  if (queueNote.length > NOTE_MAX) {
+    throw new PoolError('pool-invalid', `the request's queue note would be ${queueNote.length} characters, at most ${NOTE_MAX}: pin fewer or shorter hosts`);
+  }
   const downgrade = resolved.downgrade ? { downgrade: resolved.downgrade } : {};
   const ticketName = ticketInput(input.ticket);
   if (!absent(input.ttlSeconds) && typeof input.ttlSeconds !== 'number') throw new LeasePolicyError('ttlSeconds must be a number');
@@ -433,13 +451,14 @@ export const releasePoolSlot = async (rawName: unknown, holder: ILeaseHolder, au
   if (!ask) return releaseLease(name, holder, authority);
   return releaseLeaseWhere(name, holder, authority, (lease) => {
     const held = noteField(lease.note, 'ask');
-    if (held !== ask) throw new PoolError('pool-ask-mismatch', `${name} was taken by ${held ? `ask ${held}` : 'no ask token'}, not ask ${ask}: nothing was released`);
+    if (held !== ask) throw new PoolError('pool-ask-mismatch', `${name} was taken by ${held ? `ask ${askLabel(held)}` : 'no ask token'}, not ask ${askLabel(ask)}: nothing was released`);
   });
 };
 
 /**
  * `pool release --ask T` (vel-POOL-ENF): in one transaction, release every pool slot and queue ticket of this holder
- * that carries T, and take or renew the mark `pool-cancel:T` (600 s), which refuses an acquire with T that lands later.
+ * that carries T, and take or renew this holder's mark `pool-cancel:<hash of holder and T>` (600 s), which refuses an
+ * acquire with T by this holder that lands later.
  * Either order of a late acquire and its cancel therefore leaves no slot.
  */
 export const cancelPoolAsk = async (rawAsk: unknown, holder: ILeaseHolder, authority: ILeaseAuthority): Promise<{ released: string[]; cancelled: string }> => {
@@ -447,9 +466,9 @@ export const cancelPoolAsk = async (rawAsk: unknown, holder: ILeaseHolder, autho
   if (!ask) throw new PoolError('pool-invalid', 'a cancel needs the ask token');
   const { value } = await acquireChosenLease<string[]>(holder, authority, (state) => {
     const gone = state.leases.filter((l) => isSlotOrTicket(l) && sameHolder(l.holder, holder) && noteField(l.note, 'ask') === ask).map((l) => l.name);
-    return { name: poolCancelName(ask), ttlSeconds: POOL_CANCEL_TTL_SECONDS, note: 'pool-cancel', release: gone, value: gone };
+    return { name: cancelMark(ask, holder), ttlSeconds: POOL_CANCEL_TTL_SECONDS, note: 'pool-cancel', release: gone, value: gone };
   });
-  if (value.length) log.warn(`pool: ask ${ask} cancelled, released ${value.join(', ')}`);
+  if (value.length) log.warn(`pool: ask ${askLabel(ask)} cancelled, released ${value.join(', ')}`);
   return { released: value, cancelled: ask };
 };
 

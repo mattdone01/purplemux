@@ -497,7 +497,7 @@ describe('the ask token and the host pin (vel-POOL-ENF)', () => {
     const { findLease } = await import('@/lib/lease-store');
     expect(await findLease(lease, now)).toBeNull();
     expect(await findLease(other.lease, now)).not.toBeNull();
-    expect(await findLease(`pool-cancel:${T}`, now)).toMatchObject({ kind: 'pool-cancel', ttlSeconds: 600, note: 'pool-cancel', holder: { tabId: 'tab-a' } });
+    expect((await (await import('@/lib/lease-store')).listLeases('pool-cancel:', now))[0]).toMatchObject({ kind: 'pool-cancel', ttlSeconds: 600, note: 'pool-cancel', holder: { tabId: 'tab-a' } });
   });
 
   it('mark first: an acquire that lands after its cancel is refused pool-ask-cancelled and writes nothing', async () => {
@@ -519,7 +519,7 @@ describe('the ask token and the host pin (vel-POOL-ENF)', () => {
     expect(await cancelPoolAsk(T, tabA, authority)).toEqual({ released: [q.ticket], cancelled: T });
     now += 300_000;
     await cancelPoolAsk(T, tabA, authority);
-    expect((await findLease(`pool-cancel:${T}`, now))?.expiresAt).toBe(new Date(now + 600_000).toISOString());
+    expect(((await (await import('@/lib/lease-store')).listLeases('pool-cancel:', now))[0])?.expiresAt).toBe(new Date(now + 600_000).toISOString());
   });
 
   it('a re-asked ticket keeps its pin, and its slot carries the token', async () => {
@@ -605,5 +605,65 @@ describe('the ask token and the host pin (vel-POOL-ENF)', () => {
     const { cancelPoolAsk, releasePoolSlot } = await service();
     await expect(cancelPoolAsk('nope', tabA, authority)).rejects.toMatchObject({ code: 'pool-invalid' });
     await expect(releasePoolSlot('pool:worker-host/gate-1', tabA, authority, 'nope')).rejects.toMatchObject({ code: 'pool-invalid' });
+  });
+});
+
+describe('the ask token is the asker\'s alone (vel-POOL-ENF r2, review r1 of #64)', () => {
+  const T = '0123456789abcdef0123456789abcdef';
+  const U = 'fedcba9876543210fedcba9876543210';
+  // Neutral host names in this block (the repository is public).
+  beforeEach(() => {
+    reads = [{ ...md, host: 'control-host', readAt: now, metrics: metrics({}) }, { ...aiRead(), host: 'worker-host', via: 'worker-host' }];
+  });
+
+  it('a cancel logs a short prefix of the token, never the token', async () => {
+    const { acquirePoolSlot, cancelPoolAsk } = await service();
+    admitted(await acquirePoolSlot({ kind: 'gate', ask: T }, tabA, authority, await deps()));
+    expect((await cancelPoolAsk(T, tabA, authority)).released).toHaveLength(1);
+    expect(warnings.filter((w) => w.includes('cancelled'))).toEqual([expect.stringContaining('ask 01234567...')]);
+    expect(warnings.join('\n')).not.toContain(T);
+  });
+
+  it('another tab\'s cancel with a copied token neither refuses the asker\'s acquire nor blocks its own cancel', async () => {
+    const { acquirePoolSlot, cancelPoolAsk } = await service();
+    const { findLease } = await import('@/lib/lease-store');
+    expect(await cancelPoolAsk(T, tabB, authority)).toEqual({ released: [], cancelled: T });
+    const got = admitted(await acquirePoolSlot({ kind: 'gate', ask: T }, tabA, authority, await deps()));
+    expect(await cancelPoolAsk(T, tabA, authority)).toEqual({ released: [got.lease], cancelled: T });
+    expect(await findLease(got.lease, now)).toBeNull();
+    // Each holder's mark refuses only that holder's own late ask.
+    await expect(acquirePoolSlot({ kind: 'gate', ask: T }, tabB, authority, await deps())).rejects.toMatchObject({ code: 'pool-ask-cancelled' });
+    await expect(acquirePoolSlot({ kind: 'gate', ask: T }, tabA, authority, await deps())).rejects.toMatchObject({ code: 'pool-ask-cancelled' });
+  });
+
+  it('no lease name or lease view carries the token in full', async () => {
+    const { acquirePoolSlot, cancelPoolAsk } = await service();
+    const { listLeases, toLeaseView } = await import('@/lib/lease-store');
+    const got = admitted(await acquirePoolSlot({ kind: 'gate', ask: T }, tabA, authority, await deps()));
+    await cancelPoolAsk(U, tabA, authority);
+    const all = await listLeases(undefined, now);
+    expect(all.map((l) => l.name).join(' ')).not.toContain(U);
+    expect(all.filter((l) => l.kind === 'pool-cancel').map((l) => l.name)).toEqual([expect.stringMatching(/^pool-cancel:[0-9a-f]{32}$/)]);
+    const facts = { now, liveTabIds: new Set<string>(), agentInactive: () => false, workspaceName: () => null };
+    const slot = all.find((l) => l.name === got.lease)!;
+    expect(toLeaseView(slot, facts).note).toBe('pool mem=8 threads=8 class=product ask=01234567...');
+    expect(JSON.stringify(all.map((l) => toLeaseView(l, facts)))).not.toContain(T);
+  });
+
+  it('a release with another token names neither token in full', async () => {
+    const { acquirePoolSlot, releasePoolSlot } = await service();
+    const got = admitted(await acquirePoolSlot({ kind: 'gate', ask: T }, tabA, authority, await deps()));
+    const err = await releasePoolSlot(got.lease, tabA, authority, U).catch((e: unknown) => e as Error);
+    expect(err).toMatchObject({ code: 'pool-ask-mismatch' });
+    expect((err as Error).message).toContain('01234567...');
+    expect((err as Error).message).not.toContain(T);
+    expect((err as Error).message).not.toContain(U);
+  });
+
+  it('a pin too long for a queue note is refused before anything is written', async () => {
+    const { acquirePoolSlot } = await service();
+    const hosts = Array.from({ length: 16 }, (_, i) => `h${i}-${'x'.repeat(40)}`);
+    await expect(acquirePoolSlot({ kind: 'gate', ask: T, pin: { hosts } }, tabA, authority, await deps()))
+      .rejects.toMatchObject({ code: 'pool-invalid', message: expect.stringContaining('at most 500') });
   });
 });

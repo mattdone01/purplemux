@@ -136,7 +136,12 @@ export const poolHostId = (host: string): string => host.toLowerCase();
 
 export const poolLeaseName = (host: string, kind: TPoolKind, n: number): string => `${POOL_LEASE_KIND}:${poolHostId(host)}/${kind}-${n}`;
 export const poolQueueName = (kind: TPoolKind, n: number): string => `${POOL_QUEUE_LEASE_KIND}:${kind}-${n}`;
-export const poolCancelName = (ask: string): string => `${POOL_CANCEL_LEASE_KIND}:${ask}`;
+/** The cancel mark of one holder's ask: `key` is a hash of the holder and the token, so the name never carries the token
+ * and two holders never share a mark (review r1 of #64). */
+export const poolCancelName = (key: string): string => `${POOL_CANCEL_LEASE_KIND}:${key}`;
+
+/** An ask token as logs and messages show it: a short prefix, never the whole token (review r1 of #64). */
+export const askLabel = (ask: string): string => `${ask.slice(0, 8)}...`;
 
 /** The gate-host container of a pool host (fleet `pool.gate-host.<host>`), else null: an ssh alias only. */
 export const poolGateHostOf = (config: TConfigValue, host: string): string | null => {
@@ -689,16 +694,18 @@ export const wouldRefuseLine = (w: IPoolWouldRefuse): string => [
  */
 export const placeWork = (states: readonly IPoolHostState[], req: IPoolPlacementRequest, ctx: IPlaceContext = {}): TPoolPlacement => {
   const config: TConfigValue = states[0]?.config ?? (() => null);
-  if (req.kind === 'tab' && !isAgentPanelType(req.panelType ?? 'claude-code')) {
-    const local = states.find((s) => s.view.local);
-    return { ok: true, host: local?.view.host ?? '', local: true, envelope: null, reason: `not an agent tab: a ${req.panelType} tab has no envelope and runs on this host` };
-  }
-  const e = requestEnvelope(req, config);
+  // The pin is judged first, for every kind and class: a non-agent tab and a control-plane tab run on this host, so a
+  // pin that does not allow this host refuses them too (review r1 of #64).
   const why = tabLocalOnly(req);
   const allowed = allowedHosts(states, req);
   if (req.pin && allowed.length === 0) {
     return noPinnedHost(states, { ...req, pin: req.pin }, pinnedHosts(states, req.pin).length > 0 ? why : null);
   }
+  if (req.kind === 'tab' && !isAgentPanelType(req.panelType ?? 'claude-code')) {
+    const local = states.find((s) => s.view.local);
+    return { ok: true, host: local?.view.host ?? '', local: true, envelope: null, reason: `not an agent tab: a ${req.panelType} tab has no envelope and runs on this host` };
+  }
+  const e = requestEnvelope(req, config);
   if (req.kind === 'tab' && req.class === 'control-plane') return controlPlaneTab(states, e);
   const mode = poolModeOf(config);
   const known = allowed.filter((s) => s.budget);

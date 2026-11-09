@@ -3784,7 +3784,9 @@ Commands:
                                            --pin-local (the server's host) and --pin-gate-host (hosts whose
                                            pool.gate-host names G) admit only there, their union; a pin that
                                            matches no pool host is exit 3 pool-no-pinned-host, never queued. The
-                                           answer echoes ask and pin; pool show --json lists the server's features
+                                           answer echoes ask and pin; pool show --json lists the server's features.
+                                           A server without them drops --ask and --pin-* unsaid: check features, or
+                                           that the answer echoes both, before you rely on the pin
   pool release [LEASE|TICKET] [--ask TOKEN]
                                            Release a slot you hold (pool:<host>/<kind>-<n>) or give up a queue place
                                            (pool-queue:<kind>-<n>); a slot also ends with its TTL (default 60m, at
