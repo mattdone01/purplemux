@@ -328,7 +328,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     });
 
     describe('a remote tab\'s window scales with its host\'s remote.timeout-ms (review r1 F2)', () => {
-      const remoteTab = (): ITab => ({ ...tabWith('idle'), host: 'agent-exec-v2' });
+      const remoteTab = (): ITab => ({ ...tabWith('idle'), host: 'host-a' });
 
       const windowMs = async (): Promise<{ body: unknown; ms: number }> => {
         live.hookOnSubmit = false;
@@ -356,7 +356,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
       });
 
       it('waits 30 s for a 15 s host budget, the host key over the fleet key', async () => {
-        fleet.values = { 'remote.timeout-ms': '5000', 'remote.timeout-ms.agent-exec-v2': '15000' };
+        fleet.values = { 'remote.timeout-ms': '5000', 'remote.timeout-ms.host-a': '15000' };
 
         const { ms } = await windowMs();
 

@@ -404,7 +404,7 @@ const runRemote = async (opts: {
   const at = <T,>(list: T[], index: number): T => list[Math.min(index, list.length - 1)];
   const result = await awaitSendReadiness(
     {
-      findTarget: async () => ({ sessionName: SESSION, cliState: 'idle', panelType: 'claude-code', ...(opts.host === undefined ? { host: 'agent-exec-v2' } : opts.host ? { host: opts.host } : {}) }),
+      findTarget: async () => ({ sessionName: SESSION, cliState: 'idle', panelType: 'claude-code', ...(opts.host === undefined ? { host: 'host-a' } : opts.host ? { host: opts.host } : {}) }),
       hasSession: async () => true,
       readScreen: async () => {
         const index = captures++;
