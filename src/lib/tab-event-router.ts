@@ -1,4 +1,5 @@
 import { nanoid } from 'nanoid';
+import { type CoordinatorWindow, isWindowExempt } from '@/lib/coordinator-window';
 import { createLogger } from '@/lib/logger';
 import { NUDGE_PREFIX } from '@/lib/orchestration';
 import type { TabEventsTable } from '@/lib/tab-events-store';
@@ -45,6 +46,8 @@ export interface ITabEventRoute {
    * paste, together with the settle window, so it never follows another delivery into the turn it started.
    */
   whenReady?: () => boolean;
+  /** A `turn-marker`'s end lines: a coordinator's window lets a BLOCKED or NEEDS-DECISION verdict through (F6). */
+  markerLines?: readonly string[];
 }
 
 export interface ITabEventRouteResult {
@@ -80,6 +83,12 @@ export interface ITabEventRouterDeps {
    * recorded undelivered and typed by `releaseHeldUrgent`.
    */
   holdUrgent?: (tabId: string) => boolean;
+  /**
+   * F6 change 3: the coordinator window. For the workspace's enabled orchestrator, an urgent event that does not skip
+   * the window is held as a digest row, and a digest goes out only when the window is open and the digest has waited
+   * longer than the tab's oldest inbox item. Absent: every tab keeps the rules above (tests, a server without it).
+   */
+  window?: () => CoordinatorWindow | null;
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -205,12 +214,17 @@ export class TabEventRouter {
     let seq: number;
     let cls: TWakeClass;
     let duplicate: boolean;
+    // F6: a coordinator's urgent event waits for its window unless its kind skips it; reclassified before the
+    // duplicate check, so a repeat inside the window is logged like any held copy (design ruling, change 4).
+    const windowed = event.class === 'urgent' && !isWindowExempt(event.kind, event.markerLines)
+      && await this.governedBy(event.workspaceId, event.tabId) !== null;
+    const routed = windowed ? 'digest' : event.class;
     try {
       // Urgent kinds keep only the episode filter: an identical end line after a fix round is a new decision
       // (consult ruling 2). A copy is a duplicate only while the earlier one still waits (review r2, F3).
-      duplicate = event.class !== 'urgent'
+      duplicate = routed !== 'urgent'
         && table.hasSame(event.workspaceId, event.tabId, event.kind, event.text, now - DUPLICATE_WINDOW_MS);
-      cls = duplicate ? 'log' : event.class;
+      cls = duplicate ? 'log' : routed;
       seq = table.append({ ...event, class: cls, at: now });
     } catch (err) {
       log.warn(`tab event for ${event.tabId} not written; delivering at once: ${err instanceof Error ? err.message : err}`);
@@ -270,6 +284,18 @@ export class TabEventRouter {
     return this.deps.table().list(workspaceId, { since: 0, limit, sourced: true }).filter((row) => !this.inFlight.has(row.seq));
   }
 
+  /** The coordinator window that governs the tab, or null: a worker, or no window wired. */
+  private async governedBy(workspaceId: string, tabId: string): Promise<CoordinatorWindow | null> {
+    const window = this.deps.window?.() ?? null;
+    if (!window) return null;
+    try {
+      return (await window.governs(workspaceId, tabId)) ? window : null;
+    } catch (err) {
+      log.warn(`coordinator check for ${tabId} failed; its events keep their class: ${err instanceof Error ? err.message : err}`);
+      return null;
+    }
+  }
+
   /** Send the tab its digest when one is due and the tab is at its prompt; true when one went out. */
   async flush(workspaceId: string, tabId: string): Promise<boolean> {
     const key = `${workspaceId}/${tabId}`;
@@ -281,13 +307,21 @@ export class TabEventRouter {
       const pending = table.pending(workspaceId, tabId).filter((event) => !this.unrecorded.has(event.seq));
       if (!pending.length) return false;
       const now = this.deps.now();
+      const window = await this.governedBy(workspaceId, tabId);
+      // A coordinator: its window, and the oldest of the digest and its first inbox item goes first (F6 ruling 3).
+      // Its 20-event bypass is gone: the window is the one bound. Any other tab keeps the 15-min interval.
       const last = table.lastDigestAt(workspaceId, tabId);
-      const due = pending.length >= DIGEST_MAX_WAITING || last === null || now - last >= DIGEST_INTERVAL_MS;
+      const due = window
+        ? window.isOpen(workspaceId, tabId) && window.digestTurn(workspaceId, tabId)
+        : pending.length >= DIGEST_MAX_WAITING || last === null || now - last >= DIGEST_INTERVAL_MS;
       if (!due || this.deps.holdDigest?.(tabId) || !this.deps.atPrompt(tabId) || !this.settled(table, workspaceId, tabId)) return false;
       const message = renderDigest(pending, workspaceId, tabId);
+      // Re-read in the dispatch lock: an inbox item may have taken the window since the check above.
       const delivered = await this.paste(workspaceId, tabId, message,
-        () => !this.deps.holdDigest?.(tabId) && this.deps.atPrompt(tabId) && this.settled(table, workspaceId, tabId));
+        () => !this.deps.holdDigest?.(tabId) && this.deps.atPrompt(tabId) && this.settled(table, workspaceId, tabId)
+          && (!window || window.isOpen(workspaceId, tabId)));
       if (!delivered) return false;
+      window?.claim(workspaceId, tabId);
       const digestId = this.deps.newDigestId?.() ?? `dg-${nanoid(10)}`;
       this.markDelivered(table, pending.map((event) => event.seq), digestId);
       log.info({ workspaceId, tabId, digestId, events: pending.length, bytes: bytes(message) }, 'digest delivered');

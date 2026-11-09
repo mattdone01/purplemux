@@ -13,7 +13,6 @@ import {
   renderDigest,
   type ITabEventRoute,
 } from '@/lib/tab-event-router';
-import { classifyWake } from '@/lib/wake-class';
 import type { ITabEvent } from '@/types/tab-events';
 
 const T0 = Date.UTC(2026, 10, 3, 6, 0, 0);

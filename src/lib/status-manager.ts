@@ -72,6 +72,7 @@ import type { TabEventsTable } from '@/lib/tab-events-store';
 import type { TabTurnsTable } from '@/lib/tab-turns-store';
 import { TurnTracker, isActingTool } from '@/lib/turn-tracker';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
+import { WINDOWED_INBOX_KINDS, configureCoordinatorWindow, getCoordinatorWindow } from '@/lib/coordinator-window';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
 import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, restartRefusalOutcome, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
 import { DEFAULT_ROTATE_AT_TOKENS } from '@/lib/constraint';
@@ -309,6 +310,14 @@ interface INeedsDecisionResult {
   asker: { lineKey: string; notice: TNeedsDecisionAskerNotice; ifUnheard: boolean } | null;
 }
 
+/** The latest sign that the orchestrator took a turn: its last prompt-submit or stop, or its recorded turn end. */
+export const orchestratorTurnAt = (entry: Pick<ITabStatusEntry, 'lastEvent' | 'turnEnd'>): number | null => {
+  const event = entry.lastEvent && (entry.lastEvent.name === 'prompt-submit' || entry.lastEvent.name === 'stop') ? entry.lastEvent.at : null;
+  const ended = entry.turnEnd?.at ?? null;
+  if (event === null) return ended;
+  return ended === null ? event : Math.max(event, ended);
+};
+
 export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
   private orchestrationPendingLaunches = new Set<string>();
@@ -427,8 +436,19 @@ export class StatusManager {
     tabTurnTable: () => TabTurnsTable = () => getLedgerStore().tabTurns,
   ) {
     this.automatedPrompts = automatedPrompts;
+    // F6 change 3: one coordinator window, shared by this router and the inbox (getCoordinatorWindow).
+    configureCoordinatorWindow({
+      now: () => Date.now(),
+      isCoordinator: async (workspaceId, tabId) => {
+        const ws = await getWorkspaceByIdCached(workspaceId);
+        return !!ws?.orchestration?.enabled && ws.orchestration.orchestratorTabId === tabId;
+      },
+      lastGoverned: (workspaceId, tabId) => tabEventTable().lastGovernedDelivery(workspaceId, tabId, WINDOWED_INBOX_KINDS, Date.now()),
+      oldestDigestAt: (workspaceId, tabId) => tabEventTable().pending(workspaceId, tabId)[0]?.at ?? null,
+    });
     this.tabEvents = new TabEventRouter({
       table: tabEventTable,
+      window: getCoordinatorWindow,
       now: () => Date.now(),
       deliver: (workspaceId, tabId, message, whenReady) => this.deliverAutomatedPrompt(workspaceId, tabId, message, 'tab event', whenReady),
       atPrompt: (tabId) => this.isAtPrompt(tabId),
@@ -1778,6 +1798,13 @@ export class StatusManager {
         this.orchKeeper.set(ws.id, { ...state, idleSince: now });
         continue;
       }
+      // F6 ruling 6: a turn the polls never saw busy (a 20 s turn between two 60 s polls) still ends the idle episode.
+      // Without this, beats 2 and 3 are `log` rows nobody reads and beat 3 sends the owner a false stall alert.
+      const turnAt = orchestratorTurnAt(entry);
+      if (turnAt !== null && turnAt > Math.max(state.idleSince, state.lastBeatAt)) {
+        this.orchKeeper.set(ws.id, { idleSince: turnAt, beats: 0, lastBeatAt: 0, stallAlerted: false });
+        continue;
+      }
       if (now - state.idleSince < ORCH_IDLE_HEARTBEAT_MS || now - state.lastBeatAt < ORCH_IDLE_HEARTBEAT_MS) continue;
       if (state.beats >= ORCH_MAX_HEARTBEATS) continue;
 
@@ -2206,6 +2233,7 @@ export class StatusManager {
   ): Promise<IOrchestrationNudge> {
     const routed = await this.tabEvents.route({
       workspaceId, tabId: targetTabId, kind, text: message, class: classifyWake(kind, wake), sourceTabId: tabId, sourceTabName: tabName,
+      markerLines: wake.markerLines,
     });
     const nudge: IOrchestrationNudge = {
       id: routed.seq === null ? nanoid(8) : `te-${routed.seq}`,
