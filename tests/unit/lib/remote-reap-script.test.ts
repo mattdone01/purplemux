@@ -1,7 +1,7 @@
 import { execFile, execFileSync, spawn } from 'child_process';
 import { randomBytes } from 'crypto';
 import { promisify } from 'util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_PROVIDER_SCRIPT, REMOTE_REAP_SCRIPT, isTmuxAbsence, parseRemoteProviderObservation, parseRemoteReap } from '@/lib/remote-host';
 import { buildRemoteShellLaunchCommand } from '@/lib/shell-env';
 import fs from 'fs';
@@ -117,25 +117,45 @@ describe.skipIf(!supported)('remote reap script, run for real (ADR-0022 §9)', {
 
   it('finds claude run as a version-named binary under a shell: comm 2.1.319, argv0 claude (vel-D61, review r1 F4)', async () => {
     const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'pmux-versioned-'));
+    // A link named like a versioned build, to bash: the kernel names the process after the link, and bash keeps
+    // that name and runs whatever its argv0 says. Node renames its main thread (comm "MainThread"), and a
+    // multi-call coreutils `sleep` reads argv0 "claude" as a program name and exits (CI run 42579052178).
     const binary = pathMod.join(dir, '2.1.319');
-    fs.copyFileSync(execFileSync('sh', ['-c', 'command -v sleep']).toString().trim(), binary);
-    fs.chmodSync(binary, 0o755);
+    fs.symlinkSync(execFileSync('sh', ['-c', 'command -v bash']).toString().trim(), binary);
+    const procOf = (pid: string, file: string): string => {
+      try {
+        return fs.readFileSync(`/proc/${pid}/${file}`, 'utf-8');
+      } catch {
+        return '';
+      }
+    };
+    /** The pane's child named 2.1.319, once tmux and the pane are up; '' until then. */
+    const standIn = async (): Promise<string> => {
+      const shown = await run('tmux', ['-L', sock, 'display-message', '-p', '-t', `=${session}:`, '#{pane_pid}']).catch(() => null);
+      const panePid = shown?.stdout.trim();
+      if (!panePid) return '';
+      const children = procOf(panePid, `task/${panePid}/children`).trim().split(/\s+/).filter(Boolean);
+      return children.find((pid) => procOf(pid, 'comm').trim() === '2.1.319') ?? '';
+    };
     try {
-      // The pane's root is the shell and its foreground is not `claude`: only the descendant walk can find it.
+      // The pane's root is the shell and its foreground is not `claude`: only the descendant walk can find it. The
+      // stand-in runs until the test kills it, and the pane outlives it, so the session never ends on its own.
       await run('tmux', ['-L', sock, '-f', '/dev/null', 'new-session', '-d', '-s', session, '-x', '80', '-y', '24',
-        `bash -c 'exec -a claude "$0" 300' '${binary}' & wait`]);
-      await sleep(300);
-      const { stdout: panePid } = await run('tmux', ['-L', sock, 'display-message', '-p', '-t', `=${session}:`, '#{pane_pid}']);
-      const child = fs.readFileSync(`/proc/${panePid.trim()}/task/${panePid.trim()}/children`, 'utf-8').trim().split(/\s+/)[0];
-      expect(fs.readFileSync(`/proc/${child}/comm`, 'utf-8').trim()).toBe('2.1.319');
-      expect(fs.readFileSync(`/proc/${child}/cmdline`, 'utf-8').split('\0')[0]).toBe('claude');
+        `bash -c 'exec -a claude "$0" -c "while :; do sleep 1; done"' '${binary}' & wait; exec sleep 600`]);
+      let child = '';
+      await vi.waitFor(async () => {
+        child = await standIn();
+        expect(child).not.toBe('');
+      }, { timeout: 10_000, interval: 50 });
+      expect(procOf(child, 'comm').trim()).toBe('2.1.319');
+      expect(procOf(child, 'cmdline').split('\0')[0]).toBe('claude');
 
       const found = parseRemoteProviderObservation(await runScript([sock, session, 'claude'], REMOTE_PROVIDER_SCRIPT));
       expect(found).toMatchObject({ state: 'present', pid: child });
       process.kill(Number(child), 'SIGKILL');
-      await sleep(200);
+      await vi.waitFor(async () => expect(await standIn()).toBe(''), { timeout: 10_000, interval: 50 });
       const gone = parseRemoteProviderObservation(await runScript([sock, session, 'claude'], REMOTE_PROVIDER_SCRIPT));
-      expect(gone.state).toBe('absent');
+      expect(gone).toEqual({ state: 'absent', reason: 'no claude process in the pane' });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
