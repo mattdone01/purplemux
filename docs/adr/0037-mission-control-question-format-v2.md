@@ -259,22 +259,27 @@ A recurrence the owner raised. Two things went missing from Mission Control:
 
 **Owner steps are lint, not a refusal.**
 - **What is read:** every attention.opened and attention.updated of a kind=question, in its `context`, `decision`, `whyNow` and the options' `label`, `consequence` and `description`. Code blocks are dropped, since they hold quoted text.
-- **What counts as a step:**
-  - **An owner verb that starts a sentence, a line, a list item or a comma clause** ("In the billing page, click Upgrade"), after a connective such as "then" or "after that", followed by what makes it a command. Examples: "Click Approve", "Paste it into", "Open the", "Go to Settings", "Sign in to", "Run this", "Run the following", "Press Enter", "Add the", "Merge the", "Restart the".
-  - **Or a phrase that addresses the owner's steps:** "Your steps", "Steps:", "please <do>" (a third party too: "Please ask the vendor to ...", "please cancel it"), "you'll need to <do>", "you must <do>", "need you to <do>", "steps from you", "you <do>" at the start of a clause, after a numbered marker, a short label or a connective, in a sentence that does not ask ("A one-off: you run the script"), and a message for an outside party ("Paste this to the vendor's desk:").
+- **What counts as a step (round 6):** a clause that asks the owner to act outside his answer.
+  - **An imperative** at the start of a sentence, a line, a numbered item, a comma or slash clause, or after a short label ("Your one click: open the run page"), followed by what makes it a command: "Click Approve", "Paste it into", "Open the", "open Environments", "Go to Settings", "Sign in to", "Run the", "Press Squash and merge", "Add the", "Set can_admins_bypass to false".
+  - **"you <present verb>" at the start of a clause** ("A one-off: you run the script", "Or you sign in with a role", "If you choose (b), you put the key in"), and **"only you <verb>"** ("which only you can edit").
+  - **A phrase that addresses the owner's steps:** "Your steps", "Steps:", "please <do>" (a third party too: "Please ask the vendor to ..."), "you'll need to <do>", "you must <do>", "need you to <do>", "steps from you", and a message for an outside party ("Paste this to the vendor's desk:").
 - **What does not count:**
-  - A sentence that ends with "?", whole: a question, not a step ("Run this migration tonight, or wait?").
-  - An imperative in `decision` or in an option `label`. Both name the choice ("Select the rollout path", "Merge the PR now"), so there only the phrases count.
-  - How the owner answers: "Reply with ...", "Type the names in the text box", "Tick ...", "Tap Done", "Pick an option". The answer is that action.
-  - "you <do>" or "please <do>" that does not ask the owner to act (round 5): a sentence with a date or a past marker ("On 21 Oct, you set ..."), a relative clause ("the list you accept"), a condition or a wait ("until you accept", "before you answer"), "that you ..." ("record that you accept"), and a request for information ("Please tell us whether ...", "please check whether ...").
-  - A lettered item ("(a) add a calendar"): an option of the decision. Only numbered items are list steps.
-  - What the agent does: a sentence after "Fix:" or "Plan:", the list items under a "Fix:" or "Plan:" heading line, a sentence whose subject is we, I, the agent or a role and whose verb is a step ("We add the label"), and a list of what a grant lets the agent do ("The role lets the agent read the secret, open a tunnel").
+  - A question: a sentence that ends with "?".
+  - An imperative in `decision` or in an option `label`: both name the choice ("Select the rollout path", "Merge the PR now"), so there only the phrases count.
+  - A lettered item ("(b) add a calendar"): an option of the decision. An imperative there is a step only on the owner's own object ("(a) Add your role as an operator").
+  - A past reference: a date or a past marker ("On 21 Oct, you set ..."), or "you" with a past verb ("you wrote", "you ruled", "you asked").
+  - "you" that is not at a clause start: a relative clause ("the list you accept"), a condition or a wait ("until you accept", "before you answer"), "that you ..." ("record that you accept").
+  - A request for information: "Please tell us whether ...", "please check whether ...".
+  - An answer instruction: "Reply with ...", "Type the names in the text box", "Tick ...", "Pick an option".
+  - An agent plan: a sentence after "Fix:", "Plan:" or "Recommended:", the items under a "Fix:" or "Plan:" heading line, a sentence led by "I <verb>" that does not turn to the owner, "we <step>" or "we recommend", a role with a step verb ("The role may read the password, open a tunnel"), and a "lets the agent ..." capability list.
   - A verb that is also a noun without its command form: "Run time", "Open question", "Copy of", "Press coverage", "Press on", "Open to", "Go to production", "Sign-in rates", a capitalised heading such as "Press Coverage:".
 - **The finding** names the steps, the fields they were found in, and the split. Each owner step becomes its own kind=action item (answerType `action-done`, humanNeed `external-action`), and the question keeps to the decision.
 - **The fixture set:** the patterns are tuned on `tests/fixtures/mission-questions/owner-steps.json`.
   - Its positives are the owner-step forms.
   - Its negatives include every false positive the reviews named.
   - Round 4 (PR #60) added one case per shape from a run over the real store (1332 items, 37 hits, about 21 true): the two false-positive shapes above and five miss shapes ("you <do>" mid-sentence, "please <do>" on a third party, a paste-to-a-party message inside a line, a step in an option label, "steps from you"). Round 5 added one negative case per remaining false-positive shape: "you <verb>" or "please <verb>" that is not an instruction (precision was about 66 % at round 4, 94 hits).
+  - Round 5 added one negative per "you <verb>" shape that is not an instruction. It was worse on the real store (63 hits, precision about 57 %, and real steps dropped): tuned on descriptions, measured on items the tuner cannot see.
+  - Round 6 adds a measurable target: a `labelled` table of 24 owner-step and 24 non-step context sentences, paraphrased from real shapes. The test reports recall and the clean share of negatives; the target is at least 22 of 24 on each side, and every other case still passes. If round 6 does not beat round 4 on the real store, the lint goes back to round 4's rules.
   - Every case is neutral synthetic text modelled on the shapes of real items. The repository is public, so no real Mission Control text goes in, not even with names stripped. The lint is measured over the real items on the control host, outside the repository; only the counts and the shapes it got wrong come back as new synthetic cases.
   - No served question fixture (`mc-question-v2`) is flagged.
 - **A heuristic, so it never refuses.** A pattern cannot tell every step from a description of one, and a refused question would hide the decision too. A kind=action item is not read: it is the step.

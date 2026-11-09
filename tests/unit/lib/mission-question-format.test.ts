@@ -355,6 +355,20 @@ describe('ownerStepsLint (vel-MC-ACT)', () => {
     expect(flagged).toEqual([]);
   });
 
+  // PR #60 r6: a measurable target. One context sentence per case; misses and false hits are named in the failure.
+  const table = (set as unknown as { labelled: { positive: string[]; negative: string[] } }).labelled;
+  const hit = (sentence: string) => ownerStepsLint({ kind: 'question', context: sentence }).length > 0;
+  const missed = table.positive.filter((sentence) => !hit(sentence));
+  const falseHits = table.negative.filter(hit);
+  const recall = `${table.positive.length - missed.length}/${table.positive.length}`;
+  const clean = `${table.negative.length - falseHits.length}/${table.negative.length}`;
+  it(`labelled table: recall ${recall}, negatives clean ${clean} (target 22/24 each)`, () => {
+    expect(table.positive).toHaveLength(24);
+    expect(table.negative).toHaveLength(24);
+    expect(table.positive.length - missed.length, `missed: ${JSON.stringify(missed)}`).toBeGreaterThanOrEqual(22);
+    expect(table.negative.length - falseHits.length, `false hits: ${JSON.stringify(falseHits)}`).toBeGreaterThanOrEqual(22);
+  });
+
   it('a kind=action is not read: it is the step', () => {
     expect(ownerStepsLint({ kind: 'action', context: 'Click Approve. Paste the token into the secret.' })).toEqual([]);
   });

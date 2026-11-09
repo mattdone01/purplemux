@@ -1,5 +1,5 @@
 {
-  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named. r4 (PR #60): shapes from a counts-and-shapes-only run over the real store; how the owner answers and what the agent does are not owner steps, and an option label is read for owner-addressed phrases only. r5: 'you <verb>' and 'please <verb>' that do not ask the owner to act (a past reference, a relative clause, a condition or a wait, a request for information, a decision restated as an option) are not owner steps.",
+  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named. r4 (PR #60): shapes from a counts-and-shapes-only run over the real store; how the owner answers and what the agent does are not owner steps, and an option label is read for owner-addressed phrases only. r5: 'you <verb>' and 'please <verb>' that do not ask the owner to act (a past reference, a relative clause, a condition or a wait, a request for information, a decision restated as an option) are not owner steps. r6: the labelled table is the measurable target (recall and clean negatives, at least 22 of 24 each); the rule is an imperative or a clause-initial 'you <present verb>' that is not in a past, relative, conditional, information-request, answer or agent-plan sentence.",
   "positive": [
     {
       "name": "paste into",
@@ -313,6 +313,16 @@
       "expect": [
         "'steps from you'"
       ]
+    },
+    {
+      "name": "r6 guard: an 'I' sentence that turns to the owner",
+      "question": {
+        "kind": "question",
+        "context": "I have the signed file ready, please upload it to the shared drive before noon."
+      },
+      "expect": [
+        "'please <do>'"
+      ]
     }
   ],
   "negative": [
@@ -600,6 +610,75 @@
           }
         ]
       }
+    },
+    {
+      "name": "r6 guard: a past-verb sentence with a 'you <verb>' clause",
+      "question": {
+        "kind": "question",
+        "context": "You asked whether the cap applies, and you set it to 2,000 then. Keep the cap for the next quarter?"
+      }
+    },
+    {
+      "name": "r6 guard: an agent plan led by 'I'",
+      "question": {
+        "kind": "question",
+        "context": "I open the PR, then merge the branch after CI is green. Ship it today or on Monday?"
+      }
     }
-  ]
+  ],
+  "labelled": {
+    "about": "PR #60 r6: a labelled table of single context sentences, paraphrased from shapes measured in a real Mission Control store (no item text, names, hosts or accounts). positive: an owner step outside the answer; negative: a decision, a past reference, an agent step or an answer instruction. The test reports recall and the clean share of negatives; the target is at least 22 of 24 on each side.",
+    "positive": [
+      "Your one click: open the deployment run page and press Review deployments, then Approve.",
+      "One grant line is needed in your network policy file, and only you edit that file.",
+      "Or you sign in with a role that already has the permission and run the step yourself.",
+      "Step 1, now, before you answer: in the repository settings, open Environments and add yourself as the reviewer.",
+      "(a) Yes: I merge the pull request / you merge it.",
+      "(a) Add your developer sign-in role as an operator of the cluster.",
+      "A one-off: you run the fetch script with your own sign-in profile, then sign out.",
+      "If you choose (b), you put the key into the secret store yourself after you sign in.",
+      "Please ask the payments team to check the bank statements for both days and to record the duplicate.",
+      "Please delete the old block from the shared config file, or tell us it moved elsewhere.",
+      "Paste to the partner contact: Hi, could you please re-send the settlement callbacks for the two batches?",
+      "Copy the new token into the vault entry, then approve it as the organisation owner.",
+      "Run the two disk-usage lines and reply with their output.",
+      "If the provider asks for test credit, add it in their portal.",
+      "Copy the state file you hold to the shared path on the control host.",
+      "Open your sign-in window at about 22:30 tonight so the job can start.",
+      "Your steps: 1. Open the run. 2. Review the plan. 3. Approve the apply.",
+      "Tap Done, with the outputs in the text box, after step 1.",
+      "Set can_admins_bypass to false on each gated environment.",
+      "The change needs one line in the access policy, which only you can edit; I send you the exact line.",
+      "Before the reload, you rotate the database password in the console.",
+      "Press Squash and merge on the pull request and keep the title.",
+      "Upload the signed file to the shared drive so the reconciliation can read it.",
+      "Grant the reader role to the service account in the identity console."
+    ],
+    "negative": [
+      "On 21 Oct you set the per-transfer cap to 2,000.",
+      "On 23 Oct you wrote: \"Ideally we use workflows with federated identity\".",
+      "You ruled that a paid payout whose matched cash differs is held.",
+      "You asked whether a second server would bring things on quicker.",
+      "As you answered, the limit is 100 per business day.",
+      "It is not part of the push you set on 26 Oct.",
+      "Only records on the list you accept count as done.",
+      "A ceiling you set limits it; type another figure if you want.",
+      "Under your rule they count as not done until you accept the empty state.",
+      "These older limits still stand until you say otherwise.",
+      "Please tell us whether the bank books its fee as a separate line.",
+      "Please confirm whether the batch total cap applies in production.",
+      "(b) Record that you accept the header-asserted identity while the guard is in shadow.",
+      "Reply with the start and end time in the free-text box.",
+      "Reply with a target date, or 'not yet'.",
+      "Type the names for Q2 and Q3 in the text box.",
+      "Fix: split the suspense reason, add the new label, and add a counter for it.",
+      "We recommend No: keep the old cut, and add a test that proves it stays harmless.",
+      "I re-point the migration to the chain head and open the PR.",
+      "The role may read the app password, open a tunnel to the database, and restart the worker.",
+      "Every deploy then ends with a pass or fail you can read in the workflow page.",
+      "Should I run this migration now?",
+      "Raising a lane's budget needs your click.",
+      "The click-through rate on the page fell by 4 %."
+    ]
+  }
 }
