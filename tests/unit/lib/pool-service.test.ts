@@ -437,7 +437,7 @@ describe('the pool view (AC 7)', () => {
 
 describe('readPoolPaths (vel-RETRO-R2)', () => {
   const path = (rttMs: number, kind: 'relayed' | 'direct' | 'unknown') => ({
-    kind, alias: 'exec-1', address: 'exec-1.tailnet.example', ip: 'fd7a:115c:a1e0::9', peer: 'exec-1', region: kind === 'relayed' ? 'sin' : null,
+    kind, alias: 'exec-1', address: 'exec-1.tailnet.example', ip: 'fd7a:115c:a1e0::2', peer: 'exec-1', region: kind === 'relayed' ? 'sin' : null,
     rttMs, measuredAt: Date.parse('2026-11-09T05:00:00Z'), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
     relayedReads: kind === 'relayed' ? 2 : 0,
   });

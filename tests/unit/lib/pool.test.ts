@@ -515,7 +515,7 @@ describe('tab starts the read cannot show yet (review r1 F6)', () => {
 describe('the host view serves the tailnet path (vel-RETRO-R2)', () => {
   const relayedRead = (host: string, rttMs: number, kind: 'relayed' | 'direct' = 'relayed'): TPoolHostRead => ({
     ...known(host, false, { threads: 64, memTotalBytes: 373 * GIB }),
-    path: { kind, alias: host, address: `${host}.tailnet.example`, ip: 'fd7a:115c:a1e0::9', peer: host, region: kind === 'relayed' ? 'sin' : null, rttMs, measuredAt: NOW, reason: null, relayedReads: kind === 'relayed' ? 2 : 0 },
+    path: { kind, alias: host, address: `${host}.tailnet.example`, ip: 'fd7a:115c:a1e0::2', peer: host, region: kind === 'relayed' ? 'sin' : null, rttMs, measuredAt: NOW, reason: null, relayedReads: kind === 'relayed' ? 2 : 0 },
   });
 
   it('serves a relayed path with its alert, and this host none', () => {

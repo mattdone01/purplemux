@@ -229,7 +229,7 @@ describe('PoolReader measures the tailnet path (vel-RETRO-R2)', () => {
   let measured: string[];
   let measure: (alias: string) => Promise<IPoolPathRead>;
   const relayed = (alias: string): IPoolPathRead => ({
-    kind: 'relayed', alias, address: `${alias}.tailnet.example`, ip: 'fd7a:115c:a1e0::9', peer: alias, region: 'sin', rttMs: 1170, measuredAt: now, reason: null, relayedReads: 1,
+    kind: 'relayed', alias, address: `${alias}.tailnet.example`, ip: 'fd7a:115c:a1e0::2', peer: alias, region: 'sin', rttMs: 1170, measuredAt: now, reason: null, relayedReads: 1,
   });
   const reader = (withPath = true) => new PoolReader({
     now: () => now,
@@ -357,6 +357,34 @@ describe('PoolReader measures the tailnet path (vel-RETRO-R2)', () => {
       expect((await r.snapshot())[1]).toMatchObject({ path: { kind: 'direct' } });
     });
 
+    it('forgets the measurements of a host that leaves the pool, the fallback alias included', async () => {
+      measure = async (alias) => direct(alias);
+      let hosts = ['exec-1'];
+      const r = new PoolReader({
+        now: () => now,
+        localName: () => 'control-host',
+        remoteHosts: async () => hosts,
+        fallbackOf: async () => 'exec-1-ts',
+        runRemote: (async (alias: string) => {
+          if (alias === 'exec-1' && measured.length > 0) throw sshFailure('Connection timed out');
+          return AI_SERVER;
+        }) as never,
+        readLocal: async () => LOCAL,
+        measurePath: async (alias: string) => { measured.push(alias); return measure(alias); },
+      });
+      await r.refresh();
+      now += POOL_READ_INTERVAL_MS;
+      await r.refresh();
+      expect(measured).toEqual(['exec-1', 'exec-1-ts']);
+      hosts = [];
+      now += POOL_READ_INTERVAL_MS;
+      await r.refresh();
+      hosts = ['exec-1'];
+      now += POOL_READ_INTERVAL_MS;
+      await r.refresh();
+      expect(measured).toEqual(['exec-1', 'exec-1-ts', 'exec-1-ts']);
+    });
+
     it('caches per alias: the fallback alias is measured on its own', async () => {
       measure = async (alias) => direct(alias);
       const r = reader();
@@ -396,13 +424,13 @@ describe('defaultTailnetPathDeps.ping (vel-RETRO-R2)', () => {
   });
 
   it('keeps the pong of a run that exits 1 after a DERP pong (measured 2026-11-09)', async () => {
-    fakeTailscale('pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(syd) in 147ms\ndirect connection not established\n', 1);
-    await expect(defaultTailnetPathDeps().ping('fd7a:115c:a1e0::5e2c')).resolves.toContain('via DERP(syd) in 147ms');
+    fakeTailscale('pong from control-host (2001:db8::1) via DERP(syd) in 147ms\ndirect connection not established\n', 1);
+    await expect(defaultTailnetPathDeps().ping('fd7a:115c:a1e0::1')).resolves.toContain('via DERP(syd) in 147ms');
   });
 
   it('throws when tailscale is not installed', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-tailscale-'));
     process.env.PATH = dir;
-    await expect(defaultTailnetPathDeps().ping('fd7a:115c:a1e0::5e2c')).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(defaultTailnetPathDeps().ping('fd7a:115c:a1e0::1')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

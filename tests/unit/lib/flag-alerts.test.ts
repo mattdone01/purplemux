@@ -860,7 +860,7 @@ describe('pool path flags (vel-RETRO-R2)', () => {
     return {
       host,
       path: {
-        kind, alert, alias: host, address: `${host}.tailnet.example`, ip: 'fd7a:115c:a1e0::9', peer: host, region: kind === 'relayed' ? 'sin' : null,
+        kind, alert, alias: host, address: `${host}.tailnet.example`, ip: 'fd7a:115c:a1e0::2', peer: host, region: kind === 'relayed' ? 'sin' : null,
         rttMs, relayedReads: kind === 'relayed' ? 2 : 0, slowMs, measuredAt: new Date(T0).toISOString(), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
       },
       text: alert === 'tailnet-relayed' ? `${host} tailnet path relayed via DERP(sin), RTT ${rttMs} ms` : alert ? `${host} tailnet path slow: RTT ${rttMs} ms (threshold ${slowMs} ms)` : null,

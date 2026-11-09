@@ -22,21 +22,21 @@ import type { IPoolPathRead } from '@/types/pool';
 const T0 = 1_800_000_000_000;
 
 /** Measured from host-a on 2026-11-09 05:13Z; the command exited 1. */
-const DERP_PONG = 'pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(syd) in 147ms\ndirect connection not established\n';
-const DERP_SIN = 'pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(sin) in 1.17s\ndirect connection not established\n';
-const DIRECT_PONG = 'pong from host-b (fd7a:115c:a1e0::23) via 198.51.100.155:41641 in 3ms\n';
-const PEER_RELAY_PONG = 'pong from exec-2 (fd7a:115c:a1e0::19) via peer-relay(192.0.2.5:7777:vni:12) in 41ms\n';
+const DERP_PONG = 'pong from control-host (2001:db8::1) via DERP(syd) in 147ms\ndirect connection not established\n';
+const DERP_SIN = 'pong from control-host (2001:db8::1) via DERP(sin) in 1.17s\ndirect connection not established\n';
+const DIRECT_PONG = 'pong from host-b (2001:db8::2) via 198.51.100.155:41641 in 3ms\n';
+const PEER_RELAY_PONG = 'pong from exec-2 (2001:db8::3) via peer-relay(192.0.2.5:7777:vni:12) in 41ms\n';
 
 const deps = (over: Partial<ITailnetPathDeps> = {}): ITailnetPathDeps => ({
   now: () => T0,
   sshConfig: async (alias) => `user agent\nhostname ${alias}.tailnet.example\nport 22\n`,
-  resolve: async () => ['fd7a:115c:a1e0::5e2c'],
+  resolve: async () => ['fd7a:115c:a1e0::1'],
   ping: async () => DERP_PONG,
   ...over,
 });
 
 const read = (over: Partial<IPoolPathRead> = {}): IPoolPathRead => ({
-  kind: 'direct', alias: 'exec-1', address: 'exec-1', ip: 'fd7a:115c:a1e0::9', peer: 'exec-1', region: null, rttMs: 4, measuredAt: T0, reason: null, relayedReads: 0, ...over,
+  kind: 'direct', alias: 'exec-1', address: 'exec-1', ip: 'fd7a:115c:a1e0::2', peer: 'exec-1', region: null, rttMs: 4, measuredAt: T0, reason: null, relayedReads: 0, ...over,
 });
 
 describe('parseSshHostname', () => {
@@ -55,9 +55,9 @@ const dotted = (...octets: number[]): string => octets.join('.');
 
 describe('isTailnetIp and isIpLiteral', () => {
   it.each([
-    [dotted(100, 64, 0, 1), true], [dotted(100, 127, 255, 254), true], ['fd7a:115c:a1e0::5e2c', true],
+    [dotted(100, 64, 0, 1), true], [dotted(100, 127, 255, 254), true], ['fd7a:115c:a1e0::1', true],
     [dotted(100, 63, 255, 255), false], [dotted(100, 128, 0, 1), false], ['198.51.100.155', false], ['192.0.2.1', false],
-    ['fd7a:115c:a1e0::c737:2c73', true], ['fd7a:115c:a1e1::1', false], ['::1', false], ['host-b-lan', false],
+    ['fd7a:115c:a1e0::3', true], ['fd7a:115c:a1e1::1', false], ['::1', false], ['host-b-lan', false],
   ])('%s → %s', (ip, expected) => {
     expect(isTailnetIp(ip)).toBe(expected);
   });
@@ -115,7 +115,7 @@ describe('parseTailscalePing', () => {
   it('measures an unrecognised path token as unknown with its reason', async () => {
     const path = await measureTailnetPath(deps({ ping: async () => 'pong from a (100.1.2.3) via relay:192.0.2.5:7777 in 5ms\n' }), 'exec-1');
 
-    expect(path).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::5e2c: unrecognised path "via relay:192.0.2.5:7777"' });
+    expect(path).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::1: unrecognised path "via relay:192.0.2.5:7777"' });
     expect(pathAlert(path, 250)).toBeNull();
   });
 
@@ -125,8 +125,8 @@ describe('parseTailscalePing', () => {
   });
 
   it('never reads a pong line with an unreadable duration as a measurement', () => {
-    expect(parseTailscalePing('pong from x (fd7a:115c:a1e0::1) via DERP(sin) in soon\n')).toEqual({
-      ok: false, reason: 'pong from x (fd7a:115c:a1e0::1) via DERP(sin) in soon',
+    expect(parseTailscalePing('pong from x (2001:db8::4) via DERP(sin) in soon\n')).toEqual({
+      ok: false, reason: 'pong from x (2001:db8::4) via DERP(sin) in soon',
     });
   });
 });
@@ -137,10 +137,10 @@ describe('measureTailnetPath', () => {
     const path = await measureTailnetPath(deps({ ping: async (ip) => { pinged.push(ip); return DERP_SIN; } }), 'exec-1');
 
     expect(path).toEqual({
-      kind: 'relayed', alias: 'exec-1', address: 'exec-1.tailnet.example', ip: 'fd7a:115c:a1e0::5e2c', peer: 'control-host',
+      kind: 'relayed', alias: 'exec-1', address: 'exec-1.tailnet.example', ip: 'fd7a:115c:a1e0::1', peer: 'control-host',
       region: 'sin', rttMs: 1170, measuredAt: T0, reason: null, relayedReads: 1,
     });
-    expect(pinged).toEqual(['fd7a:115c:a1e0::5e2c']);
+    expect(pinged).toEqual(['fd7a:115c:a1e0::1']);
   });
 
   it('measures a direct host', async () => {
@@ -161,9 +161,9 @@ describe('measureTailnetPath', () => {
   });
 
   it('takes the tailnet address of a name that resolves to several', async () => {
-    const path = await measureTailnetPath(deps({ resolve: async () => ['198.51.100.6', 'fd7a:115c:a1e0::5e2c'] }), 'control-host');
+    const path = await measureTailnetPath(deps({ resolve: async () => ['198.51.100.6', 'fd7a:115c:a1e0::1'] }), 'control-host');
 
-    expect(path).toMatchObject({ kind: 'relayed', ip: 'fd7a:115c:a1e0::5e2c' });
+    expect(path).toMatchObject({ kind: 'relayed', ip: 'fd7a:115c:a1e0::1' });
   });
 
   it('reads every failure as unknown with its reason, never as direct', async () => {
@@ -176,8 +176,8 @@ describe('measureTailnetPath', () => {
     expect(sshFails).toMatchObject({ kind: 'unknown', reason: 'ssh -G failed: ssh: bad option' });
     expect(noHost).toMatchObject({ kind: 'unknown', reason: 'ssh -G printed no hostname' });
     expect(noResolve).toMatchObject({ kind: 'unknown', reason: 'x.tailnet.example does not resolve: ENOTFOUND x' });
-    expect(noPong).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::5e2c: timeout waiting for ping reply' });
-    expect(noTailscale).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::5e2c: tailscale is not installed on this host' });
+    expect(noPong).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::1: timeout waiting for ping reply' });
+    expect(noTailscale).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::1: tailscale is not installed on this host' });
   });
 });
 
@@ -211,7 +211,7 @@ describe('ageTailnetPath, pathView and pathAlertText', () => {
 
   it('serves the alert, the threshold and the time', () => {
     expect(pathView(read({ kind: 'relayed', region: 'sin', rttMs: 1170, relayedReads: 2 }), DEFAULT_POOL_PATH_SLOW_MS)).toEqual({
-      kind: 'relayed', alert: 'tailnet-relayed', alias: 'exec-1', address: 'exec-1', ip: 'fd7a:115c:a1e0::9', peer: 'exec-1',
+      kind: 'relayed', alert: 'tailnet-relayed', alias: 'exec-1', address: 'exec-1', ip: 'fd7a:115c:a1e0::2', peer: 'exec-1',
       region: 'sin', rttMs: 1170, relayedReads: 2, slowMs: 250, measuredAt: new Date(T0).toISOString(), reason: null,
     });
   });

@@ -184,6 +184,8 @@ export class PoolReader {
 
   /** The last measurement of each alias (review r1 L6): it stands for its TTL, so a host is not pinged every read. */
   private readonly paths = new Map<string, IPoolPathRead>();
+  /** The pool host each measured alias was read for, so a host that leaves the pool takes its aliases along. */
+  private readonly pathHosts = new Map<string, string>();
 
   /**
    * The path of the alias the read went through, else the host's own; a measurement that throws is `unknown`. It runs
@@ -202,6 +204,7 @@ export class PoolReader {
     }));
     const path = followTailnetPath(previous, measured);
     this.paths.set(alias, path);
+    this.pathHosts.set(alias, read.host);
     return { ...read, path };
   }
 
@@ -236,6 +239,11 @@ export class PoolReader {
       try {
         const hosts = await this.deps.remoteHosts();
         for (const known of [...this.reads.keys()]) if (!hosts.includes(known)) this.reads.delete(known);
+        for (const [alias, host] of [...this.pathHosts]) {
+          if (hosts.includes(host)) continue;
+          this.paths.delete(alias);
+          this.pathHosts.delete(alias);
+        }
         const now = this.deps.now();
         await Promise.all(hosts.map(async (host) => {
           const prev = this.reads.get(host);

@@ -2,9 +2,9 @@
 
 ## Problem
 Retro 2026-11-09 row R2: the new exec hosts reached control-host only through a DERP relay for hours (RTT about 1 s, ssh
-18-25 s), and no tool noticed. HFL measured both exec hosts DERP-relayed (`sin`), RTT 0.85-1.17 s. Measured again from
+18-25 s), and no tool noticed. The orchestrator measured both exec hosts DERP-relayed (`sin`), RTT 0.85-1.17 s. Measured again from
 `host-a` at 2026-11-09 05:13Z: `tailscale ping -c 1 control-host` printed
-`pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(syd) in 147ms` and `direct connection not established` (exit 1);
+`pong from control-host (2001:db8::1) via DERP(syd) in 147ms` and `direct connection not established` (exit 1);
 `tailscale status --json` showed the peer `Relay: "syd"`, `CurAddr: ""`.
 
 The owner keeps the hosts. The pool must not refuse a host for its path; it reports the path.
@@ -68,15 +68,15 @@ Options:
 
 RULING: **Option 1, changed in three ways.** The flag key does not include the manager workspace. Delivery is a tab line only. A host raises one rule at a time.
 
-- **Source and rules.** `source: 'pool'`; add `'pool'` to `TAlertFlagSource`. Rules are `tailnet-relayed` and `tailnet-slow`, and the subject is the host. Each host raises at most one rule per tick, and `relayed` wins over `slow`. The key is `pool:fleet:<rule>:<host>`, so the workspace part is the fixed `fleet`. A key that included the manager workspace would change on every Scrum Master reselection, which would clear and re-raise every standing path flag outside the repeat window.
-- **Read sources.** `pool:<host>` is both the raise source and the clear source. It counts as read when that host's path is `relayed`, `slow`, `direct` or `not-tailnet`. It counts as failed when the path is `unknown` or the cached pool read is older than `POOL_READ_STALE_MS` (90 s). The flag tick reads the cached pool view and never measures. `pruneFlagSources` drops `pool:<host>` for a host that a good pool view no longer lists. The per-source baseline in §4 applies unchanged.
+- **Source and rules.** `source: 'pool'`; add `'pool'` to `TAlertFlagSource`. Rules are `tailnet-relayed` and `tailnet-slow`, and the subject is the host. Each host raises at most one rule per tick, and `relayed` wins over `slow`. The key is `pool:fleet:tailnet-path:<host>` (`poolFlagKey`), one per host whatever the rule (amended by review r1 L4; the consult answered `pool:fleet:<rule>:<host>`), so the workspace part is the fixed `fleet`. A key that included the manager workspace would change on every Scrum Master reselection, which would clear and re-raise every standing path flag outside the repeat window.
+- **Read sources.** `pool:<host>` is both the raise source and the clear source. It counts as read when that host's path is `relayed`, `slow`, `direct` or `not-tailnet`. It counts as failed when the path is `unknown` or the cached pool read is older than `POOL_READ_STALE_MS` (90 s). The flag tick reads the cached pool view and never measures. `pruneFlagSources` drops `pool:<host>` for a host that a good pool view no longer lists. The per-source baseline in §4 does not hold back a pool flag (amended by review r1 M1; the consult kept it): a host already relayed at its first read alerts once, inside the repeat window.
 - **Target, resolved at send time.** It comes from `getPortfolioStore().currentSelection()`.
   - No selection: not sent, reason `no-scrum-master`.
   - Otherwise, call `flagAlertTarget({...flag, workspaceId: managerWorkspaceId, tabId: null}, managerWorkspace, view)`. If the orchestrator that comes back is not `managerTabId`, the reason is `scrum-master-not-current`.
   - Every no-target case logs `flag-alert-no-target` and leaves the flag on the fleet panel and the pool view, as §5 does.
   - The cases §5 treats as unknown stay pending and are retried with `flag-alert-target-unknown`.
 - **Delivery.** `routeTabEvent` to that tab, with kind `flag`, `classifyWake('flag', {severity: 'warn'})` (a digest line) and `rule` set. The text is `<host> tailnet path relayed via DERP(<region>), RTT <n> ms` or `<host> tailnet path slow: RTT <n> ms (threshold <slow-ms>)`. Nothing is dispatched to the phone, because under SO-10 the Scrum Master decides what reaches the owner. A line the router accepts marks the flag alerted. A refusal calls `deferFlagRaise`.
-- **Repeat.** As §3: the flag alerts when it is raised, and a re-raise inside `alerts.flag-repeat-minutes` sends nothing. A standing flag does not repeat; the board shows it. This keeps a flapping DERP/direct path to one line per window per rule and host.
+- **Repeat.** As §3: the flag alerts when it is raised, and a re-raise inside `alerts.flag-repeat-minutes` sends nothing. A standing flag does not repeat; the board shows it. This keeps a flapping DERP/direct path to one line per window per host, whatever the rule (amended by review r1 L4; the consult said per rule and host).
 - **Rejected.** Option 2 sends N copies of one fact and goes around SO-10's single seat. Option 3 skips the seat altogether.
 - **Docs.** Record this as an ADR-0032 amendment for §5, source `pool`.
 
