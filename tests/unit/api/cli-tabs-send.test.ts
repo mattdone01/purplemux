@@ -54,6 +54,12 @@ vi.mock('@/lib/agent-dispatch-policy', () => ({
     target: ITab,
     work: (checkPolicy: (options?: unknown) => Promise<unknown>) => Promise<unknown>,
   ) => work((options) => dispatchPolicy(workspaceId, target, options)),
+  withAgentDispatchThen: async (
+    workspaceId: string,
+    target: ITab,
+    work: (checkPolicy: (options?: unknown) => Promise<unknown>) => Promise<unknown>,
+    after: (typed: unknown) => Promise<unknown>,
+  ) => after(await work((options) => dispatchPolicy(workspaceId, target, options))),
 }));
 
 const fleet = vi.hoisted(() => ({ values: {} as Record<string, string>, unreadable: false }));

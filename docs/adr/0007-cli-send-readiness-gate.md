@@ -43,7 +43,13 @@ Ruling and options: `docs/design/vel-retro-r3-send-confirm.md`.
    remote capture runs is proof, also past the deadline. A remote window scales with the host's `remote.timeout-ms`
    (vel-D61, read only if set; at most 60 s), and a remote screen gate waits at least two ssh budgets, so one
    capture that runs the whole budget and fails is never the answer. The send reads its baseline before it types:
-   with no status entry it refuses (409 `submit-unconfirmed`, `typed: false`) and types nothing. Every typing path
-   (the inbox and automated dispatchers, steer, restart, both send routes) takes the same per-tab dispatch lock,
-   so no other dispatch's turn lands in the window. Known limit: keys a person types into the pane itself take no
-   lock, and the hook carries no text to tell that turn from the send's.
+   with no status entry it refuses (409 `submit-unconfirmed`, `typed: false`) and types nothing. Every dispatch
+   (the inbox and automated dispatchers, steer, restart, both send routes) takes the tab's send gate
+   (`send-proof-gate.ts`) before its dispatch lock, so no other dispatch's turn lands in the window. Known limit:
+   keys a person types into the pane itself take no gate, and the hook carries no text to tell that turn from the
+   send's.
+6. CONFIRM r2 (2026-11-09). The send types inside the dispatch lock and waits for its proof outside it, inside the
+   send gate only (`withAgentDispatchThen`). A live Codex hook is applied inside `withCodexTargetLock` for its tab,
+   and a Codex orchestrator's hooks inside its own: a proof wait under those locks locked out the proof itself, so
+   every submitted send to a local Codex tab answered `submit-unconfirmed`. No hook takes the gate. The baseline is
+   still read inside the lock, before the typing.

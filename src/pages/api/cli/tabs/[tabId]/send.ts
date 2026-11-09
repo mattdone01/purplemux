@@ -10,10 +10,10 @@ import {
 } from '@/lib/tab-send';
 import { capturePaneContent, hasSessionOrUnreachable, isContentPendingInComposer, isPaneShowingPendingLine, pressEnter } from '@/lib/tmux';
 import { readComposerScreen } from '@/lib/composer-readiness';
-import { confirmSubmission, type TSubmitResult } from '@/lib/send-confirmation';
+import { confirmSubmission, type ISubmitConfirmRequest, type TSubmitResult } from '@/lib/send-confirmation';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
-import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
+import { withAgentDispatchThen } from '@/lib/agent-dispatch-policy';
 import { TAB_NOT_FOUND_BODY, remoteHostUnreachableBody, targetChangedBody } from '@/lib/cli-error';
 import { RemoteHostError } from '@/lib/remote-host';
 import { classifyWake, mayHoldTabSend } from '@/lib/wake-class';
@@ -53,6 +53,12 @@ const remoteTimeoutMs = async (host: string): Promise<number> => {
 /** `submit` is null for a tab with no turn to prove (a terminal or browser tab). */
 interface IDelivered {
   submit: TSubmitResult | null;
+}
+
+/** What the locked part hands the proof wait: the text is typed, and the baseline was read before it. */
+interface ITyped {
+  sessionName: string;
+  request: ISubmitConfirmRequest | null;
 }
 
 /**
@@ -181,7 +187,9 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!current || current.tab.sessionName !== readiness.target.sessionName) {
     return res.status(409).json(targetChangedBody(tabId));
   }
-  const delivered = await withAgentDispatchLock(workspaceId, current.tab, async (checkPolicy): Promise<IDelivered | null> => {
+  // The typing runs inside the dispatch lock; the proof wait runs after it, inside the tab's send gate only
+  // (CONFIRM r2): a Codex hook applies inside the same lock, so a wait under it would lock out its own proof.
+  const delivered = await withAgentDispatchThen(workspaceId, current.tab, async (checkPolicy): Promise<ITyped | null> => {
     const latest = await findTab(workspaceId, tabId);
     if (!latest || latest.tab.sessionName !== readiness.target.sessionName) {
       res.status(409).json(targetChangedBody(tabId));
@@ -205,10 +213,11 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     const { sessionName, panelType, host } = latest.tab;
     if (!isAgentPanelType(panelType)) {
       await deliverPrompt(sessionName, content);
-      return { submit: null };
+      return { sessionName, request: null };
     }
-    // Inside the lock, which every typing path takes (the inbox and automated dispatchers, steer, restart and the
-    // cookie route): no other dispatch types into this composer, or starts its turn, while this send proves its own.
+    // Inside the lock and the send gate, which every dispatch takes first (the inbox and automated dispatchers,
+    // steer, restart and the cookie route): no other dispatch types into this composer, or starts its turn, until
+    // this send has its proof or its deadline.
     const baseline = getStatusManager().getSubmitEvidence(tabId);
     // Read before the typing (review r1 F4): text the send cannot prove is never typed.
     if (!baseline) {
@@ -217,14 +226,9 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     }
     const remoteBudgetMs = host ? await remoteTimeoutMs(host) : undefined;
     await deliverPrompt(sessionName, content);
-    const submit = await confirmSubmission(
-      {
-        readEvidence: () => getStatusManager().getSubmitEvidence(tabId),
-        capture: () => capturePaneContent(sessionName, { escapes: true }),
-        isPendingLine: isPaneShowingPendingLine,
-        pressEnter: () => pressEnter(sessionName),
-      },
-      {
+    return {
+      sessionName,
+      request: {
         panelType,
         remote: !!host,
         content,
@@ -232,6 +236,19 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
         screenEmptyAtGate: readiness.screenEmpty,
         ...(remoteBudgetMs !== undefined ? { remoteTimeoutMs: remoteBudgetMs } : {}),
       },
+    };
+  }, async (typed): Promise<IDelivered | null> => {
+    if (!typed) return null;
+    if (!typed.request) return { submit: null };
+    const { sessionName } = typed;
+    const submit = await confirmSubmission(
+      {
+        readEvidence: () => getStatusManager().getSubmitEvidence(tabId),
+        capture: () => capturePaneContent(sessionName, { escapes: true }),
+        isPendingLine: isPaneShowingPendingLine,
+        pressEnter: () => pressEnter(sessionName),
+      },
+      typed.request,
     );
     return { submit };
   });

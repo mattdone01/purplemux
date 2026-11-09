@@ -187,14 +187,18 @@ describe('actual orchestration PATCH and dispatch share the mapping lease', () =
     const writerAttempted = attemptedWriter();
     const remapping = call(orchestration, { enabled: true, orchestratorTabId: 'crown-b', expectedRevision: 0, mode: 'recover' }, 'PATCH');
     await writerAttempted;
-    const readerAttempted = deferred();
-    const read = mapping.withOrchestrationMappingRead;
-    vi.spyOn(mapping, 'withOrchestrationMappingRead').mockImplementation((workspaceId, work) => {
-      readerAttempted.resolve();
-      return read(workspaceId, work);
+    // The later dispatch waits at the tab's send gate, which every dispatch takes before the mapping read
+    // (vel-RETRO-R3 CONFIRM r2), so it reaches the mapping only behind the PATCH already waiting there.
+    const gateAttempted = deferred();
+    const gate = await import('@/lib/send-proof-gate');
+    const enter = gate.withSendProofGate;
+    vi.spyOn(gate, 'withSendProofGate').mockImplementation((workspaceId, tabId, work) => {
+      gateAttempted.resolve();
+      return enter(workspaceId, tabId, work);
     });
     const second = deliver('automated');
-    await readerAttempted.promise;
+    await gateAttempted.promise;
+    expect(mocks.paste).toHaveBeenCalledOnce();
     release.resolve();
     expect(await first).toMatchObject({ status: 200 });
     expect(await remapping).toMatchObject({ status: 200 });

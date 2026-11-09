@@ -113,4 +113,24 @@ Add one ADR-0016 exit-1 row for each code; `cli-exit-codes-doc` enforces this. E
 | F3 acceptance send exits 1 | `checks-effects.cjs` posts the stand-in's `prompt-submit` when the typed line reaches it, while the send waits. No other in-repo caller sends to an agent tab (`checks.cjs` and `checks-wave4.cjs` send to terminal tabs). | acceptance wave 13 |
 | F4 typed before the baseline check | The baseline is read before the typing; with none the send answers 409 `submit-unconfirmed`, `typed: false`, and types nothing. The CLI exits 1 and says nothing was typed. | `cli-tabs-send.test.ts`, `cli-exit-codes.test.ts` |
 | F5 `maintenance.sh` labels | `maintenance.sh` lives in the library (<repo>). The CLI side pins its labels: 0 sent, 4 gone, 5 and 6 retried, an unproven send exit 1 (`failed:exit-1`, never retried). The library's `test_maintenance.py` fake (rc 0 with `submitted: false`) is a library follow-up. | `cli-exit-codes.test.ts` "match the labels of a caller that retries" |
-| F6 another dispatch's hook as proof | `hook-dispatch.ts` only records hooks. Every typing path takes `withAgentDispatchLock` for the tab: the inbox dispatcher (`inbox-dispatcher.ts` `attempt`), the automated prompt dispatcher, steer, restart and the cookie send route (`withCodexTargetLock`). The send proves inside that lock, so no other dispatch types or submits during its window. No nonce: the Claude hook body the server keeps carries no prompt text. Known limit: a person typing into the pane itself. | `cli-tabs-send-inbox-lock.test.ts`: the real lock, a concurrent inbox submit waits until the send answered |
+| F6 another dispatch's hook as proof | `hook-dispatch.ts` only records hooks. Every dispatch takes the tab's send gate before its dispatch lock: `withAgentDispatchLock` (the inbox dispatcher's `attempt`, the automated prompt dispatcher, steer, restart) and the cookie send route. The send proves inside that gate, so no other dispatch types or submits during its window. (r1 proved inside the dispatch lock; CONFIRM r2 below moved the wait to the gate.) No nonce: the Claude hook body the server keeps carries no prompt text. Known limit: a person typing into the pane itself. | `cli-tabs-send-inbox-lock.test.ts`: the real lock, a concurrent inbox submit waits until the send answered |
+
+## CONFIRM r2 (xhigh, CONCERN) and the fix
+
+**Concern.** A live Codex hook is applied inside `withCodexTargetLock` for its tab (`withValidatedCodexHookGeneration`,
+`withValidatedLegacyCodexHook`). The r1 F6 fix waited for the proof inside the dispatch lock, which holds that same lock
+and the orchestrator tab's. So the `prompt-submit` hook of a local Codex tab could not apply until the window ended,
+and every submitted send answered `submit-unconfirmed` and exited 1. A Codex orchestrator's hooks waited out every
+send's window in its workspace.
+
+**Fix.** `send-proof-gate.ts` adds a per-tab send gate. `withAgentDispatchLock` takes the target's gate before the
+mapping read and the tab locks, and the cookie send route takes it before its target lock. The CLI send uses
+`withAgentDispatchThen`: it reads the baseline and types inside the gate and the locks, releases the locks, and waits for
+the proof inside the gate only. No hook and no lifecycle step takes the gate, so the Codex hooks of the target and of the
+orchestrator apply during the window, and every other dispatch still waits. The order is always gate, then lock.
+
+**Test.** `cli-tabs-send-codex-hook.test.ts` posts the Codex `UserPromptSubmit` hook through the real `dispatchHook`,
+`handleCodexHook`, `withValidatedLegacyCodexHook` and `withCodexTargetLock` while the send runs. The send answers
+`submitted: true`, and a Codex orchestrator's hook applies before the send answers. With the r2 send route, both tests
+fail at the 5 s window.
+

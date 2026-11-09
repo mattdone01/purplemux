@@ -508,6 +508,8 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   scaled by the host's remote.timeout-ms / 5000 when it is set, at most 60 s). The hook is read again
   after every capture, so one that lands during a slow remote capture still counts. A remote tab's
   screen gate waits at least two of the host's ssh budgets, so one slow capture is never the answer.
+  The send waits for its proof outside the tab's dispatch lock, so the agent's hooks apply, and inside
+  the tab's send gate, so no other dispatch types into the tab until the send answers.
   confirmation "composer-empty" counts only for a tab with no prompt-submit hook. Text still in the
   composer at 1.5 s gets ONE more Enter (resubmitted: true). Without proof, submitted is false and
   notSubmitted names why: typed-not-submitted (the text is still in the composer) or
