@@ -203,6 +203,11 @@ makes the host unknown for 30 s: it shows no figures, never 0, takes nothing new
 leases. A read older than 90 s is unknown too. A host that answered only through its fallback
 alias shows its figures and "via", but "placeable" is false and "reason" says
 "answers only through <fallback>; <alias> failed (...)": it takes nothing new.
+Each read also measures the tailnet path to the alias that answered (else the host's own),
+from this host (vel-RETRO-R2): \`ssh -G\` names the address, a lookup gives the IP, and a
+tailnet IP (100.64.0.0/10, fd7a:115c:a1e0::/48) gets one \`tailscale ping -c 1 --timeout 2s\`.
+Placement reads none of it: a relayed or slow host takes work as before, and the fleet view and
+one flag alert to the portfolio Scrum Master seat report it.
 
 GET /api/cli/pool   (any valid scope)
   \`purplemux pool show [--json]\`. The board's pool section reads the same model.
@@ -210,7 +215,11 @@ GET /api/cli/pool   (any valid scope)
   "unknownHosts", "slots": { <kind>: { "used", "cap", "free" } } }, "hosts": [{   (totals' "free"
   counts placeable hosts only; "used" and "cap" count every known host)
   "host", "local", "state": "known"|"unknown", "placeable", "readAt", "via", "reason", "loadPerThread",
-  "agentTabs", "slots", "budget": null | { "threads", "memBytes", "reserveThreads", "reserveMemBytes",
+  "agentTabs", "slots", "path": null | { "kind": "direct"|"relayed"|"not-tailnet"|"unknown", "alert":
+  null|"tailnet-relayed"|"tailnet-slow", "alias", "address", "ip", "peer", "region", "rttMs", "slowMs",
+  "measuredAt", "reason" } (null for this host and a host not measured yet; "not-tailnet" is an alias
+  that dials outside the tailnet, such as ai-lan; "unknown" is no pong or a measurement over 90 s
+  old, never read as direct; relayed wins over slow), "budget": null | { "threads", "memBytes", "reserveThreads", "reserveMemBytes",
   "workerThreads", "workerMemBytes", "maxLoad", "harnessSharePct", "used": { "product"|"harness"|
   "control-plane": { "threads", "memBytes" } }, "free": { "threads", "memBytes" } }, "metrics": null | { "threads", "load1", "load5", "memTotalBytes",
   "memAvailableBytes", "disks": [{ "path", "usedPct", "freeBytes" }], "gpus": null | [{ "index",
@@ -1000,6 +1009,9 @@ Keys in use:
   pool.harness-share-pct
                The share of each worker budget harness work may hold (vel-D4), a whole percent
                0..100. Unset means 25. Admin token only.
+  pool.path.slow-ms
+               A direct tailnet path whose RTT is at or above this is "tailnet-slow" (vel-RETRO-R2),
+               whole milliseconds 1..60000. Unset means 250. Reported, never a refusal. Admin token only.
   pool.mode
                shadow or enforce (vel-D4 review r1), checked when written. Unset, and a stored
                value that is neither, mean shadow: the budget (no-budget), measured-memory

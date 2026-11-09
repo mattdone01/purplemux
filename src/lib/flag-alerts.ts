@@ -13,6 +13,7 @@ import { classifyWake } from '@/lib/wake-class';
 import type { IFinderResult } from '@/types/constraint';
 import type { IFleetRow, IFleetView } from '@/types/fleet-status';
 import type { IFlowRecord, IFlowThresholds } from '@/types/flow';
+import type { IPortfolioSelection } from '@/types/portfolio';
 import type { IAlertFlag, TAlertProviderId } from '@/types/status';
 import type { IWorkspace } from '@/types/terminal';
 
@@ -48,7 +49,13 @@ export const FLAG_SOURCES = {
   flow: (workspaceId: string) => `flow:${workspaceId}`,
   ledger: (workspaceId: string) => `ledger:${workspaceId}`,
   ledgerSubject: (workspaceId: string, id: string, subject: string) => `ledger:${workspaceId}/${id}/${subject}`,
+  /** The pool paths the fleet view carries (vel-RETRO-R2), and one host's path among them. */
+  pool: 'pool',
+  poolHost: (host: string) => `pool:${host}`,
 } as const;
+
+/** A pool flag belongs to no workspace: its key keeps this fixed part, so a Scrum Master reselection re-raises nothing. */
+export const POOL_FLAG_WORKSPACE = 'fleet';
 
 /** A finder answer older than two ticks is not a read (`FINDER_STALE_MS`). */
 export const LEDGER_STALE_MS = FINDER_STALE_MS;
@@ -135,6 +142,7 @@ const fleetFailures = (view: IFleetView): Set<string> => {
     if (error.workspaceId !== undefined) failed.add(FLAG_SOURCES.layout(error.workspaceId));
     else if (error.scope === 'SM inbox') failed.add(FLAG_SOURCES.smInbox);
     else if (error.scope === 'watches' || error.scope === 'jobs') failed.add(FLAG_SOURCES.waits);
+    else if (error.scope === 'pool paths') failed.add(FLAG_SOURCES.pool);
     else if (!FLAG_NEUTRAL_SCOPES.has(error.scope)) failed.add(FLAG_SOURCES.fleetView);
   }
   return failed;
@@ -186,6 +194,31 @@ export const fleetFlagScan = (view: IFleetView | null, workspaces: Array<Pick<IW
     for (const source of [FLAG_SOURCES.smInbox, FLAG_SOURCES.waits]) if (!failed.has(source)) read.add(source);
     for (const w of workspaces) if (!failed.has(FLAG_SOURCES.layout(w.id))) read.add(FLAG_SOURCES.layout(w.id));
     for (const row of view.rows) if (row.state !== 'unknown') read.add(FLAG_SOURCES.tab(row.workspaceId, row.tabId));
+  }
+  return { flags, read, failed };
+};
+
+/**
+ * The tailnet path flags (vel-RETRO-R2): one per remote host whose path is relayed (`tailnet-relayed`, which wins) or
+ * slow (`tailnet-slow`). A host whose path is unknown, or not measured within the read's staleness, is an unread
+ * source: its flag neither raises nor clears. The fleet view carries the paths of the last pool read; no tick measures.
+ */
+export const poolFlagScan = (view: IFleetView | null): IFlagScan => {
+  if (!view?.poolPaths || fleetFailures(view).has(FLAG_SOURCES.pool)) return { flags: [], read: new Set(), failed: new Set([FLAG_SOURCES.pool]) };
+  const read = new Set<string>([FLAG_SOURCES.pool]);
+  const failed = new Set<string>();
+  const flags: IRaisedFlag[] = [];
+  for (const { host, path, text } of view.poolPaths) {
+    const source = FLAG_SOURCES.poolHost(host);
+    if (!path || path.kind === 'unknown') {
+      failed.add(source);
+      continue;
+    }
+    read.add(source);
+    if (!path.alert || !text) continue;
+    flags.push(raised({
+      source: 'pool', workspaceId: POOL_FLAG_WORKSPACE, rule: path.alert, subject: host, text, tabId: null, sources: [source], raiseSources: [source],
+    }));
   }
   return { flags, read, failed };
 };
@@ -312,6 +345,11 @@ export const pruneFlagSources = (state: IFlagAlertState, workspaces: Array<Pick<
     const parent = kind === 'tab' ? FLAG_SOURCES.layout(workspaceId) : kind === 'ledger' && rest ? FLAG_SOURCES.ledger(workspaceId) : null;
     if (!ids.has(workspaceId)) state.readSources.delete(source);
     else if (parent && scan.read.has(parent) && !scan.read.has(source) && !scan.failed.has(source)) state.readSources.delete(source);
+  }
+  // A host the pool no longer lists, while the pool paths read well.
+  if (!scan.read.has(FLAG_SOURCES.pool)) return;
+  for (const source of state.readSources) {
+    if (source.startsWith(`${FLAG_SOURCES.pool}:`) && !scan.read.has(source) && !scan.failed.has(source)) state.readSources.delete(source);
   }
 };
 
@@ -446,6 +484,8 @@ export interface IFlagAlertDeps {
   ledgerRouting: () => Promise<ILedgerRouting>;
   /** Hand an event to the tab event router (ADR-0035): urgent is typed at once, digest waits for the tab's digest. */
   routeTabEvent: (event: ITabEventRoute) => Promise<ITabEventRouteResult>;
+  /** The portfolio Scrum Master seat a pool flag goes to (SO-10); null with no selection; throws when unreadable. */
+  scrumMaster: () => Promise<IPortfolioSelection | null>;
   /** The copies of an alarm sent to a tab (`TabEventsTable.copies`); throws when the ledger cannot be read. */
   alarmCopies: (workspaceId: string, tabId: string, opening: string, since: number) => Promise<{ held: boolean; lastDeliveredAt: number | null }>;
 }
@@ -517,6 +557,7 @@ export const runFlagAlertTick = async (deps: IFlagAlertDeps, state: IFlagAlertSt
   const baseline = state.readSources.size === 0;
   const scan = mergeFlagScans(
     fleetFlagScan(view, workspaces), flowFlagScan(reads, thresholds, now), ledgerFlagScan(deps.finderResults(), workspaces, now, routing?.thresholds ?? null),
+    poolFlagScan(view),
   );
   const raises = stepFlagAlerts(state, scan, now, config.repeatMinutes * 60_000);
   pruneFlagSources(state, workspaces, scan);
@@ -527,6 +568,10 @@ export const runFlagAlertTick = async (deps: IFlagAlertDeps, state: IFlagAlertSt
     const workspace = byId.get(flag.workspaceId);
     if (flag.source === 'ledger') {
       await deliverLedgerRaise(ledger, flag, workspace);
+      continue;
+    }
+    if (flag.source === 'pool') {
+      await deliverPoolRaise(ledger, flag, byId);
       continue;
     }
     const target = flagAlertTarget(flag, workspace, view);
@@ -566,6 +611,60 @@ const dispatchFlag = async (
     log.warn(`flag alert dispatch failed for ${flag.key}: ${errorText(err)}`);
     return false;
   }
+};
+
+const noTarget = (result: IFlagAlertTickResult, flag: IRaisedFlag, workspaceId: string, reason: string): void => {
+  result.noTarget.push(flag.key);
+  log.warn({ key: flag.key, workspaceId, reason }, 'flag-alert-no-target');
+};
+
+const targetUnknown = (state: IFlagAlertState, result: IFlagAlertTickResult, flag: IRaisedFlag, workspaceId: string, reason: string): void => {
+  deferFlagRaise(state, flag.key);
+  result.targetUnknown.push(flag.key);
+  log.warn({ key: flag.key, workspaceId, reason }, 'flag-alert-target-unknown');
+};
+
+/**
+ * A pool flag (vel-RETRO-R2, consult ruling) goes to the portfolio Scrum Master seat as one digest line, and to no
+ * phone: under SO-10 that seat decides what reaches the owner. The seat is the manager workspace's enabled
+ * orchestrator, and it must be the selected manager tab. A raise the router refuses stays a raise for the next tick.
+ */
+const deliverPoolRaise = async (ledger: ILedgerDelivery, flag: IRaisedFlag, byId: ReadonlyMap<string, IWorkspace>): Promise<void> => {
+  const { deps, state, result, now } = ledger;
+  let seat: IPortfolioSelection | null;
+  try {
+    seat = await deps.scrumMaster();
+  } catch (err) {
+    targetUnknown(state, result, flag, flag.workspaceId, `scrum-master-unreadable: ${errorText(err)}`);
+    return;
+  }
+  if (!seat) {
+    noTarget(result, flag, flag.workspaceId, 'no-scrum-master');
+    return;
+  }
+  const target = flagAlertTarget({ ...flag, workspaceId: seat.managerWorkspaceId, tabId: null }, byId.get(seat.managerWorkspaceId), ledger.view);
+  if (!target.ok) {
+    if (target.unknown) targetUnknown(state, result, flag, seat.managerWorkspaceId, target.reason);
+    else noTarget(result, flag, seat.managerWorkspaceId, target.reason);
+    return;
+  }
+  if (target.row.tabId !== seat.managerTabId) {
+    noTarget(result, flag, seat.managerWorkspaceId, 'scrum-master-not-current');
+    return;
+  }
+  const event: ITabEventRoute = {
+    workspaceId: seat.managerWorkspaceId, tabId: target.row.tabId, kind: 'flag', text: flag.text,
+    class: classifyWake('flag', { severity: 'warn' }), rule: flag.rule,
+  };
+  try {
+    await deps.routeTabEvent(event);
+  } catch (err) {
+    log.warn(`pool flag ${flag.key} not routed to ${target.row.tabId}: ${errorText(err)}`);
+    deferFlagRaise(state, flag.key);
+    return;
+  }
+  result.routed.push(event);
+  markFlagAlerted(state, flag.key, now);
 };
 
 interface ILedgerDelivery {
@@ -719,6 +818,7 @@ const realDeps = (): IFlagAlertDeps => ({
     return routing;
   },
   routeTabEvent: async (event) => (await import('@/lib/status-manager')).getStatusManager().routeTabEvent(event),
+  scrumMaster: async () => (await import('@/lib/portfolio-store')).getPortfolioStore().currentSelection()?.selection ?? null,
   alarmCopies: async (workspaceId, tabId, opening, since) => (await import('@/lib/ledger-store')).getLedgerStore()
     .tabEvents.copies(workspaceId, tabId, 'alarm', opening, since),
 });

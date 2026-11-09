@@ -1,5 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { IPoolMetrics } from '@/types/pool';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { IPoolMetrics, IPoolPathRead } from '@/types/pool';
 
 vi.mock('@/lib/logger', () => {
   const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
@@ -7,7 +10,7 @@ vi.mock('@/lib/logger', () => {
 });
 
 const {
-  POOL_READ_INTERVAL_MS, POOL_READ_SCRIPT, POOL_READ_STALE_MS, POOL_READ_TIMEOUT_MS, PoolReader, parsePoolRead,
+  POOL_READ_INTERVAL_MS, POOL_READ_SCRIPT, POOL_READ_STALE_MS, POOL_READ_TIMEOUT_MS, PoolReader, defaultTailnetPathDeps, parsePoolRead,
 } = await import('@/lib/pool-read');
 
 // ADR-0039 §1. The ai-server output below is the live read of 2026-11-03T07:20Z
@@ -216,5 +219,104 @@ describe('PoolReader', () => {
       runRemote: runRemote as never, readLocal: async () => ({ error: 'host metrics are Linux only (this host is darwin)' }),
     });
     expect((await r.snapshot())[0]).toMatchObject({ host: 'mdserver1', state: 'unknown', reason: expect.stringContaining('Linux only') });
+  });
+});
+
+describe('PoolReader measures the tailnet path (vel-RETRO-R2)', () => {
+  let now: number;
+  let runRemote: ReturnType<typeof vi.fn>;
+  let measured: string[];
+  let measure: (alias: string) => Promise<IPoolPathRead>;
+  const relayed = (alias: string): IPoolPathRead => ({
+    kind: 'relayed', alias, address: `${alias}.ts.net`, ip: '100.64.0.9', peer: alias, region: 'sin', rttMs: 1170, measuredAt: now, reason: null,
+  });
+  const reader = (withPath = true) => new PoolReader({
+    now: () => now,
+    localName: () => 'mdserver1',
+    remoteHosts: async () => ['exec-1'],
+    fallbackOf: async () => 'exec-1-ts',
+    runRemote: runRemote as never,
+    readLocal: async () => LOCAL,
+    ...(withPath ? { measurePath: async (alias: string) => { measured.push(alias); return measure(alias); } } : {}),
+  });
+
+  beforeEach(() => {
+    now = Date.parse('2026-11-09T05:00:00Z');
+    runRemote = vi.fn(async () => AI_SERVER);
+    measured = [];
+    measure = async (alias) => relayed(alias);
+  });
+
+  it('measures the alias the read went through and keeps the path on the host read', async () => {
+    const r = reader();
+    await r.refresh();
+    expect(measured).toEqual(['exec-1']);
+    expect((await r.snapshot())[1]).toMatchObject({ state: 'known', path: { kind: 'relayed', alias: 'exec-1', region: 'sin', rttMs: 1170 } });
+  });
+
+  it('measures the fallback alias when only the fallback answered', async () => {
+    runRemote.mockImplementation(async (alias: string) => {
+      if (alias === 'exec-1') throw sshFailure('Connection timed out');
+      return AI_SERVER;
+    });
+    const r = reader();
+    await r.refresh();
+    expect(measured).toEqual(['exec-1-ts']);
+  });
+
+  it('measures a host that does not answer ssh: a relayed path is a likely cause', async () => {
+    runRemote.mockRejectedValue(sshFailure('Connection timed out during banner exchange'));
+    const r = reader();
+    await r.refresh();
+    expect((await r.snapshot())[1]).toMatchObject({ state: 'unknown', path: { kind: 'relayed', alias: 'exec-1' } });
+  });
+
+  it('reads a measurement that throws as unknown, never as direct', async () => {
+    measure = async () => { throw new Error('boom'); };
+    const r = reader();
+    await r.refresh();
+    expect((await r.snapshot())[1]).toMatchObject({ path: { kind: 'unknown', alias: 'exec-1', reason: 'boom', rttMs: null } });
+  });
+
+  it('serves a path older than the read staleness as unknown, with its age', async () => {
+    const r = reader();
+    await r.refresh();
+    now += POOL_READ_STALE_MS + 1_000;
+    expect((await r.snapshot())[1]).toMatchObject({ state: 'unknown', path: { kind: 'unknown', reason: 'last measured 91 s ago' } });
+  });
+
+  it('measures nothing without the dependency (older callers, tests)', async () => {
+    const r = reader(false);
+    await r.refresh();
+    expect((await r.snapshot())[1]).not.toHaveProperty('path');
+  });
+});
+
+describe('defaultTailnetPathDeps.ping (vel-RETRO-R2)', () => {
+  let dir: string;
+  const savedPath = process.env.PATH;
+
+  /** A `tailscale` on PATH that prints `stdout` and exits `code`. */
+  const fakeTailscale = (stdout: string, code: number): void => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-tailscale-'));
+    const bin = path.join(dir, 'tailscale');
+    fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s' '${stdout}'\nexit ${code}\n`, { mode: 0o755 });
+    process.env.PATH = `${dir}:${savedPath}`;
+  };
+
+  afterEach(() => {
+    process.env.PATH = savedPath;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps the pong of a run that exits 1 after a DERP pong (measured 2026-11-09)', async () => {
+    fakeTailscale('pong from mdserver1 (100.94.44.114) via DERP(syd) in 147ms\ndirect connection not established\n', 1);
+    await expect(defaultTailnetPathDeps().ping('100.94.44.114')).resolves.toContain('via DERP(syd) in 147ms');
+  });
+
+  it('throws when tailscale is not installed', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-tailscale-'));
+    process.env.PATH = dir;
+    await expect(defaultTailnetPathDeps().ping('100.94.44.114')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
