@@ -376,7 +376,10 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     const order = ['has-session', 'put ', 'if ! pmux_probe=$(', 'new-session', '@pmux-create', 'source-file'].map((word) => lines.findIndex((l) => l.includes(word)));
     expect(order.every((i) => i >= 0)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
-    expect(script).toContain(`'tmux' '-u' '-L' 'pmux-mdserver1' '-f' "$d/tmux.conf" 'new-session' '-d' '-s' '${REMOTE}' '-x' '120' '-y' '40' '-c' '/home/mdone/code/nomupay'`);
+    // The cwd is resolved on the host once, and tmux starts the pane in that same path (vel-PMX-FU).
+    const { remoteSocketName: socketName } = await import('@/lib/remote-host');
+    expect(script).toContain(`'tmux' '-u' '-L' '${socketName()}' '-f' "$d/tmux.conf" 'new-session' '-d' '-s' '${REMOTE}' '-x' '120' '-y' '40' '-c' "$pmux_cwd"`);
+    expect(lines.findIndex((l) => l.startsWith('pmux_cwd=$(cd -P -- '))).toBeLessThan(lines.findIndex((l) => l.startsWith('put ')));
     expect(script).toContain('PMUX_TAB_ID=');
     expect(script).toContain('http://mdserver1:8022');
     expect(script).not.toMatch(/PMUX_TOKEN|CLAUDE_CONFIG_DIR|GROK_HOME|\/\.purplemux\/workspaces/);
@@ -445,7 +448,7 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     const script = calls.list[0].input ?? '';
     const lines = script.trim().split('\n');
     const seedLine = lines.findIndex((l) => l.includes('trust-seed.py') && l.startsWith('if command -v python3'));
-    expect(lines[seedLine]).toBe(`if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '/home/mdone/code/purplemux/.worktrees/hfl2-05' '/home/mdone/code/purplemux' >/dev/null 2>&1 || :; fi`);
+    expect(lines[seedLine]).toBe(`if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" "$pmux_cwd" '${workspaceDirs.map.get('ws-r')![1]}' >/dev/null 2>&1 || :; fi`);
     const lastPut = lines.map((l, i) => (l.startsWith('put ') ? i : -1)).filter((i) => i >= 0).at(-1)!;
     const newSession = lines.findIndex((l) => l.includes('new-session'));
     expect(seedLine).toBeGreaterThan(lastPut);
@@ -462,20 +465,36 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     await createSession(REMOTE, 120, 40, '/srv/ws-one/sub', { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: '/srv/ws-one/sub/' });
     const seedLines = calls.list.map((call) => (call.input ?? '').split('\n').find((l) => l.startsWith('if command -v python3')));
     expect(seedLines).toEqual([
-      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/elsewhere/repo' '/srv/ws-one' '/srv/ws-two' >/dev/null 2>&1 || :; fi`,
-      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/ws-one/sub' '/srv/ws-one' >/dev/null 2>&1 || :; fi`,
+      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' "$pmux_cwd" '/srv/ws-one' '/srv/ws-two' >/dev/null 2>&1 || :; fi`,
+      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' "$pmux_cwd" '/srv/ws-one' >/dev/null 2>&1 || :; fi`,
     ]);
   });
 
-  it('the seed gets the cwd as tmux does, unresolved: "<link>/.." is resolved on the host, never here (review r2 CONFIRM)', async () => {
+  it('the cwd is resolved once on the host and the seed and tmux both get that result: "<link>/.." is never resolved here (CI on PR #59)', async () => {
     workspaceDirs.map.set('ws-r', ['/srv/ws-one']);
     const { createSession } = await import('@/lib/tmux');
     const cwd = '/srv/data/a/link/..';
     await createSession(REMOTE, 120, 40, cwd, { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: cwd });
     const script = calls.list[0].input ?? '';
-    expect(script.split('\n').find((l) => l.startsWith('if command -v python3'))).toBe(
-      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/data/a/link/..' '/srv/ws-one' >/dev/null 2>&1 || :; fi`);
+    const lines = script.split('\n');
+    expect(lines).toContain(`pmux_cwd=$(cd -P -- '/srv/data/a/link/..' 2>/dev/null && pwd -P) || pmux_cwd=''`);
+    expect(lines.find((l) => l.startsWith('if [ -z "$pmux_cwd" ]'))).toContain('exit 19');
+    expect(lines.find((l) => l.startsWith('if command -v python3'))).toBe(
+      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' "$pmux_cwd" '/srv/ws-one' >/dev/null 2>&1 || :; fi`);
+    expect(lines.find((l) => l.includes('new-session'))).toContain(`'-c' "$pmux_cwd"`);
     expect(script).not.toContain("'/srv/data/a'");
+  });
+
+  it('a workspace-default cwd the host lacks starts in its HOME; a named one that does not resolve refuses by name', async () => {
+    workspaceDirs.map.set('ws-r', ['/srv/ws-one']);
+    const { createSession } = await import('@/lib/tmux');
+    await createSession(REMOTE, 120, 40, '/srv/ws-one', { workspaceId: 'ws-r', tabId: 'tab-remote1' });
+    expect((calls.list[0].input ?? '').split('\n')).toContain('if [ -z "$pmux_cwd" ]; then pmux_cwd="$HOME"; fi');
+    replies.fn = (cmd) => (cmd === 'ssh' ? { code: 19, stderr: 'pmux: cwd /srv/gone is not a directory on this host' } : { stdout: '' });
+    const { RemoteCwdMissingError } = await import('@/lib/remote-kit');
+    const refused = await createSession(REMOTE, 120, 40, '/srv/gone', { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: '/srv/gone' }).catch((err: unknown) => err);
+    expect(refused).toBeInstanceOf(RemoteCwdMissingError);
+    expect((refused as Error).message).toMatch(/^\/srv\/gone is not a directory on /);
   });
 
   it('a cwd that is not the named one (the pane moved, or none was named) is not named', async () => {

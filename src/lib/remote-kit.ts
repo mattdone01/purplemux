@@ -498,12 +498,40 @@ export interface IRemoteTrustTarget {
  * The create script's pre-trust line: run only when python3 exists, every failure ignored, so a seed never
  * blocks a launch (story 05 AC 2). Runs after the kit files land and before the session starts.
  */
-export const remoteTrustSeedLine = (trust: IRemoteTrustTarget): string =>
+export const remoteTrustSeedLine = (trust: IRemoteTrustTarget, cwdExpression = shQuote(trust.cwd)): string =>
   `if command -v python3 >/dev/null 2>&1; then python3 "$d/${REMOTE_TRUST_SEED_RELATIVE}" ${[
-    ...(trust.named ? ['--named'] : []),
-    trust.cwd,
-    ...trust.workspaceDirectories,
-  ].map(shQuote).join(' ')} >/dev/null 2>&1 || :; fi`;
+    ...(trust.named ? [shQuote('--named')] : []),
+    cwdExpression,
+    ...trust.workspaceDirectories.map(shQuote),
+  ].join(' ')} >/dev/null 2>&1 || :; fi`;
+
+/** The create script exits with this when the cwd its creator named is not a directory on the host (vel-PMX-FU). */
+export const REMOTE_CWD_MISSING_EXIT = 19;
+
+/**
+ * A remote create refused because the cwd its creator named does not resolve to a directory on the host: the
+ * session would otherwise start somewhere else, and its pre-trust would name a folder the pane never runs in.
+ * Nothing was written and no session was started. 400 `cwd-missing`, as the route's own pre-check answers.
+ */
+export class RemoteCwdMissingError extends Error {
+  constructor(readonly host: string, readonly cwd: string) {
+    super(`${cwd} is not a directory on ${host}; create it there first (a remote worker uses its own checkout or worktree). No session was started`);
+    this.name = 'RemoteCwdMissingError';
+  }
+}
+
+/**
+ * The cwd resolved ON THE HOST, once, into `$pmux_cwd` (vel-PMX-FU, CI run on PR #59): the trust seed and tmux's
+ * `new-session -c` then get the same physical path, so they can never differ whatever tmux does with a symlink or a
+ * "..". A named cwd that does not resolve refuses the create (exit 19) before any file is written; the workspace
+ * default, a path on this server that a host often lacks, starts in the remote HOME, as tmux used to by itself.
+ */
+export const remoteCwdLines = (cwd: string, named: boolean): string[] => [
+  `pmux_cwd=$(cd -P -- ${shQuote(cwd)} 2>/dev/null && pwd -P) || pmux_cwd=''`,
+  named
+    ? `if [ -z "$pmux_cwd" ]; then printf '%s\\n' ${shQuote(`pmux: cwd ${cwd} is not a directory on this host`)} >&2; exit ${REMOTE_CWD_MISSING_EXIT}; fi`
+    : 'if [ -z "$pmux_cwd" ]; then pmux_cwd="$HOME"; fi',
+];
 
 // Story 12 AC 3: no script starts a pane, or answers for the kit, without a CLI that ran.
 const kitCliModules = (files: readonly IRemoteKitFile[], what: string): string[] => {
@@ -575,12 +603,14 @@ export const buildRemoteCreateScript = (opts: {
   const lines = [
     'set -e',
     remoteSessionExistsGuard(opts.session),
+    ...(opts.cwd ? remoteCwdLines(opts.cwd, !!opts.trust?.named) : []),
     ...kitWriteLines(opts.files, ['bin', 'tabs', 'hook-spool']),
     ...remoteKitProbeLines(cliModules),
-    ...(opts.trust ? [remoteTrustSeedLine(opts.trust)] : []),
+    ...(opts.trust ? [remoteTrustSeedLine(opts.trust, opts.cwd ? '"$pmux_cwd"' : undefined)] : []),
     [
       shQuote('tmux'), shQuote('-u'), shQuote('-L'), sock, shQuote('-f'), '"$d/tmux.conf"',
-      ...['new-session', '-d', '-s', opts.session, '-x', String(opts.cols), '-y', String(opts.rows), ...(opts.cwd ? ['-c', opts.cwd] : [])].map(shQuote),
+      ...['new-session', '-d', '-s', opts.session, '-x', String(opts.cols), '-y', String(opts.rows)].map(shQuote),
+      ...(opts.cwd ? [shQuote('-c'), '"$pmux_cwd"'] : []),
       shQuote(opts.launch),
       ...remoteTagArgs(opts.session, opts.nonce).map(shQuote),
     ].join(' '),

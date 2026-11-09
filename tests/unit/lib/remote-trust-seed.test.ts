@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { REMOTE_TRUST_SEED_RELATIVE, REMOTE_TRUST_SEED_SCRIPT, remoteTrustSeedLine } from '@/lib/remote-kit';
+import { REMOTE_TRUST_SEED_RELATIVE, REMOTE_TRUST_SEED_SCRIPT, remoteCwdLines, remoteTrustSeedLine } from '@/lib/remote-kit';
 
 // D14 (story 05 AC 2): the remote half of the pre-trust, run for real against a fake remote host: a
 // temporary HOME holding the remote user's ~/.claude.json, and the python3 a pool host has.
@@ -262,26 +262,43 @@ describe('the named cwd pre-trust (vel-PMX-FU)', () => {
   });
 
   const hasTmux = spawnSync('tmux', ['-V']).status === 0;
-  it.skipIf(!hasTmux)('the create script\'s seed line with a "<link>/.." cwd keys the host realpath, the directory tmux runs in (review r2 CONFIRM)', () => {
+  /** The create script's own cwd, seed and session lines, run for real: the kit's `$d`, a throwaway tmux socket. */
+  const runCreateFragment = (cwd: string, socket: string) => spawnSync('/bin/sh', ['-c', [
+    'set -e',
+    `d="${kit}"`,
+    ...remoteCwdLines(cwd, true),
+    remoteTrustSeedLine({ cwd, workspaceDirectories: [workspace], named: true }, '"$pmux_cwd"'),
+    `tmux -L ${socket} -f /dev/null new-session -d -s trust -c "$pmux_cwd" 'exec sleep 30'`,
+  ].join('\n')], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+
+  it.skipIf(!hasTmux)('"<link>/..": the pane folder, the trusted key and the host realpath are one path (CI on PR #59)', () => {
     const target = path.join(home, 'clones', 'deep', 'repo');
     fs.mkdirSync(target, { recursive: true });
     const holder = path.join(home, 'links');
     fs.mkdirSync(holder);
     fs.symlinkSync(target, path.join(holder, 'to-repo'));
     const cwd = `${holder}/to-repo/..`;
-    const line = remoteTrustSeedLine({ cwd, workspaceDirectories: [workspace], named: true });
-    execFileSync('/bin/sh', ['-c', `d="${kit}"\n${line}`], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
-    // Where the pane really runs: tmux's own `-c` (a chdir, which follows the link before the ".."), read back from tmux.
     const socket = `pmux-trust-${process.pid}-${Date.now()}`;
     let paneDirectory: string;
     try {
-      execFileSync('tmux', ['-L', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'trust', '-c', cwd, 'exec sleep 30']);
+      const run = runCreateFragment(cwd, socket);
+      expect(run.status, run.stderr).toBe(0);
       paneDirectory = execFileSync('tmux', ['-L', socket, 'display-message', '-p', '-t', '=trust:', '#{pane_current_path}'], { encoding: 'utf-8' }).trim();
     } finally {
       spawnSync('tmux', ['-L', socket, 'kill-server']);
     }
-    expect(paneDirectory).toBe(path.join(home, 'clones', 'deep'));
-    expect(Object.keys(projects())).toEqual([paneDirectory]);
+    // Node's realpath collapses ".." before it follows the link; the host's, like the kernel's chdir, follows it first.
+    const hostRealpath = execFileSync('python3', ['-c', 'import os, sys; print(os.path.realpath(sys.argv[1]))', cwd], { encoding: 'utf-8' }).trim();
+    expect(hostRealpath).toBe(path.join(home, 'clones', 'deep'));
+    expect(paneDirectory).toBe(hostRealpath);
+    expect(Object.keys(projects())).toEqual([hostRealpath]);
+  });
+
+  it('a named cwd that does not resolve refuses the create by name, exit 19, before the seed or tmux runs', () => {
+    const run = runCreateFragment(path.join(home, 'no-such-dir'), `pmux-trust-none-${process.pid}`);
+    expect(run.status).toBe(19);
+    expect(run.stderr).toContain(`pmux: cwd ${path.join(home, 'no-such-dir')} is not a directory on this host`);
+    expect(fs.existsSync(configFile())).toBe(false);
   });
 
   /**

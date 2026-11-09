@@ -41,6 +41,8 @@ import {
 } from '@/lib/remote-host';
 import {
   REMOTE_KIT_BROKEN_EXIT,
+  REMOTE_CWD_MISSING_EXIT,
+  RemoteCwdMissingError,
   RemoteKitBrokenError,
   buildRemoteCreateScript,
   buildRemoteKitProbeScript,
@@ -306,6 +308,8 @@ const createRemoteSession = async (
     await runSsh(host, cleanup, { timeoutMs: CMD_TIMEOUT }).catch(() => {});
     // The kit probe runs before new-session (story 12): no session and no agent started.
     if ((err as { code?: unknown }).code === REMOTE_KIT_BROKEN_EXIT) throw kitProbeFailure(host, err);
+    // The named cwd is resolved on the host before any file is written (vel-PMX-FU): nothing to clean up but the above.
+    if ((err as { code?: unknown }).code === REMOTE_CWD_MISSING_EXIT && cwd) throw new RemoteCwdMissingError(host, cwd);
     if (isSshFailure(err)) throw new RemoteHostError(host, `remote host ${host} did not answer over ssh (${describeRemoteFailure(err)})`);
     throw new Error(`remote session ${name} on ${host} was not created (${describeRemoteFailure(err)})`);
   }
