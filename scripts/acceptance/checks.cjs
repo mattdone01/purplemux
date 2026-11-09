@@ -265,7 +265,11 @@ class Instance {
       }
     }
 
-    const shell = await this.isolatedShellState(session);
+    // A caller that just ended a foreground process (C-c on a scratch stand-in) can reach here before the shell is back in
+    // the foreground; under host load that race refused a correct step. Poll, read-only, for the shell to settle; nothing
+    // is typed until it is proven.
+    let shell = await this.isolatedShellState(session);
+    if (!shell.ok) await within(SHELL_SETTLE_MS, async () => (shell = await this.isolatedShellState(session)).ok);
     const shellEvidence = this.persistFixtureObservation('shell-control', { sessionName: session, observation: shell });
     if (!shell.ok) return { rc: -1, out: '', err: `foreground shell not proven; evidence ${shellEvidence}`, shell };
 
@@ -916,6 +920,8 @@ const wave1 = async (inst, { bashGuard }) => {
 };
 
 /** Poll `probe` every POLL_MS until it returns a truthy value or `ms` passes. */
+/** How long a shell step waits for its tab's shell to return to the foreground before it refuses. */
+const SHELL_SETTLE_MS = 10000;
 const within = async (ms, probe) => {
   const deadline = Date.now() + ms;
   for (;;) {
