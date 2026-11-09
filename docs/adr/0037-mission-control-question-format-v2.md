@@ -228,3 +228,19 @@ exit 7), so this amendment adds no new code.
 **What proves it wrong.** In the 14 days after the deploy, more than 1 follow-up in 10 gets an owner answer that
 restates the earlier answer, or agents still open an unlinked item for an answered question more than twice a week.
 Then measure why the asker does not use the link. Do that before you add mechanism.
+
+## Amendment (2026-11-09, story vel-MC-ACT: owner steps and actions in the owner's list)
+
+A recurrence the owner raised. Two things went missing from Mission Control:
+
+1. An owner action written inside a question item closed, undone, when he answered the question.
+2. An open kind=action item did not show in his list, though the snapshot listed it as open.
+
+- **Owner steps are lint, not a refusal.** Every attention.opened and attention.updated of a kind=question, v1 or v2, is read for owner steps in its `context`: "Paste … to/into", "Your steps", "run this", "click", or two or more numbered step lines. A match adds one finding, `context: owner steps in a question: <what was found>`, with the split as its limit: each owner step becomes its own kind=action item (answerType `action-done`, humanNeed `external-action`), and the question keeps to the decision.
+  - The finding reaches the asker on `mc ask`'s stderr, through the check route, and in the events route's 200 body, like the class lint.
+  - It never refuses. A phrase match cannot tell an owner step from evidence that quotes one, and a refused question would hide the decision too.
+  - A kind=action item is not read: it is the step.
+- **Every open owner item renders.** The owner's Needs you list counts every open item whose human review needs him, whatever its kind. It used to render a card only for an item the page already held a draft for, so an item that arrived before its draft was counted and not shown. The card now renders from a fresh draft when the page holds none.
+  - An action renders as an action: the "Action" label, and the "I've completed this action" control.
+  - The opener therefore keeps accepting kind=action with humanNeed `external-action`.
+- **Not established:** why the reported action stayed out of the owner's list for longer than one render. The item's stored JSON, and which view he read (the web Needs you list, the board, or a phone notification), were not available to this story. Every server and web path read here carries an open action item.

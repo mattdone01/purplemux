@@ -182,6 +182,29 @@ export const questionLint = (question: TMissionStoredQuestion): IMissionQuestion
   return findings;
 };
 
+const OWNER_STEP_PHRASES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\bpaste\b[^.\n]{0,40}?\b(?:to|into)\b/i, "'Paste to'"],
+  [/\byour steps?\b/i, "'Your steps'"],
+  [/\brun this\b/i, "'run this'"],
+  [/\bclick\b/i, "'click'"],
+];
+const NUMBERED_STEP_LINE = /^\s*(?:step\s+)?\d{1,2}[.):]\s+\S/i;
+
+/**
+ * Owner steps inside a question (vel-MC-ACT, a recurrence the owner raised): an action the owner must take, written into
+ * a question's context, closes with the question when he answers it, undone. A warning, never a refusal: it names the
+ * phrases found and the split, one kind=action item per step. Only a kind=question item is read; an action is the step.
+ */
+export const ownerStepsLint = (question: { kind?: unknown; context?: unknown }): IMissionQuestionDefect[] => {
+  if (question.kind !== 'question' || typeof question.context !== 'string') return [];
+  const found = OWNER_STEP_PHRASES.filter(([pattern]) => pattern.test(question.context as string)).map(([, name]) => name);
+  const numbered = question.context.split('\n').filter((line) => NUMBERED_STEP_LINE.test(line)).length;
+  if (numbered >= 2) found.push(`${numbered} numbered steps`);
+  if (!found.length) return [];
+  return [defect('context', `owner steps in a question: ${found.join(', ')}`,
+    'split them: open each owner step as its own kind=action item (answerType action-done, humanNeed external-action) and keep this question to the decision; answering a question closes it, and a step written inside it closes with it, undone')];
+};
+
 /**
  * A human-reviewed item with no class sorts as Unclassified on the owner's board (ADR-0031): a warning, never a refusal,
  * since a producer that cannot name the class omits it (story 36, D6). A `none` review is never owner-visible.

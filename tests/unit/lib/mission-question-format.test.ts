@@ -7,6 +7,7 @@ import {
   emptyMissionChanges,
   effectiveAnswerType,
   mergeMissionChanges,
+  ownerStepsLint,
   questionLint,
   questionOfItem,
   validateMissionQuestion,
@@ -323,5 +324,42 @@ describe('selectedOptionLabels (ADR-0037 amendment D2; review r1 finding 4)', ()
       OPTION_NOT_IN_QUESTION_LABEL, OPTION_NOT_IN_QUESTION_LABEL, OPTION_NOT_IN_QUESTION_LABEL,
     ]);
     expect(OPTION_NOT_IN_QUESTION_LABEL).toBe('an option no longer in the question');
+  });
+});
+
+// vel-MC-ACT: an owner step written inside a question closes with the question when the owner answers it, undone (a
+// recurrence the owner raised). The lint warns and names the split; it never refuses.
+describe('ownerStepsLint (vel-MC-ACT)', () => {
+  const context = (text: string) => ({ kind: 'question', context: text });
+
+  it.each([
+    ['Paste to', 'Paste the new token to the repository secret.', "'Paste to'"],
+    ['Paste into', 'Then paste it into the settings page.', "'Paste to'"],
+    ['Your steps', 'Your steps: rotate the token, then confirm.', "'Your steps'"],
+    ['run this', 'Please run this on your laptop.', "'run this'"],
+    ['click', 'Click Approve on the pull request.', "'click'"],
+  ])('finds %s', (_name, text, found) => {
+    const [finding] = ownerStepsLint(context(text));
+    expect(finding.field).toBe('context');
+    expect(finding.measured).toContain(found);
+    expect(finding.limit).toContain('open each owner step as its own kind=action item');
+  });
+
+  it('counts numbered steps: two or more is a finding, one is not', () => {
+    expect(ownerStepsLint(context('1. Open the settings.\n2) Rotate the key.\nStep 3: confirm.'))[0].measured).toContain('3 numbered steps');
+    expect(ownerStepsLint(context('1. Only one numbered line here.'))).toEqual([]);
+  });
+
+  it('names every phrase found in one finding', () => {
+    const findings = ownerStepsLint(context('Your steps:\n1. click Save\n2. run this script'));
+    expect(findings).toHaveLength(1);
+    expect(findings[0].measured).toBe("owner steps in a question: 'Your steps', 'run this', 'click', 2 numbered steps");
+  });
+
+  it('a clean question, an action item, or no context: no finding', () => {
+    expect(ownerStepsLint(context('Pick the rollout: staged or all tenants at once.'))).toEqual([]);
+    expect(ownerStepsLint({ kind: 'action', context: 'Paste the token to the secret. 1. a 2. b' })).toEqual([]);
+    expect(ownerStepsLint({ kind: 'question' })).toEqual([]);
+    expect(ownerStepsLint(context('The clickstream report and the runtime of this job.'))).toEqual([]);
   });
 });
