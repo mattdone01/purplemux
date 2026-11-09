@@ -358,37 +358,147 @@ describe('the proofs are bounded and never hold the poll (review r1 F1)', () => 
     await manager.poll();
     expect(proofCalls().filter((c) => c.host === HOST)).toHaveLength(4);
 
+    // Freed slots start the next queued proofs at once, never more than 4 on the host (r2 M1).
+    const askedOnHost = () => proofCalls().filter((c) => c.host === HOST).map((c) => c.session);
+    for (const release of hung.splice(0)) release();
+    await vi.waitFor(() => expect(askedOnHost()).toHaveLength(8));
+    expect(new Set(askedOnHost()).size).toBe(8);
+    await vi.waitFor(() => expect(hung).toHaveLength(4));
+    for (const expected of [12, 16, 20]) {
+      for (const release of hung.splice(0)) release();
+      await vi.waitFor(() => expect(askedOnHost()).toHaveLength(expected));
+    }
+    await vi.waitFor(() => expect(hung).toHaveLength(4));
     for (const release of hung.splice(0)) release();
     await internals(manager).remoteProofs.settled();
+    expect(new Set(askedOnHost()).size).toBe(20);
     vi.setSystemTime(T0 + 20_000);
     await manager.poll();
-    const asked = proofCalls().filter((c) => c.host === HOST).map((c) => c.session);
-    expect(asked).toHaveLength(8);
-    expect(new Set(asked).size).toBe(8);
     for (const tab of slow) expect(entry(tab.id).cliState).toBe('idle');
-    for (const release of hung.splice(0)) release();
-    await internals(manager).remoteProofs.settled();
   });
 
-  it('overlapping ticks: a poll that finds the previous one running skips, and only one scan goes out', async () => {
-    let releaseScan: () => void = () => {};
+  it('20 tabs on a fast host: all proven in one poll, at most 4 at once, and the next poll asks none (r2 M1)', async () => {
+    const tabs = Array.from({ length: 20 }, (_, i) => remoteTab(`tab-f${i}`, `pt-ws-1-pane-a-tab-f${i}`));
+    state.tabs = tabs;
+    ssh.scan = (host) => ({ stdout: host === HOST ? tabs.map((t) => paneLine(t.sessionName, 'node')).join('') : '' });
+    let running = 0;
+    let peak = 0;
+    ssh.proof = () => {
+      running += 1;
+      peak = Math.max(peak, running);
+      return new Promise<TReply>((resolve) => setImmediate(() => { running -= 1; resolve(PRESENT); }));
+    };
+    const { entry, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(new Set(proofCalls().map((c) => c.session)).size).toBe(20);
+    // An upper bound: each proof reads its ssh budget before it spawns, so a fast one can end before the fourth
+    // starts. The exact cap and the drain order are pinned in remote-proof-scheduler.test.ts.
+    expect(peak).toBeGreaterThan(0);
+    expect(peak).toBeLessThanOrEqual(4);
+    vi.setSystemTime(T0 + 30_000);
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(20);
+    for (const tab of tabs) expect(entry(tab.id).cliState).toBe('idle');
+  });
+
+  it('an in-place restart proves again: the launch stamp is in the key (r2)', async () => {
+    ssh.scan = () => pane('node');
+    ssh.proof = () => PRESENT;
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] });
+    vi.setSystemTime(T0);
+    const { manager, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(1);
+    (manager as unknown as { markAgentLaunch: (id: string) => void }).markAgentLaunch('tab-r');
+    vi.setSystemTime(T0 + 6_000);
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(2);
+    vi.clearAllTimers();
+  });
+});
+
+describe('one poll at a time, coalesced, never wedged (review r1 F1 d, r2 M2 and L-M)', () => {
+  beforeEach(resetWorld);
+  afterEach(() => vi.useRealTimers());
+
+  const holdFirstScan = () => {
+    const release: { first: (reply: TReply) => void } = { first: () => {} };
     let held = false;
     ssh.scan = (host) => {
       if (host !== HOST) return { stdout: '' };
       if (held) return pane('claude');
       held = true;
-      return new Promise<TReply>((resolve) => { releaseScan = () => resolve(pane('claude')); });
+      return new Promise<TReply>((resolve) => { release.first = resolve; });
     };
+    return release;
+  };
+  const harnessScans = () => scanCalls().filter((c) => c.host === HOST);
+  /** A short real wait, for an assertion that something did NOT happen. */
+  const quiet = () => new Promise<void>((resolve) => { setImmediate(() => setImmediate(() => resolve())); });
+
+  it('a poll asked for while one runs waits for exactly one follow-up poll', async () => {
+    const release = holdFirstScan();
     const { manager } = await createManager('idle');
-    const harnessScans = () => scanCalls().filter((c) => c.host === HOST);
     const first = manager.poll();
     await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    const second = manager.poll();
+    await quiet();
+    expect(harnessScans()).toHaveLength(1);
+    release.first(pane('claude'));
+    await first;
+    await second;
+    expect(harnessScans()).toHaveLength(2);
+    await manager.poll();
+    expect(harnessScans()).toHaveLength(3);
+  });
+
+  it('the hook poll trigger and the 7 launch readiness timers during a slow poll: one follow-up serves all 8', async () => {
+    const release = holdFirstScan();
+    const { manager } = await createManager('idle');
+    const first = manager.poll();
+    await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] });
+    vi.setSystemTime(T0);
+    const hookTrigger = manager.poll();
+    (manager as unknown as { markAgentLaunch: (id: string) => void }).markAgentLaunch('tab-r');
+    vi.advanceTimersByTime(12_000);
+    expect(harnessScans()).toHaveLength(1);
+    release.first(pane('claude'));
+    await first;
+    await hookTrigger;
+    await quiet();
+    expect(harnessScans()).toHaveLength(2);
+  });
+
+  it('a poll that throws frees the next one', async () => {
+    ssh.scan = () => pane('claude');
+    const { getWorkspaces } = await import('@/lib/workspace-store');
+    const { manager } = await createManager('idle');
+    vi.mocked(getWorkspaces).mockRejectedValueOnce(new Error('workspace store unreadable'));
+    await expect(manager.poll()).rejects.toThrow('workspace store unreadable');
     await manager.poll();
     expect(harnessScans()).toHaveLength(1);
-    releaseScan();
-    await first;
+  });
+
+  it('a poll that hangs past 10 intervals is superseded: the next one runs, and the hung one applies nothing when it settles', async () => {
+    const release = holdFirstScan();
+    const { manager, entry } = await createManager('idle');
+    const hung = manager.poll();
+    await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    vi.setSystemTime(T0 + 299_000);
+    const queued = manager.poll();
+    await quiet();
+    expect(harnessScans()).toHaveLength(1);
+    vi.setSystemTime(T0 + 301_000);
     await manager.poll();
     expect(harnessScans()).toHaveLength(2);
+    expect(entry().cliState).toBe('idle');
+    await queued;
+    expect(harnessScans()).toHaveLength(3);
+    // The hung scan finally answers "no session" (an absence): the superseded poll must not act on it.
+    release.first({ stdout: '' });
+    await hung;
+    expect(entry().cliState).toBe('idle');
   });
 });
 

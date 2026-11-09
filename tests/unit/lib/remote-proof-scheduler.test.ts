@@ -62,4 +62,52 @@ describe('RemoteProofScheduler', () => {
     scheduler.forget('tab-a');
     expect(scheduler.read(req('tab-a'))).toBeNull();
   });
+
+  it('a host runs at most 4 proofs; a freed slot starts the next queued one at once, without a poll (r2 M1)', async () => {
+    const releases = new Map<string, () => void>();
+    const { scheduler, observe } = make(() => ({ state: 'present', identity: 'x' }));
+    observe.mockImplementation((sessionName: string) => new Promise((resolve) => {
+      releases.set(sessionName, () => resolve({ state: 'present', identity: 'x' }));
+    }));
+    const tabs = Array.from({ length: 10 }, (_, i) => req(`tab-${i}`));
+    const drained = scheduler.schedule(tabs);
+    expect(observe).toHaveBeenCalledTimes(4);
+    releases.get('pt-ws-1-pane-a-tab-0')!();
+    await vi.waitFor(() => expect(observe).toHaveBeenCalledTimes(5));
+    for (let started = 5; started < 10; started += 1) {
+      for (const [session, release] of releases) { releases.delete(session); release(); }
+      await vi.waitFor(() => expect(observe.mock.calls.length).toBeGreaterThan(started));
+    }
+    for (const release of releases.values()) release();
+    await drained;
+    expect(observe).toHaveBeenCalledTimes(10);
+    expect(tabs.every((t) => scheduler.read(t) === true)).toBe(true);
+  });
+
+  it('a tab whose key changed jumps the queue ahead of the least recently proven (r2 M1)', async () => {
+    const order: string[] = [];
+    let hold: (() => void) | null = null;
+    const scheduler = new RemoteProofScheduler(
+      {
+        observe: async (sessionName) => {
+          order.push(sessionName);
+          if (sessionName.endsWith('tab-blocker')) await new Promise<void>((resolve) => { hold = resolve; });
+          return { state: 'present', identity: 'x' };
+        },
+        now: () => 1_000_000 + order.length,
+      },
+      { ttlMs: 60_000, backoffMs: 30_000, perHostCap: 1 },
+    );
+    // tab-changed was proven under k1; tab-old and tab-new never were (least recently proven: never).
+    await scheduler.prove(req('tab-changed', 'k1'));
+    order.length = 0;
+    const blocker = scheduler.schedule([req('tab-blocker')]);
+    await vi.waitFor(() => expect(hold).not.toBeNull());
+    const drained = scheduler.schedule([req('tab-old'), req('tab-new'), req('tab-changed', 'k2')]);
+    expect(order).toEqual(['pt-ws-1-pane-a-tab-blocker']);
+    hold!();
+    await blocker;
+    await drained;
+    expect(order).toEqual(['pt-ws-1-pane-a-tab-blocker', 'pt-ws-1-pane-a-tab-changed', 'pt-ws-1-pane-a-tab-old', 'pt-ws-1-pane-a-tab-new']);
+  });
 });

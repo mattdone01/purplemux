@@ -2,14 +2,16 @@ import type { TStrictRuntimeObservation } from '@/lib/process-utils';
 
 /**
  * The process proofs of remote agent panes (ADR-0022 §19, vel-D61), bounded so a slow host never holds the
- * status poll. The poll never awaits a proof: it reads the answer an earlier proof left, and asks for the next
- * ones, which run in the background. Per host at most `perHostCap` proofs run at once, the least recently proven
- * tabs first; hosts run in parallel.
+ * status poll. The poll never awaits a proof: it reads the answer an earlier proof left, and queues the next
+ * ones. Per host at most `perHostCap` proofs run at once, and a freed slot starts the next queued one at once
+ * (review r2 M1), so a fast host clears its queue in seconds. The queue puts a tab whose key changed since its
+ * last proof first (the likeliest death), then the least recently proven. Hosts run in parallel.
  *
- * - `present` is kept for `ttlMs` under its key (the session, the pane and its foreground command): a new key
- *   proves again.
+ * - `present` is kept for `ttlMs` under its key (the session, the pane, its foreground command and the agent's
+ *   launch): a new key proves again.
  * - `absent` is read once: the transition it causes happens at the next read, and a relaunch never meets it.
- * - `unknown` (ssh failed or timed out) is never kept, and that host's proofs back off `backoffMs`.
+ * - `unknown` (ssh failed or timed out) is never kept; that host's proofs back off `backoffMs` and its queue is
+ *   dropped (the next poll asks again).
  */
 
 export type TRemoteProofWant = 'claude' | 'codex' | 'grok';
@@ -19,7 +21,7 @@ export interface IRemoteProofRequest {
   host: string;
   sessionName: string;
   want: TRemoteProofWant;
-  /** Changes when the session, its pane or the pane's foreground command changes. */
+  /** Changes when the session, its pane, the pane's foreground command or the agent's launch changes. */
   key: string;
 }
 
@@ -41,10 +43,15 @@ interface IResult {
 
 export class RemoteProofScheduler {
   private readonly results = new Map<string, IResult>();
+  /** Tab → the host of its running proof. */
   private readonly inFlight = new Map<string, string>();
+  private readonly running = new Set<Promise<void>>();
+  /** Host → its queued requests, by tab: a newer request for a tab replaces the older one. */
+  private readonly queues = new Map<string, Map<string, IRemoteProofRequest>>();
   private readonly lastAsked = new Map<string, number>();
+  /** Tab → the key of its last proof. */
+  private readonly lastKey = new Map<string, string>();
   private readonly hostBackoff = new Map<string, number>();
-  private pending: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly deps: IRemoteProofDeps,
@@ -69,52 +76,86 @@ export class RemoteProofScheduler {
   }
 
   /**
-   * Start the proofs these requests need, within each host's cap and outside its backoff. Never awaited by the
-   * poll; the returned promise settles when the proofs started here end (tests and `settled`).
+   * Queue the proofs these requests need and start them within each host's cap, outside its backoff. Never
+   * awaited by the poll; the returned promise settles when the queues drain (tests).
    */
   schedule(requests: readonly IRemoteProofRequest[]): Promise<void> {
-    const now = this.deps.now();
-    const byHost = new Map<string, IRemoteProofRequest[]>();
+    const hosts = new Set<string>();
     for (const req of requests) {
-      if (this.inFlight.has(req.tabId) || (this.hostBackoff.get(req.host) ?? 0) > now) continue;
-      const kept = this.results.get(req.tabId);
-      if (kept && kept.key === req.key && now - kept.at < this.opts.ttlMs) continue;
-      byHost.set(req.host, [...(byHost.get(req.host) ?? []), req]);
+      if (!this.needsProof(req)) continue;
+      const queue = this.queues.get(req.host) ?? new Map<string, IRemoteProofRequest>();
+      queue.set(req.tabId, req);
+      this.queues.set(req.host, queue);
+      hosts.add(req.host);
     }
-    const started: Promise<void>[] = [];
-    for (const [host, reqs] of byHost) {
-      const running = [...this.inFlight.values()].filter((h) => h === host).length;
-      const room = Math.max(0, this.opts.perHostCap - running);
-      const chosen = [...reqs].sort((a, b) => (this.lastAsked.get(a.tabId) ?? 0) - (this.lastAsked.get(b.tabId) ?? 0)).slice(0, room);
-      for (const req of chosen) started.push(this.run(req));
-    }
-    const batch = Promise.all(started).then(() => {});
-    this.pending = Promise.all([this.pending, batch]).then(() => {});
-    return batch;
+    for (const host of hosts) this.pump(host);
+    return this.settled();
   }
 
   /** One proof awaited by its caller (an off-poll read), through the same cache and backoff, outside the cap. */
   async prove(req: IRemoteProofRequest): Promise<boolean | null> {
     const cached = this.read(req);
     if (cached !== null) return cached;
-    if (this.inFlight.has(req.tabId) || (this.hostBackoff.get(req.host) ?? 0) > this.deps.now()) return null;
+    if (this.inFlight.has(req.tabId) || this.inBackoff(req.host)) return null;
     await this.run(req);
     return this.read(req);
   }
 
-  /** Every proof started so far has ended. */
-  settled(): Promise<void> {
-    return this.pending;
+  /** Every proof started so far, and every one a freed slot started after it, has ended. */
+  async settled(): Promise<void> {
+    while (this.running.size > 0) await Promise.all([...this.running]);
   }
 
   forget(tabId: string): void {
     this.results.delete(tabId);
     this.lastAsked.delete(tabId);
+    this.lastKey.delete(tabId);
+    for (const queue of this.queues.values()) queue.delete(tabId);
+  }
+
+  private inBackoff(host: string): boolean {
+    return (this.hostBackoff.get(host) ?? 0) > this.deps.now();
+  }
+
+  private needsProof(req: IRemoteProofRequest): boolean {
+    if (this.inFlight.has(req.tabId) || this.inBackoff(req.host)) return false;
+    const kept = this.results.get(req.tabId);
+    return !(kept && kept.key === req.key && this.deps.now() - kept.at < this.opts.ttlMs);
+  }
+
+  /** Changed key first, then least recently proven. */
+  private next(queue: Map<string, IRemoteProofRequest>): IRemoteProofRequest | undefined {
+    const changed = (r: IRemoteProofRequest) => (this.lastKey.has(r.tabId) && this.lastKey.get(r.tabId) !== r.key ? 0 : 1);
+    return [...queue.values()].sort((a, b) => changed(a) - changed(b)
+      || (this.lastAsked.get(a.tabId) ?? 0) - (this.lastAsked.get(b.tabId) ?? 0))[0];
+  }
+
+  private pump(host: string): void {
+    const queue = this.queues.get(host);
+    if (!queue) return;
+    if (this.inBackoff(host)) {
+      this.queues.delete(host);
+      return;
+    }
+    let running = [...this.inFlight.values()].filter((h) => h === host).length;
+    while (running < this.opts.perHostCap && queue.size > 0) {
+      const req = this.next(queue)!;
+      queue.delete(req.tabId);
+      if (!this.needsProof(req)) continue;
+      running += 1;
+      const done: Promise<void> = this.run(req).finally(() => {
+        this.running.delete(done);
+        this.pump(host);
+      });
+      this.running.add(done);
+    }
+    if (queue.size === 0) this.queues.delete(host);
   }
 
   private async run(req: IRemoteProofRequest): Promise<void> {
     this.inFlight.set(req.tabId, req.host);
     this.lastAsked.set(req.tabId, this.deps.now());
+    this.lastKey.set(req.tabId, req.key);
     try {
       const observed = await this.deps.observe(req.sessionName, req.want).catch((err: unknown): TStrictRuntimeObservation => ({
         state: 'unknown', reason: err instanceof Error ? err.message : String(err),

@@ -127,9 +127,12 @@ interface IRemotePaneRead {
 const remoteProofName = (providerId: string): TRemoteProofWant | null =>
   providerId === 'claude' || providerId === 'codex' || providerId === 'grok' ? providerId : null;
 
-/** The proof cache key: a new session, pane or foreground command proves again. */
-const remoteProofKey = (sessionName: string, paneInfo: IPaneInfo): string =>
-  `${sessionName}\t${paneInfo.paneRef ?? ''}\t${paneInfo.command}`;
+/**
+ * The proof cache key: a new session, pane, foreground command or agent launch proves again. The launch stamp
+ * covers an in-place restart, where the pane's shell and its pid stay (review r2).
+ */
+const remoteProofKey = (sessionName: string, paneInfo: IPaneInfo, launchedAt: number | undefined): string =>
+  `${sessionName}\t${paneInfo.paneRef ?? ''}\t${paneInfo.command}\t${launchedAt ?? ''}`;
 
 /**
  * Whether the pane's agent runs. A remote pane has no pid here (ADR-0022): its
@@ -196,6 +199,8 @@ const COMPACT_STALE_MS = 60_000;
 const TAB_SCOPE_TTL_MS = 5 * 60_000;
 
 const POLL_INTERVAL_SMALL = 30_000;
+/** A poll running longer than this many poll intervals is taken as hung (vel-D61 review r2). */
+export const POLL_MAX_AGE_INTERVALS = 10;
 const POLL_INTERVAL_MEDIUM = 45_000;
 const POLL_INTERVAL_LARGE = 60_000;
 const TAB_COUNT_MEDIUM = 11;
@@ -305,8 +310,11 @@ export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
   private orchestrationPendingLaunches = new Set<string>();
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
-  /** When the running poll started; null when none runs. */
-  private pollStartedAt: number | null = null;
+  /** The running poll; null when none runs. */
+  private pollRun: { generation: number; startedAt: number } | null = null;
+  private pollGeneration = 0;
+  /** The one poll queued behind the running one, shared by every caller that asked meanwhile. */
+  private pollFollowUp: { promise: Promise<void>; resolve: () => void; reject: (err: unknown) => void } | null = null;
   /** Remote agent process proofs, off the poll's path (vel-D61). */
   private readonly remoteProofs = new RemoteProofScheduler({
     observe: (sessionName, want) => observeRemoteProviderProcess(sessionName, want),
@@ -759,7 +767,7 @@ export class StatusManager {
     const agentRunning = await agentRunningIn(paneInfo, provider, remoteHost
       ? {
           answered: !!panes.answeredRemoteHosts?.has(remoteHost),
-          proof: (want) => this.remoteProofs.prove({ tabId, host: remoteHost, sessionName: entry.tmuxSession, want, key: remoteProofKey(entry.tmuxSession, paneInfo!) }),
+          proof: (want) => this.remoteProofs.prove({ tabId, host: remoteHost, sessionName: entry.tmuxSession, want, key: remoteProofKey(entry.tmuxSession, paneInfo!, entry.lastResumeOrStartedAt) }),
         }
       : null);
     // A remote host not read: the tab stays unknown until a hook or a read pane says (review r3 B1).
@@ -1039,23 +1047,53 @@ export class StatusManager {
   }
 
   /**
-   * One poll at a time (vel-D61): a tick that finds the previous poll still running skips, with one log line,
-   * instead of stacking a second scan and second proofs on a slow host.
+   * One poll at a time (vel-D61). A poll asked for while one runs (a tick, the hook poll trigger, a launch
+   * readiness timer) is coalesced: exactly one follow-up poll runs when the current one ends, and every caller
+   * that asked meanwhile waits for it (review r2 M2). A poll older than POLL_MAX_AGE_INTERVALS poll intervals is
+   * taken as hung: the next request runs a new poll at once, with one error line, and the hung poll is superseded
+   * and applies nothing more when it settles (review r2 L-M).
    */
-  async poll(): Promise<void> {
-    if (this.pollStartedAt !== null) {
-      log.info({ runningForMs: Date.now() - this.pollStartedAt }, 'poll skipped: the previous poll is still running');
-      return;
+  poll(): Promise<void> {
+    const current = this.pollRun;
+    if (current) {
+      const runningForMs = Date.now() - current.startedAt;
+      const maxAgeMs = POLL_MAX_AGE_INTERVALS * (this.currentInterval || this.getPollingInterval());
+      if (runningForMs < maxAgeMs) {
+        if (!this.pollFollowUp) {
+          let resolve!: () => void;
+          let reject!: (err: unknown) => void;
+          const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+          this.pollFollowUp = { promise, resolve, reject };
+          log.info({ runningForMs }, 'poll asked for while one runs: one follow-up poll queued');
+        }
+        return this.pollFollowUp.promise;
+      }
+      log.error({ runningForMs, maxAgeMs, generation: current.generation }, 'poll exceeded its maximum age: a new poll runs and the hung one is superseded');
     }
-    this.pollStartedAt = Date.now();
-    try {
-      await this.runPoll();
-    } finally {
-      this.pollStartedAt = null;
-    }
+    return this.startPoll();
   }
 
-  private async runPoll(): Promise<void> {
+  private startPoll(): Promise<void> {
+    const run = { generation: ++this.pollGeneration, startedAt: Date.now() };
+    this.pollRun = run;
+    const done = this.runPoll(run.generation).finally(() => {
+      // A superseded poll's end starts nothing: the poll that replaced it owns the follow-up.
+      if (this.pollRun !== run) return;
+      this.pollRun = null;
+      const followUp = this.pollFollowUp;
+      if (!followUp) return;
+      this.pollFollowUp = null;
+      this.startPoll().then(followUp.resolve, followUp.reject);
+    });
+    return done;
+  }
+
+  /** False once a newer poll superseded this one: it then stops and applies nothing more. */
+  private isCurrentPoll(generation: number): boolean {
+    return generation === this.pollGeneration;
+  }
+
+  private async runPoll(generation: number): Promise<void> {
     // Started, never awaited (ADR-0020): the liveness reconcile, the stuck
     // checks and the idle nudges must not wait for a slow replay. The drain is
     // one shared promise, so a poll during a drain starts no second one. On
@@ -1063,6 +1101,7 @@ export class StatusManager {
     if (this.hookSpoolDrain) void this.drainHookSpool();
     const { workspaces } = await getWorkspaces();
     const panesInfo = await getAllPanesInfo();
+    if (!this.isCurrentPoll(generation)) return;
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
     const proofRequests: IRemoteProofRequest[] = [];
@@ -1077,6 +1116,7 @@ export class StatusManager {
 
       const tabs = collectAllTabs(layout.root);
       for (const tab of tabs) {
+        if (!this.isCurrentPoll(generation)) return;
         if (tab.panelType === 'codex-cli' && tab.codexLaunchRuntime?.pending) {
           await reconcileCodexLaunchTimeout(ws.id, tab.id, now).catch((err) => {
             log.warn(`Codex launch timeout reconciliation failed: ${err instanceof Error ? err.message : err}`);
@@ -1251,7 +1291,7 @@ export class StatusManager {
               proof: (want) => {
                 // An inactive tab at its shell has nothing a proof could change: no ssh for it.
                 if (existing.cliState === 'inactive' && SAFE_SHELLS.has(paneInfo!.command)) return false;
-                const req = { tabId: tab.id, host, sessionName: tab.sessionName, want, key: remoteProofKey(tab.sessionName, paneInfo!) };
+                const req = { tabId: tab.id, host, sessionName: tab.sessionName, want, key: remoteProofKey(tab.sessionName, paneInfo!, existing.lastResumeOrStartedAt) };
                 const answer = this.remoteProofs.read(req);
                 if (answer === null) proofRequests.push(req);
                 return answer;
@@ -1340,6 +1380,7 @@ export class StatusManager {
       }
     }
 
+    if (!this.isCurrentPoll(generation)) return;
     // Not awaited: the next poll reads what these proofs answer (vel-D61).
     if (proofRequests.length > 0) void this.remoteProofs.schedule(proofRequests);
 
