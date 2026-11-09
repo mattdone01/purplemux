@@ -16,7 +16,6 @@ import {
 import { LEDGER_ALARM_KEYS, parseRouteTable, parseThresholdValue } from '@/lib/ledger-alarms';
 import { LEDGER_WAIT_REASONS } from '@/lib/ledger';
 import { leaseAuthority } from '@/lib/lease-http';
-import { STANDUP_DUE_CONFIG_KEY, parseStandupDueMinutes } from '@/lib/standup';
 import { createLogger } from '@/lib/logger';
 import { POOL_MODE_KEY, isPoolMode, isPoolNumberKey, poolNumberRefusal } from '@/lib/pool';
 import type { IFleetConfigChange, IFleetConfigSetter, IFleetConfigState, IFleetConfigValue } from '@/types/fleet-config';
@@ -49,8 +48,8 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
 /**
  * The admin token only: keys that decide where tabs run and where their tokens
  * are sent (ADR-0022), and fleet-wide keys any one workspace's orchestrator must
- * not set for every other workspace (ADR-0027 ruling R2). `standup.` is one (story hfl2-10): the orchestrator
- * the due line nags must not turn it off for every workspace.
+ * not set for every other workspace (ADR-0027 ruling R2). `standup.` stays here: since F6 no such key is read,
+ * and every write of one is refused.
  */
 export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup)\./;
 
@@ -151,13 +150,13 @@ const checkCuratorValue = (key: string, value: string): void => {
     `${key} is not a curator key: curator.routing.workspaces, curator.min-interval-ms, curator.enabled or curator.standing-order.candidates`);
 };
 
-/** The standup key (story hfl2-10): minutes in [0, 1440], decimals allowed, 0 turning the due line off. */
-const checkStandupValue = (key: string, value: string): void => {
+/**
+ * No standup key is read (F6): the server's standup due line is deleted, and a coordinator posts its standup from its
+ * status file at the end of its own turn. A `standup.*` value would change nothing, so it is refused.
+ */
+const checkStandupValue = (key: string, _value: string): void => {
   if (!key.startsWith('standup.')) return;
-  if (key !== STANDUP_DUE_CONFIG_KEY) throw new FleetConfigError('config-invalid', `${key} is not a standup key: ${STANDUP_DUE_CONFIG_KEY}`);
-  if (parseStandupDueMinutes(value) === null) {
-    throw new FleetConfigError('config-invalid', `${key} must be minutes 0..1440 (0 turns the due line off), got ${JSON.stringify(value)}`);
-  }
+  throw new FleetConfigError('config-invalid', `${key} is not a key: the standup due line (standup.dueMin) was deleted by F6`);
 };
 
 /** The alarm keys (ADR-HFL-03 decision 1): a route table parses whole; a threshold names a producer reason and holds minutes or `off`. */
