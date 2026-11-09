@@ -194,7 +194,7 @@ what, so treat it as a refusal.
 ## Pool (ADR-0039)
 
 One scheduler places gates, builds, mutation runs, browsers, test services and agent tabs on this
-host and the remote.hosts hosts (vel-D4: one shared budget per host, docs/design/vel-d4-shared-budget.md).
+host and the remote.hosts hosts (vel-D4: one shared budget per host).
 Each known host has one budget: threads and memory (fleet config pool.budget.<host>.*, else the
 read), less a control-plane reserve (default max(2, 25 % of threads) and max(4 GiB, 15 % of
 memory)). Every kind reserves its envelope (pool.envelope.<kind>.*; defaults gate, build and
