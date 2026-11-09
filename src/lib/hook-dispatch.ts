@@ -73,7 +73,7 @@ const handleClaudeStopHook = async ({ query, body, replayedAt, occurredAt }: IHo
     hookEvent: typeof payload.hook_event_name === 'string' ? payload.hook_event_name : null,
     sessionId: typeof payload.session_id === 'string' ? payload.session_id : null,
     message: typeof payload.last_assistant_message === 'string' ? payload.last_assistant_message : null,
-  }, replayedAt !== undefined);
+  }, replayedAt);
   if (decision.kind === 'block') return { status: 200, body: { decision: 'block', reason: decision.reason } };
   const workEvent = translateClaudeHookEvent('stop', undefined, undefined);
   if (workEvent) statusManager.handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt);

@@ -132,7 +132,7 @@ export type TStopDecision =
   /** The stop is held: Claude continues the turn with `reason` (the block budget is spent by one). */
   | { kind: 'block'; reason: string }
   /** No valid row: an UNREPORTED row is written, and the verdict is the classifier's (or the escalating one). */
-  | { kind: 'unreported'; reason: TUnreportedReason; escalation: TTurnMarkerName | null };
+  | { kind: 'unreported'; reason: TUnreportedReason; escalation: TTurnMarkerName | null; turnId?: number };
 
 export interface IStopDecisionInput {
   /** `turn-end.source=classifier`: the kill switch. */

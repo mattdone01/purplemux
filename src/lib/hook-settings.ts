@@ -54,7 +54,8 @@ export const claudeHookEvents = (script: string) => ({
   Notification: hookEntry(script, 'notification'),
   // F6: the stop waits for the server's decision (1 s) after tmux (1 s) and the POST: 5 s, not 3 (ruling (3)).
   Stop: hookEntry(script, 'stop', CLAUDE_STOP_HOOK_TIMEOUT_SECONDS),
-  StopFailure: hookEntry(script, 'stop'),
+  // StopFailure posts through the same stop route (review nit 2): the same bound as Stop, above tmux + the POST.
+  StopFailure: hookEntry(script, 'stop', CLAUDE_STOP_HOOK_TIMEOUT_SECONDS),
   PreCompact: hookEntry(script, 'pre-compact'),
   PostCompact: hookEntry(script, 'post-compact'),
   PostToolUse: hookEntry(script, 'post-tool', 2, SIGNAL_TOOLS),

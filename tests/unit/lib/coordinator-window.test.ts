@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   COORDINATOR_WINDOW_MS,
   CoordinatorWindow,
+  INBOX_HEADS_TTL_MS,
   WINDOWED_INBOX_KINDS,
   WINDOW_DEFERRAL,
   isWindowExempt,
@@ -76,6 +77,16 @@ describe('CoordinatorWindow', () => {
     expect(window.isOpen(WS, C)).toBe(true);
     window.claim(WS, C);
     expect(window.openAt(WS, C)).toBe(T0 + COORDINATOR_WINDOW_MS);
+  });
+
+  it('review nit 3: inbox heads the inbox stopped refreshing no longer hold the digest back', () => {
+    const { window, at } = make({ digest: T0 + 5_000 });
+    window.setInboxHeads(new Map([[`${WS}/${C}`, T0]]));
+    expect(window.digestTurn(WS, C)).toBe(false);
+    at(T0 + INBOX_HEADS_TTL_MS);
+    expect(window.digestTurn(WS, C)).toBe(false);
+    at(T0 + INBOX_HEADS_TTL_MS + 1);
+    expect(window.digestTurn(WS, C)).toBe(true);
   });
 
   it('gives the next window to whichever waited longer: the digest, or the first inbox item (ruling 3)', () => {
@@ -377,8 +388,9 @@ describe('the digest router under a coordinator window (ruling, changes 1, 4; ad
     now = T0 + 1 * MIN;
     await r.route(nudge('DONE: held', C, 2));
     inboxHeads.set(`${WS}/${C}`, T0 + 30_000);
-    window.setInboxHeads(inboxHeads);
     now = T0 + 10 * MIN;
+    // The inbox republishes its heads every 2 s tick.
+    window.setInboxHeads(inboxHeads);
     await r.tick();
     expect(typed).toHaveLength(1);
     // The inbox item went out (its ledger row), and the digest takes the window after it.

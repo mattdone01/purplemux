@@ -21,7 +21,6 @@ import { createRateLimitsWatcher } from '@/lib/rate-limits-watcher';
 import { createClaudeUsagePoller } from '@/lib/claude-usage-poller';
 import { createLogger } from '@/lib/logger';
 import { capturePaneAtWidth } from '@/lib/capture-at-width';
-import { readComposerScreen } from '@/lib/composer-readiness';
 import { paneShowsEmptyComposer, paneStartupPrompt } from '@/lib/composer-readiness';
 import { isCodexTuiReadyContent } from '@/lib/codex-tui-ready-detector';
 import { CODEX_PROVIDER_ID } from '@/lib/providers/codex';
@@ -2149,6 +2148,8 @@ export class StatusManager {
     const expectedProvider = getProviderByPanelType(entry.panelType);
     if (expectedProvider && expectedProvider.id !== providerId) return;
     if (isActingTool(activity.tool)) this.turns.toolCall(entry.workspaceId, tabId, providerId, replayedAt ?? Date.now());
+    // A tool call after a held stop is the agent working on: the hold reached it (review CONCERN).
+    if (replayedAt === undefined) this.stopGate.onHookEvent(tabId);
 
     const meta = this.tabScopeCache.get(tabId);
     if (!meta || Date.now() - meta.at > TAB_SCOPE_TTL_MS) {
@@ -2721,7 +2722,6 @@ export class StatusManager {
     // F6 kill switches: unset (or any other value) keeps rows and the payload tail on.
     this.turnEndSourceRow = (fleet ? valueOf(fleet, TURN_END_SOURCE_CONFIG_KEY)?.value : null) !== 'classifier';
     this.stopPayloadIsTail = (fleet ? valueOf(fleet, STOP_PAYLOAD_CONFIG_KEY)?.value : null) !== 'off';
-    await this.checkUndeliveredBlocks(now);
     for (const [tabId, entry] of [...this.tabs]) {
       if (this.isRetired(tabId)) continue;
       if (idleNudgeDue(entry.turnEnd, entry.lastEvent, entry.cliState, idleMs, now)) {
@@ -3104,7 +3104,7 @@ export class StatusManager {
    * Decide a live or replayed Claude stop before it is applied (F6, F10 steps 1-2). A `block` is not applied: the
    * hook prints it and the agent continues the turn. Any other decision is applied by `applyStopTurnEnd`.
    */
-  async decideClaudeStop(tmuxSession: string, payload: IStopPayload, replayed: boolean): Promise<TStopDecision> {
+  async decideClaudeStop(tmuxSession: string, payload: IStopPayload, replayedAt?: number): Promise<TStopDecision> {
     const tabId = this.findTabIdBySession(tmuxSession);
     const entry = tabId ? this.tabs.get(tabId) : undefined;
     if (!tabId || !entry) return { kind: 'classifier', why: 'no tab for the session' };
@@ -3113,7 +3113,7 @@ export class StatusManager {
       agentSessionId: entry.agentSessionId,
       host: entry.host,
       providerId: getProviderByPanelType(entry.panelType)?.id ?? entry.panelType ?? 'unknown',
-    }, payload, replayed);
+    }, payload, replayedAt);
   }
 
   /** Open work that makes a markerless stop a WAITING one; null when any part of it cannot be read. */
@@ -3136,23 +3136,9 @@ export class StatusManager {
     }
   }
 
-  /**
-   * A held stop that no later hook event confirmed: if the pane shows the agent at an empty prompt, the block never
-   * reached it, and the stop is applied now as UNREPORTED `block-undelivered` (design check (2) ruling (3)).
-   */
-  private async checkUndeliveredBlocks(now: number): Promise<void> {
-    for (const tabId of this.stopGate.unconfirmed(now)) {
-      const entry = this.tabs.get(tabId);
-      if (!entry?.tmuxSession) {
-        this.stopGate.forget(tabId);
-        continue;
-      }
-      const screen = readComposerScreen(entry.panelType, await capturePaneAtWidth(entry.tmuxSession, 120, 50, { escapes: true }).catch(() => null));
-      if (!screen.ok) continue;
-      log.info({ tabId }, 'held stop never reached the agent: applying it as UNREPORTED block-undelivered');
-      this.stopGate.undelivered(tabId);
-      this.updateTabFromHook(entry.tmuxSession, 'stop');
-    }
+  /** `purplemux done` ran in the tab: it is working, so a hold of its stop reached it (review CONCERN). */
+  confirmHeldStop(tabId: string): void {
+    this.stopGate.onHookEvent(tabId);
   }
 
   /**
@@ -3249,7 +3235,7 @@ export class StatusManager {
       decisionTail = line;
     } else if (stopDecision?.kind === 'unreported') {
       try {
-        this.stopGate.writeUnreported(entry, tabId, stopDecision.reason);
+        this.stopGate.writeUnreported(entry, tabId, stopDecision.reason, stopDecision.turnId);
       } catch (err) {
         log.warn({ tabId, err: err instanceof Error ? err.message : String(err) }, 'UNREPORTED turn-end row not written');
       }
@@ -3540,8 +3526,18 @@ export class StatusManager {
     }
     const now = this.admitHookEvent(tabId, event, replayedAt);
     if (now === null) return;
-    // Any hook event of the tab confirms that a held stop reached the agent (F6, design check (2) ruling (3)).
-    this.stopGate.onHookEvent(tabId);
+    // F6 (design check (2) ruling (3), review CONCERN): any hook event of the session confirms that a held stop reached
+    // the agent, except Claude's `idle_prompt`: the session waits at its prompt with nothing since the hold, the one
+    // positive sign that the hold never arrived. The held stop is then applied now, its row kept if the worker wrote one.
+    if (replayedAt === undefined && event === 'notification' && notificationType === 'idle_prompt') {
+      if (this.stopGate.onIdlePrompt(tabId)) {
+        log.info({ tabId }, 'held stop never reached the agent (idle_prompt with no event since): applying it now');
+        this.updateTabFromHook(tmuxSession, 'stop');
+        return;
+      }
+    } else {
+      this.stopGate.onHookEvent(tabId);
+    }
 
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');

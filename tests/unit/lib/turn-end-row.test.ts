@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import { LedgerStore } from '@/lib/ledger-store';
-import { StopGate, BLOCK_CONFIRM_MS, type IStopGateDeps, type IStopGateTab } from '@/lib/stop-gate';
+import { StopGate, type IStopGateDeps, type IStopGateTab } from '@/lib/stop-gate';
 import {
   MAX_BLOCKS_PER_TURN,
   cleanReason,
@@ -193,7 +193,7 @@ describe('StopGate', () => {
 
   it('holds a turn end with no row, counts it, and keeps no decision or tail for it', async () => {
     const { gate, store } = make();
-    expect(await gate.decide('tab-w', tab, payload('Gate green.\n\nDONE: x'), false)).toMatchObject({ kind: 'block' });
+    expect(await gate.decide('tab-w', tab, payload('Gate green.\n\nDONE: x'), undefined)).toMatchObject({ kind: 'block' });
     expect(store.turnEnds.currentTurn(S)).toEqual({ turnId: 1, blocks: 1 });
     expect(gate.take('tab-w')).toBeNull();
     expect(gate.takeTail('tab-w', S)).toBeNull();
@@ -203,47 +203,80 @@ describe('StopGate', () => {
   it('keeps the payload message as the tail only for the bound session and only with the switch on', async () => {
     const { gate, store } = make();
     store.turnEnds.put(row());
-    expect(await gate.decide('tab-w', tab, payload('x'.repeat(700) + '\nDONE: y'), false)).toMatchObject({ kind: 'row' });
+    expect(await gate.decide('tab-w', tab, payload('x'.repeat(700) + '\nDONE: y'), undefined)).toMatchObject({ kind: 'row' });
     expect(gate.takeTail('tab-w', S)).toHaveLength(600);
     expect(gate.take('tab-w')).toMatchObject({ kind: 'row' });
-    await gate.decide('tab-w', tab, payload('DONE: z', 'another-session'), false);
+    await gate.decide('tab-w', tab, payload('DONE: z', 'another-session'), undefined);
     expect(gate.takeTail('tab-w', S)).toBeNull();
     store.close();
     const off = make({ payloadIsTail: () => false });
-    await off.gate.decide('tab-w', tab, payload('DONE: z'), false);
+    await off.gate.decide('tab-w', tab, payload('DONE: z'), undefined);
     expect(off.gate.takeTail('tab-w', S)).toBeNull();
     off.store.close();
   });
 
   it('blocks nothing without a payload message (a dropped body)', async () => {
     const { gate, store } = make();
-    expect(await gate.decide('tab-w', tab, payload(null), false)).toMatchObject({ kind: 'classifier', why: 'no payload message' });
+    expect(await gate.decide('tab-w', tab, payload(null), undefined)).toMatchObject({ kind: 'classifier', why: 'no payload message' });
     store.close();
   });
 
   it('answers within its deadline: a hung open-work read lets the stop through', async () => {
     const { gate, store } = make({ openWork: () => new Promise(() => {}), deadlineMs: 50 });
     const started = Date.now();
-    expect(await gate.decide('tab-w', tab, payload('working on it'), false)).toMatchObject({ kind: 'classifier', why: 'decision deadline' });
+    expect(await gate.decide('tab-w', tab, payload('working on it'), undefined)).toMatchObject({ kind: 'classifier', why: 'decision deadline' });
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(store.turnEnds.currentTurn(S)?.blocks).toBe(0);
     store.close();
   });
 
-  it('adversarial 2: a held stop no hook event confirms becomes UNREPORTED block-undelivered', async () => {
-    const { gate, store, at } = make();
-    await gate.decide('tab-w', tab, payload('DONE: x'), false);
-    expect(gate.unconfirmed(T0 + BLOCK_CONFIRM_MS - 1)).toEqual([]);
-    expect(gate.unconfirmed(T0 + BLOCK_CONFIRM_MS)).toEqual(['tab-w']);
-    gate.undelivered('tab-w');
-    expect(gate.take('tab-w')).toEqual({ kind: 'unreported', reason: 'block-undelivered', escalation: null });
-    at(T0 + 1);
-    gate.writeUnreported(tab, 'tab-w', 'block-undelivered');
-    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'block-undelivered', source: 'unreported' })]);
-    // A hook event after a hold confirms it: nothing to check.
-    await gate.decide('tab-w', tab, payload('DONE: x'), false);
+  it('review CONCERN: only idle_prompt with nothing since the hold makes it undelivered; any event confirms it', async () => {
+    const { gate, store } = make();
+    await gate.decide('tab-w', tab, payload('DONE: x'));
+    // A tool call (a working tab, whatever its composer shows) confirms the hold: a later idle_prompt applies nothing.
     gate.onHookEvent('tab-w');
-    expect(gate.unconfirmed(T0 + 10 * BLOCK_CONFIRM_MS)).toEqual([]);
+    expect(gate.onIdlePrompt('tab-w')).toBe(false);
+    expect(gate.take('tab-w')).toBeNull();
+    // A hold with nothing after it, then idle_prompt: UNREPORTED block-undelivered against the held turn.
+    await gate.decide('tab-w', tab, payload('DONE: x'));
+    store.turnEnds.bumpTurn(S, T0 + 5);
+    expect(gate.onIdlePrompt('tab-w')).toBe(true);
+    expect(gate.take('tab-w')).toEqual({ kind: 'unreported', reason: 'block-undelivered', escalation: null, turnId: 1 });
+    expect(gate.onIdlePrompt('tab-w')).toBe(false);
+    store.close();
+  });
+
+  it('review CONCERN: a done row written after the hold is applied at idle_prompt, never overwritten', async () => {
+    const { gate, store } = make();
+    await gate.decide('tab-w', tab, payload('DONE: x'));
+    store.turnEnds.put(row());
+    expect(gate.onIdlePrompt('tab-w')).toBe(true);
+    expect(gate.take('tab-w')).toEqual({ kind: 'row', row: row() });
+    store.close();
+  });
+
+  it('review CONCERN: an UNREPORTED write never replaces the worker\'s row; the row is kept and marked used', async () => {
+    const { gate, store } = make();
+    store.turnEnds.put(row({ reason: 'the worker\'s own' }));
+    gate.writeUnreported(tab, 'tab-w', 'cap');
+    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'DONE', reason: 'the worker\'s own', consumedAt: T0 })]);
+    store.close();
+  });
+
+  it('review nit 3: a replayed stop is judged and written against its own turn, not the current one', async () => {
+    const { gate, store } = make();
+    store.turnEnds.bumpTurn(S, T0 + 60_000);
+    store.turnEnds.bumpTurn(S, T0 + 120_000);
+    expect(store.turnEnds.turnAt(S, T0 + 30_000)).toBe(1);
+    expect(store.turnEnds.turnAt(S, T0 - 1)).toBeNull();
+    const decision = await gate.decide('tab-w', tab, payload('DONE: x'), T0 + 30_000);
+    expect(decision).toEqual({ kind: 'unreported', reason: 'not-blockable:replayed', escalation: null, turnId: 1 });
+    gate.writeUnreported(tab, 'tab-w', 'not-blockable:replayed', 1);
+    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ turnId: 1, verdict: 'UNREPORTED' })]);
+    expect(store.turnEnds.unconsumed(S, 3)).toBeNull();
+    // Its own turn's row, not the current turn's, is the one it applies.
+    store.turnEnds.put(row({ turnId: 2, reason: 'turn two' }));
+    expect(await gate.decide('tab-w', tab, payload('DONE: x'), T0 + 90_000)).toMatchObject({ kind: 'row', row: { turnId: 2 } });
     store.close();
   });
 

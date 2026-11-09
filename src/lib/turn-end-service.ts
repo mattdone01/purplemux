@@ -44,6 +44,8 @@ export interface ITurnEndDeps {
   scopeOf: (workspaceId: string, tabId: string) => Promise<IEventScope | null>;
   roots: (workspaceId: string) => Promise<string[]>;
   reader: IEvidenceReader;
+  /** The tab ran `done`, so it is working: a hold of its stop reached it (review CONCERN). */
+  confirmHeld?: (tabId: string) => void;
 }
 
 export interface IDoneInput {
@@ -110,6 +112,7 @@ export class TurnEndService {
     if (!this.deps.table().put(row)) {
       throw new TurnEndError('turn-end-refused', `turn ${turn.turnId} of session ${sessionId} already ended: its row was used by its stop`);
     }
+    this.deps.confirmHeld?.(tabId);
     return row;
   }
 
@@ -189,6 +192,7 @@ export const getTurnEndService = async (): Promise<TurnEndService> => {
       return [...new Set(real.filter((dir): dir is string => dir !== null))];
     },
     reader: validators.fsEvidenceReader,
+    confirmHeld: (tabId) => getStatusManager().confirmHeldStop(tabId),
   });
   return g.__ptTurnEndService;
 };

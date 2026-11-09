@@ -43,9 +43,17 @@ takes those two steps.
    - **Never held:** a StopFailure, a replay, a remote tab, an evaluator tab, a non-Claude tab, a tab in an open
      rotation, a coordinator and an unscoped tab. A scoped turn end among them with no row gets an `UNREPORTED`
      `not-blockable:<why>` row; a coordinator and an unscoped tab keep the classifier alone.
-6. **A hold is pending until confirmed.** The next hook event of the tab confirms it. If 15 s pass with no event and
-   the pane shows the agent at an empty prompt, the hold never arrived. The stop is then applied as `UNREPORTED`
-   `block-undelivered`. The Stop hook timeout is 5 s (tmux 1 s, the POST 3 s).
+6. **A hold is pending until confirmed** (amended by the CONFIRM review of 2026-11-10). Confirmation is positive,
+   never inferred from the screen. A hold is confirmed by any hook event of the session after it: a tool call, a
+   prompt, a notification, a stop, or a `done` row. A working tab shows an empty composer too, so the pane is never
+   read. The one sign that a hold never arrived is Claude's own `idle_prompt` notification with no event since the
+   hold: the session waits for input. The held stop is then applied at once. It uses the turn's row if the worker wrote
+   one, else an `UNREPORTED` `block-undelivered` row. A hold with no such sign stays pending, and the tab's existing
+   stall signals cover it.
+   - An `UNREPORTED` write never replaces a row. When the turn has one, that row is kept and marked used.
+   - A replayed stop is judged against its own turn: the latest turn that started at or before it fired
+     (`session_turn_starts`). It is never judged against the session's current turn.
+   - The Stop and StopFailure hooks both get a 5 s timeout (tmux 1 s, the POST 3 s).
 7. **Kill switches**, admin token only: `turn-end.source` (`row`, or `classifier` to hold nothing and read rows not
    at all) and `hook.stop-payload` (`on` or `off`).
 

@@ -20,7 +20,7 @@ describe('the Claude stop route', () => {
     status.decideClaudeStop.mockResolvedValue({ kind: 'block', reason: 'Run purplemux done …' });
     const outcome = await dispatchHook({ query: { kind: 'stop', session: 'pt-s' }, body: BODY });
     expect(outcome).toEqual({ status: 200, body: { decision: 'block', reason: 'Run purplemux done …' } });
-    expect(status.decideClaudeStop).toHaveBeenCalledWith('pt-s', { hookEvent: 'Stop', sessionId: 's-1', message: 'DONE: x' }, false);
+    expect(status.decideClaudeStop).toHaveBeenCalledWith('pt-s', { hookEvent: 'Stop', sessionId: 's-1', message: 'DONE: x' }, undefined);
     expect(status.handleProviderEvent).not.toHaveBeenCalled();
   });
 
@@ -37,7 +37,7 @@ describe('the Claude stop route', () => {
   it('a replay is decided as replayed and applied at its own time; a dropped body still applies as a plain stop', async () => {
     status.decideClaudeStop.mockResolvedValue({ kind: 'unreported', reason: 'not-blockable:replayed', escalation: null });
     await dispatchHook({ query: { kind: 'stop', session: 'pt-s' }, body: null, replayedAt: 1_700_000_000_000 });
-    expect(status.decideClaudeStop).toHaveBeenCalledWith('pt-s', { hookEvent: null, sessionId: null, message: null }, true);
+    expect(status.decideClaudeStop).toHaveBeenCalledWith('pt-s', { hookEvent: null, sessionId: null, message: null }, 1_700_000_000_000);
     expect(status.handleProviderEvent).toHaveBeenCalledWith('claude', 'pt-s', { kind: 'stop' }, 1_700_000_000_000);
   });
 

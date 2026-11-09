@@ -48,6 +48,8 @@ const fromRow = (row: ITurnEndDbRow): ITurnEndRow => ({
  */
 export class TurnEndsTable {
   static readonly RETENTION_DELETE = 'DELETE FROM turn_ends WHERE rowid IN (SELECT rowid FROM turn_ends WHERE at < ? LIMIT ?)';
+  static readonly STARTS_RETENTION_DELETE = `DELETE FROM session_turn_starts WHERE rowid IN
+    (SELECT rowid FROM session_turn_starts WHERE at < ? LIMIT ?)`;
 
   constructor(private readonly database: Database.Database) {}
 
@@ -63,14 +65,29 @@ export class TurnEndsTable {
       CREATE TABLE IF NOT EXISTS session_turns (
         session_id TEXT PRIMARY KEY, turn_id INTEGER NOT NULL, blocks INTEGER NOT NULL, updated_at INTEGER NOT NULL
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS session_turn_starts (
+        session_id TEXT NOT NULL, turn_id INTEGER NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (session_id, turn_id)
+      );
     `);
   };
 
   /** A live prompt-submit started a new turn of the session: the next turn id, and its block count at 0. */
   bumpTurn = (sessionId: string, at: number): number =>
-    (this.database.prepare(`INSERT INTO session_turns (session_id, turn_id, blocks, updated_at) VALUES (?, 1, 0, ?)
-      ON CONFLICT(session_id) DO UPDATE SET turn_id = turn_id + 1, blocks = 0, updated_at = excluded.updated_at
-      RETURNING turn_id`).get(sessionId, at) as { turn_id: number }).turn_id;
+    this.database.transaction(() => {
+      const turnId = (this.database.prepare(`INSERT INTO session_turns (session_id, turn_id, blocks, updated_at) VALUES (?, 1, 0, ?)
+        ON CONFLICT(session_id) DO UPDATE SET turn_id = turn_id + 1, blocks = 0, updated_at = excluded.updated_at
+        RETURNING turn_id`).get(sessionId, at) as { turn_id: number }).turn_id;
+      this.database.prepare('INSERT OR REPLACE INTO session_turn_starts (session_id, turn_id, at) VALUES (?, ?, ?)').run(sessionId, turnId, at);
+      return turnId;
+    })();
+
+  /**
+   * The turn a stop that happened at `at` belongs to: the latest turn the session started at or before it (review nit
+   * 3: a replayed stop is judged against its own turn, never the session's current one). Null when none is recorded.
+   */
+  turnAt = (sessionId: string, at: number): number | null =>
+    (this.database.prepare(`SELECT turn_id FROM session_turn_starts WHERE session_id = ? AND at <= ?
+      ORDER BY turn_id DESC LIMIT 1`).get(sessionId, at) as { turn_id: number } | undefined)?.turn_id ?? null;
 
   /** The session's current turn and how often its stop was blocked; null before its first prompt-submit. */
   currentTurn = (sessionId: string): { turnId: number; blocks: number } | null => {
@@ -95,6 +112,17 @@ export class TurnEndsTable {
         head_sha = excluded.head_sha, gate_log = excluded.gate_log, gate_verdict = excluded.gate_verdict, reason = excluded.reason,
         source = excluded.source, unreported_reason = excluded.unreported_reason, at = excluded.at, consumed_at = excluded.consumed_at
       WHERE turn_ends.consumed_at IS NULL`).run(row).changes === 1;
+
+  /**
+   * An UNREPORTED row for a turn end with no valid row. It never replaces a row (review CONCERN): when the turn already
+   * has one, nothing is written and false is returned.
+   */
+  putIfAbsent = (row: ITurnEndRow): boolean =>
+    this.database.prepare(`INSERT INTO turn_ends (session_id, turn_id, workspace_id, tab_id, seat_role, story, attempt, verdict,
+        head_sha, gate_log, gate_verdict, reason, source, unreported_reason, at, consumed_at)
+      VALUES (@sessionId, @turnId, @workspaceId, @tabId, @seatRole, @story, @attempt, @verdict, @head, @gateLog, @gateVerdict,
+        @reason, @source, @unreportedReason, @at, @consumedAt)
+      ON CONFLICT(session_id, turn_id) DO NOTHING`).run(row).changes === 1;
 
   /** The turn's row while no stop has used it. */
   unconsumed = (sessionId: string, turnId: number): ITurnEndRow | null => {

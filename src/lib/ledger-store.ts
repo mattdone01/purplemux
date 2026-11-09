@@ -922,7 +922,8 @@ export class LedgerStore {
       tabEvents: await this.deleteInChunks('DELETE FROM tab_events WHERE seq IN (SELECT seq FROM tab_events WHERE at < ? LIMIT ?)',
         [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
       tabTurns: await this.deleteInChunks(TabTurnsTable.RETENTION_DELETE, [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
-      turnEnds: await this.deleteInChunks(TurnEndsTable.RETENTION_DELETE, [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
+      turnEnds: await this.deleteInChunks(TurnEndsTable.RETENTION_DELETE, [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS])
+        + await this.deleteInChunks(TurnEndsTable.STARTS_RETENTION_DELETE, [now - LEDGER_TAB_EVENTS_RETENTION_DAYS * DAY_MS]),
       checkpoints: await this.deleteInChunks(RotationCheckpointsTable.RETENTION_DELETE, [cutoff]),
       items: await this.deleteInChunks(`DELETE FROM items WHERE (workspace_id, item_key) IN (SELECT workspace_id, item_key FROM items
         WHERE closed_at IS NOT NULL AND closed_at < ? LIMIT ?)`, [cutoff]),

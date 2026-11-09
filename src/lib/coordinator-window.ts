@@ -13,6 +13,11 @@ import type { TInboxKind } from '@/types/inbox';
 // router half; this module is kept to the one rule both of them read.
 
 export const COORDINATOR_WINDOW_MS = 10 * 60_000;
+/**
+ * The inbox republishes its heads every tick (2 s). Heads older than this are not read (review nit 3): an inbox that
+ * stopped ticking must not hold a coordinator's digest behind an item it no longer dispatches.
+ */
+export const INBOX_HEADS_TTL_MS = 10_000;
 
 /** The `lastRefusal` prefix of an inbox item deferred by the window: no refusal budget is spent on it. */
 export const WINDOW_DEFERRAL = 'coordinator-window:';
@@ -53,6 +58,7 @@ export class CoordinatorWindow {
   private readonly claims = new Map<string, number>();
   /** Per tab: when its oldest windowed inbox item that waits only on the window was created (set by the inbox tick). */
   private inboxHeads = new Map<string, number>();
+  private inboxHeadsAt = -Infinity;
 
   constructor(private readonly deps: ICoordinatorWindowDeps) {}
 
@@ -84,10 +90,12 @@ export class CoordinatorWindow {
   /** The inbox tick's view of each tab's oldest item that waits only on the window (ruling, change 3: fairness). */
   setInboxHeads(heads: ReadonlyMap<string, number>): void {
     this.inboxHeads = new Map(heads);
+    this.inboxHeadsAt = this.deps.now();
   }
 
   /** The digest goes first unless an inbox item for the tab has waited longer than its oldest held row. */
   digestTurn(workspaceId: string, tabId: string): boolean {
+    if (this.deps.now() - this.inboxHeadsAt > INBOX_HEADS_TTL_MS) return true;
     const inbox = this.inboxHeads.get(key(workspaceId, tabId));
     if (inbox === undefined) return true;
     const digest = this.oldestDigest(workspaceId, tabId);
