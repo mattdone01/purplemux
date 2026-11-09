@@ -760,6 +760,10 @@ POST /api/cli/notes
   Response: { "note": INoteView }. 413 note-too-large (exit 2), 400 note-target-missing / note-invalid
   (exit 2), 403 forbidden (exit 3) for a fromEpic the caller does not hold or a cross-workspace
   sender that is neither the verified current source orchestrator nor the owner-granted tab.
+  A workspace-bound service sender (ADR-0044: a token in ~/.purplemux/service-senders.json, no tab)
+  is the tab-less caller of its home workspace, and may note only the one workspace its grant names,
+  by toWorkspace (admission "service"). Every other cross-workspace target is 403 forbidden. It
+  counts against the open-note cap of its home workspace's tab-less sender.
 
 GET /api/cli/notes[?open=1][&toMe=1][&fromMe=1][&epic=SLUG]
   Notes the caller's workspace sent or receives (admin: all), without bodies.

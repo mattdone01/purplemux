@@ -32,7 +32,7 @@ const resetGlobals = () => {
   for (const key of [
     '__ptTabLifecycle', '__ptTabTokens', '__ptTabTokenLock', '__ptTabTokenRevokeInstalled',
     '__ptLayoutContentCache', '__ptLayoutLock', '__ptWorkspaceTokens', '__ptCliToken',
-    '__purplemuxWorkspaceLock', '__purplemuxWorkspacesContentCache',
+    '__purplemuxWorkspaceLock', '__purplemuxWorkspacesContentCache', '__ptServiceSenders',
   ]) delete g[key];
 };
 
@@ -295,6 +295,54 @@ describe('resolveCaller', () => {
       expect(await resolveCaller(req({ 'x-pmux-token': token }))).toMatchObject({
         workspaceId: 'ws-a', tabId: 'tab-adopted', verified: true,
       });
+    });
+  });
+  describe('a workspace-bound service sender (ADR-0044)', () => {
+    const grantTo = async (noteTarget = 'ws-b') => {
+      const { grantServiceSender } = await import('@/lib/service-senders');
+      const tokenFile = path.join(mockHome.value, 'svc', 'improve-lessons.token');
+      grantServiceSender({ name: 'improve-lessons', workspaceId: 'ws-a', noteTarget }, tokenFile);
+      return (await fs.readFile(tokenFile, 'utf-8')).trim();
+    };
+
+    it('names the tab-less caller of its home workspace and carries its grant', async () => {
+      const token = await grantTo();
+      const { resolveCaller } = await import('@/lib/caller');
+      const service = { name: 'improve-lessons', workspaceId: 'ws-a', noteTarget: 'ws-b' };
+      expect(await resolveCaller(req({ 'x-pmux-token': token }))).toEqual({
+        scope: { type: 'workspace', workspaceId: 'ws-a', service },
+        workspaceId: 'ws-a',
+        tabId: null,
+        tabName: null,
+        verified: false,
+        identity: 'none',
+        admin: false,
+        service,
+      });
+    });
+
+    it('never borrows a tab through the session header', async () => {
+      const token = await grantTo();
+      const { resolveCaller } = await import('@/lib/caller');
+      expect(await resolveCaller(req({ 'x-pmux-token': token, 'x-pmux-session': 'pt-ws-a-pane-1-tab-a1' })))
+        .toMatchObject({ workspaceId: 'ws-a', tabId: null, verified: false, identity: 'none' });
+    });
+
+    it('stops resolving once the entry is revoked, and an unknown token never resolves', async () => {
+      const token = await grantTo();
+      const { revokeServiceSender } = await import('@/lib/service-senders');
+      const { resolveCaller } = await import('@/lib/caller');
+      expect(await resolveCaller(req({ 'x-pmux-token': `${token.slice(0, -1)}${token.endsWith('0') ? '1' : '0'}` }))).toBeNull();
+      expect(revokeServiceSender('improve-lessons')).toBe(true);
+      expect(await resolveCaller(req({ 'x-pmux-token': token }))).toBeNull();
+    });
+
+    it('a group- or world-writable registry grants nothing', async () => {
+      const token = await grantTo();
+      const { serviceSendersFile } = await import('@/lib/service-senders');
+      const { resolveCaller } = await import('@/lib/caller');
+      await fs.chmod(serviceSendersFile(), 0o620);
+      expect(await resolveCaller(req({ 'x-pmux-token': token }))).toBeNull();
     });
   });
 });

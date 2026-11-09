@@ -212,6 +212,7 @@ export const viewOf = (note: INote, notice: Pick<IInboxItem, 'state'> | null): I
     tabId: note.from.tabId,
     human: note.admission?.mode === 'human',
     owner: note.admission?.mode === 'owner',
+    service: note.admission?.mode === 'service' ? note.admission.service : undefined,
   });
   return { ...rest, state: presentedState(note, notice), bodyBytes: Buffer.byteLength(body, 'utf8'), fromLabel };
 };

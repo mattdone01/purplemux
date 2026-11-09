@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { verifyTokenValue } from '@/lib/cli-token';
+import { resolveServiceToken, type IServiceGrant } from '@/lib/service-senders';
 import { notePresented, resolveTabToken, tokenOrigin } from '@/lib/tab-token';
 
 const TOKENS_FILE = path.join(os.homedir(), '.purplemux', 'workspace-tokens.json');
@@ -60,7 +61,9 @@ export type TCliScope =
    * A per-tab token (ADR-0010) resolves to the same scope and additionally
    * names its tab for verified read grants, Scrum Master selection and caller attribution.
    */
-  | { type: 'workspace'; workspaceId: string; tabId?: string; tabVerified?: true; tabIdentity?: 'launch' | 'hook' };
+  | { type: 'workspace'; workspaceId: string; tabId?: string; tabVerified?: true; tabIdentity?: 'launch' | 'hook';
+    /** A workspace-bound service sender (ADR-0044): tab-less in `workspaceId`, granted to note one other workspace. */
+    service?: IServiceGrant };
 
 /**
  * Resolve what the caller is allowed to touch. Agents run with a workspace-scoped
@@ -81,7 +84,10 @@ export const resolveCliScope = (req: NextApiRequest, opts: { response?: NextApiR
   }
 
   const tab = resolveTabToken(value);
-  if (!tab) return null;
+  if (!tab) {
+    const service = resolveServiceToken(value);
+    return service ? { type: 'workspace', workspaceId: service.workspaceId, service } : null;
+  }
   // Only a token the server bound at session creation is proof; a hook-time token names the tab (story 36).
   // Scope resolution never records presentation before a completed successful route.
   const response = opts.response as (NextApiResponse & { [key: symbol]: boolean | undefined }) | undefined;
