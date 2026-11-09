@@ -179,7 +179,8 @@ describe('an explicit human review naming the orchestrator is an asserted proces
     expect(isMissionHumanInboxItem(item)).toBe(true);
     // The opener row keeps the sender's own identity, so an asserted review stays visible as asserted.
     const row = store.openItemOpeners().find((entry) => entry.itemId === 'item-explicit');
-    expect(row?.opener ?? null).toEqual(opener);
+    expect(row).toBeDefined();
+    expect(row!.opener).toEqual(opener);
   });
 
   it('naming a tab other than the configured orchestrator: refused 409, nothing opens', async () => {

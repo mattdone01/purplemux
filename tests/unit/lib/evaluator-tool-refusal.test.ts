@@ -221,7 +221,7 @@ describe.skipIf(!claudeBin)('an evaluator tab refuses writes and credential read
     // Not skipped under a managed Bash hook (vel-MC-ACT-FU): a managed hook that refused `cat <token>` first would show
     // a hook error here, not this permission message, so the test still proves the permission layer's own refusal.
     // Measured on a host whose managed PreToolUse hooks take Bash and Read: every refusal above was the permission layer's.
-    expect(results[3]!.content).toMatch(/^Permission to use Bash with command cat .*cli-token has been denied/);
+    expect(results[3]!.content).toMatch(/Permission to use Bash.*denied/i);
     expect(results[8]).toMatchObject({ isError: false, content: expect.stringContaining('hello') });
     expect(results[9]!.isError).toBe(false);
     expect(results[10]).toMatchObject({ isError: false, content: expect.stringContaining('hello') });

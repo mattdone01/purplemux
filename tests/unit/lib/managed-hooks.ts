@@ -10,10 +10,10 @@ import path from 'path';
 export const LINUX_MANAGED_SETTINGS_DIR = '/etc/claude-code';
 
 /**
- * Whether a hook matcher selects a tool, as Claude Code reads it: an absent, empty or `*` matcher selects every tool; a
- * matcher of letters, digits, `_` and `|` is a list of exact names (`Edit|Write`); anything else is a regular
- * expression tested against the tool name (`Notebook.*`). A matcher that is not a valid expression selects nothing,
- * so it cannot skip a test.
+ * Whether a hook matcher selects a tool, in the forms the hook documentation names: an absent, empty or `*` matcher
+ * selects every tool; a matcher of letters, digits, `_` and `|` is a list of exact names (`Edit|Write`); anything else
+ * is a regular expression (`Notebook.*`), tested here unanchored against the tool name. A matcher that is not a valid
+ * expression counts as selecting the tool: the fail-safe side is a skip with its reason, never a false failure.
  */
 export const matcherSelects = (matcher: unknown, tool: string): boolean => {
   if (matcher === undefined || matcher === null || matcher === '' || matcher === '*') return true;
@@ -22,7 +22,7 @@ export const matcherSelects = (matcher: unknown, tool: string): boolean => {
   try {
     return new RegExp(matcher).test(tool);
   } catch {
-    return false;
+    return true;
   }
 };
 

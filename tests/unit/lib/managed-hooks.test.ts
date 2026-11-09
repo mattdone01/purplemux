@@ -65,15 +65,23 @@ describe('managedPreToolUseHookFiles: the evaluator tests skip where a managed P
     expect(managedPreToolUseHookFiles('Bash', dir, 'linux')).toEqual([file]);
   });
 
-  it('matcherSelects reads a matcher as Claude Code does', () => {
+  it('matcherSelects reads the documented matcher forms', () => {
     expect(matcherSelects('Bash', 'Bash')).toBe(true);
     expect(matcherSelects('Edit|Write', 'Bash')).toBe(false);
     expect(matcherSelects('BashOutput', 'Bash')).toBe(false);
     expect(matcherSelects('mcp__.*', 'Bash')).toBe(false);
     expect(matcherSelects('mcp__.*', 'mcp__chrome-devtools__navigate_page')).toBe(true);
-    expect(matcherSelects('(unclosed', 'Bash')).toBe(false);
     expect(matcherSelects(42, 'Bash')).toBe(false);
     expect(matcherSelects(undefined, 'Bash')).toBe(true);
+  });
+
+  // #65 review: a matcher that is not a valid expression cannot be read, so it counts as selecting the tool. The test
+  // skips with its reason; it never runs under a hook that might refuse first and fail for the wrong cause.
+  it('an invalid regex matcher counts as selecting the tool (fail safe)', async () => {
+    expect(matcherSelects('(unclosed', 'Bash')).toBe(true);
+    expect(matcherSelects('[', 'Read')).toBe(true);
+    const file = await write('managed-settings.json', preToolUse('(unclosed'));
+    expect(managedPreToolUseHookFiles('Bash', dir, 'linux')).toEqual([file]);
   });
 
   it('ignores files with no PreToolUse hook: other events, an empty hook list, other keys, invalid JSON', async () => {
