@@ -1786,7 +1786,7 @@ describe('MissionControlStore: an owner action opened without a human review (ve
     const store = new MissionControlStore(databasePath());
     seedRun(store);
     const opened = openAction('event-action', 'item-action');
-    store.applyEvents([opened], new Map([[opened.eventId, reviewAuthority]]));
+    store.applyEvents([opened], new Map([[opened.eventId, { ...reviewAuthority, opener: { tabId: binding.tabId, identity: 'launch' as const } }]]));
 
     const item = store.snapshot().items.find((entry) => entry.id === 'item-action')!;
     expect(item.state).toBe('open');
@@ -1805,10 +1805,25 @@ describe('MissionControlStore: an owner action opened without a human review (ve
     const store = new MissionControlStore(databasePath());
     seedRun(store);
     const opened = openAction('event-worker-action', 'item-worker-action');
-    store.applyEvents([opened], new Map([[opened.eventId, { resolvedIdentity: observedIdentity('worker'), configuredOrchestratorTabId: binding.tabId }]]));
+    store.applyEvents([opened], new Map([[opened.eventId, {
+      resolvedIdentity: observedIdentity('worker'), configuredOrchestratorTabId: binding.tabId, opener: { tabId: 'tab-worker', identity: 'launch' as const },
+    }]]));
     const item = store.snapshot().items.find((entry) => entry.id === 'item-worker-action')!;
     expect(item.state).toBe('candidate');
     expect(item.humanReview).toBeNull();
+  });
+
+  it('the orchestrator\'s identity without the orchestrator as opener, or the opener named with another identity: a candidate', () => {
+    const store = new MissionControlStore(databasePath());
+    seedRun(store);
+    const noOpener = openAction('event-no-opener', 'item-no-opener');
+    store.applyEvents([noOpener], new Map([[noOpener.eventId, reviewAuthority]]));
+    const spoofed = openAction('event-spoofed', 'item-spoofed');
+    store.applyEvents([spoofed], new Map([[spoofed.eventId, {
+      resolvedIdentity: observedIdentity('worker'), configuredOrchestratorTabId: binding.tabId, opener: { tabId: binding.tabId, identity: 'launch' as const },
+    }]]));
+    const states = store.snapshot().items.filter((entry) => entry.id === 'item-no-opener' || entry.id === 'item-spoofed').map((entry) => entry.state);
+    expect(states).toEqual(['candidate', 'candidate']);
   });
 
   it('with no configured orchestrator: a candidate, as before', () => {

@@ -1,38 +1,463 @@
 {
-  "about": "vel-MC-ACT: the owner-steps lint tuning set. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names a substring the finding must carry. negative: an ordinary decision question, including every false positive the review of PR #60 named. Synthetic text in the shape of served questions; no owner text copied.",
+  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named.",
   "positive": [
-    { "name": "paste into", "question": { "kind": "question", "context": "Copy the new token from the sign-in page. Paste it into the repository secret named DEPLOY_TOKEN." }, "expect": ["'Copy the'", "'Paste it'", "in context"] },
-    { "name": "paste with a full stop before 'to'", "question": { "kind": "question", "context": "Paste the value the device flow shows. It goes to the deploy secret." }, "expect": ["'Paste the'"] },
-    { "name": "your steps", "question": { "kind": "question", "context": "Your steps: rotate the token and confirm here." }, "expect": ["'Your steps'"] },
-    { "name": "a bare Steps: heading", "question": { "kind": "question", "context": "Steps:\n- Sign in to the console\n- Rotate the key" }, "expect": ["'Steps:'", "'Sign in'", "'Rotate the'"] },
-    { "name": "numbered owner steps", "question": { "kind": "question", "context": "1. Open the repository settings.\n2. Go to Secrets and variables.\n3. Click New repository secret." }, "expect": ["3 owner steps", "'Open the'", "'Go to'", "'Click New'"] },
-    { "name": "click a button", "question": { "kind": "question", "context": "Click Approve on the pull request, then choose the merge time." }, "expect": ["'Click Approve'"] },
-    { "name": "run this", "question": { "kind": "question", "context": "Run this once on the build host: `make bootstrap`." }, "expect": ["'Run this'"] },
-    { "name": "run the following", "question": { "kind": "question", "context": "Run the following:\n```\nmake bootstrap\n```\nThen pick a merge window." }, "expect": ["'Run the'"] },
-    { "name": "please run", "question": { "kind": "question", "context": "If the check fails, please run the setup script again." }, "expect": ["'please <do>'"] },
-    { "name": "navigate", "question": { "kind": "question", "context": "Navigate to the billing page and pick a plan." }, "expect": ["'Navigate to'"] },
-    { "name": "a step in the decision", "question": { "kind": "question", "decision": "Rotate the token, then pick its expiry?", "context": "The token expires on Friday." }, "expect": ["in decision"] },
-    { "name": "a step in an option consequence", "question": { "kind": "question", "context": "Pick how the key changes.", "options": [{ "id": "a", "label": "Rotate now", "consequence": "Then sign in to the console and approve the change." }, { "id": "b", "label": "Wait" }] }, "expect": ["in options[0].consequence", "'sign in'"] },
-    { "name": "press a key", "question": { "kind": "question", "context": "Press Enter at the prompt, and the install continues." }, "expect": ["'Press Enter'"] }
+    {
+      "name": "paste into",
+      "question": {
+        "kind": "question",
+        "context": "Copy the new token from the sign-in page. Paste it into the repository secret named DEPLOY_TOKEN."
+      },
+      "expect": [
+        "'Copy the'",
+        "'Paste it'",
+        "in context"
+      ]
+    },
+    {
+      "name": "paste with a full stop before 'to'",
+      "question": {
+        "kind": "question",
+        "context": "Paste the value the device flow shows. It goes to the deploy secret."
+      },
+      "expect": [
+        "'Paste the'"
+      ]
+    },
+    {
+      "name": "your steps",
+      "question": {
+        "kind": "question",
+        "context": "Your steps: rotate the token and confirm here."
+      },
+      "expect": [
+        "'Your steps'"
+      ]
+    },
+    {
+      "name": "a bare Steps: heading",
+      "question": {
+        "kind": "question",
+        "context": "Steps:\n- Sign in to the console\n- Rotate the key"
+      },
+      "expect": [
+        "'Steps:'",
+        "'Sign in'",
+        "'Rotate the'"
+      ]
+    },
+    {
+      "name": "numbered owner steps",
+      "question": {
+        "kind": "question",
+        "context": "1. Open the repository settings.\n2. Go to Secrets and variables.\n3. Click New repository secret."
+      },
+      "expect": [
+        "3 owner steps",
+        "'Open the'",
+        "'Go to'",
+        "'Click New'"
+      ]
+    },
+    {
+      "name": "click a button",
+      "question": {
+        "kind": "question",
+        "context": "Click Approve on the pull request, then choose the merge time."
+      },
+      "expect": [
+        "'Click Approve'"
+      ]
+    },
+    {
+      "name": "run this",
+      "question": {
+        "kind": "question",
+        "context": "Run this once on the build host: `make bootstrap`."
+      },
+      "expect": [
+        "'Run this'"
+      ]
+    },
+    {
+      "name": "run the following",
+      "question": {
+        "kind": "question",
+        "context": "Run the following:\n```\nmake bootstrap\n```\nThen pick a merge window."
+      },
+      "expect": [
+        "'Run the'"
+      ]
+    },
+    {
+      "name": "please run",
+      "question": {
+        "kind": "question",
+        "context": "If the check fails, please run the setup script again."
+      },
+      "expect": [
+        "'please <do>'"
+      ]
+    },
+    {
+      "name": "navigate",
+      "question": {
+        "kind": "question",
+        "context": "Navigate to the billing page and pick a plan."
+      },
+      "expect": [
+        "'Navigate to'"
+      ]
+    },
+    {
+      "name": "a step in an option consequence",
+      "question": {
+        "kind": "question",
+        "context": "Pick how the key changes.",
+        "options": [
+          {
+            "id": "a",
+            "label": "Rotate now",
+            "consequence": "Then sign in to the console and approve the change."
+          },
+          {
+            "id": "b",
+            "label": "Wait"
+          }
+        ]
+      },
+      "expect": [
+        "in options[0].consequence",
+        "'sign in'"
+      ]
+    },
+    {
+      "name": "press a key",
+      "question": {
+        "kind": "question",
+        "context": "Press Enter at the prompt, and the install continues."
+      },
+      "expect": [
+        "'Press Enter'"
+      ]
+    },
+    {
+      "name": "an owner-steps phrase in the decision",
+      "question": {
+        "kind": "question",
+        "decision": "Your steps first, then pick the expiry",
+        "context": "The token expires on Friday."
+      },
+      "expect": [
+        "'Your steps'"
+      ]
+    },
+    {
+      "name": "you'll need to",
+      "question": {
+        "kind": "question",
+        "context": "You'll need to restart the service after the merge, so pick a quiet hour."
+      },
+      "expect": [
+        "'you need to <do>'"
+      ]
+    },
+    {
+      "name": "after that, paste",
+      "question": {
+        "kind": "question",
+        "context": "The page shows a code. After that, paste the code into the box."
+      },
+      "expect": [
+        "'paste the'"
+      ]
+    },
+    {
+      "name": "add a secret",
+      "question": {
+        "kind": "question",
+        "context": "Add the secret DEPLOY_TOKEN to the repository settings."
+      },
+      "expect": [
+        "'Add the'"
+      ]
+    },
+    {
+      "name": "merge, then reply",
+      "question": {
+        "kind": "question",
+        "context": "Merge the PR once CI is green. Reply with the merge time."
+      },
+      "expect": [
+        "'Merge the'",
+        "'Reply with'"
+      ]
+    },
+    {
+      "name": "approve the pull request",
+      "question": {
+        "kind": "question",
+        "context": "Approve the pull request in the web UI before the release window."
+      },
+      "expect": [
+        "'Approve the'"
+      ]
+    },
+    {
+      "name": "shape: numbered owner steps in the context",
+      "question": {
+        "kind": "question",
+        "context": "Before the window opens:\n1. Sign in to the vendor console.\n2. Open the API keys page.\n3. Create a key named release-bot.\nThen choose the window below."
+      },
+      "expect": [
+        "3 owner steps",
+        "'Sign in'",
+        "'Open the'",
+        "'Create a'"
+      ]
+    },
+    {
+      "name": "shape: a Paste to <party> block",
+      "question": {
+        "kind": "question",
+        "context": "Paste to the partner's support desk:\n> We rotate our key on Friday at 09:00.\nThen pick whether we wait for their reply."
+      },
+      "expect": [
+        "'Paste to'"
+      ]
+    },
+    {
+      "name": "shape: a Your steps: block",
+      "question": {
+        "kind": "question",
+        "context": "Your steps:\n- approve the access request\n- confirm the new cost centre\nDecide which cost centre to use."
+      },
+      "expect": [
+        "'Your steps'"
+      ]
+    },
+    {
+      "name": "shape: a click <button> instruction",
+      "question": {
+        "kind": "question",
+        "context": "In the billing page, click Upgrade plan, then tell us which tier you chose."
+      },
+      "expect": [
+        "'click Upgrade'"
+      ]
+    },
+    {
+      "name": "shape: a run this command",
+      "question": {
+        "kind": "question",
+        "context": "Run this from your laptop: `tool login --device`. Which account should the agents use?"
+      },
+      "expect": [
+        "'Run this'"
+      ]
+    }
   ],
   "negative": [
-    { "name": "click-through rate", "question": { "kind": "question", "context": "Click-through rate fell 3% after the change. Ship the new layout or revert?" } },
-    { "name": "one-click rollback", "question": { "kind": "question", "context": "A one-click rollback exists for both paths." } },
-    { "name": "double-click", "question": { "kind": "question", "context": "Double-click handling in the old UI is gone." } },
-    { "name": "clicks as a noun", "question": { "kind": "question", "context": "Clicks dropped 3% this week; click rate is flat." } },
-    { "name": "should I run this migration", "question": { "kind": "question", "context": "Should I run this migration on prod tonight, or wait for the freeze to end?" } },
-    { "name": "numbered options", "question": { "kind": "question", "context": "1. Ship staged to one tenant.\n2. Ship to all tenants at once.\n3. Hold until Monday." } },
-    { "name": "paste by someone else", "question": { "kind": "question", "context": "The bot will paste the log into the issue for you to read." } },
-    { "name": "open question", "question": { "kind": "question", "context": "Open question: should the lock reuse the pre-flight gate?" } },
-    { "name": "open items as a noun", "question": { "kind": "question", "context": "Open items: 3. The queue is otherwise empty." } },
-    { "name": "run time", "question": { "kind": "question", "context": "Run time is 12 minutes on the new runner." } },
-    { "name": "past tense", "question": { "kind": "question", "context": "We ran this job twice and pasted the output into the ticket." } },
-    { "name": "copy of", "question": { "kind": "question", "context": "Copy of the report is attached as evidence." } },
-    { "name": "type as a label", "question": { "kind": "question", "context": "Type: decision. Scope: one story." } },
-    { "name": "press as a noun", "question": { "kind": "question", "context": "Press coverage is unchanged either way." } },
-    { "name": "sign-in as a noun", "question": { "kind": "question", "context": "Sign-in failures rose after the release. Sign in rates are flat." } },
-    { "name": "a quoted command in a code block", "question": { "kind": "question", "context": "The worker ran:\n```\nclick Save\nrun this\n```\nDid it pick the right target?" } },
-    { "name": "approve is the decision itself", "question": { "kind": "question", "context": "Approve or reject the staged rollout." } },
-    { "name": "go-to-market", "question": { "kind": "question", "context": "The go-to-market date moves to May." } }
+    {
+      "name": "click-through rate",
+      "question": {
+        "kind": "question",
+        "context": "Click-through rate fell 3% after the change. Ship the new layout or revert?"
+      }
+    },
+    {
+      "name": "one-click rollback",
+      "question": {
+        "kind": "question",
+        "context": "A one-click rollback exists for both paths."
+      }
+    },
+    {
+      "name": "double-click",
+      "question": {
+        "kind": "question",
+        "context": "Double-click handling in the old UI is gone."
+      }
+    },
+    {
+      "name": "clicks as a noun",
+      "question": {
+        "kind": "question",
+        "context": "Clicks dropped 3% this week; click rate is flat."
+      }
+    },
+    {
+      "name": "should I run this migration",
+      "question": {
+        "kind": "question",
+        "context": "Should I run this migration on prod tonight, or wait for the freeze to end?"
+      }
+    },
+    {
+      "name": "numbered options",
+      "question": {
+        "kind": "question",
+        "context": "1. Ship staged to one tenant.\n2. Ship to all tenants at once.\n3. Hold until Monday."
+      }
+    },
+    {
+      "name": "paste by someone else",
+      "question": {
+        "kind": "question",
+        "context": "The bot will paste the log into the issue for you to read."
+      }
+    },
+    {
+      "name": "open question",
+      "question": {
+        "kind": "question",
+        "context": "Open question: should the lock reuse the pre-flight gate?"
+      }
+    },
+    {
+      "name": "open items as a noun",
+      "question": {
+        "kind": "question",
+        "context": "Open items: 3. The queue is otherwise empty."
+      }
+    },
+    {
+      "name": "run time",
+      "question": {
+        "kind": "question",
+        "context": "Run time is 12 minutes on the new runner."
+      }
+    },
+    {
+      "name": "past tense",
+      "question": {
+        "kind": "question",
+        "context": "We ran this job twice and pasted the output into the ticket."
+      }
+    },
+    {
+      "name": "copy of",
+      "question": {
+        "kind": "question",
+        "context": "Copy of the report is attached as evidence."
+      }
+    },
+    {
+      "name": "type as a label",
+      "question": {
+        "kind": "question",
+        "context": "Type: decision. Scope: one story."
+      }
+    },
+    {
+      "name": "press as a noun",
+      "question": {
+        "kind": "question",
+        "context": "Press coverage is unchanged either way."
+      }
+    },
+    {
+      "name": "sign-in as a noun",
+      "question": {
+        "kind": "question",
+        "context": "Sign-in failures rose after the release. Sign in rates are flat."
+      }
+    },
+    {
+      "name": "a quoted command in a code block",
+      "question": {
+        "kind": "question",
+        "context": "The worker ran:\n```\nclick Save\nrun this\n```\nDid it pick the right target?"
+      }
+    },
+    {
+      "name": "approve is the decision itself",
+      "question": {
+        "kind": "question",
+        "context": "Approve or reject the staged rollout."
+      }
+    },
+    {
+      "name": "go-to-market",
+      "question": {
+        "kind": "question",
+        "context": "The go-to-market date moves to May."
+      }
+    },
+    {
+      "name": "go to production",
+      "question": {
+        "kind": "question",
+        "context": "Go to production tonight or hold until Monday?"
+      }
+    },
+    {
+      "name": "a sentence-initial decision verb",
+      "question": {
+        "kind": "question",
+        "context": "Run this migration tonight? Install the patch now or on Monday?"
+      }
+    },
+    {
+      "name": "an imperative decision",
+      "question": {
+        "kind": "question",
+        "decision": "Select the rollout path",
+        "context": "Staged keeps one tenant on the old build."
+      }
+    },
+    {
+      "name": "press on",
+      "question": {
+        "kind": "question",
+        "context": "Press on with the plan, or pause for the audit."
+      }
+    },
+    {
+      "name": "open to",
+      "question": {
+        "kind": "question",
+        "context": "Open to suggestions on the timing."
+      }
+    },
+    {
+      "name": "a Title Case heading",
+      "question": {
+        "kind": "question",
+        "context": "Press Coverage: unchanged either way."
+      }
+    },
+    {
+      "name": "shape: a decision with (a)/(b) options and a recommendation",
+      "question": {
+        "kind": "question",
+        "context": "The release can ship staged or all at once. (a) staged: one tenant first, two days longer (b) all tenants tonight. Recommended: (a), because the rollback is tested only on one tenant.",
+        "options": [
+          {
+            "id": "a",
+            "label": "Staged",
+            "consequence": "One tenant first; done on Thursday."
+          },
+          {
+            "id": "b",
+            "label": "All tenants",
+            "consequence": "Done tonight; no partial rollback."
+          }
+        ]
+      }
+    },
+    {
+      "name": "shape: a status question with no owner step",
+      "question": {
+        "kind": "question",
+        "context": "The nightly import finished at 04:10 with 2 rejected rows. Both rows are duplicates of rows imported yesterday. Accept the import as complete?"
+      }
+    },
+    {
+      "name": "shape: a question quoting a log line with click",
+      "question": {
+        "kind": "question",
+        "context": "The UI test log shows:\n2026-11-09T04:44:10Z ui: click Save -> 500 (timeout)\nand `click handler bound twice` on retry. Ship the fix tonight or wait for the full suite?"
+      }
+    }
   ]
 }

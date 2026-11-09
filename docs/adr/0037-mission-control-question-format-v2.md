@@ -238,22 +238,38 @@ A recurrence the owner raised. Two things went missing from Mission Control:
 
 **Case 2's cause.** An attention.opened with no `humanReview` is stored as a **candidate** (`candidateReason: workspace-issue`), whatever its kind. A candidate is the orchestrator's to review and never reaches the owner's Needs you list. That was measured before: an item needs a human review to show. An owner action opened without a review was therefore invisible to the owner until an attention.updated added one.
 
-- **Fix: the server stamps the orchestrator's own owner action.** When the configured orchestrator, on the run's bound session, opens a kind=action with no `humanReview`, the store stamps `humanNeed: external-action`:
-  - `humanReason` is "An action only the owner can take: <decision or title>." plus its whyNow;
-  - `handling` says the server stamped it;
-  - `reviewerTabId` is the orchestrator.
-  The item opens in the owner's list. Its opener is the reviewer, so nothing is skipped: the same checks as an explicit review apply.
-- **Anyone else's action is still a candidate.** A kind=action from any other tab, or with no configured orchestrator, stays a candidate for the orchestrator's review, as before. Both the events route and `mc ask` (the check route) warn the opener: `humanReview: absent on a kind=action`, with who makes it visible.
+- **Fix: the server stamps the orchestrator's own owner action.**
+  - **Production path:** `mission events` and the events route go through `applyMissionEventBatch`. For an attention.opened kind=action with no `humanReview`, the batch reads two things:
+    - the opener's live identity: the opener is the server-resolved caller tab, never a payload claim (ADR-0023);
+    - the workspace's configured orchestrator.
+  - **When it stamps:** only when the opener IS the configured orchestrator, and its live identity matches the run's binding. These are the checks an explicit review passes. The store then stamps `humanNeed: external-action`:
+    - `humanReason` is "An action only the owner can take: <decision or title>." plus its whyNow;
+    - `handling` says the server stamped it;
+    - `reviewerTabId` is the orchestrator.
+    The item opens in the owner's list.
+  - **Pinned end to end:** through `applyMissionEventBatch` and the real store, with no injected authority.
+- **Anyone else's action is still a candidate.** That covers:
+  - a kind=action opened by any other tab;
+  - one opened by a server or admin producer with no opener;
+  - one opened by the orchestrator tab whose live session no longer matches the binding;
+  - any action when no orchestrator is configured.
+  Each stays a candidate for the orchestrator's review, as before. Both the events route and `mc ask` (the check route) warn the opener: `humanReview: absent on a kind=action`, naming who makes it visible.
+- **After the stamp:** the item is open like any reviewed item. An attention.updated that changes its text needs a `humanReview` again (renewed review, as for every open item).
 - **The view.** The Needs you list also renders an open owner item the page holds no draft for yet, from a fresh draft. That closes a one-render gap only; it was not case 2's cause.
 
 **Owner steps are lint, not a refusal.**
-- **What is read:** every attention.opened and attention.updated of a kind=question, in its `context`, `decision`, `whyNow` and the options' `consequence` and `description`. Code blocks are dropped, since they hold quoted text.
+- **What is read:** every attention.opened and attention.updated of a kind=question, in its `context`, `whyNow` and the options' `consequence` and `description`. Code blocks are dropped, since they hold quoted text.
 - **What counts as a step:**
-  - an owner verb that starts a sentence, a line or a list item, with what makes it a command: "Click Approve", "Paste it into", "Open the", "Go to", "Sign in to", "Run this", "Run the following", "Press Enter";
-  - or a phrase that addresses the owner's steps: "Your steps", "Steps:", "please <do>".
+  - **An owner verb that starts a sentence, a line, a list item or a comma clause** ("In the billing page, click Upgrade"), after a connective such as "then" or "after that", followed by what makes it a command. Examples: "Click Approve", "Paste it into", "Open the", "Go to Settings", "Sign in to", "Run this", "Run the following", "Press Enter", "Add the", "Merge the", "Restart the", "Reply with".
+  - **Or a phrase that addresses the owner's steps:** "Your steps", "Steps:", "please <do>", "you'll need to <do>", "you must <do>".
+- **What does not count:**
+  - A sentence that ends with "?", whole: a question, not a step ("Run this migration tonight, or wait?").
+  - An imperative in `decision`. A v2 decision is often imperative ("Select the rollout path"), so there only the phrases count.
+  - A verb that is also a noun without its command form: "Run time", "Open question", "Copy of", "Press coverage", "Press on", "Open to", "Go to production", "Sign-in rates", a capitalised heading such as "Press Coverage:".
 - **The finding** names the steps, the fields they were found in, and the split. Each owner step becomes its own kind=action item (answerType `action-done`, humanNeed `external-action`), and the question keeps to the decision.
 - **The fixture set:** the patterns are tuned on `tests/fixtures/mission-questions/owner-steps.json`.
   - Its positives are the owner-step forms.
-  - Its negatives include every false positive the review named: "click-through rate", "one-click rollback", "Should I run this migration?", numbered decision options. They also include nouns that look like verbs ("Run time", "Open question", "Copy of", "Press coverage", "Sign-in rates").
+  - Its negatives include every false positive the reviews named.
+  - Every case is neutral synthetic text modelled on the shapes of real items. The repository is public, so no real Mission Control text goes in, not even with names stripped. The lint is measured over the real items on the control host, outside the repository; only the counts and the shapes it got wrong come back as new synthetic cases.
   - No served question fixture (`mc-question-v2`) is flagged.
 - **A heuristic, so it never refuses.** A pattern cannot tell every step from a description of one, and a refused question would hide the decision too. A kind=action item is not read: it is the step.

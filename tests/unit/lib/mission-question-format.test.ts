@@ -361,7 +361,7 @@ describe('ownerStepsLint (vel-MC-ACT)', () => {
 
   it('names every field it found steps in, in one finding', () => {
     const [finding] = ownerStepsLint({
-      kind: 'question', decision: 'Rotate the key now?', context: 'Your steps: click Save, then confirm.',
+      kind: 'question', decision: 'Your steps come first', context: 'Your steps: click Save, then confirm.',
       options: [{ id: 'a', label: 'Yes', consequence: 'Then sign in to the console.' }, { id: 'b', label: 'No' }],
     });
     expect(finding.field).toBe('context, decision, options[0].consequence');

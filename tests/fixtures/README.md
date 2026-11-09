@@ -64,5 +64,8 @@ The three 2026-11-04 incidents (ws-zOfVyu D14, hfl-37, hfl-38) kept no capture; 
 `owner-steps.json` is the tuning set of the owner-steps lint (vel-MC-ACT, `ownerStepsLint` in
 `src/lib/mission-question-format.ts`). Its `positive` cases are owner steps written into a kind=question, each with the
 text the finding must carry; its `negative` cases are ordinary decision questions, among them every false positive the
-review of PR #60 named. Synthetic text in the shape of served questions; no owner text copied.
+reviews of PR #60 named. Every case is neutral synthetic text modelled on the shapes of real items (a decision with
+(a)/(b) options and a recommendation, numbered owner steps, a "Paste to <party>" block, a "Your steps:" block, a "click
+<button>" instruction, a "run this" command, a status question, a quoted log line that says "click"). The repository is
+public: no real Mission Control text goes in, not even with names stripped.
 `tests/unit/lib/mission-question-format.test.ts` reads it, and also requires that no `mc-question-v2` item is flagged.

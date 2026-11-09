@@ -182,30 +182,36 @@ export const questionLint = (question: TMissionStoredQuestion): IMissionQuestion
   return findings;
 };
 
+const STEP_VERBS = 'click|tap|press|paste|copy|run|open|go|navigate|sign|log|enter|type|select|upload|download|install|rotate|add|set|update|create|merge|restart|reset|grant|send|reply|connect|plug|unplug|approve|visit';
+
 /** Phrases that address the owner's own steps, anywhere in the text. */
 const OWNER_STEP_PHRASES: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(?:your|owner|manual)\s+steps?\b/i, "'Your steps'"],
   [/\bsteps\s+for\s+you\b/i, "'steps for you'"],
   [/^\s*steps\s*:/im, "'Steps:'"],
-  [/\bplease\s+(?:click|tap|press|paste|copy|run|open|go\s+to|navigate|sign\s+in|log\s+in|enter|type|rotate|upload|install)\b/i, "'please <do>'"],
+  [new RegExp(`\\bplease\\s+(?:${STEP_VERBS})\\b`, 'i'), "'please <do>'"],
+  [new RegExp(`\\byou(?:'ll|\\s+will)?\\s+(?:need|have)\\s+to\\s+(?:${STEP_VERBS})\\b`, 'i'), "'you need to <do>'"],
+  [new RegExp(`\\byou\\s+must\\s+(?:${STEP_VERBS})\\b`, 'i'), "'you must <do>'"],
 ];
 
 /**
  * An owner step: an imperative verb at the start of a sentence, a line or a list item, followed by what makes it a
  * command, since most of these verbs are also nouns or a question's own words ("Press coverage", "Run time", "Open
- * question", "Copy of", "Type:", "Click rate", "Sign-in rate").
+ * question", "Copy of", "Type:", "Click rate", "Sign-in rate", "Go to production", "Press on", "Open to").
  */
-const OBJECT = String.raw`(?:the|your|it|this|that|these|a|an|on|into|in|to|with|as|https?:|` + '`' + String.raw`|"|')`;
+const OBJECT = String.raw`(?:(?:the|your|it|this|that|these|a|an)\b|https?:|` + '`' + String.raw`|")`;
 const OWNER_STEP_IMPERATIVES: readonly RegExp[] = [
-  new RegExp(String.raw`^(?:click|tap|press|paste|copy|enter|type|select|upload|install|rotate|visit)\s+${OBJECT}`, 'i'),
-  // A UI label after click, tap or press: "Click Approve", "Press Enter" (case-sensitive: the label is capitalised).
-  /^(?:[Cc]lick|[Tt]ap|[Pp]ress)\s+[A-Z][\w-]*/,
-  new RegExp(String.raw`^(?:go|navigate)\s+to\s+`, 'i'),
+  new RegExp(String.raw`^(?:paste|copy|enter|type|select|upload|download|install|rotate|visit|add|set|update|create|merge|restart|reset|grant|send|connect|unplug|approve)\s+${OBJECT}`, 'i'),
+  new RegExp(String.raw`^(?:click|tap)\s+(?:on\s+)?${OBJECT}`, 'i'),
+  new RegExp(String.raw`^(?:plug\s+in|reply\s+with|paste\s+(?:to|into))\b`, 'i'),
+  // A UI label after click, tap or press ("Click Approve", "Press Enter"); not a capitalised heading ("Press Coverage:").
+  /^(?:[Cc]lick|[Tt]ap|[Pp]ress)\s+(?![\w-]+\s*:)[A-Z]/,
+  /^(?:[Gg]o|[Nn]avigate)\s+to\s+(?:the\b|your\b|https?:|`|[A-Z])/,
   new RegExp(String.raw`^(?:sign|log)\s+in\s+(?:to|with|as|again|using)\b`, 'i'),
-  new RegExp(String.raw`^open\s+(?!questions?\b|items?\b|issues?\b|risks?\b)${OBJECT}`, 'i'),
+  new RegExp(String.raw`^open\s+(?:(?:the|your|a|an)\b|https?:|` + '`' + String.raw`)(?!\s*(?:questions?|items?|issues?|risks?)\b)`, 'i'),
   new RegExp(String.raw`^run\s+(?:this|these|the\s+following|the\s+command|the\s+script|` + '`' + String.raw`|:)`, 'i'),
 ];
-const LEADING_CONNECTIVE = /^(?:then|and|now|next|first|finally)[,\s]+/i;
+const LEADING_CONNECTIVE = /^(?:then|and|now|next|first|finally|after\s+that|once\s+(?:that\s+is\s+|it\s+is\s+)?done)[,\s]+/i;
 
 /** The owner step a clause starts with, by its first words; null when it is not one. */
 const ownerStepOf = (clause: string): string | null => {
@@ -215,9 +221,19 @@ const ownerStepOf = (clause: string): string | null => {
 };
 const LIST_MARKER = /^\s*(?:[-*•]|\d{1,2}[.):]|step\s+\d{1,2}[.):]?)\s+/i;
 
-/** Sentences, lines and list items, each without its list marker. */
+/**
+ * Sentences, lines and list items, each without its list marker, then each sentence's comma clauses ("In the billing
+ * page, click Upgrade"). A sentence that asks ("Run this migration tonight, or wait?") is dropped whole: a question is
+ * not a step.
+ */
 const clauses = (text: string): string[] =>
-  text.split('\n').flatMap((line) => line.replace(LIST_MARKER, '').split(/(?<=[.!?;])\s+/)).map((part) => part.trim()).filter(Boolean);
+  text.split('\n')
+    .flatMap((line) => line.replace(LIST_MARKER, '').split(/(?<=[.!?;])\s+/))
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && !sentence.endsWith('?'))
+    .flatMap((sentence) => sentence.split(/,\s+/))
+    .map((part) => part.trim())
+    .filter(Boolean);
 
 /** The question's own words: never `title` (v1 title IS the decision), code blocks dropped (quoted text, not a step). */
 const ownerStepTexts = (question: Record<string, unknown>): Array<[string, string]> => {
@@ -255,7 +271,8 @@ export const ownerStepsLint = (question: Record<string, unknown>): IMissionQuest
   const fields: string[] = [];
   for (const [field, text] of ownerStepTexts(question)) {
     const phrases = OWNER_STEP_PHRASES.filter(([pattern]) => pattern.test(text)).map(([, name]) => name);
-    const steps = clauses(text).map(ownerStepOf).filter((step): step is string => step !== null);
+    // A v2 decision is often imperative ("Select the rollout path"): there only an explicit owner-step phrase counts.
+    const steps = field === 'decision' ? [] : clauses(text).map(ownerStepOf).filter((step): step is string => step !== null);
     if (!phrases.length && !steps.length) continue;
     fields.push(field);
     found.push(...phrases.filter((name) => !found.includes(name)));
