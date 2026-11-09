@@ -454,6 +454,28 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     expect(shipped && Buffer.from(shipped[1], 'base64').toString('utf-8')).toBe(REMOTE_TRUST_SEED_SCRIPT);
   });
 
+  // vel-PMX-FU: the cwd the creator named is pre-trusted by name, outside every workspace directory.
+  it('a named cwd outside every workspace directory: the seed runs with --named and every workspace directory', async () => {
+    workspaceDirs.map.set('ws-r', ['/srv/ws-one', '/srv/ws-two']);
+    const { createSession } = await import('@/lib/tmux');
+    await createSession(REMOTE, 120, 40, '/srv/elsewhere/repo', { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: '/srv/elsewhere/repo' });
+    await createSession(REMOTE, 120, 40, '/srv/ws-one/sub', { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: '/srv/ws-one/sub/' });
+    const seedLines = calls.list.map((call) => (call.input ?? '').split('\n').find((l) => l.startsWith('if command -v python3')));
+    expect(seedLines).toEqual([
+      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/elsewhere/repo' '/srv/ws-one' '/srv/ws-two' >/dev/null 2>&1 || :; fi`,
+      `if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/ws-one/sub' '/srv/ws-one' >/dev/null 2>&1 || :; fi`,
+    ]);
+  });
+
+  it('a cwd that is not the named one (the pane moved, or none was named) is not named', async () => {
+    workspaceDirs.map.set('ws-r', ['/srv/ws-one']);
+    const { createSession, remoteTrustTarget } = await import('@/lib/tmux');
+    await createSession(REMOTE, 120, 40, '/srv/elsewhere/moved', { workspaceId: 'ws-r', tabId: 'tab-remote1' }, { trustCwd: '/srv/elsewhere/repo' });
+    expect((calls.list[0].input ?? '').split('\n').filter((line) => line.includes('python3'))).toEqual([]);
+    expect(await remoteTrustTarget(REMOTE, { workspaceId: 'ws-r', tabId: 'tab-remote1' }, '/srv/elsewhere/repo')).toBeNull();
+    expect(await remoteTrustTarget(REMOTE, { workspaceId: 'ws-r', tabId: 'tab-remote1' }, '/srv/elsewhere/repo', 'relative/repo')).toBeNull();
+  });
+
   // The kit always ships the script (the Claude launch line runs it); the create runs no seed line here.
   it('pre-trusts nothing for a cwd outside every workspace directory, or with no cwd', async () => {
     workspaceDirs.map.set('ws-r', ['/home/mdone/code/nomupay']);

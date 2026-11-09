@@ -59,11 +59,20 @@ export const buildRemoteClaudeCommand = (opts: {
   skipPermissions?: boolean;
   /** The workspace's directories on this server's record: the seed trusts the cwd only under one of them. */
   workspaceDirectories?: readonly string[];
+  /**
+   * The cwd the tab's creator named (vel-PMX-FU): the seed takes it literally with `--named`, never `"$PWD"`, which
+   * is wherever the pane's shell stands when the line is typed, a directory the agent may have chosen.
+   */
+  namedCwd?: string;
 }): string => {
+  if (opts.namedCwd !== undefined && !opts.namedCwd.startsWith('/')) {
+    throw new Error(`a named cwd must be an absolute path: ${JSON.stringify(opts.namedCwd)}`);
+  }
   const seed = [
     'python3', remoteKitPath(REMOTE_TRUST_SEED_RELATIVE), '--first-run',
     ...(opts.skipPermissions ? ['--bypass-permissions'] : []),
-    '"$PWD"', ...(opts.workspaceDirectories ?? []).map(shQuote),
+    ...(opts.namedCwd !== undefined ? ['--named', shQuote(opts.namedCwd)] : ['"$PWD"']),
+    ...(opts.workspaceDirectories ?? []).map(shQuote),
   ].join(' ');
   const parts = [`PATH=${remoteKitPath('bin')}:"$PATH"`, 'claude', '--settings', remoteKitPath('hooks.json')];
   if (opts.workspaceId) parts.push('--append-system-prompt-file', remoteKitPath(remotePromptRelative(opts.workspaceId)));
@@ -80,11 +89,17 @@ export const buildRemoteClaudeCommand = (opts: {
  * node: `ssh … sh -s` reads no login profile, and on the pool hosts `node` is on PATH only in a login shell
  * (measured on mdserver1).
  *
- * `trust-seed.py [--first-run] [--bypass-permissions] <cwd> [<workspace directory>...]`
+ * `trust-seed.py [--first-run] [--bypass-permissions] [--named] <cwd> [<workspace directory>...]`
  *
  * - Always: the pre-trust (D14, ruling R-05, story 05 consult ruling), the same keys as workspace-trust.ts for the
  *   cwd, its git root and its main repository root, each only when its REAL path is inside the deepest workspace
  *   directory that holds the cwd's real path.
+ * - `--named`: the cwd is the one the tab's creator named (`tab create --cwd`), and D14 found no workspace directory
+ *   for it (vel-PMX-FU consult ruling C). The trust key goes on the cwd only, as given and as its real path: Claude
+ *   reads trust walking up from the cwd, so a key on a parent would trust every sibling. The main repository root
+ *   gets the CLAUDE.md-include keys only (where Claude keys the imports approval), never the trust key. Refused,
+ *   writing no project key: a cwd that is not a directory (exit 5); `/`, a top-level directory, the home or an
+ *   ancestor of it, at either spelling (exit 6). A refused repository root is dropped and the cwd keys stay.
  * - `--first-run`: the onboarding a new host asks for before the first prompt (measured 2026-11-09 on two new
  *   hosts: the theme picker, then the project onboarding): `hasCompletedOnboarding`, a `theme` when none is set,
  *   and `hasCompletedProjectOnboarding` on each trusted project.
@@ -92,14 +107,15 @@ export const buildRemoteClaudeCommand = (opts: {
  *   `--dangerously-skip-permissions` (the warning was the second stop on those hosts).
  *
  * Exit 0: written or nothing to change; 2: an unknown flag, nothing written; 3: the cwd is outside every workspace
- * directory (the first-run keys are still written); 4: a file is unreadable and is left as it is (the other file is
- * still written). Every caller ignores the exit: a lost seed shows the dialog, which the status reader reports as
+ * directory and not named (the first-run keys are still written); 4: a file is unreadable and is left as it is (the
+ * other file is still written); 5 and 6: the named refusals above (the first-run keys are still written). Every caller ignores the exit: a lost seed shows the dialog, which the status reader reports as
  * `startup-prompt`.
  */
 export const REMOTE_TRUST_SEED_SCRIPT = `import json, os, sys, tempfile
-TRUST_KEYS = ('hasTrustDialogAccepted', 'hasClaudeMdExternalIncludesApproved', 'hasClaudeMdExternalIncludesWarningShown')
+INCLUDE_KEYS = ('hasClaudeMdExternalIncludesApproved', 'hasClaudeMdExternalIncludesWarningShown')
+TRUST_KEYS = ('hasTrustDialogAccepted',) + INCLUDE_KEYS
 FIRST_RUN_PROJECT_KEYS = ('hasCompletedProjectOnboarding',)
-FLAGS = ('--first-run', '--bypass-permissions')
+FLAGS = ('--first-run', '--bypass-permissions', '--named')
 DEFAULT_THEME = 'dark'
 
 def within(child, root):
@@ -153,6 +169,32 @@ def trust_keys(cwd, workspace_dirs):
             keys.append(key)
     return keys
 
+def refused(path, home):
+    # '/', a top-level directory, or the home or one of its ancestors: a trust key there trusts every project below.
+    return path == '/' or os.path.dirname(path) == '/' or within(home, path)
+
+def named_entries(cwd):
+    home = os.path.realpath(os.path.expanduser('~'))
+    if not os.path.isabs(home):
+        return 6
+    given, real = os.path.abspath(cwd), os.path.realpath(cwd)
+    if not os.path.isdir(real):
+        return 5
+    if refused(given, home) or refused(real, home):
+        return 6
+    entries = [(given, TRUST_KEYS), (real, TRUST_KEYS)]
+    current = real
+    while not os.path.lexists(os.path.join(current, '.git')):
+        parent = os.path.dirname(current)
+        if parent == current:
+            return entries
+        current = parent
+    root = main_repository_root(current)
+    dot_git = os.path.join(root, '.git') if root else ''
+    if root and os.path.isdir(dot_git) and not os.path.islink(dot_git) and not refused(root, home) and not refused(os.path.realpath(root), home):
+        entries.append((root, INCLUDE_KEYS))
+    return entries
+
 def read_object(target):
     try:
         with open(target, encoding='utf-8') as handle:
@@ -182,7 +224,7 @@ def write_object(target, data, mode=None):
         os.unlink(temporary)
         raise
 
-def seed_state(keys, first_run):
+def seed_state(entries, first_run):
     target = os.path.realpath(os.path.join(os.path.expanduser('~'), '.claude.json'))
     data = read_object(target)
     if data is None:
@@ -198,8 +240,13 @@ def seed_state(keys, first_run):
     projects = data.get('projects')
     if not isinstance(projects, dict):
         projects = {}
-    names = TRUST_KEYS + (FIRST_RUN_PROJECT_KEYS if first_run else ())
-    for key in keys:
+    wanted = {}
+    for key, names in entries:
+        merged = wanted.setdefault(key, [])
+        for name in names + (FIRST_RUN_PROJECT_KEYS if first_run else ()):
+            if name not in merged:
+                merged.append(name)
+    for key, names in wanted.items():
         entry = projects.get(key)
         if entry is not None and not isinstance(entry, dict):
             continue
@@ -236,14 +283,21 @@ def main(argv):
         flags.append(argv.pop(0))
     if any(flag not in FLAGS for flag in flags) or not argv:
         return 2
-    first_run, bypass = '--first-run' in flags, '--bypass-permissions' in flags
+    first_run, bypass, named = '--first-run' in flags, '--bypass-permissions' in flags, '--named' in flags
     keys = trust_keys(argv[0], argv[1:])
-    readable = seed_state(keys or [], first_run)
+    if keys is not None:
+        entries, code = [(key, TRUST_KEYS) for key in keys], 0
+    elif named:
+        found = named_entries(argv[0])
+        entries, code = ([], found) if isinstance(found, int) else (found, 0)
+    else:
+        entries, code = [], 3
+    readable = seed_state(entries, first_run)
     if bypass:
         readable = seed_settings() and readable
     if not readable:
         return 4
-    return 3 if keys is None else 0
+    return code
 
 sys.exit(main(sys.argv[1:]))
 `;
@@ -391,11 +445,25 @@ export class RemoteKitBrokenError extends Error {
 }
 
 /**
+ * What a create pre-trusts on the host: the cwd, the workspace directories D14 checks it against, and whether the
+ * tab's creator named this cwd (`--named`, vel-PMX-FU), which lets the seed trust it outside every workspace.
+ */
+export interface IRemoteTrustTarget {
+  cwd: string;
+  workspaceDirectories: readonly string[];
+  named: boolean;
+}
+
+/**
  * The create script's pre-trust line: run only when python3 exists, every failure ignored, so a seed never
  * blocks a launch (story 05 AC 2). Runs after the kit files land and before the session starts.
  */
-export const remoteTrustSeedLine = (trust: { cwd: string; workspaceDirectory: string }): string =>
-  `if command -v python3 >/dev/null 2>&1; then python3 "$d/${REMOTE_TRUST_SEED_RELATIVE}" ${shQuote(trust.cwd)} ${shQuote(trust.workspaceDirectory)} >/dev/null 2>&1 || :; fi`;
+export const remoteTrustSeedLine = (trust: IRemoteTrustTarget): string =>
+  `if command -v python3 >/dev/null 2>&1; then python3 "$d/${REMOTE_TRUST_SEED_RELATIVE}" ${[
+    ...(trust.named ? ['--named'] : []),
+    trust.cwd,
+    ...trust.workspaceDirectories,
+  ].map(shQuote).join(' ')} >/dev/null 2>&1 || :; fi`;
 
 // Story 12 AC 3: no script starts a pane, or answers for the kit, without a CLI that ran.
 const kitCliModules = (files: readonly IRemoteKitFile[], what: string): string[] => {
@@ -443,7 +511,7 @@ export const buildRemotePromptScript = (workspaceId: string, prompt: string): st
  * One `sh -s` script: refuse a session name that exists (exit 17, before any
  * file is written), write every kit file (base64, a temporary, one rename),
  * run the kit's CLI once and refuse when it does not run (exit 18, story 12; the files must hold `bin/cli.js` and
- * `bin/purplemux`), pre-trust the cwd when it is inside a workspace directory (fail-open),
+ * `bin/purplemux`), pre-trust the cwd when it is inside a workspace directory or the creator named it (fail-open),
  * create the session with the kit's tmux.conf and tag it with this call's nonce
  * in the same tmux command, and re-read the config into a server that already ran. Fed on stdin, so file
  * contents and secrets never reach a command line.
@@ -456,8 +524,8 @@ export const buildRemoteCreateScript = (opts: {
   rows: number;
   cwd?: string;
   launch: string;
-  /** Pre-trust the cwd (D14): the kit files must include the trust-seed script. */
-  trust?: { cwd: string; workspaceDirectory: string };
+  /** Pre-trust the cwd (D14, and a named cwd, vel-PMX-FU): the kit files must include the trust-seed script. */
+  trust?: IRemoteTrustTarget;
 }): string => {
   if (opts.trust && !opts.files.some((file) => file.path === REMOTE_TRUST_SEED_RELATIVE)) {
     throw new Error(`a pre-trust needs the kit file ${REMOTE_TRUST_SEED_RELATIVE}`);

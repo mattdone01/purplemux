@@ -167,7 +167,7 @@ describe('the remote trust-seed script (story 05 AC 2)', () => {
 
   it('a seed that fails, or a host without python3, never stops the create script', () => {
     const run = (script: string, pathEnv: string) => execFileSync('/bin/sh', ['-c', script], { env: { ...process.env, HOME: home, PATH: pathEnv }, encoding: 'utf-8' });
-    const line = remoteTrustSeedLine({ cwd: workspace, workspaceDirectory: workspace });
+    const line = remoteTrustSeedLine({ cwd: workspace, workspaceDirectories: [workspace], named: false });
     fs.writeFileSync(path.join(kit, REMOTE_TRUST_SEED_RELATIVE), 'import sys\nsys.exit(1)\n');
     expect(run(`set -e\nd="${kit}"\n${line}\necho created`, process.env.PATH ?? '')).toBe('created\n');
     const noPython = fs.mkdtempSync(path.join(home, 'bin-'));
@@ -175,7 +175,130 @@ describe('the remote trust-seed script (story 05 AC 2)', () => {
   });
 
   it('quotes the cwd and the workspace directory for the remote shell', () => {
-    expect(remoteTrustSeedLine({ cwd: "/srv/it's here", workspaceDirectory: '/srv' }))
+    expect(remoteTrustSeedLine({ cwd: "/srv/it's here", workspaceDirectories: ['/srv'], named: false }))
       .toBe(`if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '/srv/it'\\''s here' '/srv' >/dev/null 2>&1 || :; fi`);
+    expect(remoteTrustSeedLine({ cwd: '/srv/a', workspaceDirectories: ['/w1', '/w2'], named: true }))
+      .toBe(`if command -v python3 >/dev/null 2>&1; then python3 "$d/trust-seed.py" '--named' '/srv/a' '/w1' '/w2' >/dev/null 2>&1 || :; fi`);
+  });
+});
+
+// vel-PMX-FU, consult ruling C: a remote tab create pre-trusts the cwd its creator named, on the host, outside every
+// workspace directory: the trust key on the cwd only, the CLAUDE.md-include keys on its main repository root, and
+// hard refusals for a cwd whose trust would cover the home or the whole disk. Run for real against a fake home.
+describe('the named cwd pre-trust (vel-PMX-FU)', () => {
+  const INCLUDES = { hasClaudeMdExternalIncludesApproved: true, hasClaudeMdExternalIncludesWarningShown: true };
+  let root: string;
+  let home: string;
+  let kit: string;
+  let workspace: string;
+
+  beforeEach(() => {
+    // Nested, so the home has an ancestor that is not a top-level directory.
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-named-')));
+    home = path.join(root, 'users', 'user');
+    kit = path.join(home, '.purplemux-remote', 'control-host');
+    fs.mkdirSync(kit, { recursive: true });
+    fs.writeFileSync(path.join(kit, REMOTE_TRUST_SEED_RELATIVE), REMOTE_TRUST_SEED_SCRIPT);
+    workspace = path.join(home, 'code', 'workspace-dir');
+    fs.mkdirSync(path.join(workspace, '.git'), { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const seed = (args: string[]) =>
+    spawnSync('python3', [path.join(kit, REMOTE_TRUST_SEED_RELATIVE), ...args], { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+  const configFile = () => path.join(home, '.claude.json');
+  const projects = () => JSON.parse(fs.readFileSync(configFile(), 'utf-8')).projects ?? {};
+
+  it('outside every workspace directory: the trust key on the cwd only, the include keys on the repository root', () => {
+    const repo = path.join(home, 'elsewhere', 'repo');
+    fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'src'));
+    fs.writeFileSync(configFile(), JSON.stringify({ oauthAccount: { id: 'kept' }, projects: { '/other': { allowedTools: ['Bash'] } } }));
+
+    expect(seed(['--named', path.join(repo, 'src'), workspace]).status).toBe(0);
+
+    const written = JSON.parse(fs.readFileSync(configFile(), 'utf-8'));
+    expect(written.oauthAccount).toEqual({ id: 'kept' });
+    expect(written.projects).toEqual({
+      '/other': { allowedTools: ['Bash'] },
+      [path.join(repo, 'src')]: TRUSTED,
+      [repo]: INCLUDES,
+    });
+    expect(fs.statSync(configFile()).mode & 0o777).toBe(0o600);
+    expect(fs.readdirSync(home).filter((name) => name.startsWith('.claude.json.'))).toEqual([]);
+  });
+
+  it('a linked worktree outside the workspace: trust on the worktree, the include keys on its main checkout; both spellings of a link', () => {
+    const main = path.join(home, 'clones', 'main');
+    fs.mkdirSync(path.join(main, '.git', 'worktrees', 'wt'), { recursive: true });
+    fs.writeFileSync(path.join(main, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+    const worktree = path.join(home, 'trees', 'wt');
+    fs.mkdirSync(worktree, { recursive: true });
+    fs.writeFileSync(path.join(worktree, '.git'), `gitdir: ${main}/.git/worktrees/wt\n`);
+    const link = path.join(home, 'link-to-wt');
+    fs.symlinkSync(worktree, link);
+
+    expect(seed(['--first-run', '--named', link]).status).toBe(0);
+
+    const onboarded = { ...TRUSTED, hasCompletedProjectOnboarding: true };
+    expect(projects()).toEqual({
+      [link]: onboarded,
+      [worktree]: onboarded,
+      [main]: { ...INCLUDES, hasCompletedProjectOnboarding: true },
+    });
+  });
+
+  it('a cwd inside a workspace directory still takes the D14 rule under --named', () => {
+    fs.mkdirSync(path.join(workspace, 'src'));
+    expect(seed(['--named', path.join(workspace, 'src'), workspace]).status).toBe(0);
+    expect(projects()).toEqual({ [path.join(workspace, 'src')]: TRUSTED, [workspace]: TRUSTED });
+  });
+
+  it('refuses a cwd whose trust would cover the home or the disk (exit 6) and a missing one (exit 5), writing no project key', () => {
+    fs.symlinkSync('/', path.join(home, 'to-root'));
+    fs.symlinkSync(home, path.join(root, 'to-home'));
+    fs.mkdirSync(path.join(home, 'x'));
+    const cases: Array<[string, number]> = [
+      ['/', 6],
+      [path.parse(root).root + root.split(path.sep)[1], 6],
+      [home, 6],
+      [path.dirname(home), 6],
+      [path.join(home, 'to-root'), 6],
+      [path.join(root, 'to-home'), 6],
+      [`${home}/x/..`, 6],
+      [path.join(home, 'no-such-dir'), 5],
+    ];
+    for (const [cwd, code] of cases) {
+      expect(seed(['--named', cwd]).status, cwd).toBe(code);
+      expect(fs.existsSync(configFile()), cwd).toBe(false);
+    }
+    fs.writeFileSync(configFile(), '{"keep": 1}');
+    for (const [cwd, code] of cases) {
+      expect(seed(['--named', cwd]).status, cwd).toBe(code);
+      expect(fs.readFileSync(configFile(), 'utf-8'), cwd).toBe('{"keep": 1}');
+    }
+    for (const [cwd, code] of cases) {
+      expect(seed(['--first-run', '--named', cwd]).status, cwd).toBe(code);
+      const written = JSON.parse(fs.readFileSync(configFile(), 'utf-8'));
+      expect(written.projects ?? {}, cwd).toEqual({});
+      expect(written.hasCompletedOnboarding, cwd).toBe(true);
+    }
+  });
+
+  it('a dotfiles repository in the home: the cwd keys only, nothing at the home', () => {
+    fs.mkdirSync(path.join(home, '.git'));
+    fs.mkdirSync(path.join(home, 'proj'));
+    expect(seed(['--named', path.join(home, 'proj')]).status).toBe(0);
+    expect(projects()).toEqual({ [path.join(home, 'proj')]: TRUSTED });
+  });
+
+  it('no widening without --named: an empty workspace list still exits 3 and writes nothing', () => {
+    const repo = path.join(home, 'elsewhere', 'repo');
+    fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
+    expect(seed([repo]).status).toBe(3);
+    expect(fs.existsSync(configFile())).toBe(false);
+    expect(seed(['--named']).status).toBe(2);
   });
 });

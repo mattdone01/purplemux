@@ -320,10 +320,12 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
 
       // Agent tabs launch their CLI by default (mirrors UI tab creation) —
       // a bare shell made `tab send` briefs land in bash, not the agent.
+      // The creator's own --cwd of a remote tab: the host pre-trusts it by name (vel-PMX-FU). A defaulted cwd is not.
+      const trustCwd = remoteHost && isCwdShape(cwd) ? cwd : undefined;
       const shouldLaunch = launch !== false && isAgentPanelType(resolvedType);
       const agentLaunchConfig = agentLaunchConfigFromOptions(model, reasoning);
       const command = shouldLaunch
-        ? await buildFreshLaunchCommand(workspaceId, { panelType: resolvedType, host: remoteHost, agentLaunchConfig, role: roleCheck.role, previewOrigin: roleCheck.previewOrigin, pgService: roleCheck.pgService })
+        ? await buildFreshLaunchCommand(workspaceId, { panelType: resolvedType, host: remoteHost, agentLaunchConfig, role: roleCheck.role, previewOrigin: roleCheck.previewOrigin, pgService: roleCheck.pgService, ...(trustCwd ? { trustCwd } : {}) })
         : undefined;
 
       try {
@@ -333,6 +335,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           reportsTo: typeof reportsTo === 'string' ? reportsTo : undefined,
           reportOn: reportOnChecked.markers ?? undefined,
           host: remoteHost,
+          ...(trustCwd ? { trustCwd } : {}),
           role: roleCheck.role,
           previewOrigin: roleCheck.previewOrigin,
           pgService: roleCheck.pgService,
