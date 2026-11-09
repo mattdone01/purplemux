@@ -546,6 +546,27 @@ export const releaseLease = async (rawName: unknown, holder: ILeaseHolder, autho
 };
 
 /**
+ * Release a lease the holder holds, only when `check` accepts it (vel-POOL-ENF: a pool slot's own ask token). The check
+ * runs inside the lock on the stored lease and throws to refuse; nothing is released then.
+ */
+export const releaseLeaseWhere = async (
+  rawName: unknown,
+  holder: ILeaseHolder,
+  authority: ILeaseAuthority,
+  check: (lease: ILease) => void,
+): Promise<ILease> => {
+  requireHolder(holder);
+  const { name } = parseLeaseName(rawName);
+  const now = authority.now();
+  const lease = await transact(now, (state) => {
+    check(findHeld(state, name, holder, now));
+    const r = releaseInState(state, name, holder, now);
+    return { state: r.state, value: r.lease, effects: [{ type: 'released', lease: r.lease, reason: 'released', by: holder }] };
+  });
+  return lease.value!;
+};
+
+/**
  * The admin token, or a human session from Mission Control (ADR-0029 §8), with a reason; audited.
  * Cooperative for the admin: the admin token is readable by every agent (C-312 class).
  * The admin's reason is cut to 500 code points; a human's longer reason is refused.
