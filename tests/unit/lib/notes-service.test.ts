@@ -1074,3 +1074,102 @@ describe('owner notes (ADR-0029)', () => {
     expect(f.note(sent.id)).toMatchObject({ admission: { mode: 'owner' }, deliveredTo: { workspaceId: 'ws-2', tabId: 'tab-b' } });
   });
 });
+
+describe('service-sender notes (ADR-0044)', () => {
+  // ws-1 is the timer's home workspace; ws-9 is the Scrum Master workspace its grant names.
+  const GRANT = { name: 'improve-lessons', workspaceId: 'ws-1', noteTarget: 'ws-9' };
+  const svcCaller = (service: { name: string; workspaceId: string; noteTarget: string } | undefined, workspaceId = 'ws-1') =>
+    ({ scope: { type: 'workspace', workspaceId, ...(service ? { service } : {}) }, workspaceId, tabId: null, tabName: null,
+      verified: false, identity: 'none', admin: false, ...(service ? { service } : {}) } as unknown as ICaller);
+  const S = svcCaller(GRANT);
+  let f: Fakes;
+  let svc: NotesService;
+  let granted: Set<string>;
+
+  beforeEach(() => {
+    f = new Fakes();
+    f.epics.set('ddh', { workspaceId: 'ws-1', tabId: 'tab-a' });
+    f.epics.set('sm', { workspaceId: 'ws-9', tabId: 'tab-orch' });
+    granted = new Set(['improve-lessons/ws-1/ws-9']);
+    svc = new NotesService({
+      ...f.deps(),
+      serviceGrantActive: (name, ws, target) => granted.has(`${name}/${ws}/${target}`),
+    });
+  });
+
+  it('admits a note to the granted workspace with admission service and routes it to that coordinator', async () => {
+    const sent = await svc.send(S, { toWorkspace: 'ws-9', subject: 'lessons pass', body: 'b' });
+    expect(sent).toMatchObject({
+      from: { workspaceId: 'ws-1', tabId: null, verified: false, identity: 'none', service: 'improve-lessons' },
+      admission: { mode: 'service', service: 'improve-lessons', targetWorkspaceId: 'ws-9', sender: { workspaceId: 'ws-1', tabId: null } },
+      deliveredTo: { workspaceId: 'ws-9', tabId: 'tab-orch' },
+      fromLabel: 'service improve-lessons (ws-1/workspace)',
+      receipt: { routingStatus: 'routed', authorizedSender: { workspaceId: 'ws-1', tabId: null } },
+    });
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]).toMatchObject({ targetWorkspaceId: 'ws-9', targetTabId: 'tab-orch' });
+    const verdict = await svc.preflight(f.inbox.get(f.note(sent.id).inboxItemId!)!);
+    expect(verdict).toMatchObject({ ok: true });
+    if (verdict.ok) verdict.settle();
+  });
+
+  it('refuses every other cross-workspace target, an epic in the granted workspace included, and stores nothing', async () => {
+    for (const input of [
+      { toWorkspace: 'ws-2' },
+      { toWorkspace: 'ws-3' },
+      { toEpic: 'sm' },
+      { toEpic: 'nobody' },
+    ]) {
+      await expectCode(svc.send(S, { ...input, subject: 's', body: 'b' }), 'forbidden');
+    }
+    expect(f.state.notes).toHaveLength(0);
+    expect(f.sent).toHaveLength(0);
+  });
+
+  it('stays the tab-less caller of its home workspace: a note into ws-1 is local, not service', async () => {
+    const sent = await svc.send(S, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    expect(sent).toMatchObject({ admission: { mode: 'local' }, deliveredTo: { workspaceId: 'ws-1', tabId: 'tab-a' } });
+  });
+
+  it('counts against the one 50-open-note cap of its sender identity (ws-1, no tab)', async () => {
+    const { NOTE_OPEN_PER_SENDER } = await import('@/lib/notes-store');
+    for (let i = 0; i < NOTE_OPEN_PER_SENDER - 1; i++) await svc.send(S, { toWorkspace: 'ws-9', subject: `s${i}`, body: 'b' });
+    // The workspace token of ws-1, with no tab, is the same sender identity: it shares the cap.
+    await svc.send(svcCaller(undefined), { toWorkspace: 'ws-1', subject: 'local', body: 'b' });
+    await expectCode(svc.send(S, { toWorkspace: 'ws-9', subject: 'one more', body: 'b' }), 'note-cap');
+    await expectCode(svc.send(svcCaller(undefined), { toWorkspace: 'ws-1', subject: 'one more', body: 'b' }), 'note-cap');
+    expect(f.state.notes).toHaveLength(NOTE_OPEN_PER_SENDER);
+  });
+
+  it('refuses an ungranted sender: admin, the plain workspace token, and a grant bound to another home', async () => {
+    await expectCode(svc.send(ADMIN, { toWorkspace: 'ws-9', subject: 's', body: 'b' }), 'forbidden');
+    await expectCode(svc.send(svcCaller(undefined), { toWorkspace: 'ws-9', subject: 's', body: 'b' }), 'forbidden');
+    await expectCode(svc.send(svcCaller(GRANT, 'ws-2'), { toWorkspace: 'ws-9', subject: 's', body: 'b' }), 'forbidden');
+    await expectCode(svc.send(svcCaller({ ...GRANT, noteTarget: 'ws-1' }), { toWorkspace: 'ws-9', subject: 's', body: 'b' }), 'forbidden');
+    expect(f.state.notes).toHaveLength(0);
+    expect(f.sent).toHaveLength(0);
+  });
+
+  it('a revoked grant stops delivery: the paste preflight refuses and the note is policy-blocked', async () => {
+    const sent = await svc.send(S, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    granted.clear();
+    const verdict = await svc.preflight(f.inbox.get(f.note(sent.id).inboxItemId!)!);
+    expect(verdict).toEqual({ ok: false, reason: 'note-policyblocked:service-grant-inactive' });
+    expect(f.note(sent.id)).toMatchObject({ routingStatus: 'policyblocked', routingReason: 'service-grant-inactive' });
+  });
+
+  it('a note sent while no grant is active is policy-blocked, never routed', async () => {
+    granted.clear();
+    const sent = await svc.send(S, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    expect(sent).toMatchObject({ receipt: { routingStatus: 'policyblocked', routingReason: 'service-grant-inactive' }, deliveredTo: null });
+    expect(f.sent).toHaveLength(0);
+  });
+
+  it('a stored service admission that does not match its target is policy-blocked', async () => {
+    const sent = await svc.send(S, { toWorkspace: 'ws-9', subject: 's', body: 'b' });
+    f.state = { notes: f.state.notes.map((n) => (n.id === sent.id
+      ? { ...n, to: { epic: null, workspaceId: 'ws-2' }, state: 'queued', deliveredTo: null, routingStatus: 'pending' } : n)) };
+    await svc.tick();
+    expect(f.note(sent.id)).toMatchObject({ routingStatus: 'policyblocked', routingReason: 'service-admission-target-mismatch' });
+  });
+});

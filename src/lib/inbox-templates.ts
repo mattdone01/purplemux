@@ -65,10 +65,13 @@ export const noteFromWords = (from: {
   tabId: string | null;
   human: boolean;
   owner: boolean;
+  /** A workspace-bound service sender (ADR-0044). */
+  service?: string;
 }): string => {
   if (from.human) return 'human';
   if (from.workspaceId === null) return 'admin';
   const party = `${from.workspaceId}/${from.tabId === null ? 'workspace' : from.tabId}`;
+  if (from.service) return `service ${from.service} (${party})`;
   return from.owner ? `owner (${party})` : party;
 };
 

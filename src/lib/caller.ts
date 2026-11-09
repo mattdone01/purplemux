@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { collectAllTabs, findTabBySessionName, readLayoutFile, resolveLayoutFile } from '@/lib/layout-store';
 import type { ITab } from '@/types/terminal';
+import type { IServiceGrant } from '@/lib/service-senders';
 import { resolveCliScope, type TCliScope } from '@/lib/workspace-token';
 import type { TCallerIdentity } from '@/types/identity';
 
@@ -18,6 +19,11 @@ export interface ICaller {
    * `admin` and is never evidence of a human.
    */
   admin: boolean;
+  /**
+   * Set only for a workspace-bound service sender token (ADR-0044). Such a caller is the tab-less caller
+   * of `service.workspaceId`, and its grant lets it note `service.noteTarget` and no other workspace.
+   */
+  service?: IServiceGrant;
 }
 
 /** Read-only: never creates a layout, unlike `getLayout`. */
@@ -46,6 +52,10 @@ export const resolveCaller = async (req: NextApiRequest, response?: NextApiRespo
   }
 
   const base = { scope, workspaceId: scope.workspaceId, admin: false };
+  if (scope.service) {
+    // A service sender has no tab, and a session header never lends it one.
+    return { ...base, tabId: null, tabName: null, verified: false, identity: 'none', service: scope.service };
+  }
   if (scope.tabId) {
     // A tab token: launch-bound (proof) or taken by a SessionStart hook (the caller's word, story 36).
     const launch = scope.tabVerified === true;

@@ -37,6 +37,7 @@ import {
   undeliverable,
   viewOf,
 } from '@/lib/notes-store';
+import type { IServiceGrant } from '@/lib/service-senders';
 import type { IGrant } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
 import type { INote, INoteAdmission, INoteReceipt, INotesState, INoteView, TNoteRoutingStatus } from '@/types/note';
@@ -72,6 +73,12 @@ export interface INotesDeps {
   portfolioActionDeliverable?: (actionId: string, noteId: string, workspaceId: string) => Promise<boolean>;
   /** The active owner grant held by this exact tab (ADR-0029), or null. */
   ownerGrantOf?: (tab: { workspaceId: string; tabId: string }) => IGrant | null;
+  /**
+   * True while the service-sender registry still grants `name`, bound to `workspaceId`, to note
+   * `noteTarget` (ADR-0044). Routing and the paste preflight recheck it, so a revoked grant stops
+   * delivery. Absent means no grant is active.
+   */
+  serviceGrantActive?: (name: string, workspaceId: string, noteTarget: string) => boolean;
   /** One coordination audit line (`owner-note`). */
   audit?: (entry: Record<string, unknown>) => Promise<unknown>;
 }
@@ -218,6 +225,22 @@ export class NotesService {
         ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
         : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
     }
+    if (note.admission?.mode === 'service') {
+      const { admission } = note;
+      if (!admission.service || note.to.epic !== null || admission.targetWorkspaceId !== targetWorkspaceId
+        || admission.sender.tabId !== null || note.from.tabId !== null
+        || note.from.workspaceId === null || note.from.workspaceId !== admission.sender.workspaceId
+        || note.from.service !== admission.service) {
+        return { status: 'policyblocked', reason: 'service-admission-target-mismatch' };
+      }
+      if (!this.deps.serviceGrantActive?.(admission.service, note.from.workspaceId, targetWorkspaceId)) {
+        return { status: 'policyblocked', reason: 'service-grant-inactive' };
+      }
+      const tabId = await r.orchestratorOf(targetWorkspaceId);
+      return tabId
+        ? { status: 'routed', recipient: { workspaceId: targetWorkspaceId, tabId } }
+        : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
+    }
     if (note.admission?.mode !== 'coordinator' && note.admission?.mode !== 'owner' && note.admission?.mode !== 'event') {
       return {
         status: 'policyblocked',
@@ -258,6 +281,7 @@ export class NotesService {
     if (caller.workspaceId && targetWorkspaceId === caller.workspaceId) {
       return { mode: 'local', sender: { workspaceId: caller.workspaceId, tabId: caller.tabId }, authorizedAt: now };
     }
+    if (caller.service) return this.serviceAdmission(caller, caller.service, to, now);
     // ADR-0029: the owner's verified tab sends anywhere, and routes like a coordinator.
     const ownerGrant = caller.verified && caller.workspaceId && caller.tabId
       ? this.deps.ownerGrantOf?.({ workspaceId: caller.workspaceId, tabId: caller.tabId }) ?? null
@@ -276,6 +300,29 @@ export class NotesService {
         ? 'cross-workspace notes require the verified, currently designated source coordinator or the owner-granted tab'
         : 'an unresolved epic may be retained only by the verified, currently designated source coordinator or the owner-granted tab',
     );
+  }
+
+  /**
+   * ADR-0044: a workspace-bound service sender notes the one workspace its grant names, addressed by
+   * workspace id. Every other target is refused, an epic target included: the grant names a workspace.
+   */
+  private serviceAdmission(caller: ICaller, service: IServiceGrant,
+    to: { epic: string | null; workspaceId: string | null }, now: number): INoteAdmission {
+    if (caller.admin || caller.tabId !== null || caller.workspaceId !== service.workspaceId
+      || service.noteTarget === service.workspaceId) {
+      throw new NoteError('forbidden', `service sender ${service.name} is not bound to this caller`);
+    }
+    if (to.epic !== null || to.workspaceId !== service.noteTarget) {
+      throw new NoteError('forbidden',
+        `service sender ${service.name} is granted to note ${service.noteTarget} only, by --to-workspace`);
+    }
+    return {
+      mode: 'service',
+      sender: { workspaceId: service.workspaceId, tabId: null },
+      service: service.name,
+      targetWorkspaceId: service.noteTarget,
+      authorizedAt: now,
+    };
   }
 
   private routingStatus(note: INote): TNoteRoutingStatus {
@@ -640,6 +687,7 @@ export class NotesService {
           identity: !caller || caller.admin ? 'none' : caller.identity,
           epic,
           ...(humanActor ? { humanActor } : {}),
+          ...(caller?.service && admission.mode === 'service' ? { service: caller.service.name } : {}),
         },
         to,
         subject,
@@ -867,7 +915,8 @@ export class NotesService {
 export const NOTES_TICK_MS = 15_000;
 
 const defaultDeps = async (): Promise<INotesDeps> => {
-  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock, grantStore, coordinationAudit] = await Promise.all([
+  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock, grantStore, coordinationAudit,
+    serviceSenders] = await Promise.all([
     import('@/lib/lease-store'),
     import('@/lib/lease-http'),
     import('@/lib/workspace-store'),
@@ -876,6 +925,7 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     import('@/lib/orchestration-mapping-lock'),
     import('@/lib/grant-store'),
     import('@/lib/coordination-audit'),
+    import('@/lib/service-senders'),
   ]);
   const epicLease = async (slug: string) => {
     const now = Date.now();
@@ -912,6 +962,7 @@ const defaultDeps = async (): Promise<INotesDeps> => {
       return getPortfolioStore().actionNoteDeliverable(actionId, noteId, workspaceId);
     },
     ownerGrantOf: (tab) => grantStore.findActiveOwnerGrant(grantStore.grantsSnapshot('owner'), tab, Date.now()),
+    serviceGrantActive: serviceSenders.serviceGrantActive,
     audit: coordinationAudit.appendCoordinationAudit,
   };
 };

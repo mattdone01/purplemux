@@ -13,11 +13,15 @@ export interface INoteAdmission {
    * Owner admission is a verified tab holding an active owner grant (ADR-0029); it routes like `coordinator`.
    * Event admission is a verified worker tab whose typed event the server validated in its declared
    * scope (ADR-0043); it routes like `coordinator`.
+   * Service admission is a workspace-bound service sender with no tab (ADR-0044). It is admitted only to
+   * the one workspace its grant names, which `targetWorkspaceId` records, and it routes to that coordinator.
    */
-  mode: 'local' | 'coordinator' | 'human' | 'owner' | 'event';
+  mode: 'local' | 'coordinator' | 'human' | 'owner' | 'event' | 'service';
   sender: { workspaceId: string | null; tabId: string | null };
   /** The owner grant that admitted an `owner` note. */
   grantId?: string;
+  /** The service sender that admitted a `service` note. */
+  service?: string;
   humanActor?: string;
   targetWorkspaceId?: string;
   authorizedAt: number;
@@ -34,6 +38,8 @@ export interface INoteParty {
   epic: string | null;
   /** Authenticated browser-session subject; never a CLI tab identity. */
   humanActor?: string;
+  /** The workspace-bound service sender (ADR-0044); absent for every other sender. */
+  service?: string;
 }
 
 export interface INoteTarget {
