@@ -209,7 +209,7 @@ describe('fleet status panel', () => {
       host,
       path: {
         kind: alert === 'tailnet-relayed' ? 'relayed' as const : 'direct' as const, alert, alias: host, address: null, ip: null, peer: null,
-        region: alert === 'tailnet-relayed' ? 'sin' : null, rttMs: 1170, slowMs: 250, measuredAt: '2026-11-09T05:00:00.000Z', reason: null,
+        region: alert === 'tailnet-relayed' ? 'sin' : null, rttMs: 1170, relayedReads: alert === 'tailnet-relayed' ? 2 : 0, slowMs: 250, measuredAt: '2026-11-09T05:00:00.000Z', reason: null,
       },
       text,
     });

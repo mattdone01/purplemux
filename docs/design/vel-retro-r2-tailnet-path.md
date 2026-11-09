@@ -23,13 +23,26 @@ The owner keeps the hosts. The pool must not refuse a host for its path; it repo
 ## Measurement (decided by the docs; no consult)
 - The path is measured from this host (the purplemux server), where `tailscale` runs. It is a local exec, not an ssh
   read, so it never waits on the host it measures and never runs under the lease lock (ADR-0039 §2).
-- Each pool read (30 s) also measures the path of each remote host: `ssh -G <alias>` gives the address ssh dials.
-  That address is matched to a peer of `tailscale status --json` (a Tailscale IP, the MagicDNS name, or the host
-  name). No match: `kind: 'not-tailnet'` (a LAN alias such as `ai-lan`), with nothing to report. A match: one
-  `tailscale ping -c 1 --timeout 2s <ip>` gives `via DERP(<region>)`, `via <ip:port>` (direct) or
-  `via peer-relay`, and the RTT.
+- After each pool read (30 s) of a remote host, the reader measures the path to the alias that answered, else the
+  host's own (`measureTailnetPath`):
+  1. `ssh -G -- <alias>` gives the address ssh dials (its `hostname` line).
+  2. A literal IP is used as is; a name goes through `dns.lookup(name, { all: true })` (the hosts file, then DNS,
+     MagicDNS included).
+  3. No address in the tailnet ranges (100.64.0.0/10, fd7a:115c:a1e0::/48): `kind: 'not-tailnet'` (a LAN alias such
+     as `ai-lan`), with nothing to report.
+  4. A tailnet address gets one `tailscale ping -c 1 --timeout 2s <ip>`. The first `pong from` line decides:
+     `via DERP(<region>)` or `via peer-relay(...)` is `relayed`; `via <ip>:<port>` (IPv6 in brackets) is `direct`;
+     any other `via` token is `unknown` with the reason `unrecognised path "via <token>"`, never `direct` (review r1
+     M2).
+  The code does not read `tailscale status --json`; an earlier draft of this section said it would.
 - A relayed path is `relayed` (with its region). A path whose RTT is at or above `pool.path.slow-ms` (fleet config,
   default 250, 1..60000) is `slow`. A measurement with no `pong from` line is `unknown`, never `direct`. A non-zero exit alone is not a failure: `tailscale ping` exits 1 with "direct connection not established" after a DERP pong, which is the retro case.
+- A measurement stands for its alias for 5 minutes (`TAILNET_PATH_TTL_MS`, review r1 L6). An `unknown` measurement, or
+  a `relayed` one not yet confirmed, is taken again at the next read. A measurement turns `unknown` in the view once it
+  is older than the TTL plus the read staleness (90 s).
+- A relayed path raises `tailnet-relayed` only on its second relayed measurement in a row (`relayedReads`, review r1
+  L3): a ping to an idle peer can pong through DERP before the direct path is set up. A direct or off-tailnet
+  measurement resets the count; an `unknown` one leaves it as it was.
 - The path is served on each host of `IPoolView` (`path`) and on the fleet view, and placement reads none of it.
 
 ## Consult
@@ -68,3 +81,14 @@ RULING: **Option 1, changed in three ways.** The flag key does not include the m
 - **Docs.** Record this as an ADR-0032 amendment for §5, source `pool`.
 
 **Measurement defect: yes.** "A failed measurement is `unknown`" must mean "no `pong from` line", not a non-zero exit. The Problem section's own evidence, `pong … via DERP(syd) in 147ms`, came back with exit 1 ("direct connection not established"). Reading exit 1 as a failure would turn exactly the retro case into `unknown`, and that path would never alert.
+
+## Review r1 (Sonnet, PASS-WITH-NITS; LOGIC: CONCERN) and the changes
+
+| Finding | Change |
+|---|---|
+| M1 a host relayed at its first read never alerts | A pool flag carries `alertAtFirstRead`: it alerts on its first good read too, inside the repeat window. A restart and a host added while relayed (the retro case) each alert once. Every other flag keeps the §4 baseline. |
+| M2 an odd `via` token reads as direct | `direct` only for an `ip:port` endpoint; anything else is `unknown` with its reason. |
+| L3 a cold ping can pong through DERP | `tailnet-relayed` needs two relayed measurements in a row; the reader retakes an unconfirmed relayed one at the next read. |
+| L4 one alert per rule and host | The key is `pool:fleet:tailnet-path:<host>` (`poolFlagKey`), so a host alerts once per window whatever the rule; a raised flag that changes rule is the same raise. This changes the ruling's key `pool:fleet:<rule>:<host>`. |
+| L5 the doc did not match the code | The Measurement section above names `ssh -G`, the lookup and the ping. |
+| L6 a ping on every read | One measurement per alias per 5 minutes, still taken after the host read. |

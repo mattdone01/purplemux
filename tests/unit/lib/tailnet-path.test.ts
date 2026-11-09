@@ -11,6 +11,10 @@ import {
   pathAlert,
   pathAlertText,
   pathView,
+  RELAYED_READS_TO_ALERT,
+  TAILNET_PATH_TTL_MS,
+  followTailnetPath,
+  isTailnetPathSettled,
   type ITailnetPathDeps,
 } from '@/lib/tailnet-path';
 import type { IPoolPathRead } from '@/types/pool';
@@ -32,7 +36,7 @@ const deps = (over: Partial<ITailnetPathDeps> = {}): ITailnetPathDeps => ({
 });
 
 const read = (over: Partial<IPoolPathRead> = {}): IPoolPathRead => ({
-  kind: 'direct', alias: 'exec-1', address: 'exec-1', ip: '100.64.0.9', peer: 'exec-1', region: null, rttMs: 4, measuredAt: T0, reason: null, ...over,
+  kind: 'direct', alias: 'exec-1', address: 'exec-1', ip: '100.64.0.9', peer: 'exec-1', region: null, rttMs: 4, measuredAt: T0, reason: null, relayedReads: 0, ...over,
 });
 
 describe('parseSshHostname', () => {
@@ -90,6 +94,28 @@ describe('parseTailscalePing', () => {
     expect(parseTailscalePing(PEER_RELAY_PONG)).toMatchObject({ ok: true, transport: 'relayed', region: 'peer-relay', rttMs: 41 });
   });
 
+  it('reads direct only for an ip:port endpoint, IPv6 in brackets (review r1 M2)', () => {
+    expect(parseTailscalePing('pong from a (100.1.2.3) via [2001:db8::1]:41641 in 5ms\n')).toMatchObject({ ok: true, transport: 'direct' });
+    expect(parseTailscalePing('pong from a (100.1.2.3) via 10.0.0.7:41641 in 5ms\n')).toMatchObject({ ok: true, transport: 'direct' });
+  });
+
+  it.each([
+    'relay:10.0.0.5:7777',
+    '10.0.0.5',
+    'mdserver1:41641',
+    'tcp-derp(sin)',
+    '[fe80::1]',
+  ])('reads an unrecognised path token (via %s) as not measured, never direct (review r1 M2)', (token) => {
+    expect(parseTailscalePing(`pong from a (100.1.2.3) via ${token} in 5ms\n`)).toEqual({ ok: false, reason: `unrecognised path "via ${token}"` });
+  });
+
+  it('measures an unrecognised path token as unknown with its reason', async () => {
+    const path = await measureTailnetPath(deps({ ping: async () => 'pong from a (100.1.2.3) via relay:10.0.0.5:7777 in 5ms\n' }), 'exec-1');
+
+    expect(path).toMatchObject({ kind: 'unknown', reason: 'tailscale ping 100.94.44.114: unrecognised path "via relay:10.0.0.5:7777"' });
+    expect(pathAlert(path, 250)).toBeNull();
+  });
+
   it('answers the last line when no pong came', () => {
     expect(parseTailscalePing('timeout waiting for ping reply\n')).toEqual({ ok: false, reason: 'timeout waiting for ping reply' });
     expect(parseTailscalePing('')).toEqual({ ok: false, reason: 'no answer' });
@@ -109,7 +135,7 @@ describe('measureTailnetPath', () => {
 
     expect(path).toEqual({
       kind: 'relayed', alias: 'exec-1', address: 'exec-1.taila9cda5.ts.net', ip: '100.94.44.114', peer: 'mdserver1',
-      region: 'sin', rttMs: 1170, measuredAt: T0, reason: null,
+      region: 'sin', rttMs: 1170, measuredAt: T0, reason: null, relayedReads: 1,
     });
     expect(pinged).toEqual(['100.94.44.114']);
   });
@@ -153,9 +179,14 @@ describe('measureTailnetPath', () => {
 });
 
 describe('pathAlert', () => {
-  it('raises relayed for any relayed path, even a fast one: relayed wins over slow', () => {
-    expect(pathAlert(read({ kind: 'relayed', rttMs: 20 }), 250)).toBe('tailnet-relayed');
-    expect(pathAlert(read({ kind: 'relayed', rttMs: 1170 }), 250)).toBe('tailnet-relayed');
+  it('raises relayed for any relayed path on its second relayed read, even a fast one: relayed wins over slow', () => {
+    expect(pathAlert(read({ kind: 'relayed', rttMs: 20, relayedReads: 2 }), 250)).toBe('tailnet-relayed');
+    expect(pathAlert(read({ kind: 'relayed', rttMs: 1170, relayedReads: 3 }), 250)).toBe('tailnet-relayed');
+  });
+
+  it('raises nothing on one relayed read: a cold ping can pong through DERP first (review r1 L3)', () => {
+    expect(RELAYED_READS_TO_ALERT).toBe(2);
+    expect(pathAlert(read({ kind: 'relayed', rttMs: 1170, relayedReads: 1 }), 250)).toBeNull();
   });
 
   it('raises slow for a direct path at or above the threshold', () => {
@@ -176,17 +207,46 @@ describe('ageTailnetPath, pathView and pathAlertText', () => {
   });
 
   it('serves the alert, the threshold and the time', () => {
-    expect(pathView(read({ kind: 'relayed', region: 'sin', rttMs: 1170 }), DEFAULT_POOL_PATH_SLOW_MS)).toEqual({
+    expect(pathView(read({ kind: 'relayed', region: 'sin', rttMs: 1170, relayedReads: 2 }), DEFAULT_POOL_PATH_SLOW_MS)).toEqual({
       kind: 'relayed', alert: 'tailnet-relayed', alias: 'exec-1', address: 'exec-1', ip: '100.64.0.9', peer: 'exec-1',
-      region: 'sin', rttMs: 1170, slowMs: 250, measuredAt: new Date(T0).toISOString(), reason: null,
+      region: 'sin', rttMs: 1170, relayedReads: 2, slowMs: 250, measuredAt: new Date(T0).toISOString(), reason: null,
     });
   });
 
   it('writes one line per alert', () => {
-    expect(pathAlertText('exec-1', pathView(read({ kind: 'relayed', region: 'sin', rttMs: 1170.4 }), 250)))
+    expect(pathAlertText('exec-1', pathView(read({ kind: 'relayed', region: 'sin', rttMs: 1170.4, relayedReads: 2 }), 250)))
       .toBe('exec-1 tailnet path relayed via DERP(sin), RTT 1170 ms');
-    expect(pathAlertText('exec-2', pathView(read({ kind: 'relayed', region: 'peer-relay', rttMs: 41 }), 250)))
+    expect(pathAlertText('exec-2', pathView(read({ kind: 'relayed', region: 'peer-relay', rttMs: 41, relayedReads: 2 }), 250)))
       .toBe('exec-2 tailnet path relayed via a peer relay, RTT 41 ms');
     expect(pathAlertText('exec-3', pathView(read({ rttMs: 300 }), 250))).toBe('exec-3 tailnet path slow: RTT 300 ms (threshold 250 ms)');
+  });
+});
+
+describe('followTailnetPath and isTailnetPathSettled (review r1 L3, L6)', () => {
+  const relayed = read({ kind: 'relayed', region: 'sin', rttMs: 1170, relayedReads: 1 });
+
+  it('counts relayed measurements in a row, and a direct or off-tailnet one resets the count', () => {
+    const second = followTailnetPath(relayed, relayed);
+    expect(second.relayedReads).toBe(2);
+    expect(followTailnetPath(second, relayed).relayedReads).toBe(3);
+    expect(followTailnetPath(second, read()).relayedReads).toBe(0);
+    expect(followTailnetPath(second, read({ kind: 'not-tailnet', ip: '192.168.1.155' })).relayedReads).toBe(0);
+    expect(followTailnetPath(undefined, relayed).relayedReads).toBe(1);
+    expect(followTailnetPath(read(), relayed).relayedReads).toBe(1);
+  });
+
+  it('keeps the count across an unknown measurement, which says nothing about the path', () => {
+    const unknown = followTailnetPath(relayed, read({ kind: 'unknown', rttMs: null, reason: 'timeout' }));
+    expect(unknown).toMatchObject({ kind: 'unknown', relayedReads: 1 });
+    expect(followTailnetPath(unknown, relayed).relayedReads).toBe(2);
+  });
+
+  it('lets a known measurement stand for its TTL, and retakes an unknown or an unconfirmed relayed one', () => {
+    expect(isTailnetPathSettled(read(), T0 + TAILNET_PATH_TTL_MS - 1)).toBe(true);
+    expect(isTailnetPathSettled(read(), T0 + TAILNET_PATH_TTL_MS)).toBe(false);
+    expect(isTailnetPathSettled(read({ kind: 'not-tailnet' }), T0 + 1)).toBe(true);
+    expect(isTailnetPathSettled(read({ kind: 'relayed', relayedReads: 2 }), T0 + 1)).toBe(true);
+    expect(isTailnetPathSettled(relayed, T0 + 1)).toBe(false);
+    expect(isTailnetPathSettled(read({ kind: 'unknown' }), T0 + 1)).toBe(false);
   });
 });

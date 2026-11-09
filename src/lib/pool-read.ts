@@ -5,7 +5,10 @@ import { promisify } from 'util';
 import { readHostMetrics } from '@/lib/host-metrics';
 import { createLogger } from '@/lib/logger';
 import { describeRemoteFailure, originName, readRemoteHosts, runSsh } from '@/lib/remote-host';
-import { TAILSCALE_PING_TIMEOUT_S, ageTailnetPath, measureTailnetPath, type ITailnetPathDeps } from '@/lib/tailnet-path';
+import {
+  TAILNET_PATH_TTL_MS, TAILSCALE_PING_TIMEOUT_S, ageTailnetPath, followTailnetPath, isTailnetPathSettled, measureTailnetPath,
+  type ITailnetPathDeps,
+} from '@/lib/tailnet-path';
 import type {
   IPoolDisk, IPoolGpu, IPoolMetrics, IPoolPathRead, IPoolSweepState, IPoolUnitState, TPoolHostRead, TPoolSweepStatus,
 } from '@/types/pool';
@@ -21,6 +24,8 @@ export const POOL_READ_INTERVAL_MS = 30_000;
 export const POOL_READ_TIMEOUT_MS = 5_000;
 /** A known read older than this is unknown: the poller missed two cycles. */
 export const POOL_READ_STALE_MS = 3 * POOL_READ_INTERVAL_MS;
+/** A path measurement stands for its TTL, so it turns unknown only once it is that old and the reads stopped. */
+export const POOL_PATH_STALE_MS = TAILNET_PATH_TTL_MS + POOL_READ_STALE_MS;
 
 export const POOL_FALLBACK_KEY_PREFIX = 'pool.fallback.';
 
@@ -177,15 +182,26 @@ export class PoolReader {
 
   constructor(private readonly deps: IPoolReaderDeps) {}
 
-  /** The path of the alias the read went through, else the host's own; a measurement that throws is `unknown`. */
+  /** The last measurement of each alias (review r1 L6): it stands for its TTL, so a host is not pinged every read. */
+  private readonly paths = new Map<string, IPoolPathRead>();
+
+  /**
+   * The path of the alias the read went through, else the host's own; a measurement that throws is `unknown`. It runs
+   * after the host read and at most once per TTL per alias; an unknown measurement, or a relayed one not yet
+   * confirmed by a second (L3), is taken again at the next read.
+   */
   private async withPath(read: TPoolHostRead): Promise<TPoolHostRead> {
     const { measurePath } = this.deps;
     if (!measurePath) return read;
     const alias = read.via ?? read.host;
-    const path = await measurePath(alias).catch((err: unknown): IPoolPathRead => ({
+    const previous = this.paths.get(alias);
+    if (previous && isTailnetPathSettled(previous, this.deps.now())) return { ...read, path: previous };
+    const measured = await measurePath(alias).catch((err: unknown): IPoolPathRead => ({
       kind: 'unknown', alias, address: null, ip: null, peer: null, region: null, rttMs: null, measuredAt: this.deps.now(),
-      reason: err instanceof Error ? err.message : String(err),
+      reason: err instanceof Error ? err.message : String(err), relayedReads: 0,
     }));
+    const path = followTailnetPath(previous, measured);
+    this.paths.set(alias, path);
     return { ...read, path };
   }
 
@@ -253,7 +269,7 @@ export class PoolReader {
     const remote = hosts.map((host): TPoolHostRead => {
       const read = this.reads.get(host);
       if (!read) return { host, local: false, state: 'unknown', readAt: null, via: null, reason: 'not read yet', retryAt: now };
-      const path = read.path ? { path: ageTailnetPath(read.path, now, POOL_READ_STALE_MS) } : {};
+      const path = read.path ? { path: ageTailnetPath(read.path, now, POOL_PATH_STALE_MS) } : {};
       if (read.state === 'known' && now - read.readAt > POOL_READ_STALE_MS) {
         return { host, local: false, state: 'unknown', readAt: read.readAt, via: read.via, reason: `last read ${Math.round((now - read.readAt) / 1000)} s ago`, retryAt: now, ...path };
       }

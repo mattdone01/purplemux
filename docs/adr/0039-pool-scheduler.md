@@ -154,12 +154,13 @@ for hours, and no tool noticed. Design and consult ruling: `docs/design/vel-retr
    (`measureTailnetPath`, `src/lib/tailnet-path.ts`). It runs on this host, after the ssh read, and never under the
    lease lock. `ssh -G` names the address, a lookup gives the IP, and a tailnet IP gets one
    `tailscale ping -c 1 --timeout 2s`. The first `pong from` line decides: `via DERP(<region>)` or `via peer-relay` is
-   `relayed`; any other `via` is `direct`. The exit status decides nothing: a DERP pong exits 1 with "direct connection
-   not established". No pong is `unknown`; so is an alias that cannot be read or resolved. An address outside the
-   tailnet is `not-tailnet`.
-2. The host view serves `path` (§7). A relayed path raises `tailnet-relayed`. A direct path at or above
-   `pool.path.slow-ms` (default 250, 1..60000) raises `tailnet-slow`. A relayed path wins. A measurement older than 90 s
-   is `unknown`.
+   `relayed`; `via <ip>:<port>` is `direct`; any other `via` is `unknown` (review r1 M2). The exit status decides
+   nothing: a DERP pong exits 1 with "direct connection not established". No pong is `unknown`; so is an alias that
+   cannot be read or resolved. An address outside the tailnet is `not-tailnet`. A measurement stands for its alias for
+   5 minutes; an unknown one, or a relayed one not yet confirmed, is taken again at the next read (review r1 L6).
+2. The host view serves `path` (§7). A relayed path raises `tailnet-relayed` on its second relayed measurement in a
+   row (`relayedReads`, review r1 L3). A direct path at or above `pool.path.slow-ms` (default 250, 1..60000) raises
+   `tailnet-slow`. A relayed path wins. A measurement older than its 5-minute TTL plus 90 s is `unknown`.
 3. Placement (§3) reads none of it. The owner keeps the hosts: a relayed host takes work as before.
 4. The fleet view carries `poolPaths`, and the Mission Control fleet panel shows one line per relayed or slow host.
    One flag alert goes to the portfolio Scrum Master seat (ADR-0032 amendment vel-RETRO-R2).

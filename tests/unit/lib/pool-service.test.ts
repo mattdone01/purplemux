@@ -439,6 +439,7 @@ describe('readPoolPaths (vel-RETRO-R2)', () => {
   const path = (rttMs: number, kind: 'relayed' | 'direct' | 'unknown') => ({
     kind, alias: 'exec-1', address: 'exec-1.ts.net', ip: '100.64.0.9', peer: 'exec-1', region: kind === 'relayed' ? 'sin' : null,
     rttMs, measuredAt: Date.parse('2026-11-09T05:00:00Z'), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
+    relayedReads: kind === 'relayed' ? 2 : 0,
   });
   const remote = (host: string, p: ReturnType<typeof path> | null): TPoolHostRead => ({
     host, local: false, state: 'known', readAt: 1, via: host, metrics: metrics({}), ...(p ? { path: p } : {}),

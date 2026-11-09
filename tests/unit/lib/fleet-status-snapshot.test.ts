@@ -263,7 +263,7 @@ describe('the tailnet paths in the fleet view (vel-RETRO-R2)', () => {
     host: 'exec-1',
     path: {
       kind: 'relayed' as const, alert: 'tailnet-relayed' as const, alias: 'exec-1', address: 'exec-1.ts.net', ip: '100.64.0.9', peer: 'exec-1',
-      region: 'sin', rttMs: 1170, slowMs: 250, measuredAt: new Date(NOW).toISOString(), reason: null,
+      region: 'sin', rttMs: 1170, relayedReads: 2, slowMs: 250, measuredAt: new Date(NOW).toISOString(), reason: null,
     },
     text: 'exec-1 tailnet path relayed via DERP(sin), RTT 1170 ms',
   }];

@@ -10,6 +10,13 @@ export const POOL_PATH_SLOW_KEY = 'pool.path.slow-ms';
 /** About a quarter of the measured DERP RTT (0.85-1.17 s) and far above a LAN or direct tailnet hop. */
 export const DEFAULT_POOL_PATH_SLOW_MS = 250;
 export const TAILSCALE_PING_TIMEOUT_S = 2;
+/**
+ * A relayed path alerts only on this many consecutive relayed measurements (review r1 L3): `tailscale ping` to an
+ * idle peer can answer with a DERP pong before the direct path is set up, and the ping itself warms the path.
+ */
+export const RELAYED_READS_TO_ALERT = 2;
+/** How long a measurement stands for its host (review r1 L6); an unknown or an unconfirmed relayed one is retaken. */
+export const TAILNET_PATH_TTL_MS = 5 * 60_000;
 
 /** The address ssh dials for an alias: the `hostname` line of `ssh -G`. */
 export const parseSshHostname = (stdout: string): string | null => {
@@ -47,6 +54,9 @@ export type TPingAnswer =
   | { ok: true; peer: string; transport: 'direct' | 'relayed'; region: string | null; rttMs: number }
   | { ok: false; reason: string };
 
+/** The endpoint of a direct pong: `ip:port`, an IPv6 address in brackets. */
+const DIRECT_ENDPOINT = /^(\[[0-9a-f:]+\]|\d{1,3}(\.\d{1,3}){3}):\d{1,5}$/i;
+
 /**
  * The first `pong from` line of `tailscale ping`. Its exit status says nothing about the path: after a DERP pong it
  * exits 1 with "direct connection not established" (measured 2026-11-09), which is the case this exists to see.
@@ -61,7 +71,9 @@ export const parseTailscalePing = (stdout: string): TPingAnswer => {
     const derp = /^DERP\(([^)]+)\)$/.exec(m[2]);
     if (derp) return { ok: true, peer: m[1], transport: 'relayed', region: derp[1], rttMs };
     if (/^peer-relay/.test(m[2])) return { ok: true, peer: m[1], transport: 'relayed', region: 'peer-relay', rttMs };
-    return { ok: true, peer: m[1], transport: 'direct', region: null, rttMs };
+    if (DIRECT_ENDPOINT.test(m[2])) return { ok: true, peer: m[1], transport: 'direct', region: null, rttMs };
+    // A form this parser does not know (a new tailscale version) is not measured, never `direct` (review r1 M2).
+    return { ok: false, reason: `unrecognised path "via ${m[2]}"` };
   }
   return { ok: false, reason: lines.at(-1) ?? 'no answer' };
 };
@@ -84,7 +96,7 @@ const errorText = (err: unknown): string => {
 
 /** One measurement of the path ssh takes to `alias`. Every failure is `unknown` with its reason, never `direct`. */
 export const measureTailnetPath = async (deps: ITailnetPathDeps, alias: string): Promise<IPoolPathRead> => {
-  const base = { alias, measuredAt: deps.now() };
+  const base = { alias, measuredAt: deps.now(), relayedReads: 0 };
   let address: string | null;
   try {
     address = parseSshHostname(await deps.sshConfig(alias));
@@ -107,12 +119,35 @@ export const measureTailnetPath = async (deps: ITailnetPathDeps, alias: string):
     answer = { ok: false, reason: errorText(err) };
   }
   if (!answer.ok) return { ...base, kind: 'unknown', address, ip, peer: null, region: null, rttMs: null, reason: `tailscale ping ${ip}: ${answer.reason}` };
-  return { ...base, kind: answer.transport, address, ip, peer: answer.peer, region: answer.region, rttMs: answer.rttMs, reason: null };
+  return {
+    ...base, kind: answer.transport, address, ip, peer: answer.peer, region: answer.region, rttMs: answer.rttMs, reason: null,
+    relayedReads: answer.transport === 'relayed' ? 1 : 0,
+  };
 };
 
-/** The alert a path raises: a relayed path wins over a slow one; a path that is not measured raises none. */
-export const pathAlert = (read: Pick<IPoolPathRead, 'kind' | 'rttMs'>, slowMs: number): TPoolPathAlert | null => {
-  if (read.kind === 'relayed') return 'tailnet-relayed';
+/**
+ * The measurement after `previous` of the same alias: a relayed one counts the relayed measurements in a row. An
+ * unknown one says nothing about the path, so it neither adds to the count nor resets it.
+ */
+export const followTailnetPath = (previous: IPoolPathRead | undefined, next: IPoolPathRead): IPoolPathRead => {
+  // A direct or off-tailnet measurement carries 0, so the count it hands on is the reset.
+  if (next.kind === 'relayed') return { ...next, relayedReads: (previous?.relayedReads ?? 0) + 1 };
+  if (next.kind === 'unknown') return { ...next, relayedReads: previous?.relayedReads ?? 0 };
+  return { ...next, relayedReads: 0 };
+};
+
+/** A measurement that stands for its host until the TTL: known, and not a relayed one still to be confirmed. */
+export const isTailnetPathSettled = (read: IPoolPathRead, now: number): boolean =>
+  now - read.measuredAt < TAILNET_PATH_TTL_MS
+  && read.kind !== 'unknown'
+  && !(read.kind === 'relayed' && read.relayedReads < RELAYED_READS_TO_ALERT);
+
+/**
+ * The alert a path raises: a relayed path on its second relayed measurement in a row, which wins over a slow one; a
+ * path that is not measured raises none, and neither does a first relayed measurement.
+ */
+export const pathAlert = (read: Pick<IPoolPathRead, 'kind' | 'rttMs' | 'relayedReads'>, slowMs: number): TPoolPathAlert | null => {
+  if (read.kind === 'relayed') return read.relayedReads >= RELAYED_READS_TO_ALERT ? 'tailnet-relayed' : null;
   if (read.kind === 'direct' && read.rttMs !== null && read.rttMs >= slowMs) return 'tailnet-slow';
   return null;
 };
@@ -133,6 +168,7 @@ export const pathView = (read: IPoolPathRead, slowMs: number): IPoolPathView => 
   peer: read.peer,
   region: read.region,
   rttMs: read.rttMs,
+  relayedReads: read.relayedReads,
   slowMs,
   measuredAt: new Date(read.measuredAt).toISOString(),
   reason: read.reason,

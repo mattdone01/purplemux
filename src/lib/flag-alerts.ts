@@ -57,6 +57,12 @@ export const FLAG_SOURCES = {
 /** A pool flag belongs to no workspace: its key keeps this fixed part, so a Scrum Master reselection re-raises nothing. */
 export const POOL_FLAG_WORKSPACE = 'fleet';
 
+/**
+ * One key per host, whatever the rule (review r1 L4): a path that flaps relayed, slow, relayed alerts once per repeat
+ * window, and a raised flag that changes rule is the same raise.
+ */
+export const poolFlagKey = (host: string): string => `pool:${POOL_FLAG_WORKSPACE}:tailnet-path:${host}`;
+
 /** A finder answer older than two ticks is not a read (`FINDER_STALE_MS`). */
 export const LEDGER_STALE_MS = FINDER_STALE_MS;
 
@@ -71,6 +77,11 @@ export interface IRaisedFlag extends IAlertFlag {
   raiseSources: string[];
   /** A ledger item waiting past its threshold (story 13): its rule is the reason, its subject the item. */
   alarm?: ILedgerAlarm;
+  /**
+   * Alert on the first good read too (review r1 M1): a standing condition nobody was told of is the alert itself, so
+   * the start-up baseline does not swallow it. The repeat window still holds.
+   */
+  alertAtFirstRead?: true;
 }
 
 export interface IFlagScan {
@@ -200,7 +211,8 @@ export const fleetFlagScan = (view: IFleetView | null, workspaces: Array<Pick<IW
 
 /**
  * The tailnet path flags (vel-RETRO-R2): one per remote host whose path is relayed (`tailnet-relayed`, which wins) or
- * slow (`tailnet-slow`). A host whose path is unknown, or not measured within the read's staleness, is an unread
+ * slow (`tailnet-slow`), keyed by the host alone (`poolFlagKey`). A host already relayed at its first read alerts,
+ * inside the repeat window: a restart and a new host are the retro case (review r1 M1). A host whose path is unknown, or not measured within the read's staleness, is an unread
  * source: its flag neither raises nor clears. The fleet view carries the paths of the last pool read; no tick measures.
  */
 export const poolFlagScan = (view: IFleetView | null): IFlagScan => {
@@ -216,9 +228,13 @@ export const poolFlagScan = (view: IFleetView | null): IFlagScan => {
     }
     read.add(source);
     if (!path.alert || !text) continue;
-    flags.push(raised({
-      source: 'pool', workspaceId: POOL_FLAG_WORKSPACE, rule: path.alert, subject: host, text, tabId: null, sources: [source], raiseSources: [source],
-    }));
+    flags.push({
+      ...raised({
+        source: 'pool', workspaceId: POOL_FLAG_WORKSPACE, rule: path.alert, subject: host, text, tabId: null, sources: [source], raiseSources: [source],
+      }),
+      key: poolFlagKey(host),
+      alertAtFirstRead: true,
+    });
   }
   return { flags, read, failed };
 };
@@ -302,7 +318,7 @@ export const mergeFlagScans = (...scans: IFlagScan[]): IFlagScan => ({
 /**
  * Apply one scan to the raise-edge state and answer the flags to alert on: each one raised since
  * the previous scan, outside the repeat window of its last alert, whose every raise source read well
- * now and on an earlier tick. A raised flag absent now clears only when none of its sources failed.
+ * now and on an earlier tick (now only, for an `alertAtFirstRead` flag). A raised flag absent now clears only when none of its sources failed.
  * The caller records a sent alert with `markFlagAlerted`.
  */
 export const stepFlagAlerts = (state: IFlagAlertState, scan: IFlagScan, now: number, repeatMs: number): IRaisedFlag[] => {
@@ -320,7 +336,7 @@ export const stepFlagAlerts = (state: IFlagAlertState, scan: IFlagScan, now: num
     }
     const lastAlertAt = entry?.lastAlertAt ?? null;
     state.entries.set(key, { flag, raisedAt: now, lastAlertAt });
-    const seen = flag.raiseSources.every((source) => state.readSources.has(source));
+    const seen = flag.alertAtFirstRead === true || flag.raiseSources.every((source) => state.readSources.has(source));
     if (seen && (lastAlertAt === null || now - lastAlertAt >= repeatMs)) raises.push(flag);
   }
   for (const source of scan.read) state.readSources.add(source);

@@ -106,12 +106,14 @@ export interface IPoolPathRead {
   rttMs: number | null;
   measuredAt: number;
   reason: string | null;
+  /** Relayed measurements in a row up to this one (0 unless relayed); a relayed path alerts at 2 (review r1 L3). */
+  relayedReads: number;
 }
 
 /** The path as the pool view and the fleet view serve it. Placement reads none of it: the pool reports, never refuses. */
 export interface IPoolPathView {
   kind: TPoolPathKind;
-  /** `tailnet-relayed` wins over `tailnet-slow`; null when the path is fine or not measured. */
+  /** `tailnet-relayed` (on 2 relayed reads in a row) wins over `tailnet-slow`; null when fine or not measured. */
   alert: TPoolPathAlert | null;
   alias: string;
   address: string | null;
@@ -119,6 +121,8 @@ export interface IPoolPathView {
   peer: string | null;
   region: string | null;
   rttMs: number | null;
+  /** Relayed measurements in a row; a relayed path with 1 is not yet an alert. */
+  relayedReads: number;
   /** `pool.path.slow-ms`: an RTT at or above it is slow. */
   slowMs: number;
   measuredAt: string;

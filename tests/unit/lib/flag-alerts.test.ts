@@ -861,7 +861,7 @@ describe('pool path flags (vel-RETRO-R2)', () => {
       host,
       path: {
         kind, alert, alias: host, address: `${host}.ts.net`, ip: '100.64.0.9', peer: host, region: kind === 'relayed' ? 'sin' : null,
-        rttMs, slowMs, measuredAt: new Date(T0).toISOString(), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
+        rttMs, relayedReads: kind === 'relayed' ? 2 : 0, slowMs, measuredAt: new Date(T0).toISOString(), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
       },
       text: alert === 'tailnet-relayed' ? `${host} tailnet path relayed via DERP(sin), RTT ${rttMs} ms` : alert ? `${host} tailnet path slow: RTT ${rttMs} ms (threshold ${slowMs} ms)` : null,
     };
@@ -870,14 +870,14 @@ describe('pool path flags (vel-RETRO-R2)', () => {
     view([row('ws-a', 'tab-orch'), row('ws-sm', 'tab-sm')], { ...(paths ? { poolPaths: paths } : {}), ...extra });
   const smHarness = (over: Parameters<typeof harness>[0] = {}) =>
     harness({ workspaces: [workspace('ws-a'), workspace('ws-sm', 'tab-sm')], seat: SEAT, view: smView([hostPath('exec-1', 'direct')]), ...over });
-  const KEY = 'pool:fleet:tailnet-relayed:exec-1';
+  const KEY = 'pool:fleet:tailnet-path:exec-1';
 
   describe('poolFlagScan', () => {
     it('raises a relayed host and a slow host, keyed by the fixed fleet part, and reads a direct host', () => {
       const scan = poolFlagScan(smView([hostPath('exec-1', 'relayed'), hostPath('exec-2', 'direct', 300), hostPath('ai-lan', 'direct')]));
       expect(scan.flags.map((f) => [f.key, f.text])).toEqual([
         [KEY, 'exec-1 tailnet path relayed via DERP(sin), RTT 1170 ms'],
-        ['pool:fleet:tailnet-slow:exec-2', 'exec-2 tailnet path slow: RTT 300 ms (threshold 250 ms)'],
+        ['pool:fleet:tailnet-path:exec-2', 'exec-2 tailnet path slow: RTT 300 ms (threshold 250 ms)'],
       ]);
       expect([...scan.read].sort()).toEqual(['pool', 'pool:ai-lan', 'pool:exec-1', 'pool:exec-2']);
       expect([...scan.failed]).toEqual([]);
@@ -918,11 +918,63 @@ describe('pool path flags (vel-RETRO-R2)', () => {
     expect(h.routed).toHaveLength(1);
   });
 
-  it('records a path that is relayed at start and sends nothing: the baseline (ADR-0032 §4)', async () => {
+  it('alerts once for a path relayed at its first read: a restart, the retro case (review r1 M1)', async () => {
+    const h = smHarness({ view: smView([hostPath('exec-1', 'relayed')]) });
+    const first = await h.tick(T0);
+    await h.tick(T0 + MIN);
+    await h.tick(T0 + 61 * MIN);
+
+    expect(first.baseline).toBe(true);
+    expect(h.routed).toEqual([expect.objectContaining({ tabId: 'tab-sm', rule: 'tailnet-relayed', class: 'digest' })]);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('alerts once for a host the pool adds while it is relayed (review r1 M1)', async () => {
+    const h = smHarness();
+    await h.tick(T0);
+    h.script.view = smView([hostPath('exec-1', 'direct'), hostPath('exec-new', 'relayed')]);
+    await h.tick(T0 + MIN);
+    await h.tick(T0 + 2 * MIN);
+
+    expect(h.routed.map((e) => e.text)).toEqual(['exec-new tailnet path relayed via DERP(sin), RTT 1170 ms']);
+  });
+
+  it('keeps the start-up baseline for every other flag: only a pool flag alerts at its first read', async () => {
+    const scan = poolFlagScan(smView([hostPath('exec-1', 'relayed')]));
+    expect(scan.flags.map((f) => f.alertAtFirstRead)).toEqual([true]);
+    expect(fleetFlagScan(smView([hostPath('exec-1', 'relayed')]), [workspace('ws-a')]).flags.every((f) => f.alertAtFirstRead === undefined)).toBe(true);
+  });
+
+  it('a first-read alert still keeps the repeat window: a re-raise inside it says nothing', async () => {
     const h = smHarness({ view: smView([hostPath('exec-1', 'relayed')]) });
     await h.tick(T0);
+    h.script.view = smView([hostPath('exec-1', 'direct')]);
     await h.tick(T0 + MIN);
-    expect(h.routed).toEqual([]);
+    h.script.view = smView([hostPath('exec-1', 'relayed')]);
+    await h.tick(T0 + 2 * MIN);
+    expect(h.routed).toHaveLength(1);
+  });
+
+  it('alerts once per host per repeat window, whatever the rule: relayed, then slow, then relayed (review r1 L4)', async () => {
+    const h = smHarness();
+    await h.tick(T0);
+    h.script.view = smView([hostPath('exec-1', 'relayed')]);
+    await h.tick(T0 + MIN);
+    h.script.view = smView([hostPath('exec-1', 'direct', 400)]);
+    await h.tick(T0 + 2 * MIN);
+    h.script.view = smView([hostPath('exec-1', 'direct')]);
+    await h.tick(T0 + 3 * MIN);
+    h.script.view = smView([hostPath('exec-1', 'direct', 400)]);
+    await h.tick(T0 + 4 * MIN);
+    h.script.view = smView([hostPath('exec-1', 'relayed')]);
+    await h.tick(T0 + 5 * MIN);
+    expect(h.routed.map((e) => e.rule)).toEqual(['tailnet-relayed']);
+
+    h.script.view = smView([hostPath('exec-1', 'direct')]);
+    await h.tick(T0 + 62 * MIN);
+    h.script.view = smView([hostPath('exec-1', 'direct', 400)]);
+    await h.tick(T0 + 63 * MIN);
+    expect(h.routed.map((e) => e.rule)).toEqual(['tailnet-relayed', 'tailnet-slow']);
   });
 
   it('with no Scrum Master selection sends nothing and names the key as having no target', async () => {

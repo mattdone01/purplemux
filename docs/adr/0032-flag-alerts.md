@@ -130,11 +130,14 @@ Consult ruling: `docs/design/vel-retro-r2-tailnet-path.md`. ADR-0039 amendment v
 
 1. **Source and rules.** `TAlertFlagSource` gains `pool`. The rules are `tailnet-relayed` and `tailnet-slow`, and the
    subject is the host. A host raises at most one rule per tick, and `relayed` wins. The key is
-   `pool:fleet:<rule>:<host>`: the fixed `fleet` keeps a Scrum Master reselection from re-raising a standing flag.
+   `pool:fleet:tailnet-path:<host>`, one per host whatever the rule (review r1 L4): the fixed `fleet` keeps a Scrum
+   Master reselection from re-raising a standing flag, and a path that flaps between the rules alerts once per window.
 2. **Read sources.** `pool` is the fleet view's `poolPaths` (failed when absent, or when the view names a `pool paths`
    error, which fails nothing else). `pool:<host>` is read for a `relayed`, `direct` or `not-tailnet` path and failed
    for an `unknown` or unmeasured one. The tick reads the cached view and never measures. A host the pool no longer
-   lists loses its source while `pool` reads well. The §4 baseline applies unchanged.
+   lists loses its source while `pool` reads well. **The §4 baseline does not hold back a pool flag** (review r1 M1):
+   a host already relayed at its first read (a restart, a host added while relayed: the retro case) alerts once,
+   inside the repeat window. Every other source keeps the baseline.
 3. **Target.** Resolved at send time from the portfolio Scrum Master selection: the manager workspace's enabled
    orchestrator, which must be the selected manager tab. No selection: `no-scrum-master`. Another tab:
    `scrum-master-not-current`. Both are no-target cases (§5): logged, and the flag stays on the fleet panel. An
