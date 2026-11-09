@@ -188,6 +188,37 @@ describe('the typed turn end through the status manager (F6; F10 steps 1-2)', ()
     expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'block-undelivered' })]);
   });
 
+  it('review round 2: a live idle_prompt carrying its occurredAt applies the held stop and its BLOCKED line; a replay does not, nor twice', async () => {
+    const { manager, store, nudges, stop } = await setup({ transcriptText: 'Lint is red.\n\nBLOCKED: lint red on lane 2' });
+    expect(await stop('Lint is red.\n\nBLOCKED: lint red on lane 2')).toMatchObject({ kind: 'block' });
+    // A replay of an idle_prompt is no sign either way: the hold stays held.
+    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'notification', notificationType: 'idle_prompt' }, Date.now() - 500, { replayed: true });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(nudges()).toEqual([]);
+    // Live, as the hook route passes it: with the hook's own occurredAt.
+    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'notification', notificationType: 'idle_prompt' }, Date.now() - 200, { replayed: false });
+    await waitFor(() => expect(nudges()).toHaveLength(1));
+    expect(nudges()[0]).toContain('ended: BLOCKED: lint red on lane 2');
+    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'block-undelivered' })]);
+    // A second idle_prompt applies nothing more.
+    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'notification', notificationType: 'idle_prompt' }, Date.now(), { replayed: false });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(nudges()).toHaveLength(1);
+    expect(store.turnEnds.list('ws-1', 0)).toHaveLength(1);
+  });
+
+  it('review round 2: a live prompt-submit with its occurredAt opens a turn; a replayed one does not', async () => {
+    const { manager, store } = await setup();
+    expect(store.turnEnds.currentTurn(SESSION)?.turnId).toBe(1);
+    // The hook's own occurredAt, after the tab's last event (an older one is history only, ADR-0020).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'prompt-submit' }, Date.now(), { replayed: false });
+    expect(store.turnEnds.currentTurn(SESSION)?.turnId).toBe(2);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'prompt-submit' }, Date.now(), { replayed: true });
+    expect(store.turnEnds.currentTurn(SESSION)?.turnId).toBe(2);
+  });
+
   it('a replayed stop is never held: with no row it is UNREPORTED not-blockable:replayed', async () => {
     const { manager, store } = await setup();
     expect(await manager.decideClaudeStop('tmux-w', { hookEvent: 'Stop', sessionId: SESSION, message: 'DONE: x' }, Date.now()))

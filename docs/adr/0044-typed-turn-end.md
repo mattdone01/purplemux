@@ -50,6 +50,9 @@ takes those two steps.
    hold: the session waits for input. The held stop is then applied at once. It uses the turn's row if the worker wrote
    one, else an `UNREPORTED` `block-undelivered` row. A hold with no such sign stays pending, and the tab's existing
    stall signals cover it.
+   - Live or replayed is the dispatch's own flag (`replayed`, set only by the spool drain), never the event time: a
+     live hook carries its `occurredAt` in the same time parameter as a replay (CONFIRM review, round 2). A replayed
+     `idle_prompt` neither applies nor confirms a hold, and a replayed prompt-submit opens no turn.
    - An `UNREPORTED` write never replaces a row. When the turn has one, that row is kept and marked used.
    - A replayed stop is judged against its own turn: the latest turn that started at or before it fired
      (`session_turn_starts`). It is never judged against the session's current turn.

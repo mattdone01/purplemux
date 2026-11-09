@@ -3512,7 +3512,8 @@ export class StatusManager {
    */
   updateTabFromHook(
     tmuxSession: string, event: string, notificationType?: string, source?: TSessionStartSource, replayedAt?: number,
-    opts: { fromTool?: boolean } = {},
+    /** `replayed`: the spool drain replays this event (F6 review round 2); `replayedAt` alone is only its time. */
+    opts: { fromTool?: boolean; replayed?: boolean } = {},
   ): void {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
@@ -3529,13 +3530,14 @@ export class StatusManager {
     // F6 (design check (2) ruling (3), review CONCERN): any hook event of the session confirms that a held stop reached
     // the agent, except Claude's `idle_prompt`: the session waits at its prompt with nothing since the hold, the one
     // positive sign that the hold never arrived. The held stop is then applied now, its row kept if the worker wrote one.
-    if (replayedAt === undefined && event === 'notification' && notificationType === 'idle_prompt') {
-      if (this.stopGate.onIdlePrompt(tabId)) {
+    // A replay is neither sign: it happened before this server's holds, which a restart does not keep.
+    if (event === 'notification' && notificationType === 'idle_prompt') {
+      if (!opts.replayed && this.stopGate.onIdlePrompt(tabId)) {
         log.info({ tabId }, 'held stop never reached the agent (idle_prompt with no event since): applying it now');
         this.updateTabFromHook(tmuxSession, 'stop');
         return;
       }
-    } else {
+    } else if (!opts.replayed) {
       this.stopGate.onHookEvent(tabId);
     }
 
@@ -3580,7 +3582,7 @@ export class StatusManager {
     entry.lastEvent = { name: eventName, at: now, seq, ...(eventName === 'prompt-submit' && opts.fromTool ? { fromTool: true as const } : {}) };
     if (eventName === 'prompt-submit' && !opts.fromTool) entry.lastPromptSubmit = { seq, at: now };
     // A live prompt-submit that no tool sent opens a new turn of the session for `purplemux done` rows (ruling (2)).
-    if (eventName === 'prompt-submit' && !opts.fromTool && replayedAt === undefined && entry.agentSessionId) {
+    if (eventName === 'prompt-submit' && !opts.fromTool && !opts.replayed && entry.agentSessionId) {
       try {
         this.stopGate.onPromptSubmit(entry.agentSessionId);
       } catch (err) {
@@ -3657,7 +3659,13 @@ export class StatusManager {
     }
   }
 
-  handleProviderEvent(providerId: string, tmuxSession: string, event: TAgentWorkStateEvent, replayedAt?: number): boolean {
+  /**
+   * `replayedAt` is the event's time: a live hook passes its `occurredAt` there too, so it never tells a replay from a
+   * live event. `opts.replayed` does: only the spool drain sets it (F6 review round 2).
+   */
+  handleProviderEvent(
+    providerId: string, tmuxSession: string, event: TAgentWorkStateEvent, replayedAt?: number, opts: { replayed?: boolean } = {},
+  ): boolean {
     const tabId = this.findTabIdBySession(tmuxSession);
     if (!tabId) {
       hookLog.debug({ providerId, tmuxSession, event: event.kind }, 'no tabId for provider event');
@@ -3676,7 +3684,7 @@ export class StatusManager {
       );
       return false;
     }
-    this.handleTabWorkStateEvent(tabId, event, replayedAt);
+    this.handleTabWorkStateEvent(tabId, event, replayedAt, opts.replayed === true);
     return true;
   }
 
@@ -3825,24 +3833,24 @@ export class StatusManager {
     this.broadcastUpdate(tabId, entry);
   }
 
-  private handleTabWorkStateEvent(tabId: string, event: TAgentWorkStateEvent, replayedAt?: number): void {
+  private handleTabWorkStateEvent(tabId: string, event: TAgentWorkStateEvent, replayedAt?: number, replayed = false): void {
     const entry = this.tabs.get(tabId);
     if (!entry) return;
     switch (event.kind) {
       case 'session-start':
-        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source, replayedAt);
+        this.updateTabFromHook(entry.tmuxSession, 'session-start', undefined, event.source, replayedAt, { replayed });
         break;
       case 'prompt-submit':
-        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt, { fromTool: event.fromTool === true });
+        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt, { fromTool: event.fromTool === true, replayed });
         break;
       case 'stop':
       case 'interrupt':
       case 'pre-compact':
       case 'post-compact':
-        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt);
+        this.updateTabFromHook(entry.tmuxSession, event.kind, undefined, undefined, replayedAt, { replayed });
         break;
       case 'notification':
-        this.updateTabFromHook(entry.tmuxSession, 'notification', event.notificationType, undefined, replayedAt);
+        this.updateTabFromHook(entry.tmuxSession, 'notification', event.notificationType, undefined, replayedAt, { replayed });
         break;
       case 'summary-update':
         if (this.admitHookEvent(tabId, event.kind, replayedAt) === null) break;

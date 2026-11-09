@@ -76,7 +76,7 @@ const handleClaudeStopHook = async ({ query, body, replayedAt, occurredAt }: IHo
   }, replayedAt);
   if (decision.kind === 'block') return { status: 200, body: { decision: 'block', reason: decision.reason } };
   const workEvent = translateClaudeHookEvent('stop', undefined, undefined);
-  if (workEvent) statusManager.handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt);
+  if (workEvent) statusManager.handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt, { replayed: replayedAt !== undefined });
   return { status: 200, body: {} };
 };
 
@@ -87,7 +87,7 @@ const handleClaudeHook = ({ body, replayedAt, occurredAt }: IHookDelivery): IHoo
     log.debug({ event, session, notificationType: type, source, replayedAt }, `received ${event}${type ? `(${type})` : ''}${typeof source === 'string' ? `(source=${source})` : ''}`);
     const workEvent = translateClaudeHookEvent(event, type, source);
     if (workEvent) {
-      getStatusManager().handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt);
+      getStatusManager().handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt, { replayed: replayedAt !== undefined });
     } else {
       log.debug({ event, session, notificationType: type }, 'unknown claude hook event, ignoring');
     }
@@ -144,7 +144,7 @@ const handleCodexHook = async ({ query, body, replayedAt, occurredAt }: IHookDel
       if (translation.clearSession) codexHookEvents.emit('session-clear', tmuxSession);
     }
     if (translation.event && shouldEmitCodexHookEvent(payload, applied.cliState)) {
-      statusManager.handleProviderEvent('codex', tmuxSession, translation.event, replayedAt ?? occurredAt);
+      statusManager.handleProviderEvent('codex', tmuxSession, translation.event, replayedAt ?? occurredAt, { replayed: replayedAt !== undefined });
     }
     return { applied };
   };
@@ -224,7 +224,7 @@ const handleGrokHook = ({ query, body, replayedAt, occurredAt }: IHookDelivery):
     log.debug({ tmuxSession, event: payload.hookEventName, reason: result.reason }, 'grok hook skipped');
   }
   if (translation.event && shouldEmitGrokHookEvent(payload, applied.cliState)) {
-    statusManager.handleProviderEvent('grok', tmuxSession, translation.event, replayedAt ?? occurredAt);
+    statusManager.handleProviderEvent('grok', tmuxSession, translation.event, replayedAt ?? occurredAt, { replayed: replayedAt !== undefined });
   }
   return NO_CONTENT;
 };
