@@ -504,7 +504,10 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Before it types into idle, ready-for-review or busy-waiting-at-prompt, an agent tab must also show an empty
   composer on screen; a timeout then carries "screen": "composer-not-empty" | "composer-unreadable" |
   "interactive-prompt-active". After the typing, an agent tab must prove the submission: a turn-starting
-  prompt-submit hook (or busy from a state that was not busy) within 5 s (10 s for a remote tab).
+  prompt-submit hook (or busy from a state that was not busy) within 5 s (10 s for a remote tab,
+  scaled by the host's remote.timeout-ms / 5000 when it is set, at most 60 s). The hook is read again
+  after every capture, so one that lands during a slow remote capture still counts. A remote tab's
+  screen gate waits at least two of the host's ssh budgets, so one slow capture is never the answer.
   confirmation "composer-empty" counts only for a tab with no prompt-submit hook. Text still in the
   composer at 1.5 s gets ONE more Enter (resubmitted: true). Without proof, submitted is false and
   notSubmitted names why: typed-not-submitted (the text is still in the composer) or
@@ -512,6 +515,8 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   typed, so never resend it: a resend types it twice. A terminal tab has no turn: "submitted" reads
   the screen, best-effort, and "confirmation" is null.
   404 { "error": "Tab not found", "code": "tab-not-found" }
+  409 { "error": "submit-unconfirmed", "code": "submit-unconfirmed", "tabId", "typed": false, "detail": "no-submit-evidence" }
+    — the server holds no status for the agent tab to prove a turn against, so nothing was typed. Exit 1.
   409 { "error": "agent-not-ready", "code", "tabId", "cliState", "detail": "readiness-timeout" | "session-not-running", "waitedMs"?, "screen"? }
     — nothing was pasted, so a later Enter cannot submit a half-forgotten prompt.
   409 { "error": "agent-not-ready", "code": "startup-prompt", "tabId", "cliState", "startupPrompt":

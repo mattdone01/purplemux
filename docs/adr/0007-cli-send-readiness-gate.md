@@ -39,3 +39,11 @@ Ruling and options: `docs/design/vel-retro-r3-send-confirm.md`.
    only to a composer that still holds the text, so it never submits an empty prompt.
 4. Without proof the answer is HTTP 200 with `submitted: false` and `notSubmitted: typed-not-submitted |
    submit-unconfirmed`, and the CLI exits 1 (ADR-0016): the text was typed, so a resend would type it twice.
+5. Review r1 (2026-11-09). The hook evidence is read again after every capture, so a hook that lands while a slow
+   remote capture runs is proof, also past the deadline. A remote window scales with the host's `remote.timeout-ms`
+   (vel-D61, read only if set; at most 60 s), and a remote screen gate waits at least two ssh budgets, so one
+   capture that runs the whole budget and fails is never the answer. The send reads its baseline before it types:
+   with no status entry it refuses (409 `submit-unconfirmed`, `typed: false`) and types nothing. Every typing path
+   (the inbox and automated dispatchers, steer, restart, both send routes) takes the same per-tab dispatch lock,
+   so no other dispatch's turn lands in the window. Known limit: keys a person types into the pane itself take no
+   lock, and the hook carries no text to tell that turn from the send's.

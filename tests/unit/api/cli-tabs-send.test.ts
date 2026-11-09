@@ -56,6 +56,19 @@ vi.mock('@/lib/agent-dispatch-policy', () => ({
   ) => work((options) => dispatchPolicy(workspaceId, target, options)),
 }));
 
+const fleet = vi.hoisted(() => ({ values: {} as Record<string, string>, unreadable: false }));
+vi.mock('@/lib/fleet-config-store', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/fleet-config-store')>();
+  return {
+    ...actual,
+    readFleetConfig: async () => {
+      if (fleet.unreadable) throw new Error('fleet config unreadable');
+      const values = Object.fromEntries(Object.entries(fleet.values).map(([k, value]) => [k, { value, version: 1, setBy: { tabId: 't', workspaceId: 'w' } }]));
+      return { values, versions: {}, history: [] };
+    },
+  };
+});
+
 vi.mock('@/lib/tmux', () => Object.assign(tmux, { hasSessionOrUnreachable: tmux.hasSession }));
 vi.mock('@/lib/agent-prompt-delivery', () => delivery);
 vi.mock('@/lib/cli-utils', () => cliUtils);
@@ -140,6 +153,8 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     live.waiting = new Set();
     live.evidence = { [TAB_ID]: { cliState: 'idle', eventSeq: 4, lastPromptSubmitSeq: 2, lastEventFromTool: false } };
     live.hookOnSubmit = true;
+    fleet.values = {};
+    fleet.unreadable = false;
     delivery.deliverPrompt.mockImplementation(async () => {
       const before = live.evidence[TAB_ID];
       if (!live.hookOnSubmit || !before) return;
@@ -300,13 +315,66 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
       expect(response.body).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed' });
     });
 
-    it('a tab with no status entry cannot prove a turn: submit-unconfirmed at once', async () => {
+    it('a tab with no status entry cannot prove a turn: refused with submit-unconfirmed, and nothing typed (review r1 F4)', async () => {
       live.evidence = {};
 
       const response = await call({ content: 'run the tests' });
 
-      expect(response.body).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed', resubmitted: false });
-      expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
+      expect(response.statusCode).toBe(409);
+      expect(response.body).toEqual({ error: 'submit-unconfirmed', code: 'submit-unconfirmed', tabId: TAB_ID, typed: false, detail: 'no-submit-evidence' });
+      expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+      expect(tmux.pressEnter).not.toHaveBeenCalled();
+      expect(ledger.store.tabEvents.list(WORKSPACE_ID, { since: 0, limit: 5 })).toEqual([]);
+    });
+
+    describe('a remote tab\'s window scales with its host\'s remote.timeout-ms (review r1 F2)', () => {
+      const remoteTab = (): ITab => ({ ...tabWith('idle'), host: 'agent-exec-v2' });
+
+      const windowMs = async (): Promise<{ body: unknown; ms: number }> => {
+        live.hookOnSubmit = false;
+        cliUtils.findTab.mockResolvedValue(locate(remoteTab()));
+        let typedAt = 0;
+        delivery.deliverPrompt.mockImplementation(async () => { typedAt = Date.now(); });
+        vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+        try {
+          let settled = false;
+          const pending = call({ content: 'run the tests' }).finally(() => { settled = true; });
+          while (!settled) await vi.advanceTimersByTimeAsync(250);
+          const response = await pending;
+          return { body: response.body, ms: Date.now() - typedAt };
+        } finally {
+          vi.useRealTimers();
+        }
+      };
+
+      it('waits 10 s with no key set', async () => {
+        const { body, ms } = await windowMs();
+
+        expect(body).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed' });
+        expect(ms).toBeGreaterThanOrEqual(10_000);
+        expect(ms).toBeLessThan(11_000);
+      });
+
+      it('waits 30 s for a 15 s host budget, the host key over the fleet key', async () => {
+        fleet.values = { 'remote.timeout-ms': '5000', 'remote.timeout-ms.agent-exec-v2': '15000' };
+
+        const { ms } = await windowMs();
+
+        expect(ms).toBeGreaterThanOrEqual(30_000);
+        expect(ms).toBeLessThan(31_000);
+      });
+
+      it('reads an unreadable store or an out-of-range value as the default, never a shorter wait', async () => {
+        fleet.values = { 'remote.timeout-ms': '1000' };
+        const outOfRange = await windowMs();
+        fleet.values = {};
+        fleet.unreadable = true;
+        const unreadable = await windowMs();
+
+        expect(outOfRange.ms).toBeGreaterThanOrEqual(10_000);
+        expect(unreadable.ms).toBeGreaterThanOrEqual(10_000);
+        expect(unreadable.ms).toBeLessThan(11_000);
+      });
     });
 
     it('reads the baseline inside the lock before typing, so a turn that started earlier is no proof', async () => {

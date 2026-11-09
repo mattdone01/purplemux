@@ -6,6 +6,7 @@ import {
   awaitSendReadiness,
   DEFAULT_SEND_READY_TIMEOUT_MS,
   MAX_SEND_READY_TIMEOUT_MS,
+  REMOTE_CALL_DEFAULT_MS,
   SEND_READY_POLL_INTERVAL_MS,
   isComposerReadyCliState,
   resolveSendWaitMs,
@@ -384,5 +385,106 @@ describe('awaitSendReadiness reads the screen on the composer-ready gate (vel-RE
     const { result } = await runReadiness([{ ...agent('idle'), screen: typed }, { ...agent('busy'), screen: typed }], 500);
 
     expect(result).toEqual({ ok: false, reason: 'readiness-timeout', cliState: 'busy', waitedMs: 500 });
+  });
+});
+
+/**
+ * The gate over a remote tab whose captures each take `captureMs` of the clock. `reads` is the answer of each
+ * capture in turn (the last one repeats); null is a capture that failed (an ssh timeout).
+ */
+const runRemote = async (opts: {
+  captureMs: number[];
+  reads: (TComposerScreen | null)[];
+  timeoutMs: number;
+  host?: string;
+  remoteTimeoutMs?: number | 'throws';
+}) => {
+  let clock = 0;
+  let captures = 0;
+  const at = <T,>(list: T[], index: number): T => list[Math.min(index, list.length - 1)];
+  const result = await awaitSendReadiness(
+    {
+      findTarget: async () => ({ sessionName: SESSION, cliState: 'idle', panelType: 'claude-code', ...(opts.host === undefined ? { host: 'agent-exec-v2' } : opts.host ? { host: opts.host } : {}) }),
+      hasSession: async () => true,
+      readScreen: async () => {
+        const index = captures++;
+        clock += at(opts.captureMs, index);
+        const read = at(opts.reads, index);
+        return read ?? { ok: false, reason: 'composer-unreadable' };
+      },
+      ...(opts.remoteTimeoutMs === undefined ? {} : {
+        remoteTimeoutMs: async () => {
+          if (opts.remoteTimeoutMs === 'throws') throw new Error('fleet config unreadable');
+          return opts.remoteTimeoutMs as number;
+        },
+      }),
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+    },
+    { workspaceId: 'ws', tabId: 'tab-1', timeoutMs: opts.timeoutMs, gate: 'composer-ready' },
+  );
+  return { result, captures, elapsed: clock };
+};
+
+describe('the composer-ready gate over a slow remote capture (review r1 F2)', () => {
+  const drawn: TComposerScreen = { ok: true };
+
+  it('reads again after a capture that ran over 5 s and failed, and passes on the fast one after it', async () => {
+    const { result, captures } = await runRemote({ captureMs: [6_000, 200], reads: [null, drawn], timeoutMs: 10_000 });
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: true });
+    expect(captures).toBe(2);
+  });
+
+  it('takes a capture that answers after the deadline: a slow reading still counts', async () => {
+    const { result } = await runRemote({ captureMs: [12_000], reads: [drawn], timeoutMs: 10_000 });
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: true });
+  });
+
+  it('leaves room for a second capture after one that spent the whole budget, at the default budget', async () => {
+    // waitMs 3 s is shorter than two 5 s budgets: the gate waits 10 s, so the 5 s failure is not the answer.
+    const { result, elapsed } = await runRemote({ captureMs: [REMOTE_CALL_DEFAULT_MS, 100], reads: [null, drawn], timeoutMs: 3_000 });
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: true });
+    expect(elapsed).toBeLessThan(2 * REMOTE_CALL_DEFAULT_MS);
+  });
+
+  it('scales the deadline with the host\'s remote.timeout-ms: two 30 s budgets', async () => {
+    const { result, elapsed, captures } = await runRemote({ captureMs: [30_000], reads: [null], timeoutMs: 10_000, remoteTimeoutMs: 30_000 });
+
+    expect(result).toMatchObject({ ok: false, reason: 'readiness-timeout', screen: 'composer-unreadable' });
+    expect(captures).toBe(2);
+    expect(elapsed).toBe(60_000 + SEND_READY_POLL_INTERVAL_MS);
+  });
+
+  it('passes on a 25 s capture that a 30 s budget lets finish, with a 10 s wait', async () => {
+    const { result } = await runRemote({ captureMs: [25_000], reads: [drawn], timeoutMs: 10_000, remoteTimeoutMs: 30_000 });
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: true });
+  });
+
+  it('keeps a longer caller wait, and keeps waitMs 0 as one look', async () => {
+    const longer = await runRemote({ captureMs: [1_000], reads: [null], timeoutMs: 20_000 });
+    const once = await runRemote({ captureMs: [1_000], reads: [null], timeoutMs: 0 });
+
+    expect(longer.elapsed).toBeGreaterThanOrEqual(20_000);
+    expect(longer.elapsed).toBeLessThan(20_000 + 1_000 + SEND_READY_POLL_INTERVAL_MS);
+    expect(once.result).toMatchObject({ ok: false, reason: 'readiness-timeout' });
+    expect(once.captures).toBe(1);
+  });
+
+  it('uses the default budget when the fleet config cannot be read, never a shorter wait', async () => {
+    const { elapsed } = await runRemote({ captureMs: [1_000], reads: [null], timeoutMs: 1_000, remoteTimeoutMs: 'throws' });
+
+    expect(elapsed).toBeGreaterThanOrEqual(2 * REMOTE_CALL_DEFAULT_MS);
+  });
+
+  it('does not stretch the wait of a local tab', async () => {
+    const { elapsed } = await runRemote({ captureMs: [100], reads: [null], timeoutMs: 1_000, host: '', remoteTimeoutMs: 30_000 });
+
+    expect(elapsed).toBeLessThan(1_000 + 100 + SEND_READY_POLL_INTERVAL_MS);
   });
 });

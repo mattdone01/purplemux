@@ -1,4 +1,5 @@
 import { paneAsSeen, readComposer } from '@/lib/composer-readiness';
+import { REMOTE_CALL_DEFAULT_MS } from '@/lib/tab-send';
 import type { ISubmitEvidence } from '@/types/status';
 import type { TPanelType } from '@/types/terminal';
 
@@ -13,6 +14,8 @@ export const SUBMIT_CONFIRM_POLL_MS = 250;
 export const SUBMIT_CONFIRM_LOCAL_MS = 5_000;
 /** A remote tab's hook crosses the tailnet and its capture is one ssh call (ADR-0022). */
 export const SUBMIT_CONFIRM_REMOTE_MS = 10_000;
+/** The longest window, at any ssh budget: the CLI's HTTP client stops waiting at 300 s, gate wait included. */
+export const SUBMIT_CONFIRM_MAX_MS = 60_000;
 /** The one extra Enter waits this long: `submitComposer` has already pressed Enter twice, 600 ms apart. */
 export const SUBMIT_RETRY_AFTER_MS = 1_500;
 
@@ -58,7 +61,20 @@ export interface ISubmitConfirmRequest {
   baseline: ISubmitEvidence;
   /** The readiness gate read an empty composer before the typing. */
   screenEmptyAtGate: boolean;
+  /** The host's `remote.timeout-ms` (vel-D61); absent or below the default, the default. */
+  remoteTimeoutMs?: number;
 }
+
+/**
+ * How long a send looks for its proof. A remote window scales with the host's ssh budget, as every remote budget
+ * does (ADR-0022 §5): one capture may take the whole budget, so a 10 s window would hold one slow capture. A
+ * capture longer than the capped window still counts its hook, read after the capture.
+ */
+export const submitConfirmDeadlineMs = (remote: boolean, remoteTimeoutMs?: number): number => {
+  if (!remote) return SUBMIT_CONFIRM_LOCAL_MS;
+  const budget = Math.max(REMOTE_CALL_DEFAULT_MS, remoteTimeoutMs ?? REMOTE_CALL_DEFAULT_MS);
+  return Math.min(SUBMIT_CONFIRM_MAX_MS, Math.ceil(SUBMIT_CONFIRM_REMOTE_MS * (budget / REMOTE_CALL_DEFAULT_MS)));
+};
 
 interface IScreenReading {
   composer: 'empty' | 'text' | 'unreadable';
@@ -87,6 +103,10 @@ const strandedText = (screen: IScreenReading, screenEmptyAtGate: boolean): boole
 /**
  * Poll after the typing until a proof, or the deadline. A failed capture is never proof, and neither is an empty
  * composer on a tab with a prompt-submit hook. Enter is pressed at most once more.
+ *
+ * The hook evidence is read again after every capture (review r1 F1): a remote capture is one ssh call that can
+ * take the whole budget, and a hook that lands while it runs is proof. Without that read, the last capture could
+ * end the window over a turn that started, and a stale screen could earn an extra Enter.
  */
 export const confirmSubmission = async (
   deps: ISubmitConfirmDeps,
@@ -94,16 +114,17 @@ export const confirmSubmission = async (
 ): Promise<TSubmitResult> => {
   const now = deps.now ?? (() => Date.now());
   const sleep = deps.sleep ?? realSleep;
-  const deadlineMs = request.remote ? SUBMIT_CONFIRM_REMOTE_MS : SUBMIT_CONFIRM_LOCAL_MS;
+  const deadlineMs = submitConfirmDeadlineMs(request.remote, request.remoteTimeoutMs);
   const screenProves = !hasPromptSubmitHook(request.panelType, request.remote);
   const startedAt = now();
   let resubmitted = false;
 
+  const proven = (): boolean => hasSubmitProof(request.baseline, deps.readEvidence());
+
   for (;;) {
-    if (hasSubmitProof(request.baseline, deps.readEvidence())) {
-      return { submitted: true, confirmation: 'prompt-submit', resubmitted };
-    }
+    if (proven()) return { submitted: true, confirmation: 'prompt-submit', resubmitted };
     const screen = await readScreen(deps, request);
+    if (proven()) return { submitted: true, confirmation: 'prompt-submit', resubmitted };
     if (screenProves && screen.composer === 'empty' && !screen.firstLinePending) {
       return { submitted: true, confirmation: 'composer-empty', resubmitted };
     }

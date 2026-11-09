@@ -259,6 +259,10 @@ const hintFor = (code, detail) => {
     const served = typeof detail?.detail === 'string' && detail.detail ? detail.detail : 'the agent waits at a Claude Code startup prompt';
     return `${served} — nothing was typed; a retry cannot help until the prompt is answered`;
   }
+  // Refused before the typing (vel-RETRO-R3, review r1 F4): the server holds no status to prove a turn against.
+  if (code === 'submit-unconfirmed' && detail?.typed === false) {
+    return 'nothing was typed: the server holds no status for the tab to prove a turn against; inspect the tab';
+  }
   if (code && Object.hasOwn(CODE_HINT, code)) return CODE_HINT[code];
   return EXIT_HINT[exitFor(code)];
 };

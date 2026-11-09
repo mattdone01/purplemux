@@ -4,6 +4,7 @@ import { getStatusManager } from '@/lib/status-manager';
 import {
   awaitSendReadiness,
   MAX_SEND_READY_TIMEOUT_MS,
+  REMOTE_CALL_DEFAULT_MS,
   resolveSendWaitMs,
   resolveTabCliState,
 } from '@/lib/tab-send';
@@ -11,6 +12,7 @@ import { capturePaneContent, hasSessionOrUnreachable, isContentPendingInComposer
 import { readComposerScreen } from '@/lib/composer-readiness';
 import { confirmSubmission, type TSubmitResult } from '@/lib/send-confirmation';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
+import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
 import { TAB_NOT_FOUND_BODY, remoteHostUnreachableBody, targetChangedBody } from '@/lib/cli-error';
 import { RemoteHostError } from '@/lib/remote-host';
@@ -23,6 +25,30 @@ import { startupPromptFix, startupPromptLabel } from '@/lib/startup-prompt';
 import { parseRawFlag, rawRefusalText, terminalInputRefusal } from '@/lib/terminal-command-line';
 
 const log = createLogger('tab-send');
+
+const REMOTE_TIMEOUT_KEY = 'remote.timeout-ms';
+
+/** Whole milliseconds, 5000..120000, as `remote.timeout-ms` takes them (vel-D61); anything else is unset. */
+const parseRemoteTimeoutMs = (raw: string | undefined): number | null => {
+  if (!raw || !/^\d{4,6}$/.test(raw.trim())) return null;
+  const ms = Number(raw.trim());
+  return ms >= REMOTE_CALL_DEFAULT_MS && ms <= 120_000 ? ms : null;
+};
+
+/**
+ * The host's ssh budget: `remote.timeout-ms.<host>`, else `remote.timeout-ms`, else the 5 s default. Read only if
+ * set (vel-D61 adds the keys); a store that cannot be read gives the default, never a shorter wait.
+ */
+const remoteTimeoutMs = async (host: string): Promise<number> => {
+  try {
+    const state = await readFleetConfig();
+    return parseRemoteTimeoutMs(valueOf(state, `${REMOTE_TIMEOUT_KEY}.${host}`)?.value)
+      ?? parseRemoteTimeoutMs(valueOf(state, REMOTE_TIMEOUT_KEY)?.value)
+      ?? REMOTE_CALL_DEFAULT_MS;
+  } catch {
+    return REMOTE_CALL_DEFAULT_MS;
+  }
+};
 
 /** `submit` is null for a tab with no turn to prove (a terminal or browser tab). */
 interface IDelivered {
@@ -114,10 +140,12 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
           cliState: resolveTabCliState(found.tab, live),
           waitingAtPrompt: getStatusManager().isWaitingAtPrompt(id),
           startupPrompt: live?.startupPrompt?.kind ?? null,
+          ...(found.tab.host ? { host: found.tab.host } : {}),
         };
       },
       hasSession: hasSessionOrUnreachable,
       readScreen: async (target) => readComposerScreen(target.panelType, await capturePaneContent(target.sessionName, { escapes: true })),
+      remoteTimeoutMs,
     },
     // `composer-ready`, not `live-session`: this is the unattended dispatch
     // path, where a paste that beats the TUI's boot is silently swallowed. The
@@ -174,15 +202,21 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
       res.status(409).json(policy);
       return null;
     }
-    const { sessionName, panelType } = latest.tab;
+    const { sessionName, panelType, host } = latest.tab;
     if (!isAgentPanelType(panelType)) {
       await deliverPrompt(sessionName, content);
       return { submit: null };
     }
-    // Inside the lock, so no other dispatch types into the composer while this one reads it (vel-RETRO-R3).
+    // Inside the lock, which every typing path takes (the inbox and automated dispatchers, steer, restart and the
+    // cookie route): no other dispatch types into this composer, or starts its turn, while this send proves its own.
     const baseline = getStatusManager().getSubmitEvidence(tabId);
+    // Read before the typing (review r1 F4): text the send cannot prove is never typed.
+    if (!baseline) {
+      res.status(409).json({ error: 'submit-unconfirmed', code: 'submit-unconfirmed', tabId, typed: false, detail: 'no-submit-evidence' });
+      return null;
+    }
+    const remoteBudgetMs = host ? await remoteTimeoutMs(host) : undefined;
     await deliverPrompt(sessionName, content);
-    if (!baseline) return { submit: { submitted: false, notSubmitted: 'submit-unconfirmed', resubmitted: false } };
     const submit = await confirmSubmission(
       {
         readEvidence: () => getStatusManager().getSubmitEvidence(tabId),
@@ -190,7 +224,14 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
         isPendingLine: isPaneShowingPendingLine,
         pressEnter: () => pressEnter(sessionName),
       },
-      { panelType, remote: !!latest.tab.host, content, baseline, screenEmptyAtGate: readiness.screenEmpty },
+      {
+        panelType,
+        remote: !!host,
+        content,
+        baseline,
+        screenEmptyAtGate: readiness.screenEmpty,
+        ...(remoteBudgetMs !== undefined ? { remoteTimeoutMs: remoteBudgetMs } : {}),
+      },
     );
     return { submit };
   });

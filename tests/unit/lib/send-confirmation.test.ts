@@ -3,12 +3,15 @@ import path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
   SUBMIT_CONFIRM_LOCAL_MS,
+  SUBMIT_CONFIRM_MAX_MS,
   SUBMIT_CONFIRM_POLL_MS,
   SUBMIT_CONFIRM_REMOTE_MS,
   SUBMIT_RETRY_AFTER_MS,
   confirmSubmission,
   hasPromptSubmitHook,
   hasSubmitProof,
+  submitConfirmDeadlineMs,
+  type ISubmitConfirmDeps,
   type ISubmitConfirmRequest,
   type TSubmitResult,
 } from '@/lib/send-confirmation';
@@ -46,10 +49,11 @@ interface IScript {
   request?: Partial<ISubmitConfirmRequest>;
 }
 
-const run = async (script: IScript): Promise<{ result: TSubmitResult; enters: number[]; elapsed: number; polls: number }> => {
+const run = async (script: IScript): Promise<{ result: TSubmitResult; enters: number[]; elapsed: number; polls: number; captures: number }> => {
   let clock = 0;
   let polls = 0;
   let captures = 0;
+  let allCaptures = 0;
   const enters: number[] = [];
   let evidenceScript = script.evidence ?? [evidence()];
   let paneScript = script.panes ?? [STRANDED];
@@ -58,6 +62,7 @@ const run = async (script: IScript): Promise<{ result: TSubmitResult; enters: nu
     {
       readEvidence: () => at(evidenceScript, polls++),
       capture: async () => {
+        allCaptures += 1;
         const pane = at(paneScript, captures++);
         if (pane === null) throw new Error('capture failed');
         return pane;
@@ -84,7 +89,7 @@ const run = async (script: IScript): Promise<{ result: TSubmitResult; enters: nu
       ...script.request,
     },
   );
-  return { result, enters, elapsed: clock, polls };
+  return { result, enters, elapsed: clock, polls, captures: allCaptures };
 };
 
 describe('hasPromptSubmitHook', () => {
@@ -218,10 +223,11 @@ describe('confirmSubmission (vel-RETRO-R3)', () => {
     expect(remote.elapsed).toBe(SUBMIT_CONFIRM_REMOTE_MS);
   });
 
-  it('polls every 250 ms', async () => {
-    const { polls } = await run({ panes: [EMPTY] });
+  it('polls every 250 ms, and reads the hook evidence before and after each capture', async () => {
+    const { polls, captures } = await run({ panes: [EMPTY] });
 
-    expect(polls).toBe(SUBMIT_CONFIRM_LOCAL_MS / SUBMIT_CONFIRM_POLL_MS + 1);
+    expect(captures).toBe(SUBMIT_CONFIRM_LOCAL_MS / SUBMIT_CONFIRM_POLL_MS + 1);
+    expect(polls).toBe(2 * captures);
   });
 
   it('reads the dim prompt suggestion of a real pane as an empty composer, not as stranded text', async () => {
@@ -245,5 +251,94 @@ describe('confirmSubmission (vel-RETRO-R3)', () => {
     );
 
     expect(result).toEqual({ submitted: false, notSubmitted: 'typed-not-submitted', resubmitted: true });
+  });
+});
+
+/**
+ * A remote capture is one ssh call that takes `captureMs` of the clock. The hook lands `hookAt` ms after the typing,
+ * whether or not a capture runs then.
+ */
+const runSlow = async (opts: { captureMs: number; hookAt: number; pane: string; remoteTimeoutMs?: number }) => {
+  let clock = 0;
+  const enters: number[] = [];
+  const reads: number[] = [];
+  const deps: ISubmitConfirmDeps = {
+    readEvidence: () => {
+      reads.push(clock);
+      return clock >= opts.hookAt ? evidence({ cliState: 'busy', eventSeq: 8, lastPromptSubmitSeq: 8 }) : evidence();
+    },
+    capture: async () => {
+      clock += opts.captureMs;
+      return opts.pane;
+    },
+    isPendingLine: isPaneShowingPendingLine,
+    pressEnter: async () => {
+      enters.push(clock);
+    },
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+    },
+  };
+  const result = await confirmSubmission(deps, {
+    panelType: 'claude-code',
+    remote: true,
+    content: BRIEF,
+    baseline: evidence(),
+    screenEmptyAtGate: true,
+    ...(opts.remoteTimeoutMs !== undefined ? { remoteTimeoutMs: opts.remoteTimeoutMs } : {}),
+  });
+  return { result, enters, elapsed: clock, reads };
+};
+
+describe('confirmSubmission with slow remote captures (review r1 F1)', () => {
+  it('takes a hook that lands during the last capture, after the deadline, as proof', async () => {
+    // Captures end at 4 s, 8.25 s and 12.5 s; the hook lands at 11 s, inside the third, past the 10 s window.
+    const { result, elapsed } = await runSlow({ captureMs: 4_000, hookAt: 11_000, pane: EMPTY });
+
+    expect(elapsed).toBeGreaterThan(SUBMIT_CONFIRM_REMOTE_MS);
+    expect(result).toEqual({ submitted: true, confirmation: 'prompt-submit', resubmitted: false });
+  });
+
+  it('still answers submit-unconfirmed when no hook lands by the end of the last capture', async () => {
+    const { result } = await runSlow({ captureMs: 4_000, hookAt: Number.POSITIVE_INFINITY, pane: EMPTY });
+
+    expect(result).toEqual({ submitted: false, notSubmitted: 'submit-unconfirmed', resubmitted: false });
+  });
+
+  it('presses no extra Enter on a stale screen when the hook landed during the capture that read it', async () => {
+    // The capture that ends at 4 s shows the text still stranded; the turn started at 3 s.
+    const { result, enters } = await runSlow({ captureMs: 4_000, hookAt: 3_000, pane: STRANDED });
+
+    expect(result).toEqual({ submitted: true, confirmation: 'prompt-submit', resubmitted: false });
+    expect(enters).toEqual([]);
+  });
+
+  it('reads the evidence after the deadline capture, so the last read is at the end of that capture', async () => {
+    const { reads, elapsed } = await runSlow({ captureMs: 4_000, hookAt: Number.POSITIVE_INFINITY, pane: EMPTY });
+
+    expect(reads.at(-1)).toBe(elapsed);
+  });
+});
+
+describe('submitConfirmDeadlineMs (review r1 F2)', () => {
+  it.each<[boolean, number | undefined, number]>([
+    [false, undefined, SUBMIT_CONFIRM_LOCAL_MS],
+    [false, 30_000, SUBMIT_CONFIRM_LOCAL_MS],
+    [true, undefined, SUBMIT_CONFIRM_REMOTE_MS],
+    [true, 1_000, SUBMIT_CONFIRM_REMOTE_MS],
+    [true, 5_000, SUBMIT_CONFIRM_REMOTE_MS],
+    [true, 15_000, 30_000],
+    [true, 30_000, SUBMIT_CONFIRM_MAX_MS],
+    [true, 120_000, SUBMIT_CONFIRM_MAX_MS],
+  ])('remote %s, remote.timeout-ms %s: %s ms', (remote, budget, expected) => {
+    expect(submitConfirmDeadlineMs(remote, budget)).toBe(expected);
+  });
+
+  it('waits the scaled window on a remote tab whose host has a longer ssh budget', async () => {
+    const { result, elapsed } = await run({ panes: [EMPTY], request: { remote: true, remoteTimeoutMs: 15_000 } });
+
+    expect(result).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed' });
+    expect(elapsed).toBe(30_000);
   });
 });

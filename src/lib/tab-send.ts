@@ -113,6 +113,8 @@ export interface ITabSendTarget {
   waitingAtPrompt?: boolean;
   /** The startup dialog a `startup-prompt` tab waits at (D14); absent in every other state. */
   startupPrompt?: TStartupPrompt | null;
+  /** The ssh alias of a remote tab's host (ADR-0022); absent for a local tab. */
+  host?: string;
 }
 
 /**
@@ -142,6 +144,8 @@ export interface ISendReadinessDeps {
    * phone route and older callers do.
    */
   readScreen?: (target: ITabSendTarget) => Promise<TComposerScreen>;
+  /** A remote host's ssh budget (`remote.timeout-ms`, vel-D61). Absent: the default budget. */
+  remoteTimeoutMs?: (host: string) => Promise<number>;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -175,6 +179,23 @@ const screensComposer = (target: ITabSendTarget): boolean =>
   target.cliState === 'idle' || target.cliState === 'ready-for-review'
   || (target.cliState === 'busy' && target.waitingAtPrompt === true);
 
+/** The ssh budget of one remote tmux call when `remote.timeout-ms` is unset (ADR-0022 §5). */
+export const REMOTE_CALL_DEFAULT_MS = 5_000;
+
+/**
+ * The gate's deadline once it reads a remote screen (review r1 F2). One capture is one ssh call that may run the
+ * host's whole budget and then fail, so the wait leaves room for a second capture after it: at least two budgets.
+ * The caller's longer wait stands, `timeoutMs: 0` stays one look, and the largest budget (120 s) gives 240 s, the
+ * CLI's own cap.
+ */
+const remoteScreenDeadlineMs = async (deps: ISendReadinessDeps, host: string, timeoutMs: number): Promise<number> => {
+  if (timeoutMs === 0) return 0;
+  const budget = deps.remoteTimeoutMs
+    ? await deps.remoteTimeoutMs(host).catch(() => REMOTE_CALL_DEFAULT_MS)
+    : REMOTE_CALL_DEFAULT_MS;
+  return Math.max(timeoutMs, 2 * Math.max(REMOTE_CALL_DEFAULT_MS, budget));
+};
+
 /**
  * Resolve a tab and decide whether it can be pasted into, per {@link TSendGate}.
  *
@@ -196,6 +217,8 @@ export const awaitSendReadiness = async (
   const sleep = deps.sleep ?? realSleep;
   const startedAt = now();
   let screen: TComposerScreenRefusal | undefined;
+  let deadlineMs = request.timeoutMs;
+  let remoteDeadlineSet = false;
 
   for (;;) {
     screen = undefined;
@@ -217,6 +240,11 @@ export const awaitSendReadiness = async (
     }
     if (isComposerReadyCliState(target.cliState) || target.waitingAtPrompt === true) {
       if (!deps.readScreen || !screensComposer(target)) return { ok: true, target, screenEmpty: false };
+      if (target.host && !remoteDeadlineSet) {
+        remoteDeadlineSet = true;
+        deadlineMs = await remoteScreenDeadlineMs(deps, target.host, request.timeoutMs);
+      }
+      // A failed or slow capture is one reading, never the answer: the gate reads again until the deadline.
       const read = await deps.readScreen(target).catch((): TComposerScreen => ({ ok: false, reason: 'composer-unreadable' }));
       if (read.ok) return { ok: true, target, screenEmpty: true };
       screen = read.reason;
@@ -229,7 +257,7 @@ export const awaitSendReadiness = async (
     }
 
     const waitedMs = now() - startedAt;
-    const remainingMs = request.timeoutMs - waitedMs;
+    const remainingMs = deadlineMs - waitedMs;
     if (remainingMs <= 0) {
       return { ok: false, reason: 'readiness-timeout', cliState: target.cliState, waitedMs, ...(screen ? { screen } : {}) };
     }
