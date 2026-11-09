@@ -110,4 +110,23 @@ describe('RemoteProofScheduler', () => {
     await drained;
     expect(order).toEqual(['pt-ws-1-pane-a-tab-blocker', 'pt-ws-1-pane-a-tab-changed', 'pt-ws-1-pane-a-tab-old', 'pt-ws-1-pane-a-tab-new']);
   });
+
+  it('an absent answer has no TTL: read ten minutes later it is still false, once (review r3 C2)', async () => {
+    const { scheduler, observe, advance } = make(() => ({ state: 'absent', reason: 'no claude process in the pane' }));
+    await scheduler.schedule([req('tab-a')]);
+    advance(10 * 60_000);
+    await scheduler.schedule([req('tab-a')]);
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(scheduler.read(req('tab-a'))).toBe(false);
+    expect(scheduler.read(req('tab-a'))).toBeNull();
+  });
+
+  it('a present answer still expires after its TTL', async () => {
+    const { scheduler, advance } = make(() => ({ state: 'present', identity: 'x' }));
+    await scheduler.schedule([req('tab-a')]);
+    advance(59_999);
+    expect(scheduler.read(req('tab-a'))).toBe(true);
+    advance(1);
+    expect(scheduler.read(req('tab-a'))).toBeNull();
+  });
 });

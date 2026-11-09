@@ -9,7 +9,8 @@ import type { TStrictRuntimeObservation } from '@/lib/process-utils';
  *
  * - `present` is kept for `ttlMs` under its key (the session, the pane, its foreground command and the agent's
  *   launch): a new key proves again.
- * - `absent` is read once: the transition it causes happens at the next read, and a relaunch never meets it.
+ * - `absent` is kept, with no TTL, until one read takes it: the transition it causes happens at that read, and
+ *   a relaunch (a new key) never meets it.
  * - `unknown` (ssh failed or timed out) is never kept; that host's proofs back off `backoffMs` and its queue is
  *   dropped (the next poll asks again).
  */
@@ -66,7 +67,8 @@ export class RemoteProofScheduler {
   read(req: IRemoteProofRequest): boolean | null {
     const result = this.results.get(req.tabId);
     if (!result) return null;
-    if (result.key !== req.key || this.deps.now() - result.at >= this.opts.ttlMs) {
+    // An absent answer has no TTL: it waits for one read, however late the next poll comes (review r3 C2).
+    if (result.key !== req.key || (result.state === 'present' && this.deps.now() - result.at >= this.opts.ttlMs)) {
       this.results.delete(req.tabId);
       return null;
     }
@@ -120,7 +122,7 @@ export class RemoteProofScheduler {
   private needsProof(req: IRemoteProofRequest): boolean {
     if (this.inFlight.has(req.tabId) || this.inBackoff(req.host)) return false;
     const kept = this.results.get(req.tabId);
-    return !(kept && kept.key === req.key && this.deps.now() - kept.at < this.opts.ttlMs);
+    return !(kept && kept.key === req.key && (kept.state === 'absent' || this.deps.now() - kept.at < this.opts.ttlMs));
   }
 
   /** Changed key first, then least recently proven. */

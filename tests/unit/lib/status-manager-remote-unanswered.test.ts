@@ -22,6 +22,10 @@ const ssh = vi.hoisted(() => ({
   scan: (_host: string): TReply | Promise<TReply> => ({ killed: true, code: null, signal: 'SIGTERM' }),
   proof: (_session: string): TReply | Promise<TReply> => ({ killed: true, code: null, signal: 'SIGTERM' }),
   localPanes: '',
+  /** Any other ssh call (not a scan, not a proof). */
+  other: (_remote: string): TReply | Promise<TReply> => ({ killed: true, code: null, signal: 'SIGTERM' }),
+  /** A local pgrep (the pane's descendants, for a local terminal tab's ports); null answers "no children". */
+  pgrep: null as null | (() => TReply | Promise<TReply>),
 }));
 
 vi.mock('child_process', async (importOriginal) => {
@@ -32,6 +36,7 @@ vi.mock('child_process', async (importOriginal) => {
     let reply: TReply | Promise<TReply> = { code: 1, stderr: 'no server running on /tmp/tmux-0/purple' };
     const call: ISshCall = { host: '', remote: '' };
     if (cmd === 'tmux' && args.includes('list-panes') && ssh.localPanes) reply = { stdout: ssh.localPanes };
+    if (cmd === 'pgrep' && ssh.pgrep) reply = ssh.pgrep();
     if (cmd === 'ssh') {
       call.host = args[args.indexOf('--') + 1] ?? '';
       call.remote = args[args.indexOf('--') + 2] ?? '';
@@ -42,7 +47,7 @@ vi.mock('child_process', async (importOriginal) => {
         call.session = call.remote.split(' ')[4]?.replace(/'/g, '');
         reply = ssh.proof(call.session ?? '');
       } else {
-        reply = { killed: true, code: null, signal: 'SIGTERM' };
+        reply = ssh.other(call.remote);
       }
     }
     void Promise.resolve(reply).then((r) => {
@@ -61,6 +66,12 @@ vi.mock('child_process', async (importOriginal) => {
   });
   return { ...actual, default: { ...actual, execFile }, execFile };
 });
+// This host's /proc never answers for a test pane: a local pane's descendants come from pgrep, which the
+// child_process mock above answers (and can hold).
+vi.mock('@/lib/process-utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/process-utils')>()),
+  readProcChildren: async () => null,
+}));
 vi.mock('os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('os')>();
   return { ...actual, default: { ...actual, hostname: () => 'control-host' }, hostname: () => 'control-host' };
@@ -141,6 +152,8 @@ const resetWorld = () => {
   ssh.scan = () => TIMED_OUT;
   ssh.proof = () => TIMED_OUT;
   ssh.localPanes = '';
+  ssh.other = () => TIMED_OUT;
+  ssh.pgrep = null;
   state.tabs = [remoteTab('tab-r', SESSION)];
 };
 
@@ -414,6 +427,111 @@ describe('the proofs are bounded and never hold the poll (review r1 F1)', () => 
     await pollAndSettle();
     expect(proofCalls()).toHaveLength(2);
     vi.clearAllTimers();
+  });
+});
+
+describe('busy remote tabs read their titles from the scan, never one ssh each (review r3 C1)', () => {
+  beforeEach(resetWorld);
+  afterEach(() => vi.useRealTimers());
+
+  const busyFleet = (count: number) => {
+    const tabs = Array.from({ length: count }, (_, i) => remoteTab(`tab-b${i}`, `pt-ws-1-pane-a-tab-b${i}`));
+    const local: ITab = { id: 'tab-local', name: 'local', order: 0, sessionName: LOCAL_SESSION, panelType: 'terminal' };
+    state.tabs = [...tabs, local];
+    ssh.localPanes = paneLine(LOCAL_SESSION, 'vim', '777');
+    // Every per-tab ssh would hang for ever: a poll that awaited one could not end.
+    ssh.other = () => new Promise<TReply>(() => {});
+    return tabs;
+  };
+  const titledLine = (session: string, title: string) => `${session}\tclaude\t/home/user\t4242\t1794200000\t${title}\n`;
+  const otherSsh = () => ssh.calls.filter((c) => !c.remote.includes("'list-panes' '-a'") && !c.input?.includes('task/*/children'));
+
+  for (const count of [5, 11]) {
+    it(`${count} busy tabs on a slow host that answers its scan: no per-tab ssh, titles from the scan, the local tab read in the same poll`, async () => {
+      const tabs = busyFleet(count);
+      ssh.scan = (host) => ({ stdout: host === HOST ? tabs.map((t, i) => titledLine(t.sessionName, `\u2733 task ${i}`)).join('') : '' });
+      const { manager, entry } = await createManager('busy');
+      for (const tab of tabs) entry(tab.id).lastEvent = { name: 'prompt-submit', at: T0, seq: 1 };
+      await manager.poll();
+      expect(otherSsh()).toEqual([]);
+      expect(entry('tab-b0').agentSummary).toBe('task 0');
+      expect(entry(`tab-b${count - 1}`).agentSummary).toBe(`task ${count - 1}`);
+      expect(entry('tab-local').currentProcess).toBe('vim');
+    });
+
+    it(`${count} busy tabs on a down host: no per-tab ssh, each keeps its summary, the local tab read in the same poll`, async () => {
+      const tabs = busyFleet(count);
+      ssh.scan = (host) => (host === HOST ? TIMED_OUT : { stdout: '' });
+      const { manager, entry } = await createManager('busy');
+      for (const tab of tabs) {
+        entry(tab.id).lastEvent = { name: 'prompt-submit', at: T0, seq: 1 };
+        entry(tab.id).agentSummary = 'earlier summary';
+      }
+      await manager.poll();
+      vi.setSystemTime(T0 + 31_000);
+      await manager.poll();
+      expect(otherSsh()).toEqual([]);
+      for (const tab of tabs) {
+        expect(entry(tab.id).agentSummary).toBe('earlier summary');
+        expect(entry(tab.id).cliState).toBe('busy');
+      }
+      expect(entry('tab-local').currentProcess).toBe('vim');
+    });
+  }
+});
+
+describe('an unread absent waits for its read (review r3 C2)', () => {
+  beforeEach(resetWorld);
+  afterEach(() => vi.useRealTimers());
+
+  it('at a 60 s poll interval, a tick 62 s after the proof answered still reads absent: inactive', async () => {
+    ssh.scan = () => pane('bash');
+    ssh.proof = () => ABSENT;
+    const { entry, inactiveNudges, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(entry().cliState).toBe('idle');
+    vi.setSystemTime(T0 + 62_000);
+    await pollAndSettle();
+    expect(entry().cliState).toBe('inactive');
+    expect(inactiveNudges()).toHaveLength(1);
+    expect(proofCalls()).toHaveLength(1);
+  });
+});
+
+describe('a superseded poll writes nothing (review r3 C3)', () => {
+  beforeEach(resetWorld);
+  afterEach(() => vi.useRealTimers());
+
+  it('a poll held inside a tab, past 10 intervals: the new poll writes, and the old one, released, writes nothing', async () => {
+    const NO_SUCH_PID = '2147483646';
+    const local: ITab = { id: 'tab-local', name: 'local', order: 0, sessionName: LOCAL_SESSION, panelType: 'terminal' };
+    state.tabs = [local];
+    ssh.localPanes = paneLine(LOCAL_SESSION, 'vim', NO_SUCH_PID);
+    let releasePgrep: () => void = () => {};
+    let heldOnce = false;
+    ssh.pgrep = () => {
+      if (heldOnce) return { code: 1, stderr: '' };
+      heldOnce = true;
+      return new Promise<TReply>((resolve) => { releasePgrep = () => resolve({ code: 1, stderr: '' }); });
+    };
+    const { manager, entry } = await createManager('idle');
+    const writes = vi.spyOn(manager as unknown as { broadcastUpdate: (...a: unknown[]) => void }, 'broadcastUpdate');
+    const stale = manager.poll();
+    await vi.waitFor(() => expect(heldOnce).toBe(true));
+    expect(entry('tab-local')).toBeUndefined();
+
+    ssh.localPanes = paneLine(LOCAL_SESSION, 'bash', NO_SUCH_PID);
+    vi.setSystemTime(T0 + 301_000);
+    await manager.poll();
+    expect(entry('tab-local').currentProcess).toBe('bash');
+    const writesAfterNewPoll = writes.mock.calls.length;
+    const snapshot = JSON.stringify(entry('tab-local'));
+
+    releasePgrep();
+    await stale;
+    expect(entry('tab-local').currentProcess).toBe('bash');
+    expect(JSON.stringify(entry('tab-local'))).toBe(snapshot);
+    expect(writes.mock.calls.length).toBe(writesAfterNewPoll);
   });
 });
 

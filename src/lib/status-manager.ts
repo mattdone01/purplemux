@@ -117,6 +117,14 @@ import {
 const toAlertProvider = (providerId: string | undefined): TAlertProviderId =>
   providerId === 'codex' || providerId === 'grok' ? providerId : 'claude';
 
+/** Thrown inside a poll that a newer one superseded: it stops there and writes nothing more (review r3 C3). */
+class PollSuperseded extends Error {
+  constructor() {
+    super('poll superseded');
+    this.name = 'PollSuperseded';
+  }
+}
+
 /** A remote tab's pane read: whether the scan read its host, and the process proof of its agent. */
 interface IRemotePaneRead {
   answered: boolean;
@@ -1094,6 +1102,18 @@ export class StatusManager {
   }
 
   private async runPoll(generation: number): Promise<void> {
+    try {
+      await this.runPollBody(() => {
+        if (!this.isCurrentPoll(generation)) throw new PollSuperseded();
+      });
+    } catch (err) {
+      if (!(err instanceof PollSuperseded)) throw err;
+      log.info({ generation }, 'superseded poll stopped before its next write');
+    }
+  }
+
+  /** `current()` throws once a newer poll superseded this one; it runs after every await that a write follows. */
+  private async runPollBody(current: () => void): Promise<void> {
     // Started, never awaited (ADR-0020): the liveness reconcile, the stuck
     // checks and the idle nudges must not wait for a slow replay. The drain is
     // one shared promise, so a poll during a drain starts no second one. On
@@ -1101,7 +1121,7 @@ export class StatusManager {
     if (this.hookSpoolDrain) void this.drainHookSpool();
     const { workspaces } = await getWorkspaces();
     const panesInfo = await getAllPanesInfo();
-    if (!this.isCurrentPoll(generation)) return;
+    current();
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
     const proofRequests: IRemoteProofRequest[] = [];
@@ -1116,11 +1136,12 @@ export class StatusManager {
 
       const tabs = collectAllTabs(layout.root);
       for (const tab of tabs) {
-        if (!this.isCurrentPoll(generation)) return;
+        current();
         if (tab.panelType === 'codex-cli' && tab.codexLaunchRuntime?.pending) {
           await reconcileCodexLaunchTimeout(ws.id, tab.id, now).catch((err) => {
             log.warn(`Codex launch timeout reconciliation failed: ${err instanceof Error ? err.message : err}`);
           });
+          current();
         }
         const trackedLifecycle = this.codexLifecycleEpoch.get(tab.id);
         const persistedLifecycle = tab.codexLaunchRuntime?.pending
@@ -1159,6 +1180,7 @@ export class StatusManager {
           await this.nudgeLiveness(ws.id, tab.id, tab.name, 'model-drift', detail, undefined, `model-drift:${detail}`);
           return true;
         }).catch((err) => log.warn(`model policy check failed: ${err instanceof Error ? err.message : err}`));
+        current();
         if ((this.codexLifecycleEpoch.get(tab.id)?.epoch ?? 0) !== lifecycleEpoch) continue;
         const paneInfo = panesInfo.get(tab.sessionName);
         // A remote tab whose host this scan did not read keeps what it showed (review r3 B1).
@@ -1170,6 +1192,7 @@ export class StatusManager {
           : provider
             ? { terminalStatus: 'idle' as const, listeningPorts: [] as number[] }
             : await this.detectTerminalStatus(paneInfo);
+        current();
         const currentProcess = paneUnread && existing ? existing.currentProcess : paneInfo?.command;
         const newPaneTitle = paneUnread && existing ? existing.paneTitle : paneInfo ? `${paneInfo.command}|${paneInfo.path}` : undefined;
 
@@ -1177,6 +1200,7 @@ export class StatusManager {
           const persisted: TCliState = (tab.cliState as TCliState | undefined) ?? 'idle';
           const initialState: TCliState = restoredCliState(persisted);
           const detected = await this.readTabMetadata(paneInfo, provider, tab);
+          current();
           // lastEvent는 메모리 전용이라 재시작 시 유실. persisted needs-input을 복원할 때는
           // 클라이언트 ack가 seq=0과 매칭할 baseline이 필요하므로 합성한다.
           const syntheticLastEvent: ILastEvent | null = initialState === 'needs-input'
@@ -1226,6 +1250,7 @@ export class StatusManager {
         const messageChanged = existing.lastUserMessage !== tab.lastUserMessage;
         const panelTypeChanged = existing.panelType !== tab.panelType;
         const refreshed = await this.readTabMetadata(paneInfo, provider, tab);
+        current();
         if ((this.codexLifecycleEpoch.get(tab.id)?.epoch ?? 0) !== lifecycleEpoch) continue;
         existing.tabName = tab.name || (newPaneTitle ? formatTabTitle(newPaneTitle, tab.panelType) : '');
         existing.currentProcess = currentProcess;
@@ -1265,14 +1290,19 @@ export class StatusManager {
         let summaryChanged = false;
         const tabSummary = provider ? provider.readSummary(tab) : null;
         if (existing.cliState === 'busy' || existing.cliState === 'needs-input') {
-          const paneTitle = await getPaneTitle(tab.sessionName);
-          const liveSummary = provider?.parsePaneTitle(paneTitle) ?? null;
-          const nextSummary = liveSummary ?? tabSummary;
-          if (nextSummary !== existing.agentSummary) {
-            existing.agentSummary = nextSummary;
-            summaryChanged = true;
-            if (liveSummary && provider) {
-              updateTabAgentSummary(tab.sessionName, provider, liveSummary).catch(() => {});
+          // A remote pane's title came with the scan, one ssh per host (review r3 C1); a host the scan did not
+          // read keeps the last summary and costs no call. A local title is one local tmux call.
+          const paneTitle = tab.host ? (paneInfo?.host ? paneInfo.title ?? null : undefined) : await getPaneTitle(tab.sessionName);
+          current();
+          if (paneTitle !== undefined) {
+            const liveSummary = provider?.parsePaneTitle(paneTitle) ?? null;
+            const nextSummary = liveSummary ?? tabSummary;
+            if (nextSummary !== existing.agentSummary) {
+              existing.agentSummary = nextSummary;
+              summaryChanged = true;
+              if (liveSummary && provider) {
+                updateTabAgentSummary(tab.sessionName, provider, liveSummary).catch(() => {});
+              }
             }
           }
         } else {
@@ -1297,6 +1327,7 @@ export class StatusManager {
                 return answer;
               },
             } : null);
+            current();
           }
           return agentRunningCache;
         };
@@ -1320,6 +1351,7 @@ export class StatusManager {
           // A registered job that died speaks first: its completion event, not a stall (L49, tab-peo88o).
           if (!this.stuckNudgedTabs.has(tab.id) && !(await this.reportDeadJobs(tab.id))
               && await this.looksStalled(tab.id, existing, now)) {
+            current();
             this.stuckNudgedTabs.set(tab.id, now);
             this.nudgeOrchestrator(tab.id, existing, 'stuck').catch((err) => {
               log.warn(`stuck nudge failed: ${err instanceof Error ? err.message : err}`);
@@ -1350,6 +1382,7 @@ export class StatusManager {
           const seq = existing.eventSeq;
           if (await this.checkCodexTuiReady(existing, checkAgentRunning)
               && this.stillInactiveAt(tab.id, existing, seq)) {
+            current();
             hookLog.debug({ tabId: tab.id }, 'codex tui ready — synthetic session-start');
             this.updateTabFromHook(existing.tmuxSession, 'session-start');
             continue;
@@ -1362,6 +1395,7 @@ export class StatusManager {
           const seq = existing.eventSeq;
           const probedState = existing.cliState;
           const reading = await this.checkAgentPaneReady(tab.id, existing, now, checkAgentRunning);
+          current();
           if (reading === 'ready' && this.stillAt(tab.id, existing, probedState, seq)) {
             this.inactiveSeenAt.delete(tab.id);
             hookLog.info({ tabId: tab.id, panelType: existing.panelType }, 'readiness: pane-probe — synthetic session-start');
@@ -1380,7 +1414,7 @@ export class StatusManager {
       }
     }
 
-    if (!this.isCurrentPoll(generation)) return;
+    current();
     // Not awaited: the next poll reads what these proofs answer (vel-D61).
     if (proofRequests.length > 0) void this.remoteProofs.schedule(proofRequests);
 
