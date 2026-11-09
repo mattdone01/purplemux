@@ -283,6 +283,40 @@ describe('tab send — permanent and retryable failures are distinct', () => {
     expect(code).toBe(0);
     expect(JSON.parse(stdout)).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
   });
+
+  it('exits 0 for a submission the server proved (vel-RETRO-R3)', async () => {
+    reply = json(200, { status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
+
+    const { code, stderr } = await cli(['tab', 'send', '-w', 'WS', 'tab-x', 'hi']);
+
+    expect(code).toBe(0);
+    expect(stderr).toBe('');
+  });
+
+  it.each([
+    ['typed-not-submitted', 'the text is in the composer; do not resend; inspect the tab'],
+    ['submit-unconfirmed', 'the text was typed and no turn was seen; do not resend; inspect the tab'],
+  ])('exits 1 for %s, prints the body, and says not to resend (vel-RETRO-R3)', async (notSubmitted, hint) => {
+    const body = { status: 'sent', submitted: false, cliState: 'idle', confirmation: null, resubmitted: true, notSubmitted };
+    reply = json(200, body);
+
+    const { code, stdout, stderr } = await cli(['tab', 'send', '-w', 'WS', 'tab-x', 'hi']);
+
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toEqual(body);
+    expect(stderr).toBe(`error: ${notSubmitted} (${hint}) — tab tab-x (Enter was pressed once more)\n`);
+  });
+
+  it('names the screen reading of a readiness timeout (vel-RETRO-R3)', async () => {
+    reply = json(409, {
+      error: 'agent-not-ready', code: 'readiness-timeout', tabId: 'tab-x', cliState: 'idle', detail: 'readiness-timeout', waitedMs: 60000, screen: 'composer-not-empty',
+    });
+
+    const { code, stderr } = await cli(['tab', 'send', '-w', 'WS', 'tab-x', 'hi']);
+
+    expect(code).toBe(5);
+    expect(stderr).toContain('not ready after 60000 ms, cliState idle, screen composer-not-empty');
+  });
 });
 
 describe('the code → exit table', () => {

@@ -3,13 +3,22 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import type { ITab, TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 
+const panes = vi.hoisted(() => {
+  const rule = '─'.repeat(60);
+  const claude = (composer: string): string => ['● Earlier output', '', rule, `❯ ${composer}`, rule, '  ⏵⏵ bypass permissions on'].join('\n');
+  return { claude, empty: claude('') };
+});
+
 const tmux = vi.hoisted(() => ({
   hasSession: vi.fn(async () => true),
   isContentPendingInComposer: vi.fn(async () => false),
+  capturePaneContent: vi.fn(async (_session: string, _opts?: unknown): Promise<string | null> => panes.empty),
+  isPaneShowingPendingLine: (pane: string, content: string): boolean => pane.includes(`❯ ${content.split('\n')[0]}`),
+  pressEnter: vi.fn(async (_session: string) => {}),
 }));
 
 const delivery = vi.hoisted(() => ({
-  deliverPrompt: vi.fn(async () => {}),
+  deliverPrompt: vi.fn(async (_session: string, _content: string) => {}),
 }));
 const cliUtils = vi.hoisted(() => ({
   findTab: vi.fn(),
@@ -24,6 +33,9 @@ const cliUtils = vi.hoisted(() => ({
 const live = vi.hoisted(() => ({
   entries: {} as Record<string, { cliState: TCliState; startupPrompt?: { kind: 'folder-trust' | 'external-imports'; since: number } | null }>,
   waiting: new Set<string>(),
+  evidence: {} as Record<string, import('@/types/status').ISubmitEvidence>,
+  /** The agent's prompt-submit hook fires when the typing ends (vel-RETRO-R3); false: no turn starts. */
+  hookOnSubmit: true,
 }));
 const tabEvents = vi.hoisted(() => ({
   route: vi.fn(async (_event: unknown) => ({ class: 'digest', delivered: false, seq: 1, duplicate: false })),
@@ -51,6 +63,7 @@ vi.mock('@/lib/status-manager', () => ({
   getStatusManager: () => ({
     getAllForClient: () => live.entries,
     isWaitingAtPrompt: (id: string) => live.waiting.has(id),
+    getSubmitEvidence: (id: string) => live.evidence[id] ?? null,
     routeTabEvent: tabEvents.route,
   }),
 }));
@@ -104,12 +117,6 @@ const tabWith = (cliState?: TCliState, panelType: TPanelType = 'claude-code'): I
 
 const locate = (tab: ITab) => ({ workspaceId: WORKSPACE_ID, paneId: 'pane-1', tab });
 
-interface ISendBody {
-  status: string;
-  submitted: boolean;
-  cliState: TCliState | null;
-}
-
 type THandler = (req: NextApiRequest, res: NextApiResponse) => Promise<unknown>;
 
 describe('POST /api/cli/tabs/[tabId]/send', () => {
@@ -131,6 +138,15 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     dispatchPolicy.mockResolvedValue({ ok: true });
     live.entries = {};
     live.waiting = new Set();
+    live.evidence = { [TAB_ID]: { cliState: 'idle', eventSeq: 4, lastPromptSubmitSeq: 2, lastEventFromTool: false } };
+    live.hookOnSubmit = true;
+    delivery.deliverPrompt.mockImplementation(async () => {
+      const before = live.evidence[TAB_ID];
+      if (!live.hookOnSubmit || !before) return;
+      live.evidence[TAB_ID] = { ...before, cliState: 'busy', eventSeq: before.eventSeq + 1, lastPromptSubmitSeq: before.eventSeq + 1 };
+    });
+    tmux.capturePaneContent.mockReset().mockResolvedValue(panes.empty);
+    tmux.pressEnter.mockReset();
     const { LedgerStore } = await import('@/lib/ledger-store');
     ledger.store = new LedgerStore(':memory:');
     tmux.hasSession.mockResolvedValue(true);
@@ -144,7 +160,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'run the tests' });
 
     expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
     expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
     expect(ledger.store.tabEvents.list(WORKSPACE_ID, { since: 0, limit: 5 })).toEqual([
       expect.objectContaining({ tabId: TAB_ID, kind: 'tab-send', text: 'run the tests', class: 'urgent', deliveredAt: expect.any(Number) }),
@@ -220,21 +236,110 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     expect(delivery.deliverPrompt).not.toHaveBeenCalled();
   });
 
-  it('reports submitted false when the paste is still sitting in the composer', async () => {
-    tmux.isContentPendingInComposer.mockResolvedValue(true);
+  describe('the submission needs proof (vel-RETRO-R3)', () => {
+    /** Runs a send whose confirmation polls to its deadline, on fake timers. */
+    const callToDeadline = async (body: unknown): Promise<IFakeResponse> => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+      try {
+        let settled = false;
+        const pending = call(body).finally(() => { settled = true; });
+        while (!settled) await vi.advanceTimersByTimeAsync(250);
+        return await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+    };
 
-    const response = await call({ content: 'run the tests' });
+    it('typed-not-submitted: the text stays in the composer, ONE more Enter is pressed, and the body names it', async () => {
+      live.hookOnSubmit = false;
+      tmux.capturePaneContent
+        .mockResolvedValueOnce(panes.empty)
+        .mockResolvedValue(panes.claude('run the tests'));
 
-    expect(response.statusCode).toBe(200);
-    expect((response.body as ISendBody).submitted).toBe(false);
-  });
+      const response = await callToDeadline({ content: 'run the tests' });
 
-  it('reports submitted when the composer probe itself fails', async () => {
-    tmux.isContentPendingInComposer.mockRejectedValue(new Error('capture-pane failed'));
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toEqual({
+        status: 'sent', submitted: false, cliState: 'idle', confirmation: null, resubmitted: true, notSubmitted: 'typed-not-submitted',
+      });
+      expect(tmux.pressEnter).toHaveBeenCalledTimes(1);
+      expect(tmux.pressEnter).toHaveBeenCalledWith(SESSION_NAME);
+      expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
+    });
 
-    const response = await call({ content: 'run the tests' });
+    it('confirms when the one extra Enter starts the turn', async () => {
+      live.hookOnSubmit = false;
+      tmux.capturePaneContent
+        .mockResolvedValueOnce(panes.empty)
+        .mockResolvedValue(panes.claude('run the tests'));
+      tmux.pressEnter.mockImplementationOnce(async () => {
+        const before = live.evidence[TAB_ID];
+        live.evidence[TAB_ID] = { ...before, cliState: 'busy', eventSeq: before.eventSeq + 1, lastPromptSubmitSeq: before.eventSeq + 1 };
+      });
 
-    expect((response.body as ISendBody).submitted).toBe(true);
+      const response = await callToDeadline({ content: 'run the tests' });
+
+      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: true });
+    });
+
+    it('a failed probe is not proof: submit-unconfirmed', async () => {
+      live.hookOnSubmit = false;
+      tmux.capturePaneContent.mockResolvedValueOnce(panes.empty).mockResolvedValue(null);
+
+      const response = await callToDeadline({ content: 'run the tests' });
+
+      expect(response.body).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed', resubmitted: false });
+      expect(tmux.pressEnter).not.toHaveBeenCalled();
+    });
+
+    it('an empty composer is not proof on a tab with a prompt-submit hook: submit-unconfirmed', async () => {
+      live.hookOnSubmit = false;
+
+      const response = await callToDeadline({ content: 'run the tests' });
+
+      expect(response.body).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed' });
+    });
+
+    it('a tab with no status entry cannot prove a turn: submit-unconfirmed at once', async () => {
+      live.evidence = {};
+
+      const response = await call({ content: 'run the tests' });
+
+      expect(response.body).toMatchObject({ submitted: false, notSubmitted: 'submit-unconfirmed', resubmitted: false });
+      expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads the baseline inside the lock before typing, so a turn that started earlier is no proof', async () => {
+      live.evidence[TAB_ID] = { ...live.evidence[TAB_ID], lastPromptSubmitSeq: 4 };
+      live.hookOnSubmit = false;
+
+      const response = await callToDeadline({ content: 'run the tests' });
+
+      expect(response.body).toMatchObject({ submitted: false });
+    });
+
+    it('not ready, then ready: an idle tab with no composer drawn waits, then is typed into once', async () => {
+      tmux.capturePaneContent
+        .mockResolvedValueOnce('Claude Code v2 starting…')
+        .mockResolvedValueOnce('Claude Code v2 starting…')
+        .mockResolvedValue(panes.empty);
+
+      const response = await call({ content: 'here is your brief', waitMs: 5_000 });
+
+      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
+      expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
+      expect(tmux.capturePaneContent.mock.calls[0]).toEqual([SESSION_NAME, { escapes: true }]);
+    });
+
+    it('refuses a composer that holds text until the deadline, names the screen, and types nothing', async () => {
+      tmux.capturePaneContent.mockResolvedValue(panes.claude('half a brief somebody typed'));
+
+      const response = await call({ content: 'here is your brief', waitMs: 0 });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.body).toMatchObject({ code: 'readiness-timeout', cliState: 'idle', screen: 'composer-not-empty' });
+      expect(delivery.deliverPrompt).not.toHaveBeenCalled();
+    });
   });
 
   it('refuses a booting agent, names the tab and its state, and pastes nothing', async () => {
@@ -321,7 +426,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'here is your brief', waitMs: 40 });
 
     expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle' });
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
     expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'here is your brief');
   });
 
@@ -340,11 +445,12 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     cliUtils.findTab.mockResolvedValue(locate(tabWith('busy')));
     live.entries = { [TAB_ID]: { cliState: 'busy' } };
     live.waiting.add(TAB_ID);
+    live.evidence[TAB_ID] = { ...live.evidence[TAB_ID], cliState: 'busy' };
 
     const response = await call({ content: 'gate r2 is green; merge it', waitMs: 30 });
 
     expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'busy' });
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'busy', confirmation: 'prompt-submit', resubmitted: false });
     expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'gate r2 is green; merge it');
   });
 
@@ -356,8 +462,9 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
       const response = await call({ content: 'ls -la' });
 
       expect(response.statusCode).toBe(200);
-      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: null });
+      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: null, confirmation: null, resubmitted: false });
       expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'ls -la');
+      expect(tmux.capturePaneContent).not.toHaveBeenCalled();
     },
   );
 

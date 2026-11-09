@@ -21,3 +21,21 @@ Accepted (2026-08-16, epic `purplemux-mobile`, story 22). Narrowed by ADR-0008: 
  `submitted: true` from either send route now means an agent that could accept a turn was pasted into and the composer came back empty. A `tab send` can block for up to `waitMs` (`--wait-ms N` / `--no-wait` on the CLI); the 409 body names the tab, its `cliState`, and `detail: 'readiness-timeout' | 'session-not-running'`. Terminal, browser and diff tabs are ungated — they have no turn to accept — which also lifts the cookie route's accidental block on sending to a terminal tab.
 
 Source of truth for the epic: `_output/purplemux-mobile/architecture.md` (nomupay workspace).
+
+## Amendment vel-RETRO-R3 (2026-11-09): the screen and the proof
+Retro row R3: a brief sent to a fresh tab was typed and not submitted, `tab send` exited 0, and the receiver sat idle
+for 15 minutes. A fresh Claude tab turns `idle` on its SessionStart hook, which can fire before the TUI takes keys.
+Ruling and options: `docs/design/vel-retro-r3-send-confirm.md`.
+
+1. On the `composer-ready` gate, a tab in `idle`, `ready-for-review` or `busy` waiting at its prompt must also show an
+   empty composer on screen (`readComposerScreen`, the screen half of Mission Control's `checkComposerReady`).
+   `needs-input` stays status-only. A timeout carries `screen: composer-not-empty | composer-unreadable |
+   interactive-prompt-active`, and nothing is typed.
+2. After the typing, an agent tab must prove the submission: a turn-starting `prompt-submit` hook after the seq read
+   inside the dispatch lock (`lastPromptSubmit`; a Codex tool event does not count), or `busy` from a state that was
+   not. The window is 5 s, 10 s for a remote tab, polled every 250 ms. An empty composer is proof only on a tab with no
+   prompt-submit hook; a failed capture is never proof.
+3. Text still in the composer at 1.5 s gets one more Enter (L37). Option 2's objection does not apply: the Enter goes
+   only to a composer that still holds the text, so it never submits an empty prompt.
+4. Without proof the answer is HTTP 200 with `submitted: false` and `notSubmitted: typed-not-submitted |
+   submit-unconfirmed`, and the CLI exits 1 (ADR-0016): the text was typed, so a resend would type it twice.

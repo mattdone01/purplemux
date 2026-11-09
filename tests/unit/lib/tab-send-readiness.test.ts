@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { TComposerScreen } from '@/lib/composer-readiness';
 import type { TPanelType } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 import {
@@ -21,6 +22,8 @@ interface IStep {
   alive?: boolean;
   waitingAtPrompt?: boolean;
   startupPrompt?: ITabSendTarget['startupPrompt'];
+  /** What the screen half of the gate reads at this poll; absent means the caller passes no screen reader. */
+  screen?: TComposerScreen | 'throws';
 }
 
 /**
@@ -31,11 +34,13 @@ const runReadiness = async (
   steps: (IStep | null)[],
   timeoutMs: number,
   gate: TSendGate = 'composer-ready',
-): Promise<{ result: TSendReadiness; sleeps: number[]; polls: number }> => {
+): Promise<{ result: TSendReadiness; sleeps: number[]; polls: number; screenReads: string[] }> => {
   const sleeps: number[] = [];
   let clock = 0;
   let polls = 0;
   let current: IStep | null = null;
+  const screened = steps.some((step) => step?.screen !== undefined);
+  const screenReads: string[] = [];
 
   const result = await awaitSendReadiness(
     {
@@ -49,6 +54,14 @@ const runReadiness = async (
         };
       },
       hasSession: async () => current !== null && current.alive !== false,
+      ...(screened ? {
+        readScreen: async (target: ITabSendTarget): Promise<TComposerScreen> => {
+          screenReads.push(String(target.cliState));
+          const screen = current?.screen ?? { ok: true };
+          if (screen === 'throws') throw new Error('capture failed');
+          return screen;
+        },
+      } : {}),
       now: () => clock,
       sleep: async (ms: number) => {
         sleeps.push(ms);
@@ -58,7 +71,7 @@ const runReadiness = async (
     { workspaceId: 'ws', tabId: 'tab-1', timeoutMs, gate },
   );
 
-  return { result, sleeps, polls };
+  return { result, sleeps, polls, screenReads };
 };
 
 const agent = (cliState: TCliState | null, alive = true): IStep => ({
@@ -74,6 +87,7 @@ describe('awaitSendReadiness on the composer-ready gate', () => {
     expect(result).toEqual({
       ok: true,
       target: { sessionName: SESSION, cliState: 'idle', panelType: 'claude-code' },
+      screenEmpty: false,
     });
     expect(sleeps).toEqual([]);
     expect(polls).toBe(1);
@@ -297,5 +311,78 @@ describe('composer-ready gate and a startup prompt (story 05, D14)', () => {
 
   it('is not a composer-ready state', () => {
     expect(isComposerReadyCliState('startup-prompt')).toBe(false);
+  });
+});
+
+describe('awaitSendReadiness reads the screen on the composer-ready gate (vel-RETRO-R3)', () => {
+  const drawn: TComposerScreen = { ok: true };
+  const notDrawn: TComposerScreen = { ok: false, reason: 'composer-unreadable' };
+  const typed: TComposerScreen = { ok: false, reason: 'composer-not-empty' };
+
+  it('is ready at once when the idle agent shows an empty composer, and says the screen was read', async () => {
+    const { result, sleeps } = await runReadiness([{ ...agent('idle'), screen: drawn }], 5_000);
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: true });
+    expect(sleeps).toEqual([]);
+  });
+
+  it('waits out an idle agent whose composer is not drawn yet (SessionStart before the TUI takes keys)', async () => {
+    const { result, sleeps, polls } = await runReadiness(
+      [{ ...agent('idle'), screen: notDrawn }, { ...agent('idle'), screen: notDrawn }, { ...agent('idle'), screen: drawn }],
+      5_000,
+    );
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: true });
+    expect(sleeps).toEqual([SEND_READY_POLL_INTERVAL_MS, SEND_READY_POLL_INTERVAL_MS]);
+    expect(polls).toBe(3);
+  });
+
+  it('times out on a composer that holds text, names the screen reading, and types nothing', async () => {
+    const { result } = await runReadiness([{ ...agent('idle'), screen: typed }], 1_000);
+
+    expect(result).toEqual({ ok: false, reason: 'readiness-timeout', cliState: 'idle', waitedMs: 1_000, screen: 'composer-not-empty' });
+  });
+
+  it('reads a capture that throws as not ready, never as an empty composer', async () => {
+    const { result } = await runReadiness([{ ...agent('idle'), screen: 'throws' }], 500);
+
+    expect(result).toMatchObject({ ok: false, reason: 'readiness-timeout', screen: 'composer-unreadable' });
+  });
+
+  it('answers at once with waitMs 0: one look, no sleep', async () => {
+    const { result, sleeps } = await runReadiness([{ ...agent('idle'), screen: typed }], 0);
+
+    expect(result).toMatchObject({ ok: false, reason: 'readiness-timeout', waitedMs: 0, screen: 'composer-not-empty' });
+    expect(sleeps).toEqual([]);
+  });
+
+  it('screens ready-for-review and a busy tab waiting at its prompt, the states Mission Control screens', async () => {
+    const review = await runReadiness([{ ...agent('ready-for-review'), screen: typed }], 0);
+    const waiting = await runReadiness([{ ...agent('busy'), waitingAtPrompt: true, screen: typed }], 0);
+
+    expect(review.result).toMatchObject({ ok: false, screen: 'composer-not-empty' });
+    expect(waiting.result).toMatchObject({ ok: false, screen: 'composer-not-empty' });
+  });
+
+  it('leaves needs-input status-only: its option list is what the send answers (ADR-0007)', async () => {
+    const { result, screenReads } = await runReadiness([{ ...agent('needs-input'), screen: typed }], 0);
+
+    expect(result).toMatchObject({ ok: true, screenEmpty: false });
+    expect(screenReads).toEqual([]);
+  });
+
+  it('never reads the screen of a terminal tab or on the live-session gate', async () => {
+    const terminal = await runReadiness([{ cliState: null, panelType: 'terminal', screen: typed }], 0);
+    const live = await runReadiness([{ ...agent('idle'), screen: typed }], 0, 'live-session');
+
+    expect(terminal.result).toMatchObject({ ok: true, screenEmpty: false });
+    expect(live.result).toMatchObject({ ok: true, screenEmpty: false });
+    expect([...terminal.screenReads, ...live.screenReads]).toEqual([]);
+  });
+
+  it('drops a screen reading once the state leaves the screened set, so a timeout names the latest cause', async () => {
+    const { result } = await runReadiness([{ ...agent('idle'), screen: typed }, { ...agent('busy'), screen: typed }], 500);
+
+    expect(result).toEqual({ ok: false, reason: 'readiness-timeout', cliState: 'busy', waitedMs: 500 });
   });
 });

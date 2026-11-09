@@ -7,7 +7,9 @@ import {
   resolveSendWaitMs,
   resolveTabCliState,
 } from '@/lib/tab-send';
-import { hasSessionOrUnreachable, isContentPendingInComposer } from '@/lib/tmux';
+import { capturePaneContent, hasSessionOrUnreachable, isContentPendingInComposer, isPaneShowingPendingLine, pressEnter } from '@/lib/tmux';
+import { readComposerScreen } from '@/lib/composer-readiness';
+import { confirmSubmission, type TSubmitResult } from '@/lib/send-confirmation';
 import { deliverPrompt } from '@/lib/agent-prompt-delivery';
 import { withAgentDispatchLock } from '@/lib/agent-dispatch-policy';
 import { TAB_NOT_FOUND_BODY, remoteHostUnreachableBody, targetChangedBody } from '@/lib/cli-error';
@@ -22,6 +24,11 @@ import { parseRawFlag, rawRefusalText, terminalInputRefusal } from '@/lib/termin
 
 const log = createLogger('tab-send');
 
+/** `submit` is null for a tab with no turn to prove (a terminal or browser tab). */
+interface IDelivered {
+  submit: TSubmitResult | null;
+}
+
 /**
  * Deliver a prompt to a tab.
  *
@@ -35,6 +42,10 @@ const log = createLogger('tab-send');
  * `waitMs: 0` opts out and answers with whatever the tab is doing right now.
  * On timeout nothing is pasted at all — half a brief sitting in a composer for
  * a stray Enter to submit is worse than no brief.
+ *
+ * An agent tab's text then needs proof that it was submitted: a turn-starting
+ * `prompt-submit` hook after the typing (vel-RETRO-R3, `send-confirmation.ts`).
+ * Without it the answer names `notSubmitted` and the CLI exits 1.
  */
 /** A remote tab's host that did not answer is retryable, never "the session is dead" (ADR-0022). */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {
@@ -106,6 +117,7 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
         };
       },
       hasSession: hasSessionOrUnreachable,
+      readScreen: async (target) => readComposerScreen(target.panelType, await capturePaneContent(target.sessionName, { escapes: true })),
     },
     // `composer-ready`, not `live-session`: this is the unattended dispatch
     // path, where a paste that beats the TUI's boot is silently swallowed. The
@@ -133,7 +145,7 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
       tabId,
       cliState: readiness.cliState,
       detail: readiness.reason,
-      ...(readiness.reason === 'readiness-timeout' ? { waitedMs: readiness.waitedMs } : {}),
+      ...(readiness.reason === 'readiness-timeout' ? { waitedMs: readiness.waitedMs, ...(readiness.screen ? { screen: readiness.screen } : {}) } : {}),
     });
   }
 
@@ -141,29 +153,46 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!current || current.tab.sessionName !== readiness.target.sessionName) {
     return res.status(409).json(targetChangedBody(tabId));
   }
-  const delivered = await withAgentDispatchLock(workspaceId, current.tab, async (checkPolicy) => {
+  const delivered = await withAgentDispatchLock(workspaceId, current.tab, async (checkPolicy): Promise<IDelivered | null> => {
     const latest = await findTab(workspaceId, tabId);
     if (!latest || latest.tab.sessionName !== readiness.target.sessionName) {
       res.status(409).json(targetChangedBody(tabId));
-      return false;
+      return null;
     }
     if (!await hasSessionOrUnreachable(latest.tab.sessionName)) {
       res.status(409).json({ error: 'agent-not-ready', code: 'session-not-running', tabId, detail: 'session-not-running' });
-      return false;
+      return null;
     }
     // A shell runs each line as a command (D30): multi-line text into a terminal tab needs raw: true.
     const refusal = terminalInputRefusal(latest.tab, content, raw);
     if (refusal) {
       res.status(400).json(refusal);
-      return false;
+      return null;
     }
     const policy = await checkPolicy({ consumeBootstrapForTarget: true });
     if (!policy.ok) {
       res.status(409).json(policy);
-      return false;
+      return null;
     }
-    await deliverPrompt(latest.tab.sessionName, content);
-    return true;
+    const { sessionName, panelType } = latest.tab;
+    if (!isAgentPanelType(panelType)) {
+      await deliverPrompt(sessionName, content);
+      return { submit: null };
+    }
+    // Inside the lock, so no other dispatch types into the composer while this one reads it (vel-RETRO-R3).
+    const baseline = getStatusManager().getSubmitEvidence(tabId);
+    await deliverPrompt(sessionName, content);
+    if (!baseline) return { submit: { submitted: false, notSubmitted: 'submit-unconfirmed', resubmitted: false } };
+    const submit = await confirmSubmission(
+      {
+        readEvidence: () => getStatusManager().getSubmitEvidence(tabId),
+        capture: () => capturePaneContent(sessionName, { escapes: true }),
+        isPendingLine: isPaneShowingPendingLine,
+        pressEnter: () => pressEnter(sessionName),
+      },
+      { panelType, remote: !!latest.tab.host, content, baseline, screenEmptyAtGate: readiness.screenEmpty },
+    );
+    return { submit };
   });
   if (!delivered) return;
   try {
@@ -172,16 +201,30 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     log.warn(`tab send to ${tabId} not recorded: ${err instanceof Error ? err.message : err}`);
   }
 
-  // Report delivery, not just dispatch. A paste that lands while the agent is
-  // mid-turn can have its Enter swallowed and sit in the composer until
-  // somebody else's keystroke submits it, so a caller that reads only
-  // `status` cannot tell a queued message from a stranded one. `pending` is
-  // best-effort and never fatal: the send DID happen either way.
+  const { submit } = delivered;
+  if (submit) {
+    if (!submit.submitted || submit.resubmitted) {
+      log.warn({ tabId, ...submit }, submit.submitted ? 'tab send: submitted after one more Enter' : `tab send: ${submit.notSubmitted}`);
+    }
+    // HTTP 200 either way: the text was typed (ADR-0004, additive). The CLI exits 1 on `notSubmitted`.
+    return res.status(200).json({
+      status: 'sent',
+      submitted: submit.submitted,
+      cliState: readiness.target.cliState,
+      confirmation: submit.submitted ? submit.confirmation : null,
+      resubmitted: submit.resubmitted,
+      ...(submit.submitted ? {} : { notSubmitted: submit.notSubmitted }),
+    });
+  }
+
+  // A terminal tab takes no turn, so there is nothing to prove: `submitted` reads the screen as before, best-effort.
   const pending = await isContentPendingInComposer(readiness.target.sessionName, content).catch(() => false);
   return res.status(200).json({
     status: 'sent',
     submitted: !pending,
     cliState: readiness.target.cliState,
+    confirmation: null,
+    resubmitted: false,
   });
 };
 

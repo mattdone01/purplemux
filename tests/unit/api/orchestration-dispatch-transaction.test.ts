@@ -30,6 +30,9 @@ vi.mock('@/lib/tmux', () => ({
   hasSessionOrUnreachable: vi.fn(async () => true),
   sendEscape: mocks.escape,
   isContentPendingInComposer: vi.fn(async () => false),
+  capturePaneContent: vi.fn(async () => '› \n❯ '),
+  isPaneShowingPendingLine: () => false,
+  pressEnter: vi.fn(),
   listSessions: vi.fn(async () => []),
   killSession: vi.fn(),
 }));
@@ -40,7 +43,9 @@ vi.mock('@/lib/caller', () => ({ resolveCaller: async () => ({ kind: 'workspace'
 vi.mock('@/lib/providers/codex', () => ({ CODEX_LAUNCHER_SCRIPT: '/test/codex-launcher.js', codexProvider: {} }));
 vi.mock('@/lib/providers/codex/session-detection', () => ({ findCodexSessionById: vi.fn() }));
 vi.mock('@/lib/providers/codex/model-observation', () => ({ getCodexModelStatus: mocks.model }));
-vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false }) }));
+// Every paste starts a turn: its prompt-submit seq is the paste count (vel-RETRO-R3).
+const submitEvidence = () => ({ cliState: 'idle' as const, eventSeq: mocks.paste.mock.calls.length, lastPromptSubmitSeq: mocks.paste.mock.calls.length, lastEventFromTool: false });
+vi.mock('@/lib/status-manager', () => ({ getStatusManager: () => ({ getAllForClient: () => ({}), isWaitingAtPrompt: () => false, getSubmitEvidence: submitEvidence }) }));
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
 vi.mock('@/lib/providers/registry', () => ({ listProviders: () => [] }));
 vi.mock('@/lib/grok-home', () => ({ removeWorkspaceGrokHome: vi.fn() }));

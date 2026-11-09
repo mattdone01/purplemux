@@ -9,7 +9,9 @@ const run = promisify(execFile);
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'bin', 'purplemux.js');
 
 /** fetch refuses port 1 before connecting, so a command that reaches the network still fails fast. */
-const ENV = { ...process.env, PMUX_PORT: '1', PMUX_TOKEN: 'test-token', NO_UPDATE_NOTIFIER: '1' };
+/** The caller's own PMUX_URL wins over PMUX_PORT, and its tab token over PMUX_TOKEN: neither may leak in. */
+const { PMUX_URL: _url, PMUX_TAB_TOKEN: _tabToken, ...inherited } = process.env;
+const ENV = { ...inherited, PMUX_PORT: '1', PMUX_TOKEN: 'test-token', NO_UPDATE_NOTIFIER: '1' };
 
 const cli = async (args: string[]): Promise<{ code: number; stderr: string }> => {
   try {
