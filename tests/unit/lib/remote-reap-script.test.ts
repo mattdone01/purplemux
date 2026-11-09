@@ -115,6 +115,32 @@ describe.skipIf(!supported)('remote reap script, run for real (ADR-0022 §9)', {
     expect(parseRemoteProviderObservation(await runScript([sock, session, 'claude'], REMOTE_PROVIDER_SCRIPT)).state).toBe('absent');
   });
 
+  it('finds claude run as a version-named binary under a shell: comm 2.1.319, argv0 claude (vel-D61, review r1 F4)', async () => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'pmux-versioned-'));
+    const binary = pathMod.join(dir, '2.1.319');
+    fs.copyFileSync(execFileSync('sh', ['-c', 'command -v sleep']).toString().trim(), binary);
+    fs.chmodSync(binary, 0o755);
+    try {
+      // The pane's root is the shell and its foreground is not `claude`: only the descendant walk can find it.
+      await run('tmux', ['-L', sock, '-f', '/dev/null', 'new-session', '-d', '-s', session, '-x', '80', '-y', '24',
+        `bash -c 'exec -a claude "$0" 300' '${binary}' & wait`]);
+      await sleep(300);
+      const { stdout: panePid } = await run('tmux', ['-L', sock, 'display-message', '-p', '-t', `=${session}:`, '#{pane_pid}']);
+      const child = fs.readFileSync(`/proc/${panePid.trim()}/task/${panePid.trim()}/children`, 'utf-8').trim().split(/\s+/)[0];
+      expect(fs.readFileSync(`/proc/${child}/comm`, 'utf-8').trim()).toBe('2.1.319');
+      expect(fs.readFileSync(`/proc/${child}/cmdline`, 'utf-8').split('\0')[0]).toBe('claude');
+
+      const found = parseRemoteProviderObservation(await runScript([sock, session, 'claude'], REMOTE_PROVIDER_SCRIPT));
+      expect(found).toMatchObject({ state: 'present', pid: child });
+      process.kill(Number(child), 'SIGKILL');
+      await sleep(200);
+      const gone = parseRemoteProviderObservation(await runScript([sock, session, 'claude'], REMOTE_PROVIDER_SCRIPT));
+      expect(gone.state).toBe('absent');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('closing the last session on the socket: the server exits, the reap still says gone, and tmux\'s answer reads as absence (review r3 B2)', async () => {
     await start();
     const reap = parseRemoteReap(await runScript([sock, session, tab, '0']));

@@ -7,17 +7,21 @@ import type { ITab } from '@/types/terminal';
 // for remote tabs whose claude was alive, over a link where one ssh took 18-25 s. ADR-0022 §19: a scan that did
 // not read the host is unknown, and no inactive transition acts on the tab. Here the real pane scan, the real
 // process proof and the real ssh error classification run; only the ssh process itself is simulated.
+// Review r1 F1: the proofs never hold the poll. The poll reads what an earlier proof answered.
 
-const SESSION = 'pt-ws-1-pane-a-tab-r';
 const HOST = 'agent-exec-harness';
+const HOST2 = 'agent-exec-v2';
+const SESSION = 'pt-ws-1-pane-a-tab-r';
+const LOCAL_SESSION = 'pt-ws-1-pane-l-tab-local';
 
 type TReply = { stdout?: string; stderr?: string; code?: number | null; killed?: boolean; signal?: string };
-interface ISshCall { remote: string; input?: string }
+interface ISshCall { host: string; remote: string; input?: string; session?: string }
 
 const ssh = vi.hoisted(() => ({
   calls: [] as ISshCall[],
-  scan: (): TReply => ({ killed: true, code: null, signal: 'SIGTERM' }),
-  proof: (): TReply => ({ killed: true, code: null, signal: 'SIGTERM' }),
+  scan: (_host: string): TReply | Promise<TReply> => ({ killed: true, code: null, signal: 'SIGTERM' }),
+  proof: (_session: string): TReply | Promise<TReply> => ({ killed: true, code: null, signal: 'SIGTERM' }),
+  localPanes: '',
 }));
 
 vi.mock('child_process', async (importOriginal) => {
@@ -25,21 +29,27 @@ vi.mock('child_process', async (importOriginal) => {
   const { promisify } = await import('util');
   type TCallback = (err: Error | null, stdout: string, stderr: string) => void;
   const execFile = (cmd: string, args: string[], _opts: unknown, cb: TCallback) => {
-    let reply: TReply = { code: 1, stderr: 'no server running on /tmp/tmux-0/purple' };
-    const call: ISshCall = { remote: '' };
+    let reply: TReply | Promise<TReply> = { code: 1, stderr: 'no server running on /tmp/tmux-0/purple' };
+    const call: ISshCall = { host: '', remote: '' };
+    if (cmd === 'tmux' && args.includes('list-panes') && ssh.localPanes) reply = { stdout: ssh.localPanes };
     if (cmd === 'ssh') {
+      call.host = args[args.indexOf('--') + 1] ?? '';
       call.remote = args[args.indexOf('--') + 2] ?? '';
       ssh.calls.push(call);
-      reply = call.remote.includes("'list-panes' '-a'") ? ssh.scan()
-        : call.remote.startsWith("'sh' '-s'") ? ssh.proof()
-          : { killed: true, code: null, signal: 'SIGTERM' };
-    }
-    queueMicrotask(() => {
-      if (reply.code !== undefined || reply.killed) {
-        const err = Object.assign(new Error('failed'), { code: reply.code, killed: !!reply.killed, signal: reply.signal ?? null });
-        cb(err, reply.stdout ?? '', reply.stderr ?? '');
+      if (call.remote.includes("'list-panes' '-a'")) {
+        reply = ssh.scan(call.host);
+      } else if (call.remote.startsWith("'sh' '-s'")) {
+        call.session = call.remote.split(' ')[4]?.replace(/'/g, '');
+        reply = ssh.proof(call.session ?? '');
       } else {
-        cb(null, reply.stdout ?? '', reply.stderr ?? '');
+        reply = { killed: true, code: null, signal: 'SIGTERM' };
+      }
+    }
+    void Promise.resolve(reply).then((r) => {
+      if (r.code !== undefined || r.killed) {
+        cb(Object.assign(new Error('failed'), { code: r.code, killed: !!r.killed, signal: r.signal ?? null }), r.stdout ?? '', r.stderr ?? '');
+      } else {
+        cb(null, r.stdout ?? '', r.stderr ?? '');
       }
     });
     return { stdin: { on: () => {}, end: (input: string) => { call.input = input; } } };
@@ -56,7 +66,7 @@ vi.mock('os', async (importOriginal) => {
   return { ...actual, default: { ...actual, hostname: () => 'mdserver1' }, hostname: () => 'mdserver1' };
 });
 
-const state = vi.hoisted(() => ({ tab: null as ITab | null }));
+const state = vi.hoisted(() => ({ tabs: [] as ITab[] }));
 
 vi.mock('@/lib/logger', () => {
   const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
@@ -71,8 +81,8 @@ vi.mock('@/lib/layout-store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/layout-store')>()),
   resolveLayoutFile: () => '/nonexistent/layout.json',
   readLayoutFile: vi.fn(async () => ({ root: {} })),
-  collectAllTabs: () => (state.tab ? [state.tab] : []),
-  findTabBySessionName: vi.fn(async () => state.tab),
+  collectAllTabs: () => state.tabs,
+  findTabBySessionName: vi.fn(async (name: string) => state.tabs.find((t) => t.sessionName === name) ?? null),
   updateTabCliStatus: vi.fn(async () => {}),
   updateTabAgentSummary: vi.fn(async () => {}),
 }));
@@ -88,9 +98,9 @@ vi.mock('@/lib/notification-dispatcher', () => ({
 vi.mock('@/lib/fcm-channel', () => ({ registerFcmChannel: vi.fn() }));
 vi.mock('@/lib/session-host', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/session-host')>()),
-  sessionHostOf: async (s: string) => (s === SESSION ? HOST : null),
-  knownRemoteHosts: () => [HOST],
-  remoteHostsInUse: async () => [HOST],
+  sessionHostOf: async (s: string) => state.tabs.find((t) => t.sessionName === s)?.host ?? null,
+  knownRemoteHosts: () => [HOST, HOST2],
+  remoteHostsInUse: async () => [HOST, HOST2],
 }));
 
 await Promise.all([
@@ -99,76 +109,104 @@ await Promise.all([
 ]);
 
 const scanBackoff = () => (globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff;
-const pane = (command: string): TReply => ({ stdout: `${SESSION}\t${command}\t/home/agent\t4242\t1794200000\n` });
+const paneLine = (session: string, command: string, pid = '4242'): string => `${session}\t${command}\t/home/agent\t${pid}\t1794200000\n`;
+const pane = (command: string): TReply => ({ stdout: paneLine(SESSION, command) });
 const TIMED_OUT: TReply = { killed: true, code: null, signal: 'SIGTERM' };
 const SSH_255: TReply = { code: 255, stderr: 'kex_exchange_identification: read: Connection reset by peer' };
+const PRESENT: TReply = { stdout: 'present\t%3\t4242\t4300\t918273\n' };
+const ABSENT: TReply = { stdout: 'absent\tno claude process in the pane\n' };
+const T0 = new Date('2026-11-09T04:44:00Z').getTime();
 
-describe('a remote claude tab and a host that does not answer (vel-D61, ADR-0022 §19)', () => {
-  const T0 = new Date('2026-11-09T04:44:00Z').getTime();
+interface IManager {
+  poll: () => Promise<void>;
+  registerTab: (id: string, entry: ITabStatusEntry) => void;
+}
+const internals = (manager: IManager) => manager as unknown as {
+  tabs: Map<string, ITabStatusEntry>;
+  remoteProofs: { settled: () => Promise<void> };
+};
+const proofCalls = () => ssh.calls.filter((c) => c.input?.includes('task/*/children'));
+const scanCalls = () => ssh.calls.filter((c) => c.remote.includes("'list-panes' '-a'"));
 
-  beforeEach(() => {
-    vi.resetModules();
-    vi.clearAllMocks();
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(T0);
-    scanBackoff()?.clear();
-    ssh.calls = [];
-    ssh.scan = () => TIMED_OUT;
-    ssh.proof = () => TIMED_OUT;
-    state.tab = { id: 'tab-r', name: 'builder', order: 0, sessionName: SESSION, panelType: 'claude-code', host: HOST };
-  });
-  afterEach(() => vi.useRealTimers());
+const remoteTab = (id: string, sessionName: string, host = HOST): ITab =>
+  ({ id, name: id, order: 0, sessionName, panelType: 'claude-code', host });
 
-  const setup = async (cliState: TCliState) => {
-    const { StatusManager } = await import('@/lib/status-manager');
-    const manager = new StatusManager(undefined, vi.fn(async () => true), vi.fn(async () => {}));
-    manager.registerTab('tab-r', {
-      cliState, workspaceId: 'ws-1', tabName: 'builder', tmuxSession: SESSION, panelType: 'claude-code',
+const resetWorld = () => {
+  vi.resetModules();
+  vi.clearAllMocks();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(T0);
+  scanBackoff()?.clear();
+  ssh.calls = [];
+  ssh.scan = () => TIMED_OUT;
+  ssh.proof = () => TIMED_OUT;
+  ssh.localPanes = '';
+  state.tabs = [remoteTab('tab-r', SESSION)];
+};
+
+const createManager = async (cliState: TCliState) => {
+  const { StatusManager } = await import('@/lib/status-manager');
+  const manager = new StatusManager(undefined, vi.fn(async () => true), vi.fn(async () => {})) as unknown as IManager;
+  for (const tab of state.tabs) {
+    if (!tab.host) continue;
+    manager.registerTab(tab.id, {
+      cliState, workspaceId: 'ws-1', tabName: tab.name, tmuxSession: tab.sessionName, panelType: 'claude-code',
       lastEvent: { name: 'prompt-submit', at: T0 - 30 * 60_000, seq: 1 }, eventSeq: 1,
     });
-    const entry = (manager as unknown as { tabs: Map<string, ITabStatusEntry> }).tabs.get('tab-r')!;
+    const entry = internals(manager).tabs.get(tab.id)!;
     entry.paneTitle = 'claude|/home/agent';
     entry.currentProcess = 'claude';
-    const nudges = vi.spyOn(manager as unknown as { nudgeOrchestrator: (...a: unknown[]) => Promise<boolean> }, 'nudgeOrchestrator')
-      .mockResolvedValue(true);
-    const inactiveNudges = () => nudges.mock.calls.filter((c) => c[2] === 'inactive');
-    return { manager, entry, inactiveNudges };
+  }
+  const nudges = vi.spyOn(manager as unknown as { nudgeOrchestrator: (...a: unknown[]) => Promise<boolean> }, 'nudgeOrchestrator')
+    .mockResolvedValue(true);
+  const inactiveNudges = () => nudges.mock.calls.filter((c) => c[2] === 'inactive');
+  const entry = (id = 'tab-r') => internals(manager).tabs.get(id)!;
+  /** One poll, then the proofs it started end: the next poll reads their answers. */
+  const pollAndSettle = async () => {
+    await manager.poll();
+    await internals(manager).remoteProofs.settled();
   };
+  return { manager, entry, inactiveNudges, pollAndSettle };
+};
 
-  /** Polls across the 30 s backoff, so both a fresh failed scan and a skipped host are seen. */
-  const pollAcrossBackoff = async (manager: { poll: () => Promise<void> }) => {
+describe('a remote claude tab and a host that does not answer (vel-D61, ADR-0022 §19)', () => {
+  beforeEach(resetWorld);
+  afterEach(() => vi.useRealTimers());
+
+  /** Polls across the 30 s backoffs, so a fresh failure and a skipped host are both seen. */
+  const pollAcrossBackoff = async (pollAndSettle: () => Promise<void>) => {
     for (const offset of [0, 10_000, 31_000, 62_000, 93_000]) {
       vi.setSystemTime(T0 + offset);
-      await manager.poll();
+      await pollAndSettle();
     }
   };
 
   for (const cliState of ['idle', 'ready-for-review', 'needs-input', 'busy'] as const) {
     it(`a ${cliState} tab keeps ${cliState} and sends no inactive nudge while every scan times out`, async () => {
-      const { manager, entry, inactiveNudges } = await setup(cliState);
-      await pollAcrossBackoff(manager);
-      expect(entry.cliState).toBe(cliState);
-      expect(entry.paneTitle).toBe('claude|/home/agent');
+      const { entry, inactiveNudges, pollAndSettle } = await createManager(cliState);
+      await pollAcrossBackoff(pollAndSettle);
+      expect(entry().cliState).toBe(cliState);
+      expect(entry().paneTitle).toBe('claude|/home/agent');
       expect(inactiveNudges()).toEqual([]);
-      expect(ssh.calls.some((c) => c.remote.includes("'list-panes' '-a'"))).toBe(true);
+      expect(scanCalls().length).toBeGreaterThan(0);
     });
   }
 
   it('ssh exit 255 is unknown too: no transition, no nudge', async () => {
     ssh.scan = () => SSH_255;
     ssh.proof = () => SSH_255;
-    const { manager, entry, inactiveNudges } = await setup('ready-for-review');
-    await pollAcrossBackoff(manager);
-    expect(entry.cliState).toBe('ready-for-review');
+    const { entry, inactiveNudges, pollAndSettle } = await createManager('ready-for-review');
+    await pollAcrossBackoff(pollAndSettle);
+    expect(entry().cliState).toBe('ready-for-review');
     expect(inactiveNudges()).toEqual([]);
   });
 
   it('a host that answered once and then times out keeps the tab as it was', async () => {
     let answered = false;
     ssh.scan = () => (answered ? TIMED_OUT : ((answered = true), pane('claude')));
-    const { manager, entry, inactiveNudges } = await setup('idle');
-    await pollAcrossBackoff(manager);
-    expect(entry.cliState).toBe('idle');
+    const { entry, inactiveNudges, pollAndSettle } = await createManager('idle');
+    await pollAcrossBackoff(pollAndSettle);
+    expect(entry().cliState).toBe('idle');
     expect(inactiveNudges()).toEqual([]);
   });
 
@@ -176,39 +214,49 @@ describe('a remote claude tab and a host that does not answer (vel-D61, ADR-0022
     for (const command of ['node', '2.1.319', 'bash']) {
       it(`(${command}) with claude proven in the pane on the host: no inactive transition`, async () => {
         ssh.scan = () => pane(command);
-        ssh.proof = () => ({ stdout: 'present\t%3\t4242\t4300\t918273\n' });
-        const { manager, entry, inactiveNudges } = await setup('ready-for-review');
-        await pollAcrossBackoff(manager);
-        expect(entry.cliState).toBe('ready-for-review');
+        ssh.proof = () => PRESENT;
+        const { entry, inactiveNudges, pollAndSettle } = await createManager('ready-for-review');
+        await pollAcrossBackoff(pollAndSettle);
+        expect(entry().cliState).toBe('ready-for-review');
         expect(inactiveNudges()).toEqual([]);
-        expect(ssh.calls.some((c) => c.input?.includes('task/*/children'))).toBe(true);
+        expect(proofCalls().length).toBeGreaterThan(0);
       });
     }
 
     it('with a process proof that times out: unknown, no transition', async () => {
       ssh.scan = () => pane('bash');
       ssh.proof = () => TIMED_OUT;
-      const { manager, entry, inactiveNudges } = await setup('idle');
-      await pollAcrossBackoff(manager);
-      expect(entry.cliState).toBe('idle');
+      const { entry, inactiveNudges, pollAndSettle } = await createManager('idle');
+      await pollAcrossBackoff(pollAndSettle);
+      expect(entry().cliState).toBe('idle');
       expect(inactiveNudges()).toEqual([]);
     });
 
-    it('with a proof that the host answered and that names no claude process: inactive, one nudge', async () => {
+    it('with a proof that the host answered and that names no claude process: inactive at the next poll, one nudge', async () => {
       ssh.scan = () => pane('bash');
-      ssh.proof = () => ({ stdout: 'absent\tno claude process in the pane\n' });
-      const { manager, entry, inactiveNudges } = await setup('idle');
-      await manager.poll();
-      expect(entry.cliState).toBe('inactive');
+      ssh.proof = () => ABSENT;
+      const { entry, inactiveNudges, pollAndSettle } = await createManager('idle');
+      await pollAndSettle();
+      expect(entry().cliState).toBe('idle');
+      await pollAndSettle();
+      expect(entry().cliState).toBe('inactive');
       expect(inactiveNudges()).toHaveLength(1);
+    });
+
+    it('an inactive tab at its shell runs no proof', async () => {
+      ssh.scan = () => pane('bash');
+      ssh.proof = () => ABSENT;
+      const { pollAndSettle } = await createManager('inactive');
+      await pollAcrossBackoff(pollAndSettle);
+      expect(proofCalls()).toEqual([]);
     });
   });
 
   it('an answered scan without the session is absence: inactive, one nudge that names the host and the check', async () => {
     ssh.scan = () => ({ stdout: '' });
-    const { manager, entry, inactiveNudges } = await setup('idle');
-    await manager.poll();
-    expect(entry.cliState).toBe('inactive');
+    const { entry, inactiveNudges, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(entry().cliState).toBe('inactive');
     expect(inactiveNudges()).toHaveLength(1);
     const detail = String(inactiveNudges()[0][3]);
     expect(detail).toContain(HOST);
@@ -220,18 +268,127 @@ describe('a remote claude tab and a host that does not answer (vel-D61, ADR-0022
 
   it('tmux on the host says no server: absence, inactive', async () => {
     ssh.scan = () => ({ code: 1, stderr: 'no server running on /tmp/tmux-1002/pmux-mdserver1\n' });
-    const { manager, entry, inactiveNudges } = await setup('ready-for-review');
-    await manager.poll();
-    expect(entry.cliState).toBe('inactive');
+    const { entry, inactiveNudges, pollAndSettle } = await createManager('ready-for-review');
+    await pollAndSettle();
+    expect(entry().cliState).toBe('inactive');
     expect(inactiveNudges()).toHaveLength(1);
   });
 
   it('a claude foreground on an answered scan needs no process proof', async () => {
     ssh.scan = () => pane('claude');
-    const { manager, entry } = await setup('idle');
+    const { entry, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(entry().cliState).toBe('idle');
+    expect(proofCalls()).toEqual([]);
+  });
+});
+
+describe('the proofs are bounded and never hold the poll (review r1 F1)', () => {
+  beforeEach(resetWorld);
+  afterEach(() => vi.useRealTimers());
+
+  it('cache hit: a present proof is not asked again within 60 s for the same session, pane and command', async () => {
+    ssh.scan = () => pane('node');
+    ssh.proof = () => PRESENT;
+    const { pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(1);
+    for (const offset of [15_000, 30_000, 59_000]) {
+      vi.setSystemTime(T0 + offset);
+      await pollAndSettle();
+    }
+    expect(proofCalls()).toHaveLength(1);
+  });
+
+  it('cache expiry and key change: after 60 s, or when the pane or its command changes, it proves again', async () => {
+    let command = 'node';
+    let pid = '4242';
+    ssh.scan = () => ({ stdout: paneLine(SESSION, command, pid) });
+    ssh.proof = () => PRESENT;
+    const { entry, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    vi.setSystemTime(T0 + 61_000);
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(2);
+    vi.setSystemTime(T0 + 62_000);
+    command = '2.1.319';
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(3);
+    vi.setSystemTime(T0 + 63_000);
+    pid = '5151';
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(4);
+    expect(entry().cliState).toBe('idle');
+  });
+
+  it('backoff after unknown: that host is not proven again for 30 s, then it is', async () => {
+    ssh.scan = () => pane('node');
+    ssh.proof = () => TIMED_OUT;
+    const { entry, pollAndSettle } = await createManager('idle');
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(1);
+    for (const offset of [5_000, 20_000, 29_000]) {
+      vi.setSystemTime(T0 + offset);
+      await pollAndSettle();
+    }
+    expect(proofCalls()).toHaveLength(1);
+    vi.setSystemTime(T0 + 31_000);
+    await pollAndSettle();
+    expect(proofCalls()).toHaveLength(2);
+    expect(entry().cliState).toBe('idle');
+  });
+
+  it('20 tabs on a host whose proofs hang: the poll ends without them, at most 4 run, a local tab is read in the same poll, and the other host is proven alongside', async () => {
+    const slow = Array.from({ length: 20 }, (_, i) => remoteTab(`tab-s${i}`, `pt-ws-1-pane-a-tab-s${i}`));
+    const other = remoteTab('tab-o', 'pt-ws-1-pane-b-tab-o', HOST2);
+    const local: ITab = { id: 'tab-local', name: 'local', order: 0, sessionName: LOCAL_SESSION, panelType: 'terminal' };
+    state.tabs = [...slow, other, local];
+    ssh.scan = (host) => ({ stdout: host === HOST ? slow.map((t) => paneLine(t.sessionName, 'node')).join('') : paneLine(other.sessionName, 'node') });
+    const hung: Array<() => void> = [];
+    ssh.proof = (session) => (session === other.sessionName ? PRESENT : new Promise<TReply>((resolve) => { hung.push(() => resolve(PRESENT)); }));
+    ssh.localPanes = paneLine(LOCAL_SESSION, 'vim', '777');
+    const { manager, entry } = await createManager('idle');
+
     await manager.poll();
-    expect(entry.cliState).toBe('idle');
-    expect(ssh.calls.some((c) => c.input?.includes('task/*/children'))).toBe(false);
+    expect(proofCalls().filter((c) => c.host === HOST)).toHaveLength(4);
+    expect(proofCalls().filter((c) => c.host === HOST2)).toHaveLength(1);
+    expect(entry('tab-local').terminalStatus).toBe('running');
+
+    vi.setSystemTime(T0 + 10_000);
+    await manager.poll();
+    expect(proofCalls().filter((c) => c.host === HOST)).toHaveLength(4);
+
+    for (const release of hung.splice(0)) release();
+    await internals(manager).remoteProofs.settled();
+    vi.setSystemTime(T0 + 20_000);
+    await manager.poll();
+    const asked = proofCalls().filter((c) => c.host === HOST).map((c) => c.session);
+    expect(asked).toHaveLength(8);
+    expect(new Set(asked).size).toBe(8);
+    for (const tab of slow) expect(entry(tab.id).cliState).toBe('idle');
+    for (const release of hung.splice(0)) release();
+    await internals(manager).remoteProofs.settled();
+  });
+
+  it('overlapping ticks: a poll that finds the previous one running skips, and only one scan goes out', async () => {
+    let releaseScan: () => void = () => {};
+    let held = false;
+    ssh.scan = (host) => {
+      if (host !== HOST) return { stdout: '' };
+      if (held) return pane('claude');
+      held = true;
+      return new Promise<TReply>((resolve) => { releaseScan = () => resolve(pane('claude')); });
+    };
+    const { manager } = await createManager('idle');
+    const harnessScans = () => scanCalls().filter((c) => c.host === HOST);
+    const first = manager.poll();
+    await vi.waitFor(() => expect(harnessScans()).toHaveLength(1));
+    await manager.poll();
+    expect(harnessScans()).toHaveLength(1);
+    releaseScan();
+    await first;
+    await manager.poll();
+    expect(harnessScans()).toHaveLength(2);
   });
 });
 

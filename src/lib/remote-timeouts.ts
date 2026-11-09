@@ -1,4 +1,5 @@
-import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
+import fs from 'fs/promises';
+import { emptyFleetConfig, fleetConfigFile, readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { createLogger } from '@/lib/logger';
 import type { IFleetConfigState } from '@/types/fleet-config';
 
@@ -12,7 +13,7 @@ const log = createLogger('remote');
 export const REMOTE_TIMEOUT_KEY = 'remote.timeout-ms';
 export const REMOTE_TIMEOUT_DEFAULT_MS = 5_000;
 export const REMOTE_TIMEOUT_MAX_MS = 120_000;
-/** ADR-0022 §5's ConnectTimeout, in seconds, at the default budget. */
+/** ADR-0022 §5's ConnectTimeout, in seconds: the attach, which has no call budget. */
 export const SSH_CONNECT_TIMEOUT_S = 5;
 
 export const remoteTimeoutKeyFor = (host: string): string => `${REMOTE_TIMEOUT_KEY}.${host}`;
@@ -39,13 +40,37 @@ export const remoteTimeoutMsIn = (state: IFleetConfigState, host: string): numbe
 const UNREADABLE_WARN_GAP_MS = 60_000;
 let unreadableWarnedAt = 0;
 
+const gCache = globalThis as unknown as { __ptRemoteTimeoutConfig?: { stamp: string; state: IFleetConfigState } };
+
+/**
+ * The fleet store for the ssh budget, read again only when the file changes (review r1 F3): one stat per ssh
+ * call, not a read and a parse. The stamp holds the inode, so a write (tmp + rename) is seen even when the
+ * filesystem's mtime is coarse.
+ */
+const fleetConfigForTimeouts = async (): Promise<IFleetConfigState> => {
+  const file = fleetConfigFile();
+  let stamp: string;
+  try {
+    const st = await fs.stat(file);
+    stamp = `${file}:${st.ino}:${st.mtimeMs}:${st.size}`;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyFleetConfig();
+    throw err;
+  }
+  const cached = gCache.__ptRemoteTimeoutConfig;
+  if (cached?.stamp === stamp) return cached.state;
+  const state = await readFleetConfig();
+  gCache.__ptRemoteTimeoutConfig = { stamp, state };
+  return state;
+};
+
 /**
  * Read at call time (ADR-0019). A store that cannot be read gives the default, never a shorter budget: the call
  * then behaves as it did before this key existed.
  */
 export const remoteTimeoutMs = async (host: string): Promise<number> => {
   try {
-    return remoteTimeoutMsIn(await readFleetConfig(), host);
+    return remoteTimeoutMsIn(await fleetConfigForTimeouts(), host);
   } catch (err) {
     if (Date.now() - unreadableWarnedAt > UNREADABLE_WARN_GAP_MS) {
       unreadableWarnedAt = Date.now();
@@ -61,8 +86,12 @@ export interface IRemoteBudget {
   connectTimeoutS: number;
 }
 
-/** A call's budget on this host: `baseMs` is its budget at the default, as the caller names it. */
+/**
+ * A call's budget on this host: `baseMs` is its budget at the default, as the caller names it. ssh's
+ * ConnectTimeout stays a second under the call's own budget (review r1 F2), so ssh's connect failure, not the
+ * kill, ends a call that cannot connect.
+ */
 export const remoteBudget = (baseMs: number, hostTimeoutMs: number): IRemoteBudget => {
-  const ratio = hostTimeoutMs / REMOTE_TIMEOUT_DEFAULT_MS;
-  return { timeoutMs: Math.ceil(baseMs * ratio), connectTimeoutS: Math.ceil(SSH_CONNECT_TIMEOUT_S * ratio) };
+  const timeoutMs = Math.ceil(baseMs * (hostTimeoutMs / REMOTE_TIMEOUT_DEFAULT_MS));
+  return { timeoutMs, connectTimeoutS: Math.max(1, Math.floor(timeoutMs / 1000) - 1) };
 };

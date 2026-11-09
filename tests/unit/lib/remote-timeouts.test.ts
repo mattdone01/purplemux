@@ -11,6 +11,12 @@ import type { ICaller } from '@/lib/caller';
 interface ISpawn { args: string[]; timeout: number }
 const spawned = vi.hoisted(() => ({ list: [] as ISpawn[] }));
 
+const reads = vi.hoisted(() => ({ count: 0 }));
+vi.mock('@/lib/fleet-config-store', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/fleet-config-store')>();
+  return { ...actual, readFleetConfig: async () => { reads.count += 1; return actual.readFleetConfig(); } };
+});
+
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
   type TCallback = (err: Error | null, stdout: string | Buffer, stderr: string) => void;
@@ -72,13 +78,18 @@ describe('the remote ssh budget (vel-D61)', () => {
     expect(remoteTimeoutMsIn(state({ 'remote.timeout-ms': '20000', 'remote.timeout-ms.ai-server': '1000' }), 'ai-server')).toBe(20_000);
   });
 
-  it('scales a call budget and the connect timeout by the ratio to the default', async () => {
+  it('scales a call budget by the ratio to the default; ConnectTimeout stays a second under the call budget (r1 F2)', async () => {
     const { remoteBudget } = await import('@/lib/remote-timeouts');
-    expect(remoteBudget(5000, 5000)).toEqual({ timeoutMs: 5000, connectTimeoutS: 5 });
-    expect(remoteBudget(20_000, 5000)).toEqual({ timeoutMs: 20_000, connectTimeoutS: 5 });
-    expect(remoteBudget(5000, 30_000)).toEqual({ timeoutMs: 30_000, connectTimeoutS: 30 });
-    expect(remoteBudget(10_000, 30_000)).toEqual({ timeoutMs: 60_000, connectTimeoutS: 30 });
-    expect(remoteBudget(20_000, 7500)).toEqual({ timeoutMs: 30_000, connectTimeoutS: 8 });
+    expect(remoteBudget(5000, 5000)).toEqual({ timeoutMs: 5000, connectTimeoutS: 4 });
+    expect(remoteBudget(20_000, 5000)).toEqual({ timeoutMs: 20_000, connectTimeoutS: 19 });
+    expect(remoteBudget(5000, 30_000)).toEqual({ timeoutMs: 30_000, connectTimeoutS: 29 });
+    expect(remoteBudget(10_000, 30_000)).toEqual({ timeoutMs: 60_000, connectTimeoutS: 59 });
+    expect(remoteBudget(5000, 5001)).toEqual({ timeoutMs: 5001, connectTimeoutS: 4 });
+    expect(remoteBudget(1500, 5000)).toEqual({ timeoutMs: 1500, connectTimeoutS: 1 });
+    for (const [base, host] of [[5000, 5000], [5000, 5001], [10_000, 7500], [20_000, 120_000], [1500, 5000]]) {
+      const budget = remoteBudget(base, host);
+      if (budget.timeoutMs >= 2000) expect(budget.connectTimeoutS * 1000).toBeLessThan(budget.timeoutMs);
+    }
   });
 
   it('unset: runSsh and runSshBuffer keep the budgets ADR-0022 §5 names', async () => {
@@ -87,7 +98,7 @@ describe('the remote ssh budget (vel-D61)', () => {
     await runSsh('agent-exec-v2', 'sh -s', { timeoutMs: 20_000 });
     await runSshBuffer('agent-exec-v2', 'cat x', { timeoutMs: 10_000, maxBytes: 16 });
     expect(spawned.list.map((s) => s.timeout)).toEqual([5000, 20_000, 10_000]);
-    expect(spawned.list.map((s) => connectTimeout(s.args))).toEqual(['ConnectTimeout=5', 'ConnectTimeout=5', 'ConnectTimeout=5']);
+    expect(spawned.list.map((s) => connectTimeout(s.args))).toEqual(['ConnectTimeout=4', 'ConnectTimeout=19', 'ConnectTimeout=9']);
   });
 
   it('set for one host: that host scales, another keeps the default, at the next call with no restart', async () => {
@@ -97,9 +108,9 @@ describe('the remote ssh budget (vel-D61)', () => {
     await runSshBuffer('agent-exec-harness', 'cat x', { timeoutMs: 10_000, maxBytes: 16 });
     await runSsh('agent-exec-v2', 'true', { timeoutMs: 5000 });
     expect(spawned.list.map((s) => [s.args[s.args.indexOf('--') + 1], s.timeout, connectTimeout(s.args)])).toEqual([
-      ['agent-exec-harness', 30_000, 'ConnectTimeout=30'],
-      ['agent-exec-harness', 60_000, 'ConnectTimeout=30'],
-      ['agent-exec-v2', 5000, 'ConnectTimeout=5'],
+      ['agent-exec-harness', 30_000, 'ConnectTimeout=29'],
+      ['agent-exec-harness', 60_000, 'ConnectTimeout=59'],
+      ['agent-exec-v2', 5000, 'ConnectTimeout=4'],
     ]);
   });
 
@@ -108,7 +119,22 @@ describe('the remote ssh budget (vel-D61)', () => {
     fs.writeFileSync(path.join(directory, '.purplemux', 'fleet-config.json'), '{ not json');
     const { runSsh } = await import('@/lib/remote-host');
     await expect(runSsh('agent-exec-v2', 'true', { timeoutMs: 5000 })).resolves.toEqual({ stdout: 'ok', stderr: '' });
-    expect(spawned.list.map((s) => [s.timeout, connectTimeout(s.args)])).toEqual([[5000, 'ConnectTimeout=5']]);
+    expect(spawned.list.map((s) => [s.timeout, connectTimeout(s.args)])).toEqual([[5000, 'ConnectTimeout=4']]);
+  });
+
+  it('reads the fleet store again only when the file changes (r1 F3)', async () => {
+    const { remoteTimeoutMs } = await import('@/lib/remote-timeouts');
+    reads.count = 0;
+    expect(await remoteTimeoutMs('agent-exec-v2')).toBe(5000);
+    expect(reads.count).toBe(0);
+    await set('remote.timeout-ms', '20000');
+    reads.count = 0;
+    for (let i = 0; i < 5; i += 1) expect(await remoteTimeoutMs('agent-exec-v2')).toBe(20_000);
+    expect(reads.count).toBe(1);
+    await set('remote.timeout-ms.agent-exec-v2', '40000');
+    expect(await remoteTimeoutMs('agent-exec-v2')).toBe(40_000);
+    expect(await remoteTimeoutMs('ai-server')).toBe(20_000);
+    expect(reads.count).toBe(2);
   });
 
   it('sshArgv keeps ConnectTimeout=5 when no budget is given (the attach)', async () => {

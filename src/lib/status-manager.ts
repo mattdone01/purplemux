@@ -7,6 +7,7 @@ import { HookFloorStore } from '@/lib/hook-floors';
 import { onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
 import { capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid, observeRemoteProviderProcess } from '@/lib/tmux';
 import { sessionHostOf } from '@/lib/session-host';
+import { RemoteProofScheduler, type IRemoteProofRequest, type TRemoteProofWant } from '@/lib/remote-proof-scheduler';
 import { getChildPids } from '@/lib/process-utils';
 import { getProvider, getProviderByPanelType } from '@/lib/providers/registry';
 import { detectAnyActiveSession } from '@/lib/providers/session-scan';
@@ -116,14 +117,19 @@ import {
 const toAlertProvider = (providerId: string | undefined): TAlertProviderId =>
   providerId === 'codex' || providerId === 'grok' ? providerId : 'claude';
 
-/** A remote tab's session and whether the pane scan that produced its pane info read its host. */
+/** A remote tab's pane read: whether the scan read its host, and the process proof of its agent. */
 interface IRemotePaneRead {
-  sessionName: string;
   answered: boolean;
+  /** True, false, or null when no proof answered (vel-D61: the poll never waits for one). */
+  proof: (want: TRemoteProofWant) => boolean | null | Promise<boolean | null>;
 }
 
-const remoteProofName = (providerId: string): 'claude' | 'codex' | 'grok' | null =>
+const remoteProofName = (providerId: string): TRemoteProofWant | null =>
   providerId === 'claude' || providerId === 'codex' || providerId === 'grok' ? providerId : null;
+
+/** The proof cache key: a new session, pane or foreground command proves again. */
+const remoteProofKey = (sessionName: string, paneInfo: IPaneInfo): string =>
+  `${sessionName}\t${paneInfo.paneRef ?? ''}\t${paneInfo.command}`;
 
 /**
  * Whether the pane's agent runs. A remote pane has no pid here (ADR-0022): its
@@ -145,8 +151,7 @@ const agentRunningIn = async (
     if (provider.matchesProcess(paneInfo.command)) return true;
     const want = remoteProofName(provider.id);
     if (!want) return false;
-    const proof = await observeRemoteProviderProcess(remote.sessionName, want);
-    return proof.state === 'present' ? true : proof.state === 'absent' ? false : null;
+    return remote.proof(want);
   }
   if (!paneInfo || !paneInfo.pid) return false;
   return provider.isAgentRunning(paneInfo.pid, await getChildPids(paneInfo.pid));
@@ -300,6 +305,14 @@ export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
   private orchestrationPendingLaunches = new Set<string>();
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
+  /** When the running poll started; null when none runs. */
+  private pollStartedAt: number | null = null;
+  /** Remote agent process proofs, off the poll's path (vel-D61). */
+  private readonly remoteProofs = new RemoteProofScheduler({
+    observe: (sessionName, want) => observeRemoteProviderProcess(sessionName, want),
+    now: () => Date.now(),
+    onUnknown: (req, reason) => log.info({ tabId: req.tabId, host: req.host, reason }, 'remote process proof unknown; host proofs back off'),
+  });
   private currentInterval = 0;
   private clients = new Set<WebSocket>();
   private initialized = false;
@@ -744,7 +757,10 @@ export class StatusManager {
     const paneInfo = panes.get(entry.tmuxSession);
     const remoteHost = await sessionHostOf(entry.tmuxSession);
     const agentRunning = await agentRunningIn(paneInfo, provider, remoteHost
-      ? { sessionName: entry.tmuxSession, answered: !!panes.answeredRemoteHosts?.has(remoteHost) }
+      ? {
+          answered: !!panes.answeredRemoteHosts?.has(remoteHost),
+          proof: (want) => this.remoteProofs.prove({ tabId, host: remoteHost, sessionName: entry.tmuxSession, want, key: remoteProofKey(entry.tmuxSession, paneInfo!) }),
+        }
       : null);
     // A remote host not read: the tab stays unknown until a hook or a read pane says (review r3 B1).
     if (agentRunning === null) return;
@@ -1022,7 +1038,24 @@ export class StatusManager {
     hookLog.info({ tabId, tmuxSession, event, at: replayedAt, reason }, `replayed hook event skipped (${reason}): history only`);
   }
 
+  /**
+   * One poll at a time (vel-D61): a tick that finds the previous poll still running skips, with one log line,
+   * instead of stacking a second scan and second proofs on a slow host.
+   */
   async poll(): Promise<void> {
+    if (this.pollStartedAt !== null) {
+      log.info({ runningForMs: Date.now() - this.pollStartedAt }, 'poll skipped: the previous poll is still running');
+      return;
+    }
+    this.pollStartedAt = Date.now();
+    try {
+      await this.runPoll();
+    } finally {
+      this.pollStartedAt = null;
+    }
+  }
+
+  private async runPoll(): Promise<void> {
     // Started, never awaited (ADR-0020): the liveness reconcile, the stuck
     // checks and the idle nudges must not wait for a slow replay. The drain is
     // one shared promise, so a poll during a drain starts no second one. On
@@ -1032,6 +1065,7 @@ export class StatusManager {
     const panesInfo = await getAllPanesInfo();
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
+    const proofRequests: IRemoteProofRequest[] = [];
     const now = Date.now();
     for (const [tabId, retirement] of this.retiredTabs) {
       if (retirement.until <= now) this.retiredTabs.delete(tabId);
@@ -1211,7 +1245,18 @@ export class StatusManager {
         let agentRunningCache: boolean | null | undefined;
         const agentRunningNow = async (): Promise<boolean | null> => {
           if (agentRunningCache === undefined) {
-            agentRunningCache = await agentRunningIn(paneInfo, provider, tab.host ? { sessionName: tab.sessionName, answered: hostAnswered } : null);
+            const host = tab.host;
+            agentRunningCache = await agentRunningIn(paneInfo, provider, host ? {
+              answered: hostAnswered,
+              proof: (want) => {
+                // An inactive tab at its shell has nothing a proof could change: no ssh for it.
+                if (existing.cliState === 'inactive' && SAFE_SHELLS.has(paneInfo!.command)) return false;
+                const req = { tabId: tab.id, host, sessionName: tab.sessionName, want, key: remoteProofKey(tab.sessionName, paneInfo!) };
+                const answer = this.remoteProofs.read(req);
+                if (answer === null) proofRequests.push(req);
+                return answer;
+              },
+            } : null);
           }
           return agentRunningCache;
         };
@@ -1295,8 +1340,12 @@ export class StatusManager {
       }
     }
 
+    // Not awaited: the next poll reads what these proofs answer (vel-D61).
+    if (proofRequests.length > 0) void this.remoteProofs.schedule(proofRequests);
+
     for (const tabId of tabsBeforePoll) {
       if (!knownTabIds.has(tabId) && this.tabs.has(tabId)) {
+        this.remoteProofs.forget(tabId);
         this.stopJsonlWatch(tabId);
         this.tabs.delete(tabId);
         this.orchestrationPendingLaunches.delete(tabId);

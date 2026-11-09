@@ -686,6 +686,11 @@ export interface IPaneInfo {
   windowActivity: number;
   /** The remote host that runs this pane; absent for a local one. */
   host?: string;
+  /**
+   * A remote pane's own pid as tmux printed it, an opaque identity for the process-proof cache (vel-D61). Never
+   * a process id on this host (ADR-0022 §6): nothing reads /proc or signals with it.
+   */
+  paneRef?: string;
 }
 
 const ALL_PANES_FORMAT = '#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{window_activity}';
@@ -704,7 +709,7 @@ const parsePanes = (stdout: string, host?: string): Map<string, IPaneInfo> => {
       path: path || '',
       pid: host || Number.isNaN(pid) ? 0 : pid,
       windowActivity: Number.isNaN(windowActivity) ? 0 : windowActivity,
-      ...(host ? { host } : {}),
+      ...(host ? { host, paneRef: pidStr ?? '' } : {}),
     });
   }
   return result;
