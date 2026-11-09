@@ -1,5 +1,5 @@
 {
-  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named. r4 (PR #60): shapes from a counts-and-shapes-only run over the real store; how the owner answers and what the agent does are not owner steps, and an option label is read for owner-addressed phrases only.",
+  "about": "vel-MC-ACT: the owner-steps lint tuning set. Neutral synthetic questions only (the repository is public: no real Mission Control text, not even with names stripped), modelled on the shapes of real items. positive: an owner step written into a kind=question, which closes with the question when the owner answers it; each names text the finding must carry. negative: an ordinary decision or status question, including every false positive the reviews of PR #60 named. r4 (PR #60): shapes from a counts-and-shapes-only run over the real store; how the owner answers and what the agent does are not owner steps, and an option label is read for owner-addressed phrases only. r5: 'you <verb>' and 'please <verb>' that do not ask the owner to act (a past reference, a relative clause, a condition or a wait, a request for information, a decision restated as an option) are not owner steps.",
   "positive": [
     {
       "name": "paste into",
@@ -552,6 +552,51 @@
           {
             "id": "b",
             "label": "Wait for the freeze"
+          }
+        ]
+      }
+    },
+    {
+      "name": "r5 false positive: 'you <verb>' as a past reference",
+      "question": {
+        "kind": "question",
+        "context": "On 21 Oct, you set the push window to 09:00. The push you set on 26 Oct also ran at 09:00. Keep that window for the next release or move it?"
+      }
+    },
+    {
+      "name": "r5 false positive: 'you <verb>' in a relative clause after a noun",
+      "question": {
+        "kind": "question",
+        "context": "A ceiling you set limits each batch to 500 rows. The list you accept today becomes the allow-list. Raise the ceiling or keep it?"
+      }
+    },
+    {
+      "name": "r5 false positive: 'you <verb>' in a condition or a wait",
+      "question": {
+        "kind": "question",
+        "context": "The import stays paused until you accept the empty state. Before you answer, note that the old file stays on disk. Resume now or wait for the vendor?"
+      }
+    },
+    {
+      "name": "r5 false positive: a request for information, not an action",
+      "question": {
+        "kind": "question",
+        "context": "Please tell us whether the vendor has the new key. Please check whether the cut-over is still on Friday. Go ahead on Friday or move it?"
+      }
+    },
+    {
+      "name": "r5 false positive: a decision restated as an option",
+      "question": {
+        "kind": "question",
+        "context": "The feed sends no rows on public holidays.\n(a) add a holiday calendar to the check\n(b) record that you accept the empty state and close the item",
+        "options": [
+          {
+            "id": "a",
+            "label": "Add the calendar"
+          },
+          {
+            "id": "b",
+            "label": "Record that you accept the empty state"
           }
         ]
       }

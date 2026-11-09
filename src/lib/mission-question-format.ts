@@ -188,7 +188,25 @@ const PARTY_VERBS = 'ask|tell|email|message|contact|call|forward|share|cancel|di
 /** "you <verb>" outside a question (PR #60 r4): the owner named as the one who acts. */
 const YOU_VERBS = `${STEP_VERBS}|${PARTY_VERBS}|check|edit|change|accept`;
 
-interface IStepPhrase { pattern: RegExp; name: string; inQuestion: boolean }
+/**
+ * A request for information is not a step (PR #60 r5): "please tell us whether ...", "please confirm which ...", "let
+ * me know when ...". The owner answers it in the reply.
+ */
+const INFO_REQUEST = String.raw`(?!(?:tell|let)\s+(?:us|me)\b)(?!\w+(?:\s+(?:us|me|it|this|that))?\s+(?:whether|if|which|what|when|where|how|who|why)\b)`;
+/**
+ * "you <do>" as an instruction (PR #60 r4, r5): only at the start of a clause, after a list marker such as "(2)", a
+ * short label ("A one-off: you run the script"), or a connective ("then you send it"). Not after a noun ("the list you
+ * accept", a relative clause), a condition or a wait ("until you accept", "if you want", "before you answer"), or
+ * "that" ("record that you accept"): those describe the owner, they do not ask him to act.
+ */
+const YOU_STEP = new RegExp(String.raw`^(?:\(?\d{1,2}\)\s+)?(?:[^:,]{1,40}:\s+)?(?:(?:then|and|so|now|next|first|instead|also)\s+)?you\s+(?:then\s+)?${INFO_REQUEST}(?:${YOU_VERBS})\b(?!-)`, 'i');
+/**
+ * A sentence about the past is not a step (PR #60 r5): "On 21 Oct, you set the window", "the push you set on 26 Oct",
+ * "you already sent it". "set", "sent"-like forms read the same in both tenses, so a date or a past marker decides.
+ */
+const PAST_MARKER = /\b(?:on\s+\d{1,2}\s+[A-Z][a-z]{2,8}|on\s+[A-Z][a-z]{2,8}\s+\d{1,2}|on\s+\d{4}-\d{2}-\d{2}|yesterday|earlier|last\s+(?:week|night|time|month)|already|ago|previously)\b/i;
+
+interface IStepPhrase { pattern: RegExp; name: string; inQuestion: boolean; perClause?: boolean }
 /**
  * Phrases that address the owner's own steps, read per sentence. `inQuestion: false` skips a sentence that asks ("Do
  * you run it nightly?"): there "you <verb>" is the question's subject, not a step.
@@ -197,19 +215,13 @@ const OWNER_STEP_PHRASES: readonly IStepPhrase[] = [
   { pattern: /\b(?:your|owner|manual)\s+steps?\b/i, name: "'Your steps'", inQuestion: true },
   { pattern: /\bsteps\s+for\s+you\b/i, name: "'steps for you'", inQuestion: true },
   { pattern: /^\s*steps\s*:/i, name: "'Steps:'", inQuestion: true },
-  { pattern: new RegExp(`\\bplease\\s+(?:${STEP_VERBS}|${PARTY_VERBS})\\b`, 'i'), name: "'please <do>'", inQuestion: true },
+  { pattern: new RegExp(`\\bplease\\s+${INFO_REQUEST}(?:${STEP_VERBS}|${PARTY_VERBS})\\b`, 'i'), name: "'please <do>'", inQuestion: true },
   { pattern: new RegExp(`\\byou(?:'ll|\\s+will)?\\s+(?:need|have)\\s+to\\s+(?:${STEP_VERBS})\\b`, 'i'), name: "'you need to <do>'", inQuestion: true },
   { pattern: new RegExp(`\\byou\\s+must\\s+(?:${STEP_VERBS})\\b`, 'i'), name: "'you must <do>'", inQuestion: true },
   // "we need two short steps from you", "one action from you" (PR #60 r4).
   { pattern: /\b(?:steps?|actions?)\s+from\s+you\b/i, name: "'steps from you'", inQuestion: true },
-  { pattern: new RegExp(`\\bneed\\s+you\\s+to\\s+(?:${YOU_VERBS})\\b`, 'i'), name: "'need you to <do>'", inQuestion: true },
-  // "A one-off: you run the script with your sign-in" (PR #60 r4); not after a conditional or an auxiliary ("if you
-  // run it", "do you run it").
-  {
-    pattern: new RegExp(`(?<!\\b(?:if|when|whenever|whether|unless|do|did|can|could|would|should|will|may|might|than|as)\\s+)\\byou\\s+(?:then\\s+)?(?:${YOU_VERBS})\\b(?!-)`, 'i'),
-    name: "'you <do>'",
-    inQuestion: false,
-  },
+  { pattern: new RegExp(`\\bneed\\s+you\\s+to\\s+${INFO_REQUEST}(?:${YOU_VERBS})\\b`, 'i'), name: "'need you to <do>'", inQuestion: true },
+  { pattern: YOU_STEP, name: "'you <do>'", inQuestion: false, perClause: true },
   // A message for an outside party: "Paste this to the vendor's desk:", "Send to the bank contact:" (PR #60 r4).
   { pattern: /\b(?:paste|send|forward|post)\s+(?:this\s+|the\s+(?:following|text\s+below)\s+)?to\s+[^.:?\n]{1,60}:/i, name: "'Paste to <party>:'", inQuestion: true },
 ];
@@ -264,7 +276,8 @@ const ownerStepOf = (clause: string): string | null => {
   if (!OWNER_STEP_IMPERATIVES.some((pattern) => pattern.test(text))) return null;
   return text.split(/\s+/).slice(0, 2).join(' ').replace(/[`:"',.]+$/, '');
 };
-const LIST_MARKER = /^\s*(?:[-*•]|\d{1,2}[.):]|\(\d{1,2}\)|\([a-z]\)|step\s+\d{1,2}[.):]?)\s+/i;
+/** Numbered items only: a lettered item, "(a) add a calendar", is an option of the decision (PR #60 r5), never a step. */
+const LIST_MARKER = /^\s*(?:[-*•]|\d{1,2}[.):]|\(\d{1,2}\)|step\s+\d{1,2}[.):]?)\s+/i;
 const BLANK = /^\s*$/;
 
 /**
@@ -342,7 +355,10 @@ export const ownerStepsLint = (question: Record<string, unknown>): IMissionQuest
   for (const [field, text] of ownerStepTexts(question)) {
     const sentences = stepSentences(text);
     const phrases = OWNER_STEP_PHRASES
-      .filter(({ pattern, inQuestion }) => sentences.some(({ sentence, asks }) => (inQuestion || !asks) && pattern.test(sentence)))
+      .filter(({ pattern, inQuestion, perClause }) => sentences.some(({ sentence, asks }) => (inQuestion || !asks)
+        && (perClause
+          ? !PAST_MARKER.test(sentence) && clausesOf(sentence).some((clause) => pattern.test(clause.replace(LEADING_CONNECTIVE, '')))
+          : pattern.test(sentence))))
       .map(({ name }) => name);
     const steps = PHRASES_ONLY.test(field) ? [] : sentences
       .filter(({ asks }) => !asks)
