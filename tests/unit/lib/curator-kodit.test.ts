@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { KODIT_WINDOW_MS, koditDrop, koditNeedsRateLimit, koditRate, parseKoditLog } from '@/lib/curator-kodit';
+import { KODIT_WINDOW_MS, koditDrop, koditLogHost, koditNeedsRateLimit, koditRate, parseKoditLog } from '@/lib/curator-kodit';
 
 // AC 7: the enrichment log as enrich-log.sh writes it, every 3 h.
 const LOG = [
@@ -44,5 +44,13 @@ describe('kodit enrichment rate (AC 7)', () => {
     expect(koditDrop(before, { ...before, docsPerHour: null })).toBeNull();
     expect(koditDrop({ ...before, docsPerHour: 0 }, before)).toBeNull();
     expect(koditNeedsRateLimit(null)).toBe(false);
+  });
+});
+
+describe('the kodit log host (no default host)', () => {
+  it('is PMUX_KODIT_LOG_HOST, trimmed; unset or blank is null', () => {
+    expect(koditLogHost({ PMUX_KODIT_LOG_HOST: ' host-b-lan ' })).toBe('host-b-lan');
+    expect(koditLogHost({ PMUX_KODIT_LOG_HOST: '   ' })).toBeNull();
+    expect(koditLogHost({})).toBeNull();
   });
 });

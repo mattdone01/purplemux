@@ -3903,7 +3903,7 @@ Exit codes:
     error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
 
 Environment:
-  PMUX_URL           Server base URL, e.g. http://mdserver1:8022 (a remote tab's CLI; wins over PMUX_PORT)
+  PMUX_URL           Server base URL, e.g. http://myhost:8022 (a remote tab's CLI; wins over PMUX_PORT)
   PMUX_PORT          Server port (falls back to ~/.purplemux/port)
   PMUX_TAB_TOKEN     This tab's own token; names the calling tab (set in every tab created by the server)
   PMUX_TOKEN         This tab's workspace token (ignored while PMUX_TAB_TOKEN is set; unset that to override)
