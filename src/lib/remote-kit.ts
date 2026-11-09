@@ -95,8 +95,10 @@ export const buildRemoteClaudeCommand = (opts: {
  *   cwd, its git root and its main repository root, each only when its REAL path is inside the deepest workspace
  *   directory that holds the cwd's real path.
  * - `--named`: the cwd is the one the tab's creator named (`tab create --cwd`), and D14 found no workspace directory
- *   for it (vel-PMX-FU consult ruling C). The trust key goes on the cwd only, as given and as its real path: Claude
- *   reads trust walking up from the cwd, so a key on a parent would trust every sibling. The main repository root
+ *   for it (vel-PMX-FU consult ruling C). The trust key goes on the cwd only: Claude
+ *   reads trust walking up from the cwd, so a key on a parent would trust every sibling. Only the cwd's real path
+ *   is keyed: `abspath` collapses a `..` lexically, and `<link>/..` names a directory the tab never runs in. The
+ *   main repository root
  *   gets the CLAUDE.md-include keys only (where Claude keys the imports approval), never the trust key. Refused,
  *   writing no project key: a cwd that is not a directory (exit 5); `/`, a top-level directory, the home or an
  *   ancestor of it, at either spelling (exit 6). A refused repository root is dropped and the cwd keys stay.
@@ -108,10 +110,13 @@ export const buildRemoteClaudeCommand = (opts: {
  *
  * Exit 0: written or nothing to change; 2: an unknown flag, nothing written; 3: the cwd is outside every workspace
  * directory and not named (the first-run keys are still written); 4: a file is unreadable and is left as it is (the
- * other file is still written); 5 and 6: the named refusals above (the first-run keys are still written). Every caller ignores the exit: a lost seed shows the dialog, which the status reader reports as
+ * other file is still written); 5 and 6: the named refusals above (the first-run keys are still written); 7: a file
+ * changed between the read and the write twice, so it is left as the other writer made it (review r1 C1: Claude
+ * Code rewrites `~/.claude.json` from memory with no lock to share, so each write goes ahead only on the version it
+ * read). Every caller ignores the exit: a lost seed shows the dialog, which the status reader reports as
  * `startup-prompt`.
  */
-export const REMOTE_TRUST_SEED_SCRIPT = `import json, os, sys, tempfile
+export const REMOTE_TRUST_SEED_SCRIPT = `import hashlib, json, os, sys, tempfile
 INCLUDE_KEYS = ('hasClaudeMdExternalIncludesApproved', 'hasClaudeMdExternalIncludesWarningShown')
 TRUST_KEYS = ('hasTrustDialogAccepted',) + INCLUDE_KEYS
 FIRST_RUN_PROJECT_KEYS = ('hasCompletedProjectOnboarding',)
@@ -182,7 +187,9 @@ def named_entries(cwd):
         return 5
     if refused(given, home) or refused(real, home):
         return 6
-    entries = [(given, TRUST_KEYS), (real, TRUST_KEYS)]
+    # The real path only (review r1 C2): abspath collapses a ".." lexically, so "<link>/.." names the link's own
+    # parent, a directory the process never stands in.
+    entries = [(real, TRUST_KEYS)]
     current = real
     while not os.path.lexists(os.path.join(current, '.git')):
         parent = os.path.dirname(current)
@@ -205,7 +212,20 @@ def read_object(target):
         return None
     return data if isinstance(data, dict) else None
 
-def write_object(target, data, mode=None):
+def stamp(target):
+    # What identifies one version of the file: a rename (inode), an in-place write (mtime, size), and the bytes
+    # themselves, since file times are only as fine as the kernel's clock tick and two same-size writes in one tick
+    # look the same otherwise.
+    try:
+        st = os.stat(target)
+        with open(target, 'rb') as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size, digest)
+
+def write_object(target, data, mode, expected):
+    # Replace the file only if it is still the version that was read (expected); False when it changed.
     # mode None keeps the file's own mode; a new file gets 0600.
     directory = os.path.dirname(target)
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -219,63 +239,83 @@ def write_object(target, data, mode=None):
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(data, handle, indent=2, ensure_ascii=False)
         os.chmod(temporary, mode)
+        if stamp(target) != expected:
+            os.unlink(temporary)
+            return False
         os.replace(temporary, target)
+        return True
     except BaseException:
-        os.unlink(temporary)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
         raise
+
+def update_object(target, edit, mode=None):
+    # A read-modify-write that never puts back a stale copy (vel-PMX-FU review r1 C1): Claude Code rewrites this
+    # file from memory and takes no lock this script could share, so the write goes ahead only when the file is
+    # unchanged since the read, re-read and re-applied once, and otherwise nothing is written.
+    for _ in range(2):
+        before = stamp(target)
+        data = read_object(target)
+        if data is None:
+            return 'unreadable'
+        if not edit(data):
+            return 'unchanged'
+        if write_object(target, data, mode, before):
+            return 'written'
+    return 'raced'
 
 def seed_state(entries, first_run):
     target = os.path.realpath(os.path.join(os.path.expanduser('~'), '.claude.json'))
-    data = read_object(target)
-    if data is None:
-        return False
-    changed = False
-    if first_run:
-        if data.get('hasCompletedOnboarding') is not True:
-            data['hasCompletedOnboarding'] = True
-            changed = True
-        if not isinstance(data.get('theme'), str) or not data.get('theme'):
-            data['theme'] = DEFAULT_THEME
-            changed = True
-    projects = data.get('projects')
-    if not isinstance(projects, dict):
-        projects = {}
     wanted = {}
     for key, names in entries:
         merged = wanted.setdefault(key, [])
         for name in names + (FIRST_RUN_PROJECT_KEYS if first_run else ()):
             if name not in merged:
                 merged.append(name)
-    for key, names in wanted.items():
-        entry = projects.get(key)
-        if entry is not None and not isinstance(entry, dict):
-            continue
-        following = dict(entry or {})
-        declined = following.get('hasClaudeMdExternalIncludesApproved') is False and following.get('hasClaudeMdExternalIncludesWarningShown') is True
-        touched = entry is None
-        for name in names:
-            if following.get(name) is True or (declined and name == 'hasClaudeMdExternalIncludesApproved'):
+
+    def edit(data):
+        changed = False
+        if first_run:
+            if data.get('hasCompletedOnboarding') is not True:
+                data['hasCompletedOnboarding'] = True
+                changed = True
+            if not isinstance(data.get('theme'), str) or not data.get('theme'):
+                data['theme'] = DEFAULT_THEME
+                changed = True
+        projects = data.get('projects')
+        if not isinstance(projects, dict):
+            projects = {}
+        for key, names in wanted.items():
+            entry = projects.get(key)
+            if entry is not None and not isinstance(entry, dict):
                 continue
-            following[name] = True
-            touched = True
-        if touched:
-            projects[key] = following
-            data['projects'] = projects
-            changed = True
-    if changed:
-        # 0600 whatever the file had: it holds the account.
-        write_object(target, data, 0o600)
-    return True
+            following = dict(entry or {})
+            declined = following.get('hasClaudeMdExternalIncludesApproved') is False and following.get('hasClaudeMdExternalIncludesWarningShown') is True
+            touched = entry is None
+            for name in names:
+                if following.get(name) is True or (declined and name == 'hasClaudeMdExternalIncludesApproved'):
+                    continue
+                following[name] = True
+                touched = True
+            if touched:
+                projects[key] = following
+                data['projects'] = projects
+                changed = True
+        return changed
+
+    # 0600 whatever the file had: it holds the account.
+    return update_object(target, edit, 0o600)
 
 def seed_settings():
     target = os.path.realpath(os.path.join(os.path.expanduser('~'), '.claude', 'settings.json'))
-    data = read_object(target)
-    if data is None:
-        return False
-    if data.get('skipDangerousModePermissionPrompt') is not True:
+
+    def edit(data):
+        if data.get('skipDangerousModePermissionPrompt') is True:
+            return False
         data['skipDangerousModePermissionPrompt'] = True
-        write_object(target, data)
-    return True
+        return True
+
+    return update_object(target, edit)
 
 def main(argv):
     flags = []
@@ -292,11 +332,11 @@ def main(argv):
         entries, code = ([], found) if isinstance(found, int) else (found, 0)
     else:
         entries, code = [], 3
-    readable = seed_state(entries, first_run)
-    if bypass:
-        readable = seed_settings() and readable
-    if not readable:
+    results = [seed_state(entries, first_run)] + ([seed_settings()] if bypass else [])
+    if 'unreadable' in results:
         return 4
+    if 'raced' in results:
+        return 7
     return code
 
 sys.exit(main(sys.argv[1:]))

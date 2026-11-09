@@ -242,12 +242,71 @@ describe('the named cwd pre-trust (vel-PMX-FU)', () => {
 
     expect(seed(['--first-run', '--named', link]).status).toBe(0);
 
+    // The real path only (review r1 C2): the link's spelling is not keyed.
     const onboarded = { ...TRUSTED, hasCompletedProjectOnboarding: true };
     expect(projects()).toEqual({
-      [link]: onboarded,
       [worktree]: onboarded,
       [main]: { ...INCLUDES, hasCompletedProjectOnboarding: true },
     });
+  });
+
+  it('a link followed by "..": the trust key goes on the real parent, never on the lexical one (review r1 C2)', () => {
+    const target = path.join(home, 'clones', 'deep', 'repo');
+    fs.mkdirSync(target, { recursive: true });
+    const holder = path.join(home, 'links');
+    fs.mkdirSync(holder);
+    fs.symlinkSync(target, path.join(holder, 'to-repo'));
+    expect(seed(['--named', `${holder}/to-repo/..`]).status).toBe(0);
+    expect(projects()).toEqual({ [path.join(home, 'clones', 'deep')]: TRUSTED });
+    expect(projects()).not.toHaveProperty(home);
+  });
+
+  /**
+   * Runs the seed's own functions with read_object wrapped: `races` other writes land on the file right after the
+   * seed reads it, the lost-update window of an unlocked read-modify-write (review r1 C1).
+   */
+  const seedWithRacingWriter = (args: string[], races: number) => {
+    const runner = `
+import json, sys
+src = open(sys.argv[1], encoding='utf-8').read().replace('sys.exit(main(sys.argv[1:]))', '')
+ns = {'__name__': 'seed'}
+exec(src, ns)
+original = ns['read_object']
+left = [int(sys.argv[2])]
+def racing(target):
+    data = original(target)
+    if left[0] > 0 and target.endswith('.claude.json'):
+        left[0] -= 1
+        current = original(target) or {}
+        current['otherWriter'] = current.get('otherWriter', 0) + 1
+        with open(target, 'w', encoding='utf-8') as handle:
+            json.dump(current, handle)
+    return data
+ns['read_object'] = racing
+sys.exit(ns['main'](sys.argv[3:]))
+`;
+    return spawnSync('python3', ['-c', runner, path.join(kit, REMOTE_TRUST_SEED_RELATIVE), String(races), ...args],
+      { env: { ...process.env, HOME: home }, encoding: 'utf-8' });
+  };
+
+  it('a write that lands between the read and the replace is kept: the seed re-reads and applies its keys on top', () => {
+    fs.mkdirSync(path.join(home, 'proj'));
+    fs.writeFileSync(configFile(), JSON.stringify({ kept: true }));
+    const run = seedWithRacingWriter(['--named', path.join(home, 'proj')], 1);
+    expect(run.status, run.stderr).toBe(0);
+    const written = JSON.parse(fs.readFileSync(configFile(), 'utf-8'));
+    expect(written.kept).toBe(true);
+    expect(written.otherWriter).toBe(1);
+    expect(written.projects).toEqual({ [path.join(home, 'proj')]: TRUSTED });
+  });
+
+  it('two racing writes: the seed writes nothing and exits 7, so the other writer\'s file stands', () => {
+    fs.mkdirSync(path.join(home, 'proj'));
+    fs.writeFileSync(configFile(), JSON.stringify({ kept: true }));
+    const run = seedWithRacingWriter(['--named', path.join(home, 'proj')], 2);
+    expect(run.status, run.stderr).toBe(7);
+    expect(JSON.parse(fs.readFileSync(configFile(), 'utf-8'))).toEqual({ kept: true, otherWriter: 2 });
+    expect(fs.readdirSync(home).filter((name) => name.startsWith('.claude.json.'))).toEqual([]);
   });
 
   it('a cwd inside a workspace directory still takes the D14 rule under --named', () => {
