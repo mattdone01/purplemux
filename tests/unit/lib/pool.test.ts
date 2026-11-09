@@ -515,7 +515,7 @@ describe('tab starts the read cannot show yet (review r1 F6)', () => {
 describe('the host view serves the tailnet path (vel-RETRO-R2)', () => {
   const relayedRead = (host: string, rttMs: number, kind: 'relayed' | 'direct' = 'relayed'): TPoolHostRead => ({
     ...known(host, false, { threads: 64, memTotalBytes: 373 * GIB }),
-    path: { kind, alias: host, address: `${host}.ts.net`, ip: '100.64.0.9', peer: host, region: kind === 'relayed' ? 'sin' : null, rttMs, measuredAt: NOW, reason: null, relayedReads: kind === 'relayed' ? 2 : 0 },
+    path: { kind, alias: host, address: `${host}.tailnet.example`, ip: 'fd7a:115c:a1e0::9', peer: host, region: kind === 'relayed' ? 'sin' : null, rttMs, measuredAt: NOW, reason: null, relayedReads: kind === 'relayed' ? 2 : 0 },
   });
 
   it('serves a relayed path with its alert, and this host none', () => {
@@ -532,10 +532,10 @@ describe('the host view serves the tailnet path (vel-RETRO-R2)', () => {
 
   it('never refuses a host for its path: placement reads none of it (the owner keeps the hosts)', () => {
     const quiet = { threads: 64, memTotalBytes: 373 * GIB, load1: 0, load5: 0, memAvailableBytes: 300 * GIB };
-    const relayed = { ...relayedRead('ai-lan', 1170), metrics: metrics(quiet) } as TPoolHostRead;
-    const plain = known('ai-lan', false, quiet);
+    const relayed = { ...relayedRead('host-b-lan', 1170), metrics: metrics(quiet) } as TPoolHostRead;
+    const plain = known('host-b-lan', false, quiet);
     const req: IPoolPlacementRequest = { kind: 'gate', memGb: 8 };
     expect(place([md({ load1: 30, load5: 30 }), relayed], req)).toEqual(place([md({ load1: 30, load5: 30 }), plain], req));
-    expect(place([md({ load1: 30, load5: 30 }), relayed], req)).toMatchObject({ ok: true, host: 'ai-lan' });
+    expect(place([md({ load1: 30, load5: 30 }), relayed], req)).toMatchObject({ ok: true, host: 'host-b-lan' });
   });
 });

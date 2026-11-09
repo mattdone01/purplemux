@@ -1,10 +1,10 @@
 # vel-RETRO-R2: pool admission measures the tailnet path
 
 ## Problem
-Retro 2026-11-09 row R2: the new exec hosts reached mdserver1 only through a DERP relay for hours (RTT about 1 s, ssh
+Retro 2026-11-09 row R2: the new exec hosts reached control-host only through a DERP relay for hours (RTT about 1 s, ssh
 18-25 s), and no tool noticed. HFL measured both exec hosts DERP-relayed (`sin`), RTT 0.85-1.17 s. Measured again from
-`agent-exec-v2` at 2026-11-09 05:13Z: `tailscale ping -c 1 mdserver1` printed
-`pong from mdserver1 (100.94.44.114) via DERP(syd) in 147ms` and `direct connection not established` (exit 1);
+`host-a` at 2026-11-09 05:13Z: `tailscale ping -c 1 control-host` printed
+`pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(syd) in 147ms` and `direct connection not established` (exit 1);
 `tailscale status --json` showed the peer `Relay: "syd"`, `CurAddr: ""`.
 
 The owner keeps the hosts. The pool must not refuse a host for its path; it reports the path.
@@ -28,8 +28,8 @@ The owner keeps the hosts. The pool must not refuse a host for its path; it repo
   1. `ssh -G -- <alias>` gives the address ssh dials (its `hostname` line).
   2. A literal IP is used as is; a name goes through `dns.lookup(name, { all: true })` (the hosts file, then DNS,
      MagicDNS included).
-  3. No address in the tailnet ranges (100.64.0.0/10, fd7a:115c:a1e0::/48): `kind: 'not-tailnet'` (a LAN alias such
-     as `ai-lan`), with nothing to report.
+  3. No address in the tailnet ranges (the RFC 6598 shared address space and fd7a:115c:a1e0::/48): `kind: 'not-tailnet'` (a LAN alias such
+     as `host-b-lan`), with nothing to report.
   4. A tailnet address gets one `tailscale ping -c 1 --timeout 2s <ip>`. The first `pong from` line decides:
      `via DERP(<region>)` or `via peer-relay(...)` is `relayed`; `via <ip>:<port>` (IPv6 in brackets) is `direct`;
      any other `via` token is `unknown` with the reason `unrecognised path "via <token>"`, never `direct` (review r1

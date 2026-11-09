@@ -229,11 +229,11 @@ describe('PoolReader measures the tailnet path (vel-RETRO-R2)', () => {
   let measured: string[];
   let measure: (alias: string) => Promise<IPoolPathRead>;
   const relayed = (alias: string): IPoolPathRead => ({
-    kind: 'relayed', alias, address: `${alias}.ts.net`, ip: '100.64.0.9', peer: alias, region: 'sin', rttMs: 1170, measuredAt: now, reason: null, relayedReads: 1,
+    kind: 'relayed', alias, address: `${alias}.tailnet.example`, ip: 'fd7a:115c:a1e0::9', peer: alias, region: 'sin', rttMs: 1170, measuredAt: now, reason: null, relayedReads: 1,
   });
   const reader = (withPath = true) => new PoolReader({
     now: () => now,
-    localName: () => 'mdserver1',
+    localName: () => 'control-host',
     remoteHosts: async () => ['exec-1'],
     fallbackOf: async () => 'exec-1-ts',
     runRemote: runRemote as never,
@@ -396,13 +396,13 @@ describe('defaultTailnetPathDeps.ping (vel-RETRO-R2)', () => {
   });
 
   it('keeps the pong of a run that exits 1 after a DERP pong (measured 2026-11-09)', async () => {
-    fakeTailscale('pong from mdserver1 (100.94.44.114) via DERP(syd) in 147ms\ndirect connection not established\n', 1);
-    await expect(defaultTailnetPathDeps().ping('100.94.44.114')).resolves.toContain('via DERP(syd) in 147ms');
+    fakeTailscale('pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(syd) in 147ms\ndirect connection not established\n', 1);
+    await expect(defaultTailnetPathDeps().ping('fd7a:115c:a1e0::5e2c')).resolves.toContain('via DERP(syd) in 147ms');
   });
 
   it('throws when tailscale is not installed', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmux-tailscale-'));
     process.env.PATH = dir;
-    await expect(defaultTailnetPathDeps().ping('100.94.44.114')).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(defaultTailnetPathDeps().ping('fd7a:115c:a1e0::5e2c')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

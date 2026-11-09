@@ -1,7 +1,7 @@
 import type { IPoolPathRead, IPoolPathView, TPoolPathAlert } from '@/types/pool';
 
 // The tailnet path to each remote pool host (vel-RETRO-R2): measured from this host, where tailscale runs, beside each
-// 30 s pool read. Retro 2026-11-09 R2: the exec hosts reached mdserver1 only through a DERP relay (RTT ~1 s, ssh
+// 30 s pool read. Retro 2026-11-09 R2: the exec hosts reached control-host only through a DERP relay (RTT ~1 s, ssh
 // 18-25 s) for hours and no tool noticed. The pool reports the path; it never refuses a host for it.
 // Design: docs/design/vel-retro-r2-tailnet-path.md. No Node imports: the fleet panel renders these lines in the
 // browser (CLAUDE.md, host-warnings.ts); the exec deps are in `pool-read.ts`.
@@ -34,7 +34,7 @@ export const isIpLiteral = (text: string): boolean => {
   return /^[0-9a-f:]+$/i.test(text) && text.includes(':');
 };
 
-/** Tailscale's CGNAT range 100.64.0.0/10 and its ULA prefix fd7a:115c:a1e0::/48. */
+/** Tailscale's CGNAT range (RFC 6598: first octet 100, second 64..127) and its ULA prefix fd7a:115c:a1e0::/48. */
 export const isTailnetIp = (ip: string): boolean => {
   const v4 = IPV4.exec(ip);
   if (v4) return Number(v4[1]) === 100 && Number(v4[2]) >= 64 && Number(v4[2]) <= 127 && Number(v4[3]) <= 255 && Number(v4[4]) <= 255;

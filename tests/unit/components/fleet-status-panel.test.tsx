@@ -219,12 +219,12 @@ describe('fleet status panel', () => {
         poolPaths: [
           hostPath('exec-1', 'tailnet-relayed', 'exec-1 tailnet path relayed via DERP(sin), RTT 1170 ms'),
           hostPath('exec-2', 'tailnet-slow', 'exec-2 tailnet path slow: RTT 300 ms (threshold 250 ms)'),
-          hostPath('ai-lan', null, null),
+          hostPath('host-b-lan', null, null),
         ],
       })));
       expect(html).toMatch(/data-pool-path-host="exec-1" data-pool-path-alert="tailnet-relayed">exec-1 tailnet path relayed via DERP\(sin\), RTT 1170 ms</);
       expect(html).toMatch(/data-pool-path-host="exec-2" data-pool-path-alert="tailnet-slow">exec-2 tailnet path slow/);
-      expect(html).not.toContain('data-pool-path-host="ai-lan"');
+      expect(html).not.toContain('data-pool-path-host="host-b-lan"');
     });
 
     it('renders no line without paths (an older server) or for a host not measured', () => {

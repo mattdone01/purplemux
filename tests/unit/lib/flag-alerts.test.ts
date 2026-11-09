@@ -860,7 +860,7 @@ describe('pool path flags (vel-RETRO-R2)', () => {
     return {
       host,
       path: {
-        kind, alert, alias: host, address: `${host}.ts.net`, ip: '100.64.0.9', peer: host, region: kind === 'relayed' ? 'sin' : null,
+        kind, alert, alias: host, address: `${host}.tailnet.example`, ip: 'fd7a:115c:a1e0::9', peer: host, region: kind === 'relayed' ? 'sin' : null,
         rttMs, relayedReads: kind === 'relayed' ? 2 : 0, slowMs, measuredAt: new Date(T0).toISOString(), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
       },
       text: alert === 'tailnet-relayed' ? `${host} tailnet path relayed via DERP(sin), RTT ${rttMs} ms` : alert ? `${host} tailnet path slow: RTT ${rttMs} ms (threshold ${slowMs} ms)` : null,
@@ -874,12 +874,12 @@ describe('pool path flags (vel-RETRO-R2)', () => {
 
   describe('poolFlagScan', () => {
     it('raises a relayed host and a slow host, keyed by the fixed fleet part, and reads a direct host', () => {
-      const scan = poolFlagScan(smView([hostPath('exec-1', 'relayed'), hostPath('exec-2', 'direct', 300), hostPath('ai-lan', 'direct')]));
+      const scan = poolFlagScan(smView([hostPath('exec-1', 'relayed'), hostPath('exec-2', 'direct', 300), hostPath('host-b-lan', 'direct')]));
       expect(scan.flags.map((f) => [f.key, f.text])).toEqual([
         [KEY, 'exec-1 tailnet path relayed via DERP(sin), RTT 1170 ms'],
         ['pool:fleet:tailnet-path:exec-2', 'exec-2 tailnet path slow: RTT 300 ms (threshold 250 ms)'],
       ]);
-      expect([...scan.read].sort()).toEqual(['pool', 'pool:ai-lan', 'pool:exec-1', 'pool:exec-2']);
+      expect([...scan.read].sort()).toEqual(['pool', 'pool:exec-1', 'pool:exec-2', 'pool:host-b-lan']);
       expect([...scan.failed]).toEqual([]);
     });
 

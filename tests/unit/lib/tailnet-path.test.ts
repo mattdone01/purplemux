@@ -21,28 +21,28 @@ import type { IPoolPathRead } from '@/types/pool';
 
 const T0 = 1_800_000_000_000;
 
-/** Measured from agent-exec-v2 on 2026-11-09 05:13Z; the command exited 1. */
-const DERP_PONG = 'pong from mdserver1 (100.94.44.114) via DERP(syd) in 147ms\ndirect connection not established\n';
-const DERP_SIN = 'pong from mdserver1 (100.94.44.114) via DERP(sin) in 1.17s\ndirect connection not established\n';
-const DIRECT_PONG = 'pong from ai-server (100.101.2.3) via 192.168.1.155:41641 in 3ms\n';
-const PEER_RELAY_PONG = 'pong from exec-2 (100.70.1.9) via peer-relay(10.0.0.5:7777:vni:12) in 41ms\n';
+/** Measured from host-a on 2026-11-09 05:13Z; the command exited 1. */
+const DERP_PONG = 'pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(syd) in 147ms\ndirect connection not established\n';
+const DERP_SIN = 'pong from control-host (fd7a:115c:a1e0::5e2c) via DERP(sin) in 1.17s\ndirect connection not established\n';
+const DIRECT_PONG = 'pong from host-b (fd7a:115c:a1e0::23) via 198.51.100.155:41641 in 3ms\n';
+const PEER_RELAY_PONG = 'pong from exec-2 (fd7a:115c:a1e0::19) via peer-relay(192.0.2.5:7777:vni:12) in 41ms\n';
 
 const deps = (over: Partial<ITailnetPathDeps> = {}): ITailnetPathDeps => ({
   now: () => T0,
-  sshConfig: async (alias) => `user agent\nhostname ${alias}.taila9cda5.ts.net\nport 22\n`,
-  resolve: async () => ['100.94.44.114'],
+  sshConfig: async (alias) => `user agent\nhostname ${alias}.tailnet.example\nport 22\n`,
+  resolve: async () => ['fd7a:115c:a1e0::5e2c'],
   ping: async () => DERP_PONG,
   ...over,
 });
 
 const read = (over: Partial<IPoolPathRead> = {}): IPoolPathRead => ({
-  kind: 'direct', alias: 'exec-1', address: 'exec-1', ip: '100.64.0.9', peer: 'exec-1', region: null, rttMs: 4, measuredAt: T0, reason: null, relayedReads: 0, ...over,
+  kind: 'direct', alias: 'exec-1', address: 'exec-1', ip: 'fd7a:115c:a1e0::9', peer: 'exec-1', region: null, rttMs: 4, measuredAt: T0, reason: null, relayedReads: 0, ...over,
 });
 
 describe('parseSshHostname', () => {
   it('reads the hostname line of ssh -G, whatever its case', () => {
-    expect(parseSshHostname('user agent\nhostname 192.168.1.155\nport 22\n')).toBe('192.168.1.155');
-    expect(parseSshHostname('HostName exec-1.taila9cda5.ts.net\n')).toBe('exec-1.taila9cda5.ts.net');
+    expect(parseSshHostname('user agent\nhostname 198.51.100.155\nport 22\n')).toBe('198.51.100.155');
+    expect(parseSshHostname('HostName exec-1.tailnet.example\n')).toBe('exec-1.tailnet.example');
   });
 
   it('answers null with no hostname line', () => {
@@ -50,20 +50,23 @@ describe('parseSshHostname', () => {
   });
 });
 
+/** A dotted IPv4 address from its octets: the boundaries of Tailscale's range (RFC 6598), no host's address. */
+const dotted = (...octets: number[]): string => octets.join('.');
+
 describe('isTailnetIp and isIpLiteral', () => {
   it.each([
-    ['100.64.0.1', true], ['100.127.255.254', true], ['100.94.44.114', true],
-    ['100.63.255.255', false], ['100.128.0.1', false], ['192.168.1.155', false], ['10.0.0.1', false],
-    ['fd7a:115c:a1e0::c737:2c73', true], ['fd7a:115c:a1e1::1', false], ['::1', false], ['ai-lan', false],
+    [dotted(100, 64, 0, 1), true], [dotted(100, 127, 255, 254), true], ['fd7a:115c:a1e0::5e2c', true],
+    [dotted(100, 63, 255, 255), false], [dotted(100, 128, 0, 1), false], ['198.51.100.155', false], ['192.0.2.1', false],
+    ['fd7a:115c:a1e0::c737:2c73', true], ['fd7a:115c:a1e1::1', false], ['::1', false], ['host-b-lan', false],
   ])('%s → %s', (ip, expected) => {
     expect(isTailnetIp(ip)).toBe(expected);
   });
 
   it('tells an IP literal from a name', () => {
-    expect(isIpLiteral('192.168.1.155')).toBe(true);
+    expect(isIpLiteral('198.51.100.155')).toBe(true);
     expect(isIpLiteral('fd7a:115c:a1e0::1')).toBe(true);
     expect(isIpLiteral('999.1.1.1')).toBe(false);
-    expect(isIpLiteral('ai-lan')).toBe(false);
+    expect(isIpLiteral('host-b-lan')).toBe(false);
     expect(isIpLiteral('deadbeef')).toBe(false);
   });
 });
@@ -82,12 +85,12 @@ describe('parseGoDurationMs', () => {
 
 describe('parseTailscalePing', () => {
   it('reads a DERP pong even though the command then says no direct connection (the retro case)', () => {
-    expect(parseTailscalePing(DERP_PONG)).toEqual({ ok: true, peer: 'mdserver1', transport: 'relayed', region: 'syd', rttMs: 147 });
-    expect(parseTailscalePing(DERP_SIN)).toEqual({ ok: true, peer: 'mdserver1', transport: 'relayed', region: 'sin', rttMs: 1170 });
+    expect(parseTailscalePing(DERP_PONG)).toEqual({ ok: true, peer: 'control-host', transport: 'relayed', region: 'syd', rttMs: 147 });
+    expect(parseTailscalePing(DERP_SIN)).toEqual({ ok: true, peer: 'control-host', transport: 'relayed', region: 'sin', rttMs: 1170 });
   });
 
   it('reads a direct pong', () => {
-    expect(parseTailscalePing(DIRECT_PONG)).toEqual({ ok: true, peer: 'ai-server', transport: 'direct', region: null, rttMs: 3 });
+    expect(parseTailscalePing(DIRECT_PONG)).toEqual({ ok: true, peer: 'host-b', transport: 'direct', region: null, rttMs: 3 });
   });
 
   it('reads a peer relay as relayed', () => {
@@ -96,13 +99,13 @@ describe('parseTailscalePing', () => {
 
   it('reads direct only for an ip:port endpoint, IPv6 in brackets (review r1 M2)', () => {
     expect(parseTailscalePing('pong from a (100.1.2.3) via [2001:db8::1]:41641 in 5ms\n')).toMatchObject({ ok: true, transport: 'direct' });
-    expect(parseTailscalePing('pong from a (100.1.2.3) via 10.0.0.7:41641 in 5ms\n')).toMatchObject({ ok: true, transport: 'direct' });
+    expect(parseTailscalePing('pong from a (100.1.2.3) via 192.0.2.7:41641 in 5ms\n')).toMatchObject({ ok: true, transport: 'direct' });
   });
 
   it.each([
-    'relay:10.0.0.5:7777',
-    '10.0.0.5',
-    'mdserver1:41641',
+    'relay:192.0.2.5:7777',
+    '192.0.2.5',
+    'control-host:41641',
     'tcp-derp(sin)',
     '[fe80::1]',
   ])('reads an unrecognised path token (via %s) as not measured, never direct (review r1 M2)', (token) => {
@@ -110,9 +113,9 @@ describe('parseTailscalePing', () => {
   });
 
   it('measures an unrecognised path token as unknown with its reason', async () => {
-    const path = await measureTailnetPath(deps({ ping: async () => 'pong from a (100.1.2.3) via relay:10.0.0.5:7777 in 5ms\n' }), 'exec-1');
+    const path = await measureTailnetPath(deps({ ping: async () => 'pong from a (100.1.2.3) via relay:192.0.2.5:7777 in 5ms\n' }), 'exec-1');
 
-    expect(path).toMatchObject({ kind: 'unknown', reason: 'tailscale ping 100.94.44.114: unrecognised path "via relay:10.0.0.5:7777"' });
+    expect(path).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::5e2c: unrecognised path "via relay:192.0.2.5:7777"' });
     expect(pathAlert(path, 250)).toBeNull();
   });
 
@@ -122,8 +125,8 @@ describe('parseTailscalePing', () => {
   });
 
   it('never reads a pong line with an unreadable duration as a measurement', () => {
-    expect(parseTailscalePing('pong from x (100.64.0.1) via DERP(sin) in soon\n')).toEqual({
-      ok: false, reason: 'pong from x (100.64.0.1) via DERP(sin) in soon',
+    expect(parseTailscalePing('pong from x (fd7a:115c:a1e0::1) via DERP(sin) in soon\n')).toEqual({
+      ok: false, reason: 'pong from x (fd7a:115c:a1e0::1) via DERP(sin) in soon',
     });
   });
 });
@@ -134,14 +137,14 @@ describe('measureTailnetPath', () => {
     const path = await measureTailnetPath(deps({ ping: async (ip) => { pinged.push(ip); return DERP_SIN; } }), 'exec-1');
 
     expect(path).toEqual({
-      kind: 'relayed', alias: 'exec-1', address: 'exec-1.taila9cda5.ts.net', ip: '100.94.44.114', peer: 'mdserver1',
+      kind: 'relayed', alias: 'exec-1', address: 'exec-1.tailnet.example', ip: 'fd7a:115c:a1e0::5e2c', peer: 'control-host',
       region: 'sin', rttMs: 1170, measuredAt: T0, reason: null, relayedReads: 1,
     });
-    expect(pinged).toEqual(['100.94.44.114']);
+    expect(pinged).toEqual(['fd7a:115c:a1e0::5e2c']);
   });
 
   it('measures a direct host', async () => {
-    const path = await measureTailnetPath(deps({ ping: async () => DIRECT_PONG }), 'ai-server');
+    const path = await measureTailnetPath(deps({ ping: async () => DIRECT_PONG }), 'host-b');
 
     expect(path).toMatchObject({ kind: 'direct', rttMs: 3, region: null });
   });
@@ -149,18 +152,18 @@ describe('measureTailnetPath', () => {
   it('calls a LAN alias not-tailnet and pings nothing', async () => {
     let pinged = false;
     const path = await measureTailnetPath(deps({
-      sshConfig: async () => 'hostname 192.168.1.155\n',
+      sshConfig: async () => 'hostname 198.51.100.155\n',
       ping: async () => { pinged = true; return DIRECT_PONG; },
-    }), 'ai-lan');
+    }), 'host-b-lan');
 
-    expect(path).toMatchObject({ kind: 'not-tailnet', address: '192.168.1.155', ip: '192.168.1.155', reason: null });
+    expect(path).toMatchObject({ kind: 'not-tailnet', address: '198.51.100.155', ip: '198.51.100.155', reason: null });
     expect(pinged).toBe(false);
   });
 
   it('takes the tailnet address of a name that resolves to several', async () => {
-    const path = await measureTailnetPath(deps({ resolve: async () => ['192.168.1.6', '100.94.44.114'] }), 'mdserver1');
+    const path = await measureTailnetPath(deps({ resolve: async () => ['198.51.100.6', 'fd7a:115c:a1e0::5e2c'] }), 'control-host');
 
-    expect(path).toMatchObject({ kind: 'relayed', ip: '100.94.44.114' });
+    expect(path).toMatchObject({ kind: 'relayed', ip: 'fd7a:115c:a1e0::5e2c' });
   });
 
   it('reads every failure as unknown with its reason, never as direct', async () => {
@@ -172,9 +175,9 @@ describe('measureTailnetPath', () => {
 
     expect(sshFails).toMatchObject({ kind: 'unknown', reason: 'ssh -G failed: ssh: bad option' });
     expect(noHost).toMatchObject({ kind: 'unknown', reason: 'ssh -G printed no hostname' });
-    expect(noResolve).toMatchObject({ kind: 'unknown', reason: 'x.taila9cda5.ts.net does not resolve: ENOTFOUND x' });
-    expect(noPong).toMatchObject({ kind: 'unknown', reason: 'tailscale ping 100.94.44.114: timeout waiting for ping reply' });
-    expect(noTailscale).toMatchObject({ kind: 'unknown', reason: 'tailscale ping 100.94.44.114: tailscale is not installed on this host' });
+    expect(noResolve).toMatchObject({ kind: 'unknown', reason: 'x.tailnet.example does not resolve: ENOTFOUND x' });
+    expect(noPong).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::5e2c: timeout waiting for ping reply' });
+    expect(noTailscale).toMatchObject({ kind: 'unknown', reason: 'tailscale ping fd7a:115c:a1e0::5e2c: tailscale is not installed on this host' });
   });
 });
 
@@ -208,7 +211,7 @@ describe('ageTailnetPath, pathView and pathAlertText', () => {
 
   it('serves the alert, the threshold and the time', () => {
     expect(pathView(read({ kind: 'relayed', region: 'sin', rttMs: 1170, relayedReads: 2 }), DEFAULT_POOL_PATH_SLOW_MS)).toEqual({
-      kind: 'relayed', alert: 'tailnet-relayed', alias: 'exec-1', address: 'exec-1', ip: '100.64.0.9', peer: 'exec-1',
+      kind: 'relayed', alert: 'tailnet-relayed', alias: 'exec-1', address: 'exec-1', ip: 'fd7a:115c:a1e0::9', peer: 'exec-1',
       region: 'sin', rttMs: 1170, relayedReads: 2, slowMs: 250, measuredAt: new Date(T0).toISOString(), reason: null,
     });
   });
@@ -230,7 +233,7 @@ describe('followTailnetPath and isTailnetPathSettled (review r1 L3, L6)', () => 
     expect(second.relayedReads).toBe(2);
     expect(followTailnetPath(second, relayed).relayedReads).toBe(3);
     expect(followTailnetPath(second, read()).relayedReads).toBe(0);
-    expect(followTailnetPath(second, read({ kind: 'not-tailnet', ip: '192.168.1.155' })).relayedReads).toBe(0);
+    expect(followTailnetPath(second, read({ kind: 'not-tailnet', ip: '198.51.100.155' })).relayedReads).toBe(0);
     expect(followTailnetPath(undefined, relayed).relayedReads).toBe(1);
     expect(followTailnetPath(read(), relayed).relayedReads).toBe(1);
   });

@@ -437,25 +437,25 @@ describe('the pool view (AC 7)', () => {
 
 describe('readPoolPaths (vel-RETRO-R2)', () => {
   const path = (rttMs: number, kind: 'relayed' | 'direct' | 'unknown') => ({
-    kind, alias: 'exec-1', address: 'exec-1.ts.net', ip: '100.64.0.9', peer: 'exec-1', region: kind === 'relayed' ? 'sin' : null,
+    kind, alias: 'exec-1', address: 'exec-1.tailnet.example', ip: 'fd7a:115c:a1e0::9', peer: 'exec-1', region: kind === 'relayed' ? 'sin' : null,
     rttMs, measuredAt: Date.parse('2026-11-09T05:00:00Z'), reason: kind === 'unknown' ? 'timeout waiting for ping reply' : null,
     relayedReads: kind === 'relayed' ? 2 : 0,
   });
   const remote = (host: string, p: ReturnType<typeof path> | null): TPoolHostRead => ({
     host, local: false, state: 'known', readAt: 1, via: host, metrics: metrics({}), ...(p ? { path: p } : {}),
   });
-  const local: TPoolHostRead = { host: 'mdserver1', local: true, state: 'known', readAt: 1, via: null, metrics: metrics({}) };
+  const local: TPoolHostRead = { host: 'control-host', local: true, state: 'known', readAt: 1, via: null, metrics: metrics({}) };
 
   it('serves every remote host with its path and the alert line, and never this host', async () => {
     const { readPoolPaths } = await service();
     const paths = await readPoolPaths({
-      reads: async () => [local, remote('exec-1', path(1170, 'relayed')), remote('exec-2', path(300, 'direct')), remote('ai-lan', null)],
+      reads: async () => [local, remote('exec-1', path(1170, 'relayed')), remote('exec-2', path(300, 'direct')), remote('host-b-lan', null)],
       config: async () => () => null,
     });
     expect(paths.map((p) => [p.host, p.path?.alert ?? null, p.text])).toEqual([
       ['exec-1', 'tailnet-relayed', 'exec-1 tailnet path relayed via DERP(sin), RTT 1170 ms'],
       ['exec-2', 'tailnet-slow', 'exec-2 tailnet path slow: RTT 300 ms (threshold 250 ms)'],
-      ['ai-lan', null, null],
+      ['host-b-lan', null, null],
     ]);
   });
 

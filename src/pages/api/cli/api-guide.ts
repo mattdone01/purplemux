@@ -205,7 +205,7 @@ alias shows its figures and "via", but "placeable" is false and "reason" says
 "answers only through <fallback>; <alias> failed (...)": it takes nothing new.
 Each read also measures the tailnet path to the alias that answered (else the host's own),
 from this host (vel-RETRO-R2): \`ssh -G\` names the address, a lookup gives the IP, and a
-tailnet IP (100.64.0.0/10, fd7a:115c:a1e0::/48) gets one \`tailscale ping -c 1 --timeout 2s\`,
+tailnet IP (the RFC 6598 shared address space and fd7a:115c:a1e0::/48) gets one \`tailscale ping -c 1 --timeout 2s\`,
 at most once per 5 minutes per alias (an unknown or a first relayed measurement is taken again
 at the next read). A relayed path alerts on its second relayed measurement in a row.
 Placement reads none of it: a relayed or slow host takes work as before, and the fleet view and
@@ -220,7 +220,7 @@ GET /api/cli/pool   (any valid scope)
   "agentTabs", "slots", "path": null | { "kind": "direct"|"relayed"|"not-tailnet"|"unknown", "alert":
   null|"tailnet-relayed"|"tailnet-slow", "alias", "address", "ip", "peer", "region", "rttMs",
   "relayedReads", "slowMs", "measuredAt", "reason" } (null for this host and a host not measured
-  yet; "not-tailnet" is an alias that dials outside the tailnet, such as ai-lan; "unknown" is no
+  yet; "not-tailnet" is an alias that dials outside the tailnet, such as host-b-lan; "unknown" is no
   pong, a via token that is not DERP, a peer relay or ip:port, or a measurement older than its
   5-minute TTL plus 90 s, never read as direct; relayedReads counts relayed measurements in a row,
   and "tailnet-relayed" needs 2; relayed wins over slow), "budget": null | { "threads", "memBytes", "reserveThreads", "reserveMemBytes",

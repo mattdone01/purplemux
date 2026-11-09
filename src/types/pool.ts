@@ -85,7 +85,7 @@ export interface IPoolMetrics {
 
 /**
  * How ssh reaches a remote host over the tailnet (vel-RETRO-R2). `not-tailnet`: the alias dials an address outside the
- * tailnet (a LAN alias such as `ai-lan`); `unknown`: not measured, never read as `direct`.
+ * tailnet (a LAN alias such as `host-b-lan`); `unknown`: not measured, never read as `direct`.
  */
 export type TPoolPathKind = 'direct' | 'relayed' | 'not-tailnet' | 'unknown';
 

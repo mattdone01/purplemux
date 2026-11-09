@@ -147,7 +147,7 @@ a caller that never asks is not placed.
 - A placement lands on a host that was unknown, or two leases share one slot.
 
 ## Amendment vel-RETRO-R2: the tailnet path (2026-11-09)
-Retro 2026-11-09 row R2: the exec hosts reached mdserver1 only through a DERP relay (RTT 0.85-1.17 s, ssh 18-25 s)
+Retro 2026-11-09 row R2: the exec hosts reached control-host only through a DERP relay (RTT 0.85-1.17 s, ssh 18-25 s)
 for hours, and no tool noticed. Design and consult ruling: `docs/design/vel-retro-r2-tailnet-path.md`.
 
 1. Each remote read (§1) also measures the tailnet path to the alias that answered, else the host's own
