@@ -132,8 +132,8 @@ HOOK_HEADERS
   return 0
 }
 
-# post_stop TARGET BODY: post_hook for the Claude stop (F6), under the same spool rule, that prints the server's
-# 200 answer to stdout so the caller can hand a block to Claude. Nothing is printed for any other outcome.
+# post_stop TARGET BODY: post_hook for the Claude stop (F6) with the stop's own bound, under the same spool rule. It
+# prints nothing: no stop is held, so no answer is ever handed to Claude (party ruling SIMPLIFY).
 post_stop() {
   case "$1" in *\\?*) HOOK_TARGET="$1&occurredAt=$AT" ;; *) HOOK_TARGET="$1?occurredAt=$AT" ;; esac
   HOOK_BODY="$2"
@@ -156,7 +156,6 @@ HOOK_HEADERS
     5:*|6:*|7:*|35:*|60:*|*:5[0-9][0-9]) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;;
     28:*) case "\${HOOK_RESULT#* }" in *[1-9]*) ;; *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;; esac ;;
   esac
-  [ "$HOOK_RC" = 0 ] && [ "$HOOK_HTTP" = 200 ] && printf '%s' "\${HOOK_OUT%$HOOK_NL*}"
   return 0
 }`;
 
@@ -204,17 +203,12 @@ if [ "$EVENT" = "post-tool" ]; then
 fi
 
 # The Claude stop (F6, F10 steps 1-2): the hook's own JSON (session_id, last_assistant_message, hook_event_name) goes
-# to the server, which answers {} or a block. Only a well-formed one-line block object is printed for Claude; any
-# other answer, or no answer, prints nothing and the stop goes through. A body over the spool limit is sent as {}.
+# to the server. Nothing is printed, whatever the answer: the stop always goes through. A body over the spool limit is
+# sent as {}.
 if [ "$EVENT" = "stop" ]; then
   BODY=$(cat)
   [ -n "$BODY" ] && [ \${#BODY} -le ${HOOK_SPOOL_MAX_BODY} ] || BODY="{}"
-  ANSWER=$(post_stop "/api/status/hook?kind=stop&session=\${SESSION}" "$BODY")
-  case "$ANSWER" in
-    *"
-"*) ;;
-    '{"decision":"block","reason":"'*'"}') printf '%s\\n' "$ANSWER" ;;
-  esac
+  post_stop "/api/status/hook?kind=stop&session=\${SESSION}" "$BODY" >/dev/null
   exit 0
 fi
 

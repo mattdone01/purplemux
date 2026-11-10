@@ -1665,7 +1665,7 @@ const cmdEventScope = async (args) => {
 };
 
 // `purplemux done` (F6, F10 step 2): the typed end of this turn. The server checks the evidence and keeps the row; the
-// stop that ends the turn reads it. Worker seats are held at the stop until they write one (at most twice).
+// stop that ends the turn reads it, and the higher rank of the row and the end line wins (the row on a tie).
 const DONE_VERDICTS = ['DONE', 'BLOCKED', 'NEEDS-DECISION', 'READY-TO-MERGE', 'CHECKPOINTED'];
 const DONE_USAGE = 'usage: done --verdict DONE|BLOCKED|NEEDS-DECISION|READY-TO-MERGE|CHECKPOINTED [--reason TEXT] [--story KEY] [--head SHA] [--gate-log ABS]';
 
@@ -3850,8 +3850,8 @@ Commands:
                                            The scopes of your workspace; clear is the coordinator's
   done --verdict DONE|BLOCKED|NEEDS-DECISION|READY-TO-MERGE|CHECKPOINTED [--reason TEXT] [--story KEY]
        [--head SHA] [--gate-log ABS]       The typed end of this turn (F6), before its last line. A builder's DONE and
-                                           READY-TO-MERGE need --gate-log (checked: VALID, its tree is head's); a worker
-                                           seat that stops without one is held at most twice. Exit 2 names each defect
+                                           READY-TO-MERGE need --gate-log (checked: VALID, its tree is head's). No stop
+                                           is held; an end line of higher rank wins over the row. Exit 2 names each defect
   config get KEY                           Print a fleet config value bare (e.g. gate.slots); exit 7 when unset
   config list [--json]                     Every fleet config value with its version, time and setter
   config set KEY VALUE [--expect-version N]

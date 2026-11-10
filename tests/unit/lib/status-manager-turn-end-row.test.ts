@@ -8,14 +8,21 @@ import type { ITurnEndRow } from '@/lib/turn-end-row';
 import type { ITabStatusEntry } from '@/types/status';
 import type { ITab } from '@/types/terminal';
 
-// F6, folding in F10 steps 1 and 2 (design check (2) ruling, 2026-11-10), through the status manager: a held stop, a
-// row applied as the end line with the classifier in shadow, the cap, a WAITING stop, the payload tail, the kill switch
-// and a block that never reached the agent.
+// F6, folding in F10 steps 1 and 2, through the status manager, after the party ruling SIMPLIFY (2026-11-10): no stop
+// is held, and ONE precedence order decides between the row and E, the end line the stop applies (cases A1-A12).
 
 const mockHome = vi.hoisted(() => ({ value: '' }));
 const workspaceStore = vi.hoisted(() => ({ getWorkspaceByIdCached: vi.fn(), getWorkspacesCached: vi.fn() }));
 const liveness = vi.hoisted(() => ({ statusForTab: vi.fn(), removeTab: vi.fn() }));
 const pane = vi.hoisted(() => ({ text: '' as string | null }));
+const needsDecision = vi.hoisted(() => ({
+  open: vi.fn(async (_deps: unknown, _stop: unknown): Promise<Record<string, unknown>> => ({ opened: true, itemId: 'nd-0123456789abcdef0123456789abcdef', runId: 'run-a' })),
+}));
+vi.mock('@/lib/needs-decision-opener', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/needs-decision-opener')>()),
+  needsDecisionDeps: vi.fn(async () => ({})),
+  openNeedsDecisionItem: needsDecision.open,
+}));
 
 vi.mock('@/lib/logger', () => {
   const logger = { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => logger };
@@ -90,7 +97,7 @@ const setup = async (opts: { scoped?: boolean; transcriptText?: string } = {}) =
   };
   manager.registerTab('w', worker);
   manager.updateTabFromHook('tmux-w', 'prompt-submit');
-  const internals = manager as unknown as { turnEndSourceRow: boolean; runWatchdogTimers: (now: number) => Promise<void> };
+  const internals = manager as unknown as { turnEndSourceRow: boolean; stopPayloadIsTail: boolean };
   const nudges = () => paste.mock.calls.map(([, message]) => message);
   const stop = (message: string | null) => manager.decideClaudeStop('tmux-w', { hookEvent: 'Stop', sessionId: SESSION, message });
   const row = (over: Partial<ITurnEndRow> = {}): ITurnEndRow => ({
@@ -114,117 +121,116 @@ describe('the typed turn end through the status manager (F6; F10 steps 1-2)', ()
     await fs.rm(mockHome.value, { recursive: true, force: true });
   });
 
-  it('a live prompt-submit opens a turn; a stop with no row is held; the row written after it is the end line', async () => {
-    const { manager, store, nudges, stop, row } = await setup();
-    expect(store.turnEnds.currentTurn(SESSION)).toEqual({ turnId: 1, blocks: 0 });
-    expect(await stop('Gate green.\n\nDONE: shipped')).toMatchObject({ kind: 'block' });
-    expect(store.turnEnds.currentTurn(SESSION)?.blocks).toBe(1);
-    store.turnEnds.put(row());
-    expect(await stop('Gate green.\n\nDONE: shipped')).toMatchObject({ kind: 'row' });
+  const applied = async (nudgesFn: () => string[], manager: { updateTabFromHook: (s: string, e: string) => void }) => {
     manager.updateTabFromHook('tmux-w', 'stop');
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain(`ended: DONE: shipped (story F6, head ${'c'.repeat(12)}, gate VALID)`);
-    expect(store.turnEnds.unconsumed(SESSION, 1)).toBeNull();
+    await waitFor(() => expect(nudgesFn()).toHaveLength(1));
+    return nudgesFn()[0];
+  };
+  const ndLine = () => JSON.stringify(needsDecision.open.mock.calls.at(-1)?.[1] ?? null);
+
+  it('A1: a DONE row under a NEEDS-DECISION end line: the line applies, its item opens, the row is consumed and kept', async () => {
+    const { manager, store, nudges, stop, row } = await setup({ transcriptText: 'Options.\n\nNEEDS-DECISION: pick A or B' });
+    store.turnEnds.put(row());
+    expect(await stop('Options.\n\nNEEDS-DECISION: pick A or B')).toMatchObject({ kind: 'row' });
+    expect(await applied(nudges, manager)).toContain('ended: NEEDS-DECISION: pick A or B');
+    expect(ndLine()).toContain('NEEDS-DECISION: pick A or B');
     expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'DONE', consumedAt: expect.any(Number) })]);
   });
 
-  it('after two holds the third stop goes through: one UNREPORTED cap row and the classifier\'s verdict', async () => {
-    const { manager, store, nudges, stop } = await setup();
-    expect(await stop('DONE: shipped')).toMatchObject({ kind: 'block' });
-    expect(await stop('DONE: shipped')).toMatchObject({ kind: 'block' });
-    expect(await stop('DONE: shipped')).toEqual({ kind: 'unreported', reason: 'cap', escalation: null, turnId: 1 });
-    manager.updateTabFromHook('tmux-w', 'stop');
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain('ended: DONE: shipped');
-    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'cap' })]);
+  it('A2: a DONE row and no payload message (body over the limit): E is the transcript tail, and its BLOCKED line applies', async () => {
+    const { manager, store, nudges, stop, row } = await setup({ transcriptText: 'Stuck.\n\nBLOCKED: no creds' });
+    store.turnEnds.put(row());
+    expect(await stop(null)).toMatchObject({ kind: 'row' });
+    expect(await applied(nudges, manager)).toContain('ended: BLOCKED: no creds');
+    expect(store.turnEnds.unconsumed(SESSION, 1)).toBeNull();
   });
 
-  it('never holds a WAITING stop: a markerless stop with a live job needs no row', async () => {
-    const { store, stop } = await setup({ transcriptText: 'gate launched' });
+  it('A3: hook.stop-payload=off: E is the transcript tail; the payload tail is not consulted', async () => {
+    const { manager, store, internals, nudges, stop, row } = await setup({ transcriptText: 'Hmm.\n\nNEEDS-DECISION: y' });
+    internals.stopPayloadIsTail = false;
+    store.turnEnds.put(row());
+    await stop('All done.\n\nDONE: x');
+    expect(await applied(nudges, manager)).toContain('ended: NEEDS-DECISION: y');
+  });
+
+  it('A4: a NEEDS-DECISION row under a DONE line: the synthesized NEEDS-DECISION line applies and opens the item', async () => {
+    const { manager, store, nudges, stop, row } = await setup({ transcriptText: 'Wrapped.\n\nDONE: finished' });
+    store.turnEnds.put(row({ verdict: 'NEEDS-DECISION', reason: 'pick A or B', head: null, gateLog: null, gateVerdict: null }));
+    await stop('Wrapped.\n\nDONE: finished');
+    expect(await applied(nudges, manager)).toContain('ended: NEEDS-DECISION: pick A or B (story F6)');
+    expect(ndLine()).toContain('NEEDS-DECISION: pick A or B (story F6)');
+  });
+
+  it('A5: a BLOCKED row under a NEEDS-DECISION line: the line applies; a DONE row under a DONE line: the row\'s line', async () => {
+    const one = await setup({ transcriptText: 'Q.\n\nNEEDS-DECISION: z' });
+    one.store.turnEnds.put(one.row({ verdict: 'BLOCKED', reason: 'red' }));
+    await one.stop('Q.\n\nNEEDS-DECISION: z');
+    expect(await applied(one.nudges, one.manager)).toContain('ended: NEEDS-DECISION: z');
+    const two = await setup({ transcriptText: 'Ok.\n\nDONE: z' });
+    two.store.turnEnds.put(two.row());
+    await two.stop('Ok.\n\nDONE: z');
+    expect(await applied(two.nudges, two.manager)).toContain(`ended: DONE: shipped (story F6, head ${'c'.repeat(12)}, gate VALID)`);
+  });
+
+  it('A6: a scoped turn end with no row is never held: its DONE line applies once, with one UNREPORTED no-row row', async () => {
+    const { manager, store, nudges, stop } = await setup();
+    expect(await stop('Gate green.\n\nDONE: shipped')).toEqual({ kind: 'unreported', reason: 'no-row', turnId: 1 });
+    expect(await applied(nudges, manager)).toContain('ended: DONE: shipped');
+    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'no-row' })]);
+  });
+
+  it('A7: a markerless stop with a live job is WAITING: no row asked, none consumed; a later stop applies its row once', async () => {
+    const { manager, store, nudges, stop, row } = await setup({ transcriptText: 'gate launched' });
     liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [{ pid: 1, alive: true }] });
     expect(await stop('gate launched, waiting on it')).toMatchObject({ kind: 'classifier', why: 'waiting on open work' });
-    expect(store.turnEnds.currentTurn(SESSION)?.blocks).toBe(0);
-  });
-
-  it('F10 step 1: the stop\'s own message is the tail when the transcript has not caught up', async () => {
-    const { manager, nudges, stop } = await setup({ scoped: false, transcriptText: 'still writing the summary' });
-    expect(await stop('Summary.\n\nBLOCKED: gate red on lint')).toMatchObject({ kind: 'classifier', why: 'unscoped' });
     manager.updateTabFromHook('tmux-w', 'stop');
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain('ended: BLOCKED: gate red on lint');
-  });
-
-  it('the kill switch turn-end.source=classifier holds nothing', async () => {
-    const { internals, stop } = await setup();
-    internals.turnEndSourceRow = false;
-    expect(await stop('DONE: shipped')).toMatchObject({ kind: 'classifier', why: 'turn-end.source=classifier' });
-  });
-
-  it('review CONCERN: a working tab with an empty composer is never applied mid-turn; its fresh row stays for its real stop', async () => {
-    const { manager, internals, store, nudges, stop, row } = await setup();
-    expect(await stop('DONE: shipped')).toMatchObject({ kind: 'block' });
-    // The hold reached the agent: it works on, with an empty composer on screen, through polls past any delay.
-    pane.text = EMPTY_CLAUDE;
-    manager.handleToolActivity('claude', 'tmux-w', { tool: 'Bash', paths: [], failed: false, commandPreview: 'npm test' });
-    await internals.runWatchdogTimers(Date.now() + 10 * 60_000);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(nudges()).toEqual([]);
+    expect(store.turnEnds.list('ws-1', 0)).toEqual([]);
+    liveness.statusForTab.mockResolvedValue({ probes: [], backgroundJobs: [] });
     store.turnEnds.put(row());
-    manager.updateTabFromHook('tmux-w', 'notification', 'idle_prompt');
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(nudges()).toEqual([]);
-    expect(store.turnEnds.unconsumed(SESSION, 1)).toMatchObject({ verdict: 'DONE', source: 'done' });
-    // Its real stop applies the row, held no more.
-    expect(await stop('DONE: shipped')).toMatchObject({ kind: 'row' });
-    manager.updateTabFromHook('tmux-w', 'stop');
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain('ended: DONE: shipped (story F6');
+    expect(await stop('Gate green.\n\nDONE: shipped')).toMatchObject({ kind: 'row' });
+    expect(await applied(nudges, manager)).toContain('ended: DONE: shipped (story F6');
   });
 
-  it('review CONCERN: idle_prompt with no event since the hold applies the held stop as UNREPORTED block-undelivered', async () => {
+  it('A10: a live idle_prompt, then a live prompt-submit, after an applied stop: no synthetic stop, the turn advances', async () => {
     const { manager, store, nudges, stop } = await setup();
-    expect(await stop('DONE: shipped')).toMatchObject({ kind: 'block' });
-    manager.updateTabFromHook('tmux-w', 'notification', 'idle_prompt');
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain('ended: DONE: shipped');
-    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'block-undelivered' })]);
-  });
-
-  it('review round 2: a live idle_prompt carrying its occurredAt applies the held stop and its BLOCKED line; a replay does not, nor twice', async () => {
-    const { manager, store, nudges, stop } = await setup({ transcriptText: 'Lint is red.\n\nBLOCKED: lint red on lane 2' });
-    expect(await stop('Lint is red.\n\nBLOCKED: lint red on lane 2')).toMatchObject({ kind: 'block' });
-    // A replay of an idle_prompt is no sign either way: the hold stays held.
-    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'notification', notificationType: 'idle_prompt' }, Date.now() - 500, { replayed: true });
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(nudges()).toEqual([]);
-    // Live, as the hook route passes it: with the hook's own occurredAt.
-    manager.handleProviderEvent('claude', 'tmux-w', { kind: 'notification', notificationType: 'idle_prompt' }, Date.now() - 200, { replayed: false });
-    await waitFor(() => expect(nudges()).toHaveLength(1));
-    expect(nudges()[0]).toContain('ended: BLOCKED: lint red on lane 2');
-    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'UNREPORTED', unreportedReason: 'block-undelivered' })]);
-    // A second idle_prompt applies nothing more.
+    await stop('DONE: shipped');
+    await applied(nudges, manager);
+    await new Promise((resolve) => setTimeout(resolve, 5));
     manager.handleProviderEvent('claude', 'tmux-w', { kind: 'notification', notificationType: 'idle_prompt' }, Date.now(), { replayed: false });
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(nudges()).toHaveLength(1);
-    expect(store.turnEnds.list('ws-1', 0)).toHaveLength(1);
-  });
-
-  it('review round 2: a live prompt-submit with its occurredAt opens a turn; a replayed one does not', async () => {
-    const { manager, store } = await setup();
-    expect(store.turnEnds.currentTurn(SESSION)?.turnId).toBe(1);
-    // The hook's own occurredAt, after the tab's last event (an older one is history only, ADR-0020).
     await new Promise((resolve) => setTimeout(resolve, 5));
     manager.handleProviderEvent('claude', 'tmux-w', { kind: 'prompt-submit' }, Date.now(), { replayed: false });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(nudges()).toHaveLength(1);
     expect(store.turnEnds.currentTurn(SESSION)?.turnId).toBe(2);
     await new Promise((resolve) => setTimeout(resolve, 5));
     manager.handleProviderEvent('claude', 'tmux-w', { kind: 'prompt-submit' }, Date.now(), { replayed: true });
     expect(store.turnEnds.currentTurn(SESSION)?.turnId).toBe(2);
   });
 
-  it('a replayed stop is never held: with no row it is UNREPORTED not-blockable:replayed', async () => {
-    const { manager, store } = await setup();
+  it('A11: turn-end.source=classifier with a DONE row and a NEEDS-DECISION line: the classifier applies; the row stays', async () => {
+    const { manager, store, internals, nudges, stop, row } = await setup({ transcriptText: 'Q.\n\nNEEDS-DECISION: y' });
+    internals.turnEndSourceRow = false;
+    store.turnEnds.put(row());
+    expect(await stop('Q.\n\nNEEDS-DECISION: y')).toMatchObject({ kind: 'classifier', why: 'turn-end.source=classifier' });
+    expect(await applied(nudges, manager)).toContain('ended: NEEDS-DECISION: y');
+    expect(store.turnEnds.unconsumed(SESSION, 1)).toMatchObject({ verdict: 'DONE' });
+  });
+
+  it('A12: a worker that ends DONE with no row leaves busy at that stop: its prompt is ready for the inbox', async () => {
+    const { manager, nudges, stop } = await setup();
+    await stop('Gate green.\n\nDONE: shipped');
+    await applied(nudges, manager);
+    expect(manager.getAllForClient().w?.cliState).toBe('ready-for-review');
+    expect(manager.isAtPrompt('w')).toBe(true);
+  });
+
+  it('a replayed stop is judged against its own turn: with no row it is UNREPORTED no-row:replayed', async () => {
+    const { manager } = await setup();
     expect(await manager.decideClaudeStop('tmux-w', { hookEvent: 'Stop', sessionId: SESSION, message: 'DONE: x' }, Date.now()))
-      .toEqual({ kind: 'unreported', reason: 'not-blockable:replayed', escalation: null, turnId: 1 });
-    expect(store.turnEnds.currentTurn(SESSION)?.blocks).toBe(0);
+      .toEqual({ kind: 'unreported', reason: 'no-row:replayed', turnId: 1 });
     expect(await manager.decideClaudeStop('tmux-w', { hookEvent: 'StopFailure', sessionId: SESSION, message: 'API Error' }))
-      .toMatchObject({ kind: 'unreported', reason: 'not-blockable:stop-failure' });
+      .toMatchObject({ kind: 'unreported', reason: 'no-row:stop-failure' });
   });
 });

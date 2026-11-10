@@ -261,7 +261,7 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     expect(fs.existsSync(path.join(home, '.purplemux', 'status-hook.sh'))).toBe(false);
   });
 
-  describe('the Claude stop answers a block (F6, F10 steps 1-2)', () => {
+  describe('the Claude stop posts its payload and prints nothing (F6; party ruling SIMPLIFY)', () => {
     const stop = (stdin: string, out: string, exit = 0) => {
       const script = path.join(dir, 'hook.sh');
       fs.writeFileSync(script, HOOK_SCRIPT_CONTENT);
@@ -270,23 +270,24 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
       expect(r.status, r.stderr).toBe(0);
       return r.stdout;
     };
-    const BLOCK = '{"decision":"block","reason":"Run purplemux done --verdict DONE before you end the turn; missing: \\"a row\\""}';
+    const BLOCK = '{"decision":"block","reason":"x"}';
 
-    it('prints the server\'s block object, alone, for Claude', () => {
-      expect(stop('{"hook_event_name":"Stop","session_id":"s-1"}', `${BLOCK}\n200 0.000100`)).toBe(`${BLOCK}\n`);
+    it('A9: a server that answers a block object gets no output and exit 0: no stop can be held', () => {
+      expect(stop('{"hook_event_name":"Stop","session_id":"s-1"}', `${BLOCK}\n200 0.000100`)).toBe('');
       expect(JSON.parse(fs.readFileSync(path.join(dir, 'curl-body'), 'utf-8'))).toEqual({ hook_event_name: 'Stop', session_id: 's-1' });
       expect(fs.readFileSync(path.join(dir, 'curl-args'), 'utf-8')).toMatch(/\/api\/status\/hook\?kind=stop&session=pt-ws-1-pane-a-tab-w&occurredAt=\d{13}/);
       expect(fs.readFileSync(path.join(dir, 'curl-args'), 'utf-8')).toContain('--max-time 3');
+      expect(spoolFiles()).toEqual([]);
     });
 
     it.each([
-      ['an empty answer {}', '{}\n200 0.000100', 0],
-      ['a block on a non-200 status', `${BLOCK}\n500 0.000100`, 0],
-      ['a block cut by a timeout', `${BLOCK}\n000 0.000100`, 28],
-      ['an answer of two lines', `${BLOCK}\n{"decision":"block","reason":"x"}\n200 0.000100`, 0],
-      ['another object', '{"decision":"approve"}\n200 0.000100', 0],
-    ])('prints nothing for %s: the stop goes through', (_label, out, exit) => {
+      ['an empty answer {}', '{}\n200 0.000100', 0, false],
+      ['a 5xx answer (spooled)', `${BLOCK}\n503 0.000100`, 0, true],
+      ['a refused connect (spooled)', '000 0.000000', 7, true],
+      ['a timeout after the connect (not spooled)', `${BLOCK}\n000 0.000100`, 28, false],
+    ])('prints nothing for %s; the spool rule is unchanged', (_label, out, exit, spooled) => {
       expect(stop('{"hook_event_name":"Stop"}', out as string, exit as number)).toBe('');
+      expect(spoolFiles().length > 0).toBe(spooled);
     });
 
     it('sends {} for a body over the spool limit, and for an empty one', () => {

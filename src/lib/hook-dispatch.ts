@@ -32,7 +32,7 @@ export interface IHookDelivery {
 export interface IHookOutcome {
   status: number;
   error?: string;
-  /** A JSON answer the hook script reads: the Claude stop route's `{}` or `{"decision":"block",...}` (F6). */
+  /** A JSON answer: the Claude stop route answers `{}` (F6; the script prints nothing, no stop is held). */
   body?: Record<string, unknown>;
 }
 
@@ -59,22 +59,20 @@ const handleClaudeToolHook = ({ query, body, replayedAt }: IHookDelivery): IHook
 };
 
 /**
- * The Claude stop (F6, F10 steps 1-2): the script posts the hook's own JSON with `session=` in the query. The decision
- * comes first (within 1 s); a `block` is answered and NOT applied, so the agent continues its turn. Any other decision
- * is applied as the stop. A replayed stop is never blocked (ruling (4)), and one whose body was dropped applies as a
- * plain stop.
+ * The Claude stop (F6, F10 steps 1-2): the script posts the hook's own JSON with `session=` in the query. The route
+ * decides (within 1 s), applies the stop and answers `{}`: no stop is held (party ruling SIMPLIFY). A replay is judged
+ * against its own turn, and one whose body was dropped applies as a plain stop.
  */
 const handleClaudeStopHook = async ({ query, body, replayedAt, occurredAt }: IHookDelivery): Promise<IHookOutcome> => {
   const session = queryString(query, 'session');
   if (!session) return { status: 200, body: {} };
   const payload = bodyRecord(body);
   const statusManager = getStatusManager();
-  const decision = await statusManager.decideClaudeStop(session, {
+  await statusManager.decideClaudeStop(session, {
     hookEvent: typeof payload.hook_event_name === 'string' ? payload.hook_event_name : null,
     sessionId: typeof payload.session_id === 'string' ? payload.session_id : null,
     message: typeof payload.last_assistant_message === 'string' ? payload.last_assistant_message : null,
   }, replayedAt);
-  if (decision.kind === 'block') return { status: 200, body: { decision: 'block', reason: decision.reason } };
   const workEvent = translateClaudeHookEvent('stop', undefined, undefined);
   if (workEvent) statusManager.handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt, { replayed: replayedAt !== undefined });
   return { status: 200, body: {} };

@@ -3,7 +3,11 @@
 ## Status
 Accepted (2026-11-10, epic `delivery-flow-fix`, story F6, which folds in F10 steps 1 and 2). One Opus 5.5 xhigh
 design consult, APPROVE-WITH-CHANGES. Amends ADR-0018 (the turn end is a row when one exists) and ADR-0043 (a scope
-carries a seat).
+carries a seat). Amended the same day by an architect /party (Opus 5.5 xhigh, ruling SIMPLIFY, after three CONFIRM
+rounds on the held stop): no stop is held. That party is the authority that amends the consult's ruling (6) (a
+contradicted row was a hold reason in a budget of two; now the precedence order of item 5 decides it at the first
+stop) and withdraws the hold parts of its rulings (3) and (4) (the pending hold, its `idle_prompt` and undelivered
+paths, and the never-held list as a list of holds).
 
 ## Context
 A worker's verdict was a regex over the last 600 characters of its transcript: one end line was refused 406 times in
@@ -28,41 +32,50 @@ takes those two steps.
    NEEDS-DECISION need a reason. A remote tab cannot write a row: the server cannot read its evidence.
 4. **The seat.** `event scope set … --seat builder|reviewer|consult`. With no seat declared, a scope that names a
    story is a builder.
-5. **At the stop.** The server decides within 1 s; past that, the stop goes through on the classifier. Options:
-   - **Row:** a row that the payload tail does not contradict is the verdict. Its line is synthesized as
-     `<MARKER>: <reason> (story K, head <12>, gate <verdict>)` and feeds the nudge, `reportOn`, the coordinator window
-     and the NEEDS-DECISION item. The classifier runs beside it, and a disagreement is logged (7 days of shadow,
-     then F10 step 5 deletes it).
-   - **WAITING:** a stop whose tail has no marker, while the tab has a live registered job, an armed watch or an open
-     provider task, is WAITING and needs no row. An unknown count holds nothing.
-   - **Held:** a scoped worker's turn end with no row is held with `{"decision":"block","reason":"Run purplemux
-     done …"}`, at most twice per turn (counted in the ledger). The third stop goes through, writes an `UNREPORTED`
-     row with reason `cap`, and takes the classifier's verdict.
-   - **Contradicted row:** a row of DONE, READY-TO-MERGE or CHECKPOINTED under a BLOCKED or NEEDS-DECISION tail is a
-     hold reason in the same budget. At the cap, the escalating verdict (the tail's) applies.
-   - **Never held:** a StopFailure, a replay, a remote tab, an evaluator tab, a non-Claude tab, a tab in an open
-     rotation, a coordinator and an unscoped tab. A scoped turn end among them with no row gets an `UNREPORTED`
-     `not-blockable:<why>` row; a coordinator and an unscoped tab keep the classifier alone.
-6. **A hold is pending until confirmed** (amended by the CONFIRM review of 2026-11-10). Confirmation is positive,
-   never inferred from the screen. A hold is confirmed by any hook event of the session after it: a tool call, a
-   prompt, a notification, a stop, or a `done` row. A working tab shows an empty composer too, so the pane is never
-   read. The one sign that a hold never arrived is Claude's own `idle_prompt` notification with no event since the
-   hold: the session waits for input. The held stop is then applied at once. It uses the turn's row if the worker wrote
-   one, else an `UNREPORTED` `block-undelivered` row. A hold with no such sign stays pending, and the tab's existing
-   stall signals cover it.
+5. **At the stop: no stop is held.** The route decides within 1 s (past that, the classifier), applies the stop and
+   answers `{}`; the script prints nothing, whatever the answer. The decision only finds the row of the stop's own
+   turn, or marks the turn end:
+   - **WAITING:** a stop whose tail has no marker and no row, while the tab has a live registered job, an armed watch
+     or an open provider task, is WAITING and asks no row. An unknown count asks none either.
+   - **No row:** a scoped worker's turn end with no row gets an `UNREPORTED` `no-row` row and the classifier's verdict.
+     A stop no row is asked of (a StopFailure, a replay, a remote, evaluator or non-Claude tab, a tab in an open
+     rotation) gets `no-row:<why>`; a coordinator and an unscoped tab keep the classifier alone. These rows measure
+     adoption: `done` is voluntary.
+   - **One precedence order, evaluated once, at apply time, against E** (party ruling, section 1). E is the end line
+     the stop applies: the stop's own message when it is the bound session's and `hook.stop-payload` is on, else the
+     transcript tail. The other tail is shadow data, never a source. The first candidate that exists wins:
+     1. a `NEEDS-DECISION` row
+     2. a `NEEDS-DECISION:` end line in E
+     3. a `BLOCKED` row
+     4. a `BLOCKED:` end line in E
+     5. a rank-0 row (`DONE`, `READY-TO-MERGE`, `CHECKPOINTED`)
+     6. a rank-0 end line in E
+     7. WAITING
+     8. ready-for-review
+
+     That is: the higher rank wins (NEEDS-DECISION > BLOCKED > the rest), and on equal rank the row wins. Rank comes
+     first because a lost escalation costs a stalled story or an unanswered owner question (ADR-0041: a question never
+     vanishes); within a rank a row carries checked evidence. A row that wins is applied as its synthesized line
+     `<MARKER>: <reason> (story K, head <12>, gate <verdict>)`, which feeds the nudge, `reportOn`, the coordinator
+     window and the NEEDS-DECISION item. A row that loses is consumed and kept, and the override is logged with both
+     verdicts. The classifier's own verdict is the row's shadow (7 days, then F10 step 5 deletes it).
+6. **Turns and replays.**
    - Live or replayed is the dispatch's own flag (`replayed`, set only by the spool drain), never the event time: a
      live hook carries its `occurredAt` in the same time parameter as a replay (CONFIRM review, round 2). A replayed
-     `idle_prompt` neither applies nor confirms a hold, and a replayed prompt-submit opens no turn.
-   - An `UNREPORTED` write never replaces a row. When the turn has one, that row is kept and marked used.
+     prompt-submit opens no turn.
    - A replayed stop is judged against its own turn: the latest turn that started at or before it fired
-     (`session_turn_starts`). It is never judged against the session's current turn.
+     (`session_turn_starts`), never the session's current turn. `consume` is single-use, so a replay applies once.
+   - An `UNREPORTED` write never replaces a row. When the turn has one, that row is kept and marked used.
    - The Stop and StopFailure hooks both get a 5 s timeout (tmux 1 s, the POST 3 s).
-7. **Kill switches**, admin token only: `turn-end.source` (`row`, or `classifier` to hold nothing and read rows not
-   at all) and `hook.stop-payload` (`on` or `off`).
+   - **Reopen trigger for holding** (party ruling): only as its own story with design check T1, when the team runner
+     or a revived F10 step 3 needs a Stop-hook block. It must model every exit (continue, stop again, `idle_prompt`,
+     prompt-submit, restart, session-start, kill-switch flip), keep its pending state durable, and never hold an
+     escalating end line.
+7. **Kill switches**, admin token only: `turn-end.source` (`row`, or `classifier` to read no rows at all) and
+   `hook.stop-payload` (`on` or `off`).
 
 ## Consequences
-- The script prints only a well-formed one-line block object. Any other answer, or none, lets the stop through: the
-  guard fails open.
-- A worker that ignores the hold costs at most two forced continuations per turn, then the stop goes through.
-- Rows are reported by source (`done`, `unreported` with its reason), and holds per day are a worker cost.
+- The guard holds nothing: every stop goes through on its first answer.
+- Rows are voluntary. Rows are reported by source (`done`, `unreported` with its reason); the `no-row` count measures
+  adoption.
 - F10 step 3 (messages) and step 5 (deleting the classifier) build on these rows; neither is part of this record.

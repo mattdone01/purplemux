@@ -76,7 +76,7 @@ import { TurnTracker, isActingTool } from '@/lib/turn-tracker';
 import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '@/lib/tab-event-router';
 import { WINDOWED_INBOX_KINDS, configureCoordinatorWindow, getCoordinatorWindow } from '@/lib/coordinator-window';
 import { StopGate, type IStopPayload } from '@/lib/stop-gate';
-import { STOP_PAYLOAD_CONFIG_KEY, TURN_END_SOURCE_CONFIG_KEY, synthesizeLine, tailMarker, type TStopDecision } from '@/lib/turn-end-row';
+import { STOP_PAYLOAD_CONFIG_KEY, TURN_END_SOURCE_CONFIG_KEY, resolveTurnEnd, synthesizeLine, tailMarker, type TStopDecision } from '@/lib/turn-end-row';
 import type { TurnEndsTable } from '@/lib/turn-ends-store';
 import type { ITurnEndTab } from '@/lib/turn-end-service';
 import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
@@ -2148,8 +2148,6 @@ export class StatusManager {
     const expectedProvider = getProviderByPanelType(entry.panelType);
     if (expectedProvider && expectedProvider.id !== providerId) return;
     if (isActingTool(activity.tool)) this.turns.toolCall(entry.workspaceId, tabId, providerId, replayedAt ?? Date.now());
-    // A tool call after a held stop is the agent working on: the hold reached it (review CONCERN).
-    if (replayedAt === undefined) this.stopGate.onHookEvent(tabId);
 
     const meta = this.tabScopeCache.get(tabId);
     if (!meta || Date.now() - meta.at > TAB_SCOPE_TTL_MS) {
@@ -3136,11 +3134,6 @@ export class StatusManager {
     }
   }
 
-  /** `purplemux done` ran in the tab: it is working, so a hold of its stop reached it (review CONCERN). */
-  confirmHeldStop(tabId: string): void {
-    this.stopGate.onHookEvent(tabId);
-  }
-
   /**
    * Classify a `stop` before announcing it (ADR-0018). A marker line
    * (`DONE:` …) becomes a `turn-marker` nudge carrying it. No marker and open
@@ -3222,17 +3215,24 @@ export class StatusManager {
       liveRegisteredJobs,
       armedWatches,
     });
-    // F10 step 2: a row is the turn's verdict, its line synthesized; the classifier runs beside it in shadow (7 days).
+    // F10 step 2 (party ruling SIMPLIFY): ONE precedence order, evaluated once, here, against E, the end line this stop
+    // applies (`tail`): the higher rank wins, NEEDS-DECISION > BLOCKED > the rest, and on equal rank the row wins. A row
+    // that loses is consumed and kept. The classifier's own verdict is the shadow of the row (7 days).
     let turnEnd = classified;
     let decisionTail = tail;
     if (stopDecision?.kind === 'row' && this.stopGate.consume(stopDecision.row)) {
-      const line = synthesizeLine(stopDecision.row);
-      const shadow = classified.kind === 'turn-marker' ? tailMarker(classified.lines.at(-1)) : null;
-      if (shadow !== stopDecision.row.verdict) {
-        log.info({ tabId, row: stopDecision.row.verdict, classifier: shadow ?? classified.kind }, 'turn-end shadow: the classifier reads another verdict than the row');
+      const row = stopDecision.row;
+      const lineMarker = classified.kind === 'turn-marker' ? tailMarker(classified.lines.at(-1)) : null;
+      if (row.verdict !== 'UNREPORTED' && resolveTurnEnd(row.verdict, lineMarker) === 'line') {
+        log.info({ tabId, row: row.verdict, line: lineMarker }, 'turn-end precedence: the end line escalates beyond the row');
+      } else {
+        if (lineMarker !== row.verdict) {
+          log.info({ tabId, row: row.verdict, classifier: lineMarker ?? classified.kind }, 'turn-end shadow: the classifier reads another verdict than the row');
+        }
+        const line = synthesizeLine(row);
+        turnEnd = { kind: 'turn-marker', lines: [line] };
+        decisionTail = line;
       }
-      turnEnd = { kind: 'turn-marker', lines: [line] };
-      decisionTail = line;
     } else if (stopDecision?.kind === 'unreported') {
       try {
         this.stopGate.writeUnreported(entry, tabId, stopDecision.reason, stopDecision.turnId);
@@ -3527,19 +3527,6 @@ export class StatusManager {
     }
     const now = this.admitHookEvent(tabId, event, replayedAt);
     if (now === null) return;
-    // F6 (design check (2) ruling (3), review CONCERN): any hook event of the session confirms that a held stop reached
-    // the agent, except Claude's `idle_prompt`: the session waits at its prompt with nothing since the hold, the one
-    // positive sign that the hold never arrived. The held stop is then applied now, its row kept if the worker wrote one.
-    // A replay is neither sign: it happened before this server's holds, which a restart does not keep.
-    if (event === 'notification' && notificationType === 'idle_prompt') {
-      if (!opts.replayed && this.stopGate.onIdlePrompt(tabId)) {
-        log.info({ tabId }, 'held stop never reached the agent (idle_prompt with no event since): applying it now');
-        this.updateTabFromHook(tmuxSession, 'stop');
-        return;
-      }
-    } else if (!opts.replayed) {
-      this.stopGate.onHookEvent(tabId);
-    }
 
     if (event === 'pre-compact' || event === 'post-compact') {
       hookLog.debug({ tabId, event }, 'compact hook');

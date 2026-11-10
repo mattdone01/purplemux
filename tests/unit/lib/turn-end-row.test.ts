@@ -4,21 +4,22 @@ import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import { LedgerStore } from '@/lib/ledger-store';
 import { StopGate, type IStopGateDeps, type IStopGateTab } from '@/lib/stop-gate';
+import { TURN_MARKER_NAMES, type TTurnMarkerName } from '@/lib/turn-end';
 import {
-  MAX_BLOCKS_PER_TURN,
   cleanReason,
   decideStop,
-  escalates,
-  notBlockable,
+  noRowExemption,
+  resolveTurnEnd,
   seatRoleOf,
   synthesizeLine,
   tailMarker,
-  type IBlockability,
   type IStopDecisionInput,
+  type ITurnEndContext,
   type ITurnEndRow,
 } from '@/lib/turn-end-row';
 
-// F6, folding in F10 steps 1 and 2 (design check (2) ruling, APPROVE-WITH-CHANGES, 2026-11-10).
+// F6, folding in F10 steps 1 and 2. No stop is held (party ruling SIMPLIFY, 2026-11-10): one precedence order decides
+// between a row and the applied end line, at apply time.
 
 const T0 = Date.UTC(2026, 10, 10, 1, 0, 0);
 const S = 'sess-1';
@@ -29,12 +30,12 @@ const row = (over: Partial<ITurnEndRow> = {}): ITurnEndRow => ({
   at: T0, consumedAt: null, ...over,
 });
 
-const worker: IBlockability = {
+const worker: ITurnEndContext = {
   stopFailure: false, replayed: false, remote: false, evaluator: false, provider: 'claude', openRotation: false, coordinator: false, scoped: true,
 };
 
 const input = (over: Partial<IStopDecisionInput> = {}): IStopDecisionInput => ({
-  classifierOnly: false, blockability: worker, sessionId: S, row: null, tailMarker: 'DONE', openWork: async () => 0, blocks: 0, ...over,
+  classifierOnly: false, context: worker, sessionId: S, row: null, tailMarker: 'DONE', openWork: async () => 0, ...over,
 });
 
 describe('cleanReason (ruling (5))', () => {
@@ -55,7 +56,7 @@ describe('cleanReason (ruling (5))', () => {
   });
 });
 
-describe('the seat, the synthesized line, the escalation', () => {
+describe('the seat and the synthesized line', () => {
   it('reads a declared seat, else builder when the scope names a story, else none (ruling (8))', () => {
     expect(seatRoleOf({ story: 'F6' })).toBe('builder');
     expect(seatRoleOf({ story: 'F6', seat: 'reviewer' })).toBe('reviewer');
@@ -69,70 +70,81 @@ describe('the seat, the synthesized line, the escalation', () => {
     expect(synthesizeLine(row({ reason: null, story: null, head: null, gateVerdict: null }))).toBe('DONE: done');
     expect(tailMarker(synthesizeLine(row({ verdict: 'NEEDS-DECISION', reason: 'A or B' })))).toBe('NEEDS-DECISION');
   });
+});
 
-  it('a BLOCKED or NEEDS-DECISION tail escalates beyond DONE, READY-TO-MERGE and CHECKPOINTED rows only', () => {
-    expect(escalates('DONE', 'BLOCKED')).toBe(true);
-    expect(escalates('CHECKPOINTED', 'NEEDS-DECISION')).toBe(true);
-    expect(escalates('BLOCKED', 'NEEDS-DECISION')).toBe(true);
-    expect(escalates('NEEDS-DECISION', 'BLOCKED')).toBe(false);
-    expect(escalates('DONE', 'DONE')).toBe(false);
-    expect(escalates('BLOCKED', null)).toBe(false);
+describe('resolveTurnEnd: the one precedence order (party ruling, section 1)', () => {
+  const rank = (marker: TTurnMarkerName | null) => (marker === 'NEEDS-DECISION' ? 2 : marker === 'BLOCKED' ? 1 : 0);
+  const lines: Array<TTurnMarkerName | null> = [...TURN_MARKER_NAMES, null];
+
+  it.each(TURN_MARKER_NAMES.flatMap((verdict) => lines.map((line) => [verdict, line] as const)))(
+    'row %s against end line %s: the higher rank wins, the row on a tie', (verdict, line) => {
+      expect(resolveTurnEnd(verdict, line)).toBe(rank(line) > rank(verdict) ? 'line' : 'row');
+    });
+
+  it('spells the order out: NEEDS-DECISION row > NEEDS-DECISION line > BLOCKED row > BLOCKED line > row > line', () => {
+    expect(resolveTurnEnd('NEEDS-DECISION', 'NEEDS-DECISION')).toBe('row');
+    expect(resolveTurnEnd('BLOCKED', 'NEEDS-DECISION')).toBe('line');
+    expect(resolveTurnEnd('BLOCKED', 'BLOCKED')).toBe('row');
+    expect(resolveTurnEnd('DONE', 'BLOCKED')).toBe('line');
+    expect(resolveTurnEnd('DONE', 'READY-TO-MERGE')).toBe('row');
+    expect(resolveTurnEnd('CHECKPOINTED', null)).toBe('row');
   });
 
   it.each([
     [{ stopFailure: true }, 'stop-failure'], [{ replayed: true }, 'replayed'], [{ remote: true }, 'remote'],
     [{ evaluator: true }, 'evaluator'], [{ provider: 'codex' }, 'provider-codex'], [{ openRotation: true }, 'rotation'],
     [{ coordinator: true }, 'coordinator'], [{ scoped: false }, 'unscoped'], [{}, null],
-  ] as const)('never blocks %j: %s (ruling (4))', (over, why) => {
-    expect(notBlockable({ ...worker, ...over })).toBe(why);
+  ] as const)('names why no row is asked of %j: %s', (over, why) => {
+    expect(noRowExemption({ ...worker, ...over })).toBe(why);
   });
 });
 
-describe('decideStop', () => {
-  it('applies an unconsumed row that agrees with the tail', async () => {
-    expect(await decideStop(input({ row: row() }))).toEqual({ kind: 'row', row: row() });
+describe('decideStop never holds a stop', () => {
+  const flags = ['stopFailure', 'replayed', 'remote', 'evaluator', 'openRotation', 'coordinator', 'scoped'] as const;
+  const contexts: ITurnEndContext[] = [];
+  for (let bits = 0; bits < 1 << flags.length; bits++) {
+    for (const provider of ['claude', 'codex']) {
+      const c = { ...worker, provider } as ITurnEndContext;
+      flags.forEach((flag, i) => { (c as unknown as Record<string, boolean>)[flag] = (bits & (1 << i)) !== 0; });
+      contexts.push(c);
+    }
+  }
+
+  it(`returns row, classifier or unreported for all ${contexts.length * 2 * 3} combinations of context, row and tail`, async () => {
+    const kinds = new Set<string>();
+    for (const context of contexts) {
+      for (const r of [null, row()]) {
+        for (const tail of ['DONE', 'NEEDS-DECISION', null] as const) {
+          const decision = await decideStop(input({ context, row: r, tailMarker: tail, openWork: async () => 0 }));
+          kinds.add(decision.kind);
+          expect(['row', 'classifier', 'unreported']).toContain(decision.kind);
+        }
+      }
+    }
+    expect([...kinds].sort()).toEqual(['classifier', 'row', 'unreported']);
   });
 
-  it('adversarial 1: a markerless stop with a live job is WAITING: no block, no row needed', async () => {
+  it('hands any unconsumed row to apply time, whatever the tail says (the order is evaluated there)', async () => {
+    expect(await decideStop(input({ row: row(), tailMarker: 'NEEDS-DECISION' }))).toEqual({ kind: 'row', row: row() });
+    expect(await decideStop(input({ row: row(), tailMarker: null, openWork: async () => 3 }))).toMatchObject({ kind: 'row' });
+  });
+
+  it('A7: a markerless stop with a live job is WAITING: no row asked, open work read once', async () => {
     const openWork = vi.fn(async () => 1);
     expect(await decideStop(input({ tailMarker: null, openWork }))).toEqual({ kind: 'classifier', why: 'waiting on open work' });
     expect(openWork).toHaveBeenCalledOnce();
-  });
-
-  it('blocks nothing when the open work is unknown by the deadline', async () => {
     expect(await decideStop(input({ tailMarker: null, openWork: async () => null }))).toMatchObject({ kind: 'classifier' });
   });
 
-  it('reads no open work when the tail ends on a marker', async () => {
-    const openWork = vi.fn(async () => 3);
-    expect(await decideStop(input({ openWork }))).toMatchObject({ kind: 'block' });
-    expect(openWork).not.toHaveBeenCalled();
+  it('A6: a scoped turn end with no row is UNREPORTED no-row; an exempt one names why; others keep the classifier', async () => {
+    expect(await decideStop(input())).toEqual({ kind: 'unreported', reason: 'no-row' });
+    expect(await decideStop(input({ context: { ...worker, replayed: true } }))).toEqual({ kind: 'unreported', reason: 'no-row:replayed' });
+    expect(await decideStop(input({ context: { ...worker, scoped: false } }))).toMatchObject({ kind: 'classifier', why: 'unscoped' });
+    expect(await decideStop(input({ context: { ...worker, coordinator: true } }))).toMatchObject({ kind: 'classifier', why: 'coordinator' });
   });
 
-  it('blocks a turn end with no row twice, then lets it through as UNREPORTED cap (F10 AC2)', async () => {
-    expect(await decideStop(input({ blocks: 0 }))).toMatchObject({ kind: 'block', reason: expect.stringContaining('stop 1 of 2 held') });
-    expect(await decideStop(input({ blocks: 1 }))).toMatchObject({ kind: 'block', reason: expect.stringContaining('stop 2 of 2 held') });
-    expect(await decideStop(input({ blocks: MAX_BLOCKS_PER_TURN }))).toEqual({ kind: 'unreported', reason: 'cap', escalation: null });
-    expect((await decideStop(input())) as { reason: string }).toMatchObject({ reason: expect.stringContaining('purplemux done --verdict') });
-  });
-
-  it('ruling (6): a DONE row under a NEEDS-DECISION tail is held, then the escalating verdict applies at the cap', async () => {
-    const mismatch = input({ row: row(), tailMarker: 'NEEDS-DECISION' });
-    expect(await decideStop(mismatch)).toMatchObject({ kind: 'block', reason: expect.stringContaining('says DONE, but your last line ends NEEDS-DECISION') });
-    expect(await decideStop({ ...mismatch, blocks: 2 })).toEqual({ kind: 'unreported', reason: 'cap', escalation: 'NEEDS-DECISION' });
-  });
-
-  it('gives a never-blockable scoped turn end an UNREPORTED row with its reason; unscoped and coordinator tabs keep the classifier', async () => {
-    expect(await decideStop(input({ blockability: { ...worker, replayed: true } }))).toEqual({ kind: 'unreported', reason: 'not-blockable:replayed', escalation: null });
-    expect(await decideStop(input({ blockability: { ...worker, evaluator: true } }))).toMatchObject({ reason: 'not-blockable:evaluator' });
-    expect(await decideStop(input({ blockability: { ...worker, scoped: false } }))).toMatchObject({ kind: 'classifier', why: 'unscoped' });
-    expect(await decideStop(input({ blockability: { ...worker, coordinator: true } }))).toMatchObject({ kind: 'classifier', why: 'coordinator' });
-    // A replayed stop still takes its own row.
-    expect(await decideStop(input({ blockability: { ...worker, replayed: true }, row: row() }))).toMatchObject({ kind: 'row' });
-  });
-
-  it('the kill switch and an unbound session leave the classifier', async () => {
-    expect(await decideStop(input({ classifierOnly: true }))).toMatchObject({ kind: 'classifier', why: 'turn-end.source=classifier' });
+  it('A11: the kill switch and an unbound session leave the classifier, and hand over no row', async () => {
+    expect(await decideStop(input({ classifierOnly: true, row: row() }))).toMatchObject({ kind: 'classifier', why: 'turn-end.source=classifier' });
     expect(await decideStop(input({ sessionId: null }))).toMatchObject({ kind: 'classifier' });
   });
 });
@@ -143,9 +155,8 @@ describe('TurnEndsTable', () => {
     const t = store.turnEnds;
     expect(t.currentTurn(S)).toBeNull();
     expect(t.bumpTurn(S, T0)).toBe(1);
-    expect(t.addBlock(S, T0)).toBe(1);
     expect(t.bumpTurn(S, T0)).toBe(2);
-    expect(t.currentTurn(S)).toEqual({ turnId: 2, blocks: 0 });
+    expect(t.currentTurn(S)).toEqual({ turnId: 2 });
     expect(t.put(row({ turnId: 2 }))).toBe(true);
     expect(t.put(row({ turnId: 2, verdict: 'BLOCKED', reason: 'second' }))).toBe(true);
     expect(t.unconsumed(S, 2)).toMatchObject({ verdict: 'BLOCKED', reason: 'second' });
@@ -180,111 +191,77 @@ describe('StopGate', () => {
   const tab: IStopGateTab = { workspaceId: 'ws-1', agentSessionId: S, host: null, providerId: 'claude' };
   const make = (over: Partial<IStopGateDeps> = {}) => {
     const store = new LedgerStore(':memory:');
-    let now = T0;
     const gate = new StopGate({
-      now: () => now, table: () => store.turnEnds, rowsAreSource: () => true, payloadIsTail: () => true,
+      now: () => T0, table: () => store.turnEnds, rowsAreSource: () => true, payloadIsTail: () => true,
       isCoordinator: async () => false, isScoped: async () => true, roleOf: async () => null, inRotation: () => false,
       openWork: async () => 0, ...over,
     });
     store.turnEnds.bumpTurn(S, T0);
-    return { gate, store, at: (ms: number) => { now = ms; } };
+    return { gate, store };
   };
   const payload = (message: string | null, sessionId: string | null = S) => ({ hookEvent: 'Stop', sessionId, message });
 
-  it('holds a turn end with no row, counts it, and keeps no decision or tail for it', async () => {
+  it('a scoped turn end with no row decides UNREPORTED no-row for its turn, and keeps the decision for the apply', async () => {
     const { gate, store } = make();
-    expect(await gate.decide('tab-w', tab, payload('Gate green.\n\nDONE: x'), undefined)).toMatchObject({ kind: 'block' });
-    expect(store.turnEnds.currentTurn(S)).toEqual({ turnId: 1, blocks: 1 });
+    expect(await gate.decide('tab-w', tab, payload('Gate green.\n\nDONE: x'))).toEqual({ kind: 'unreported', reason: 'no-row', turnId: 1 });
+    expect(gate.take('tab-w')).toEqual({ kind: 'unreported', reason: 'no-row', turnId: 1 });
     expect(gate.take('tab-w')).toBeNull();
-    expect(gate.takeTail('tab-w', S)).toBeNull();
     store.close();
   });
 
   it('keeps the payload message as the tail only for the bound session and only with the switch on', async () => {
     const { gate, store } = make();
     store.turnEnds.put(row());
-    expect(await gate.decide('tab-w', tab, payload('x'.repeat(700) + '\nDONE: y'), undefined)).toMatchObject({ kind: 'row' });
+    expect(await gate.decide('tab-w', tab, payload('x'.repeat(700) + '\nDONE: y'))).toMatchObject({ kind: 'row' });
     expect(gate.takeTail('tab-w', S)).toHaveLength(600);
     expect(gate.take('tab-w')).toMatchObject({ kind: 'row' });
-    await gate.decide('tab-w', tab, payload('DONE: z', 'another-session'), undefined);
+    await gate.decide('tab-w', tab, payload('DONE: z', 'another-session'));
     expect(gate.takeTail('tab-w', S)).toBeNull();
     store.close();
     const off = make({ payloadIsTail: () => false });
-    await off.gate.decide('tab-w', tab, payload('DONE: z'), undefined);
+    await off.gate.decide('tab-w', tab, payload('DONE: z'));
     expect(off.gate.takeTail('tab-w', S)).toBeNull();
     off.store.close();
   });
 
-  it('blocks nothing without a payload message (a dropped body)', async () => {
+  it('applies the classifier without a payload message and no row (a dropped body); with a row, the row goes to apply time (A2)', async () => {
     const { gate, store } = make();
-    expect(await gate.decide('tab-w', tab, payload(null), undefined)).toMatchObject({ kind: 'classifier', why: 'no payload message' });
+    expect(await gate.decide('tab-w', tab, payload(null))).toMatchObject({ kind: 'classifier', why: 'no payload message' });
+    store.turnEnds.put(row());
+    expect(await gate.decide('tab-w', tab, payload(null))).toMatchObject({ kind: 'row' });
     store.close();
   });
 
-  it('answers within its deadline: a hung open-work read lets the stop through', async () => {
+  it('answers within its deadline: a hung open-work read applies the classifier', async () => {
     const { gate, store } = make({ openWork: () => new Promise(() => {}), deadlineMs: 50 });
     const started = Date.now();
-    expect(await gate.decide('tab-w', tab, payload('working on it'), undefined)).toMatchObject({ kind: 'classifier', why: 'decision deadline' });
+    expect(await gate.decide('tab-w', tab, payload('working on it'))).toMatchObject({ kind: 'classifier', why: 'decision deadline' });
     expect(Date.now() - started).toBeLessThan(1_000);
-    expect(store.turnEnds.currentTurn(S)?.blocks).toBe(0);
     store.close();
   });
 
-  it('review CONCERN: only idle_prompt with nothing since the hold makes it undelivered; any event confirms it', async () => {
-    const { gate, store } = make();
-    await gate.decide('tab-w', tab, payload('DONE: x'));
-    // A tool call (a working tab, whatever its composer shows) confirms the hold: a later idle_prompt applies nothing.
-    gate.onHookEvent('tab-w');
-    expect(gate.onIdlePrompt('tab-w')).toBe(false);
-    expect(gate.take('tab-w')).toBeNull();
-    // A hold with nothing after it, then idle_prompt: UNREPORTED block-undelivered against the held turn.
-    await gate.decide('tab-w', tab, payload('DONE: x'));
-    store.turnEnds.bumpTurn(S, T0 + 5);
-    expect(gate.onIdlePrompt('tab-w')).toBe(true);
-    expect(gate.take('tab-w')).toEqual({ kind: 'unreported', reason: 'block-undelivered', escalation: null, turnId: 1 });
-    expect(gate.onIdlePrompt('tab-w')).toBe(false);
-    store.close();
-  });
-
-  it('review CONCERN: a done row written after the hold is applied at idle_prompt, never overwritten', async () => {
-    const { gate, store } = make();
-    await gate.decide('tab-w', tab, payload('DONE: x'));
-    store.turnEnds.put(row());
-    expect(gate.onIdlePrompt('tab-w')).toBe(true);
-    expect(gate.take('tab-w')).toEqual({ kind: 'row', row: row() });
-    store.close();
-  });
-
-  it('review CONCERN: an UNREPORTED write never replaces the worker\'s row; the row is kept and marked used', async () => {
+  it('an UNREPORTED write never replaces the worker\'s row; the row is kept and marked used', async () => {
     const { gate, store } = make();
     store.turnEnds.put(row({ reason: 'the worker\'s own' }));
-    gate.writeUnreported(tab, 'tab-w', 'cap');
+    gate.writeUnreported(tab, 'tab-w', 'no-row');
     expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ verdict: 'DONE', reason: 'the worker\'s own', consumedAt: T0 })]);
     store.close();
   });
 
-  it('review nit 3: a replayed stop is judged and written against its own turn, not the current one', async () => {
+  it('A8: a replayed stop is judged and written against its own turn, never the current one; a second replay consumes nothing', async () => {
     const { gate, store } = make();
     store.turnEnds.bumpTurn(S, T0 + 60_000);
     store.turnEnds.bumpTurn(S, T0 + 120_000);
     expect(store.turnEnds.turnAt(S, T0 + 30_000)).toBe(1);
     expect(store.turnEnds.turnAt(S, T0 - 1)).toBeNull();
-    const decision = await gate.decide('tab-w', tab, payload('DONE: x'), T0 + 30_000);
-    expect(decision).toEqual({ kind: 'unreported', reason: 'not-blockable:replayed', escalation: null, turnId: 1 });
-    gate.writeUnreported(tab, 'tab-w', 'not-blockable:replayed', 1);
-    expect(store.turnEnds.list('ws-1', 0)).toEqual([expect.objectContaining({ turnId: 1, verdict: 'UNREPORTED' })]);
-    expect(store.turnEnds.unconsumed(S, 3)).toBeNull();
-    // Its own turn's row, not the current turn's, is the one it applies.
-    store.turnEnds.put(row({ turnId: 2, reason: 'turn two' }));
-    expect(await gate.decide('tab-w', tab, payload('DONE: x'), T0 + 90_000)).toMatchObject({ kind: 'row', row: { turnId: 2 } });
-    store.close();
-  });
-
-  it('consumes a row once', async () => {
-    const { gate, store } = make();
-    store.turnEnds.put(row());
-    expect(gate.consume(row())).toBe(true);
-    expect(gate.consume(row())).toBe(false);
+    expect(await gate.decide('tab-w', tab, payload('DONE: x'), T0 + 30_000)).toEqual({ kind: 'unreported', reason: 'no-row:replayed', turnId: 1 });
+    store.turnEnds.put(row({ turnId: 1, reason: 'turn one' }));
+    store.turnEnds.put(row({ turnId: 3, reason: 'turn three' }));
+    const replay = await gate.decide('tab-w', tab, payload('BLOCKED: q'), T0 + 30_000);
+    expect(replay).toMatchObject({ kind: 'row', row: { turnId: 1 } });
+    expect(gate.consume((replay as { row: ITurnEndRow }).row)).toBe(true);
+    expect(gate.consume((replay as { row: ITurnEndRow }).row)).toBe(false);
+    expect(store.turnEnds.unconsumed(S, 3)).toMatchObject({ reason: 'turn three' });
     store.close();
   });
 });

@@ -1,9 +1,10 @@
 // Browser-safe: the typed turn end (F6, folding in F10 steps 1 and 2; design check (2) ruling, 2026-11-10).
 //
-// A worker writes one row per turn with `purplemux done` before it stops. At the stop, the row is the turn's verdict
-// and the marker classifier (turn-end.ts) runs beside it in shadow for 7 days, after which F10 step 5 deletes it. A
-// worker seat that stops a turn with no row is blocked at most twice, then gets an UNREPORTED row and the classifier's
-// verdict. This module holds the rules; the store, the service and the stop route apply them.
+// A worker writes one row per turn with `purplemux done` before it stops. No stop is held (party ruling SIMPLIFY,
+// 2026-11-10, which amends design check (2) rulings (3), (4) and (6)). At apply time ONE precedence order decides
+// between the row and the applied end line (`resolveTurnEnd`); the marker classifier (turn-end.ts) reads that end line.
+// A scoped worker's turn end with no row gets an UNREPORTED `no-row` row, which measures adoption. This module holds
+// the rules; the store, the service and the stop route apply them.
 
 import { TURN_MARKER_NAMES, readTurnEnd, type TTurnMarkerName } from '@/lib/turn-end';
 
@@ -12,13 +13,11 @@ export const TURN_VERDICTS: readonly TTurnVerdict[] = TURN_MARKER_NAMES;
 export type TSeatRole = 'builder' | 'reviewer' | 'consult';
 export const SEAT_ROLES: readonly TSeatRole[] = ['builder', 'reviewer', 'consult'];
 
-/** A turn end with no valid row: why (ruling (3), (4)). */
-export type TUnreportedReason = 'cap' | 'block-undelivered' | `not-blockable:${string}`;
+/** A scoped turn end with no row: `no-row`, or `no-row:<why>` for a stop no row was asked of (remote, replay, …). */
+export type TUnreportedReason = 'no-row' | `no-row:${string}`;
 
 export const REASON_MAX_CHARS = 500;
-/** How many times one turn's stop is blocked before it goes through as UNREPORTED (F10 AC2). */
-export const MAX_BLOCKS_PER_TURN = 2;
-/** The stop route decides within this, or lets the stop through (ruling (1)). */
+/** The stop route decides within this, or the classifier applies (ruling (1)). */
 export const STOP_DECISION_DEADLINE_MS = 1_000;
 
 /** Fleet config kill switches (F10 staged plan, step 1 and 2). Unset means on. */
@@ -86,7 +85,9 @@ export const synthesizeLine = (row: Pick<ITurnEndRow, 'verdict' | 'reason' | 'st
   return `${marker}: ${reason}${facts.length ? ` (${facts.join(', ')})` : ''}`;
 };
 
-const ESCALATION: Readonly<Record<string, number>> = { 'NEEDS-DECISION': 2, BLOCKED: 1 };
+/** rank (party ruling, section 1): NEEDS-DECISION 2, BLOCKED 1, every other verdict or no marker 0. */
+const RANK: Readonly<Record<string, number>> = { 'NEEDS-DECISION': 2, BLOCKED: 1 };
+const rankOf = (verdict: string | null): number => (verdict !== null && Object.hasOwn(RANK, verdict) ? RANK[verdict] : 0);
 
 /** The payload tail's end-line marker, or null (no tail, no marker, or a refused two-marker line). */
 export const tailMarker = (tail: string | null | undefined): TTurnMarkerName | null => {
@@ -96,12 +97,17 @@ export const tailMarker = (tail: string | null | undefined): TTurnMarkerName | n
   return TURN_MARKER_NAMES.find((name) => last.startsWith(`${name}:`)) ?? null;
 };
 
-/** A row that a BLOCKED or NEEDS-DECISION tail contradicts: the tail escalates beyond the row (ruling (6)). */
-export const escalates = (rowVerdict: TTurnVerdict, tail: TTurnMarkerName | null): boolean =>
-  tail !== null && (ESCALATION[tail] ?? 0) > (ESCALATION[rowVerdict] ?? 0);
+/**
+ * The ONE precedence order (party ruling SIMPLIFY, section 1), evaluated once, at apply time, against E: the end line
+ * the stop applies. The higher rank wins (NEEDS-DECISION > BLOCKED > the rest); on equal rank the row wins over the
+ * end line. So: a NEEDS-DECISION row > a NEEDS-DECISION line > a BLOCKED row > a BLOCKED line > a rank-0 row > a rank-0
+ * line. WAITING and ready-for-review (no row, no marker) are the classifier's and never reach here.
+ */
+export const resolveTurnEnd = (rowVerdict: TTurnVerdict, endLineMarker: TTurnMarkerName | null): 'row' | 'line' =>
+  rankOf(endLineMarker) > rankOf(rowVerdict) ? 'line' : 'row';
 
-/** Why a turn end can never be blocked, or null (ruling (4)). */
-export interface IBlockability {
+/** A stop's context: why no row is asked of it, or null when one is (a live, local, scoped Claude worker). */
+export interface ITurnEndContext {
   stopFailure: boolean;
   replayed: boolean;
   remote: boolean;
@@ -112,74 +118,58 @@ export interface IBlockability {
   scoped: boolean;
 }
 
-export const notBlockable = (b: IBlockability): string | null => {
-  if (b.stopFailure) return 'stop-failure';
-  if (b.replayed) return 'replayed';
-  if (b.remote) return 'remote';
-  if (b.evaluator) return 'evaluator';
-  if (b.provider !== 'claude') return `provider-${b.provider}`;
-  if (b.openRotation) return 'rotation';
-  if (b.coordinator) return 'coordinator';
-  if (!b.scoped) return 'unscoped';
+export const noRowExemption = (c: ITurnEndContext): string | null => {
+  if (c.stopFailure) return 'stop-failure';
+  if (c.replayed) return 'replayed';
+  if (c.remote) return 'remote';
+  if (c.evaluator) return 'evaluator';
+  if (c.provider !== 'claude') return `provider-${c.provider}`;
+  if (c.openRotation) return 'rotation';
+  if (c.coordinator) return 'coordinator';
+  if (!c.scoped) return 'unscoped';
   return null;
 };
 
 export type TStopDecision =
   /** The stop applies as before this story: the classifier's lines. */
   | { kind: 'classifier'; why: string }
-  /** The row is the turn's verdict. */
+  /** The stop's turn has a row: `resolveTurnEnd` decides at apply time between it and the applied end line. */
   | { kind: 'row'; row: ITurnEndRow }
-  /** The stop is held: Claude continues the turn with `reason` (the block budget is spent by one). */
-  | { kind: 'block'; reason: string }
-  /** No valid row: an UNREPORTED row is written, and the verdict is the classifier's (or the escalating one). */
-  | { kind: 'unreported'; reason: TUnreportedReason; escalation: TTurnMarkerName | null; turnId?: number };
+  /** A scoped turn end with no row: an UNREPORTED row for its turn, and the classifier's verdict. */
+  | { kind: 'unreported'; reason: TUnreportedReason; turnId?: number };
 
 export interface IStopDecisionInput {
   /** `turn-end.source=classifier`: the kill switch. */
   classifierOnly: boolean;
-  blockability: IBlockability;
+  context: ITurnEndContext;
   /** The tab's bound agent session; null when none is bound. */
   sessionId: string | null;
-  /** The unconsumed row of the current turn, or null. */
+  /** The unconsumed row of the stop's own turn, or null. */
   row: ITurnEndRow | null;
-  /** The payload tail's marker (the classifier's own read of the stop's message). */
+  /** The payload tail's marker: only whether the stop is markerless (a WAITING candidate) is read here. */
   tailMarker: TTurnMarkerName | null;
   /**
    * Open work that makes a markerless stop a WAITING stop: registered jobs + armed watches + open provider tasks.
-   * null when it could not be read by the deadline. Read only when the tail has no marker.
+   * null when it could not be read by the deadline. Read only when the tail has no marker and there is no row.
    */
   openWork: () => Promise<number | null>;
-  blocks: number;
 }
 
-const BLOCK_HELP = 'purplemux done --verdict DONE|BLOCKED|NEEDS-DECISION|READY-TO-MERGE|CHECKPOINTED [--reason TEXT] [--gate-log ABS]';
-
 /**
- * One stop's decision (ruling (1), (4), (6)). Only a turn end is ever blocked: a markerless stop with open work is a
- * WAITING stop and needs no row. An unknown background count blocks nothing.
+ * One stop's decision. Nothing is held. A row is always handed to apply time, where the precedence order is evaluated
+ * against the end line actually applied (never against this tail). A markerless stop with open work is WAITING and
+ * asks no row; an unknown count asks none either.
  */
 export const decideStop = async (input: IStopDecisionInput): Promise<TStopDecision> => {
   if (input.classifierOnly) return { kind: 'classifier', why: 'turn-end.source=classifier' };
   if (input.sessionId === null) return { kind: 'classifier', why: 'no bound agent session' };
-  const never = notBlockable(input.blockability);
-  if (input.row && !(input.row.verdict !== 'UNREPORTED' && escalates(input.row.verdict, input.tailMarker))) {
-    return { kind: 'row', row: input.row };
-  }
-  if (input.tailMarker === null && input.row === null) {
+  if (input.row) return { kind: 'row', row: input.row };
+  if (input.tailMarker === null) {
     const open = await input.openWork();
     if (open === null) return { kind: 'classifier', why: 'open work unknown by the deadline' };
     if (open > 0) return { kind: 'classifier', why: 'waiting on open work' };
   }
-  const mismatch = input.row !== null;
-  if (never !== null) {
-    if (never === 'unscoped' || never === 'coordinator') return { kind: 'classifier', why: never };
-    return { kind: 'unreported', reason: `not-blockable:${never}`, escalation: mismatch ? input.tailMarker : null };
-  }
-  if (input.blocks < MAX_BLOCKS_PER_TURN) {
-    const missing = mismatch
-      ? `your turn-end row says ${input.row!.verdict}, but your last line ends ${input.tailMarker}: write the row again with --verdict ${input.tailMarker} (or end with the row's verdict)`
-      : 'no turn-end row for this turn';
-    return { kind: 'block', reason: `Run ${BLOCK_HELP} before you end the turn; missing: ${missing} (stop ${input.blocks + 1} of ${MAX_BLOCKS_PER_TURN} held).` };
-  }
-  return { kind: 'unreported', reason: 'cap', escalation: mismatch ? input.tailMarker : null };
+  const exempt = noRowExemption(input.context);
+  if (exempt === 'unscoped' || exempt === 'coordinator') return { kind: 'classifier', why: exempt };
+  return { kind: 'unreported', reason: exempt === null ? 'no-row' : `no-row:${exempt}` };
 };

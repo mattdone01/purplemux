@@ -62,6 +62,7 @@ export class TurnEndsTable {
         PRIMARY KEY (session_id, turn_id)
       );
       CREATE INDEX IF NOT EXISTS turn_ends_ws_at_idx ON turn_ends(workspace_id, at);
+      -- blocks: nothing reads it since the party ruling SIMPLIFY (no stop is held); kept, the ledger is additive.
       CREATE TABLE IF NOT EXISTS session_turns (
         session_id TEXT PRIMARY KEY, turn_id INTEGER NOT NULL, blocks INTEGER NOT NULL, updated_at INTEGER NOT NULL
       ) WITHOUT ROWID;
@@ -71,7 +72,7 @@ export class TurnEndsTable {
     `);
   };
 
-  /** A live prompt-submit started a new turn of the session: the next turn id, and its block count at 0. */
+  /** A live prompt-submit started a new turn of the session: the next turn id. */
   bumpTurn = (sessionId: string, at: number): number =>
     this.database.transaction(() => {
       const turnId = (this.database.prepare(`INSERT INTO session_turns (session_id, turn_id, blocks, updated_at) VALUES (?, 1, 0, ?)
@@ -89,17 +90,12 @@ export class TurnEndsTable {
     (this.database.prepare(`SELECT turn_id FROM session_turn_starts WHERE session_id = ? AND at <= ?
       ORDER BY turn_id DESC LIMIT 1`).get(sessionId, at) as { turn_id: number } | undefined)?.turn_id ?? null;
 
-  /** The session's current turn and how often its stop was blocked; null before its first prompt-submit. */
-  currentTurn = (sessionId: string): { turnId: number; blocks: number } | null => {
-    const row = this.database.prepare('SELECT turn_id, blocks FROM session_turns WHERE session_id = ?').get(sessionId) as
-      { turn_id: number; blocks: number } | undefined;
-    return row ? { turnId: row.turn_id, blocks: row.blocks } : null;
+  /** The session's current turn; null before its first prompt-submit. */
+  currentTurn = (sessionId: string): { turnId: number } | null => {
+    const row = this.database.prepare('SELECT turn_id FROM session_turns WHERE session_id = ?').get(sessionId) as
+      { turn_id: number } | undefined;
+    return row ? { turnId: row.turn_id } : null;
   };
-
-  /** One more block of the current turn; returns the new count. */
-  addBlock = (sessionId: string, at: number): number =>
-    (this.database.prepare('UPDATE session_turns SET blocks = blocks + 1, updated_at = ? WHERE session_id = ? RETURNING blocks')
-      .get(at, sessionId) as { blocks: number } | undefined)?.blocks ?? 0;
 
   /** Write the turn's row; a second `done` in the same turn replaces an unconsumed one. A consumed row stays. */
   put = (row: ITurnEndRow): boolean =>
