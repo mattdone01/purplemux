@@ -2,7 +2,7 @@ import type { ICaller } from '@/lib/caller';
 import { createHash } from 'crypto';
 import type { CoordinatorWindow } from '@/lib/coordinator-window';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
-import { renderNotePointerLine, type TNoteEvent } from '@/lib/inbox-templates';
+import { isNoteBounceReason, renderNotePointerLine, type TNoteEvent } from '@/lib/inbox-templates';
 import { NotePointBounds, type INotePointPort } from '@/lib/note-pointer';
 import { createLogger } from '@/lib/logger';
 import {
@@ -81,9 +81,15 @@ export interface INotesDeps {
   window?: () => CoordinatorWindow | null;
   /**
    * G7: one line to the portfolio Scrum Master seat's digest for a note whose line has not reached its recipient's
-   * composer after 15 min. Best effort: a failure never holds back the sender's notice.
+   * composer after 15 min. Best effort: a failure never holds back the sender's notice. `senderTold` is true only when
+   * a notice to the sender's live tab went out.
    */
-  alertUndelivered?: (note: INote, now: number) => Promise<void>;
+  alertUndelivered?: (note: INote, now: number, senderTold: boolean) => Promise<void>;
+  /**
+   * One line to a bounced note's sender tab, for its digest, after the sender's notice went out. Best effort: a
+   * failure never holds back the bounce or the notice.
+   */
+  alertBounced?: (note: INote, now: number) => Promise<void>;
 }
 
 /** The answer to a typed pointer (G7). `notSubmitted` is set when the line still sits in the composer. */
@@ -103,6 +109,16 @@ export interface ILiveTabs {
 }
 
 type TTabState = 'live' | 'closed' | 'unknown';
+
+/** What became of a notice to the sender: it went out, there is nobody to tell (no tab, or its tab closed), or not known. */
+type TSenderNotice = 'sent' | 'none' | 'unknown';
+
+const isBounce = (note: INote): boolean =>
+  note.state === 'undeliverable' && note.routingStatus === 'undeliverable' && isNoteBounceReason(note.routingReason);
+
+/** The note bounced in this step: it has no live recipient now, and it had one, or was not yet routed, before. */
+const bouncedNow = (before: INote | null, after: INote): boolean =>
+  isBounce(after) && !(before && before.state === 'undeliverable');
 
 /**
  * The reads one pass shares: the notes' own inbox and live-tab reads happen once each, and each epic
@@ -252,13 +268,15 @@ export class NotesService {
   }
 
   private notice(note: INote, to: { workspaceId: string; tabId: string }, event: TNoteEvent): IEnqueueRequest<'note'> {
+    const reason = event === 'bounced' && isNoteBounceReason(note.routingReason) ? { reason: note.routingReason } : {};
     return {
       kind: 'note',
       targetWorkspaceId: to.workspaceId,
       targetTabId: to.tabId,
       dedupeKey: `note:${note.id}:${event}:${to.tabId}`,
       fields: { noteId: note.id, fromWorkspaceId: note.from.workspaceId, fromTabId: note.from.tabId,
-        fromHuman: note.admission?.mode === 'human', fromOwner: note.admission?.mode === 'owner', sentAt: note.createdAt, event },
+        fromHuman: note.admission?.mode === 'human', fromOwner: note.admission?.mode === 'owner', sentAt: note.createdAt, event,
+        ...reason },
     };
   }
 
@@ -340,7 +358,7 @@ export class NotesService {
       return { ok: false as const, reason };
     };
     try {
-      const match = /^note:(n-[A-Za-z0-9_-]{4,32}):(delivered|reminder|unacked|undelivered|expired|acked):/.exec(item.dedupeKey);
+      const match = /^note:(n-[A-Za-z0-9_-]{4,32}):(delivered|reminder|unacked|undelivered|expired|bounced|acked):/.exec(item.dedupeKey);
       if (!match) return reject('note-notice-key-invalid');
       const [, id, event] = match;
       // F6: an ack types nothing. An `acked` notice queued before this release is rejected here (withdrawn, never
@@ -348,11 +366,14 @@ export class NotesService {
       if (event === 'acked') return reject('note-ack-notice-retired');
       const note = (await this.deps.read()).notes.find((candidate) => candidate.id === id);
       if (!note) return reject('note-not-found');
-      if (event === 'unacked' || event === 'undelivered' || event === 'expired') {
-        // An `undelivered` notice is stale once the line reached the recipient's composer.
+      if (event === 'unacked' || event === 'undelivered' || event === 'expired' || event === 'bounced') {
+        // An `undelivered` notice is stale once the line reached the recipient's composer; a `bounced` one once the
+        // note has a recipient again.
         const valid = event === 'expired'
           ? note.state === 'expired' || (OPEN_STATES.has(note.state) && this.deps.now() - note.createdAt >= NOTE_EXPIRE_MS)
-          : note.state === 'delivered' && (event === 'unacked' || note.deliveredAt === null);
+          : event === 'bounced'
+            ? isBounce(note)
+            : note.state === 'delivered' && (event === 'unacked' || note.deliveredAt === null);
         if (!valid) return reject(`note-terminal:${note.state}`);
         if (item.targetWorkspaceId !== note.from.workspaceId || item.targetTabId !== note.from.tabId) {
           return reject('note-sender-changed');
@@ -397,15 +418,34 @@ export class NotesService {
   }
 
   /**
-   * One notice to the sender's tab when it is live. True when the notice is settled: sent, or the
-   * sender has no tab or its tab is confirmed closed. An unknown tab state settles nothing.
+   * One notice to the sender's tab when it is live. Settled unless `unknown`: sent, or the sender has no tab or its
+   * tab is confirmed closed. An unknown tab state settles nothing.
    */
-  private async noticeSender(note: INote, event: 'unacked' | 'undelivered' | 'expired', r: IReads): Promise<boolean> {
+  private async noticeSender(note: INote, event: 'unacked' | 'undelivered' | 'expired' | 'bounced', r: IReads): Promise<TSenderNotice> {
     const { workspaceId, tabId } = note.from;
-    if (!workspaceId || !tabId) return true;
+    if (!workspaceId || !tabId) return 'none';
     const state = await r.tabState(workspaceId, tabId);
-    if (state === 'live') await this.deps.enqueue(this.notice(note, { workspaceId, tabId }, event));
-    return state !== 'unknown';
+    if (state === 'unknown') return 'unknown';
+    if (state === 'closed') return 'none';
+    await this.deps.enqueue(this.notice(note, { workspaceId, tabId }, event));
+    return 'sent';
+  }
+
+  /**
+   * The sender of a note that bounced hears it at once: one notice typed to its live tab and one line in that tab's
+   * digest. False when nothing is settled (the sender tab's state is unknown): the caller keeps the note as it was,
+   * so the next pass bounces it again and tells the sender then. A failed notice throws, with the same effect.
+   */
+  private async tellBounced(note: INote, now: number, r: IReads): Promise<boolean> {
+    const told = await this.noticeSender(note, 'bounced', r);
+    if (told === 'unknown') return false;
+    // Not awaited, for the lock order `alertUndelivered` keeps below.
+    if (told === 'sent' && this.deps.alertBounced) {
+      void Promise.resolve().then(() => this.deps.alertBounced!(note, now)).catch((err) => {
+        log.warn(`note ${note.id} bounced alert not sent: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+    return true;
   }
 
   /**
@@ -434,7 +474,7 @@ export class NotesService {
         expiring = reachedComposer(expiring, item.deliveredAt ?? now);
       }
       // The one expiry notice waits while the sender's liveness is unknown, for at most a day.
-      const settled = await this.noticeSender(expiring, 'expired', r);
+      const settled = (await this.noticeSender(expiring, 'expired', r)) !== 'unknown';
       if (!settled && now - expiring.createdAt < NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS) return expiring;
       if (expiring.inboxItemId) await this.deps.withdraw(expiring.inboxItemId, 'note-terminal:expired');
       if (expiring.reminderItemId) await this.deps.withdraw(expiring.reminderItemId, 'note-terminal:expired');
@@ -500,8 +540,10 @@ export class NotesService {
     const undelivered = next.deliveredAt === null;
     const noticeAfter = undelivered ? NOTE_UNDELIVERED_NOTICE_MS : NOTE_SENDER_NOTICE_MS;
     if (next.senderNotifiedAt === null && next.routedAt !== null && now - next.routedAt >= noticeAfter) {
+      let told: TSenderNotice;
       try {
-        if (!(await this.noticeSender(next, undelivered ? 'undelivered' : 'unacked', r))) return next;
+        told = await this.noticeSender(next, undelivered ? 'undelivered' : 'unacked', r);
+        if (told === 'unknown') return next;
       } catch (err) {
         log.warn(`note ${note.id} sender notice not sent: ${err instanceof Error ? err.message : err}`);
         return next;
@@ -511,7 +553,7 @@ export class NotesService {
       // The inbox takes them in the other order (dispatch lock, then the notes lock in its preflight).
       if (undelivered && this.deps.alertUndelivered) {
         const notified = next;
-        void Promise.resolve().then(() => this.deps.alertUndelivered!(notified, now)).catch((err) => {
+        void Promise.resolve().then(() => this.deps.alertUndelivered!(notified, now, told === 'sent')).catch((err) => {
           log.warn(`note ${note.id} undelivered alert not sent: ${err instanceof Error ? err.message : err}`);
         });
       }
@@ -591,6 +633,8 @@ export class NotesService {
         let advanced: INote;
         try {
           advanced = await this.advance(note, now, r);
+          // The bounce is recorded only once its sender is told (or has nobody to tell): else the next pass tries again.
+          if (bouncedNow(note, advanced) && !(await this.tellBounced(advanced, now, r))) continue;
         } catch (err) {
           log.warn(`note ${note.id} could not advance: ${err instanceof Error ? err.message : err}`);
           continue;
@@ -675,6 +719,12 @@ export class NotesService {
         throw new NoteError('note-cap', `this sender already has ${mine} open notes (the limit is ${NOTE_OPEN_PER_SENDER}); wait for acks or expiry`);
       }
       const routedNote = await this.route(note, now, reads);
+      // The send's own answer carries the bounce too; a failed notice never fails the send.
+      if (bouncedNow(null, routedNote)) {
+        await this.tellBounced(routedNote, now, reads).catch((err) => {
+          log.warn(`note ${routedNote.id} bounced notice not sent: ${err instanceof Error ? err.message : err}`);
+        });
+      }
       created = true;
       return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
     }));
@@ -1046,10 +1096,10 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     ownerGrantOf: (tab) => grantStore.findActiveOwnerGrant(grantStore.grantsSnapshot('owner'), tab, Date.now()),
     audit: coordinationAudit.appendCoordinationAudit,
     window: coordinatorWindow.getCoordinatorWindow,
-    alertUndelivered: async (note, now) => {
+    alertUndelivered: async (note, _now, senderTold) => {
       // The portfolio Scrum Master seat hears it as one digest line, as a pool flag does. Its own note needs no copy: it
       // is the sender, told already, or the recipient that has not read it.
-      const [{ getPortfolioStore }, { getStatusManager }, { renderUndeliveredAlert }] = await Promise.all([
+      const [{ getPortfolioStore }, { getStatusManager }, { undeliveredDigestEvent }] = await Promise.all([
         import('@/lib/portfolio-store'),
         import('@/lib/status-manager'),
         import('@/lib/note-pending'),
@@ -1059,7 +1109,15 @@ const defaultDeps = async (): Promise<INotesDeps> => {
       const at = { workspaceId: seat.managerWorkspaceId, tabId: seat.managerTabId };
       const same = (t: { workspaceId: string | null; tabId: string | null } | null) => !!t && t.workspaceId === at.workspaceId && t.tabId === at.tabId;
       if (same(note.from) || same(note.deliveredTo)) return;
-      await getStatusManager().routeTabEvent({ ...at, kind: 'note-undelivered', text: renderUndeliveredAlert(note, now), class: 'digest' });
+      await getStatusManager().routeTabEvent(undeliveredDigestEvent(note, at, senderTold));
+    },
+    alertBounced: async (note) => {
+      const [{ getStatusManager }, { bouncedDigestEvent }] = await Promise.all([
+        import('@/lib/status-manager'),
+        import('@/lib/note-pending'),
+      ]);
+      const event = bouncedDigestEvent(note);
+      if (event) await getStatusManager().routeTabEvent(event);
     },
   };
 };
