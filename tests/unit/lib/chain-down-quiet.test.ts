@@ -2,8 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { chainDownQuiet, chainHoldsPathError, holdFor, parseChainHolds, rangeParts } from '@/lib/chain-down-quiet';
 
 // vel-WATCHDOG-F6-NOISE: a chain-down wait on a dead or replaced v2 range raises no alarm. The hold list grammar and
-// its until window are the Scrum Master watcher's (its chain_age.py); this parser holds the
-// same lines.
+// its until window are the Scrum Master watcher's; this parser holds the same lines.
 
 const NOW = Date.UTC(2026, 10, 11, 9, 0, 0);
 const IN_2D = '2026-11-13T09:00:00Z';

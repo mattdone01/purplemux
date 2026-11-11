@@ -680,17 +680,23 @@ const readHoldLists = async (
   return holds;
 };
 
-/** A hold list: at most CHAIN_HOLDS_MAX_BYTES of strict UTF-8 with no NUL; null when the file does not exist. */
+/**
+ * A hold list: a regular file of at most CHAIN_HOLDS_MAX_BYTES of strict UTF-8 with no NUL; null when the file does not
+ * exist. The open is non-blocking and anything but a regular file (a FIFO, a device, a directory) is refused, so a path
+ * that an agent can replace never stalls the alert tick.
+ */
 export const readChainHoldsFile = async (path: string): Promise<string | null> => {
   const fs = await import('fs/promises');
+  const { constants } = await import('fs');
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    handle = await fs.open(path, 'r');
+    handle = await fs.open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
   try {
+    if (!(await handle.stat()).isFile()) throw new Error('not a regular file');
     const buffer = Buffer.alloc(CHAIN_HOLDS_MAX_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead > CHAIN_HOLDS_MAX_BYTES) throw new Error(`larger than ${CHAIN_HOLDS_MAX_BYTES} bytes`);
