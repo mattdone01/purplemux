@@ -325,6 +325,11 @@ describe('the constraint (AC 2, consult 03 A1)', () => {
         item('range:mc:dddddddddddd', { ...down, openedAt: NOW - 30 * HOUR }),
         item('range:mc:eeeeeeeeeeee', { openedAt: NOW - 20 * HOUR, closedAt: NOW - 2 * HOUR, state: 'dropped' }),
         item('range:mc:ffffffffffff', { openedAt: NOW - 40 * HOUR, closedAt: NOW - 35 * HOUR, state: 'landed' }),
+        // A reopened later range keeps state 'landed' but is open again: it supersedes nothing (review r1 nit 1).
+        item('range:visa:dddddddddddd', { openedAt: NOW - 5 * HOUR, state: 'landed' }),
+        // A landed range opened at the same moment as the down head: not strictly later, so nothing (review r1 nit 2).
+        item('range:kit:111111111111', { ...down, openedAt: NOW - 30 * HOUR }),
+        item('range:kit:222222222222', { openedAt: NOW - 30 * HOUR, closedAt: NOW - 1 * HOUR, state: 'landed' }),
       ],
     }), null, null, null, NOW);
     expect(Object.fromEntries(result.stuck.map((s) => [s.key, s.supersededBy ?? null]))).toEqual({
@@ -332,6 +337,7 @@ describe('the constraint (AC 2, consult 03 A1)', () => {
       'range:visa:bbbbbbbbbbbb': null,
       'range:visa:cccccccccccc': null,
       'range:mc:dddddddddddd': null,
+      'range:kit:111111111111': null,
     });
   });
 
