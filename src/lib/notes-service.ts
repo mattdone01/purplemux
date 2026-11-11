@@ -13,6 +13,7 @@ import {
   NOTE_SENDER_NOTICE_MS,
   NOTE_UNDELIVERED_NOTICE_MS,
   NoteError,
+  bounceNotified,
   OPEN_STATES,
   acked,
   canAck,
@@ -116,9 +117,8 @@ type TSenderNotice = 'sent' | 'none' | 'unknown';
 const isBounce = (note: INote): boolean =>
   note.state === 'undeliverable' && note.routingStatus === 'undeliverable' && isNoteBounceReason(note.routingReason);
 
-/** The note bounced in this step: it has no live recipient now, and it had one, or was not yet routed, before. */
-const bouncedNow = (before: INote | null, after: INote): boolean =>
-  isBounce(after) && !(before && before.state === 'undeliverable');
+/** The note bounced and its sender is not yet told. A note stored before bounce alerts (no field) owes nothing. */
+const owesBounceNotice = (note: INote): boolean => isBounce(note) && note.bounceNotifiedAt === null;
 
 /**
  * The reads one pass shares: the notes' own inbox and live-tab reads happen once each, and each epic
@@ -432,20 +432,26 @@ export class NotesService {
   }
 
   /**
-   * The sender of a note that bounced hears it at once: one notice typed to its live tab and one line in that tab's
-   * digest. False when nothing is settled (the sender tab's state is unknown): the caller keeps the note as it was,
-   * so the next pass bounces it again and tells the sender then. A failed notice throws, with the same effect.
+   * The sender of a note that bounced hears it once per bounce: one notice typed to its live tab and one line in that
+   * tab's digest. The note comes back marked once that is settled (sent, or no tab to tell). An unknown sender tab or a
+   * failed notice leaves it unmarked, and the next pass tries again.
    */
-  private async tellBounced(note: INote, now: number, r: IReads): Promise<boolean> {
-    const told = await this.noticeSender(note, 'bounced', r);
-    if (told === 'unknown') return false;
+  private async tellBounced(note: INote, now: number, r: IReads): Promise<INote> {
+    let told: TSenderNotice;
+    try {
+      told = await this.noticeSender(note, 'bounced', r);
+    } catch (err) {
+      log.warn(`note ${note.id} bounced notice not sent: ${err instanceof Error ? err.message : err}`);
+      return note;
+    }
+    if (told === 'unknown') return note;
     // Not awaited, for the lock order `alertUndelivered` keeps below.
     if (told === 'sent' && this.deps.alertBounced) {
       void Promise.resolve().then(() => this.deps.alertBounced!(note, now)).catch((err) => {
         log.warn(`note ${note.id} bounced alert not sent: ${err instanceof Error ? err.message : err}`);
       });
     }
-    return true;
+    return bounceNotified(note, now);
   }
 
   /**
@@ -633,8 +639,7 @@ export class NotesService {
         let advanced: INote;
         try {
           advanced = await this.advance(note, now, r);
-          // The bounce is recorded only once its sender is told (or has nobody to tell): else the next pass tries again.
-          if (bouncedNow(note, advanced) && !(await this.tellBounced(advanced, now, r))) continue;
+          if (owesBounceNotice(advanced)) advanced = await this.tellBounced(advanced, now, r);
         } catch (err) {
           log.warn(`note ${note.id} could not advance: ${err instanceof Error ? err.message : err}`);
           continue;
@@ -718,13 +723,9 @@ export class NotesService {
       if (mine >= NOTE_OPEN_PER_SENDER) {
         throw new NoteError('note-cap', `this sender already has ${mine} open notes (the limit is ${NOTE_OPEN_PER_SENDER}); wait for acks or expiry`);
       }
-      const routedNote = await this.route(note, now, reads);
-      // The send's own answer carries the bounce too; a failed notice never fails the send.
-      if (bouncedNow(null, routedNote)) {
-        await this.tellBounced(routedNote, now, reads).catch((err) => {
-          log.warn(`note ${routedNote.id} bounced notice not sent: ${err instanceof Error ? err.message : err}`);
-        });
-      }
+      const bounced = await this.route(note, now, reads);
+      // A failed notice never fails the send: the note stays unmarked and the next pass tells the sender.
+      const routedNote = owesBounceNotice(bounced) ? await this.tellBounced(bounced, now, reads) : bounced;
       created = true;
       return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
     }));

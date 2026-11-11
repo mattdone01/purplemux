@@ -1097,7 +1097,7 @@ describe('a bounced note alerts its sender (vel-NOTE-BOUNCE-ALERT)', () => {
     expect(bounces.map((b) => b.at)).toEqual([T0 + MIN, T0 + 2 * MIN]);
   });
 
-  it('waits while the sender tab state is unknown, records the bounce silently for a closed sender tab', async () => {
+  it('records the bounce while the sender tab state is unknown, and marks it told once the sender tab is closed', async () => {
     const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
     f.live.delete('ws-1/tab-a');
     f.epics.delete('ddh');
@@ -1105,45 +1105,95 @@ describe('a bounced note alerts its sender (vel-NOTE-BOUNCE-ALERT)', () => {
     f.live.delete('ws-2/tab-b');
     await svc.tick();
     await settle();
-    expect(f.note(id).state).toBe('delivered');
+    expect(f.note(id)).toMatchObject({ state: 'undeliverable', bounceNotifiedAt: null });
     expect(bounced()).toEqual([]);
-    expect(bounces).toEqual([]);
 
     f.uncertain.delete('ws-2');
+    f.now += MIN;
+    await svc.tick();
     await svc.tick();
     await settle();
-    expect(f.note(id).state).toBe('undeliverable');
+    expect(f.note(id)).toMatchObject({ state: 'undeliverable', bounceNotifiedAt: T0 + MIN });
     expect(bounced()).toEqual([]);
     expect(bounces).toEqual([]);
   });
 
-  it('a failed notice holds the bounce for the next pass; a failed send-time notice never fails the send', async () => {
+  const failingOnce = () => {
     const base = f.deps();
-    let failures = 1;
+    const state = { failures: 1 };
     svc = new NotesService({
       ...base,
       enqueue: async (req) => {
-        if (req.fields.event === 'bounced' && failures-- > 0) throw new Error('inbox unwritable');
+        if (req.fields.event === 'bounced' && state.failures-- > 0) throw new Error('inbox unwritable');
         return base.enqueue(req);
       },
       alertBounced: async (n, at) => { bounces.push({ id: n.id, at, reason: n.routingReason }); },
     });
-    const routedNote = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    return state;
+  };
+
+  it('a failed notice at a pass leaves the bounce unmarked; the next pass tells the sender once', async () => {
+    failingOnce();
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
     f.live.delete('ws-1/tab-a');
     f.epics.delete('ddh');
     await svc.tick();
     await settle();
-    expect(f.note(routedNote.id).state).toBe('delivered');
+    expect(f.note(id)).toMatchObject({ state: 'undeliverable', bounceNotifiedAt: null });
     expect(bounces).toEqual([]);
+    for (let i = 0; i < 3; i++) await svc.tick();
+    await settle();
+    expect(bounced().map((s) => s.fields.noteId)).toEqual([id]);
+    expect(bounces.map((b) => b.id)).toEqual([id]);
+    expect(f.note(id).bounceNotifiedAt).toBe(T0);
+  });
+
+  it('a failed notice at the send never fails the send; the next pass tells the sender exactly once', async () => {
+    failingOnce();
+    const sent = await svc.send(B, { toEpic: 'nobody', subject: 's', body: 'b' });
+    expect(sent).toMatchObject({ state: 'undeliverable', receipt: { routingReason: 'target-epic-unowned' } });
+    expect(f.note(sent.id).bounceNotifiedAt).toBeNull();
+    await settle();
+    expect(bounced()).toEqual([]);
+    for (let i = 0; i < 3; i++) {
+      f.now += MIN;
+      await svc.tick();
+    }
+    await settle();
+    expect(bounced().map((s) => s.fields.noteId)).toEqual([sent.id]);
+    expect(bounces).toEqual([{ id: sent.id, at: T0 + MIN, reason: 'target-epic-unowned' }]);
+  });
+
+  it('a sender tab of unknown state at the send is told exactly once by a later pass', async () => {
+    f.uncertain.add('ws-2');
+    f.live.delete('ws-2/tab-b');
+    f.orchestrators.delete('ws-2');
+    const sent = await svc.send(B, { toWorkspace: 'ws-2', subject: 's', body: 'b' });
+    expect(f.note(sent.id)).toMatchObject({ state: 'undeliverable', bounceNotifiedAt: null });
     await svc.tick();
     await settle();
-    expect(f.note(routedNote.id).state).toBe('undeliverable');
-    expect(bounced().map((s) => s.fields.noteId)).toEqual([routedNote.id]);
-    expect(bounces.map((b) => b.id)).toEqual([routedNote.id]);
+    expect(bounced()).toEqual([]);
+    f.uncertain.delete('ws-2');
+    f.live.add('ws-2/tab-b');
+    for (let i = 0; i < 3; i++) {
+      f.now += MIN;
+      await svc.tick();
+    }
+    await settle();
+    expect(bounced().map((s) => `${s.fields.noteId}>${s.targetTabId}`)).toEqual([`${sent.id}>tab-b`]);
+    expect(bounces).toEqual([{ id: sent.id, at: T0 + MIN, reason: 'target-coordinator-unavailable' }]);
+  });
 
-    failures = 1;
-    const atSend = await svc.send(B, { toEpic: 'nobody', subject: 's', body: 'b' });
-    expect(atSend).toMatchObject({ state: 'undeliverable', receipt: { routingReason: 'target-epic-unowned' } });
+  it('a note stored undeliverable before bounce alerts owes no notice', async () => {
+    const { id } = await svc.send(B, { toEpic: 'nobody', subject: 's', body: 'b' });
+    const { bounceNotifiedAt: _dropped, ...legacy } = f.note(id);
+    f.state = { notes: [legacy] };
+    f.sent = [];
+    bounces = [];
+    await svc.tick();
+    await settle();
+    expect(bounced()).toEqual([]);
+    expect(bounces).toEqual([]);
   });
 
   it('a failed digest line never holds back the bounce or the sender\'s line', async () => {

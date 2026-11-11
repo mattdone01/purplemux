@@ -111,9 +111,11 @@ epic that nobody held stayed `target-epic-unowned` for about 2.5 h, and nobody s
   expires; purplemux note show n-…`. The same tab's digest gets one line:
   `note n-… bounced at <time> (<reason>): no live recipient; it waits for one until it expires — purplemux note show n-…`.
   Neither line types the epic slug. The paste preflight rejects a `bounced` notice once the note has a recipient again.
-- One alert per bounce. A note that routes again and bounces again alerts again. A pass records the bounce only once
-  the sender is told, or has nobody to tell (no tab, or its tab closed). An unknown sender tab, or a failed notice,
-  leaves the note as it was, and the next pass tries again. At the send, a failed notice never fails the send.
+- One alert per bounce. A note that routes again and bounces again alerts again. The bounce is always recorded; the
+  note's `bounceNotifiedAt` is set once the sender is told, or has nobody to tell (no tab, or its tab closed). An
+  unknown sender tab, or a failed notice, at the send or at a pass, leaves it null, and each pass tells the sender of
+  any bounced note whose `bounceNotifiedAt` is null. A route or a re-queue resets it. A failed notice never fails the
+  send. A note stored before this change has no `bounceNotifiedAt` and owes no notice.
 - The Scrum Master seat's `undelivered` line now says `its sender was told` only when a notice went out, else
   `its sender has no live tab and was not told`. Both digest lines carry a fixed time, not an age:
   `… has not reached its recipient's composer since it was routed at <time>; …`. The text is fixed per note, so the
