@@ -92,7 +92,13 @@ describe('the Portfolio Scrum Master writes its limit keys (ADR-0045)', () => {
     await expect(putValue(sm, key, { value, reason: 'r', expectedVersion: 0 }, authority())).rejects.toMatchObject({
       code: 'forbidden', message: expect.stringContaining('the Portfolio Scrum Master writes tabs.cap-per-workspace.<workspaceId>, pool.tab-place.<workspaceId>'),
     });
-    expect(auditLines()).toEqual([]);
+    // Review r1: the refusal is audited, with the key, the code and kind and the reason; never the value.
+    expect(auditLines()).toEqual([{
+      at: expect.any(String), event: 'fleet-config-refused', action: 'set', key, code: 'forbidden', refusal: 'admin-only', reason: 'r', expectedVersion: 0,
+      by: { workspaceId: 'ws-pm', tabId: 'tab-sm', verified: true, identity: 'launch', role: 'portfolio-scrum-master' },
+      selection: { actor: 'owner', updatedAt: 1000, managerWorkspaceId: 'ws-pm', managerTabId: 'tab-sm' },
+    }]);
+    expect(JSON.stringify(auditLines())).not.toContain(`"${value}"`);
   });
 
   it('a workspace outside the portfolio selection is refused for the cap and the plain-create mode', async () => {
@@ -172,5 +178,64 @@ describe('the Portfolio Scrum Master writes its limit keys (ADR-0045)', () => {
     await expect(putValue(admin, 'pool.tab-place.ws-a', { value: 'auto' }, authority())).rejects.toMatchObject({ code: 'config-invalid', message: expect.stringContaining('here, advise, place') });
     await expect(putValue(admin, 'pool.tab-place.ws a', { value: 'here' }, authority())).rejects.toMatchObject({ code: 'config-invalid' });
     await expect(putValue(admin, 'remote.hosts', { value: 'host-b,local' }, authority())).rejects.toMatchObject({ code: 'config-invalid', message: expect.stringContaining('--host local') });
+  });
+
+  describe('every refused Scrum Master write is audited, one line per refusal (review r1)', () => {
+    const refused = () => auditLines().filter((l) => l.event === 'fleet-config-refused');
+
+    it.each<[string, () => Promise<unknown>, string, string, boolean]>([
+      ['a forged, unverified caller presenting a Scrum Master key', async () => (await import('@/lib/fleet-config-http')).putValue(tabCaller('ws-pm', 'tab-sm', false), 'pool.slots.host-a.tab', { value: '4', reason: 'r', expectedVersion: 0 }, authority()), 'forbidden', 'not-scrum-master', false],
+      ['another verified orchestrator on a Scrum Master key', async () => (await import('@/lib/fleet-config-http')).putValue(tabCaller('ws-a', 'tab-o'), 'pool.slots.host-a.tab', { value: '4', reason: 'r', expectedVersion: 0 }, authority()), 'forbidden', 'not-scrum-master', false],
+      ['a workspace outside the selection', async () => (await import('@/lib/fleet-config-http')).putValue(sm, 'pool.tab-place.ws-z', { value: 'here', reason: 'r', expectedVersion: 0 }, authority()), 'forbidden', 'outside-selection', true],
+      ['no reason', async () => (await import('@/lib/fleet-config-http')).putValue(sm, 'pool.slots.host-a.tab', { value: '4', expectedVersion: 0 }, authority()), 'config-invalid', 'reason-missing', true],
+      ['a reason out of range', async () => (await import('@/lib/fleet-config-http')).putValue(sm, 'pool.slots.host-a.tab', { value: '4', reason: '', expectedVersion: 0 }, authority()), 'config-invalid', 'reason-invalid', false],
+      ['no version', async () => (await import('@/lib/fleet-config-http')).putValue(sm, 'pool.slots.host-a.tab', { value: '4', reason: 'r' }, authority()), 'config-invalid', 'version-missing', true],
+      ['a stale version (409)', async () => (await import('@/lib/fleet-config-http')).putValue(sm, 'pool.slots.host-a.tab', { value: '4', reason: 'r', expectedVersion: 3 }, authority()), 'config-version-conflict', 'version-conflict', true],
+      ['an invalid value', async () => (await import('@/lib/fleet-config-http')).putValue(sm, 'pool.tab-place.ws-a', { value: 'auto', reason: 'r', expectedVersion: 0 }, authority()), 'config-invalid', 'invalid', true],
+      ['an unset of a key that is not set', async () => (await import('@/lib/fleet-config-http')).deleteValue(sm, 'pool.slots.host-a.tab', { reason: 'r', expectedVersion: 0 }, authority()), 'config-not-found', 'not-found', true],
+    ])('%s: refused, and one audit line names the key, the code, the kind and the reason', async (_name, write, code, refusal, asScrumMaster) => {
+      await expect(write()).rejects.toMatchObject({ code });
+      const lines = refused();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ code, refusal, key: expect.stringMatching(/^(pool|tabs)\./) });
+      expect(lines[0]).not.toHaveProperty('value');
+      expect(lines[0].by).toEqual(asScrumMaster ? expect.objectContaining({ role: 'portfolio-scrum-master' }) : expect.not.objectContaining({ role: expect.anything() }));
+      expect(lines[0].reason).toBe(refusal === 'reason-missing' ? null : refusal === 'reason-invalid' ? '' : 'r');
+    });
+
+    it('the selection changing inside the store lock is audited with the selection it was judged on', async () => {
+      const { putValue } = await import('@/lib/fleet-config-http');
+      const a = authority();
+      a.scrumMaster.mockImplementationOnce(async () => {
+        const snapshot = current;
+        current = selection({ updatedAt: 2000 });
+        return snapshot;
+      });
+      await expect(putValue(sm, 'pool.slots.host-a.tab', { value: '4', reason: 'move room', expectedVersion: 0 }, a)).rejects.toMatchObject({ code: 'forbidden' });
+      expect(refused()).toEqual([expect.objectContaining({
+        refusal: 'selection-changed', key: 'pool.slots.host-a.tab', reason: 'move room', selection: expect.objectContaining({ updatedAt: 1000 }),
+        by: expect.objectContaining({ role: 'portfolio-scrum-master' }),
+      })]);
+    });
+
+    it('a same-value set by the Scrum Master answers changed:false and is audited with its reason', async () => {
+      const { putValue } = await import('@/lib/fleet-config-http');
+      await putValue(sm, 'pool.slots.host-a.tab', { value: '6', reason: 'first', expectedVersion: 0 }, authority());
+      expect(await putValue(sm, 'pool.slots.host-a.tab', { value: '6', reason: 'still right', expectedVersion: 1 }, authority())).toMatchObject({ changed: false, version: 1 });
+      expect(auditLines().at(-1)).toEqual({
+        at: expect.any(String), event: 'fleet-config-unchanged', key: 'pool.slots.host-a.tab', value: '6', version: 1, reason: 'still right',
+        by: { workspaceId: 'ws-pm', tabId: 'tab-sm', verified: true, identity: 'launch', role: 'portfolio-scrum-master' },
+        selection: { actor: 'owner', updatedAt: 1000, managerWorkspaceId: 'ws-pm', managerTabId: 'tab-sm' },
+      });
+    });
+
+    it('stays out: the admin token\'s refusals, an unverified caller on a key no Scrum Master writes, and an admin no-op', async () => {
+      const { putValue } = await import('@/lib/fleet-config-http');
+      await expect(putValue(admin, 'pool.tab-place.ws-a', { value: 'auto' }, authority())).rejects.toMatchObject({ code: 'config-invalid' });
+      await expect(putValue(tabCaller('ws-a', 'tab-x', false), 'remote.hosts', { value: 'host-c' }, authority())).rejects.toMatchObject({ code: 'forbidden' });
+      await putValue(admin, 'pool.mode', { value: 'shadow' }, authority());
+      await putValue(admin, 'pool.mode', { value: 'shadow' }, authority());
+      expect(auditLines().map((l) => l.event)).toEqual(['fleet-config-set']);
+    });
   });
 });

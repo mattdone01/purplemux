@@ -1197,7 +1197,10 @@ PUT /api/cli/fleet-config/KEY   { "value": "6", "expectedVersion"?: 4, "reason"?
   the current portfolio selection, a live coordinator) writes tabs.cap-per-workspace.<ws> and
   pool.tab-place.<ws> for a workspace in its selection, and pool.slots.<host>.tab. Its write needs
   "reason" and "expectedVersion" (400 config-invalid without), is refused when the selection changed
-  between the check and the write (403), and is audited with the reason and the selection.
+  between the check and the write (403), and is audited with the reason and the selection. A refused write by a
+  launch-verified tab, or one naming a Scrum Master key form, is audited as "fleet-config-refused" with the key, the
+  code, the refusal kind and the reason given, never the value; a Scrum Master same-value set (changed false) as
+  "fleet-config-unchanged" with its reason.
   Response: { "key", "version", "value": { "value", "version", "setAt", "setBy" }, "changed" }. Setting the value a key already holds changes
   nothing (no version, no audit line). 400 config-invalid (exit 2); 403 forbidden (exit 3);
   409 config-version-conflict (exit 3) when expectedVersion is not the stored version (0 = never set).

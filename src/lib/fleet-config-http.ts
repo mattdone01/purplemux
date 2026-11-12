@@ -95,11 +95,39 @@ export const scrumMasterKey = (key: string): { workspaceId: string | null } | nu
 
 export const REASON_MAX = 500;
 
+/**
+ * Why a write was refused, as the audit names it (ADR-0045 review r1): a refusal of the writer rule has its own kind;
+ * any other refusal takes the kind of its code.
+ */
+export type TWriteRefusal =
+  | 'admin-only' | 'not-scrum-master' | 'outside-selection' | 'reason-missing' | 'reason-invalid' | 'version-missing'
+  | 'selection-changed' | 'not-writer' | 'version-conflict' | 'invalid' | 'not-found' | 'forbidden';
+
+/** A writer-rule refusal: the store's error, with its kind and the selection it was judged on (when one was). */
+class WriteRefusal extends FleetConfigError {
+  constructor(
+    code: ConstructorParameters<typeof FleetConfigError>[0],
+    readonly refusal: TWriteRefusal,
+    message: string,
+    readonly snapshot: IScrumMasterSnapshot | null = null,
+  ) {
+    super(code, message);
+  }
+}
+
+const refusalOf = (err: FleetConfigError): TWriteRefusal => {
+  if (err instanceof WriteRefusal) return err.refusal;
+  if (err.code === 'config-version-conflict') return 'version-conflict';
+  if (err.code === 'config-invalid') return 'invalid';
+  if (err.code === 'config-not-found') return 'not-found';
+  return 'forbidden';
+};
+
 /** `reason` (ADR-0045): 1..500 characters when given; null when absent. */
 const checkReason = (raw: unknown): string | null => {
   if (raw === undefined || raw === null) return null;
   if (typeof raw !== 'string' || raw.trim().length === 0 || raw.length > REASON_MAX) {
-    throw new FleetConfigError('config-invalid', `reason must be 1..${REASON_MAX} characters, got ${JSON.stringify(raw)}`);
+    throw new WriteRefusal('config-invalid', 'reason-invalid', `reason must be 1..${REASON_MAX} characters, got ${JSON.stringify(raw)}`);
   }
   return raw;
 };
@@ -271,24 +299,24 @@ const requireWriter = async (caller: ICaller, authority: IFleetConfigAuthority, 
     const form = scrumMasterKey(key);
     const snapshot = authority.scrumMaster ? await authority.scrumMaster(caller) : null;
     if (!form) {
-      throw new FleetConfigError('forbidden', snapshot
+      throw new WriteRefusal('forbidden', 'admin-only', snapshot
         ? `${key} is written by the admin token only (ADR-0022, ADR-0027, ADR-0037, ADR-0039); the Portfolio Scrum Master writes ${SCRUM_MASTER_KEY_FORMS} (ADR-0045)`
-        : `${key} is written by the admin token only (ADR-0022, ADR-0027, ADR-0037, ADR-0039; ADR-0045 lets the Portfolio Scrum Master's verified tab write ${SCRUM_MASTER_KEY_FORMS})`);
+        : `${key} is written by the admin token only (ADR-0022, ADR-0027, ADR-0037, ADR-0039; ADR-0045 lets the Portfolio Scrum Master's verified tab write ${SCRUM_MASTER_KEY_FORMS})`, snapshot);
     }
     if (!snapshot) {
-      throw new FleetConfigError('forbidden', `${key} is written by the admin token or the Portfolio Scrum Master's verified tab (the manager tab of the current portfolio selection, ADR-0045)`);
+      throw new WriteRefusal('forbidden', 'not-scrum-master', `${key} is written by the admin token or the Portfolio Scrum Master's verified tab (the manager tab of the current portfolio selection, ADR-0045)`);
     }
     if (form.workspaceId && !snapshot.selection.workspaceIds.includes(form.workspaceId)) {
-      throw new FleetConfigError('forbidden', `${key} names ${form.workspaceId}, which is not in the portfolio selection (${snapshot.selection.workspaceIds.join(', ') || 'none'}); the admin token writes it (ADR-0045)`);
+      throw new WriteRefusal('forbidden', 'outside-selection', `${key} names ${form.workspaceId}, which is not in the portfolio selection (${snapshot.selection.workspaceIds.join(', ') || 'none'}); the admin token writes it (ADR-0045)`, snapshot);
     }
-    if (reason === null) throw new FleetConfigError('config-invalid', `a Portfolio Scrum Master write of ${key} needs a reason (--reason TEXT, 1..${REASON_MAX} characters, ADR-0045)`);
+    if (reason === null) throw new WriteRefusal('config-invalid', 'reason-missing', `a Portfolio Scrum Master write of ${key} needs a reason (--reason TEXT, 1..${REASON_MAX} characters, ADR-0045)`, snapshot);
     if (body.expectedVersion === undefined || body.expectedVersion === null) {
-      throw new FleetConfigError('config-invalid', `a Portfolio Scrum Master write of ${key} needs the version it read (--expect-version N from config list or config history; 0 when unset, ADR-0045)`);
+      throw new WriteRefusal('config-invalid', 'version-missing', `a Portfolio Scrum Master write of ${key} needs the version it read (--expect-version N: config get KEY --json; 0 only for a key never set, ADR-0045)`, snapshot);
     }
     return { setter: { ...setterOf(caller), role: 'portfolio-scrum-master' }, reason, scrumMaster: { snapshot, workspaceId: form.workspaceId } };
   }
   if (caller.workspaceId && caller.tabId && (await authority.isWorkspaceOrchestrator(caller.workspaceId, caller.tabId))) return { setter: setterOf(caller), reason, scrumMaster: null };
-  throw new FleetConfigError('forbidden', "fleet config is written by the admin token or the workspace's enabled orchestrator tab");
+  throw new WriteRefusal('forbidden', 'not-writer', "fleet config is written by the admin token or the workspace's enabled orchestrator tab");
 };
 
 /**
@@ -301,7 +329,7 @@ const recheckScrumMaster = (writer: IWriter, authority: IFleetConfigAuthority, k
   const now = authority.currentSelection?.() ?? null;
   const { snapshot, workspaceId } = writer.scrumMaster;
   if (!sameSelection(now, snapshot) || (workspaceId && !now!.selection.workspaceIds.includes(workspaceId))) {
-    throw new FleetConfigError('forbidden', `the portfolio selection changed while ${key} was written; nothing was written (ADR-0045)`);
+    throw new WriteRefusal('forbidden', 'selection-changed', `the portfolio selection changed while ${key} was written; nothing was written (ADR-0045)`, snapshot);
   }
 };
 
@@ -315,14 +343,68 @@ const audit = (change: IFleetConfigChange, caller: ICaller, writer: IWriter): Pr
     version: change.version,
     ...(writer.reason ? { reason: writer.reason } : {}),
     by: { ...writer.setter, verified: caller.admin ? false : caller.verified, identity: caller.admin ? 'none' : caller.identity },
-    ...(writer.scrumMaster ? {
-      selection: {
-        actor: writer.scrumMaster.snapshot.actor,
-        updatedAt: writer.scrumMaster.snapshot.updatedAt,
-        managerWorkspaceId: writer.scrumMaster.snapshot.selection.managerWorkspaceId,
-        managerTabId: writer.scrumMaster.snapshot.selection.managerTabId,
-      },
-    } : {}),
+    ...(writer.scrumMaster ? { selection: selectionOf(writer.scrumMaster.snapshot) } : {}),
+  });
+
+const selectionOf = (snapshot: IScrumMasterSnapshot) => ({
+  actor: snapshot.actor,
+  updatedAt: snapshot.updatedAt,
+  managerWorkspaceId: snapshot.selection.managerWorkspaceId,
+  managerTabId: snapshot.selection.managerTabId,
+});
+
+/** The caller as an audit line names it: never a token, never a value. */
+const byOf = (caller: ICaller, snapshot: IScrumMasterSnapshot | null) => ({
+  workspaceId: caller.workspaceId,
+  tabId: caller.tabId,
+  verified: caller.verified,
+  identity: caller.identity,
+  ...(snapshot ? { role: 'portfolio-scrum-master' as const } : {}),
+});
+
+interface IRefusalContext {
+  action: 'set' | 'unset';
+  caller: ICaller;
+  key: string | null;
+  body: Record<string, unknown>;
+  writer: IWriter | null;
+}
+
+/**
+ * Every refused write is audited (ADR-0045 review r1) when a launch-verified tab made it, or when it named a key the
+ * Portfolio Scrum Master may write: the caller, the key, the refusal code and kind, and the reason given. The value is
+ * never written: a refused value may be anything. The admin token's refusals and an unverified caller's refusal of
+ * any other key stay out, as before. The original error is thrown again whatever the audit answers.
+ */
+const auditRefusal = async (err: unknown, ctx: IRefusalContext): Promise<void> => {
+  if (!(err instanceof FleetConfigError) || ctx.caller.admin) return;
+  if (!ctx.caller.verified && !(ctx.key !== null && scrumMasterKey(ctx.key) !== null)) return;
+  const snapshot = err instanceof WriteRefusal ? err.snapshot : ctx.writer?.scrumMaster?.snapshot ?? null;
+  const reason = typeof ctx.body.reason === 'string' ? ctx.body.reason.slice(0, REASON_MAX) : null;
+  const expected = ctx.body.expectedVersion;
+  await appendCoordinationAudit({
+    event: 'fleet-config-refused',
+    action: ctx.action,
+    key: ctx.key,
+    code: err.code,
+    refusal: refusalOf(err),
+    reason,
+    ...(typeof expected === 'number' && Number.isSafeInteger(expected) ? { expectedVersion: expected } : {}),
+    by: byOf(ctx.caller, snapshot),
+    ...(snapshot ? { selection: selectionOf(snapshot) } : {}),
+  });
+};
+
+/** A Portfolio Scrum Master set of the value a key already holds: no version, no history, but the reason is kept here. */
+const auditUnchanged = (key: string, stored: IFleetConfigValue, caller: ICaller, writer: IWriter): Promise<boolean> =>
+  appendCoordinationAudit({
+    event: 'fleet-config-unchanged',
+    key,
+    value: stored.value,
+    version: stored.version,
+    reason: writer.reason,
+    by: byOf(caller, writer.scrumMaster!.snapshot),
+    selection: selectionOf(writer.scrumMaster!.snapshot),
   });
 
 export const putValue = async (
@@ -331,10 +413,28 @@ export const putValue = async (
   body: Record<string, unknown>,
   authority: IFleetConfigAuthority = defaultAuthority,
 ): Promise<{ key: string; version: number; value: IFleetConfigValue; changed: boolean }> => {
+  const ctx: IRefusalContext = { action: 'set', caller, key: null, body, writer: null };
+  try {
+    return await setChecked(caller, rawKey, body, authority, ctx);
+  } catch (err) {
+    await auditRefusal(err, ctx);
+    throw err;
+  }
+};
+
+const setChecked = async (
+  caller: ICaller,
+  rawKey: unknown,
+  body: Record<string, unknown>,
+  authority: IFleetConfigAuthority,
+  ctx: IRefusalContext,
+): Promise<{ key: string; version: number; value: IFleetConfigValue; changed: boolean }> => {
   const key = checkKey(rawKey);
+  ctx.key = key;
   const value = checkValue(body.value);
   const expectedVersion = checkExpectedVersion(body.expectedVersion);
   const writer = await requireWriter(caller, authority, key, body);
+  ctx.writer = writer;
   const { state, change } = await mutateFleetConfig((s) => {
     recheckScrumMaster(writer, authority, key);
     checkRemoteValue(key, value, s);
@@ -346,8 +446,9 @@ export const putValue = async (
     checkTurnEndValue(key, value);
     return setValue(s, { key, value, expectedVersion, ...(writer.reason ? { reason: writer.reason } : {}) }, writer.setter, authority.now());
   });
-  if (change) await audit(change, caller, writer);
   const stored = valueOf(state, key)!;
+  if (change) await audit(change, caller, writer);
+  else if (writer.scrumMaster) await auditUnchanged(key, stored, caller, writer);
   return { key, version: stored.version, value: stored, changed: change !== null };
 };
 
@@ -357,9 +458,27 @@ export const deleteValue = async (
   body: Record<string, unknown>,
   authority: IFleetConfigAuthority = defaultAuthority,
 ): Promise<{ key: string; version: number; unset: IFleetConfigChange }> => {
+  const ctx: IRefusalContext = { action: 'unset', caller, key: null, body, writer: null };
+  try {
+    return await unsetChecked(caller, rawKey, body, authority, ctx);
+  } catch (err) {
+    await auditRefusal(err, ctx);
+    throw err;
+  }
+};
+
+const unsetChecked = async (
+  caller: ICaller,
+  rawKey: unknown,
+  body: Record<string, unknown>,
+  authority: IFleetConfigAuthority,
+  ctx: IRefusalContext,
+): Promise<{ key: string; version: number; unset: IFleetConfigChange }> => {
   const key = checkKey(rawKey);
+  ctx.key = key;
   const expectedVersion = checkExpectedVersion(body.expectedVersion);
   const writer = await requireWriter(caller, authority, key, body);
+  ctx.writer = writer;
   const { change } = await mutateFleetConfig((s) => {
     recheckScrumMaster(writer, authority, key);
     return unsetValue(s, { key, expectedVersion, ...(writer.reason ? { reason: writer.reason } : {}) }, writer.setter, authority.now());

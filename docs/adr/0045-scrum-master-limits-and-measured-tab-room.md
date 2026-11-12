@@ -56,8 +56,9 @@ Three facts stood in the way:
    So no Scrum Master write can shrink the control host's reserve.
 2. **The write.** A Scrum Master set or unset needs two fields:
    - `reason`, 1 to 500 characters.
-   - `expectedVersion`, the version it read (`config get KEY --json`; 0 when the key is unset). The CLI never fetches
-     this just before the write, so a write never overwrites an owner value it did not read (409).
+   - `expectedVersion`, the version it read (`config get KEY --json`). 0 is right only for a key that was never set:
+     after an unset the version keeps counting, so `config history KEY` names it. The CLI never fetches the version
+     just before the write, so a write never overwrites an owner value it did not read (409).
 
    The proof (a file read and a tmux check) runs before the store lock. Inside the lock, the store compares the
    selection snapshot synchronously: the same actor, time, manager and workspaces, and the key's workspace still in
@@ -66,6 +67,17 @@ Three facts stood in the way:
    The change keeps `reason` in the fleet-config history, and `by.role: portfolio-scrum-master`.
    `coordination.jsonl` records the reason, the writer and the selection snapshot. The admin token keeps its rule; it
    may give a reason.
+
+   Every refused write is audited too (review round 1). This covers a write by a launch-verified tab, or a write
+   that names a key form the Scrum Master may write. The line is `fleet-config-refused`, with:
+   - the caller and the key;
+   - the code and the kind: `admin-only`, `not-scrum-master`, `outside-selection`, `reason-missing`,
+     `reason-invalid`, `version-missing`, `version-conflict`, `selection-changed`, `invalid` or `not-found`;
+   - the reason given, and the selection the write was judged on, when the refusal had one.
+
+   The line never carries the value. A Scrum Master set of the value a key already holds answers `changed: false`,
+   writes no version, and is audited as `fleet-config-unchanged` with its reason. The admin token's refusals stay
+   out, as before.
 3. **The tab room.** For a known, placeable host with tab envelope `e` and the vel-D4 budget `b`:
    - free threads = min(`b.threads` − `b.reserveThreads`, `b.maxLoad`) − (min(load1, load5) + unseen work)
    - free memory = MemAvailable − unseen work − `b.reserveMemBytes`
