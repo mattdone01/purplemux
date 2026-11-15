@@ -428,14 +428,31 @@ export interface ICloseTabResult {
   refused?: string;
 }
 
+/** What `refuseIf` judges besides the tab: the layout it was read from and the workspace's orchestrator designation. */
+export interface ICloseGuardContext {
+  layout: ILayoutData;
+  /** Read under the mapping write lease, which every orchestration commit holds. `ok: false`: the registry did not read. */
+  orchestrator: { ok: true; tabId: string | null } | { ok: false; error: string };
+}
+
 export interface ICloseTabOptions {
   keepProcesses?: boolean;
   /**
-   * Read under the layout lock and the orchestration mapping write lock, before anything is signalled (ADR-0048 §7):
+   * Read under the layout lock and the orchestration mapping write lock, before anything is signalled (ADR-0048 §3):
    * a reason keeps the tab. Every input path records its pending turn under that mapping lock before it types.
    */
-  refuseIf?: (tab: ITab) => string | null;
+  refuseIf?: (tab: ITab, context: ICloseGuardContext) => string | null;
 }
+
+const readOrchestratorTabId = async (wsId: string): Promise<ICloseGuardContext['orchestrator']> => {
+  try {
+    const { readWorkspacesStrict } = await import('@/lib/workspace-store');
+    const ws = (await readWorkspacesStrict()).workspaces.find((w) => w.id === wsId);
+    return { ok: true, tabId: ws?.orchestration?.orchestratorTabId ?? null };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+};
 
 export const removeTabFromPane = async (wsId: string, paneId: string, tabId: string): Promise<boolean> =>
   (await closeTab(wsId, paneId, tabId)).ok;
@@ -447,6 +464,7 @@ export const closeTab = async (
   tabId: string,
   opts: ICloseTabOptions = {},
 ): Promise<ICloseTabResult> => withOrchestrationMappingWrite(wsId, async () => {
+  const orchestrator = opts.refuseIf ? await readOrchestratorTabId(wsId) : null;
   const tabInfo = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
     const layout = await readLayoutFile(filePath);
@@ -457,7 +475,7 @@ export const closeTab = async (
 
     const tab = pane.tabs.find((t) => t.id === tabId);
     if (!tab) return null;
-    const refused = opts.refuseIf?.(tab) ?? null;
+    const refused = opts.refuseIf && orchestrator ? opts.refuseIf(tab, { layout, orchestrator }) : null;
     if (refused) return { refused };
     return { sessionName: tab.sessionName, panelType: tab.panelType, pending: !!(tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn) };
   });

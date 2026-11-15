@@ -78,7 +78,7 @@ const config = (values: Record<string, string>, failing: string[] = []) => async
   return Object.hasOwn(values, key) ? values[key] : null;
 };
 
-describe('policy: mode and hours (ADR-0048 §4)', () => {
+describe('policy: mode and hours (ADR-0048 §6)', () => {
   it('parses each mode and refuses any other word', () => {
     expect(parseDormantMode('close').mode).toBe('close');
     expect(parseDormantMode(' report ').mode).toBe('report');
@@ -137,7 +137,7 @@ describe('policy: mode and hours (ADR-0048 §4)', () => {
   });
 });
 
-describe('keep mark input (ADR-0048 §6)', () => {
+describe('keep mark input (ADR-0048 §5)', () => {
   it('parses a duration and an ISO time with a zone', () => {
     expect(parseKeepUntil('12h', NOW)).toEqual({ ok: true, until: NOW + 12 * HOUR });
     expect(parseKeepUntil('3d', NOW)).toEqual({ ok: true, until: NOW + 3 * DAY });
@@ -215,7 +215,7 @@ describe('judgeActivity: dormant is an eligible state and no sign of life for N 
   });
 });
 
-describe('holdsOf: each hold keeps a dormant tab open (ADR-0048 §5)', () => {
+describe('holdsOf: each hold keeps a dormant tab open (ADR-0048 §2)', () => {
   it('finds nothing on a bare dormant tab', () => {
     expect(holdsOf(holdInput(), NOW)).toEqual([]);
   });
@@ -304,7 +304,7 @@ describe('holdsOf: each hold keeps a dormant tab open (ADR-0048 §5)', () => {
   });
 });
 
-describe('worktreeVerdict: uncommitted changes in the tab\'s cwd hold it (ADR-0048 §6)', () => {
+describe('worktreeVerdict: uncommitted changes in the tab\'s cwd hold it (ADR-0048 §2)', () => {
   const git = (over: Partial<IGitFacts>): { ok: true; value: IGitFacts } => ({
     ok: true,
     value: { kind: 'ok', cwd: '/w', worktree: '/w', branch: 'feat/x', head: 'abc', baseRef: null, base: null, dirty: 0, ...over },

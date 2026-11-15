@@ -50,6 +50,10 @@ interface IWorld {
   layoutTab: Map<string, ITab>;
   closeError: Error | null;
   noteError: Error | null;
+  /** The registry's orchestrator as `closeTab` reads it under the mapping lease; an Error: the registry did not read. */
+  orchestratorTabId: string | null | Error;
+  /** Tabs the layout holds besides the candidates (another tab's reportsTo). */
+  extraLayoutTabs: ITab[];
 }
 
 let world: IWorld;
@@ -92,7 +96,14 @@ const deps = (): IDormantSweeperDeps => ({
     if (world.closeError) throw world.closeError;
     const current = world.layoutTab.get(tabId);
     if (!current) return { ok: false };
-    const refused = refuseIf(current);
+    const layoutTabs = [...world.layoutTab.values(), ...world.extraLayoutTabs];
+    const orchestrator = world.orchestratorTabId instanceof Error
+      ? { ok: false as const, error: world.orchestratorTabId.message }
+      : { ok: true as const, tabId: world.orchestratorTabId };
+    const refused = refuseIf(current, {
+      layout: { root: { type: 'pane', id: 'pane-1', tabs: layoutTabs, activeTabId: null }, activePaneId: 'pane-1', updatedAt: '' },
+      orchestrator,
+    });
     if (refused) return { ok: false, refused };
     closes.push(tabId);
     world.layoutTab.delete(tabId);
@@ -133,6 +144,8 @@ beforeEach(() => {
     layoutTab: new Map(),
     closeError: null,
     noteError: null,
+    orchestratorTabId: null,
+    extraLayoutTabs: [],
   };
   closes.length = 0;
   notes.length = 0;
@@ -230,6 +243,50 @@ describe('close mode', () => {
     expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'close-refused' });
     expect(closes).toEqual([]);
     expect(audits.at(-1)).toMatchObject({ event: 'dormant-close-refused', reason });
+  });
+
+  it('refuses the close when the tab became the orchestrator, or another tab reports to it, after the judgement', async () => {
+    addTab('ws-a', tabOf('tab-1'));
+    addTab('ws-a', tabOf('tab-2'));
+    const sweeper = new DormantSweeper(deps());
+    await sweeper.sweep();
+    world.orchestratorTabId = 'tab-1';
+    world.extraLayoutTabs = [tabOf('tab-lead', { panelType: 'terminal', reportsTo: 'tab-2' })];
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'close-refused', 'tab-2': 'close-refused' });
+    expect(closes).toEqual([]);
+    expect(audits.filter((a) => a.event === 'dormant-close-refused').map((a) => [a.tabId, a.reason]))
+      .toEqual([['tab-1', 'orchestrator'], ['tab-2', 'reports-target']]);
+  });
+
+  it('refuses the close when the registry does not read under the lease', async () => {
+    addTab('ws-a', tabOf('tab-1'));
+    const sweeper = new DormantSweeper(deps());
+    await sweeper.sweep();
+    world.orchestratorTabId = new Error('Invalid workspaces registry');
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'close-refused' });
+    expect(audits.at(-1)).toMatchObject({ event: 'dormant-close-refused', reason: 'orchestrator-unreadable' });
+  });
+
+  it('starts the confirm again after a close that threw', async () => {
+    addTab('ws-a', tabOf('tab-1'));
+    const sweeper = new DormantSweeper(deps());
+    await sweeper.sweep();
+    world.closeError = new Error('remote host did not answer');
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'close-failed' });
+    world.closeError = null;
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'confirming' });
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'closed' });
+  });
+
+  it.each(['report', 'off'])('starts the confirm again after a %s pass in between', async (mode) => {
+    addTab('ws-a', tabOf('tab-1'));
+    const sweeper = new DormantSweeper(deps());
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'confirming' });
+    world.config = { 'tabs.dormant.mode': mode };
+    await sweeper.sweep();
+    world.config = { 'tabs.dormant.mode': 'close' };
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'confirming' });
+    expect(outcomes(await sweeper.sweep())).toEqual({ 'tab-1': 'closed' });
   });
 
   it('closes at most 5 a pass, oldest activity first, and defers the rest', async () => {

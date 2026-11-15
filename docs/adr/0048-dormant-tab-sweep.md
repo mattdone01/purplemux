@@ -1,7 +1,6 @@
 # ADR-0048: The dormant-tab sweep and the keep mark
 
-Status: accepted, 16 Nov 2026, on the owner's order: "Also we need to make sure dormant tabs are closed." The design
-check had one architect consult (read-only, approve with changes). Its rulings are below.
+Status: accepted, 16 Nov 2026. The design was reviewed before code, and the review's changes are in this record.
 
 ## Context
 
@@ -56,7 +55,7 @@ A dormant tab that holds any of these is reported and never closed. A read that 
 | `tab-events-held (n)` | digest events held for the tab (urgent rows are held only while `rotating`, a seat hold) |
 | `background-tasks (n)` | the Claude transcript's open background tasks. On claude-code, an unread ledger is `background-unreadable` |
 | `lease …` | a lease whose holder is the tab |
-| `bg-jobs (n)` | a live registered `tab bg` job. The read is direct: a failure is never zero |
+| `bg-jobs (n)` | a live registered `tab bg` job. The sweep reads the workspace's `liveness.json` strictly first: absent is no jobs, unreadable or malformed is `jobs-unreadable` (the store's own readers turn both into no jobs). A job on disk that the liveness manager does not know (a hydrate that failed) holds the tab |
 | `watches (n)`, `inbox (n)`, `notes (n)` | an armed watch; a queued or held inbox line; an open note routed to the tab |
 | `mission-control …` | an open item whose opener row or NEEDS-DECISION line row names the tab; an open run bound to it |
 | `grant …` | an active grant whose grantee is the tab. One unreadable grant file makes the read fail |
@@ -76,12 +75,21 @@ most 5 tabs close in one pass, fleet-wide, oldest activity first. The others are
 
 - a launch or turn is pending;
 - a keep mark is unexpired;
+- the tab became the workspace orchestrator, or the registry does not read (the registry is read under the same
+  mapping write lease, which every orchestration commit holds);
+- another tab of the layout now names it as its `reportsTo`;
 - the tab is restarting or closing;
 - the `eventSeq` changed;
 - the state is no longer eligible.
 
 Every path that types into a tab first records its pending turn under that lock. These paths are automated delivery,
-`tab send` and the web terminal. So the window between the judgement and the close is closed.
+`tab send` and the web terminal. So a turn that starts between the judgement and the close refuses the close.
+
+The holds read from other stores are not read again under the lock. A pass judges every tab first and closes after, so
+for up to one pass these changes are not seen: a lease taken or a watch armed for the tab by another tab, an inbox
+line or note queued for it, a grant or Mission Control item that names it, and a hand edit in its worktree. A change
+the tab makes itself is a turn and changes its `eventSeq`. A close that throws, or a report or off pass, starts the
+two-pass confirm again.
 
 Each close writes:
 
@@ -89,10 +97,9 @@ Each close writes:
 - one `dormant-close` audit line, with the threshold, the last activity and its source, the checks, the worktree
   answer, and the agent session and transcript (so the work can be resumed).
 
-Each pass also sends one note per workspace, through the system sender, that lists every tab closed in the pass. The
-ticket asked for one note per close. This ADR changes that to one note per workspace per pass: the system sender
-shares the 50-open-note cap, and an unacked note stays open 14 days. A note that fails is logged and audited
-(`dormant-close-note-failed`).
+Each pass also sends one note per workspace, through the system sender, that lists every tab closed in the pass. One
+note per close was rejected: the system sender shares the 50-open-note cap, and an unacked note stays open 14 days. A
+note that fails is logged and audited (`dormant-close-note-failed`).
 
 ### 4. Report once
 
@@ -129,7 +136,14 @@ Rollout:
 ## Consequences
 
 - Dormant tabs close with no person, and only after a day of report lines shows that the holds are right.
-- A tab that waits for the owner (NEEDS-DECISION, BLOCKED, an open Mission Control item) stays open and is reported
-  daily. To close such a tab, a person closes it, or the owner answers and the tab ends its turn.
+- A tab that waits for an answer (NEEDS-DECISION, BLOCKED, an open Mission Control item) stays open and is reported
+  daily. To close such a tab, a person closes it, or the answer comes and the tab ends its turn.
 - A remote tab whose host does not answer is never closed: its worktree read fails.
 - After a restart, the first close comes at least 20 min after boot (two passes).
+
+## Known limits
+
+- The Codex transcript reader swallows its own read errors (`providers/codex/runtime-snapshot.ts`), so
+  `transcript-unreadable` never fires for a Codex tab. One activity source is lost for Codex; the hook events and the
+  turn ledger still count.
+- The close does not re-read every hold under the lock (§3 names the window).

@@ -17,6 +17,8 @@ import {
 } from '@/lib/dormant-sweep';
 import type { IDormantStatusFacts, TDormantRead } from '@/types/dormant';
 import type { IGitFacts } from '@/types/rotation-checkpoint';
+import type { ICloseGuardContext } from '@/lib/layout-store';
+import { collectAllTabs } from '@/lib/layout-tree';
 import type { ITab } from '@/types/terminal';
 import type { TCliState } from '@/types/timeline';
 
@@ -53,10 +55,13 @@ export interface IDormantSweeperDeps {
   workspaceReads: (workspaceId: string) => IDormantWorkspaceReads;
   status: (tabId: string) => Promise<IDormantStatusFacts | null>;
   pane: (tab: ITab) => Promise<IDormantPane>;
-  jobs: (tabId: string) => Promise<number>;
+  /** Live registered `tab bg` jobs of the tab; throws when the job store cannot be read (never zero). */
+  jobs: (workspaceId: string, tabId: string) => Promise<number>;
   gitFacts: (host: string | null, cwd: string) => Promise<IGitFacts>;
   guard: (tabId: string) => IDormantGuard | null;
-  close: (workspaceId: string, paneId: string, tabId: string, refuseIf: (tab: ITab) => string | null) => Promise<IDormantCloseResult>;
+  close: (
+    workspaceId: string, paneId: string, tabId: string, refuseIf: (tab: ITab, context: ICloseGuardContext) => string | null,
+  ) => Promise<IDormantCloseResult>;
   note: (workspaceId: string, subject: string, body: string) => Promise<void>;
   audit: (entry: Record<string, unknown>) => Promise<unknown>;
   log: IDormantLog;
@@ -127,6 +132,8 @@ export class DormantSweeper {
       const policy = await readDormantPolicy(this.deps.config, ws.workspaceId);
       this.logPolicy(ws.workspaceId, policy);
       if (policy.mode !== 'off') policies.set(ws.workspaceId, policy);
+      // A confirm counts only for consecutive close-mode passes: a report or off pass in between starts it again.
+      if (policy.mode !== 'close') for (const c of ws.tabs) this.confirming.delete(c.tab.id);
     }
     if (policies.size === 0) return results;
     const passReads = await this.deps.passReads();
@@ -169,7 +176,7 @@ export class DormantSweeper {
       this.confirming.delete(tab.id);
       return { result: { ...base, outcome: 'active', detail: activity.reason } };
     }
-    const holds = [...activity.holds, ...holdsOf({ candidate, status, pass, workspace, jobs: await read(() => this.deps.jobs(tab.id)) }, now)];
+    const holds = [...activity.holds, ...holdsOf({ candidate, status, pass, workspace, jobs: await read(() => this.deps.jobs(workspaceId, tab.id)) }, now)];
     let worktree = 'not read (already held)';
     if (holds.length === 0) {
       const facts = pane.cwd === null ? null : await read(() => this.deps.gitFacts(tab.host ?? null, pane.cwd!));
@@ -215,8 +222,9 @@ export class DormantSweeper {
       const judgedSeq = item.status.eventSeq;
       let closed: IDormantCloseResult;
       try {
-        closed = await this.deps.close(workspaceId, paneId, tab.id, (current) => this.refusal(current, judgedSeq, now));
+        closed = await this.deps.close(workspaceId, paneId, tab.id, (current, context) => this.refusal(current, context, judgedSeq, now));
       } catch (err) {
+        this.confirming.delete(tab.id);
         const why = err instanceof Error ? err.message : String(err);
         this.deps.log.warn(`dormant tab ${label(tab)} in ${workspaceId} close failed: ${why}`);
         await this.audit({ event: 'dormant-close-failed', workspaceId, tabId: tab.id, error: why });
@@ -249,10 +257,17 @@ export class DormantSweeper {
     return results;
   }
 
-  /** Read under the layout lock, after the judgement: anything that moved since keeps the tab. */
-  private refusal(tab: ITab, judgedSeq: number, now: number): string | null {
+  /**
+   * Read under the layout lock and the mapping write lease, after the judgement: anything on the tab, its layout or its
+   * orchestrator designation that moved since keeps the tab. The holds read from other stores are not read again here
+   * (ADR-0048 §3 names that window).
+   */
+  private refusal(tab: ITab, context: ICloseGuardContext, judgedSeq: number, now: number): string | null {
     if (tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn) return 'orchestration-pending';
     if (keepHolds(tab.keep, now)) return 'keep';
+    if (!context.orchestrator.ok) return 'orchestrator-unreadable';
+    if (context.orchestrator.tabId === tab.id) return 'orchestrator';
+    if (collectAllTabs(context.layout.root).some((other) => other.reportsTo === tab.id)) return 'reports-target';
     const guard = this.deps.guard(tab.id);
     if (!guard) return 'status unknown';
     if (guard.retired) return 'closing';

@@ -77,7 +77,7 @@ describe('every close path reaps by tab id (ADR-0016)', () => {
     expect(tmux.killSession).toHaveBeenCalledWith('s-a2', { tabId: 'tab-a2', keepProcesses: undefined });
   });
 
-  it('closeTab refuseIf keeps the tab before anything is signalled (ADR-0048 §7)', async () => {
+  it('closeTab refuseIf keeps the tab before anything is signalled (ADR-0048 §3)', async () => {
     const store = await import('@/lib/layout-store');
     const { onTabClosing } = await import('@/lib/tab-lifecycle');
     const closing: string[] = [];
@@ -105,6 +105,25 @@ describe('every close path reaps by tab id (ADR-0016)', () => {
     } finally {
       off();
     }
+  });
+
+  it('closeTab hands refuseIf the layout and the orchestrator read under the mapping lease', async () => {
+    const store = await import('@/lib/layout-store');
+    const contexts: unknown[] = [];
+    const refuse = (_tab: unknown, context: import('@/lib/layout-store').ICloseGuardContext) => {
+      contexts.push({ orchestrator: context.orchestrator, tabs: JSON.stringify(context.layout).includes('"tab-b1"') });
+      return 'held';
+    };
+    await store.closeTab(WS, 'pane-a', 'tab-a2', { refuseIf: refuse });
+    await fs.writeFile(path.join(mockHome.value, '.purplemux', 'workspaces.json'), JSON.stringify({
+      workspaces: [{ id: WS, name: 'close', directories: [], orchestration: { enabled: false, orchestratorTabId: 'tab-a2' } }],
+    }));
+    await store.closeTab(WS, 'pane-a', 'tab-a2', { refuseIf: refuse });
+    expect(contexts).toEqual([
+      { orchestrator: { ok: false, error: expect.stringContaining('Workspace registry unavailable') }, tabs: true },
+      { orchestrator: { ok: true, tabId: 'tab-a2' }, tabs: true },
+    ]);
+    expect(tmux.killSession).not.toHaveBeenCalled();
   });
 
   it('closeTab closes when refuseIf answers null', async () => {

@@ -754,7 +754,7 @@ export class StatusManager {
     };
   }
 
-  /** The close's re-read under the layout lock (ADR-0048 §7): synchronous, so it runs inside `closeTab`'s lock. */
+  /** The close's re-read under the layout lock (ADR-0048 §3): synchronous, so it runs inside `closeTab`'s lock. */
   dormantGuard(tabId: string): { cliState: TCliState; eventSeq: number; retired: boolean; restarting: boolean } | null {
     const entry = this.tabs.get(tabId);
     if (!entry) return null;
