@@ -27,7 +27,7 @@ import {
   REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_KEY, REMOTE_TAILNET_SUFFIX_KEY, callbackUrlRefusal,
   isValidBareHostName, isValidRemoteHostName, isValidTailnetSuffix, parseCallbackAllowHosts, parseRemoteHosts, scrumMasterCallbackRefusal,
 } from '@/lib/remote-host';
-import { REMOTE_TIMEOUT_KEY, remoteTimeoutRefusal } from '@/lib/remote-timeouts';
+import { REMOTE_TIMEOUT_DEFAULT_MS, REMOTE_TIMEOUT_KEY, REMOTE_TIMEOUT_MAX_MS, remoteTimeoutRefusal } from '@/lib/remote-timeouts';
 
 const log = createLogger('fleet-config');
 
@@ -78,19 +78,22 @@ const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|mutation|browser
 /**
  * What the Portfolio Scrum Master's verified tab may write besides the admin token (ADR-0045): the WIP cap and the
  * plain-create mode of a workspace in its selection, a host's tab ceiling, and (ADR-0047, owner order) a known host's
- * callback URL, whose value names the tailnet only (`checkScrumMasterValue`). Not `pool.mode`, the gate and build
- * slots, the fleet-wide cap, `remote.tailnet-suffix`, `remote.hosts`, nor any reserve, budget or envelope key: those
- * stay with the admin token.
+ * callback URL, whose value names the tailnet only (`checkScrumMasterValue`), and a known host's ssh budget
+ * `remote.timeout-ms.<host>` in the bounds every writer obeys (ADR-0047 amendment, ticket PMUX-PSM-TIMEOUT-RIGHT). Not
+ * `pool.mode`, the gate and build slots, the fleet-wide cap, the fleet-wide `remote.timeout-ms`,
+ * `remote.tailnet-suffix`, `remote.hosts`, nor any reserve, budget or envelope key: those stay with the admin token.
  */
 const SCRUM_MASTER_KEYS: readonly { re: RegExp; workspace: boolean }[] = [
   { re: /^tabs\.cap-per-workspace\.([A-Za-z0-9_-]+)$/, workspace: true },
   { re: TAB_PLACE_KEY, workspace: true },
   { re: /^pool\.slots\.[a-z0-9._-]+\.tab$/, workspace: false },
   { re: /^remote\.callback-url\.[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/, workspace: false },
+  { re: /^remote\.timeout-ms\.[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/, workspace: false },
 ];
 
 export const SCRUM_MASTER_KEY_FORMS = 'tabs.cap-per-workspace.<workspaceId>, pool.tab-place.<workspaceId> (a workspace in the portfolio selection), '
-  + 'pool.slots.<host>.tab or remote.callback-url.<host> (a host on remote.hosts, a tailnet URL)';
+  + 'pool.slots.<host>.tab, remote.callback-url.<host> (a host on remote.hosts, a tailnet URL) or remote.timeout-ms.<host> '
+  + `(a host on remote.hosts, whole ms ${REMOTE_TIMEOUT_DEFAULT_MS}..${REMOTE_TIMEOUT_MAX_MS})`;
 
 /** The key's Scrum Master form, and the workspace it names; null when the Scrum Master may not write it. */
 export const scrumMasterKey = (key: string): { workspaceId: string | null } | null => {
@@ -336,18 +339,24 @@ const requireWriter = async (caller: ICaller, authority: IFleetConfigAuthority, 
   throw new WriteRefusal('forbidden', 'not-writer', "fleet config is written by the admin token or the workspace's enabled orchestrator tab");
 };
 
+/** The per-host remote keys the Portfolio Scrum Master writes (ADR-0047): each names a host on `remote.hosts`. */
+const SCRUM_MASTER_HOST_KEYS = [REMOTE_CALLBACK_URL_KEY, REMOTE_TIMEOUT_KEY] as const;
+
 /**
- * A Portfolio Scrum Master's value (ADR-0047), inside the store lock: a callback URL names a host on `remote.hosts` and
- * the tailnet only (`scrumMasterCallbackRefusal`). The admin token never reaches this check.
+ * A Portfolio Scrum Master's value (ADR-0047), inside the store lock: a per-host remote key names a host on
+ * `remote.hosts`; a callback URL names the tailnet only (`scrumMasterCallbackRefusal`). A timeout's bounds
+ * (5000..120000 whole ms) are the ones `checkRemoteValue` holds every writer to. The admin token never reaches this check.
  */
 const checkScrumMasterValue = (writer: IWriter, key: string, value: string, state: IFleetConfigState): void => {
-  if (!writer.scrumMaster || !key.startsWith(`${REMOTE_CALLBACK_URL_KEY}.`)) return;
+  const prefix = SCRUM_MASTER_HOST_KEYS.find((k) => key.startsWith(`${k}.`));
+  if (!writer.scrumMaster || !prefix) return;
   const { snapshot } = writer.scrumMaster;
-  const host = key.slice(REMOTE_CALLBACK_URL_KEY.length + 1);
+  const host = key.slice(prefix.length + 1);
   const hosts = parseRemoteHosts(valueOf(state, REMOTE_HOSTS_KEY)?.value);
   if (!hosts.includes(host)) {
     throw new WriteRefusal('config-invalid', 'unknown-host', `${key} names ${host}, which is not on ${REMOTE_HOSTS_KEY} (${hosts.join(', ') || 'none'}); the admin token writes it (ADR-0047)`, snapshot);
   }
+  if (prefix !== REMOTE_CALLBACK_URL_KEY) return;
   const suffix = valueOf(state, REMOTE_TAILNET_SUFFIX_KEY)?.value ?? null;
   const refusal = scrumMasterCallbackRefusal(value, suffix);
   if (refusal) throw new WriteRefusal('config-invalid', 'outside-tailnet', `${key}: ${refusal} (ADR-0047)`, snapshot);

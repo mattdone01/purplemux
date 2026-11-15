@@ -3966,7 +3966,9 @@ Commands:
                                            pool.slots.<host>.tab, with --reason and --expect-version (ADR-0045),
                                            and remote.callback-url.<host> for a host on remote.hosts, whose value
                                            names the tailnet: http(s)://<name>.<remote.tailnet-suffix>:<port> or
-                                           http(s)://<100.64.0.0/10 address>:<port> (ADR-0047)
+                                           http(s)://<100.64.0.0/10 address>:<port> (ADR-0047), and
+                                           remote.timeout-ms.<host> for a host on remote.hosts, whole ms
+                                           5000..120000 (ADR-0047 amendment)
   config unset KEY [--expect-version N] [--reason TEXT]
                                            Remove a value (same authority); exit 7 when unset
   config history [KEY] [--json]            The last 200 changes: when, key, old -> new, version, who

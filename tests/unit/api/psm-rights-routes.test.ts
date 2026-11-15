@@ -237,3 +237,52 @@ describe('note show (ADR-0047)', () => {
     expect(notes.show).toHaveBeenCalledWith(expect.anything(), 'n-abc123', []);
   });
 });
+
+// ADR-0047 amendment (ticket PMUX-PSM-TIMEOUT-RIGHT): config set remote.timeout-ms.<host> through the real route and
+// the real Scrum Master predicate. The fleet store lives under the test home.
+describe('config set remote.timeout-ms.<host> (ADR-0047 amendment)', () => {
+  const configRoute = () => import('@/pages/api/cli/fleet-config/[key]');
+  const KEY = 'remote.timeout-ms.host-b';
+  const put = (key: string, body: Record<string, unknown>) => call(configRoute, 'PUT', { key }, body);
+  beforeEach(async () => {
+    delete (globalThis as Record<string, unknown>).__ptFleetConfigLock;
+    state.scope = ADMIN;
+    expect((await put('remote.hosts', { value: 'host-b,host-c' })).status).toBe(200);
+    audit.entries.length = 0;
+  });
+
+  it('the Scrum Master sets a known host\'s budget in bounds, with a reason and the version it read: audited with its role', async () => {
+    state.scope = SM;
+    const got = await put(KEY, { value: '15000', reason: 'tmux calls pass 5 s under load', expectedVersion: 0 });
+    expect(got.status).toBe(200);
+    expect(got.body).toMatchObject({ key: KEY, version: 1, value: { value: '15000', setBy: { role: 'portfolio-scrum-master' } } });
+    expect(audit.entries.at(-1)).toMatchObject({ event: 'fleet-config-set', key: KEY, reason: 'tmux calls pass 5 s under load',
+      by: expect.objectContaining({ role: 'portfolio-scrum-master' }), selection: expect.objectContaining({ managerTabId: 'tab-sm' }) });
+  });
+
+  it.each([
+    ['out of bounds', KEY, { value: '4999', reason: 'r', expectedVersion: 0 }, 400, 'config-invalid'],
+    ['over the maximum', KEY, { value: '120001', reason: 'r', expectedVersion: 0 }, 400, 'config-invalid'],
+    ['with no reason', KEY, { value: '15000', expectedVersion: 0 }, 400, 'config-invalid'],
+    ['with a stale version', KEY, { value: '15000', reason: 'r', expectedVersion: 3 }, 409, 'config-version-conflict'],
+    ['for an unknown host', 'remote.timeout-ms.host-z', { value: '15000', reason: 'r', expectedVersion: 0 }, 400, 'config-invalid'],
+    ['for the fleet-wide key', 'remote.timeout-ms', { value: '15000', reason: 'r', expectedVersion: 0 }, 403, 'forbidden'],
+  ])('refuses the Scrum Master %s', async (_label, key, body, status, code) => {
+    state.scope = SM;
+    const got = await put(key, body);
+    expect(got).toMatchObject({ status, body: { code } });
+    expect(audit.entries.at(-1)).toMatchObject({ event: 'fleet-config-refused', by: expect.objectContaining({ role: 'portfolio-scrum-master' }) });
+  });
+
+  it.each(REFUSED)('refuses %s: 403, nothing written', async (_label, scope) => {
+    state.scope = scope;
+    expect(await put(KEY, { value: '15000', reason: 'r', expectedVersion: 0 })).toMatchObject({ status: 403, body: { code: 'forbidden' } });
+    state.scope = ADMIN;
+    expect((await call(configRoute, 'DELETE', { key: KEY }, {})).status).toBe(404);
+  });
+
+  it('the admin token is unchanged: any host, no reason or version', async () => {
+    state.scope = ADMIN;
+    expect(await put('remote.timeout-ms.host-z', { value: '30000' })).toMatchObject({ status: 200, body: { version: 1 } });
+  });
+});
