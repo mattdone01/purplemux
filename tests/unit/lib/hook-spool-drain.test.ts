@@ -779,6 +779,42 @@ describe('drainHookSpool (ADR-0020)', () => {
     expect(await fs.readdir(spoolDir())).toEqual([]);
   });
 
+  // PMUX-STUCK-BUSY: each spooled entry says why the hook spooled it; the drain counts the reasons in its summary line
+  // and logs each replayed stop with its reason, so a lost turn end can be traced to the failed POST.
+  it('logs each replayed stop with why it spooled, and counts every reason in the summary line', async () => {
+    const { apply } = collect();
+    const now = Date.now();
+    const write = async (at: number, query: string, why?: string) => {
+      await fs.mkdir(spoolDir(), { recursive: true });
+      const name = `${at}-${4000 + (at % 1000)}-0a0b0c0d.json`;
+      await fs.writeFile(path.join(spoolDir(), name), `${JSON.stringify({ v: 1, at, session: 'pt-s', query, ...(why ? { why } : {}), body: {} })}\n`);
+      return name;
+    };
+    const stopFile = await write(now - 3_000, 'kind=stop&session=pt-s', '7:000');
+    await write(now - 2_000, 'remote=claude&event=stop&session=pt-s', '0:503');
+    await write(now - 1_000, 'remote=claude&event=prompt-submit&session=pt-s');
+
+    expect(await drain(apply, { now })).toMatchObject({ applied: 3 });
+
+    const stops = logs.lines.filter((line) => line.msg === 'replaying a spooled stop');
+    expect(stops.map((line) => line.fields)).toEqual([
+      { file: stopFile, session: 'pt-s', at: now - 3_000, pulledAt: null, why: '7:000' },
+      expect.objectContaining({ at: now - 2_000, why: '0:503' }),
+    ]);
+    const summary = logs.lines.find((line) => line.msg.startsWith('replayed 3 spooled hook event'));
+    expect(summary?.fields).toMatchObject({ spooledBecause: { 'curl-7': 1, 'http-5xx': 1, unknown: 1 } });
+  });
+
+  it('spoolReasonClass keeps the count bounded; parseSpooledHook takes only a plain reason', async () => {
+    const { parseSpooledHook, spoolReasonClass } = await import('@/lib/hook-spool');
+    expect([null, 'no-url', 'no-token', 'no-curl', '7:000', '6:000', '28:000', '127:', '99:000', '0:503', '0:404', '0:308', '0:', '0:200x', 'weird']
+      .map(spoolReasonClass))
+      .toEqual(['unknown', 'no-url', 'no-token', 'no-curl', 'curl-7', 'curl-6', 'curl-28', 'curl-127', 'curl-other', 'http-5xx', 'http-4xx', 'http-3xx', 'http-none', 'other', 'other']);
+    const parse = (why: unknown) => parseSpooledHook(JSON.stringify({ v: 1, at: 5, session: 's', query: '', body: null, why }))?.why;
+    expect(parse('7:000')).toBe('7:000');
+    expect([undefined, 7, 'A:B', 'x'.repeat(33), '7:000"', ''].map(parse)).toEqual([null, null, null, null, null, null]);
+  });
+
   it('moves a file that fails to parse to bad/, and still applies the rest', async () => {
     const { seen, apply } = collect();
     const now = Date.now();
@@ -1067,5 +1103,233 @@ describe('server boot wiring (ADR-0020)', () => {
     expect(server).toContain('  await gracefulStatusShutdown();');
     expect(server).not.toContain('await getStatusManager().drainHookSpool()');
     expect(server).not.toContain('await getStatusManager().startBootHookSpoolDrains()');
+  });
+});
+
+// PMUX-STUCK-BUSY: a remote tab's stop spooled; Claude's idle notification about 60 s later posted live and raised the
+// floor although it applied no state; the stop then replayed under that floor, history only, and the tab stayed busy
+// for hours. ADR-0020 §4 (amended): only an event that applies a state raises the floor; a stop under a floor that no
+// newer state event set still ends a busy turn; a busy tab whose pane shows an idle prompt is reconciled.
+describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
+  type TInternals = {
+    tabs: Map<string, ITabStatusEntry>;
+    stuckNudgedTabs: Map<string, number>;
+    idleReconcileReadAt: Map<string, number>;
+    stopGate: { decisions: Map<string, unknown> };
+    looksStalled: (tabId: string, entry: ITabStatusEntry, now: number) => Promise<boolean>;
+    takeRemoteCapture: (host: string, session: string) => string | null | undefined;
+    reconcileIdlePrompt: (tabId: string, entry: ITabStatusEntry, now: number) => Promise<{ outcome: string; stalled?: boolean }>;
+  };
+  const inner = (manager: StatusManager) => manager as unknown as TInternals;
+  const fixture = async (name: string) => fs.readFile(path.join(__dirname, '../../fixtures/panes', name), 'utf-8');
+  const busyEntry = (over: Partial<ITabStatusEntry> = {}): ITabStatusEntry => ({
+    cliState: 'busy', workspaceId: 'ws-1', tabName: 'w', tmuxSession: 'tmux-w', panelType: 'claude-code',
+    agentProviderId: 'claude', jsonlPath: null, lastEvent: { name: 'prompt-submit', at: Date.now() - 120_000, seq: 1 }, eventSeq: 1,
+    ...over,
+  });
+  const logged = (text: string) => logs.lines.filter((line) => line.msg.includes(text));
+
+  it('a live non-input notification raises no floor: the stop spooled before it replays and ends the turn', async () => {
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    const entry = busyEntry();
+    manager.registerTab('w', entry);
+    const stopAt = Date.now() - 61_000;
+    manager.updateTabFromHook('tmux-w', 'notification', 'idle_prompt');
+    expect(entry.cliState).toBe('busy');
+    await spoolEvent(stopAt, claudeStop());
+
+    await manager.drainHookSpool();
+
+    await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
+    expect(entry.lastEvent).toMatchObject({ name: 'stop', at: stopAt });
+    expect(manager.getHookHistory('w').find((item) => item.event === 'stop')).toEqual({ event: 'stop', at: stopAt, replayed: true, stale: false });
+    await manager.shutdown();
+    expect(JSON.parse(await fs.readFile(path.join(spoolDir(), '.floors.json'), 'utf-8'))).toEqual({ w: stopAt });
+  });
+
+  it('a stop under a floor the old rule saved still ends the busy turn when no newer state event was applied: logged', async () => {
+    const floor = Date.now() - 30_000;
+    await fs.mkdir(spoolDir(), { recursive: true });
+    await fs.writeFile(path.join(spoolDir(), '.floors.json'), JSON.stringify({ w: floor }));
+    state.tabs = [tab('w')];
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    const entry = inner(manager).tabs.get('w')!;
+    Object.assign(entry, { cliState: 'busy', agentProviderId: 'claude', lastEvent: { name: 'prompt-submit', at: floor - 120_000, seq: 1 }, eventSeq: 1 });
+    await spoolEvent(floor - 60_000, claudeStop());
+
+    await manager.drainHookSpool();
+
+    await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
+    expect(logged('replayed stop under the floor applied')).toHaveLength(1);
+    expect(logged('replayed stop under the floor applied')[0].fields).toMatchObject({ tabId: 'w', event: 'stop', at: floor - 60_000, floor });
+  });
+
+  describe('the rescue holds only for a stop that is still the newest state event of a busy tab', () => {
+    const T0 = () => Date.now() - 120_000;
+    const setup = async (over: Partial<ITabStatusEntry> = {}) => {
+      const { manager } = await managerWithPaste();
+      await manager.init();
+      const entry = busyEntry({ lastEvent: { name: 'prompt-submit', at: T0(), seq: 1 }, ...over });
+      manager.registerTab('w', entry);
+      // A live compaction event raises the floor to now and applies no busy-ending state.
+      manager.updateTabFromHook('tmux-w', 'post-compact');
+      return { manager, entry };
+    };
+    const replayStop = (manager: StatusManager, at: number) => manager.handleProviderEvent('claude', 'tmux-w', { kind: 'stop' }, at, { replayed: true });
+
+    it('applies a stop strictly after the latest state event', async () => {
+      const { manager, entry } = await setup();
+      const at = entry.lastEvent!.at + 1;
+      replayStop(manager, at);
+      await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
+      expect(entry.lastEvent).toMatchObject({ name: 'stop', at });
+    });
+
+    it.each([
+      ['at the same time as the latest state event (strict)', {}, (e: ITabStatusEntry) => e.lastEvent!.at],
+      ['before the agent launch', { lastResumeOrStartedAt: Date.now() - 10_000 }, (e: ITabStatusEntry) => e.lastEvent!.at + 1],
+      ['with no latest state event (a restart)', { lastEvent: null }, () => Date.now() - 60_000],
+      ['of a tab that waits on its human (needs-input)', { cliState: 'needs-input' as const }, (e: ITabStatusEntry) => e.lastEvent!.at + 1],
+    ])('keeps history only for a stop %s', async (_label, over, atOf) => {
+      const { manager, entry } = await setup(over as Partial<ITabStatusEntry>);
+      const stateBefore = entry.cliState;
+      const at = atOf(entry);
+      replayStop(manager, at);
+      await settle();
+      expect(entry.cliState).toBe(stateBefore);
+      expect(manager.getHookHistory('w').find((item) => item.event === 'stop')).toMatchObject({ at, stale: true });
+    });
+
+    it('keeps history only for a stop older than a newer live prompt', async () => {
+      const { manager, entry } = await setup();
+      const stopAt = Date.now() - 30_000;
+      manager.updateTabFromHook('tmux-w', 'prompt-submit');
+      replayStop(manager, stopAt);
+      await settle();
+      expect(entry.cliState).toBe('busy');
+      expect(manager.getHookHistory('w').find((item) => item.event === 'stop')).toMatchObject({ at: stopAt, stale: true });
+    });
+
+    it('keeps history only for a local stop past the replay window, even when it would be the newest state event', async () => {
+      const { HOOK_REPLAY_WINDOW_MS } = await import('@/lib/hook-spool');
+      const old = Date.now() - HOOK_REPLAY_WINDOW_MS - 60_000;
+      const { manager, entry } = await setup({ lastEvent: { name: 'prompt-submit', at: old - 60_000, seq: 1 } });
+      replayStop(manager, old);
+      await settle();
+      expect(entry.cliState).toBe('busy');
+    });
+  });
+
+  it('a stop filed history only leaves no held stop decision behind for a later stop', async () => {
+    const { manager } = await managerWithPaste();
+    await manager.init();
+    const entry = busyEntry({ cliState: 'idle' });
+    manager.registerTab('w', entry);
+    manager.updateTabFromHook('tmux-w', 'prompt-submit');
+    manager.updateTabFromHook('tmux-w', 'stop');
+    await waitFor(() => expect(entry.cliState).not.toBe('busy'));
+    await spoolEvent(Date.now() - 60_000, { hook_event_name: 'Stop' }, 'kind=stop&session=tmux-w');
+
+    await manager.drainHookSpool();
+
+    expect(manager.getHookHistory('w').filter((item) => item.event === 'stop' && item.stale)).toHaveLength(1);
+    expect(inner(manager).stopGate.decisions.has('w')).toBe(false);
+  });
+
+  describe('the busy reconcile reads the pane of a stalled Claude tab', () => {
+    const OLD = () => Date.now() - 11 * 60_000;
+    const setup = async (over: Partial<ITabStatusEntry> = {}, stalled = true) => {
+      const { manager, paste } = await managerWithPaste();
+      await manager.init();
+      const entry = busyEntry({ lastEvent: { name: 'prompt-submit', at: OLD(), seq: 1 }, ...over });
+      manager.registerTab('w', entry);
+      const stall = vi.spyOn(inner(manager), 'looksStalled').mockResolvedValue(stalled);
+      const tmux = await import('@/lib/tmux');
+      const capture = vi.mocked(tmux.capturePaneContent);
+      return { manager, entry, stall, capture, paste };
+    };
+
+    it('an idle prompt and a quiet transcript: a synthetic live stop classifies the turn, logged; a late replay of the lost stop is history only', async () => {
+      const { manager, entry, capture } = await setup();
+      capture.mockResolvedValue(await fixture('claude-empty-composer.ansi'));
+      const lostStopAt = Date.now() - 10 * 60_000;
+
+      expect(await inner(manager).reconcileIdlePrompt('w', entry, Date.now())).toEqual({ outcome: 'reconciled', stalled: true });
+
+      await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
+      expect(entry.lastEvent?.name).toBe('stop');
+      expect(logged('busy reconciled')).toHaveLength(1);
+      expect(logged('busy reconciled')[0].fields).toMatchObject({ tabId: 'w', lastEvent: 'prompt-submit' });
+      manager.handleProviderEvent('claude', 'tmux-w', { kind: 'stop' }, lostStopAt, { replayed: true });
+      expect(manager.getHookHistory('w').find((item) => item.at === lostStopAt)).toMatchObject({ stale: true });
+    });
+
+    it('a busy pane (esc to interrupt) stays busy, and the pane is read again only after 5 minutes', async () => {
+      const { manager, entry, capture } = await setup();
+      capture.mockResolvedValue(await fixture('claude-busy-empty-composer.ansi'));
+      const now = Date.now();
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now)).outcome).toBe('not-idle');
+      expect(entry.cliState).toBe('busy');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 4 * 60_000)).outcome).toBe('skipped');
+      expect(capture).toHaveBeenCalledTimes(1);
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 5 * 60_000 + 1)).outcome).toBe('not-idle');
+      expect(capture).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ['a tab WAITING on its own stop', { lastEvent: { name: 'stop' as const, at: Date.now() - 11 * 60_000, seq: 2 }, eventSeq: 2, turnEnd: { kind: 'waiting' as const, at: Date.now() - 11 * 60_000, seq: 2 } }, true],
+      ['a Codex tab', { panelType: 'codex-cli' as const, agentProviderId: 'codex' }, true],
+      ['a tab whose transcript is not quiet', {}, false],
+    ])('never reads the pane of %s', async (_label, over, stalled) => {
+      const { manager, entry, capture } = await setup(over as Partial<ITabStatusEntry>, stalled);
+      capture.mockResolvedValue(await fixture('claude-empty-composer.ansi'));
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, Date.now())).outcome).toBe('skipped');
+      expect(capture).not.toHaveBeenCalled();
+      expect(entry.cliState).toBe('busy');
+    });
+
+    it('a hook that lands while the pane is read decides, not the reading', async () => {
+      const { manager, entry, capture } = await setup();
+      const idle = await fixture('claude-empty-composer.ansi');
+      capture.mockImplementation(async () => {
+        manager.updateTabFromHook('tmux-w', 'prompt-submit');
+        return idle;
+      });
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, Date.now())).outcome).toBe('not-idle');
+      expect(entry.cliState).toBe('busy');
+    });
+
+    it('a remote pane takes two polls: pending first (the throttle not started), then the read reconciles', async () => {
+      const { manager, entry, capture } = await setup({ host: 'remote-a', tmuxSession: 'tmux-w' });
+      const idle = await fixture('claude-empty-composer.ansi');
+      const take = vi.spyOn(inner(manager), 'takeRemoteCapture').mockReturnValueOnce(undefined).mockReturnValueOnce(idle);
+      const now = Date.now();
+      expect(await inner(manager).reconcileIdlePrompt('w', entry, now)).toEqual({ outcome: 'pending', stalled: true });
+      expect(inner(manager).idleReconcileReadAt.has('w')).toBe(false);
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 1_000)).outcome).toBe('reconciled');
+      expect(take).toHaveBeenCalledWith('remote-a', 'tmux-w');
+      expect(capture).not.toHaveBeenCalled();
+      await waitFor(() => expect(entry.cliState).not.toBe('busy'));
+    });
+
+    it('the poll reconciles a tab already nudged as stuck (outside the one-nudge latch), and sends no second stuck nudge', async () => {
+      state.tabs = [tab('w')];
+      const { manager, paste } = await managerWithPaste();
+      await manager.init();
+      const entry = inner(manager).tabs.get('w')!;
+      Object.assign(entry, { cliState: 'busy', agentProviderId: 'claude', lastEvent: { name: 'prompt-submit', at: OLD(), seq: 1 }, eventSeq: 1 });
+      inner(manager).stuckNudgedTabs.set('w', Date.now() - 60 * 60_000);
+      vi.spyOn(inner(manager), 'looksStalled').mockResolvedValue(true);
+      const tmux = await import('@/lib/tmux');
+      vi.mocked(tmux.capturePaneContent).mockResolvedValue(await fixture('claude-empty-composer.ansi'));
+
+      await manager.poll();
+
+      await waitFor(() => expect(entry.cliState).not.toBe('busy'));
+      expect(logged('busy reconciled')).toHaveLength(1);
+      expect(paste.mock.calls.filter(([, message]) => /stuck|STALLED/i.test(message))).toEqual([]);
+    });
   });
 });

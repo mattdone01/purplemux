@@ -57,7 +57,29 @@ export interface ISpooledHook {
   bodyLength: number | null;
   /** A remote hook's event: when this server pulled it from the host's spool (`remote-spool.ts`). */
   pulledAt: number | null;
+  /**
+   * Why the hook spooled the event instead of a delivered POST (PMUX-STUCK-BUSY): `no-url`, `no-token`, `no-curl`, or
+   * `<curl exit>:<http code>` (e.g. `7:000`, `0:503`, `28:000`). Null for an entry a hook without the field wrote.
+   */
+  why: string | null;
 }
+
+const SPOOL_WHY = /^[a-z0-9:-]{1,32}$/;
+const KNOWN_CURL_EXITS = new Set(['3', '5', '6', '7', '28', '35', '52', '56', '60', '127']);
+
+/**
+ * The spool reason as the drain counts it: a fixed set, so a count line stays bounded whatever a hook wrote.
+ * `no-url` / `no-token` / `no-curl`; `http-3xx` / `http-4xx` / `http-5xx` / `http-none` for curl exit 0;
+ * `curl-<exit>` for a named curl exit; `curl-other`; `unknown` (no field); `other`.
+ */
+export const spoolReasonClass = (why: string | null): string => {
+  if (why === null) return 'unknown';
+  if (why === 'no-url' || why === 'no-token' || why === 'no-curl') return why;
+  const m = /^(\d{1,3}):(\d{0,3})$/.exec(why);
+  if (!m) return 'other';
+  if (m[1] !== '0') return KNOWN_CURL_EXITS.has(m[1]) ? `curl-${m[1]}` : 'curl-other';
+  return /^[345]\d\d$/.test(m[2]) ? `http-${m[2][0]}xx` : 'http-none';
+};
 
 export interface IHookSpoolDrainResult {
   applied: number;
@@ -93,7 +115,7 @@ export const parseSpooledHook = (text: string): ISpooledHook | null => {
     return null;
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const { at, session, query, body, bodyDropped, bodyLength, pulledAt } = raw as Record<string, unknown>;
+  const { at, session, query, body, bodyDropped, bodyLength, pulledAt, why } = raw as Record<string, unknown>;
   if (typeof at !== 'number' || !Number.isSafeInteger(at) || at <= 0) return null;
   if (typeof session !== 'string' || typeof query !== 'string' || !('body' in raw)) return null;
   return {
@@ -104,6 +126,7 @@ export const parseSpooledHook = (text: string): ISpooledHook | null => {
     bodyDropped: bodyDropped === true,
     bodyLength: typeof bodyLength === 'number' ? bodyLength : null,
     pulledAt: typeof pulledAt === 'number' && Number.isSafeInteger(pulledAt) && pulledAt > 0 ? pulledAt : null,
+    why: typeof why === 'string' && SPOOL_WHY.test(why) ? why : null,
   };
 };
 
@@ -298,6 +321,8 @@ export const drainHookSpool = async (
   }
 
   let droppedBodyLength = 0;
+  /** Each dispatched entry's spool reason, counted by `spoolReasonClass` (PMUX-STUCK-BUSY). */
+  const reasons: Record<string, number> = {};
   for (const [index, entry] of kept.entries()) {
     if (index > 0 && index % DRAIN_BATCH === 0) await yieldToEventLoop();
     const file = path.join(dir, entry.name);
@@ -337,6 +362,12 @@ export const drainHookSpool = async (
     }
     // A hook clock ahead of the server's must not date an event in the future.
     const query = spooledHookQuery(spooled.query);
+    const reason = spoolReasonClass(spooled.why);
+    reasons[reason] = (reasons[reason] ?? 0) + 1;
+    // A stop is one per turn: each replayed one says why it spooled (PMUX-STUCK-BUSY), so a lost turn end can be traced.
+    if (query.kind === 'stop' || query.event === 'stop') {
+      log.info({ file: entry.name, session: spooled.session, at: spooled.at, pulledAt: spooled.pulledAt, why: spooled.why }, 'replaying a spooled stop');
+    }
     const delivery = { query, body: spooled.body, replayedAt: Math.min(spooled.at, now) };
     const timeoutMs = query.remote ? remoteEventTimeoutMs : eventTimeoutMs;
     const badPath = path.join(dir, HOOK_SPOOL_BAD_DIRNAME, entry.name);
@@ -368,7 +399,7 @@ export const drainHookSpool = async (
     log.info({ metadataOnly: result.metadataOnly, droppedBodyLength }, `hook spool: ${result.metadataOnly} event(s) spooled without their body (too large), not replayed`);
   }
   if (result.applied > 0) {
-    log.info({ applied: result.applied, from: kept[0].at, to: kept[kept.length - 1].at }, `replayed ${result.applied} spooled hook event(s)`);
+    log.info({ applied: result.applied, from: kept[0].at, to: kept[kept.length - 1].at, spooledBecause: reasons }, `replayed ${result.applied} spooled hook event(s)`);
   }
   return result;
 };

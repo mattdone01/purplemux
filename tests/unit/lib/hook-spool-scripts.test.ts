@@ -197,6 +197,45 @@ describe('hook scripts spool an event no server answered (ADR-0020)', () => {
     expect(spoolFiles()).toEqual([]);
   });
 
+  // PMUX-STUCK-BUSY: the spool entry says why the POST was not proven delivered: `<curl exit>:<http code>`, or the
+  // precondition that skipped the POST.
+  it.each([
+    ['a refused connect', REFUSED, 'prompt-submit', '7:000'],
+    ['a 5xx answer', { out: '503 0.000200', exit: 0 }, 'prompt-submit', '0:503'],
+    ['a connect timeout', { out: '000 0.000000', exit: 28 }, 'prompt-submit', '28:000'],
+    ['curl 127 with no code', { out: '', exit: 127 }, 'prompt-submit', '127:'],
+    ['a refused connect on the stop path', REFUSED, 'stop', '7:000'],
+    ['a 4xx on the stop path', { out: '403 0.000200', exit: 0 }, 'stop', '0:403'],
+  ])('records why it spooled: %s', (_label, curl: ICurlBehaviour, event: string, why: string) => {
+    run(HOOK_SCRIPT_CONTENT, [event], '{}', curl);
+    expect(readOnly().why).toBe(why);
+  });
+
+  it('records the skipped precondition: no port, no token, no curl', () => {
+    fs.rmSync(path.join(home, '.purplemux', 'port'));
+    run(HOOK_SCRIPT_CONTENT, ['prompt-submit'], '{}', DELIVERED);
+    expect(readOnly().why).toBe('no-url');
+    fs.rmSync(spool, { recursive: true, force: true });
+    fs.writeFileSync(path.join(home, '.purplemux', 'port'), '8022');
+    fs.rmSync(path.join(home, '.purplemux', 'cli-token'));
+    run(HOOK_SCRIPT_CONTENT, ['stop'], '{}', DELIVERED);
+    expect(readOnly().why).toBe('no-token');
+    fs.rmSync(spool, { recursive: true, force: true });
+    fs.writeFileSync(path.join(home, '.purplemux', 'cli-token'), 'tok');
+    const stub = commandStubPath(path.join(dir, 'stub'));
+    fs.copyFileSync(path.join(bin, 'tmux'), path.join(stub, 'tmux'));
+    fs.chmodSync(path.join(stub, 'tmux'), 0o755);
+    run(HOOK_SCRIPT_CONTENT, ['prompt-submit'], '{}', DELIVERED, { PATH: stub });
+    expect(readOnly().why).toBe('no-curl');
+  });
+
+  it('keeps the reason beside a dropped body, and writes no reason for a delivered POST', () => {
+    run(HOOK_SCRIPT_CONTENT, ['post-tool'], JSON.stringify({ tool_name: 'Write', tool_input: { content: 'x'.repeat(300 * 1024) } }), REFUSED);
+    settle(spoolLanded);
+    const hook = readOnly();
+    expect(hook).toMatchObject({ bodyDropped: true, why: '7:000' });
+  });
+
   it('spools when no server is running at all (the port file is gone), without calling curl', () => {
     fs.rmSync(path.join(home, '.purplemux', 'port'));
     run(HOOK_SCRIPT_CONTENT, ['session-start'], '{"source":"resume"}', DELIVERED);
