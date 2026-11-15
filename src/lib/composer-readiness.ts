@@ -182,6 +182,33 @@ const claudeComposerFrame = (lines: string[]): IClaudeComposerFrame | null => {
   return { box: lines.slice(top + 1, bottom), outside: [...lines.slice(0, top + 1), ...lines.slice(bottom)] };
 };
 
+/** How far up the idle read looks for Claude's busy footer or spinner line. */
+const IDLE_PROMPT_SCAN_LINES = 12;
+const CLAUDE_BUSY_TEXT = /esc to interrupt/i;
+
+/**
+ * Whether a Claude Code pane shows an idle prompt (PMUX-STUCK-BUSY): an empty composer inside its frame of rules, no
+ * option list of either kind outside the box, and no `esc to interrupt` in the last 12 lines. A busy Claude pane also
+ * draws an empty box, with `esc to interrupt` in its footer (fixture `claude-busy-empty-composer.ansi`) or, in older
+ * layouts, on the spinner line above the box; so the empty box alone is never proof. Read only; the capture is the
+ * caller's.
+ *
+ * The risk (PMUX-STUCK-BUSY r2): `esc to interrupt` is the only busy text the measured captures show; no second busy
+ * mark appears on the pane. A Claude release that renames it makes a busy pane read idle here. So this answer alone
+ * never moves a tab: the busy reconcile also needs two reads one poll apart with the same screen (a working TUI
+ * redraws) and a transcript quiet for 10 minutes, so a missed string fails toward "not reconciled".
+ */
+export const paneShowsIdleClaudePrompt = (captured: string | null): boolean => {
+  if (!captured) return false;
+  const plain = paneAsSeen('claude-code', captured);
+  if (CLAUDE_BUSY_TEXT.test(tail(plain, IDLE_PROMPT_SCAN_LINES))) return false;
+  const frame = claudeComposerFrame(tail(plain, COMPOSER_SCAN_LINES).split('\n'));
+  if (!frame) return false;
+  if (frame.box.join('\n').replace(/^[ \t]*❯/, '').trim() !== '') return false;
+  const rest = tail(frame.outside.join('\n'));
+  return parsePermissionOptions(rest).options.length === 0 && parseChoiceOptions(rest).options.length === 0;
+};
+
 /** Text as the sender typed it, compared without any whitespace (a wrap, an indent, a no-break space) or control character. */
 const squashText = (text: string): string => text.replace(/[\x00-\x1f\x7f]/g, '').replace(/[\s\u00a0]+/g, '');
 

@@ -399,7 +399,11 @@ generation) is skipped; a skipped replay is recorded by `recordSkippedReplay` as
   before the scan and drops the floors of tabs that no longer exist.
 - A replayed event older than the floor, or past the replay window, is recorded in
   `getHookHistory(tabId)` with `stale: true` and changes nothing: no `lastEvent`, no `cliState`,
-  no metadata, no broadcast.
+  no metadata, no broadcast. A non-input notification, an unknown event and the provider metadata
+  events never raise the floor (PMUX-STUCK-BUSY). One exception: a replayed `stop`/`interrupt`
+  under the floor (not past the window) of a `busy` tab whose known `lastEvent` is strictly older,
+  after the agent's launch, with no compaction event or tool call after it, applies (`stopEndsBusyTurn`,
+  ADR-0020 §4 amendment).
 - Otherwise it applies like a live event, dated at `at`: `lastEvent.at`, `lastResumeOrStartedAt`,
   `compactingSince`, and a stop's `turnEnd.at`, so the turn end is classified and nudged as it
   would have been and the idle clock counts from the real stop.
@@ -473,6 +477,8 @@ JSONL watcher is also started in the `unknown` state — it does not change `cli
 
 If a `busy` state lasts longer than `BUSY_STUCK_MS` (**10 minutes**) and the agent process has died, silently recover to `idle`. Performed inside the metadata poll loop. Designed to handle dropped `stop` hooks (e.g. SIGKILL).
 
+If the agent still runs, a Claude tab whose transcript is quiet (`looksStalled`) and whose pane shows an idle prompt (`paneShowsIdleClaudePrompt`: an empty framed composer, no option list, no `esc to interrupt`) lost its `stop`: once the pane reads idle twice, one poll apart, with the same screen, `reconcileIdlePrompt` applies one synthetic live `stop`, classified as a real one (waiting, turn error, end-line marker, else `ready-for-review`), and logs `busy reconciled`. A registered job that died speaks first. It runs outside the one-stuck-nudge latch, decides at most every 5 minutes, skips a tab WAITING on its own stop, and holds the stuck nudge while a remote pane read is pending (PMUX-STUCK-BUSY).
+
 ### Agent-Gone Inactive Guard (F1/F2)
 
 For agent tabs in any active state (`busy` / `idle` / `needs-input` / `ready-for-review`), the metadata poll silently transitions to `inactive` only when **all** of the following hold:
@@ -525,7 +531,7 @@ A **metadata-only** poll that does not touch `cliState`.
 - New tab found → `readTabMetadata` loads initial metadata + creates entry
   - Persisted `cliState === 'busy'` → converted to `'unknown'` + `resolveUnknown` scheduled
 - Existing tab → updates process/ports/title/summary (cliState untouched)
-- Busy stuck check → 10 minutes elapsed + Claude process dead → silent `idle`
+- Busy stuck check → 10 minutes elapsed + Claude process dead → silent `idle`; agent alive, transcript quiet, idle prompt on the pane → one synthetic `stop`
 - Deleted tabs → cleanup + `broadcastRemove`
 
 Removing the `cliState` decision and the `hasPermissionPrompt` check has reduced poll cost by roughly 80% compared to pre-Phase 1.

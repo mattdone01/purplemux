@@ -95,8 +95,10 @@ spool_hook() {
   fi
   SPOOL_BODY="\${2:-null}"
   SPOOL_META=""
+  SPOOL_WHY=$(printf '%s' "\${3:-}" | tr -cd 'a-z0-9:-' | cut -c1-32)
+  [ -n "$SPOOL_WHY" ] && SPOOL_META=",\\"why\\":\\"$SPOOL_WHY\\""
   if [ \${#SPOOL_BODY} -gt ${HOOK_SPOOL_MAX_BODY} ]; then
-    SPOOL_META=",\\"bodyDropped\\":true,\\"bodyLength\\":\${#SPOOL_BODY}"
+    SPOOL_META="$SPOOL_META,\\"bodyDropped\\":true,\\"bodyLength\\":\${#SPOOL_BODY}"
     SPOOL_BODY="null"
   fi
   SPOOL_DIR="\${HOOK_SPOOL_DIR:-$HOME/.purplemux/${HOOK_SPOOL_DIRNAME}}"
@@ -119,8 +121,12 @@ post_hook() {
   HOOK_BODY="$2"
   shift 2
   case "$HOOK_TARGET" in *\\?*) HOOK_QUERY="\${HOOK_TARGET#*\\?}" ;; *) HOOK_QUERY="" ;; esac
-  if [ -z "\${HOOK_BASE_URL:-$PORT}" ] || [ -z "$TOKEN" ] || ! command -v curl >/dev/null 2>&1; then
-    spool_hook "$HOOK_QUERY" "$HOOK_BODY"
+  HOOK_SKIP=""
+  [ -z "\${HOOK_BASE_URL:-$PORT}" ] && HOOK_SKIP="no-url"
+  [ -z "$HOOK_SKIP" ] && [ -z "$TOKEN" ] && HOOK_SKIP="no-token"
+  [ -z "$HOOK_SKIP" ] && ! command -v curl >/dev/null 2>&1 && HOOK_SKIP="no-curl"
+  if [ -n "$HOOK_SKIP" ]; then
+    spool_hook "$HOOK_QUERY" "$HOOK_BODY" "$HOOK_SKIP"
     return 0
   fi
   HOOK_RESULT=$(printf '%s' "$HOOK_BODY" | curl -s -X POST -o /dev/null -w '%{http_code} %{time_connect}' \\
@@ -133,8 +139,8 @@ HOOK_HEADERS
   HOOK_HTTP="\${HOOK_RESULT%% *}"
   case "$HOOK_RC:$HOOK_HTTP" in
     0:2[0-9][0-9]|52:*|56:*) ;;
-    28:*) case "\${HOOK_RESULT#* }" in *[1-9]*) ;; *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;; esac ;;
-    *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;;
+    28:*) case "\${HOOK_RESULT#* }" in *[1-9]*) ;; *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" "$HOOK_RC:$HOOK_HTTP" ;; esac ;;
+    *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" "$HOOK_RC:$HOOK_HTTP" ;;
   esac
   return 0
 }
@@ -145,8 +151,12 @@ post_stop() {
   case "$1" in *\\?*) HOOK_TARGET="$1&occurredAt=$AT" ;; *) HOOK_TARGET="$1?occurredAt=$AT" ;; esac
   HOOK_BODY="$2"
   case "$HOOK_TARGET" in *\\?*) HOOK_QUERY="\${HOOK_TARGET#*\\?}" ;; *) HOOK_QUERY="" ;; esac
-  if [ -z "\${HOOK_BASE_URL:-$PORT}" ] || [ -z "$TOKEN" ] || ! command -v curl >/dev/null 2>&1; then
-    spool_hook "$HOOK_QUERY" "$HOOK_BODY"
+  HOOK_SKIP=""
+  [ -z "\${HOOK_BASE_URL:-$PORT}" ] && HOOK_SKIP="no-url"
+  [ -z "$HOOK_SKIP" ] && [ -z "$TOKEN" ] && HOOK_SKIP="no-token"
+  [ -z "$HOOK_SKIP" ] && ! command -v curl >/dev/null 2>&1 && HOOK_SKIP="no-curl"
+  if [ -n "$HOOK_SKIP" ]; then
+    spool_hook "$HOOK_QUERY" "$HOOK_BODY" "$HOOK_SKIP"
     return 0
   fi
   HOOK_OUT=$(printf '%s' "$HOOK_BODY" | curl -s -X POST -w '\\n%{http_code} %{time_connect}' \\
@@ -161,8 +171,8 @@ HOOK_HEADERS
   HOOK_HTTP="\${HOOK_RESULT%% *}"
   case "$HOOK_RC:$HOOK_HTTP" in
     0:2[0-9][0-9]|52:*|56:*) ;;
-    28:*) case "\${HOOK_RESULT#* }" in *[1-9]*) ;; *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;; esac ;;
-    *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" ;;
+    28:*) case "\${HOOK_RESULT#* }" in *[1-9]*) ;; *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" "$HOOK_RC:$HOOK_HTTP" ;; esac ;;
+    *) spool_hook "$HOOK_QUERY" "$HOOK_BODY" "$HOOK_RC:$HOOK_HTTP" ;;
   esac
   return 0
 }`;

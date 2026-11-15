@@ -38,8 +38,8 @@ vi.mock('os', async (importOriginal) => {
   return { ...actual, default: { ...actual, hostname: () => 'host-a' }, hostname: () => 'host-a' };
 });
 
-const spooled = (session: string, query: string, at = 1791660000123) =>
-  Buffer.from(JSON.stringify({ v: 1, at, session, query, body: { session_id: 'x' } })).toString('base64');
+const spooled = (session: string, query: string, at = 1791660000123, why?: string) =>
+  Buffer.from(JSON.stringify({ v: 1, at, session, query, ...(why ? { why } : {}), body: { session_id: 'x' } })).toString('base64');
 const file = (name: string, session: string, query: string) => `file\t${name}\t${spooled(session, query)}`;
 const R = 'pt-ws-a-pane-p-tab-r';
 
@@ -79,6 +79,15 @@ describe('pulling remote hook spools (ADR-0022)', () => {
     const { parseSpooledHook } = await import('@/lib/hook-spool');
     expect(parseSpooledHook(JSON.stringify(taken))?.pulledAt).toBe(taken.pulledAt);
     expect(remote.commands.at(-1)).toBe(`host-b: cd "$HOME/.purplemux-remote/host-a/hook-spool" && rm -f -- '1791660000123-4242-0a1b2c3d.json' '1791660000150-4246-0a1b2c41.json' '1791660000200-4243-0a1b2c3e.json' '1791660000300-4244-0a1b2c3f.json' '1791660000400-4245-0a1b2c40.json'`);
+  });
+
+  it('keeps why the remote hook spooled the event on the copy it takes (PMUX-STUCK-BUSY)', async () => {
+    remote.lines = [`file\t1791660000123-4242-0a1b2c3d.json\t${spooled(R, `remote=claude&event=stop&session=${R}`, 1791660000123, '28:000')}`];
+    const { pullRemoteHookSpools } = await import('@/lib/remote-spool');
+    await pullRemoteHookSpools(dir);
+    const { parseSpooledHook } = await import('@/lib/hook-spool');
+    const taken = parseSpooledHook(await fs.readFile(path.join(dir, '1791660000123-r4242-0a1b2c3d.json'), 'utf-8'));
+    expect(taken?.why).toBe('28:000');
   });
 
   it('audits and logs an oversize file the host moved aside', async () => {

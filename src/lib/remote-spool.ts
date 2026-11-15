@@ -98,7 +98,7 @@ const pullHost = async (host: string, spoolDir: string): Promise<IRemoteSpoolPul
     await fs.mkdir(spoolDir, { recursive: true, mode: 0o700 });
     const local = path.join(spoolDir, `${match[1]}-r${match[2]}-${match[3] || '0'}.json`);
     const tmp = path.join(spoolDir, `.${path.basename(local)}.tmp`);
-    await fs.writeFile(tmp, JSON.stringify({ v: 1, at: hook.at, pulledAt, session: hook.session, query: hook.query, body: hook.body, ...(hook.bodyDropped ? { bodyDropped: true, bodyLength: hook.bodyLength } : {}) }), { mode: 0o600 });
+    await fs.writeFile(tmp, JSON.stringify({ v: 1, at: hook.at, pulledAt, session: hook.session, query: hook.query, body: hook.body, ...(hook.bodyDropped ? { bodyDropped: true, bodyLength: hook.bodyLength } : {}), ...(hook.why ? { why: hook.why } : {}) }), { mode: 0o600 });
     await fs.rename(tmp, local);
     result.taken += 1;
   }

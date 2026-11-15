@@ -83,6 +83,13 @@ describe('remote Claude hook script (ADR-0022)', () => {
     expect((fs.statSync(spoolDir()).mode & 0o777)).toBe(0o700);
   });
 
+  it('records why it spooled, as the local hook does (PMUX-STUCK-BUSY)', () => {
+    run('stop', '{"session_id":"0f9e"}', { out: '000 0.000000', exit: 6 });
+    const files = spooled();
+    expect(files).toHaveLength(1);
+    expect(parseSpooledHook(fs.readFileSync(path.join(spoolDir(), files[0]), 'utf-8'))?.why).toBe('6:000');
+  });
+
   // The server cannot have received a request that curl never sent. Measured 2026-11-09: the
   // callback name did not resolve on the remote host, curl exited 6, and every event was lost.
   it.each([
