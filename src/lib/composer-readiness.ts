@@ -192,6 +192,11 @@ const CLAUDE_BUSY_TEXT = /esc to interrupt/i;
  * draws an empty box, with `esc to interrupt` in its footer (fixture `claude-busy-empty-composer.ansi`) or, in older
  * layouts, on the spinner line above the box; so the empty box alone is never proof. Read only; the capture is the
  * caller's.
+ *
+ * The risk (PMUX-STUCK-BUSY r2): `esc to interrupt` is the only busy text the measured captures show; no second busy
+ * mark appears on the pane. A Claude release that renames it makes a busy pane read idle here. So this answer alone
+ * never moves a tab: the busy reconcile also needs two reads one poll apart with the same screen (a working TUI
+ * redraws) and a transcript quiet for 10 minutes, so a missed string fails toward "not reconciled".
  */
 export const paneShowsIdleClaudePrompt = (captured: string | null): boolean => {
   if (!captured) return false;

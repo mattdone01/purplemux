@@ -221,6 +221,10 @@ const TAB_COUNT_LARGE = 21;
 const BUSY_STUCK_MS = 10 * 60 * 1000;
 /** The busy reconcile reads a tab's pane at most this often (PMUX-STUCK-BUSY). */
 const IDLE_RECONCILE_GAP_MS = 5 * 60 * 1000;
+/** A pane as the reconcile compares two reads of it: escapes and trailing blanks dropped, so only a redraw differs. */
+const idleScreenOf = (content: string): string => content
+  .replace(/\x1b\[[0-9;:?]*[A-Za-z]/g, '')
+  .split('\n').map((line) => line.trimEnd()).join('\n').trimEnd();
 const STOP_SETTLE_MS = 500;
 /** Backoff resumes a rate-limited episode gets before its target is nudged (PMUX-REMOTE-RESILIENCE fix 1). */
 export const RATE_LIMIT_MAX_RESUMES = 3;
@@ -443,6 +447,17 @@ export class StatusManager {
    * Cleared when the tab leaves busy or closes. A remote capture asked for and not yet taken sets nothing.
    */
   private readonly idleReconcileReadAt = new Map<string, number>();
+  /**
+   * Tab → the first idle screen the busy reconcile read, awaiting a second identical read one poll later
+   * (PMUX-STUCK-BUSY r2): a working TUI redraws between reads, an idle prompt does not.
+   */
+  private readonly idleReconcileScreen = new Map<string, { screen: string; seq: number | undefined }>();
+  /**
+   * Tab → the time of the latest sign that its agent worked which sets no `lastEvent` (PMUX-STUCK-BUSY r2): an applied
+   * compaction event or a tool call. A stop older than it is never rescued: the agent worked after that stop, so a
+   * newer turn may run whose prompt-submit was lost too.
+   */
+  private readonly workSignAt = new Map<string, number>();
   /** Tab → when it last became `inactive` (runtime only; the fleet panel times the dead agent from it). */
   private inactiveSince = new Map<string, number>();
   private transcriptFallbackLogged = new Set<string>();
@@ -1138,16 +1153,24 @@ export class StatusManager {
 
   /**
    * A stop or interrupt under the floor that still ends the tab's turn (PMUX-STUCK-BUSY, ADR-0020 §4 amendment): the
-   * tab is busy, its latest applied state event is known and strictly older than the stop, and the agent was launched
-   * before it. Only a non-state event raised the floor past it (a floor saved by the rule before this one, or a
-   * compaction event), so no newer observation of the tab exists and the stop is its newest state event. A missing
-   * `lastEvent` (a restart: busy came back through `resolveUnknown`) leaves the floor as the only order: no rescue.
+   * tab is busy, its latest applied state event is known and strictly older than the stop, the agent was launched
+   * before it, and no sign of work (a compaction event, a tool call: `workSignAt`) came after it. A compaction raises
+   * the floor and proves the agent worked after the stop: a newer turn may run whose prompt-submit was lost to the
+   * spool too (r2 CONCERN), so the tab stays busy and the idle-prompt reconcile decides from the pane. What is left is a
+   * floor that only the rule before this one raised (a non-input notification), with no newer observation of the tab.
+   * A missing `lastEvent` (a restart: busy came back through `resolveUnknown`) leaves the floor as the only order.
    */
   private stopEndsBusyTurn(tabId: string, event: string, at: number): boolean {
     if (event !== 'stop' && event !== 'interrupt') return false;
     const entry = this.tabs.get(tabId);
     if (!entry || entry.cliState !== 'busy' || !entry.lastEvent) return false;
-    return entry.lastEvent.at < at && (entry.lastResumeOrStartedAt ?? 0) <= at;
+    const workedAfter = (this.workSignAt.get(tabId) ?? -Infinity) >= at;
+    return !workedAfter && entry.lastEvent.at < at && (entry.lastResumeOrStartedAt ?? 0) <= at;
+  }
+
+  /** A sign the tab's agent worked at `at` that sets no `lastEvent`: a compaction event or a tool call. */
+  private noteWorkSign(tabId: string, at: number): void {
+    if (at > (this.workSignAt.get(tabId) ?? -Infinity)) this.workSignAt.set(tabId, at);
   }
 
   /**
@@ -1543,13 +1566,17 @@ export class StatusManager {
             this.broadcastUpdate(tab.id, existing);
             continue;
           }
+          // A registered job that died speaks first: its completion event, not a stall and not a reconcile (L49,
+          // tab-peo88o; PMUX-STUCK-BUSY r2). Its report holds the tab off STALLED for BUSY_STUCK_MS (`jobEventAt`),
+          // so the reconcile below waits for the tab's answer to it. As before, it is asked only before the stuck nudge.
+          const deadJobSpoke = !this.stuckNudgedTabs.has(tab.id) && await this.reportDeadJobs(tab.id);
+          current();
           // PMUX-STUCK-BUSY: outside the one-nudge latch, so a tab already nudged as stuck is still reconciled.
-          const reconcile = await this.reconcileIdlePrompt(tab.id, existing, now);
+          const reconcile = deadJobSpoke ? { outcome: 'skipped' as const, stalled: undefined } : await this.reconcileIdlePrompt(tab.id, existing, now);
           current();
           if (reconcile.outcome === 'reconciled') continue;
-          // A registered job that died speaks first: its completion event, not a stall (L49, tab-peo88o). A remote
-          // pane read still in flight holds the stuck nudge for the poll that reads it.
-          if (reconcile.outcome !== 'pending' && !this.stuckNudgedTabs.has(tab.id) && !(await this.reportDeadJobs(tab.id))
+          // A pane read still in flight (remote, or the confirming second read) holds the stuck nudge for the poll that reads it.
+          if (!deadJobSpoke && reconcile.outcome !== 'pending' && !this.stuckNudgedTabs.has(tab.id)
               && (reconcile.stalled ?? await this.looksStalled(tab.id, existing, now))) {
             current();
             this.stuckNudgedTabs.set(tab.id, now);
@@ -1651,6 +1678,8 @@ export class StatusManager {
         this.codexLifecycleEpoch.delete(tabId);
         this.stuckNudgedTabs.delete(tabId);
         this.idleReconcileReadAt.delete(tabId);
+        this.idleReconcileScreen.delete(tabId);
+        this.workSignAt.delete(tabId);
         this.clearBackoffResume(tabId);
         this.outages.forget(tabId);
         this.transcriptFallbackLogged.delete(tabId);
@@ -2233,6 +2262,7 @@ export class StatusManager {
     if (newState !== 'busy') {
       this.stuckNudgedTabs.delete(tabId);
       this.idleReconcileReadAt.delete(tabId);
+      this.idleReconcileScreen.delete(tabId);
     }
     if (newState === 'idle' && this.pendingKickoffs.has(tabId)) {
       this.deliverKickoff(tabId);
@@ -2334,6 +2364,7 @@ export class StatusManager {
     if (!entry) return;
     const expectedProvider = getProviderByPanelType(entry.panelType);
     if (expectedProvider && expectedProvider.id !== providerId) return;
+    this.noteWorkSign(tabId, replayedAt ?? Date.now());
     if (isActingTool(activity.tool)) this.turns.toolCall(entry.workspaceId, tabId, providerId, replayedAt ?? Date.now());
 
     const meta = this.tabScopeCache.get(tabId);
@@ -2353,6 +2384,7 @@ export class StatusManager {
     if (!tabId || !entry) return;
     const expectedProvider = getProviderByPanelType(entry.panelType);
     if (expectedProvider && expectedProvider.id !== providerId) return;
+    this.noteWorkSign(tabId, at);
     // Codex starts a turn only with UserPromptSubmit: a tool call with none open belongs to a turn of unknown start.
     this.turns.toolCall(entry.workspaceId, tabId, providerId, at, false);
   }
@@ -2594,7 +2626,8 @@ export class StatusManager {
    * (`paneShowsIdleClaudePrompt`), the reconcile applies a synthetic live `stop`: `applyStopTurnEnd` classifies it as a
    * real stop would be (waiting on open work, a turn error, an end-line marker nudged once, else ready-for-review), and
    * its floor makes a late replay of the lost stop history only. A tab WAITING on its own stop is busy by design and is
-   * never read. One pane read per tab per IDLE_RECONCILE_GAP_MS; a remote read takes two polls (`pending`).
+   * never read. The pane must read idle twice, one poll apart, with the same screen (r2): the first idle read answers
+   * `pending`. After a decision the next read waits IDLE_RECONCILE_GAP_MS; a remote read takes two polls (`pending`).
    * `stalled` carries the stall verdict when it was computed, so the stuck nudge does not read it twice.
    */
   private async reconcileIdlePrompt(tabId: string, entry: ITabStatusEntry, now: number): Promise<{ outcome: 'reconciled' | 'pending' | 'not-idle' | 'skipped'; stalled?: boolean }> {
@@ -2608,9 +2641,26 @@ export class StatusManager {
     const seq = entry.eventSeq;
     const content = entry.host ? this.takeRemoteCapture(entry.host, entry.tmuxSession) : await capturePaneContent(entry.tmuxSession, { escapes: true });
     if (content === undefined) return { outcome: 'pending', stalled };
-    this.idleReconcileReadAt.set(tabId, now);
     // A hook that landed during the read decides, not this reading.
-    if (!paneShowsIdleClaudePrompt(content) || entry.cliState !== 'busy' || entry.eventSeq !== seq) return { outcome: 'not-idle', stalled };
+    if (content === null || !paneShowsIdleClaudePrompt(content) || entry.cliState !== 'busy' || entry.eventSeq !== seq) {
+      this.idleReconcileReadAt.set(tabId, now);
+      this.idleReconcileScreen.delete(tabId);
+      return { outcome: 'not-idle', stalled };
+    }
+    // The second, independent signal (r2 nit 2): the busy footer is one string, `esc to interrupt`. A working TUI redraws
+    // (its output grows, its spinner turns); an idle prompt holds still. So the screen must read idle twice, one poll
+    // apart, and the same both times. A Claude release that drops the string fails toward "not reconciled" while its
+    // screen moves; a busy screen that holds still for a poll AND a transcript quiet for 10 min is the residual risk.
+    const screen = idleScreenOf(content);
+    const first = this.idleReconcileScreen.get(tabId);
+    // A first read, or one taken before a hook event that landed since: this read starts the pair.
+    if (first === undefined || first.seq !== seq) {
+      this.idleReconcileScreen.set(tabId, { screen, seq });
+      return { outcome: 'pending', stalled };
+    }
+    this.idleReconcileScreen.delete(tabId);
+    this.idleReconcileReadAt.set(tabId, now);
+    if (first.screen !== screen) return { outcome: 'not-idle', stalled };
     hookLog.info({ tabId, host: entry.host ?? null, lastEvent: entry.lastEvent.name, lastEventAt: entry.lastEvent.at, busySince: entry.busySince ?? null },
       'busy reconciled: the transcript is quiet and the pane shows an idle prompt; a synthetic stop classifies the lost turn end (PMUX-STUCK-BUSY)');
     this.updateTabFromHook(entry.tmuxSession, 'stop');
@@ -4003,6 +4053,7 @@ export class StatusManager {
 
     if (event === 'pre-compact' || event === 'post-compact') {
       this.raiseHookFloor(tabId, now);
+      this.noteWorkSign(tabId, now);
       hookLog.debug({ tabId, event }, 'compact hook');
       this.setCompacting(tabId, entry, event === 'pre-compact' ? now : null);
       this.contextLifecycle.onCompact(tabId, event === 'pre-compact' ? 'pre' : 'post');
@@ -4017,6 +4068,7 @@ export class StatusManager {
     if (event === 'session-start' && source === 'compact') {
       // No state change, no nudge, no relaunch stamp: the turn goes on.
       this.raiseHookFloor(tabId, now);
+      this.noteWorkSign(tabId, now);
       entry.turnEnd = { kind: 'compacting', at: now, seq: entry.lastEvent?.seq };
       hookLog.debug({ tabId, source, cliState: entry.cliState }, 'compaction session-start: turn continues');
       this.setCompacting(tabId, entry, null);
@@ -4278,6 +4330,8 @@ export class StatusManager {
     }
     this.stuckNudgedTabs.delete(tabId);
     this.idleReconcileReadAt.delete(tabId);
+    this.idleReconcileScreen.delete(tabId);
+    this.workSignAt.delete(tabId);
     this.inactiveSince.delete(tabId);
     this.unreadInactive.delete(tabId);
     this.probeInactive.delete(tabId);

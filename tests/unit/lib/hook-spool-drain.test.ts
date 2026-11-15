@@ -64,12 +64,16 @@ vi.mock('@/lib/providers/codex/launch-lifecycle', async (importOriginal) => ({
     ({ ok: true, value: work({ workspaceId: 'ws-1', tabId: 'c', generation }) })),
   withValidatedLegacyCodexHook: vi.fn(async () => ({ ok: false, reason: 'legacy-model-unverified' })),
 }));
+/** The registered-job reconcile a test may answer (PMUX-STUCK-BUSY r2: a dead job speaks first). */
+const liveness = vi.hoisted(() => ({
+  reconcileJobs: async (_tabId: string, _emit: (event: unknown) => void) => ({ reported: 0, pendingDead: 0 }),
+}));
 vi.mock('@/lib/liveness-manager', () => ({
   getLivenessManager: () => ({
     tick: vi.fn(async () => {}),
     removeTab: vi.fn(),
     statusForTab: vi.fn(async () => ({ probes: [], backgroundJobs: [] })),
-    reconcileJobs: vi.fn(async () => ({ reported: 0, pendingDead: 0 })),
+    reconcileJobs: vi.fn((tabId: string, emit: (event: unknown) => void) => liveness.reconcileJobs(tabId, emit)),
   }),
 }));
 vi.mock('@/lib/lease-sweeper', () => ({ getLeaseSweeper: () => ({ sweep: vi.fn(async () => []) }), setLeaseAgentStateSource: vi.fn() }));
@@ -162,6 +166,7 @@ beforeEach(async () => {
   state.home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-hook-spool-drain-'));
   state.tabs = [];
   logs.lines = [];
+  liveness.reconcileJobs = async () => ({ reported: 0, pendingDead: 0 });
 });
 
 afterEach(async () => {
@@ -1115,6 +1120,8 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
     tabs: Map<string, ITabStatusEntry>;
     stuckNudgedTabs: Map<string, number>;
     idleReconcileReadAt: Map<string, number>;
+    hookFloors: { raise: (tabId: string, at: number) => void };
+    reportDeadJobs: (tabId: string) => Promise<boolean>;
     stopGate: { decisions: Map<string, unknown> };
     looksStalled: (tabId: string, entry: ITabStatusEntry, now: number) => Promise<boolean>;
     takeRemoteCapture: (host: string, session: string) => string | null | undefined;
@@ -1173,8 +1180,8 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
       await manager.init();
       const entry = busyEntry({ lastEvent: { name: 'prompt-submit', at: T0(), seq: 1 }, ...over });
       manager.registerTab('w', entry);
-      // A live compaction event raises the floor to now and applies no busy-ending state.
-      manager.updateTabFromHook('tmux-w', 'post-compact');
+      // A floor the earlier rule raised on a non-state event (a live idle notification): no newer observation of the tab.
+      inner(manager).hookFloors.raise('w', Date.now());
       return { manager, entry };
     };
     const replayStop = (manager: StatusManager, at: number) => manager.handleProviderEvent('claude', 'tmux-w', { kind: 'stop' }, at, { replayed: true });
@@ -1210,6 +1217,35 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
       await settle();
       expect(entry.cliState).toBe('busy');
       expect(manager.getHookHistory('w').find((item) => item.event === 'stop')).toMatchObject({ at: stopAt, stale: true });
+    });
+
+    // r2 CONCERN: (1) turn N ends, its stop is lost to the spool; (2) turn N+1 starts, its prompt-submit is lost too;
+    // (3) the agent auto-compacts in turn N+1 and the live pre-compact raises the floor; (4) the stop replays under it.
+    // The tab works: the stop must not mark it ready. It stays busy; the idle-prompt reconcile decides from the pane.
+    it('keeps a WORKING tab busy: a compaction after the lost stop proves a newer turn (steps 1-4)', async () => {
+      const { manager } = await managerWithPaste();
+      await manager.init();
+      const entry = busyEntry({ lastEvent: { name: 'prompt-submit', at: Date.now() - 300_000, seq: 1 } });
+      manager.registerTab('w', entry);
+      const lostStopAt = Date.now() - 200_000;
+      await spoolEvent(lostStopAt, claudeStop());
+      manager.updateTabFromHook('tmux-w', 'pre-compact');
+
+      await manager.drainHookSpool();
+      await settle();
+
+      expect(entry.cliState).toBe('busy');
+      expect(manager.getHookHistory('w').find((item) => item.event === 'stop')).toEqual({ event: 'stop', at: lostStopAt, replayed: true, stale: true });
+      expect(logged('replayed stop under the floor applied')).toEqual([]);
+    });
+
+    it('keeps a tab busy when a tool call came after the stop, under a floor the earlier rule raised', async () => {
+      const { manager, entry } = await setup();
+      const stopAt = entry.lastEvent!.at + 1;
+      manager.handleToolActivity('claude', 'tmux-w', { tool: 'Bash', paths: [], failed: false } as never);
+      replayStop(manager, stopAt);
+      await settle();
+      expect(entry.cliState).toBe('busy');
     });
 
     it('keeps history only for a local stop past the replay window, even when it would be the newest state event', async () => {
@@ -1256,7 +1292,10 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
       capture.mockResolvedValue(await fixture('claude-empty-composer.ansi'));
       const lostStopAt = Date.now() - 10 * 60_000;
 
-      expect(await inner(manager).reconcileIdlePrompt('w', entry, Date.now())).toEqual({ outcome: 'reconciled', stalled: true });
+      // The first idle read only starts the pair; the second, the same screen, reconciles.
+      expect(await inner(manager).reconcileIdlePrompt('w', entry, Date.now())).toEqual({ outcome: 'pending', stalled: true });
+      expect(entry.cliState).toBe('busy');
+      expect(await inner(manager).reconcileIdlePrompt('w', entry, Date.now() + 1_000)).toEqual({ outcome: 'reconciled', stalled: true });
 
       await waitFor(() => expect(entry.cliState).toBe('ready-for-review'));
       expect(entry.lastEvent?.name).toBe('stop');
@@ -1290,6 +1329,74 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
       expect(entry.cliState).toBe('busy');
     });
 
+    it('two idle reads that differ are not reconciled, and the next decision waits 5 minutes', async () => {
+      const { manager, entry, capture } = await setup();
+      const idle = await fixture('claude-empty-composer.ansi');
+      capture.mockResolvedValueOnce(idle).mockResolvedValueOnce(`${idle.trimEnd()}\nnew output line\n`);
+      const now = Date.now();
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now)).outcome).toBe('pending');
+      // The second read shows another screen: something redrew it.
+      const rule = '─'.repeat(40);
+      capture.mockReset();
+      capture.mockResolvedValueOnce(['✻ Baked for 3s', 'more text', rule, '❯ ', rule, '  ? for shortcuts'].join('\n'));
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 1_000)).outcome).toBe('not-idle');
+      expect(entry.cliState).toBe('busy');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 2_000)).outcome).toBe('skipped');
+    });
+
+    // r2 nit 2, the single-string risk: the busy footer evidence is `esc to interrupt` alone. A Claude release that
+    // renames it shows a busy pane that `paneShowsIdleClaudePrompt` reads as idle. The second read catches a working
+    // TUI because its screen moves (here: the output grows between reads); the failure direction is "not reconciled".
+    it('a busy pane without the busy footer text is not reconciled while its screen moves', async () => {
+      const { manager, entry, capture } = await setup();
+      const rule = '─'.repeat(40);
+      const frame = (lines: string[]) => [...lines, rule, '❯ ', rule, '  ⏵⏵ auto mode on (shift+tab to cycle) · ctrl+c to stop'].join('\n');
+      const { paneShowsIdleClaudePrompt } = await import('@/lib/composer-readiness');
+      expect(paneShowsIdleClaudePrompt(frame(['writing the answer, part 1']))).toBe(true);
+      capture.mockResolvedValueOnce(frame(['writing the answer, part 1'])).mockResolvedValueOnce(frame(['writing the answer, part 1', 'part 2']));
+      const now = Date.now();
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now)).outcome).toBe('pending');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 1_000)).outcome).toBe('not-idle');
+      expect(entry.cliState).toBe('busy');
+      expect(logged('busy reconciled')).toEqual([]);
+    });
+
+    it('a hook event between the two reads starts the pair again', async () => {
+      const { manager, entry, capture } = await setup();
+      capture.mockResolvedValue(await fixture('claude-empty-composer.ansi'));
+      const now = Date.now();
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now)).outcome).toBe('pending');
+      manager.updateTabFromHook('tmux-w', 'notification');
+      entry.cliState = 'busy';
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 1_000)).outcome).toBe('pending');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 2_000)).outcome).toBe('reconciled');
+    });
+
+    it('a dead registered job speaks first: its report reaches the orchestrator, and the pane is not read that poll (L49)', async () => {
+      state.tabs = [tab('root'), tab('w')];
+      const { manager } = await managerWithPaste();
+      await manager.init();
+      const entry = inner(manager).tabs.get('w')!;
+      Object.assign(entry, { cliState: 'busy', agentProviderId: 'claude', lastEvent: { name: 'prompt-submit', at: OLD(), seq: 1 }, eventSeq: 1 });
+      vi.spyOn(inner(manager), 'looksStalled').mockResolvedValue(true);
+      const reconcile = vi.spyOn(inner(manager), 'reconcileIdlePrompt');
+      liveness.reconcileJobs = async (tabId, emit) => {
+        emit({ kind: 'bg-failed', job: { workspaceId: 'ws-1', tabId, pid: 4711, label: 'gate', registeredAt: Date.now() - 60_000 }, exitCode: 2, stderrTail: null });
+        return { reported: 1, pendingDead: 0 };
+      };
+      const tmux = await import('@/lib/tmux');
+      vi.mocked(tmux.capturePaneContent).mockResolvedValue(await fixture('claude-empty-composer.ansi'));
+
+      await manager.poll();
+
+      await waitFor(() => expect(logged('liveness nudge').map((line) => line.fields)).toEqual([
+        // Routed to the orchestrator as a job report (a digest the tab-event router holds for its next prompt).
+        expect.objectContaining({ tabId: 'w', kind: 'bg-failed', targetTabId: 'root', wakeClass: 'digest' }),
+      ]));
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(entry.cliState).toBe('busy');
+    });
+
     it('a hook that lands while the pane is read decides, not the reading', async () => {
       const { manager, entry, capture } = await setup();
       const idle = await fixture('claude-empty-composer.ansi');
@@ -1304,11 +1411,14 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
     it('a remote pane takes two polls: pending first (the throttle not started), then the read reconciles', async () => {
       const { manager, entry, capture } = await setup({ host: 'remote-a', tmuxSession: 'tmux-w' });
       const idle = await fixture('claude-empty-composer.ansi');
-      const take = vi.spyOn(inner(manager), 'takeRemoteCapture').mockReturnValueOnce(undefined).mockReturnValueOnce(idle);
+      const take = vi.spyOn(inner(manager), 'takeRemoteCapture')
+        .mockReturnValueOnce(undefined).mockReturnValueOnce(idle).mockReturnValueOnce(undefined).mockReturnValueOnce(idle);
       const now = Date.now();
       expect(await inner(manager).reconcileIdlePrompt('w', entry, now)).toEqual({ outcome: 'pending', stalled: true });
       expect(inner(manager).idleReconcileReadAt.has('w')).toBe(false);
-      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 1_000)).outcome).toBe('reconciled');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 1_000)).outcome).toBe('pending');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 2_000)).outcome).toBe('pending');
+      expect((await inner(manager).reconcileIdlePrompt('w', entry, now + 3_000)).outcome).toBe('reconciled');
       expect(take).toHaveBeenCalledWith('remote-a', 'tmux-w');
       expect(capture).not.toHaveBeenCalled();
       await waitFor(() => expect(entry.cliState).not.toBe('busy'));
@@ -1325,6 +1435,8 @@ describe('a lost turn end never leaves a tab busy (PMUX-STUCK-BUSY)', () => {
       const tmux = await import('@/lib/tmux');
       vi.mocked(tmux.capturePaneContent).mockResolvedValue(await fixture('claude-empty-composer.ansi'));
 
+      await manager.poll();
+      expect(entry.cliState).toBe('busy');
       await manager.poll();
 
       await waitFor(() => expect(entry.cliState).not.toBe('busy'));

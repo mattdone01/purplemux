@@ -37,13 +37,15 @@ Every agent state change reaches the server as a hook POST (`status-hook.sh`, `c
    and the provider metadata events (`summary-update`, `last-user-message`) are ordered against it and never raise it;
    the compaction events and the compaction `session-start` still raise it. (b) A replayed `stop` or `interrupt` under
    the floor (not past the replay window) still applies when the tab is `busy`, its `lastEvent` is known and strictly
-   older than the stop, and the agent launched before it: the stop is then the tab's newest state event, and only a
-   non-state event (a floor saved by the earlier rule, or a compaction event) put the floor past it. A missing
-   `lastEvent` (after a restart) leaves the floor as the only order. One info line names each such stop. A stop filed
+   older than the stop, the agent launched before it, and no compaction event or tool call came after it (round 2: a
+   compaction raises the floor and proves the agent worked after the stop, so a newer turn may run whose prompt-submit
+   was lost too; such a tab stays busy and (c) decides from the pane). What is left is a floor that the earlier rule
+   raised on a non-state event, with no newer observation of the tab. A missing `lastEvent` (after a restart) leaves
+   the floor as the only order. One info line names each such stop. A stop filed
    history only also drops its held stop decision. (c) A Claude tab busy past `BUSY_STUCK_MS` with a quiet transcript
-   whose pane shows an idle prompt (an empty framed composer, no option list, no `esc to interrupt`) gets one synthetic
-   live `stop`, classified as a real one; it runs outside the one-stuck-nudge latch, reads a pane at most every 5 min,
-   and is logged. Each spool entry also carries `why` (`no-url`, `no-token`, `no-curl` or `<curl exit>:<http code>`);
+   whose pane shows an idle prompt (an empty framed composer, no option list, no `esc to interrupt`) twice, one poll
+   apart, with the same screen, gets one synthetic live `stop`, classified as a real one. A registered job that died
+   speaks first. It runs outside the one-stuck-nudge latch, decides at most every 5 min, and is logged. Each spool entry also carries `why` (`no-url`, `no-token`, `no-curl` or `<curl exit>:<http code>`);
    the drain logs each replayed stop with it and counts the reasons.
 
    Not every spool file comes from a gap. A 5xx answer, or a connect that never finishes (curl 28 with `time_connect` 0), spools while a server is up. That server drains the file at its next poll against its in-memory floor, which is correct. The edge: the server crashes (no graceful shutdown, so no final save) before that poll. The saved floor can then be up to 5 s behind the events it applied live, and the next server can replay such a file although a live event of those last 5 s was newer, so that older event overwrites the newer state once. The next live hook of the tab, or `resolveUnknown` for a tab left `busy`, corrects it. It needs a 5xx or a stalled connect and a crash within one poll interval; it is accepted, not fixed. The one accepted edge: a replayed metadata patch that is older than a live metadata patch, with no live state event between them, restores the older summary or last user message until the next hook of that tab.
@@ -51,7 +53,7 @@ Every agent state change reaches the server as a hook POST (`status-hook.sh`, `c
 
 ## Consequences
 - A restart through `deploy-live.sh` into a release with this ADR loses no hook event from a purplemux tab that fired while no server answered. Two cases are still lost: an event whose POST the exiting server cut (curl 52/56), and an event spooled around a rollback into an older release (set aside, not replayed). In both cases the tab is rebuilt from the process and the transcript, as before.
-- A replay never overwrites a newer applied STATE event, across restarts too, and never repeats an end-line nudge: an older stop is history only, and a repeated end line is not re-sent. The one exception (§4 amendment, PMUX-STUCK-BUSY): a stop under a floor that only a non-state event raised still ends a busy turn, because no newer state event of that tab exists.
+- A replay never overwrites a newer applied STATE event, across restarts too, and never repeats an end-line nudge: an older stop is history only, and a repeated end line is not re-sent. The one exception (§4 amendment, PMUX-STUCK-BUSY): a stop under a floor that the earlier rule raised on a non-state event still ends a busy turn, when no newer state event, compaction event or tool call of that tab exists.
 - The pre-installed scripts post the same headers, URL and body as the old ones, but the Claude post-tool body now goes on stdin rather than as a `-d` argument. Bodies over the 128 KiB argument limit used to fail before curl ran; now they reach the server. That is harmless: the tool parser reads only the paths and the command.
 - Anyone who can write `~/.purplemux/hook-spool/` can inject hook events without the CLI token. That user can already read `~/.purplemux/cli-token`, so the spool adds no new authority.
 - The spool is bounded only by a draining server. While none runs (a long rollback), the writer-side limits (no PreToolUse, metadata-only large bodies) keep it small, and the next drain prunes it.
