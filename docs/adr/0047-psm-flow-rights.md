@@ -60,6 +60,13 @@ between the Scrum Master proof and the lock refuses the action, and nothing is w
 403 `selection-changed` for the retry). The gap ADR-0045 states remains: a respawn of the manager tab between the proof
 and the lock is not seen by the compare, which reads the selection only. A note show is a read and holds no lock.
 
+**Amendment, 15 Nov 2026 (ticket PMUX-PSM-TIMEOUT-RIGHT):** the Scrum Master also writes `remote.timeout-ms.<host>`
+for a host on `remote.hosts`, in the shape of item 1: a reason (1..500), the version it read, the in-lock selection
+re-check, setBy role `portfolio-scrum-master`, and the bound every writer obeys (whole ms 5000..120000, vel-D61). A host
+outside `remote.hosts` is refused as `unknown-host`. The fleet value `remote.timeout-ms` stays admin-only. Why: under load
+a tmux call on a remote host passes the 5 s default, the host is marked "did not answer" and skipped, and tab sends fail;
+the per-host budget is the Scrum Master's flow knob.
+
 ## Why
 
 The owner ordered it, for the Scrum Master alone. The value guard on the callback URL keeps the one new write that
@@ -69,7 +76,7 @@ note) and stay inside the selection where a workspace is named.
 
 ## What does not change
 
-`remote.hosts`, `remote.tailnet-suffix`, `remote.callback-url` (the fleet value), `remote.timeout-ms.*`, `pool.mode`,
+`remote.hosts`, `remote.tailnet-suffix`, `remote.callback-url` (the fleet value), `remote.timeout-ms` (the fleet value), `pool.mode`,
 the gate and build slots, the fleet cap, and every other admin-only key stay with the admin token. Like every
 fleet-config rule, this is cooperative authority, not a security boundary (C-312 class): every agent can read the
 admin token.
