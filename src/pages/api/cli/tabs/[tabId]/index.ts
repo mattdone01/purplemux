@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { authorizeWorkspace, authorizeWorkspaceInput, findTab } from '@/lib/cli-utils';
-import { closeTab, setTabReportOn, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
+import { closeTab, setTabKeep, setTabReportOn, setTabReportsTo, updateTabAgentLaunchConfig } from '@/lib/layout-store';
+import { checkKeepInput } from '@/lib/dormant-sweep';
 import { getProviderByPanelType } from '@/lib/providers';
 import { isValidModelName } from '@/lib/claude-command-shared';
 import { isValidReasoningForPanelType, reasoningErrorForPanelType } from '@/lib/agent-effort';
@@ -39,6 +40,7 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       agentLaunchConfig: found.tab.agentLaunchConfig,
       reportsTo: found.tab.reportsTo ?? null,
       reportOn: found.tab.reportOn ?? null,
+      keep: found.tab.keep ?? null,
     });
   }
 
@@ -87,6 +89,20 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       reportsTo: reportsTo !== undefined ? reportsTo : found.tab.reportsTo ?? null,
       reportOn: reportOn !== undefined ? reportOn.markers : found.tab.reportOn ?? null,
     });
+  }
+
+  // The keep mark (ADR-0048): the dormant sweep never closes the tab before its `until`. Patched on its own.
+  if (req.method === 'PATCH' && req.body && typeof req.body === 'object' && 'keep' in req.body) {
+    const body = req.body as Record<string, unknown>;
+    if (Object.keys(body).some((key) => key !== 'keep')) {
+      return res.status(400).json({ error: 'keep is patched on its own' });
+    }
+    const checked = checkKeepInput(body.keep, Date.now());
+    if (!checked.ok) return res.status(400).json({ error: checked.error });
+    const found = await findTab(workspaceId, tabId);
+    if (!found) return res.status(404).json(TAB_NOT_FOUND_BODY);
+    if (!(await setTabKeep(workspaceId, tabId, checked.keep))) return res.status(404).json(TAB_NOT_FOUND_BODY);
+    return res.status(200).json({ tabId, workspaceId, keep: checked.keep });
   }
 
   if (req.method === 'PATCH') {

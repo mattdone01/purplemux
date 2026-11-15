@@ -58,6 +58,12 @@ export class TabTurnsTable {
         toolCalls: row.tool_calls,
       }));
 
+  /** Per tab of the workspace, its newest turn start or end (ADR-0048: the dormant sweep's durable activity). */
+  lastActivityByTab = (workspaceId: string): Map<string, number> =>
+    new Map((this.database.prepare(`SELECT tab_id, MAX(MAX(ended_at), COALESCE(MAX(started_at), 0)) AS at FROM tab_turns
+      INDEXED BY tab_turns_ws_end_idx WHERE workspace_id = ? GROUP BY tab_id`).all(workspaceId) as Array<{ tab_id: string; at: number }>)
+      .map((row) => [row.tab_id, row.at]));
+
   /** The retention statement's shape (`LedgerStore.deleteInChunks`): rows that ended before the cutoff. */
   static readonly RETENTION_DELETE = 'DELETE FROM tab_turns WHERE id IN (SELECT id FROM tab_turns WHERE ended_at < ? LIMIT ?)';
 }

@@ -23,7 +23,7 @@ import {
   equalizeNode,
   isEqualized,
 } from '@/lib/layout-tree';
-import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig, TTabRole } from '@/types/terminal';
+import type { ITab, TLayoutNode, IPaneNode, ILayoutData, TPanelType, IDiffSettings, IAgentLaunchConfig, ITabKeep, TTabRole } from '@/types/terminal';
 import type { TRotateAt } from '@/types/context-lifecycle';
 import type { TTurnMarkerName } from '@/lib/turn-end';
 import type { TCliState } from '@/types/timeline';
@@ -424,6 +424,17 @@ export interface ICloseTabResult {
   ok: boolean;
   /** The processes reaped with the tab (null for a browser tab or a session already gone). */
   reap: IReapResult | null;
+  /** Why `refuseIf` kept the tab: nothing was signalled and no session was touched. */
+  refused?: string;
+}
+
+export interface ICloseTabOptions {
+  keepProcesses?: boolean;
+  /**
+   * Read under the layout lock and the orchestration mapping write lock, before anything is signalled (ADR-0048 §7):
+   * a reason keeps the tab. Every input path records its pending turn under that mapping lock before it types.
+   */
+  refuseIf?: (tab: ITab) => string | null;
 }
 
 export const removeTabFromPane = async (wsId: string, paneId: string, tabId: string): Promise<boolean> =>
@@ -434,7 +445,7 @@ export const closeTab = async (
   wsId: string,
   paneId: string,
   tabId: string,
-  opts: { keepProcesses?: boolean } = {},
+  opts: ICloseTabOptions = {},
 ): Promise<ICloseTabResult> => withOrchestrationMappingWrite(wsId, async () => {
   const tabInfo = await withLock(async () => {
     const filePath = resolveLayoutFile(wsId);
@@ -446,10 +457,13 @@ export const closeTab = async (
 
     const tab = pane.tabs.find((t) => t.id === tabId);
     if (!tab) return null;
+    const refused = opts.refuseIf?.(tab) ?? null;
+    if (refused) return { refused };
     return { sessionName: tab.sessionName, panelType: tab.panelType, pending: !!(tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn) };
   });
 
   if (!tabInfo) return { ok: false, reap: null };
+  if ('refused' in tabInfo) return { ok: false, reap: null, refused: tabInfo.refused };
 
   // Before the reap: the watchdog retires the tab's liveness checks and pending
   // nudges, so the processes this close kills never read as a death (L38).
@@ -859,6 +873,15 @@ export const setTabReportsTo = async (wsId: string, tabId: string, reportsTo: st
     if ((tab.reportsTo ?? null) === reportsTo) return { changed: false, value: true };
     if (reportsTo) tab.reportsTo = reportsTo;
     else delete tab.reportsTo;
+    return { changed: true, value: true };
+  })).found;
+
+/** The tab's keep mark (ADR-0048); null clears it. False when the layout does not name the tab. */
+export const setTabKeep = async (wsId: string, tabId: string, keep: ITabKeep | null): Promise<boolean> =>
+  (await mutateTabAtomically(wsId, tabId, (tab) => {
+    if (!keep && !tab.keep) return { changed: false, value: true };
+    if (keep) tab.keep = { ...keep };
+    else delete tab.keep;
     return { changed: true, value: true };
   })).found;
 

@@ -1290,6 +1290,29 @@ export class MissionControlStore {
       ORDER BY opened_at, item_id`).all(workspaceId, tabId, since, NEEDS_DECISION_EVENT_PREFIX, NEEDS_DECISION_EVENT_PREFIX) as Array<{ item_id: string }>)
       .map((row) => row.item_id);
 
+  /**
+   * The tabs of a workspace that still wait on Mission Control (ADR-0048), each with its item or run ids: an open item
+   * whose opener row or NEEDS-DECISION line row names the tab, and an open run bound to the tab.
+   */
+  openWorkOfTabs = (workspaceId: string): Map<string, string[]> => {
+    const byTab = new Map<string, string[]>();
+    const add = (tabId: string, id: string) => {
+      const ids = byTab.get(tabId) ?? [];
+      if (!ids.includes(id)) ids.push(id);
+      byTab.set(tabId, ids);
+    };
+    const items = this.database.prepare(`SELECT o.tab_id, a.id FROM attention_items a
+        JOIN mission_item_openers o ON o.item_id = a.id
+        WHERE a.workspace_id = ? AND a.state IN ('candidate','open')
+      UNION SELECT l.tab_id, a.id FROM attention_items a
+        JOIN mission_nd_lines l ON l.item_id = a.id AND l.workspace_id = a.workspace_id
+        WHERE a.workspace_id = ? AND a.state IN ('candidate','open')
+      ORDER BY 1, 2`).all(workspaceId, workspaceId) as Array<{ tab_id: string | null; id: string }>;
+    for (const row of items) if (row.tab_id) add(row.tab_id, row.id);
+    for (const run of this.listOpenRunBindings(workspaceId)) add(run.binding.tabId, run.runId);
+    return byTab;
+  };
+
   /** Still-open items (candidate or open) whose id starts with the prefix, whoever opened them (ADR-0041 §2). */
   openItemsWithIdPrefix = (workspaceId: string, prefix: string): string[] =>
     (this.database.prepare(`SELECT id FROM attention_items WHERE workspace_id = ? AND substr(id, 1, length(?)) = ?

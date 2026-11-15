@@ -8,6 +8,7 @@ import { AUTO_ANSWER_KEY } from '@/lib/mission-control-auto-answer';
 import { QUESTION_MIN_VERSION_KEY } from '@/lib/mission-question-config';
 import { REMOTE_CALLBACK_ALLOW_HOSTS_KEY, REMOTE_CALLBACK_URL_KEY, REMOTE_HOSTS_KEY, REMOTE_TAILNET_SUFFIX_KEY } from '@/lib/remote-host';
 import { TAB_CAP_KEY } from '@/lib/tab-cap';
+import { DORMANT_HOURS_KEY, DORMANT_MODE_KEY } from '@/lib/dormant-sweep';
 import { IDLE_NUDGE_CONFIG_KEY, WAIT_BACKSTOP_CONFIG_KEY } from '@/lib/turn-end';
 import { ROTATE_AT_CONFIG_KEY } from '@/lib/context-lifecycle';
 import { CURATOR_KEYS } from '@/lib/curator-service';
@@ -29,6 +30,9 @@ const SERVER_KEYS = [
   REMOTE_CALLBACK_ALLOW_HOSTS_KEY,
   TAB_CAP_KEY,
   `${TAB_CAP_KEY}.<workspaceId>`,
+  DORMANT_MODE_KEY,
+  `${DORMANT_MODE_KEY}.<workspaceId>`,
+  DORMANT_HOURS_KEY,
   'pool.slots.<host>.<gate|build|mutation|browser|test-service|tab>',
   ...POOL_BUDGET_FIELDS.map((field) => `${POOL_BUDGET_KEY_PREFIX}<host>.${field}`),
   `${POOL_ENVELOPE_KEY_PREFIX}<kind>.threads`,

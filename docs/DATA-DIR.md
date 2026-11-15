@@ -403,6 +403,11 @@ releasing tab or admin token (`{workspaceId, tabId, verified, identity, admin}`)
 human session breaks the lease from Mission Control (ADR-0029 §8), or `null` for a server-made release. A break adds
 `breakReason` (at most 500 code points).
 
+The dormant-tab sweep (ADR-0048) writes `dormant-close` (one per close: `workspaceId`, `tabId`, `tabName`, `state`,
+`lastActivityAt`, `source`, `thresholdHours`, `checked`, `worktree`, `agentSessionId`, `jsonlPath`), `dormant-held` and
+`dormant-would-close` (at most one per tab per 24 h each), `dormant-close-deferred`, `dormant-close-refused`,
+`dormant-close-failed` and `dormant-close-note-failed`.
+
 The lines added by epic `purplemux-flow` (architecture §4.11):
 
 - `tab-over-cap` (ADR-0027): an orchestrator made an agent tab over the WIP cap. `workspaceId`, `tabId` (the new tab),
@@ -455,6 +460,9 @@ Released on `process.on('exit')`.
 Recursive pane/tab tree. Leaf `pane` nodes hold `tabs[]`; `split` nodes hold `children[]` with `ratio`. Each tab carries its `sessionName` (`pt-{wsId}-{paneId}-{tabId}`), cached `cliState`, `claudeSessionId`, and the last resume command.
 
 A tab that `tab restart` relaunched carries `lastRestartAt` (Unix ms, ADR-0028); the fleet row reads it as `restartedAt`. Older releases ignore the field. Each restart also appends one `tab-restart` line to `~/.purplemux/audit/coordination.jsonl`.
+
+A tab marked with `tab keep` carries `keep: { until: <Unix ms> | null, reason, at }` (ADR-0048); the dormant-tab sweep
+never closes it while `until` is null or in the future. Older releases ignore the field.
 
 See [TMUX.md](./TMUX.md) for how tabs map to tmux sessions and [STATUS.md](./STATUS.md) for the state fields.
 

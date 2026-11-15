@@ -2206,6 +2206,25 @@ const cmdTabReportsTo = async (args) => {
   out(body);
 };
 
+// The keep mark (ADR-0048): the dormant-tab sweep never closes TAB_ID while the mark holds. --until takes an ISO
+// time with a zone or a duration (12h, 3d; at most 30 d); without it the mark has no expiry and is reported daily.
+const cmdTabKeep = async (args) => {
+  requireEnv();
+  const clear = args.includes('--clear');
+  const reason = flagValue(args, '--reason');
+  const until = flagValue(args, '--until');
+  const rest = stripBooleanFlags(stripFlags(args, ['--workspace', '-w', '--reason', '--until']), ['--clear']);
+  const tabId = rest[0];
+  const usage = 'usage: tab keep -w WS TAB_ID --reason TEXT [--until ISO|12h|3d]  |  tab keep -w WS TAB_ID --clear';
+  if (!tabId || rest.length > 1) die(usage);
+  if (clear && (reason || until)) die(usage);
+  if (!clear && !reason) die(usage);
+  const wsId = resolveWsForTab(args);
+  const keep = clear ? null : { reason, ...(until ? { until } : {}) };
+  const { body } = await api('PATCH', `/api/cli/tabs/${tabId}?workspaceId=${encodeURIComponent(wsId)}`, { keep });
+  out(body);
+};
+
 const resolveWsForTab = (args) => {
   const wsId = flagValue(args, '--workspace') || flagValue(args, '-w');
   if (!wsId) die('--workspace is required');
@@ -3640,6 +3659,9 @@ Commands:
                   [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
                                            --on MARKERS (alone or with a target) forwards only those end lines,
                                            e.g. --on DONE,BLOCKED,NEEDS-DECISION; --on all lifts the filter
+  tab keep -w WS TAB_ID --reason TEXT      Keep TAB_ID open: the dormant-tab sweep (tabs.dormant.mode, ADR-0048)
+                  [--until ISO|12h|3d]     never closes it while the mark holds. --until is at most 30 d; without
+                  | --clear                it the mark has no expiry and is reported daily. --clear removes it
   tab steer -w WS TAB_ID CONTENT...        Send CONTENT as a mid-turn correction. From an agent tab (claude-code,
            [--interrupt --reason TEXT]     codex-cli, grok-cli) the default does NOT interrupt: the text waits for
            [--no-interrupt] [--raw]        the turn to end. --interrupt --reason TEXT stops the turn first (Escape);
@@ -4138,6 +4160,7 @@ const main = async () => {
         case 'probe': return cmdTabProbe(rest);
         case 'bg': return cmdTabBg(rest);
         case 'reports-to': return cmdTabReportsTo(rest);
+        case 'keep': return cmdTabKeep(rest);
         case 'browser': return cmdTabBrowser(rest);
         default: die(`unknown tab command: ${sub || '(none)'}. Run 'purplemux help' for usage.`);
       }
