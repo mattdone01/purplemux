@@ -81,4 +81,13 @@ describe('tab_events.rule and the delivery read', () => {
     ]);
     expect(store.tabEvents.list(WS, { since: 0, limit: 10 })[0].rule).toBe('not-armed');
   });
+
+  it('answers each tab\'s newest turn start or end in the workspace (ADR-0048)', () => {
+    store.tabTurns.record(turn({ tabId: 'tab-a', startedAt: T0, endedAt: T0 + MIN }));
+    store.tabTurns.record(turn({ tabId: 'tab-a', startedAt: T0 + 10 * MIN, endedAt: T0 + 12 * MIN }));
+    store.tabTurns.record(turn({ tabId: 'tab-b', startedAt: null, endedAt: T0 + 3 * MIN }));
+    store.tabTurns.record(turn({ workspaceId: 'ws-b', tabId: 'tab-c', endedAt: T0 + 50 * MIN }));
+    expect([...store.tabTurns.lastActivityByTab(WS)].sort()).toEqual([['tab-a', T0 + 12 * MIN], ['tab-b', T0 + 3 * MIN]]);
+    expect(store.tabTurns.lastActivityByTab('ws-none').size).toBe(0);
+  });
 });

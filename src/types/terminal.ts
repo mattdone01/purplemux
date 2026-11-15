@@ -178,9 +178,19 @@ export interface ITab {
    * and never sends a sent one again.
    */
   watchdogTurnEnd?: import('@/types/status').ITurnEndRecord | null;
+  /** `tab keep` (ADR-0048): the dormant sweep never closes the tab before `until` (null: no expiry). */
+  keep?: ITabKeep;
   webUrl?: string | null;
   terminalRatio?: number;
   terminalCollapsed?: boolean;
+}
+
+export interface ITabKeep {
+  /** Unix ms; null: no expiry (reported daily as `keep (no expiry)`). */
+  until: number | null;
+  reason: string;
+  /** When the mark was set, Unix ms. */
+  at: number;
 }
 
 export interface ISplitNode {

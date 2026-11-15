@@ -77,6 +77,56 @@ describe('every close path reaps by tab id (ADR-0016)', () => {
     expect(tmux.killSession).toHaveBeenCalledWith('s-a2', { tabId: 'tab-a2', keepProcesses: undefined });
   });
 
+  it('closeTab refuseIf keeps the tab before anything is signalled (ADR-0048 §7)', async () => {
+    const store = await import('@/lib/layout-store');
+    const { onTabClosing } = await import('@/lib/tab-lifecycle');
+    const closing: string[] = [];
+    const off = onTabClosing((e) => closing.push(e.tabId));
+    try {
+      // A turn recorded after the sweep judged the tab, as `tab send` records it under the mapping lock.
+      const recorded = await store.mutateTabAtomically(WS, 'tab-a2', (tab) => {
+        tab.orchestrationActivity = { sessionName: 's-a2', runtimeGeneration: 'g1', turn: { generation: 't1', runtimeGeneration: 'g1', at: 1 } };
+        return { changed: true, value: true };
+      });
+      expect(recorded.found).toBe(true);
+      const seen: string[] = [];
+      const result = await store.closeTab(WS, 'pane-a', 'tab-a2', {
+        refuseIf: (tab) => {
+          seen.push(tab.id);
+          return tab.orchestrationActivity?.turn ? 'orchestration-pending' : null;
+        },
+      });
+      expect(result).toEqual({ ok: false, reap: null, refused: 'orchestration-pending' });
+      expect(seen).toEqual(['tab-a2']);
+      expect(tmux.killSession).not.toHaveBeenCalled();
+      expect(closing).toEqual([]);
+      const kept = await store.readLayoutFile(store.resolveLayoutFile(WS));
+      expect(JSON.stringify(kept)).toContain('"tab-a2"');
+    } finally {
+      off();
+    }
+  });
+
+  it('closeTab closes when refuseIf answers null', async () => {
+    const store = await import('@/lib/layout-store');
+    expect(await store.closeTab(WS, 'pane-a', 'tab-a2', { refuseIf: () => null })).toEqual({ ok: true, reap: REAP });
+    expect(tmux.killSession).toHaveBeenCalledWith('s-a2', { tabId: 'tab-a2', keepProcesses: undefined });
+  });
+
+  it('setTabKeep writes and clears the keep mark', async () => {
+    const store = await import('@/lib/layout-store');
+    const keep = { until: null, reason: 'lead seat', at: 5 };
+    expect(await store.setTabKeep(WS, 'tab-a2', keep)).toBe(true);
+    const tabOf = async () => {
+      const read = await store.readLayoutFile(store.resolveLayoutFile(WS));
+      return read!.root.type === 'split' && read!.root.children[0].type === 'pane' ? read!.root.children[0].tabs.find((t) => t.id === 'tab-a2') : undefined;
+    };
+    expect((await tabOf())?.keep).toEqual(keep);
+    expect(await store.setTabKeep(WS, 'tab-a2', null)).toBe(true);
+    expect((await tabOf())?.keep).toBeUndefined();
+    expect(await store.setTabKeep(WS, 'tab-none', keep)).toBe(false);
+  });
+
   it('closeTab --keep-processes passes keepProcesses', async () => {
     const store = await import('@/lib/layout-store');
     await store.closeTab(WS, 'pane-a', 'tab-a2', { keepProcesses: true });

@@ -526,6 +526,11 @@ PATCH /api/cli/tabs/<tabId>?workspaceId=WS
   to itself); reportOn sets or clears (null / "all") the markers it forwards (ADR-0025).
   Response: { "tabId", "workspaceId", "reportsTo", "reportOn" } with the tab's current values.
   Body: { "agentLaunchConfig": { "model"?, "effort"? } | null } — pins for future launches.
+  Body: { "keep": { "reason": TEXT, "until"?: ISO | "12h" | "3d" } | null } — alone (ADR-0048, CLI tab keep).
+  The dormant-tab sweep never closes the tab while the mark holds. reason is 1-200 characters of one
+  line; until is an ISO time with a zone or a duration in m, h or d, in the future and at most 30 d
+  ahead; without it the mark has no expiry (reported daily). null clears it. Else 400 { "error" }.
+  Response: { "tabId", "workspaceId", "keep": { "until": ms | null, "reason", "at": ms } | null }.
 
 DELETE /api/cli/tabs/<tabId>?workspaceId=WS[&keepProcesses=1]
   Close the tab: reap its processes, kill its tmux session, remove it from the layout.
@@ -1167,6 +1172,20 @@ Keys in use:
                and is logged. Admin token only, except that the Portfolio Scrum Master's verified tab
                writes it for a workspace in its portfolio selection, with a reason and the version it
                read (ADR-0045); the fleet value stays with the admin token.
+  tabs.dormant.mode
+               The dormant-tab sweep (ADR-0048): off | report | close. Every 10 min it judges each agent
+               tab; a tab idle, ready for review or inactive with no activity for tabs.dormant.hours is
+               dormant. report logs and audits one would-close line per tab a day; close closes a dormant
+               tab that holds nothing, on the second pass in a row that finds it so, at most 5 a pass,
+               and sends one note per workspace naming each close. A dormant tab that holds anything is
+               reported once a day, never closed. Unset, invalid or unreadable means report. Admin token
+               only (exit 3 forbidden for a tab).
+  tabs.dormant.mode.<workspaceId>
+               One workspace's sweep mode (ADR-0048): it wins over the fleet value for that workspace; an
+               invalid value means report, never the fleet value. Admin token only.
+  tabs.dormant.hours
+               Hours with no activity before a tab is dormant (ADR-0048): 1..168, unset or invalid means
+               6 (an invalid value is logged). Admin token only.
   pool.slots.<host>.<gate|build|mutation|browser|test-service|tab>
                A pool host's count cap for the kind (ADR-0039), a whole number 0..64 (0: none there);
                <host> is the lower-case pool host (this host's name or a remote.hosts alias).

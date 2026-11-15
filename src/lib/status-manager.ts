@@ -4,7 +4,8 @@ import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/li
 import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd, findTabBySessionName } from '@/lib/layout-store';
 import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR, type IHookSpoolDrainResult } from '@/lib/hook-spool';
 import { HookFloorStore } from '@/lib/hook-floors';
-import { onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
+import { isTabRestarting, onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
+import type { IDormantStatusFacts, TDormantRead, TDormantSnapshot } from '@/types/dormant';
 import { captureRemotePanes, capturePaneContent, getAllPanesInfo, getListeningPorts, SAFE_SHELLS, getPaneTitle, getSessionCwd, getSessionPanePid, observeRemoteProviderProcess } from '@/lib/tmux';
 import { RemotePaneCaptures } from '@/lib/remote-pane-captures';
 import { sessionHostOf } from '@/lib/session-host';
@@ -55,6 +56,7 @@ import {
   parseWaitBackstopHours,
   readTurnEnd,
   reportOnAdmits,
+  turnMarkerName,
 } from '@/lib/turn-end';
 import { NudgeDeduper } from '@/lib/nudge-dedupe';
 import { readWatches } from '@/lib/watch-store';
@@ -429,6 +431,7 @@ export class StatusManager {
   private restartJobs = new Map<string, Promise<IBackgroundJob[]>>();
   private modelWatch = new AgentModelWatch();
   private automatedPrompts: AutomatedPromptDispatcher;
+  private readonly tabEventsLog: () => TabEventsTable;
   /** Every event bound for a tab goes through its wake class and into `tab_events` (ADR-0035). */
   private tabEvents: TabEventRouter;
   /** Seats rotate from their handoff file (ADR-0036). */
@@ -525,6 +528,7 @@ export class StatusManager {
     turnEndTable: () => TurnEndsTable = () => getLedgerStore().turnEnds,
   ) {
     this.automatedPrompts = automatedPrompts;
+    this.tabEventsLog = tabEventTable;
     // F6 (F10 steps 1-2): the Claude stop's payload and its typed turn end.
     this.stopGate = new StopGate({
       now: () => Date.now(),
@@ -704,6 +708,79 @@ export class StatusManager {
     const entry = this.tabs.get(tabId);
     if (!entry || !isAgentPanelType(entry.panelType) || this.isRetired(tabId) || this.isHaltedByUsageLimit(tabId)) return false;
     return entry.cliState === 'idle' || entry.cliState === 'ready-for-review';
+  }
+
+  /**
+   * What the dormant sweep judges a tab on (ADR-0048), read now. Null for a tab this manager does not know. Each read
+   * that can fail says so; the sweep turns a failure into a hold, never into "nothing there".
+   */
+  async dormantFacts(tabId: string): Promise<IDormantStatusFacts | null> {
+    const entry = this.tabs.get(tabId);
+    if (!entry) return null;
+    const turnEnd = entry.turnEnd;
+    // A restored stop sets lastEvent from its own seq (applyRestoredStop), so the record is current only on that seq.
+    const markerLine = turnEnd?.kind === 'turn-marker' && turnEnd.seq !== undefined && turnEnd.seq === entry.lastEvent?.seq
+      ? turnEnd.marker?.at(-1) ?? null
+      : null;
+    const marker = markerLine ? turnMarkerName(markerLine.trim()) : null;
+    const rotation = this.contextLifecycle.rotationFacts(tabId);
+    const read = <T>(fn: () => T): TDormantRead<T> => {
+      try {
+        return { ok: true, value: fn() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    };
+    return {
+      cliState: entry.cliState,
+      panelType: entry.panelType ?? null,
+      providerId: runtimeProviderId(entry.agentProviderId, entry.panelType) ?? null,
+      eventSeq: entry.eventSeq ?? 0,
+      lastEventAt: entry.lastEvent?.at ?? null,
+      busySince: entry.busySince ?? null,
+      lastResumeOrStartedAt: entry.lastResumeOrStartedAt ?? null,
+      retired: this.isRetired(tabId),
+      restarting: isTabRestarting(tabId),
+      halted: this.isHaltedByUsageLimit(tabId),
+      seatPhase: rotation.phase,
+      seatAdvancing: rotation.advancing,
+      turnOpen: this.turns.openIn(entry.workspaceId).has(tabId),
+      waitingMarker: marker === 'NEEDS-DECISION' || marker === 'BLOCKED' ? marker : null,
+      agentSessionId: entry.agentSessionId ?? null,
+      jsonlPath: entry.jsonlPath ?? null,
+      snapshot: await this.dormantSnapshot(tabId, entry),
+      heldDigests: read(() => this.tabEventsLog().pending(entry.workspaceId, tabId).length),
+      lastDeliveredAt: read(() => this.tabEventsLog().lastDeliveredSince(entry.workspaceId, tabId, 0)),
+    };
+  }
+
+  /** The close's re-read under the layout lock (ADR-0048 §7): synchronous, so it runs inside `closeTab`'s lock. */
+  dormantGuard(tabId: string): { cliState: TCliState; eventSeq: number; retired: boolean; restarting: boolean } | null {
+    const entry = this.tabs.get(tabId);
+    if (!entry) return null;
+    return { cliState: entry.cliState, eventSeq: entry.eventSeq ?? 0, retired: this.isRetired(tabId), restarting: isTabRestarting(tabId) };
+  }
+
+  private async dormantSnapshot(tabId: string, entry: ITabStatusEntry): Promise<TDormantSnapshot> {
+    const handle = this.runtimeHandle(entry);
+    const provider = entry.agentProviderId ? getProvider(entry.agentProviderId) : getProviderByPanelType(entry.panelType);
+    if (!handle || !provider) return { read: 'none' };
+    try {
+      const snapshot = await provider.readRuntimeSnapshot(handle, {
+        tasksSince: await this.agentProcessStartedAt(tabId, entry),
+        withBackground: true,
+        withActivity: true,
+      });
+      return {
+        read: 'ok',
+        lastEntryTs: snapshot.lastEntryTs,
+        backgroundActivityAt: snapshot.backgroundActivityAt ?? null,
+        openBackgroundTasks: snapshot.openBackgroundTasks ?? null,
+        transcriptRead: snapshot.transcriptRead ?? null,
+      };
+    } catch (err) {
+      return { read: 'failed', error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /**

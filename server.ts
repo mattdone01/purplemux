@@ -37,6 +37,7 @@ import { scanSessions, applyConfig } from './src/lib/tmux';
 import { initWorkspaceStore, getWorkspaces, writeAllWorkspacePrompts } from './src/lib/workspace-store';
 import { initTabTokens } from './src/lib/tab-token';
 import { initLeases } from './src/lib/lease-sweeper';
+import { startDormantSweep, stopDormantSweep } from './src/lib/dormant-sweep-runtime';
 import { startCredentialForkSync } from './src/lib/workspace-home';
 import { autoResumeOnStartup } from './src/lib/auto-resume';
 import { initAuthCredentials } from './src/lib/auth-credentials';
@@ -130,6 +131,7 @@ const shutdownWs = async () => {
   stopPoolPoller();
   stopCurator();
   await stopWatches();
+  await stopDormantSweep();
   await stopNotes();
   stopGrants();
   stopHostSignals();
@@ -440,6 +442,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });
   await startWatches();
   startPortfolioRuntime();
+  // The dormant-tab sweep: every 10 min, first one tick after boot; `tabs.dormant.mode` defaults to report (ADR-0048).
+  await startDormantSweep();
 
   const envHost = process.env.HOST?.trim();
   const configData = await getConfig();

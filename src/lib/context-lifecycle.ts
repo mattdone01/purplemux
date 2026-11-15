@@ -326,6 +326,11 @@ export class ContextLifecycle {
     return this.states.get(tabId) ?? null;
   }
 
+  /** The seat's phase, and whether a lifecycle step runs for it now (ADR-0048: a seat in rotation is never closed). */
+  rotationFacts(tabId: string): { phase: TSeatPhase | null; advancing: boolean } {
+    return { phase: this.states.get(tabId)?.phase ?? null, advancing: this.running.has(tabId) };
+  }
+
   /** The router holds the seat's digests while it owes a rotation or waits for its first message (F1, F4). */
   holdsDigest(tabId: string): boolean {
     const state = this.states.get(tabId);

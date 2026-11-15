@@ -166,6 +166,18 @@ describe('the server opens the item (story 14 AC 4)', () => {
     expect(store.snapshot([], 'ws-a').workspaces).toBeDefined();
   });
 
+  // ADR-0048: the dormant sweep holds a tab that still waits on Mission Control, by opener row or line row.
+  it('names the opener tab and a line-row tab of an open item in openWorkOfTabs', async () => {
+    startRun();
+    await openNeedsDecisionItem(await needsDecisionDeps(), stop());
+    const [item] = items();
+    store.recordNeedsDecisionLine('ws-a', 'tab-z', 'line-key', 'text-key', item.id, false, 2_000);
+    const work = store.openWorkOfTabs('ws-a');
+    expect(work.get('tab-w')).toContain(item.id);
+    expect(work.get('tab-z')).toEqual([item.id]);
+    expect(store.openWorkOfTabs('ws-other').size).toBe(0);
+  });
+
   // Story 33 (merge with story 14): a server-opened item reaches the alert through the same batch, and the
   // real transition rule alerts it exactly once, with the summary an answer button needs.
   it('a server-opened item alerts once through the story 33 rule', async () => {
