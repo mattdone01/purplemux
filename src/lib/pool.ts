@@ -601,7 +601,8 @@ const fmtGb = (bytes: number): string => `${(Math.round((bytes / GIB) * 10) / 10
 /**
  * Where a tab may run (consult ruling, story 17): a remote host only for a
  * claude-code tab with no role. codex-cli and grok-cli cannot run remote
- * (ADR-0022 §13), and a coordinator is never a remote tab (§20).
+ * (ADR-0022 §13). The pool places a control-plane tab here; a remote tab created with --host may
+ * still coordinate (owner, 16 Nov 2026).
  */
 export const tabLocalOnly = (req: IPoolPlacementRequest): string | null => {
   if (req.kind !== 'tab') return null;

@@ -299,8 +299,8 @@ POST /api/cli/pool/acquire   (a tab token, or the admin token)
   the most free memory, a tie staying on this host. A worker tab (ADR-0045) is admitted by its tab room
   and ceiling instead of the budget and measured checks; tabs go to the most room, then the most free
   memory, a tie going to a remote host. Only a claude-code
-  tab with no role may leave this host (codex-cli and grok-cli cannot run remote, ADR-0022 §13; a
-  coordinator is never remote, §20). A control-plane tab runs here on the reserve: never queued or
+  tab with no role may leave this host (codex-cli and grok-cli cannot run remote, ADR-0022 §13); an
+  explicit remote tab (--host) may still coordinate (owner, 16 Nov 2026). A control-plane tab runs here on the reserve: never queued or
   refused, and its reason states the reserve use. Class control-plane is honoured only for the
   workspace's enabled orchestrator tab, resolved from the caller's identity; any other caller runs
   as product and the answer carries "downgrade" with the reason. A non-agent tab type is refused (no envelope).
