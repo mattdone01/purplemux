@@ -171,4 +171,16 @@ describe('remote transcript copy (ADR-0022)', () => {
     emitTabClosed({ workspaceId: 'ws-a', tabId: 'tab-r', sessionName: SESSION, reason: 'closed' } as never);
     await vi.waitFor(async () => expect(await fs.stat(path.join(remoteTranscriptRoot(), 'tab-r')).then(() => true, () => false)).toBe(false));
   });
+
+  it('names the bound local copy for a reader with no local pane, and nothing before a bind', async () => {
+    const { bindRemoteTranscript, remoteTranscriptCopy, mirrorPathFor } = await import('@/lib/remote-transcript');
+    expect(await remoteTranscriptCopy(SESSION)).toBeNull();
+    await bindRemoteTranscript({ session: SESSION, host: 'host-b', sessionId: SID, remotePath: REMOTE_PATH });
+    expect(await remoteTranscriptCopy(SESSION)).toEqual({ jsonlPath: mirrorPathFor('tab-r', SID), sessionId: SID });
+    // A restarted server reads the sidecar.
+    delete (globalThis as Record<string, unknown>).__ptRemoteMirrors;
+    vi.resetModules();
+    const fresh = await import('@/lib/remote-transcript');
+    expect(await fresh.remoteTranscriptCopy(SESSION)).toEqual({ jsonlPath: fresh.mirrorPathFor('tab-r', SID), sessionId: SID });
+  });
 });

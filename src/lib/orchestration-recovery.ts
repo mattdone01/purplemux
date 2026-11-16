@@ -96,8 +96,9 @@ export const changeOrchestration = async (
         }
         const candidate = tabs.find((tab) => tab.id === next.orchestratorTabId);
         if (!candidate || !isAgentPanelType(candidate.panelType)) throw new OrchestrationError(409, 'orchestrator-candidate-invalid', 'Recovery requires an agent tab in this workspace');
-        // A coordinator runs on this server's host: its process proof, nudges and recovery are local (ADR-0022).
-        if (candidate.host) throw new OrchestrationError(409, 'orchestrator-candidate-invalid', `A tab on remote host ${candidate.host} cannot coordinate a workspace (ADR-0022); designate a local agent tab`);
+        // A remote tab may coordinate (owner, 16 Nov 2026). Its process proof runs on its host (observeOrchestrationProcess);
+        // its nudges reach it as typed input over ssh; its tab token runs the CLI for its own workspace (ADR-0022, ADR-0021).
+        // A host that does not answer reads as unknown below, so an unreachable remote candidate is refused, never assumed.
         // An evaluator reads and judges; it cannot edit, commit or dispatch (ADR-0040).
         if (candidate.role === 'evaluator') throw new OrchestrationError(409, 'orchestrator-candidate-invalid', 'An evaluator tab cannot coordinate a workspace (ADR-0040); designate an agent tab without a role');
         const observation = await observeOrchestrationRuntime(candidate);

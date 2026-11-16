@@ -186,6 +186,16 @@ const copyRemoteBytes = async (session: string, host: string): Promise<boolean> 
   return true;
 };
 
+/**
+ * The local copy of a remote session's bound transcript, for a reader that has no local pane to
+ * detect a session from (the timeline). Null when no hook has bound the session yet.
+ */
+export const remoteTranscriptCopy = async (session: string): Promise<{ jsonlPath: string; sessionId: string } | null> => {
+  const mirror = mirrors.get(session) ?? (await loadSidecar(session));
+  if (!mirror) return null;
+  return { jsonlPath: mirrorPathFor(mirror.tabId, mirror.sessionId), sessionId: mirror.sessionId };
+};
+
 /** Drop a closed tab's copies. */
 export const removeRemoteTranscripts = async (session: string): Promise<void> => {
   const tabId = tabIdOf(session);

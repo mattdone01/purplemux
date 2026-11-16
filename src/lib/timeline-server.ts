@@ -20,6 +20,7 @@ import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { getSessionPanePid, checkTerminalProcess, sendKeys, getSessionCwd, getPaneTitle } from './tmux';
 import { sessionHostOf } from './session-host';
+import { remoteTranscriptCopy, syncRemoteTranscript } from './remote-transcript';
 import { cwdToProjectPath } from './session-list';
 import { EMPTY_PENDING } from './buffer-lines';
 import { buildSessionKey } from './session-key';
@@ -79,6 +80,8 @@ interface ITimelineConnection {
   lastHeartbeat: number;
   currentJsonlPath: string | null;
   cleaned: boolean;
+  /** A remote tab's copy refresh (ADR-0022): it has no local pane to watch. */
+  remoteTimer?: ReturnType<typeof setInterval>;
 }
 
 interface IFileWatcher {
@@ -658,6 +661,7 @@ const cleanup = (conn: ITimelineConnection) => {
   conn.cleaned = true;
 
   clearInterval(conn.heartbeatTimer);
+  if (conn.remoteTimer) clearInterval(conn.remoteTimer);
   connections.delete(conn.ws);
 
   if (conn.currentJsonlPath) {
@@ -807,6 +811,77 @@ export const handleResumeMessage = async (
   }
 };
 
+/** How often an open timeline of a remote tab refreshes the tab's transcript copy. */
+export const REMOTE_TIMELINE_REFRESH_MS = 5_000;
+
+/**
+ * The timeline of a remote tab (ADR-0022). Its Claude runs on another host, so the session is the one
+ * its hook bound (remote-transcript.ts), and the file is the local copy. While a viewer is connected the
+ * copy is refreshed every REMOTE_TIMELINE_REFRESH_MS; a change of the bound session moves the viewer.
+ */
+const handleRemoteTimelineConnection = async (ws: WebSocket, sessionName: string, provider: IAgentProvider) => {
+  let lastHeartbeat = Date.now();
+  const heartbeatTimer = setInterval(() => {
+    if (Date.now() - lastHeartbeat > HEARTBEAT_TIMEOUT) {
+      ws.close(1001, 'Heartbeat timeout');
+      return;
+    }
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, HEARTBEAT_INTERVAL);
+  const conn: ITimelineConnection = { ws, sessionName, panePid: 0, provider, heartbeatTimer, lastHeartbeat, currentJsonlPath: null, cleaned: false };
+  connections.set(ws, conn);
+  ws.on('pong', () => { lastHeartbeat = Date.now(); conn.lastHeartbeat = lastHeartbeat; });
+  ws.on('close', () => cleanup(conn));
+  ws.on('error', (err) => {
+    log.error(`websocket error: ${err.message}`);
+    cleanup(conn);
+  });
+  ws.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString()) as { type?: string; jsonlPath?: string; sessionId?: string; tmuxSession?: string };
+      if (msg.type === 'timeline:subscribe' && msg.jsonlPath) {
+        if (!isAllowedJsonlPath(msg.jsonlPath)) {
+          sendJson(ws, { type: 'timeline:error', code: 'forbidden-path', message: 'Not allowed path' });
+          return;
+        }
+        if (conn.currentJsonlPath) unsubscribeFromFile(ws, conn.currentJsonlPath);
+        conn.currentJsonlPath = msg.jsonlPath;
+        await subscribeToFile(ws, msg.jsonlPath, undefined, conn.sessionName, conn.provider);
+      } else if (msg.type === 'timeline:unsubscribe' && conn.currentJsonlPath) {
+        unsubscribeFromFile(ws, conn.currentJsonlPath);
+        conn.currentJsonlPath = null;
+      } else if (msg.type === 'timeline:resume' && msg.sessionId && msg.tmuxSession) {
+        // The resume handler answers a remote tab with its own refusal (resume is local only).
+        await handleResumeMessage(ws, conn, { sessionId: msg.sessionId, tmuxSession: msg.tmuxSession });
+      }
+    } catch (err) {
+      log.warn(`remote timeline message failed: ${err instanceof Error ? err.message : err}`);
+    }
+  });
+
+  const follow = async (initial: boolean): Promise<void> => {
+    await syncRemoteTranscript(sessionName).catch(() => false);
+    if (conn.cleaned) return;
+    const copy = await remoteTranscriptCopy(sessionName);
+    if (conn.cleaned) return;
+    if (!copy) {
+      if (initial) sendEmptyInit(ws, '', true);
+      return;
+    }
+    if (copy.jsonlPath === conn.currentJsonlPath) return;
+    if (conn.currentJsonlPath) unsubscribeFromFile(ws, conn.currentJsonlPath);
+    conn.currentJsonlPath = copy.jsonlPath;
+    if (!initial) sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'new-session-started' });
+    await subscribeAndUpdateSummary(ws, copy.jsonlPath, copy.sessionId, sessionName, provider);
+  };
+
+  await follow(true);
+  if (conn.cleaned) return;
+  conn.remoteTimer = setInterval(() => {
+    void follow(false).catch((err) => log.warn(`remote timeline refresh failed: ${err instanceof Error ? err.message : err}`));
+  }, REMOTE_TIMELINE_REFRESH_MS);
+};
+
 export const handleTimelineConnection = async (ws: WebSocket, request: IncomingMessage) => {
   if (connections.size >= MAX_CONNECTIONS) {
     ws.close(1013, 'Too many connections');
@@ -825,6 +900,12 @@ export const handleTimelineConnection = async (ws: WebSocket, request: IncomingM
   const provider = getProviderByPanelType(panelType);
   if (!provider) {
     ws.close(1008, 'Unknown panel type');
+    return;
+  }
+
+  // A remote tab's pane is on its host, so no local pane pid exists: read its transcript copy (ADR-0022).
+  if (await sessionHostOf(sessionName)) {
+    await handleRemoteTimelineConnection(ws, sessionName, provider);
     return;
   }
 
