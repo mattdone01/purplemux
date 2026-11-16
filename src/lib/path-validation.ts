@@ -6,6 +6,8 @@ const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 const WORKSPACES_DIR = path.join(os.homedir(), '.purplemux', 'workspaces');
 const CLAUDE_HOME_PROJECTS_SEGMENT = path.sep + path.join('claude-home', 'projects') + path.sep;
 const GROK_SESSIONS_DIR = path.join(os.homedir(), '.grok', 'sessions');
+// A remote tab's transcript is read from its local copy (remote-transcript.ts, ADR-0022).
+const REMOTE_TRANSCRIPTS_DIR = path.join(os.homedir(), '.purplemux', 'remote-transcripts');
 const GROK_HOME_SESSIONS_SEGMENT = path.sep + path.join('grok-home', 'sessions') + path.sep;
 
 // Workspace panes run claude with CLAUDE_CONFIG_DIR under
@@ -38,6 +40,7 @@ export const isAllowedJsonlPath = (filePath: string): boolean => {
   if (!resolved.endsWith('.jsonl')) return false;
   return (
     resolved.startsWith(CLAUDE_PROJECTS_DIR + path.sep) ||
+    resolved.startsWith(REMOTE_TRANSCRIPTS_DIR + path.sep) ||
     resolved.startsWith(CODEX_SESSIONS_DIR + path.sep) ||
     isWorkspaceClaudeJsonlPath(resolved) ||
     resolved.startsWith(GROK_SESSIONS_DIR + path.sep) ||
