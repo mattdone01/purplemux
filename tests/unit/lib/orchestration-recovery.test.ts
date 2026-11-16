@@ -47,12 +47,25 @@ beforeEach(() => {
 afterEach(() => { fs.rmSync(fixture.home, { recursive: true, force: true }); });
 
 describe('guarded orchestration revision and recovery', () => {
-  it('a remote tab is never designated coordinator, before any runtime proof is asked (ADR-0022)', async () => {
+  it('a remote tab can be designated coordinator once its process is proven on its host', async () => {
     layout([tab('tab-old'), { ...tab('tab-next'), host: 'host-b' }]);
     const { changeOrchestration } = await load();
-    await expect(changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options()))
-      .rejects.toMatchObject({ code: 'orchestrator-candidate-invalid', message: expect.stringContaining('remote host host-b') });
-    expect(fixture.runtime.mock.calls.map((c) => (c[0] as ITab).id)).not.toContain('tab-next');
+    const updated = await changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options());
+    expect(updated.orchestration).toMatchObject({ enabled: true, orchestratorTabId: 'tab-next', revision: 1 });
+    expect(fixture.runtime.mock.calls.map((c) => (c[0] as ITab).id)).toContain('tab-next');
+  });
+
+  it('a remote candidate whose host does not answer is refused as unknown, and the mapping stays', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old', revision: 3 } as IWorkspaceOrchestration);
+    layout([tab('tab-old'), { ...tab('tab-next'), host: 'host-b' }]);
+    fixture.runtime.mockImplementation(async (target: ITab) => target.id === 'tab-old'
+      ? { state: 'absent', reason: 'strict session absence' }
+      : { state: 'unknown', reason: 'remote host host-b did not answer' });
+    const { changeOrchestration } = await load();
+    await expect(changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options({ expectedRevision: 3 })))
+      .rejects.toMatchObject({ code: 'orchestrator-state-unknown', message: expect.stringContaining('host-b') });
+    const store = await import('@/lib/workspace-store');
+    expect((await store.getWorkspaceStrict('ws-a')).orchestration).toMatchObject({ orchestratorTabId: 'tab-old', revision: 3 });
   });
 
   it('an evaluator tab is never designated coordinator, before any runtime proof is asked (ADR-0040)', async () => {
