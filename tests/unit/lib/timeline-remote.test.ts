@@ -112,7 +112,8 @@ describe('timeline of a remote tab (ADR-0022)', () => {
     await vi.waitFor(() => expect(ws.sent.filter((m) => m.type === 'timeline:init').at(-1)).toMatchObject({ jsonlPath: file }));
     const last = ws.sent.filter((m) => m.type === 'timeline:init').at(-1) as { entries: unknown[] };
     expect(last.entries.length).toBeGreaterThan(0);
-    expect(ws.sent).toContainEqual(expect.objectContaining({ type: 'timeline:session-changed', newSessionId: SID, reason: 'new-session-started' }));
+    // The same session's file appearing is not reported as a new session.
+    expect(ws.sent.some((m) => m.type === 'timeline:session-changed' && m.reason === 'new-session-started')).toBe(false);
     const inits = ws.sent.filter((m) => m.type === 'timeline:init').length;
     await vi.advanceTimersByTimeAsync(REMOTE_TIMELINE_REFRESH_MS * 2);
     expect(ws.sent.filter((m) => m.type === 'timeline:init')).toHaveLength(inits);

@@ -879,6 +879,9 @@ const handleRemoteTimelineConnection = async (ws: WebSocket, sessionName: string
     conn.remoteBound = copy.jsonlPath;
     if (!ready) {
       conn.remoteLive = false;
+      // The old session's file stops here: drop its watcher while the new one is not written yet.
+      if (conn.currentJsonlPath) unsubscribeFromFile(ws, conn.currentJsonlPath);
+      conn.currentJsonlPath = null;
       if (initial) sendEmptyInit(ws, copy.sessionId, true);
       else sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'session-waiting' });
       return;
@@ -886,7 +889,8 @@ const handleRemoteTimelineConnection = async (ws: WebSocket, sessionName: string
     if (conn.currentJsonlPath) unsubscribeFromFile(ws, conn.currentJsonlPath);
     conn.currentJsonlPath = copy.jsonlPath;
     conn.remoteLive = true;
-    if (!initial) sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'new-session-started' });
+    // The same session's file appearing is not a new session: the init alone shows it.
+    if (!initial && changed) sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'new-session-started' });
     await subscribeAndUpdateSummary(ws, copy.jsonlPath, copy.sessionId, sessionName, provider);
   };
 
