@@ -78,6 +78,7 @@ describe('timeline of a remote tab (ADR-0022)', () => {
     expect(fx.syncs).toBeGreaterThan(0);
     const init = ws.sent.find((m) => m.type === 'timeline:init');
     expect(init).toMatchObject({ jsonlPath: fx.copy.jsonlPath });
+    expect((init as { entries: unknown[] }).entries.length).toBeGreaterThan(0);
     ws.close(1000, 'done');
   });
 
@@ -95,6 +96,28 @@ describe('timeline of a remote tab (ADR-0022)', () => {
     ws.close(1000, 'done');
     await vi.advanceTimersByTimeAsync(REMOTE_TIMELINE_REFRESH_MS * 2);
     expect(fx.syncs).toBe(syncsAtClose);
+  });
+
+  it('a session bound before Claude wrote its file is followed once the copy appears (review r1 finding 2)', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const file = path.join(fx.home, '.purplemux', 'remote-transcripts', 'tab-r', `${SID}.jsonl`);
+    fx.copy = { jsonlPath: file, sessionId: SID };
+    const ws = await connect();
+    expect(ws.sent.find((m) => m.type === 'timeline:init')).toMatchObject({ entries: [], sessionId: SID });
+    const { REMOTE_TIMELINE_REFRESH_MS } = await import('@/lib/timeline-server');
+    await vi.advanceTimersByTimeAsync(REMOTE_TIMELINE_REFRESH_MS);
+    expect(ws.sent.filter((m) => m.type === 'timeline:init')).toHaveLength(1);
+    await writeCopy(SID);
+    await vi.advanceTimersByTimeAsync(REMOTE_TIMELINE_REFRESH_MS);
+    await vi.waitFor(() => expect(ws.sent.filter((m) => m.type === 'timeline:init').at(-1)).toMatchObject({ jsonlPath: file }));
+    const last = ws.sent.filter((m) => m.type === 'timeline:init').at(-1) as { entries: unknown[] };
+    expect(last.entries.length).toBeGreaterThan(0);
+    // The same session's file appearing is not reported as a new session.
+    expect(ws.sent.some((m) => m.type === 'timeline:session-changed' && m.reason === 'new-session-started')).toBe(false);
+    const inits = ws.sent.filter((m) => m.type === 'timeline:init').length;
+    await vi.advanceTimersByTimeAsync(REMOTE_TIMELINE_REFRESH_MS * 2);
+    expect(ws.sent.filter((m) => m.type === 'timeline:init')).toHaveLength(inits);
+    ws.close(1000, 'done');
   });
 
   it('allows a subscribe to a transcript copy and refuses a path that escapes it', async () => {

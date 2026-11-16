@@ -17,7 +17,8 @@ export const currentCoordinator = async (workspaceId: string, tabId: string,
   const token = getTabTokenRecord(tabId);
   return !!tab?.sessionName && token?.workspaceId === workspaceId && token.sessionName === tab.sessionName
     && tabIdentityOf(workspaceId, tabId) === 'launch'
-    && (snapshot ? snapshot.liveSessions.has(tab.sessionName) : await hasSession(tab.sessionName));
+    // The snapshot lists this host's tmux only: a remote coordinator is asked on its host (ADR-0022).
+    && (snapshot && !tab.host ? snapshot.liveSessions.has(tab.sessionName) : await hasSession(tab.sessionName));
 };
 
 /** One persisted human selection: who made it, when, and what it names. */

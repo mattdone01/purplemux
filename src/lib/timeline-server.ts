@@ -82,6 +82,10 @@ interface ITimelineConnection {
   cleaned: boolean;
   /** A remote tab's copy refresh (ADR-0022): it has no local pane to watch. */
   remoteTimer?: ReturnType<typeof setInterval>;
+  /** The copy the remote tab's hook bound last, apart from the viewer's own subscription. */
+  remoteBound?: string;
+  /** Whether the viewer is subscribed to remoteBound: false while that copy does not exist yet. */
+  remoteLive?: boolean;
 }
 
 interface IFileWatcher {
@@ -868,10 +872,25 @@ const handleRemoteTimelineConnection = async (ws: WebSocket, sessionName: string
       if (initial) sendEmptyInit(ws, '', true);
       return;
     }
-    if (copy.jsonlPath === conn.currentJsonlPath) return;
+    // A session is bound at its start, before Claude writes the file: wait for the copy to exist.
+    const ready = existsSync(copy.jsonlPath);
+    const changed = copy.jsonlPath !== conn.remoteBound;
+    if (!changed && (conn.remoteLive || !ready)) return;
+    conn.remoteBound = copy.jsonlPath;
+    if (!ready) {
+      conn.remoteLive = false;
+      // The old session's file stops here: drop its watcher while the new one is not written yet.
+      if (conn.currentJsonlPath) unsubscribeFromFile(ws, conn.currentJsonlPath);
+      conn.currentJsonlPath = null;
+      if (initial) sendEmptyInit(ws, copy.sessionId, true);
+      else sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'session-waiting' });
+      return;
+    }
     if (conn.currentJsonlPath) unsubscribeFromFile(ws, conn.currentJsonlPath);
     conn.currentJsonlPath = copy.jsonlPath;
-    if (!initial) sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'new-session-started' });
+    conn.remoteLive = true;
+    // The same session's file appearing is not a new session: the init alone shows it.
+    if (!initial && changed) sendJson(ws, { type: 'timeline:session-changed', newSessionId: copy.sessionId, reason: 'new-session-started' });
     await subscribeAndUpdateSummary(ws, copy.jsonlPath, copy.sessionId, sessionName, provider);
   };
 
