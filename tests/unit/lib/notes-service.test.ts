@@ -1409,3 +1409,76 @@ describe('the send-queue receipt (NR-1, ADR-0013 amendment)', () => {
     expect((await svc.show(ADMIN, sent.id)).note.receipt!.notice).toMatchObject({ heldReason: 'composer-not-ready:needs-input (30 refusals)' });
   });
 });
+
+describe('the list hint on a recipient note line (NR-2\', design ruling E)', () => {
+  let f: Fakes;
+  let flags: Set<string>;
+  let svc: NotesService;
+  const TAIL = '— run purplemux note list --open --to-me, then ack each';
+
+  beforeEach(() => {
+    f = new Fakes();
+    f.epics.set('ddh', { workspaceId: 'ws-1', tabId: 'tab-a' });
+    flags = new Set();
+    svc = new NotesService({ ...f.deps(), flag: async (key) => flags.has(key) });
+  });
+
+  it('flag off: the delivered and reminder notices carry no listHint field and the 010793fd lines', async () => {
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!, f.now);
+    f.now += NOTE_REMIND_MS;
+    await svc.tick();
+    const lines = f.sent.filter((s) => s.targetTabId === 'tab-a');
+    expect(lines.map((s) => s.fields.event ?? 'delivered')).toEqual(['delivered', 'reminder']);
+    for (const s of lines) expect(s.fields).not.toHaveProperty('listHint');
+    expect(lines[0].line).toBe(`[purplemux note ${id}] from ws-2/tab-b at 2026-09-26T09:00:00Z — purplemux note show ${id}, then purplemux note ack ${id}`);
+    expect(lines[1].line).toBe(`[purplemux note ${id}] from ws-2/tab-b at 2026-09-26T09:00:00Z is still unacked — purplemux note show ${id}, then purplemux note ack ${id}`);
+  });
+
+  it('flag on for the recipient workspace: the delivered and reminder lines end with the list command', async () => {
+    flags.add('notes.list-hint.ws-1');
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    f.deliverInbox(f.note(id).inboxItemId!, f.now);
+    f.now += NOTE_REMIND_MS;
+    await svc.tick();
+    const lines = f.sent.filter((s) => s.targetTabId === 'tab-a');
+    expect(lines.map((s) => s.line)).toEqual([
+      `[purplemux note ${id}] from ws-2/tab-b at 2026-09-26T09:00:00Z ${TAIL}`,
+      `[purplemux note ${id}] from ws-2/tab-b at 2026-09-26T09:00:00Z is still unacked ${TAIL}`,
+    ]);
+  });
+
+  it('reads the flag of the recipient workspace only, and never changes a line to the sender', async () => {
+    flags.add('notes.list-hint.ws-2');
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    expect(f.sent[0].line).not.toContain('note list');
+    // A bounced notice goes to the sender in ws-2: its line is unchanged.
+    const bounced = await svc.send(B, { toEpic: 'nobody', subject: 's', body: 'b' });
+    expect(bounced.state).toBe('undeliverable');
+    const toSender = f.sent.filter((s) => s.targetTabId === 'tab-b');
+    expect(toSender.map((s) => s.fields.event)).toEqual(['bounced']);
+    expect(toSender[0].fields).not.toHaveProperty('listHint');
+    expect(toSender[0].line).toContain(`purplemux note show ${bounced.id}`);
+    expect(id).toBeTruthy();
+  });
+
+  it('reads the flag at enqueue: a notice queued before the flag keeps its old line, a new one takes the tail', async () => {
+    const first = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    flags.add('notes.list-hint.ws-1');
+    const queued = f.inbox.get(f.note(first.id).inboxItemId!)!;
+    expect(f.sent.find((s) => s.id === queued.id)!.line).toContain(`purplemux note ack ${first.id}`);
+    const second = await svc.send(B, { toEpic: 'ddh', subject: 's2', body: 'b' });
+    expect(f.sent.find((s) => s.id === f.note(second.id).inboxItemId)!.line).toMatch(/run purplemux note list --open --to-me, then ack each$/);
+    // Turned off again: the next notice is the old line.
+    flags.clear();
+    const third = await svc.send(B, { toEpic: 'ddh', subject: 's3', body: 'b' });
+    expect(f.sent.find((s) => s.id === f.note(third.id).inboxItemId)!.fields).not.toHaveProperty('listHint');
+  });
+
+  it('a flag read that fails reads as off; the send succeeds', async () => {
+    svc = new NotesService({ ...f.deps(), flag: async () => { throw new Error('fleet config unreadable'); } });
+    const { id } = await svc.send(B, { toEpic: 'ddh', subject: 's', body: 'b' });
+    expect(f.note(id).state).toBe('delivered');
+    expect(f.sent[0].fields).not.toHaveProperty('listHint');
+  });
+});

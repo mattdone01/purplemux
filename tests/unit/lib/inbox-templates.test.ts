@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { INBOX_KINDS, InboxFieldError, renderInboxLine, type IInboxFields } from '@/lib/inbox-templates';
+import { INBOX_KINDS, InboxFieldError, renderInboxLine, renderNotePointerLine, type IInboxFields } from '@/lib/inbox-templates';
 import type { TInboxKind } from '@/types/inbox';
 
 const AT = Date.parse('2026-09-26T06:00:00.000Z');
@@ -71,6 +71,42 @@ describe('inbox templates (ADR-0012)', () => {
 
   it.each(HOSTILE)('refuses a note event that is not one of the four: %j', (event) => {
     expect(() => renderInboxLine('note', { ...VALID.note, event } as never)).toThrow(InboxFieldError);
+  });
+
+  describe('the list hint (NR-2\', design ruling E)', () => {
+    const TAIL = '— run purplemux note list --open --to-me, then ack each';
+
+    it.each([
+      ['delivered', `[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z ${TAIL}`],
+      ['reminder', `[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z is still unacked ${TAIL}`],
+    ] as const)('ends the %s line with the list command', (event, line) => {
+      expect(renderInboxLine('note', { ...VALID.note, event, listHint: true }).line).toBe(line);
+    });
+
+    it.each([false, undefined])('listHint %j: the delivered and reminder lines are byte-identical to 010793fd', (listHint) => {
+      expect(renderInboxLine('note', { ...VALID.note, listHint }).line)
+        .toBe('[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z — purplemux note show n-AbC123, then purplemux note ack n-AbC123');
+      expect(renderInboxLine('note', { ...VALID.note, event: 'reminder', listHint }).line)
+        .toBe('[purplemux note n-AbC123] from ws-fOvEfz/tab-csMTHf at 2026-09-26T06:00:00Z is still unacked — purplemux note show n-AbC123, then purplemux note ack n-AbC123');
+    });
+
+    it('changes no other note line and no pointer line', () => {
+      for (const fields of [
+        { ...VALID.note, event: 'unacked' as const },
+        { ...VALID.note, event: 'undelivered' as const, afterMinutes: 15 },
+        { ...VALID.note, event: 'expired' as const },
+        { ...VALID.note, event: 'bounced' as const, reason: 'target-epic-unowned' as const },
+      ]) {
+        expect(renderInboxLine('note', { ...fields, listHint: true }).line).toBe(renderInboxLine('note', fields).line);
+      }
+      expect(renderNotePointerLine({ ...VALID.note, listHint: true })).toBe(renderNotePointerLine(VALID.note));
+      expect(renderNotePointerLine({ ...VALID.note, listHint: true, ownerItem: true })).toBe(renderNotePointerLine({ ...VALID.note, ownerItem: true }));
+    });
+
+    it.each(['on', 1, 'true', null, {}])('refuses a listHint that is not a boolean: %j', (listHint) => {
+      expect(() => renderInboxLine('note', { ...VALID.note, listHint } as never)).toThrow(InboxFieldError);
+      expect(() => renderInboxLine('note', { ...VALID.note, event: 'bounced', reason: 'target-epic-unowned', listHint } as never)).toThrow(InboxFieldError);
+    });
   });
 
   // F6 AC1: no note line reports an ack; the `acked` event is not a note event any more.

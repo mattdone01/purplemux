@@ -113,6 +113,8 @@ export interface INotesDeps {
 
 /** NR-1: the send answer, `note show` and `note list --from-me` carry `receipt.queue` (ADR-0013 amendment). */
 export const SEND_QUEUE_RECEIPT_KEY = 'notes.send-queue-receipt';
+/** NR-2': `notes.list-hint.<recipient workspace id>`. */
+export const LIST_HINT_KEY_PREFIX = 'notes.list-hint.';
 
 /**
  * The answer to a typed pointer (G7). `notSubmitted` is set when the line may sit in the composer: still in the box
@@ -315,7 +317,7 @@ export class NotesService {
       : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
   }
 
-  private notice(note: INote, to: { workspaceId: string; tabId: string }, event: TNoteEvent): IEnqueueRequest<'note'> {
+  private notice(note: INote, to: { workspaceId: string; tabId: string }, event: TNoteEvent, listHint = false): IEnqueueRequest<'note'> {
     const reason = event === 'bounced' && isNoteBounceReason(note.routingReason) ? { reason: note.routingReason } : {};
     return {
       kind: 'note',
@@ -324,8 +326,18 @@ export class NotesService {
       dedupeKey: `note:${note.id}:${event}:${to.tabId}`,
       fields: { noteId: note.id, fromWorkspaceId: note.from.workspaceId, fromTabId: note.from.tabId,
         fromHuman: note.admission?.mode === 'human', fromOwner: note.admission?.mode === 'owner', sentAt: note.createdAt, event,
-        ...reason, ...(event === 'undelivered' ? { afterMinutes: Math.round(undeliveredNoticeMs(note) / 60_000) } : {}) },
+        ...reason, ...(event === 'undelivered' ? { afterMinutes: Math.round(undeliveredNoticeMs(note) / 60_000) } : {}),
+        ...(listHint ? { listHint: true } : {}) },
     };
+  }
+
+  /**
+   * NR-2': a recipient line (`delivered`, `reminder`) ends with the list command while `notes.list-hint.<wsId>` is on
+   * for the recipient's workspace. The flag is read here, at enqueue: a notice queued before a change keeps its line.
+   */
+  private async recipientNotice(note: INote, to: { workspaceId: string; tabId: string }, event: 'delivered' | 'reminder'): Promise<{ item: IInboxItem }> {
+    const listHint = await this.flagOn(`${LIST_HINT_KEY_PREFIX}${to.workspaceId}`);
+    return this.deps.enqueue(this.notice(note, to, event, listHint));
   }
 
   private async admissionFor(caller: ICaller, to: { epic: string | null; workspaceId: string | null }, now: number, r: IReads): Promise<INoteAdmission> {
@@ -530,7 +542,7 @@ export class NotesService {
     const decision = await this.recipientOf(note, r);
     if (decision.status === 'policyblocked') return policyBlocked(note, now, decision.reason);
     if (decision.status === 'undeliverable') return undeliverable(note, now, decision.reason);
-    const { item } = await this.deps.enqueue(this.notice(note, decision.recipient, 'delivered'));
+    const { item } = await this.recipientNotice(note, decision.recipient, 'delivered');
     return routed(note, decision.recipient, item.id, now);
   }
 
@@ -649,7 +661,7 @@ export class NotesService {
       let sent: string | null = null;
       try {
         if ((await r.tabState(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) === 'live') {
-          sent = (await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'))).item.id;
+          sent = (await this.recipientNotice(next, next.deliveredTo, 'reminder')).item.id;
         }
       } catch (err) {
         log.warn(`note ${note.id} reminder not sent: ${err instanceof Error ? err.message : err}`);

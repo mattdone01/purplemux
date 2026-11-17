@@ -251,3 +251,18 @@ notice: a notice to a coordinator sender would wait behind that sender's own win
 
 Rejected: an inbox notice to the sender at queue time (it adds wakes and waits behind the sender's own window), and an
 earlier `undelivered` notice (still a wake, still late).
+
+## Amendment: the recipient line can end with the list command (2026-11-17, NR-2', train A1)
+The same design check proposed a "window drain" that typed every waiting note id in one line. The consult rejected it
+(ruling E): each note preflight holds the notes lock until the inbox records the outcome, so a second preflight in the
+same attempt waits for ever under the dispatch lock and stops the tick for every tab. The approved change is in the
+template only.
+- While fleet config `notes.list-hint.<wsId>` is on for the recipient's workspace, the `delivered` and `reminder`
+  lines end `— run purplemux note list --open --to-me, then ack each` in place of `— purplemux note show n-…, then
+  purplemux note ack n-…`. The id, the sender words and the time stay; the line still carries no caller text
+  (ADR-0012).
+- The flag is read when the notice is queued, so a notice queued before a change keeps its line.
+- The window still gives one wake per 10 min, and at that wake the coordinator reads every waiting note. That is how a
+  coordinator already cleared bursts (23 of 25 notes on 15 Nov were acked without their line typed).
+- No other line changes: the sender's `unacked`, `undelivered`, `expired` and `bounced` lines and every pointer line
+  are as before. No dispatcher change.

@@ -853,7 +853,9 @@ never falls back to a worker. When a note bounces (target-epic-unowned or target
 or later), the sender's live tab gets one line at once, "[purplemux note n-…] you sent it at <time>; it bounced
 (<reason>): …", and one line in its digest; the note waits for a recipient until it expires. The recipient's tab
 receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
-show n-…, then purplemux note ack n-…" (from "owner (<ws>/<tab>)" for an owner note); the subject and
+show n-…, then purplemux note ack n-…" (from "owner (<ws>/<tab>)" for an owner note); while fleet config
+notes.list-hint.<recipient workspace id> is on (NR-2'), that line and the reminder end "— run purplemux note list
+--open --to-me, then ack each" instead, read when the notice is queued. The subject and
 body are never typed. Every note view carries fromLabel, the same server-made words after "from". If that tab closes
 before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
 the line reached its composer, and one notice reaches the sender's tab (if live): at 15 min (an owner item: 5 min)
@@ -1286,6 +1288,12 @@ Keys in use:
                --from-me carries "queue" (NR-1, ADR-0013 amendment), and a viewer outside the
                recipient workspace reads the notice's refusal and hold as fixed words. Read on each
                call. Written by the admin token or an enabled orchestrator (ADR-0019).
+  notes.list-hint.<workspaceId>
+               on, or unset (off). On, the delivered and reminder note lines to a tab of that
+               workspace end "— run purplemux note list --open --to-me, then ack each" in place of
+               the note's own show and ack commands (NR-2'): one wake reads every waiting note. Read
+               when the notice is queued, so a notice queued earlier keeps its line. Written by the
+               admin token or an enabled orchestrator (ADR-0019).
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
