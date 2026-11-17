@@ -7,6 +7,7 @@ import { normalizeOrchestration, OrchestrationError, requireOrchestrationRevisio
   type TOrchestrationActor, type TOrchestrationMode, type IOrchestrationPrecondition, type TOrchestrationPatch } from '@/lib/orchestration-contract';
 import { observeOrchestrationRuntime, candidateModelUsable } from '@/lib/orchestration-runtime';
 import { readOrchestrationWorkState } from '@/lib/orchestration-work-state';
+import { readRemoteHosts } from '@/lib/remote-host';
 import { createLogger } from '@/lib/logger';
 import type { ITab, IWorkspace } from '@/types/terminal';
 
@@ -26,6 +27,19 @@ const strictTabs = async (workspaceId: string): Promise<ITab[]> => {
   } catch {
     throw new OrchestrationError(409, 'orchestrator-state-unknown', 'Authoritative workspace layout is unavailable');
   }
+};
+/**
+ * A remote candidate's host must be on `remote.hosts` now (ADR-0049 §1): the create checked it once, and a host taken
+ * off the list since is never asked over ssh, let alone given the workspace. Checked before the first observation.
+ */
+const requireRegisteredHost = async (host: string): Promise<void> => {
+  let registered: string[];
+  try {
+    registered = await readRemoteHosts();
+  } catch (error) {
+    throw new OrchestrationError(409, 'orchestrator-state-unknown', `remote.hosts is unreadable, so remote host ${host} is not proven registered: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!registered.includes(host)) throw new OrchestrationError(409, 'orchestrator-candidate-invalid', `remote host ${host} is not on remote.hosts; a tab on it cannot coordinate (ADR-0049)`);
 };
 const authorize = (workspaceId: string, options: IOrchestrationChange): void => {
   if (!options?.actor || options.actor.kind !== 'human' && (options.actor.kind !== 'workspace' || options.actor.workspaceId !== workspaceId)) {
@@ -86,7 +100,9 @@ export const changeOrchestration = async (
     }
     return underTargets(workspaceId, [current.orchestratorTabId, next.orchestratorTabId].filter((id): id is string => !!id), async () => {
       if (!next.enabled || !next.orchestratorTabId) {
-        const work = await readOrchestrationWorkState(workspace);
+        // The verified caller's own turn is this call, not work that keeps a coordinator (ADR-0049 §4; seen 16 Nov).
+        const callerTabId = options.actor.kind === 'workspace' && options.actor.verified ? options.actor.tabId : null;
+        const work = await readOrchestrationWorkState(workspace, { callerTabId });
         if (work.state !== 'complete' || work.incomplete) throw new OrchestrationError(409, 'orchestration-work-remains', `Keep a coordinator while work is ${work.state}: ${work.evidence.join('; ')}`, current);
       } else {
         const tabs = await strictTabs(workspaceId);
@@ -96,11 +112,13 @@ export const changeOrchestration = async (
         }
         const candidate = tabs.find((tab) => tab.id === next.orchestratorTabId);
         if (!candidate || !isAgentPanelType(candidate.panelType)) throw new OrchestrationError(409, 'orchestrator-candidate-invalid', 'Recovery requires an agent tab in this workspace');
-        // A remote tab may coordinate (owner, 16 Nov 2026). Its process proof runs on its host (observeOrchestrationProcess);
-        // its nudges reach it as typed input over ssh; its tab token runs the CLI for its own workspace (ADR-0022, ADR-0021).
-        // A host that does not answer reads as unknown below, so an unreachable remote candidate is refused, never assumed.
+        // A remote tab may coordinate (owner, 16 Nov 2026; ADR-0049). Its host must be on remote.hosts; its process proof
+        // runs on its host (observeOrchestrationProcess); its nudges reach it as typed input over ssh; its tab token runs
+        // the CLI for its own workspace (ADR-0022, ADR-0021). A host that does not answer reads as unknown below, so an
+        // unreachable remote candidate is refused, never assumed.
         // An evaluator reads and judges; it cannot edit, commit or dispatch (ADR-0040).
         if (candidate.role === 'evaluator') throw new OrchestrationError(409, 'orchestrator-candidate-invalid', 'An evaluator tab cannot coordinate a workspace (ADR-0040); designate an agent tab without a role');
+        if (candidate.host) await requireRegisteredHost(candidate.host);
         const observation = await observeOrchestrationRuntime(candidate);
         if (observation.state !== 'present') throw new OrchestrationError(409, observation.state === 'unknown' ? 'orchestrator-state-unknown' : 'orchestrator-candidate-invalid', observation.reason);
         if (!(await candidateModelUsable(candidate))) throw new OrchestrationError(409, 'orchestrator-candidate-invalid', 'Candidate model identity is not verified; recovery does not grant a bootstrap claim');

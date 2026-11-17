@@ -584,7 +584,7 @@ export const observeRemoteProviderProcess = async (
       input: REMOTE_PROVIDER_SCRIPT,
     }));
   } catch (err) {
-    return { state: 'unknown', reason: `remote host ${host} did not answer (${describeRemoteFailure(err)})` };
+    return { state: 'unknown', reason: `remote host ${host} did not answer (${describeRemoteFailure(err)})`, sshFailed: true };
   }
   const observed = parseRemoteProviderObservation(stdout);
   if (observed.state !== 'present') return observed;
@@ -789,6 +789,14 @@ const REMOTE_SCAN_BACKOFF_MS = 30_000;
 const gScan = globalThis as unknown as { __ptRemoteScanBackoff?: Map<string, number> };
 if (!gScan.__ptRemoteScanBackoff) gScan.__ptRemoteScanBackoff = new Map();
 const scanBackoff = gScan.__ptRemoteScanBackoff;
+
+/** The host failed to answer a scan or a proof less than 30 s ago (ADR-0049 §6): callers skip it, no ssh. */
+export const remoteHostBackedOff = (host: string): boolean => (scanBackoff.get(host) ?? 0) > Date.now();
+
+/** A host that did not answer an off-poll proof backs off as a failed scan does, so a 5 s retry never ssh's it each pass. */
+export const backOffRemoteHost = (host: string): void => {
+  scanBackoff.set(host, Date.now() + REMOTE_SCAN_BACKOFF_MS);
+};
 
 interface IRemoteScan {
   panes: Map<string, IPaneInfo>;

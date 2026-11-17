@@ -1324,16 +1324,25 @@ PATCH /api/cli/workspaces/<workspaceId>/orchestration
   stale revision: 409 orchestration-conflict with current orchestration. Never retry a conflict
   automatically. Legacy mappings read as revision 0; each semantic change increments once.
   An own-workspace caller may explicitly recover a vacant or positively dead incumbent to a
-  live local agent. Live, pending or unknown incumbent state refuses recovery. A missing legacy
-  session binding is unknown. Only the launch-verified incumbent can hand off a live mapping.
+  live agent tab. Live, pending or unknown incumbent state refuses recovery. A missing legacy
+  session binding is unknown. A remote claude-code tab may coordinate (ADR-0049): its host must
+  be on remote.hosts (else 409 orchestrator-candidate-invalid; an unreadable list is 409
+  orchestrator-state-unknown), and its agent is proven on its host twice before the commit. A
+  host that does not answer is unknown, never absent: it neither becomes nor loses the role. Only the launch-verified incumbent can hand off a live mapping.
   The human UI can explicitly replace after confirmation; it uses cookie, same origin and CAS,
   and leaves the former process running. Global tokens, peers and grants confer no mutation right.
   CLI: orchestration recover -w WS TAB; orchestration handoff -w WS TAB; on aliases recover.
   A committed change of the coordinator tab moves each open Mission Control run of the workspace
   to the new coordinator at the next binding generation (see "Orchestrator rebind" below).
   Clear/off requires fresh complete work evidence: no active epic lease, agent work or background
-  job, no unfinished standup, and no unknown observations. awaiting-human retains ownership and
-  pauses idle heartbeats. A tab's live reportsTo still overrides the coordinator nudge target.
+  job, no unfinished standup, and no unknown observations. The calling tab's own turn is the call:
+  a verified caller's tab is left out (its registered jobs still count). awaiting-human retains
+  ownership and pauses idle heartbeats. A coordinator whose last turn ended CHECKPOINTED: while its
+  workspace holds no lease (but num: and pool-cancel:), no watch, no busy worker, no live job and
+  no undelivered urgent event is parked: no heartbeat until one of those changes or a new turn ends
+  otherwise. While any of them holds, a CHECKPOINTED: answer does not restart the heartbeats; the
+  third goes to the owner as a stall alert (ADR-0049).
+  A tab's live reportsTo still overrides the coordinator nudge target.
 
   Turn ends (ADR-0018): a worker whose last line starts with DONE:, BLOCKED:, NEEDS-DECISION:,
   READY-TO-MERGE: or CHECKPOINTED: produces "[orchestrator-watchdog] worker <tab> (<name>) ended: <line>

@@ -36,7 +36,7 @@ export const INBOX_FIRST_TICK_MAX_WAIT_MS = 10_000;
  */
 export type TInboxPreflight = (item: IInboxItem) => Promise<
   | { ok: true; settle?: () => void | Promise<void> }
-  | { ok: false; reason: string }
+  | { ok: false; reason: string; /** Cannot tell yet: refused and retried on the backoff, never rejected (ADR-0049 §6). */ retry?: boolean }
 >;
 
 /** Kinds whose items may not be typed without their owner's preflight. */
@@ -257,7 +257,7 @@ export class InboxDispatcher {
           } catch (err) {
             return { outcome: 'refused', reason: `preflight-error:${err instanceof Error ? err.message : String(err)}` };
           }
-          if (!verdict.ok) return { outcome: 'rejected', reason: `preflight:${verdict.reason}` };
+          if (!verdict.ok) return { outcome: verdict.retry ? 'refused' : 'rejected', reason: `preflight:${verdict.reason}` };
           settle = verdict.settle;
         }
         try {
