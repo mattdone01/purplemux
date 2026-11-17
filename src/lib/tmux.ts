@@ -584,7 +584,7 @@ export const observeRemoteProviderProcess = async (
       input: REMOTE_PROVIDER_SCRIPT,
     }));
   } catch (err) {
-    return { state: 'unknown', reason: `remote host ${host} did not answer (${describeRemoteFailure(err)})` };
+    return { state: 'unknown', reason: `remote host ${host} did not answer (${describeRemoteFailure(err)})`, sshFailed: true };
   }
   const observed = parseRemoteProviderObservation(stdout);
   if (observed.state !== 'present') return observed;

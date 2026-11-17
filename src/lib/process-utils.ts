@@ -134,7 +134,7 @@ export const getProcessStartTimeMs = async (
 export type TStrictRuntimeObservation =
   | { state: 'present'; identity: string }
   | { state: 'absent'; reason: string }
-  | { state: 'unknown'; reason: string };
+  | { state: 'unknown'; reason: string; /** A remote proof: ssh itself failed or timed out, not an on-host doubt (ADR-0049 §6). */ sshFailed?: true };
 
 /** Bounded process inventory: errors and unreadable argv are uncertainty, never death. */
 export const observeProviderProcess = async (rootPid: number, provider: 'claude' | 'codex' | 'grok'): Promise<TStrictRuntimeObservation> => {

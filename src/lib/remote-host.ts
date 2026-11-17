@@ -405,7 +405,8 @@ if tmux -L "$sock" has-session -t "=$session" 2>/dev/null; then printf 'session\
  * `present\t<pane id>\t<pane pid>\t<pid>\t<start time>`, `absent\t<reason>` or
  * `unknown\t<reason>`. tmux's own "no such session" is absent. A walk can prove an absence only over a process table it
  * can read: the pane process's `stat` and its task `children` file (a kernel without CONFIG_PROC_CHILDREN has none),
- * else `unknown` (ADR-0049 §3: recovery moves a coordinator only on a positive absence).
+ * else `unknown` (ADR-0049 §3: recovery moves a coordinator only on a positive absence). A
+ * descendant the walk lists but cannot read (hidepid, another uid) is `unknown` too: it may be the agent.
  */
 export const REMOTE_PROVIDER_SCRIPT = `sock=$1; session=$2; want=$3
 out=$(tmux -L "$sock" list-panes -t "=$session:" -F '#{session_name}\t#{pane_id}\t#{pane_pid}' 2>&1)
@@ -418,6 +419,9 @@ fi
 name=$(printf '%s' "$out" | cut -f1); pane=$(printf '%s' "$out" | cut -f2); root=$(printf '%s' "$out" | cut -f3)
 [ "$name" = "$session" ] || { printf 'unknown\tsession identity changed\n'; exit 0; }
 check() {
+  if [ "$2" = child ] && { [ ! -r /proc/"$1"/comm ] || [ ! -r /proc/"$1"/cmdline ]; }; then
+    printf 'unknown\tprocess %s unreadable\n' "$1"; exit 0
+  fi
   comm=$(cat /proc/"$1"/comm 2>/dev/null)
   argv0=$(tr '\\0' '\\n' < /proc/"$1"/cmdline 2>/dev/null | sed -n 1p)
   entry=$(tr '\\0' '\\n' < /proc/"$1"/cmdline 2>/dev/null | sed -n 2p)
@@ -441,7 +445,7 @@ while [ -n "$frontier" ]; do
       seen=$((seen + 1))
       [ $seen -gt 512 ] && { printf 'unknown\tprocess inventory bound exceeded\n'; exit 0; }
       next="$next $c"
-      check "$c"
+      check "$c" child
     done
   done
   frontier=$next

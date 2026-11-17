@@ -254,6 +254,35 @@ describe.skipIf(process.platform !== 'linux')('remote provider script: absent ne
     }
   });
 
+  // Review r1 (Sonnet 4, first hole): a descendant listed in children whose comm or cmdline cannot be read (hidepid,
+  // another uid) may be the agent: unknown, never absent.
+  it('a listed child the walk cannot read is unknown; the same child readable and not the provider is absent', async () => {
+    const table = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'pmux-fake-proc-'));
+    const proc = (pid: string, comm: string | null, children = '') => {
+      fs.mkdirSync(pathMod.join(table, pid, 'task', pid), { recursive: true });
+      fs.writeFileSync(pathMod.join(table, pid, 'stat'), `${pid} (x) S 1 ${pid} ${pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0\n`);
+      fs.writeFileSync(pathMod.join(table, pid, 'task', pid, 'children'), children);
+      if (comm !== null) {
+        fs.writeFileSync(pathMod.join(table, pid, 'comm'), `${comm}\n`);
+        fs.writeFileSync(pathMod.join(table, pid, 'cmdline'), `${comm}\0`);
+      }
+    };
+    try {
+      proc('4242', 'bash', '5555 ');
+      fs.mkdirSync(pathMod.join(table, '4242'), { recursive: true });
+      const script = REMOTE_PROVIDER_SCRIPT.replaceAll('/proc/', `${table}/`);
+      await withFakeTmux(4242, async (env) => {
+        expect(parseRemoteProviderObservation(await runWith(env, ['sock', 'pt-ws-a-pane-a-tab-a', 'claude'], script)))
+          .toEqual({ state: 'unknown', reason: 'process 5555 unreadable' });
+        proc('5555', 'sleep');
+        expect(parseRemoteProviderObservation(await runWith(env, ['sock', 'pt-ws-a-pane-a-tab-a', 'claude'], script)))
+          .toEqual({ state: 'absent', reason: 'no claude process in the pane' });
+      });
+    } finally {
+      fs.rmSync(table, { recursive: true, force: true });
+    }
+  });
+
   it('the control: a readable pane process without the provider is still absent', async () => {
     const pane = spawn('sleep', ['30'], { stdio: 'ignore' });
     try {

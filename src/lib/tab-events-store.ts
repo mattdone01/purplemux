@@ -110,6 +110,16 @@ export class TabEventsTable {
     return { held: row.held === 1, lastDeliveredAt: row.delivered };
   };
 
+  /**
+   * How many urgent events for the tab at or after `since` were not typed (ADR-0049 §5), but a ROTATE and the seqs in
+   * `exclude`: a direct count, never a window of the newest rows (review r1, Sonnet 3).
+   */
+  countUndeliveredUrgent = (workspaceId: string, tabId: string, since: number, exclude: readonly number[] = []): number =>
+    (this.database.prepare(`SELECT COUNT(*) AS n FROM tab_events INDEXED BY tab_events_tab_idx
+      WHERE workspace_id = ? AND tab_id = ? AND at >= ? AND class = 'urgent' AND delivered_at IS NULL AND kind != 'rotate'
+      ${exclude.length ? `AND seq NOT IN (${exclude.map(() => '?').join(',')})` : ''}`)
+      .get(workspaceId, tabId, since, ...exclude) as { n: number }).n;
+
   /** Digest events waiting for the tab's next digest, oldest first. */
   pending = (workspaceId: string, tabId: string): ITabEvent[] =>
     (this.database.prepare(`SELECT * FROM tab_events INDEXED BY tab_events_pending_idx WHERE workspace_id = ? AND tab_id = ?

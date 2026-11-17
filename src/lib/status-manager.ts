@@ -381,6 +381,14 @@ export const checkpointedAtStop = (entry: Pick<ITabStatusEntry, 'lastEvent' | 't
   return entry.lastEvent?.name === 'stop' && entry.lastEvent.seq === record.seq;
 };
 
+/**
+ * The stall alert's detail. A remote coordinator none of whose heartbeats was typed did not sleep through them: its host
+ * may not answer, and the alert says so (ADR-0049, follow-up b).
+ */
+export const stallAlertDetail = (idleMinutes: number, undeliveredHost: string | null): string => (undeliveredHost
+  ? `Idle ~${idleMinutes} min with no worker activity; the ${ORCH_MAX_HEARTBEATS} heartbeats to its host ${undeliveredHost} were not delivered: check that the host answers.`
+  : `Idle ~${idleMinutes} min with no worker activity after ${ORCH_MAX_HEARTBEATS} heartbeats.`);
+
 /** Reservation leases hold no work (ADR-0049 §5): a `num:` number outlives its tab for days, a `pool-cancel:` is a mark. */
 const PARK_IGNORED_LEASE_KINDS = new Set(['num', 'pool-cancel']);
 
@@ -428,7 +436,8 @@ export class StatusManager {
   /** Fleet kill switches (F10 steps 1-2), read by every status poll: `turn-end.source`, `hook.stop-payload`. */
   private turnEndSourceRow = true;
   private stopPayloadIsTail = true;
-  private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean }>();
+  /** `delivered`: a beat of this episode was typed (ADR-0049, follow-up b); absent counts as none. */
+  private orchKeeper = new Map<string, { idleSince: number | null; beats: number; lastBeatAt: number; stallAlerted: boolean; delivered?: boolean }>();
   /** Identical nudges within 60 s are dropped and counted (L49). */
   private nudgeDedupe = new NudgeDeduper();
   /** Turn-marker nudges a tab's `reportOn` withheld since the server started (ADR-0025). */
@@ -2067,9 +2076,12 @@ export class StatusManager {
       // Last heartbeat of the episode: the orchestrator slept through every
       // nudge purplemux can send, so the human is the only one left to ask.
       const stalled = isStallEpisodeEnd(beats, ORCH_MAX_HEARTBEATS, state.stallAlerted);
-      this.orchKeeper.set(ws.id, { ...state, beats, lastBeatAt: now, stallAlerted: state.stallAlerted || stalled });
+      const anyDelivered = state.delivered === true || delivered;
+      this.orchKeeper.set(ws.id, { ...state, beats, lastBeatAt: now, stallAlerted: state.stallAlerted || stalled, delivered: anyDelivered });
       if (stalled) {
-        void this.dispatchStallAlert(ws, entry, orch.orchestratorTabId, idleMinutes).catch((err) => {
+        // A remote coordinator none of whose beats was typed: say so, rather than "slept through" (ADR-0049, follow-up b).
+        const undeliveredHost = entry.host && !anyDelivered ? entry.host : null;
+        void this.dispatchStallAlert(ws, entry, orch.orchestratorTabId, idleMinutes, undeliveredHost).catch((err) => {
           log.warn(`orchestrator stall alert failed: ${err instanceof Error ? err.message : err}`);
         });
       }
@@ -2202,7 +2214,7 @@ export class StatusManager {
     });
   }
 
-  private async dispatchStallAlert(ws: IWorkspace, entry: ITabStatusEntry, tabId: string, idleMinutes: number): Promise<void> {
+  private async dispatchStallAlert(ws: IWorkspace, entry: ITabStatusEntry, tabId: string, idleMinutes: number, undeliveredHost: string | null = null): Promise<void> {
     if (!shouldAlert({ id: tabId }, ws, await getConfig())) return;
     await this.dispatchAlert({
       kind: 'orchestrator-stalled',
@@ -2212,7 +2224,7 @@ export class StatusManager {
       tabName: entry.tabName,
       providerId: toAlertProvider(entry.agentProviderId),
       agentSessionId: entry.agentSessionId,
-      detail: `Idle ~${idleMinutes} min with no worker activity after ${ORCH_MAX_HEARTBEATS} heartbeats.`,
+      detail: stallAlertDetail(idleMinutes, undeliveredHost),
     });
   }
 

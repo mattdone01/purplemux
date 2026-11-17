@@ -2,6 +2,8 @@
 
 ## Status
 Accepted (2026-11-17). One Opus 5.5 xhigh design consult, APPROVE-WITH-CHANGES; built to all seven of its rulings.
+Amended in review round 1 (the xhigh CONFIRM's CONCERN and the Sonnet nits): §6 now has three answers, and a host
+that cannot tell is a retried refusal, never "not live".
 It records the rule that #92 (16 Nov 2026) changed in code only: before #92, a comment in
 `src/lib/orchestration-recovery.ts` refused every remote tab and named ADR-0022, which has no coordinator text.
 It also fixes two defects seen on 16 Nov: the keeper typed a heartbeat into a parked coordinator every ~11 min, and
@@ -35,8 +37,9 @@ cases that a remote coordinator adds:
 3. **Absent is a positive answer.** The remote walk prints `absent` only when two things hold: the host's tmux
    answered, and the process table of the pane process is readable. That means `/proc/<pid>/stat` and
    `/proc/<pid>/task/<pid>/children` (a kernel without CONFIG_PROC_CHILDREN has no children file). In every other
-   case the result is `unknown`. So an own-workspace recovery never replaces a live coordinator whose host hides
-   its processes.
+   case the result is `unknown`. A descendant that the children files list but whose `comm` or `cmdline` the walk
+   cannot read (hidepid, another uid) is `unknown` too, because it may be the agent. So an own-workspace recovery
+   never replaces a live coordinator whose host hides its processes.
 4. **The caller's own turn is not work.** `orchestration off` (and clear) reads fresh work evidence. The tab of a
    verified caller is left out, because its busy turn is the call itself. Its registered jobs, the leases, the
    standup and every other tab still count. A human or unverified caller excludes nothing.
@@ -47,16 +50,27 @@ cases that a remote coordinator adds:
    - no worker is busy and no registered job is live;
    - the workspace holds no unexpired lease, except the reservation kinds `num:` and `pool-cancel:`;
    - the workspace has no watch;
-   - no urgent event for the coordinator in the last 24 h is still untyped.
+   - no urgent event for the coordinator in the last 24 h is still untyped (a direct count, not a window of rows).
 
    The last condition keeps the heartbeat as the backstop for an urgent paste that failed, because the router does
    not retry one. If any source is unreadable, the coordinator is not parked. While the coordinator is not parked, a
    `CHECKPOINTED:` answer to a heartbeat does not start a new episode: beat 3 goes to the owner as a stall alert,
-   instead of a new beat every window.
+   instead of a new beat every window. That holds for an answer the poll never saw busy. If the poll sees the
+   coordinator `busy` while it answers a beat, the episode resets as on main: such a coordinator can still get a beat
+   each window. It is not silenced, so this stays as on main. If none of a remote coordinator's beats was typed, the
+   stall alert says that the heartbeats to its host were not delivered, not that it slept through them.
 6. **Mission Control binds a remote coordinator by its host's proof.** A remote pane has no local pid, so before this
-   change no run could bind to a remote tab, and no owner answer reached one. `inspectLiveTab` now proves a remote
-   tab with a fresh strict observation on its host. A host that does not answer backs off for 30 s with the pane
-   scans, so the 5 s rebind retry does not ssh a dead host on each pass. Discovery's `alive` uses the poll's own
+   change no run could bind to a remote tab, and no owner answer reached one. Mission Control now proves a remote
+   tab with a fresh strict observation on its host, and the paste-time preflight reads one of three answers:
+   - **present**: the preflight claims the row, and the inbox types the answer once;
+   - **not live** (absent, or not a claude-code tab): the preflight rejects, as for a local tab;
+   - **cannot tell** (ssh failed, the host is in its backoff, or the host answered with a doubt about this pane):
+     the preflight refuses with `retry`. The inbox keeps the item queued and asks again on its backoff. Nothing is
+     claimed and nothing is typed.
+
+   Only an ssh that itself failed (`sshFailed` on the observation) backs the host off for 30 s with the pane scans,
+   so the 5 s rebind retry does not ssh a dead host on each pass. A doubt on a host that answered does not freeze
+   that host's scans. Discovery's `alive` uses the poll's own
    rule over the pane scan that it already read: the provider in the foreground, or a kept `present` proof that it
    reads without consuming. It sends no ssh of its own. The paste-time preflight still runs the fresh proof.
 
@@ -64,20 +78,27 @@ cases that a remote coordinator adds:
 
 - **The host does not answer.** Recovery and handoff refuse with `orchestrator-state-unknown`. The incumbent's own
   verified handoff and a human replace still work, but a candidate must be proven. Mission Control answers stay
-  queued: the preflight refuses `bound-agent-not-live` without a claim, so nothing is typed, and the inbox backoff
-  asks again (10 s up to 5 min, held after 30 refusals or 24 h, a held item tried every 5 min). An urgent nudge whose
+  queued: the preflight refuses `bound-agent-unknown` with `retry` and without a claim, so nothing is typed, and the
+  inbox backoff asks again (10 s up to 5 min, held after 30 refusals or 24 h, a held item tried every 5 min). An urgent nudge whose
   paste fails is recorded as untyped, and the coordinator then cannot park (§5). An idle coordinator keeps its
   cached `idle`, so the keeper counts beats 1 to 3 and the owner receives a stall alert in about 30 min. When the
   host answers again, the next observation decides, and a held digest is typed when the tab is at its prompt.
 - **Input typed over ssh.** A nudge is confirmed by the pane. A failed check counts as delivered, so the nudge is
   never typed twice. A digest whose text was typed but whose Enter failed can be typed again. Mission Control keeps
   exactly-once: an uncertain send is held as `transport-uncertain`, a text left in the composer is held, and a row
-  still `dispatching` at a restart is held.
+  still `dispatching` at a restart is held. A composer read that fails after the paste reads as delivered and is not
+  typed again.
+
+## Known limits (named in review round 1, not changed)
+- tmux's "No such file or directory" reads as a gone session (`absent`). If ssh runs with another `TMUX_TMPDIR` than
+  the one the panes use, a live session reads as gone.
+- The walk's reads of descendant `children` files still discard their errors (`2>/dev/null`). A children file that
+  cannot be read while the others can still ends the walk early.
+- A coordinator that the poll sees `busy` while it answers a heartbeat resets the beat count (§5), as on main.
 
 ## Consequences
 - A team lead on its team host can be its workspace's coordinator and receive the owner's answers.
 - A coordinator that checkpoints with nothing in flight is quiet until a nudge, a note or an answer wakes it, or a
   lease, watch or worker appears.
-- Follow-ups, not built here:
-  - (a) a router retry for an untyped urgent row, for every tab. This needs its own design against double typing.
-  - (b) a stall alert that names a host which did not answer.
+- Follow-up, not built here: (a) a router retry for an untyped urgent row, for every tab. This needs its own design
+  against double typing. Follow-up (b), the stall alert that names the host, is built (§5).

@@ -75,6 +75,7 @@ vi.mock('@/lib/providers/registry', () => ({
 
 import {
   discoverMissionControlWorkspaces,
+  observeMissionTarget,
   resolveMissionTargetIdentity,
   hasEmptyAgentComposer,
   missionBootstrapKey,
@@ -189,9 +190,9 @@ describe('Mission Control runtime discovery', () => {
       expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
       expect(mocks.observe).not.toHaveBeenCalled();
     });
-    it('a host that did not answer is not asked again inside its backoff, then is asked again', async () => {
+    it('a host whose ssh failed is not asked again inside its backoff, then is asked again', async () => {
       remote();
-      mocks.observe.mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)' });
+      mocks.observe.mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)', sshFailed: true });
       expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
       expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
       expect(mocks.observe).toHaveBeenCalledTimes(1);
@@ -199,6 +200,26 @@ describe('Mission Control runtime discovery', () => {
       mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:x' });
       expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toMatchObject({ tabId: 'orch' });
       expect(mocks.observe).toHaveBeenCalledTimes(2);
+    });
+    // Review r1 (Sonnet 1): a host that answered with a doubt about one pane must not freeze the host's scans.
+    it.each(['tmux failed', 'session identity ambiguous', 'process table unreadable'])('an on-host unknown (%s) does not back the host off', async (reason) => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'unknown', reason });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'unknown', reason });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'unknown', reason });
+      expect(mocks.observe).toHaveBeenCalledTimes(2);
+      expect((globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff?.has('host-a') ?? false).toBe(false);
+    });
+    it('the paste-time view: ssh failed and backed off read unknown, never not live; absent reads not live', async () => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)', sshFailed: true });
+      expect(await observeMissionTarget('ws-one', 'orch')).toMatchObject({ state: 'unknown' });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'unknown', reason: 'remote host host-a backed off after it did not answer' });
+      (globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff?.clear();
+      mocks.observe.mockResolvedValue({ state: 'absent', reason: 'no claude process in the pane' });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'not-live' });
+      mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:x' });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'live', identity: expect.objectContaining({ tabId: 'orch', sessionId: 'session-orch' }) });
     });
     it('an absent answer does not back the host off: the next call asks again', async () => {
       remote();
@@ -919,7 +940,7 @@ describe('Mission Control paste-time preflight (story 12, ruling A′ §4)', () 
   // ADR-0049 §6 with a fake remote: the owner's answer to a remote coordinator is claimed for a paste only on a fresh
   // proof from its host. A host that does not answer leaves the row waiting, unclaimed: nothing is typed, and the
   // inbox backoff asks again later.
-  it('a remote coordinator: an unanswered host refuses without a claim; a proven one is claimed once', async () => {
+  it('a remote coordinator: an unanswered host is a retryable refusal without a claim; a proven one is claimed once', async () => {
     const backoff = (globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff;
     backoff?.clear();
     const orch = { id: 'orch', sessionName: 'pt-ws-one-pane-orch', name: 'orchestrator', order: 0, panelType: 'claude-code' as const, host: 'host-a' };
@@ -927,9 +948,10 @@ describe('Mission Control paste-time preflight (story 12, ruling A′ §4)', () 
     mocks.statuses = { orch: { workspaceId: 'ws-one', agentProviderId: 'claude', agentSessionId: 'session-orch', cliState: 'idle' } };
     const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } });
     harness.deps.resolveIdentity = resolveMissionTargetIdentity;
+    harness.deps.observeTarget = observeMissionTarget;
 
-    mocks.observe.mockReset().mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)' });
-    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: false, reason: 'bound-agent-not-live' });
+    mocks.observe.mockReset().mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)', sshFailed: true });
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: false, retry: true, reason: 'bound-agent-unknown:remote host host-a did not answer (timeout)' });
     expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
 
     backoff?.clear();
@@ -937,6 +959,10 @@ describe('Mission Control paste-time preflight (story 12, ruling A′ §4)', () 
     await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: true });
     expect(harness.store.claimInboxDelivery).toHaveBeenCalledTimes(1);
     expect(mocks.observe).toHaveBeenCalledTimes(2);
+
+    // Absent stays what it was: not live, a rejection.
+    mocks.observe.mockResolvedValue({ state: 'absent', reason: 'no claude process in the pane' });
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: false, reason: 'bound-agent-not-live' });
   });
 
   it('holds the claimed row when the record changed, and refuses the paste', async () => {

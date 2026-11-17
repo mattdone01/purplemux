@@ -271,9 +271,7 @@ export class TabEventRouter {
   undeliveredUrgent(workspaceId: string, tabId: string, since: number): number {
     const table = this.tableOrNull();
     if (!table) throw new Error('tab event log unreadable');
-    return table.list(workspaceId, { tabId, since, limit: 500 })
-      .filter((row) => row.class === 'urgent' && row.deliveredAt === null && row.kind !== 'rotate'
-        && !this.unrecorded.has(row.seq) && !this.inFlight.has(row.seq)).length;
+    return table.countUndeliveredUrgent(workspaceId, tabId, since, [...this.unrecorded, ...this.inFlight]);
   }
 
   /**

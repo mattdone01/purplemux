@@ -53,13 +53,13 @@ const lease = (workspaceId: string | null, name = 'epic:alpha') => ({
   acquiredAt: '2026-11-16T02:00:00Z', renewedAt: '2026-11-16T02:00:00Z', ttlSeconds: null, expiresAt: null,
 });
 
-const setup = async (entry: ITabStatusEntry) => {
+const setup = async (entry: ITabStatusEntry, hostAnswers = true) => {
   const tables = memoryLedgerTables();
   const paste = vi.fn(async () => {});
   const dispatcher = new AutomatedPromptDispatcher({
     findTarget: vi.fn(async (_workspaceId, id) => tab(id)),
     withPolicyLock: policyLock(),
-    hasSession: vi.fn(async () => true),
+    hasSession: vi.fn(async () => hostAnswers),
     paste,
   });
   const { StatusManager } = await import('@/lib/status-manager');
@@ -72,7 +72,7 @@ const setup = async (entry: ITabStatusEntry) => {
     await vi.advanceTimersByTimeAsync(ORCH_IDLE_HEARTBEAT_MS + 60_000);
     await runKeeper();
   };
-  const stallAlert = vi.spyOn(manager as unknown as { dispatchStallAlert: () => Promise<void> }, 'dispatchStallAlert').mockResolvedValue();
+  const stallAlert = vi.spyOn(manager as unknown as { dispatchStallAlert: (...args: unknown[]) => Promise<void> }, 'dispatchStallAlert').mockResolvedValue();
   return { paste, window, runKeeper, stallAlert, events: tables[0]() };
 };
 
@@ -166,6 +166,17 @@ describe('a parked coordinator gets no heartbeat', () => {
     expect(paste).toHaveBeenCalledTimes(1);
   });
 
+  // Review r1 (Sonnet 3): a direct count, not the newest 500 rows: an old untyped urgent row behind 600 newer ones counts.
+  it('an untyped urgent event behind more than 500 newer rows still keeps the heartbeat', async () => {
+    const { paste, window, events } = await setup(coordinator('CHECKPOINTED: parked'));
+    events.append({ workspaceId: 'ws-a', tabId: 'root', at: Date.now() - 60_000, class: 'urgent', kind: 'turn-marker', text: 'worker ended: DONE: x', sourceTabId: 'worker' });
+    for (let i = 0; i < 600; i += 1) {
+      events.append({ workspaceId: 'ws-a', tabId: 'root', at: Date.now(), class: 'log', kind: 'note', text: `n${i}`, deliveredAt: Date.now() });
+    }
+    await window();
+    expect(paste).toHaveBeenCalledTimes(1);
+  });
+
   it('an undelivered urgent event for another tab, or a typed one for the coordinator, still parks', async () => {
     const { paste, window, events } = await setup(coordinator('CHECKPOINTED: parked'));
     events.append({ workspaceId: 'ws-a', tabId: 'worker', at: Date.now(), class: 'urgent', kind: 'turn-marker', text: 'a', sourceTabId: 'x' });
@@ -204,5 +215,32 @@ describe('a parked coordinator gets no heartbeat', () => {
     const { paste, window } = await setup(coordinator('CHECKPOINTED: parked', over as Partial<ITabStatusEntry>));
     await window();
     expect(paste).toHaveBeenCalledTimes(1);
+  });
+
+  // Review r1 item 6 (consult ruling 6, text only): a remote coordinator whose beats were never typed did not sleep
+  // through them; the owner's alert names its host.
+  it('the stall alert of a remote coordinator whose heartbeats were not typed names its host; a typed one does not', async () => {
+    const beatThrice = async (runKeeper: () => Promise<void>) => {
+      await runKeeper();
+      for (let beat = 1; beat <= 3; beat += 1) {
+        await vi.advanceTimersByTimeAsync(ORCH_IDLE_HEARTBEAT_MS + 60_000);
+        await runKeeper();
+      }
+    };
+    const remote = await setup(coordinator(null, { host: 'host-a' }), false);
+    await beatThrice(remote.runKeeper);
+    expect(remote.stallAlert).toHaveBeenCalledTimes(1);
+    expect(remote.stallAlert.mock.calls[0]?.at(-1)).toBe('host-a');
+
+    const reached = await setup(coordinator(null, { host: 'host-a' }));
+    await beatThrice(reached.runKeeper);
+    expect(reached.paste).toHaveBeenCalledTimes(1);
+    expect(reached.stallAlert.mock.calls[0]?.at(-1)).toBeNull();
+  });
+
+  it('the stall alert detail', async () => {
+    const { stallAlertDetail } = await import('@/lib/status-manager');
+    expect(stallAlertDetail(31, null)).toBe('Idle ~31 min with no worker activity after 3 heartbeats.');
+    expect(stallAlertDetail(31, 'host-a')).toBe('Idle ~31 min with no worker activity; the 3 heartbeats to its host host-a were not delivered: check that the host answers.');
   });
 });
