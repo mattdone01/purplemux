@@ -403,7 +403,9 @@ if tmux -L "$sock" has-session -t "=$session" 2>/dev/null; then printf 'session\
  * session's one pane, then the pane's descendants (bounded at 512) for the
  * provider's executable, `comm`, or a node/bun entrypoint. Output, one line:
  * `present\t<pane id>\t<pane pid>\t<pid>\t<start time>`, `absent\t<reason>` or
- * `unknown\t<reason>`. tmux's own "no such session" is absent.
+ * `unknown\t<reason>`. tmux's own "no such session" is absent. A walk can prove an absence only over a process table it
+ * can read: the pane process's `stat` and its task `children` file (a kernel without CONFIG_PROC_CHILDREN has none),
+ * else `unknown` (ADR-0049 §3: recovery moves a coordinator only on a positive absence).
  */
 export const REMOTE_PROVIDER_SCRIPT = `sock=$1; session=$2; want=$3
 out=$(tmux -L "$sock" list-panes -t "=$session:" -F '#{session_name}\t#{pane_id}\t#{pane_pid}' 2>&1)
@@ -430,6 +432,7 @@ check() {
   exit 0
 }
 check "$root"
+[ -r /proc/"$root"/stat ] && [ -r /proc/"$root"/task/"$root"/children ] || { printf 'unknown\tprocess table unreadable\n'; exit 0; }
 frontier=$root; seen=0
 while [ -n "$frontier" ]; do
   next=""

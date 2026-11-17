@@ -264,6 +264,19 @@ export class TabEventRouter {
   }
 
   /**
+   * How many urgent events for the tab since `since` were not typed (ADR-0049 §5): a failed paste is not retried by
+   * the router, so the coordinator keeper keeps its heartbeat while one waits. A row in flight, a typed row whose
+   * record failed, and a ROTATE (retried by its owner) are not counted. Throws when the log is unreadable.
+   */
+  undeliveredUrgent(workspaceId: string, tabId: string, since: number): number {
+    const table = this.tableOrNull();
+    if (!table) throw new Error('tab event log unreadable');
+    return table.list(workspaceId, { tabId, since, limit: 500 })
+      .filter((row) => row.class === 'urgent' && row.deliveredAt === null && row.kind !== 'rotate'
+        && !this.unrecorded.has(row.seq) && !this.inFlight.has(row.seq)).length;
+  }
+
+  /**
    * Type the urgent events the tab's hold kept since `since`, oldest first (ADR-0036): every undelivered urgent row
    * but a ROTATE (a refused ROTATE is retried by its own owner). Each is in flight while typed, as any urgent paste,
    * so it enters the nudge history with its outcome. Returns how many were typed.

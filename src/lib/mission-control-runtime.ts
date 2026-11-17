@@ -11,7 +11,8 @@ import { verifyCodexActiveRuntime } from '@/lib/providers/codex/launch-lifecycle
 import { getChildPids } from '@/lib/process-utils';
 import { readStandups } from '@/lib/standup-store';
 import { getStatusManager } from '@/lib/status-manager';
-import { getAllPanesInfo } from '@/lib/tmux';
+import { backOffRemoteHost, getAllPanesInfo, remoteHostBackedOff } from '@/lib/tmux';
+import { observeOrchestrationProcess } from '@/lib/orchestration-runtime';
 import { readWorkspaceLayout } from '@/lib/workspace-layout-read';
 import { getWorkspaces } from '@/lib/workspace-store';
 import {
@@ -210,6 +211,19 @@ const sameIdentity = (
 // Moved to composer-readiness (story 09); re-exported for existing importers.
 export { hasEmptyAgentComposer } from '@/lib/composer-readiness';
 
+/**
+ * A remote tab's agent, proven on its host (ADR-0049 §6): a remote pane has no pid here, so the local pid and /proc
+ * checks could never bind one, and an owner's answer never reached a remote coordinator. Only a claude-code tab runs
+ * remotely (ADR-0022). The strict observation runs fresh on each call: `present` alone binds. A host that does not
+ * answer backs off with the pane scans, so the 5 s rebind retry never asks a dead host each pass.
+ */
+const remoteAgentProven = async (tab: ITab, host: string): Promise<boolean> => {
+  if (tab.panelType !== 'claude-code' || remoteHostBackedOff(host)) return false;
+  const observed = await observeOrchestrationProcess(tab);
+  if (observed.state === 'unknown') backOffRemoteHost(host);
+  return observed.state === 'present';
+};
+
 const inspectLiveTab = async (workspaceId: string, tabId: string): Promise<ILiveTab | null> => {
   const found = await findTab(workspaceId, tabId);
   if (!found || !isAgentPanelType(found.tab.panelType)) return null;
@@ -221,12 +235,16 @@ const inspectLiveTab = async (workspaceId: string, tabId: string): Promise<ILive
   const sessionId = status.agentSessionId;
   if (!sessionId || !provider.isValidSessionId(sessionId)) return null;
 
-  const panes = await getAllPanesInfo();
-  const pane = panes.get(found.tab.sessionName);
-  if (!pane?.pid) return null;
-  if (!processMatchesPanelType(found.tab.panelType, pane.command)) return null;
-  const childPids = await getChildPids(pane.pid);
-  if (!await provider.isAgentRunning(pane.pid, childPids)) return null;
+  if (found.tab.host) {
+    if (!await remoteAgentProven(found.tab, found.tab.host)) return null;
+  } else {
+    const panes = await getAllPanesInfo();
+    const pane = panes.get(found.tab.sessionName);
+    if (!pane?.pid) return null;
+    if (!processMatchesPanelType(found.tab.panelType, pane.command)) return null;
+    const childPids = await getChildPids(pane.pid);
+    if (!await provider.isAgentRunning(pane.pid, childPids)) return null;
+  }
 
   if (found.tab.panelType === 'codex-cli') {
     if (!runtimeGenerationFor(found.tab)) return null;
@@ -270,7 +288,9 @@ export const discoverMissionControlWorkspaces = async (): Promise<IMissionDiscov
       const status = statuses[tab.id];
       const pane = panes.get(tab.sessionName);
       let alive = false;
-      if (provider && pane?.pid && processMatchesPanelType(tab.panelType, pane.command)) {
+      // A remote tab: the poll's rule over this scan, no ssh of discovery's own (ADR-0049 §6); preflight proves it fresh.
+      if (tab.host) alive = tab.panelType === 'claude-code' && await getStatusManager().remoteAgentAlive(tab, pane).catch(() => false);
+      else if (provider && pane?.pid && processMatchesPanelType(tab.panelType, pane.command)) {
         const childPids = await getChildPids(pane.pid).catch(() => []);
         alive = await provider.isAgentRunning(pane.pid, childPids).catch(() => false);
         if (alive && tab.panelType === 'codex-cli') {

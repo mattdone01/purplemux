@@ -79,7 +79,7 @@ import { StopGate, type IStopPayload } from '@/lib/stop-gate';
 import { STOP_PAYLOAD_CONFIG_KEY, TURN_END_SOURCE_CONFIG_KEY, resolveTurnEnd, synthesizeLine, tailMarker, type TStopDecision } from '@/lib/turn-end-row';
 import type { TurnEndsTable } from '@/lib/turn-ends-store';
 import type { ITurnEndTab } from '@/lib/turn-end-service';
-import { classifyWake, type IWakeDetail } from '@/lib/wake-class';
+import { classifyWake, lastTurnMarker, type IWakeDetail } from '@/lib/wake-class';
 import { CONTEXT_TICK_MS, ContextLifecycle, ROTATE_AT_CONFIG_KEY, fleetRotateAtFrom, restartRefusalOutcome, type IContextLifecycleDeps, type TRestartOutcome } from '@/lib/context-lifecycle';
 import { DEFAULT_ROTATE_AT_TOKENS } from '@/lib/constraint';
 import { SERVER_PRODUCER } from '@/lib/ledger-store';
@@ -369,6 +369,23 @@ export const orchestratorTurnAt = (entry: Pick<ITabStatusEntry, 'lastEvent' | 't
   if (event === null) return ended;
   return ended === null ? event : Math.max(event, ended);
 };
+
+/**
+ * The coordinator's current stop ended CHECKPOINTED: (ADR-0049 §5): the turn-marker record is the stop that is the
+ * tab's last event, so no prompt and no later stop came after it.
+ */
+export const checkpointedAtStop = (entry: Pick<ITabStatusEntry, 'lastEvent' | 'turnEnd'>): boolean => {
+  const record = entry.turnEnd;
+  if (record?.kind !== 'turn-marker' || record.seq === undefined) return false;
+  if (lastTurnMarker(record.marker) !== 'CHECKPOINTED') return false;
+  return entry.lastEvent?.name === 'stop' && entry.lastEvent.seq === record.seq;
+};
+
+/** Reservation leases hold no work (ADR-0049 §5): a `num:` number outlives its tab for days, a `pool-cancel:` is a mark. */
+const PARK_IGNORED_LEASE_KINDS = new Set(['num', 'pool-cancel']);
+
+/** How far back an undelivered urgent event keeps a parked coordinator's heartbeat (ADR-0049 §5). */
+const PARK_UNDELIVERED_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
@@ -2019,14 +2036,24 @@ export class StatusManager {
         continue;
       }
 
+      // A parked coordinator (ADR-0049 §5): its last turn ended CHECKPOINTED: and its workspace holds nothing that
+      // will need it. No heartbeat, no stall alert; the episode starts over when it is no longer parked.
+      const checkpointed = checkpointedAtStop(entry);
+      if (checkpointed && await this.coordinatorHoldsNothing(ws.id, orch.orchestratorTabId, entry)) {
+        this.orchKeeper.set(ws.id, { idleSince: null, beats: 0, lastBeatAt: 0, stallAlerted: false });
+        continue;
+      }
+
       if (state.idleSince === null) {
         this.orchKeeper.set(ws.id, { ...state, idleSince: now });
         continue;
       }
       // F6 ruling 6: a turn the polls never saw busy (a 20 s turn between two 60 s polls) still ends the idle episode.
       // Without this, beats 2 and 3 are `log` rows nobody reads and beat 3 sends the owner a false stall alert.
+      // A CHECKPOINTED: answer to a beat does not (ADR-0049 §5): it holds work it does not do, so the beats go on to
+      // the owner's alert instead of starting over every window (16 Nov: one beat each ~11 min, for good).
       const turnAt = orchestratorTurnAt(entry);
-      if (turnAt !== null && turnAt > Math.max(state.idleSince, state.lastBeatAt)) {
+      if (turnAt !== null && turnAt > Math.max(state.idleSince, state.lastBeatAt) && !(checkpointed && state.beats > 0)) {
         this.orchKeeper.set(ws.id, { idleSince: turnAt, beats: 0, lastBeatAt: 0, stallAlerted: false });
         continue;
       }
@@ -2047,6 +2074,42 @@ export class StatusManager {
         });
       }
       log.info({ workspaceId: ws.id, beats, delivered }, 'orchestrator heartbeat');
+    }
+  }
+
+  /**
+   * Mission Control discovery's `alive` for a remote agent tab (ADR-0049 §6): the poll's own rule (`agentRunningIn`)
+   * over the pane scan discovery already read, without any ssh of its own. The provider in the foreground is alive;
+   * else only a kept `present` proof under the pane's current key, read without consuming it. Anything else is not
+   * alive. Cached CLI state is never evidence (ADR-0021).
+   */
+  async remoteAgentAlive(tab: ITab, paneInfo: IPaneInfo | undefined): Promise<boolean> {
+    const host = tab.host;
+    if (!host) return false;
+    const launchedAt = this.tabs.get(tab.id)?.lastResumeOrStartedAt;
+    return (await agentRunningIn(paneInfo, getProviderByPanelType(tab.panelType), {
+      answered: false,
+      proof: (want) => this.remoteProofs.peek({ tabId: tab.id, host, sessionName: tab.sessionName, want, key: remoteProofKey(tab.sessionName, paneInfo!, launchedAt) }),
+    })) === true;
+  }
+
+  /**
+   * Whether a CHECKPOINTED: coordinator's workspace holds nothing that will need it (ADR-0049 §5): no lease of the
+   * workspace (but the reservation kinds), no watch of the workspace, and no urgent event for the coordinator that
+   * was not typed. The caller has already ruled out busy workers and live registered jobs. Any unreadable source is
+   * "holds something": the heartbeat goes on as before.
+   */
+  private async coordinatorHoldsNothing(workspaceId: string, tabId: string, entry: ITabStatusEntry): Promise<boolean> {
+    try {
+      const leases = await readLeaseEvidence();
+      if (!leases.known) return false;
+      if (leases.leases.some((lease) => lease.holder.workspaceId === workspaceId && !PARK_IGNORED_LEASE_KINDS.has(lease.kind))) return false;
+      if ((await readWatches()).watches.some((watch) => watch.workspaceId === workspaceId)) return false;
+      const since = Math.min(entry.turnEnd?.at ?? Date.now(), Date.now()) - PARK_UNDELIVERED_WINDOW_MS;
+      return this.tabEvents.undeliveredUrgent(workspaceId, tabId, since) === 0;
+    } catch (err) {
+      log.debug({ workspaceId, tabId, err: err instanceof Error ? err.message : String(err) }, 'park evidence unreadable; the heartbeat stays');
+      return false;
     }
   }
 

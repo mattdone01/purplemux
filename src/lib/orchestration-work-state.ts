@@ -10,14 +10,25 @@ import { observeOrchestrationRuntime } from '@/lib/orchestration-runtime';
 import type { IWorkspace } from '@/types/terminal';
 import type { IOrchestratorPresenceFacts } from '@/types/coordination';
 
+export interface IOrchestrationWorkStateOptions {
+  /**
+   * The verified tab that asked (ADR-0049): its own turn is the call, so its tab is no evidence either way. Its
+   * registered jobs, the leases, the standup and every other tab still count. Null: a human or an unverified caller.
+   */
+  callerTabId?: string | null;
+}
+
 /** Fresh source observations inside the mapping guard, never the dashboard's issue cache. */
-export const readOrchestrationWorkState = async (workspace: IWorkspace): Promise<ReturnType<typeof workStateOf>> => {
+export const readOrchestrationWorkState = async (
+  workspace: IWorkspace, options: IOrchestrationWorkStateOptions = {},
+): Promise<ReturnType<typeof workStateOf>> => {
   const [layout, leases, standup, background] = await Promise.all([
     readWorkspaceLayout(workspace.id).catch(() => null), readLeaseEvidence(),
     readLatestStandupEvidence(workspace.id), readLivenessEvidence(workspace.id),
   ]);
   const statuses = getStatusManager().getAllForClient();
-  const tabs: IOrchestratorPresenceFacts['tabs'] = layout ? await Promise.all(collectAllTabs(layout.root).map(async (tab) => {
+  const callerTabId = options.callerTabId ?? null;
+  const tabs: IOrchestratorPresenceFacts['tabs'] = layout ? await Promise.all(collectAllTabs(layout.root).filter((tab) => tab.id !== callerTabId).map(async (tab) => {
     const isAgent = isAgentPanelType(tab.panelType) || !!(tab.orchestrationActivity?.launch || tab.orchestrationActivity?.turn);
     const runtime = isAgent ? await observeOrchestrationRuntime(tab) : null;
     const status = statuses[tab.id]?.workspaceId === workspace.id ? statuses[tab.id].cliState : null;

@@ -207,3 +207,62 @@ describe.skipIf(!supported)('remote reap script, run for real (ADR-0022 §9)', {
     }
   });
 });
+
+// Recovery moves a coordinator only on a positive "absent" (ADR-0049). The pane's process table must be readable for
+// the walk to prove an absence: an unreadable /proc entry for the pane pid is unknown, never "no process in the pane".
+describe.skipIf(process.platform !== 'linux')('remote provider script: absent needs a readable process table', () => {
+  const withFakeTmux = async (panePid: number, fn: (env: NodeJS.ProcessEnv) => Promise<void>) => {
+    const dir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'pmux-fake-tmux-'));
+    try {
+      fs.writeFileSync(pathMod.join(dir, 'tmux'), `#!/bin/sh\nprintf 'pt-ws-a-pane-a-tab-a\\t%%1\\t${panePid}\\n'\n`, { mode: 0o755 });
+      await fn({ ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const runWith = (env: NodeJS.ProcessEnv, args: string[], script = REMOTE_PROVIDER_SCRIPT): Promise<string> => new Promise((resolve, reject) => {
+    const child = spawn('sh', ['-s', '--', ...args], { stdio: ['pipe', 'pipe', 'pipe'], env });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('error', reject);
+    child.on('close', () => resolve(out));
+    child.stdin.end(script);
+  });
+
+  it('a pane pid with no /proc entry reads unknown', async () => {
+    await withFakeTmux(2_147_483_000, async (env) => {
+      const observed = parseRemoteProviderObservation(await runWith(env, ['sock', 'pt-ws-a-pane-a-tab-a', 'claude']));
+      expect(observed).toEqual({ state: 'unknown', reason: 'process table unreadable' });
+    });
+  });
+
+  it('a kernel without per-task children files (no CONFIG_PROC_CHILDREN) reads unknown, never absent', async () => {
+    // The script's /proc paths point at a stand-in table: the pane process has a stat line but no task children file.
+    const table = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'pmux-fake-proc-'));
+    try {
+      fs.mkdirSync(pathMod.join(table, '4242', 'task', '4242'), { recursive: true });
+      fs.writeFileSync(pathMod.join(table, '4242', 'stat'), '4242 (bash) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0\n');
+      fs.writeFileSync(pathMod.join(table, '4242', 'comm'), 'bash\n');
+      fs.writeFileSync(pathMod.join(table, '4242', 'cmdline'), 'bash\0');
+      const script = REMOTE_PROVIDER_SCRIPT.replaceAll('/proc/', `${table}/`);
+      await withFakeTmux(4242, async (env) => {
+        const observed = parseRemoteProviderObservation(await runWith(env, ['sock', 'pt-ws-a-pane-a-tab-a', 'claude'], script));
+        expect(observed).toEqual({ state: 'unknown', reason: 'process table unreadable' });
+      });
+    } finally {
+      fs.rmSync(table, { recursive: true, force: true });
+    }
+  });
+
+  it('the control: a readable pane process without the provider is still absent', async () => {
+    const pane = spawn('sleep', ['30'], { stdio: 'ignore' });
+    try {
+      await withFakeTmux(pane.pid!, async (env) => {
+        const observed = parseRemoteProviderObservation(await runWith(env, ['sock', 'pt-ws-a-pane-a-tab-a', 'claude']));
+        expect(observed).toEqual({ state: 'absent', reason: 'no claude process in the pane' });
+      });
+    } finally {
+      pane.kill('SIGKILL');
+    }
+  });
+});
