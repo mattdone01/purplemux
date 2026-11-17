@@ -143,6 +143,28 @@ describe('lease routes', () => {
       expect(((await get('/api/cli/leases', tok.b, { prefix: 'merge:' })).body.leases as Array<{ name: string }>).map((l) => l.name)).toEqual(['merge:x/y']);
     });
 
+    it('NR-5b: --kind lists one exact kind, holder workspace, tab and expiry included; a malformed kind is 400', async () => {
+      await post('/api/cli/leases/acquire', tok.a, { name: 'held:host-a/browser-9333', note: 'dev sign-in' });
+      await post('/api/cli/leases/acquire', tok.b, { name: 'held:host-b/gate-1.run-1', note: 'acme/acme-ledger-api' });
+      await post('/api/cli/leases/acquire', tok.b, { name: 'helder:x' });
+      await post('/api/cli/leases/acquire', tok.a, { name: 'merge:x/y' });
+      const held = await get('/api/cli/leases', tok.b, { kind: 'HELD' });
+      expect(held.status).toBe(200);
+      const leases = held.body.leases as Array<Record<string, unknown>>;
+      expect(leases.map((l) => l.name)).toEqual(['held:host-a/browser-9333', 'held:host-b/gate-1.run-1']);
+      expect(leases[0]).toMatchObject({
+        kind: 'held', note: 'dev sign-in', ttlSeconds: 900, expiresInSeconds: expect.any(Number),
+        holder: { workspaceId: expect.any(String), tabId: expect.any(String) },
+      });
+      expect(((await get('/api/cli/leases', tok.b, { kind: 'held', mine: '1' })).body.leases as Array<{ name: string }>).map((l) => l.name))
+        .toEqual(['held:host-b/gate-1.run-1']);
+      for (const kind of ['held:', 'h', '']) {
+        const bad = await get('/api/cli/leases', tok.b, { kind });
+        expect(bad.status, kind).toBe(400);
+        expect(bad.body).toMatchObject({ code: 'lease-policy' });
+      }
+    });
+
     it('shows closed for a holder tab that left the layout', async () => {
       await post('/api/cli/leases/acquire', tok.admin, { name: 'smoke:x', ttlSeconds: 60 });
       await post('/api/cli/leases/acquire', tok.a, { name: 'smoke:y' });

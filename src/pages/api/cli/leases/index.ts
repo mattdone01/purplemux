@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import { parseLeaseKind } from '@/lib/lease-policy';
 import { listLeases, sameHolder } from '@/lib/lease-store';
 import { holderOf, requireCaller, requireMethod, sendLeaseError, viewsOf } from '@/lib/lease-http';
 
@@ -9,7 +10,10 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (!caller) return;
   try {
     const prefix = typeof req.query.prefix === 'string' ? req.query.prefix : undefined;
+    // An exact kind (NR-5b: `lease list --kind held`); a malformed one is 400 lease-policy, never read as "all".
+    const kind = req.query.kind === undefined ? null : parseLeaseKind(req.query.kind);
     let leases = await listLeases(prefix);
+    if (kind !== null) leases = leases.filter((l) => l.kind === kind);
     if (req.query.mine === '1') {
       const me = holderOf(caller);
       leases = leases.filter((l) => sameHolder(l.holder, me));

@@ -1835,6 +1835,9 @@ const cmdLease = async (args) => {
       const qs = new URLSearchParams();
       const prefix = flagValue(rest, '--prefix');
       if (prefix !== null) qs.set('prefix', prefix);
+      const kind = flagValue(rest, '--kind');
+      if (rest.includes('--kind') && kind === null) die('--kind needs a value, e.g. --kind held');
+      if (kind !== null) qs.set('kind', kind);
       if (rest.includes('--mine')) qs.set('mine', '1');
       requireEnv();
       const query = qs.toString();
@@ -3856,8 +3859,10 @@ Commands:
                                            holds it; the holder is named) or forbidden / caller-unresolved
   lease renew NAME [--ttl 45m]             Move the expiry forward (holder only)
   lease release NAME                       Release a lease you hold. Exit 0, 3 held by another, 7 not held
-  lease list [--prefix P] [--mine] [--json]
-                                           Every lease on the host: holder, state, age, expiry, epic, note
+  lease list [--prefix P] [--kind K] [--mine] [--json]
+                                           Every lease on the host: holder, state, age, expiry, epic, note.
+                                           --kind is one exact kind: --kind held names who holds the shared
+                                           browser and each gate slot (a record only, NR-5b)
   lease check NAME                         Exact name only. Prints {held, mine, lease}; exit 0 you hold it,
                                            3 another holds it, 7 nobody holds it. Exit 3 WITHOUT a body on
                                            stdout is a refusal (bad token), not a holder

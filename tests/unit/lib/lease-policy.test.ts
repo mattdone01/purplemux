@@ -3,6 +3,7 @@ import {
   LEASE_KINDS,
   LeasePolicyError,
   OTHER_KIND,
+  parseLeaseKind,
   parseLeaseName,
   resolveEpic,
   resolveNote,
@@ -29,6 +30,7 @@ describe('lease kind policy table (architecture.md "Lease kinds")', () => {
       'pool-queue': [2 * M, D, false, false, false],
       'pool-cancel': [10 * M, 10 * M, false, false, false],
       num: [14 * D, 30 * D, true, true, false],
+      held: [15 * M, 15 * M, false, false, false],
     });
     expect([OTHER_KIND.defaultTtlSeconds, OTHER_KIND.maxTtlSeconds, OTHER_KIND.survivesTab]).toEqual([30 * M, D, false]);
   });
@@ -53,6 +55,17 @@ describe('parseLeaseName', () => {
     [`epic:${'a'.repeat(101)}`, 'must be an epic slug'],
     ['pool:host-b-lan/review-1', 'must be <host>/<gate|build|mutation|browser|test-service|tab>-<n>'],
     ['pool:host-b-lan/gate-1000', 'must be <host>/<gate|build|mutation|browser|test-service|tab>-<n>'],
+    // NR-5b: the shared browser and one run's gate slot, nothing else.
+    ['held:host-a', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/browser-9400', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/gate-1', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/gate-1.', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/gate-1.-run', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/gate-1000.run1', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/gate-1.run.2', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    [`held:host-a/gate-1.${'r'.repeat(65)}`, 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/tab-1', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
+    ['held:host-a/gate-1.run1/x', 'must be <host>/browser-9333 or <host>/gate-<k>.<runid>'],
   ])('refuses %j with a named rule', (raw, message) => {
     expect(() => parseLeaseName(raw)).toThrow(LeasePolicyError);
     expect(() => parseLeaseName(raw)).toThrow(message);
@@ -60,7 +73,8 @@ describe('parseLeaseName', () => {
 
   it('accepts every kind in its resource form', () => {
     for (const name of ['merge:acme/acme-ledger-api', 'dev-deploy:acme/acme-ledger-ui', 'dev-write:dev', 'deploy:purplemux',
-      'epic:purplemux-portfolio-coordination', 'num:acme/acme-ledger-api:adr:0373', 'num:acme/acme-ledger-event-consumer:migration:415', 'pool:host-b-lan/gate-1', 'pool:host-a/tab-12', 'smoke:anything/goes#1']) {
+      'epic:purplemux-portfolio-coordination', 'num:acme/acme-ledger-api:adr:0373', 'num:acme/acme-ledger-event-consumer:migration:415', 'pool:host-b-lan/gate-1', 'pool:host-a/tab-12', 'smoke:anything/goes#1',
+      'held:host-a/browser-9333', 'held:host-b-lan/gate-3.20261117t0700-4821', `held:host-a/gate-12.${'r'.repeat(64)}`]) {
       expect(parseLeaseName(name).name).toBe(name);
     }
   });
@@ -68,10 +82,27 @@ describe('parseLeaseName', () => {
   it('refuses a non-string', () => {
     expect(() => parseLeaseName(undefined)).toThrow('name is required');
   });
+
+  it('lower-cases a held run id, so two spellings are one record', () => {
+    expect(parseLeaseName('held:Host-A/gate-2.Run-7')).toEqual({ name: 'held:host-a/gate-2.run-7', kind: 'held', resource: 'host-a/gate-2.run-7' });
+  });
+});
+
+describe('parseLeaseKind', () => {
+  it('lower-cases a kind and checks it alone', () => {
+    expect(parseLeaseKind('held')).toBe('held');
+    expect(parseLeaseKind(' HELD ')).toBe('held');
+  });
+
+  it.each(['', 'h', 'held:x', '1held', 'held kind', 'h'.repeat(33), undefined, 7])('refuses %j, naming the grammar', (raw) => {
+    expect(() => parseLeaseKind(raw)).toThrow(LeasePolicyError);
+    expect(() => parseLeaseKind(raw)).toThrow('does not match');
+  });
 });
 
 describe('resolveTtl', () => {
   it('takes the kind default when none is given', () => {
+    expect(resolveTtl('held', undefined, tab)).toBe(15 * M);
     expect(resolveTtl('merge', undefined, tab)).toBe(45 * M);
     expect(resolveTtl('num', undefined, tab)).toBe(14 * D);
     expect(resolveTtl('smoke', undefined, tab)).toBe(30 * M);

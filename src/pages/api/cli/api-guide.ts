@@ -168,7 +168,9 @@ One host-wide register of held resources (ADR-0011). A name is \`<kind>:<resourc
 case: \`merge:<owner>/<repo>\`, \`dev-deploy:<owner>/<repo>\`, \`dev-write:<env>\`,
 \`deploy:<service>\` (admin token or the workspace's enabled orchestrator tab only),
 \`epic:<slug>\` (no expiry by default, \`none\` allowed, at most 7 d), \`num:<owner>/<repo>:<adr|migration>:<nnnn>\` (requires an
-epic; survives the tab), or any other kind (30 m default, 24 h max). A lease dies with its tab,
+epic; survives the tab), \`held:<host>/browser-9333\` or \`held:<host>/gate-<k>.<runid>\` (NR-5b: who holds the shared
+browser or one run's gate slot; 15 m, at most 15 m, renewed by its holder every 5 min; a record only, which nothing
+refuses on and the pool does not count), or any other kind (30 m default, 24 h max). A lease dies with its tab,
 by TTL, or 10 min after its agent goes inactive; \`num\` leases outlive the tab and end by TTL,
 release, release-epic or break.
 Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_TOKEN plus
@@ -178,8 +180,9 @@ A lease view: { name, kind, resource, holder: { workspaceId, workspaceName, tabI
 verified, identity, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
 ageSeconds, expiresInSeconds, holderState: live|agent-gone|closed|admin }.
 
-GET /api/cli/leases?prefix=&mine=1
-  Response: { "leases": [lease view, ...] }
+GET /api/cli/leases?prefix=&kind=&mine=1
+  Response: { "leases": [lease view, ...] }. "kind" is one exact kind, lower-cased (\`lease list --kind held\`);
+  a malformed kind is 400 lease-policy.
 
 GET /api/cli/leases/check?name=NAME
   Exact name only (a prefix would also match merge:x/y-z). 200 for any well-formed name
