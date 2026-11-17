@@ -352,6 +352,77 @@ describe('inbox store — held recovery (ws-5TO0NJ, 2026-10-08)', () => {
   });
 });
 
+describe('inbox store — the queue a note waits in (NR-1)', () => {
+  beforeEach(() => { seq = 0; });
+
+  const noteReq = (key: string, overrides: Record<string, unknown> = {}) => req({
+    kind: 'watch', dedupeKey: key, fields: { watchId: 'w-abcd1234', target: 'merge:o/r', notice: 'free' }, ...overrides,
+  });
+
+  it('counts the queued items and recoverable holds before an item at its tab, oldest first; other tabs and later items do not count', async () => {
+    const { aheadOf, enqueueInState, holdInState, refuseInState } = await load();
+    let state: IInboxState = { items: [] };
+    const add = (key: string, at: number, overrides: Record<string, unknown> = {}) => {
+      const r = enqueueInState(state, noteReq(key, overrides), at, ids);
+      state = r.state;
+      return r.item.id;
+    };
+    const budget = add('budget', T0);
+    for (let i = 1; i <= 30; i++) state = refuseInState(state, budget, 'composer-not-ready:busy', T0 + i);
+    const stranded = add('stranded', T0 + 100);
+    state = holdInState(state, stranded, 'stranded-in-composer', T0 + 101);
+    add('queued', T0 + 200);
+    add('other-tab', T0 + 250, { targetTabId: 'tab-o' });
+    const mine = add('mine', T0 + 300);
+    add('later', T0 + 400);
+    expect(aheadOf(state.items, mine, T0 + 500)).toEqual({ ahead: 2, oldestAheadSince: T0, headRefusal: 'held' });
+    // The head is the oldest waiting item: here the recoverable hold.
+    expect(aheadOf(state.items, budget, T0 + 500)).toEqual({ ahead: 0, oldestAheadSince: null, headRefusal: 'held' });
+    // A hold that is not recoverable waits for nothing and blocks nothing.
+    expect(aheadOf(state.items, stranded, T0 + 500)).toBeNull();
+    expect(aheadOf(state.items, 'i-none', T0 + 500)).toBeNull();
+  });
+
+  it('keeps the store order on a tie, as the dispatcher does', async () => {
+    const { aheadOf, enqueueInState } = await load();
+    const first = enqueueInState({ items: [] }, noteReq('first'), T0, ids);
+    const second = enqueueInState(first.state, noteReq('second'), T0, ids);
+    expect(aheadOf(second.state.items, second.item.id, T0)).toMatchObject({ ahead: 1, oldestAheadSince: T0 });
+    expect(aheadOf(second.state.items, first.item.id, T0)).toMatchObject({ ahead: 0 });
+  });
+
+  it('reads the head refusal as a fixed word', async () => {
+    const { aheadOf, enqueueInState, deferInState, refuseInState } = await load();
+    const head = enqueueInState({ items: [] }, noteReq('head'), T0, ids);
+    const mine = enqueueInState(head.state, noteReq('mine'), T0 + 1, ids);
+    expect(aheadOf(mine.state.items, mine.item.id, T0 + 2)?.headRefusal).toBeNull();
+    const deferred = deferInState(mine.state, head.item.id, T0 + 10 * MIN, 'coordinator-window:573s', T0 + 2);
+    expect(aheadOf(deferred.items, mine.item.id, T0 + 3)?.headRefusal).toBe('coordinator-window');
+    const busy = refuseInState(mine.state, head.item.id, 'composer-not-ready:busy', T0 + 2);
+    expect(aheadOf(busy.items, mine.item.id, T0 + 3)?.headRefusal).toBe('composer-not-ready');
+    const odd = refuseInState(mine.state, head.item.id, 'dispatch-error:EPIPE ws-other/tab-x', T0 + 2);
+    expect(aheadOf(odd.items, mine.item.id, T0 + 3)?.headRefusal).toBe('other');
+  });
+
+  it.each([
+    [null, null],
+    ['coordinator-window:573s', 'coordinator-window'],
+    ['coordinator-window:digest-first', 'coordinator-window'],
+    ['composer-not-ready:busy', 'composer-not-ready'],
+    ['composer-not-empty', 'composer-not-ready'],
+    ['composer-unreadable', 'composer-not-ready'],
+    ['interactive-prompt-active', 'composer-not-ready'],
+    ['native-prompt-active', 'composer-not-ready'],
+    ['status-unavailable', 'composer-not-ready'],
+    ['composer-not-empty-but-more', 'other'],
+    ['session-not-running', 'other'],
+    ['preflight-error:no note n-secret1 subject x', 'other'],
+  ] as const)('maps the refusal %j to %j', async (raw, word) => {
+    const { refusalWord } = await load();
+    expect(refusalWord(raw)).toBe(word);
+  });
+});
+
 describe('inbox store — file', () => {
   beforeEach(async () => {
     vi.resetModules();

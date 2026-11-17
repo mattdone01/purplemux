@@ -5,8 +5,10 @@ import { renderInboxLine } from '@/lib/inbox-templates';
 import { NoteError, NOTE_EXPIRE_MS, NOTE_EXPIRE_NOTICE_GRACE_MS, NOTE_PRUNE_MS, NOTE_REMIND_MS, NOTE_SENDER_NOTICE_MS, NOTE_UNDELIVERED_NOTICE_MS } from '@/lib/notes-store';
 import { NotesService, NOTES_TICK_MS, startNotes, stopNotes, type INotesDeps } from '@/lib/notes-service';
 import { withOrchestrationMappingRead, withOrchestrationMappingWrite } from '@/lib/orchestration-mapping-lock';
+import { CoordinatorWindow } from '@/lib/coordinator-window';
 import type { IInboxItem } from '@/types/inbox';
 import type { INotesState } from '@/types/note';
+import type { TCliState } from '@/types/timeline';
 
 // ADR-0013 through fakes: an in-memory note store, an epic-lease table, a set of
 // live tabs, per-workspace orchestrators and an inbox that records every notice.
@@ -1249,5 +1251,161 @@ describe('a bounced note alerts its sender (vel-NOTE-BOUNCE-ALERT)', () => {
     await svc.tick('later');
     expect(f.note(id).state).toBe('delivered');
     await expect(svc.preflight(item)).resolves.toEqual({ ok: false, reason: 'note-terminal:delivered' });
+  });
+});
+
+describe('the send-queue receipt (NR-1, ADR-0013 amendment)', () => {
+  let f: Fakes;
+  let flags: Set<string>;
+  let cliStates: Map<string, TCliState>;
+  let lastGoverned: Map<string, number>;
+  let svc: NotesService;
+
+  /** A notice already in the recipient's inbox, from another sender: what a send waits behind. */
+  const put = (id: string, fields: Partial<IInboxItem>) => {
+    f.inbox.set(id, {
+      id, kind: 'note', dedupeKey: `note:n-other${id}:delivered:${fields.targetTabId ?? 'tab-a'}`, state: 'queued',
+      targetWorkspaceId: 'ws-1', targetTabId: 'tab-a', createdAt: T0 - 5 * MIN, deliveredAt: null, lastRefusal: null,
+      heldReason: null, expiresAt: T0 + 24 * 60 * MIN, ...fields,
+    } as unknown as IInboxItem);
+  };
+
+  const build = (overrides: Partial<INotesDeps> = {}) => {
+    const window = new CoordinatorWindow({
+      now: () => f.now,
+      isCoordinator: async (ws, tab) => f.orchestrators.get(ws) === tab,
+      lastGoverned: (ws, tab) => lastGoverned.get(`${ws}/${tab}`) ?? null,
+      oldestDigestAt: () => null,
+    });
+    svc = new NotesService({
+      ...f.deps(),
+      window: () => window,
+      flag: async (key) => flags.has(key),
+      cliStateOf: async (_ws, tab) => cliStates.get(tab) ?? null,
+      ...overrides,
+    });
+  };
+
+  beforeEach(() => {
+    f = new Fakes();
+    f.epics.set('ddh', { workspaceId: 'ws-1', tabId: 'tab-a' });
+    f.epics.set('worker-epic', { workspaceId: 'ws-2', tabId: 'tab-worker' });
+    flags = new Set(['notes.send-queue-receipt']);
+    cliStates = new Map([['tab-a', 'busy']]);
+    lastGoverned = new Map([['ws-1/tab-a', T0 - 2 * MIN]]);
+    build();
+  });
+
+  it('flag off: the receipt is the pre-NR-1 receipt, raw refusals included, for a foreign sender too', async () => {
+    flags.clear();
+    put('i-older', { lastRefusal: 'coordinator-window:300s' });
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    expect(Object.keys(sent.receipt!)).toEqual(['routingStatus', 'routingReason', 'authorizedSender', 'authorizedRecipient', 'notice', 'composerDeliveredAt']);
+    const id = sent.receipt!.notice!.id;
+    f.inbox.set(id, { ...f.inbox.get(id)!, lastRefusal: 'composer-not-ready:busy', state: 'held', heldReason: 'composer-not-ready:busy (30 refusals)' } as IInboxItem);
+    const shown = (await svc.show(B, sent.id)).note.receipt!;
+    expect(shown.notice).toMatchObject({ lastRefusal: 'composer-not-ready:busy', heldReason: 'composer-not-ready:busy (30 refusals)' });
+    expect(shown).not.toHaveProperty('queue');
+    expect(shown).not.toHaveProperty('queueUnavailable');
+    // No flag reader at all reads as off.
+    build({ flag: undefined });
+    const plain = await svc.send(B, { toWorkspace: 'ws-1', subject: 's2', body: 'b' });
+    expect(plain.receipt).not.toHaveProperty('queue');
+  });
+
+  it('flag off: an unreadable inbox still fails the view as before', async () => {
+    flags.clear();
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    build({ inboxItems: async () => { throw new Error('EIO'); } });
+    await expect(svc.show(B, sent.id)).rejects.toThrow('EIO');
+  });
+
+  it('counts the queued items and recoverable holds ahead at the recipient tab, with the oldest time', async () => {
+    put('i-old', { createdAt: T0 - 9 * MIN, lastRefusal: 'coordinator-window:300s' });
+    put('i-mid', { createdAt: T0 - 4 * MIN });
+    put('i-stranded', { createdAt: T0 - 20 * MIN, state: 'held', heldReason: 'stranded-in-composer' });
+    put('i-done', { createdAt: T0 - 30 * MIN, state: 'delivered' });
+    put('i-elsewhere', { createdAt: T0 - 30 * MIN, targetWorkspaceId: 'ws-3', targetTabId: 'tab-c' });
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    expect(sent.receipt!.queue).toEqual({
+      at: T0,
+      targetWorkspaceId: 'ws-1',
+      targetTabId: 'tab-a',
+      targetCliState: 'busy',
+      ahead: 2,
+      oldestAheadSince: T0 - 9 * MIN,
+      windowOpensAt: T0 + 8 * MIN,
+      headRefusal: 'coordinator-window',
+    });
+    expect(sent.receipt).not.toHaveProperty('queueUnavailable');
+  });
+
+  it('gives windowOpensAt only while the window governs the target and is closed', async () => {
+    lastGoverned.set('ws-2/tab-worker', T0 - MIN);
+    const worker = await svc.send(B, { toEpic: 'worker-epic', subject: 's', body: 'b' });
+    expect(worker.receipt!.queue).toMatchObject({ targetTabId: 'tab-worker', windowOpensAt: null, ahead: 0, headRefusal: null });
+    lastGoverned.set('ws-1/tab-a', T0 - 11 * MIN);
+    const open = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    expect(open.receipt!.queue).toMatchObject({ targetTabId: 'tab-a', windowOpensAt: null });
+    build({ window: () => null });
+    const none = await svc.send(B, { toWorkspace: 'ws-1', subject: 's3', body: 'b' });
+    expect(none.receipt!.queue).toMatchObject({ windowOpensAt: null });
+  });
+
+  it('answers queueUnavailable, and the send still succeeds, when the inbox or the view cannot be read', async () => {
+    build({ inboxItems: async () => { throw new Error('EIO'); } });
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    expect(f.note(sent.id).state).toBe('delivered');
+    expect(sent.receipt).toMatchObject({ routingStatus: 'routed', notice: null, queueUnavailable: 'inbox-unreadable' });
+    expect(sent.receipt).not.toHaveProperty('queue');
+    build({ cliStateOf: async () => { throw new Error('status down'); } });
+    const again = await svc.send(B, { toWorkspace: 'ws-1', subject: 's2', body: 'b' });
+    expect(again.receipt).toMatchObject({ queueUnavailable: 'view-unreadable' });
+    expect(again.receipt).not.toHaveProperty('queue');
+    build({ flag: async () => { throw new Error('fleet config unreadable'); } });
+    const off = await svc.send(B, { toWorkspace: 'ws-1', subject: 's3', body: 'b' });
+    expect(off.receipt).not.toHaveProperty('queue');
+  });
+
+  it('has no queue once the notice is no longer waiting, or when the note has no route', async () => {
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    f.deliverInbox(sent.receipt!.notice!.id, T0 + 1);
+    expect((await svc.show(B, sent.id)).note.receipt).not.toHaveProperty('queue');
+    const bounced = await svc.send(B, { toEpic: 'nobody', subject: 's', body: 'b' });
+    expect(bounced.receipt).not.toHaveProperty('queue');
+    expect(bounced.receipt).not.toHaveProperty('queueUnavailable');
+  });
+
+  it('puts the queue in note show and note list --from-me, read at call time, and not in a plain list', async () => {
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    expect(sent.receipt!.queue!.ahead).toBe(0);
+    f.now = T0 + MIN;
+    put('i-late', { createdAt: T0 - MIN });
+    expect((await svc.show(B, sent.id)).note.receipt!.queue).toMatchObject({ at: T0 + MIN, ahead: 1, oldestAheadSince: T0 - MIN });
+    expect((await svc.list(B, { fromMe: true }))[0].receipt!.queue).toMatchObject({ ahead: 1 });
+    expect((await svc.list(B, {}))[0].receipt).not.toHaveProperty('queue');
+    expect((await svc.list(A, { toMe: true }))[0].receipt).not.toHaveProperty('queue');
+  });
+
+  it('shows a foreign sender fixed words only: no other note id, subject, kind or raw refusal (consult C-1)', async () => {
+    const other = await svc.send(C, { toWorkspace: 'ws-1', subject: 'SECRET-SUBJECT', body: 'b' });
+    const otherItem = other.receipt!.notice!.id;
+    f.inbox.set(otherItem, { ...f.inbox.get(otherItem)!, createdAt: T0 - MIN, lastRefusal: 'preflight-error:ws-3/tab-c pane said rm -rf' } as IInboxItem);
+    const sent = await svc.send(B, { toWorkspace: 'ws-1', subject: 's', body: 'b' });
+    const mine = sent.receipt!.notice!.id;
+    f.inbox.set(mine, {
+      ...f.inbox.get(mine)!, state: 'held', lastRefusal: 'composer-not-ready:needs-input',
+      heldReason: 'composer-not-ready:needs-input (30 refusals)', expiresAt: T0 + 24 * 60 * MIN,
+    } as IInboxItem);
+    const seen = (await svc.show(B, sent.id)).note.receipt!;
+    expect(seen.notice).toMatchObject({ id: mine, lastRefusal: 'composer-not-ready', heldReason: 'held' });
+    expect(seen.queue).toMatchObject({ ahead: 1, headRefusal: 'other' });
+    const text = JSON.stringify(seen);
+    for (const leak of [other.id, otherItem, 'SECRET-SUBJECT', 'preflight-error', 'needs-input', '"kind"', 'dedupeKey', 'ws-3']) {
+      expect(text).not.toContain(leak);
+    }
+    // The recipient workspace and the admin token read their own inbox's raw strings.
+    expect((await svc.show(A, sent.id)).note.receipt!.notice).toMatchObject({ lastRefusal: 'composer-not-ready:needs-input' });
+    expect((await svc.show(ADMIN, sent.id)).note.receipt!.notice).toMatchObject({ heldReason: 'composer-not-ready:needs-input (30 refusals)' });
   });
 });

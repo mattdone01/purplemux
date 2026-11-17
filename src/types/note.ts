@@ -1,4 +1,5 @@
 import type { TCallerIdentity } from '@/types/identity';
+import type { TCliState } from '@/types/timeline';
 import type { INoteEventRecord } from '@/types/worker-event';
 
 // Notes with acknowledgement (ADR-0013): a body the recipient pulls. Only the
@@ -124,6 +125,36 @@ export interface INoteReceipt {
   } | null;
   /** Kept after the inbox prunes its item. Null means routed, but not known to have reached a composer. */
   composerDeliveredAt: number | null;
+  /** NR-1, `notes.send-queue-receipt` on: where the note's notice waits, while it waits. */
+  queue?: INoteQueue;
+  /** NR-1: present in place of `queue` when the inbox could not be read; the answer itself never fails on it. */
+  queueUnavailable?: TNoteQueueUnavailable;
+}
+
+/**
+ * The fixed words a refusal is shown as (NR-1): to every viewer in `queue.headRefusal`, and to a viewer outside the
+ * recipient workspace in place of the raw `notice.lastRefusal` and `notice.heldReason`.
+ */
+export type TNoteQueueRefusal = 'coordinator-window' | 'composer-not-ready' | 'held' | 'other';
+
+export type TNoteQueueUnavailable = 'inbox-unreadable' | 'view-unreadable';
+
+/**
+ * A snapshot of the recipient tab's inbox at `at` (NR-1, ADR-0013 amendment): server-made counts, times and fixed
+ * words only. Nothing decides on it; the dispatcher may drain the queue a second later.
+ */
+export interface INoteQueue {
+  at: number;
+  targetWorkspaceId: string;
+  targetTabId: string;
+  targetCliState: TCliState | null;
+  /** Queued items and recoverable holds the dispatcher types before this one, at the same tab. */
+  ahead: number;
+  oldestAheadSince: number | null;
+  /** Only when the coordinator window governs the target and is closed: the earliest time, never a promise. */
+  windowOpensAt: number | null;
+  /** Why the head of the tab's queue (the first of `ahead`, or this notice) last waited; null when it never did. */
+  headRefusal: TNoteQueueRefusal | null;
 }
 
 /**

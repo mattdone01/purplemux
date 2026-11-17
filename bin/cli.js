@@ -1582,6 +1582,24 @@ const NOTE_VALUE_FLAGS = ['--to-epic', '--to-workspace', '--subject', '--file', 
 const NOTE_BOOL_FLAGS = ['--open', '--to-me', '--from-me', '--owner-item'];
 const NOTE_ID = /^n-[A-Za-z0-9_-]{4,32}$/;
 
+// NR-1: one stderr line when the sent note waits behind other notices, a busy tab or a closed coordinator window.
+// Nothing is printed when the line is likely to be typed at once, or when the server sent no queue view.
+const clockZ = (ms) => `${new Date(ms).toISOString().slice(11, 16)}Z`;
+const isTime = (v) => Number.isSafeInteger(v) && v >= 0;
+
+const noteQueueLine = (note) => {
+  const q = note && note.receipt ? note.receipt.queue : null;
+  if (!q || typeof q !== 'object' || !Number.isSafeInteger(q.ahead)) return null;
+  const busy = q.targetCliState === 'busy';
+  const window = isTime(q.windowOpensAt);
+  if (q.ahead <= 0 && !window && !busy) return null;
+  const parts = [`${q.ahead} ahead`];
+  if (isTime(q.oldestAheadSince)) parts.push(`oldest since ${clockZ(q.oldestAheadSince)}`);
+  if (window) parts.push(`window opens ${clockZ(q.windowOpensAt)} at the earliest`);
+  if (busy) parts.push('target busy');
+  return `note ${note.id} waits at ${q.targetWorkspaceId}/${q.targetTabId}: ${parts.join(', ')}`;
+};
+
 const noteId = (rest) => {
   const positional = stripBooleanFlags(stripFlags(rest, NOTE_VALUE_FLAGS), NOTE_BOOL_FLAGS);
   if (positional.length !== 1 || !NOTE_ID.test(positional[0])) die(`exactly one note id (n-…) is required — ${NOTE_USAGE}`);
@@ -1611,7 +1629,10 @@ const cmdNote = async (args) => {
       if (rest.includes('--owner-item')) data.ownerItem = true;
       requireEnv();
       const { body: resp } = await api('POST', '/api/cli/notes', data);
-      return out(resp);
+      out(resp);
+      const waits = noteQueueLine(resp && resp.note);
+      if (waits) process.stderr.write(`${waits}\n`);
+      return undefined;
     }
     case 'list': {
       const positional = stripBooleanFlags(stripFlags(rest, NOTE_VALUE_FLAGS), NOTE_BOOL_FLAGS);
@@ -3919,7 +3940,9 @@ Commands:
                                            --owner-item (the verified current orchestrator only, else exit 3): the server
                                            types one pointer line into the recipient orchestrator at once, busy included,
                                            retried each pass until it is in that composer; at most 5 not yet delivered
-                                           per sender (exit 3 note-cap); the sender hears at 5 min if it is not there
+                                           per sender (exit 3 note-cap); the sender hears at 5 min if it is not there.
+                                           With notes.send-queue-receipt on, one stderr line names what the note waits
+                                           behind: notices ahead, a busy target, a closed coordinator window
   note list [--open] [--to-me] [--from-me] [--epic SLUG]
                                            Notes your workspace sent or receives (no bodies; fromLabel names the sender,
                                            e.g. "owner (WS/TAB)"). Run --open --to-me at turn start

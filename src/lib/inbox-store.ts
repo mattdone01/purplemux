@@ -6,6 +6,7 @@ import { WINDOWED_INBOX_KINDS, WINDOW_DEFERRAL, WINDOW_EXEMPT_INBOX_KINDS } from
 import { humanRetryRefusal } from '@/lib/human-actions';
 import { renderInboxLine, type IInboxFields } from '@/lib/inbox-templates';
 import type { IInboxItem, IInboxState, THumanRetryRefusal, TInboxErrorCode, TInboxKind } from '@/types/inbox';
+import type { TNoteQueueRefusal } from '@/types/note';
 
 export class InboxError extends Error {
   constructor(readonly code: TInboxErrorCode, message: string, readonly reason: THumanRetryRefusal | null = null) {
@@ -105,6 +106,44 @@ export const isRecoverableHold = (item: IInboxItem, now: number): boolean =>
 /** Queued, or a recoverable hold: the item may still be typed. */
 const awaitsDelivery = (item: IInboxItem, now: number): boolean =>
   item.state === 'queued' || isRecoverableHold(item, now);
+
+/** The refusals `checkComposerReady` gives (composer-readiness.ts): each one says the composer was not ready. */
+const COMPOSER_REFUSALS = ['composer-not-ready:', 'composer-not-empty', 'composer-unreadable', 'interactive-prompt-active',
+  'native-prompt-active', 'status-unavailable'];
+
+/** A raw `lastRefusal` as one fixed word (NR-1). The raw string can carry another workspace's pane state or an error. */
+export const refusalWord = (raw: string | null): Exclude<TNoteQueueRefusal, 'held'> | null => {
+  if (raw === null) return null;
+  if (raw.startsWith(WINDOW_DEFERRAL)) return 'coordinator-window';
+  if (COMPOSER_REFUSALS.some((p) => (p.endsWith(':') ? raw.startsWith(p) : raw === p))) return 'composer-not-ready';
+  return 'other';
+};
+
+export interface IAheadOf {
+  ahead: number;
+  oldestAheadSince: number | null;
+  headRefusal: TNoteQueueRefusal | null;
+}
+
+/**
+ * What waits before item `id` at its tab (NR-1): the queued items and the recoverable holds the dispatcher types first,
+ * in `dueItems` order (oldest first; a tie keeps the store order). A non-recoverable hold no longer blocks the tab
+ * (ADR-0012, 2026-10-08), so it is not counted. Null when `id` itself is not waiting to be typed.
+ */
+export const aheadOf = (items: readonly IInboxItem[], id: string, now: number): IAheadOf | null => {
+  const index = items.findIndex((i) => i.id === id);
+  const mine = items[index];
+  if (!mine || !awaitsDelivery(mine, now)) return null;
+  const before = items.filter((i, k) => k !== index && i.targetWorkspaceId === mine.targetWorkspaceId
+    && i.targetTabId === mine.targetTabId && awaitsDelivery(i, now)
+    && (i.createdAt < mine.createdAt || (i.createdAt === mine.createdAt && k < index)));
+  const head = before.reduce<IInboxItem>((first, i) => (i.createdAt < first.createdAt ? i : first), before[0] ?? mine);
+  return {
+    ahead: before.length,
+    oldestAheadSince: before.length ? head.createdAt : null,
+    headRefusal: head.state === 'held' ? 'held' : refusalWord(head.lastRefusal),
+  };
+};
 
 /** One refusal: back off, or hold after the 30th refusal or past 24 h. A recoverable hold stays held. */
 export const refuseInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState =>

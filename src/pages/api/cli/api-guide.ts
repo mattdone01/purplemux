@@ -890,6 +890,23 @@ last refusal, held reason, and composer delivery time. It never includes the rec
 Queued notices are revalidated immediately before paste; terminal, legacy-policy-blocked, or stale
 recipient notices are dropped.
 
+With fleet config notes.send-queue-receipt on (NR-1, ADR-0013 amendment), the receipt in the send answer,
+note show and note list --from-me also carries, while the notice waits to be typed:
+  "queue": { "at", "targetWorkspaceId", "targetTabId", "targetCliState", "ahead", "oldestAheadSince",
+    "windowOpensAt", "headRefusal" }
+"ahead" counts the queued notices and recoverable holds the inbox types before this one at that tab, and
+"oldestAheadSince" is the oldest of them (null when none). "windowOpensAt" is set only while the
+coordinator window governs the target and is closed: the earliest time, never a promise (the digest may
+go first). "headRefusal" is why the head of the tab's queue last waited: coordinator-window,
+composer-not-ready, held, other, or null. "at" stamps the snapshot; nothing decides on it. When the inbox
+or the view cannot be read, "queueUnavailable": "inbox-unreadable" | "view-unreadable" comes in its place,
+and the send itself still succeeds. Under the same flag, a viewer outside the recipient workspace (not the
+admin token, not a human session) reads notice.lastRefusal as one of those words and notice.heldReason as
+"held". The CLI prints one stderr line after a send whose notice waits behind others, at a busy tab or a
+closed window:
+  note <id> waits at <ws>/<tab>: <n> ahead[, oldest since HH:MMZ][, window opens HH:MMZ at the earliest][, target busy]
+and nothing otherwise.
+
 POST /api/cli/notes
   Any resolved caller. Body: { "toEpic"? , "toWorkspace"? (exactly one), "subject" (≤ 120, control
   characters removed), "body" (≤ 16 KiB UTF-8), "fromEpic"? (only the holder of epic:<slug>),
@@ -1264,6 +1281,11 @@ Keys in use:
                or unset, is on. alerts.flag-repeat-minutes, 1..10080 (default 60, decimals allowed),
                is the least time between two alerts for one flag. Admin token only (exit 3
                forbidden for a tab): they decide what reaches the owner's phone.
+  notes.send-queue-receipt
+               on, or unset (off). On, a note's receipt in the send answer, note show and note list
+               --from-me carries "queue" (NR-1, ADR-0013 amendment), and a viewer outside the
+               recipient workspace reads the notice's refusal and hold as fixed words. Read on each
+               call. Written by the admin token or an enabled orchestrator (ADR-0019).
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }
