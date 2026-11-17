@@ -147,7 +147,18 @@ describe('tmux calls for a remote tab go over ssh (ADR-0022)', () => {
     replies.fn = () => ({ stdout: 'absent\tsession gone\n' });
     expect(await observeRemoteProviderProcess(REMOTE, 'claude')).toEqual({ state: 'absent', reason: 'session gone' });
     replies.fn = () => ({ code: 255, stderr: 'Connection timed out' });
-    expect((await observeRemoteProviderProcess(REMOTE, 'claude')).state).toBe('unknown');
+    expect(await observeRemoteProviderProcess(REMOTE, 'claude')).toMatchObject({ state: 'unknown', sshFailed: true });
+  });
+
+  // ADR-0049 §6 (review r1, Sonnet 1): only an ssh that itself failed is typed so; a host that answered with a doubt is not.
+  it('an on-host unknown carries no ssh-failed flag', async () => {
+    const { observeRemoteProviderProcess } = await import('@/lib/tmux');
+    for (const line of ['unknown\ttmux failed', 'unknown\tsession identity ambiguous', 'unknown\tprocess table unreadable']) {
+      replies.fn = () => ({ stdout: `${line}\n` });
+      const observed = await observeRemoteProviderProcess(REMOTE, 'claude');
+      expect(observed.state).toBe('unknown');
+      expect(observed).not.toHaveProperty('sshFailed');
+    }
   });
 
   it('a process proof that ssh cut short or timed out is unknown, never absent (PMUX-REMOTE-SEND)', async () => {

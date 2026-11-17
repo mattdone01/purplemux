@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ITab, IWorkspaceOrchestration } from '@/types/terminal';
 import type { IOrchestrationChange } from '@/lib/orchestration-recovery';
 
-const fixture = vi.hoisted(() => ({ home: '', runtime: vi.fn(), work: vi.fn(), model: vi.fn(), sessions: vi.fn(), rebind: vi.fn() }));
+const fixture = vi.hoisted(() => ({ home: '', runtime: vi.fn(), work: vi.fn(), model: vi.fn(), sessions: vi.fn(), rebind: vi.fn(), hosts: vi.fn() }));
 vi.mock('os', async (original) => {
   const actual = await original<typeof import('os')>();
   return { ...actual, default: { ...actual, homedir: () => fixture.home }, homedir: () => fixture.home };
@@ -15,6 +15,7 @@ vi.mock('@/lib/orchestration-work-state', () => ({ readOrchestrationWorkState: f
 vi.mock('@/lib/tmux', () => ({ killSession: vi.fn(async () => null), hasSession: vi.fn(async () => false), createSession: vi.fn(async () => undefined), resolveExistingDir: vi.fn(async () => '/tmp'), sendKeys: vi.fn(), listSessions: vi.fn(async () => []), workspaceSessionName: vi.fn(), observeTabSessionsStrict: fixture.sessions }));
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
 vi.mock('@/lib/mission-control-runtime', () => ({ rebindMissionRunsToOrchestrator: fixture.rebind }));
+vi.mock('@/lib/remote-host', async (original) => ({ ...(await original<typeof import('@/lib/remote-host')>()), readRemoteHosts: fixture.hosts }));
 // The first load of this module graph costs about 1 s alone and passed the 5 s test budget on a loaded gate
 // (story hfl2-53). Load it once here, at collection, outside every test's budget. vi.resetModules() discards
 // this instance; each test's own import evaluates again from the transform cache in milliseconds.
@@ -42,6 +43,7 @@ beforeEach(() => {
   fixture.model.mockResolvedValue(true);
   fixture.sessions.mockResolvedValue({ state: 'present', sessions: ['pt-ws-a-pane-a-tab-missing'] });
   fixture.rebind.mockResolvedValue([]);
+  fixture.hosts.mockResolvedValue(['host-b']);
   for (const key of ['__purplemuxWorkspacesContentCache', '__ptWorkspacesMemo', '__ptTabTokens', '__ptWorkspaceTokens']) delete (globalThis as Record<string, unknown>)[key];
 });
 afterEach(() => { fs.rmSync(fixture.home, { recursive: true, force: true }); });
@@ -66,6 +68,33 @@ describe('guarded orchestration revision and recovery', () => {
       .rejects.toMatchObject({ code: 'orchestrator-state-unknown', message: expect.stringContaining('host-b') });
     const store = await import('@/lib/workspace-store');
     expect((await store.getWorkspaceStrict('ws-a')).orchestration).toMatchObject({ orchestratorTabId: 'tab-old', revision: 3 });
+  });
+
+  it('a remote candidate whose host is not on remote.hosts is refused before any ssh, and the mapping stays', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old', revision: 3 } as IWorkspaceOrchestration);
+    layout([tab('tab-old'), { ...tab('tab-next'), host: 'host-gone' }]);
+    const { changeOrchestration } = await load();
+    await expect(changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options({ expectedRevision: 3, mode: 'replace', actor: { kind: 'human' } })))
+      .rejects.toMatchObject({ code: 'orchestrator-candidate-invalid', message: expect.stringContaining('host-gone') });
+    expect(fixture.runtime.mock.calls.map((c) => (c[0] as ITab).id)).not.toContain('tab-next');
+    const store = await import('@/lib/workspace-store');
+    expect((await store.getWorkspaceStrict('ws-a')).orchestration).toMatchObject({ orchestratorTabId: 'tab-old', revision: 3 });
+  });
+
+  it('an unreadable remote.hosts refuses a remote candidate as unknown, before any ssh', async () => {
+    layout([tab('tab-old'), { ...tab('tab-next'), host: 'host-b' }]);
+    fixture.hosts.mockRejectedValue(new Error('fleet config unreadable'));
+    const { changeOrchestration } = await load();
+    await expect(changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options()))
+      .rejects.toMatchObject({ code: 'orchestrator-state-unknown' });
+    expect(fixture.runtime.mock.calls.map((c) => (c[0] as ITab).id)).not.toContain('tab-next');
+  });
+
+  it('a local candidate never reads remote.hosts', async () => {
+    fixture.hosts.mockRejectedValue(new Error('fleet config unreadable'));
+    const { changeOrchestration } = await load();
+    await expect(changeOrchestration('ws-a', { enabled: true, orchestratorTabId: 'tab-next' }, options())).resolves.toBeDefined();
+    expect(fixture.hosts).not.toHaveBeenCalled();
   });
 
   it('an evaluator tab is never designated coordinator, before any runtime proof is asked (ADR-0040)', async () => {
@@ -186,6 +215,18 @@ describe('guarded orchestration revision and recovery', () => {
     write({ enabled: true, orchestratorTabId: 'tab-old' }); fixture.work.mockResolvedValue({ state, evidence: ['awaiting-human or unresolved work'], incomplete: state === 'unknown' });
     const { changeOrchestration } = await load();
     for (const patch of [{ enabled: false }, { orchestratorTabId: null }]) await expect(changeOrchestration('ws-a', patch, options())).rejects.toMatchObject({ code: 'orchestration-work-remains' });
+  });
+  it('off passes only a verified caller tab to the work-state read (its own turn is the call, not work)', async () => {
+    write({ enabled: true, orchestratorTabId: 'tab-old' });
+    const { changeOrchestration } = await load();
+    await changeOrchestration('ws-a', { enabled: false }, options({ mode: 'handoff', actor: { kind: 'workspace', workspaceId: 'ws-a', tabId: 'tab-old', verified: true } }));
+    expect(fixture.work).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'ws-a' }), { callerTabId: 'tab-old' });
+    write({ enabled: true, orchestratorTabId: 'tab-old' });
+    await changeOrchestration('ws-a', { enabled: false }, options({ actor: { kind: 'workspace', workspaceId: 'ws-a', tabId: 'tab-old', verified: false } }));
+    expect(fixture.work).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'ws-a' }), { callerTabId: null });
+    write({ enabled: true, orchestratorTabId: 'tab-old' });
+    await changeOrchestration('ws-a', { enabled: false }, options({ actor: { kind: 'human' } }));
+    expect(fixture.work).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'ws-a' }), { callerTabId: null });
   });
   it('allows finished work to disable and leaves the mapping evidence intact', async () => {
     write({ enabled: true, orchestratorTabId: 'tab-old' });

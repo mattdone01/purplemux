@@ -81,6 +81,16 @@ export class RemoteProofScheduler {
   }
 
   /**
+   * A kept `present` answer for this key, without consuming anything (ADR-0049 §6): an off-poll reader (Mission
+   * Control discovery) may read a proof but never take the absent answer the poll's transition waits for. Null
+   * otherwise: no proof, another key, expired, or absent.
+   */
+  peek(req: IRemoteProofRequest): true | null {
+    const result = this.results.get(req.tabId);
+    return result && result.state === 'present' && result.key === req.key && !this.expired(result) ? true : null;
+  }
+
+  /**
    * Queue the proofs these requests need and start them within each host's cap, outside its backoff. Never
    * awaited by the poll; the returned promise settles when the queues drain (tests).
    */

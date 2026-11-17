@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   deliverPrompt: vi.fn(),
   agentRunning: true,
   halted: new Set<string>(),
+  observe: vi.fn(),
+  remoteAlive: vi.fn(),
 }));
 
 const logs = vi.hoisted(() => ({ warn: vi.fn() }));
@@ -56,8 +58,9 @@ vi.mock('@/lib/tmux', async () => {
   return { ...actual, getAllPanesInfo: mocks.getAllPanesInfo };
 });
 vi.mock('@/lib/process-utils', () => ({ getChildPids: vi.fn(async () => []) }));
+vi.mock('@/lib/orchestration-runtime', () => ({ observeOrchestrationProcess: mocks.observe }));
 vi.mock('@/lib/status-manager', () => ({
-  getStatusManager: () => ({ getAllForClient: () => mocks.statuses, isHaltedByUsageLimit: (tabId: string) => mocks.halted.has(tabId) }),
+  getStatusManager: () => ({ getAllForClient: () => mocks.statuses, isHaltedByUsageLimit: (tabId: string) => mocks.halted.has(tabId), remoteAgentAlive: mocks.remoteAlive }),
 }));
 vi.mock('@/lib/providers/registry', () => ({
   getProviderByPanelType: (panelType: string | undefined) => panelType === 'claude-code'
@@ -72,6 +75,8 @@ vi.mock('@/lib/providers/registry', () => ({
 
 import {
   discoverMissionControlWorkspaces,
+  observeMissionTarget,
+  resolveMissionTargetIdentity,
   hasEmptyAgentComposer,
   missionBootstrapKey,
   missionLiveRunSourceKey,
@@ -144,6 +149,103 @@ describe('Mission Control runtime discovery', () => {
     mocks.readLayoutFile.mockImplementation(async () => mocks.layout);
     mocks.readStandups.mockImplementation(async () => mocks.standups);
     mocks.getAllPanesInfo.mockImplementation(async () => mocks.panes);
+  });
+
+  // A remote pane has no local pid (getAllPanesInfo gives 0), so the local pid and /proc checks can never bind a remote
+  // tab: an owner answer never reached a remote coordinator. Its process is proven on its host instead (ADR-0049).
+  describe('a remote tab is proven on its host', () => {
+    beforeEach(() => {
+      (globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff?.clear();
+      mocks.observe.mockReset();
+    });
+    const remote = (panelType: 'claude-code' | 'codex-cli' = 'claude-code') => {
+      const orch = { id: 'orch', sessionName: 'pt-ws-one-pane-orch', name: 'orchestrator', order: 0, panelType, host: 'host-a' };
+      mocks.findTab.mockImplementation(async () => ({ tab: orch }));
+      mocks.panes = new Map([['pt-ws-one-pane-orch', { command: 'claude', path: '/repo', pid: 0, windowActivity: NOW / 1_000 - 10 }]]);
+      return orch;
+    };
+    it('binds a remote coordinator whose host proves its provider process', async () => {
+      const orch = remote();
+      mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:host-a:pt-ws-one-pane-orch:%1:10:11:99:claude' });
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toMatchObject({ tabId: 'orch', providerId: 'claude', sessionId: 'session-orch' });
+      expect(mocks.observe).toHaveBeenCalledWith(orch);
+    });
+    it.each([
+      ['unknown', { state: 'unknown', reason: 'remote host host-a did not answer (timeout)' }],
+      ['absent', { state: 'absent', reason: 'no claude process in the pane' }],
+    ])('gives no identity when the host answers %s, so the inbox holds and retries', async (_name, observation) => {
+      remote();
+      mocks.observe.mockResolvedValue(observation);
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
+    });
+    it('still needs the status, provider and session checks', async () => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:x' });
+      mocks.statuses = { orch: { workspaceId: 'ws-one', agentProviderId: 'claude', agentSessionId: '', cliState: 'idle' } };
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
+    });
+    it('a remote tab that is not claude-code is never proven (only claude-code runs remotely)', async () => {
+      remote('codex-cli');
+      mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:x' });
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
+      expect(mocks.observe).not.toHaveBeenCalled();
+    });
+    it('a host whose ssh failed is not asked again inside its backoff, then is asked again', async () => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)', sshFailed: true });
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toBeNull();
+      expect(mocks.observe).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(30_001);
+      mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:x' });
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toMatchObject({ tabId: 'orch' });
+      expect(mocks.observe).toHaveBeenCalledTimes(2);
+    });
+    // Review r1 (Sonnet 1): a host that answered with a doubt about one pane must not freeze the host's scans.
+    it.each(['tmux failed', 'session identity ambiguous', 'process table unreadable'])('an on-host unknown (%s) does not back the host off', async (reason) => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'unknown', reason });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'unknown', reason });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'unknown', reason });
+      expect(mocks.observe).toHaveBeenCalledTimes(2);
+      expect((globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff?.has('host-a') ?? false).toBe(false);
+    });
+    it('the paste-time view: ssh failed and backed off read unknown, never not live; absent reads not live', async () => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)', sshFailed: true });
+      expect(await observeMissionTarget('ws-one', 'orch')).toMatchObject({ state: 'unknown' });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'unknown', reason: 'remote host host-a backed off after it did not answer' });
+      (globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff?.clear();
+      mocks.observe.mockResolvedValue({ state: 'absent', reason: 'no claude process in the pane' });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'not-live' });
+      mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:x' });
+      expect(await observeMissionTarget('ws-one', 'orch')).toEqual({ state: 'live', identity: expect.objectContaining({ tabId: 'orch', sessionId: 'session-orch' }) });
+    });
+    it('an absent answer does not back the host off: the next call asks again', async () => {
+      remote();
+      mocks.observe.mockResolvedValue({ state: 'absent', reason: 'no claude process in the pane' });
+      await resolveMissionTargetIdentity('ws-one', 'orch');
+      await resolveMissionTargetIdentity('ws-one', 'orch');
+      expect(mocks.observe).toHaveBeenCalledTimes(2);
+    });
+    it('discovery reads a remote tab alive from the status manager rule only, never from a cached busy state', async () => {
+      const orch = remote();
+      mocks.layout = { ...mocks.layout!, root: { type: 'pane', id: 'pane-one', activeTabId: 'orch', tabs: [orch] } };
+      mocks.statuses = { orch: { workspaceId: 'ws-one', agentProviderId: 'claude', agentSessionId: 'session-orch', cliState: 'busy' } };
+      mocks.remoteAlive.mockResolvedValue(false);
+      let [workspace] = await discoverMissionControlWorkspaces();
+      expect(workspace.agents.find((agent) => agent.tabId === 'orch')?.alive).toBe(false);
+      expect(mocks.remoteAlive).toHaveBeenCalledWith(orch, mocks.panes.get('pt-ws-one-pane-orch'));
+      mocks.remoteAlive.mockResolvedValue(true);
+      [workspace] = await discoverMissionControlWorkspaces();
+      expect(workspace.agents.find((agent) => agent.tabId === 'orch')?.alive).toBe(true);
+      expect(mocks.observe).not.toHaveBeenCalled();
+    });
+    it('a local tab never asks the remote proof', async () => {
+      mocks.observe.mockClear();
+      expect(await resolveMissionTargetIdentity('ws-one', 'orch')).toMatchObject({ tabId: 'orch', sessionId: 'session-orch' });
+      expect(mocks.observe).not.toHaveBeenCalled();
+    });
   });
 
   it('keeps a workspace active for a busy worker when its orchestrator is idle and disabled', async () => {
@@ -833,6 +935,34 @@ describe('Mission Control paste-time preflight (story 12, ruling A′ §4)', () 
     await expect(harness.runtime.preflight(item)).resolves.toEqual({ ok: false, reason });
 
     expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
+  });
+
+  // ADR-0049 §6 with a fake remote: the owner's answer to a remote coordinator is claimed for a paste only on a fresh
+  // proof from its host. A host that does not answer leaves the row waiting, unclaimed: nothing is typed, and the
+  // inbox backoff asks again later.
+  it('a remote coordinator: an unanswered host is a retryable refusal without a claim; a proven one is claimed once', async () => {
+    const backoff = (globalThis as { __ptRemoteScanBackoff?: Map<string, number> }).__ptRemoteScanBackoff;
+    backoff?.clear();
+    const orch = { id: 'orch', sessionName: 'pt-ws-one-pane-orch', name: 'orchestrator', order: 0, panelType: 'claude-code' as const, host: 'host-a' };
+    mocks.findTab.mockImplementation(async () => ({ tab: orch }));
+    mocks.statuses = { orch: { workspaceId: 'ws-one', agentProviderId: 'claude', agentSessionId: 'session-orch', cliState: 'idle' } };
+    const harness = runtimeHarness({ handoffs: { deliveries: [waitingDelivery()], bootstrapEntries: [] } });
+    harness.deps.resolveIdentity = resolveMissionTargetIdentity;
+    harness.deps.observeTarget = observeMissionTarget;
+
+    mocks.observe.mockReset().mockResolvedValue({ state: 'unknown', reason: 'remote host host-a did not answer (timeout)', sshFailed: true });
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: false, retry: true, reason: 'bound-agent-unknown:remote host host-a did not answer (timeout)' });
+    expect(harness.store.claimInboxDelivery).not.toHaveBeenCalled();
+
+    backoff?.clear();
+    mocks.observe.mockResolvedValue({ state: 'present', identity: 'remote:host-a:pt-ws-one-pane-orch:%1:10:11:99:claude' });
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: true });
+    expect(harness.store.claimInboxDelivery).toHaveBeenCalledTimes(1);
+    expect(mocks.observe).toHaveBeenCalledTimes(2);
+
+    // Absent stays what it was: not live, a rejection.
+    mocks.observe.mockResolvedValue({ state: 'absent', reason: 'no claude process in the pane' });
+    await expect(harness.runtime.preflight(inboxItem())).resolves.toEqual({ ok: false, reason: 'bound-agent-not-live' });
   });
 
   it('holds the claimed row when the record changed, and refuses the paste', async () => {

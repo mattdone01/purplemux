@@ -23,6 +23,23 @@ describe('RemoteProofScheduler', () => {
     expect(scheduler.read(req('tab-a'))).toBeNull();
   });
 
+  // ADR-0049 §6: Mission Control discovery reads a proof but must never take the absent answer the poll waits for.
+  it('peek reads a present answer for its key without consuming, and never takes an absent one', async () => {
+    let answer: TStrictRuntimeObservation = { state: 'present', identity: 'x' };
+    const { scheduler, advance } = make(() => answer);
+    await scheduler.schedule([req('tab-a')]);
+    expect(scheduler.peek(req('tab-a'))).toBe(true);
+    expect(scheduler.peek(req('tab-a'))).toBe(true);
+    expect(scheduler.peek(req('tab-a', 'k2'))).toBeNull();
+    expect(scheduler.read(req('tab-a'))).toBe(true);
+    advance(60_000);
+    expect(scheduler.peek(req('tab-a'))).toBeNull();
+    answer = { state: 'absent', reason: 'no claude process in the pane' };
+    await scheduler.schedule([req('tab-b')]);
+    expect(scheduler.peek(req('tab-b'))).toBeNull();
+    expect(scheduler.read(req('tab-b'))).toBe(false);
+  });
+
   it('a present answer is kept for its key only', async () => {
     const { scheduler } = make(() => ({ state: 'present', identity: 'x' }));
     await scheduler.schedule([req('tab-a')]);

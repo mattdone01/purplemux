@@ -11,7 +11,8 @@ import { verifyCodexActiveRuntime } from '@/lib/providers/codex/launch-lifecycle
 import { getChildPids } from '@/lib/process-utils';
 import { readStandups } from '@/lib/standup-store';
 import { getStatusManager } from '@/lib/status-manager';
-import { getAllPanesInfo } from '@/lib/tmux';
+import { backOffRemoteHost, getAllPanesInfo, remoteHostBackedOff } from '@/lib/tmux';
+import { observeOrchestrationProcess } from '@/lib/orchestration-runtime';
 import { readWorkspaceLayout } from '@/lib/workspace-layout-read';
 import { getWorkspaces } from '@/lib/workspace-store';
 import {
@@ -78,6 +79,11 @@ export interface IMissionRuntimeDeps {
   discover: (bootstrapId: string, reconcile: boolean, boundarySeq: number) => Promise<IMissionDiscoveryInput>;
   workspaceViews: () => Promise<IMissionWorkspaceView[]>;
   resolveIdentity: (workspaceId: string, tabId: string) => Promise<Omit<IMissionBinding, 'generation'> | null>;
+  /**
+   * The paste-time preflight's read of the bound tab (ADR-0049 §6). Absent: `resolveIdentity`, where null is not live.
+   * `unknown` (a remote host that cannot tell) is a refusal the inbox retries on its backoff, never a rejection.
+   */
+  observeTarget?: (workspaceId: string, tabId: string) => Promise<TMissionTargetObservation>;
   /** Null without a configured orchestrator tab that a readable layout still holds. */
   orchestratorTarget: (workspaceId: string) => Promise<IMissionOrchestratorTarget | null>;
   /** Excludes an orchestrator change of the workspace while a deferred rebind reads the mapping and writes. */
@@ -210,7 +216,37 @@ const sameIdentity = (
 // Moved to composer-readiness (story 09); re-exported for existing importers.
 export { hasEmptyAgentComposer } from '@/lib/composer-readiness';
 
+/**
+ * A remote tab's agent, proven on its host (ADR-0049 §6): a remote pane has no pid here, so the local pid and /proc
+ * checks could never bind one, and an owner's answer never reached a remote coordinator. Only a claude-code tab runs
+ * remotely (ADR-0022). The strict observation runs fresh on each call: `present` alone binds. Three answers: proven,
+ * not live (absent, or not a claude-code tab), or cannot tell (the host did not answer, is in its backoff, or answered
+ * with a doubt about this pane). Only an ssh that itself failed backs the host off, with the pane scans, so the 5 s
+ * rebind retry never asks a dead host each pass; a doubt on a host that answered does not freeze the host's scans.
+ */
+const remoteAgentProof = async (tab: ITab, host: string): Promise<'present' | 'not-live' | { unknown: string }> => {
+  if (tab.panelType !== 'claude-code') return 'not-live';
+  if (remoteHostBackedOff(host)) return { unknown: `remote host ${host} backed off after it did not answer` };
+  const observed = await observeOrchestrationProcess(tab);
+  if (observed.state === 'present') return 'present';
+  if (observed.state === 'absent') return 'not-live';
+  if (observed.sshFailed) backOffRemoteHost(host);
+  return { unknown: observed.reason };
+};
+
+/** What the paste-time preflight learns of the bound tab: live with its identity, not live, or cannot tell. */
+export type TMissionTargetObservation =
+  | { state: 'live'; identity: Omit<IMissionBinding, 'generation'> }
+  | { state: 'not-live' }
+  | { state: 'unknown'; reason: string };
+
 const inspectLiveTab = async (workspaceId: string, tabId: string): Promise<ILiveTab | null> => {
+  const observed = await inspectTab(workspaceId, tabId);
+  return observed !== null && 'tab' in observed ? observed : null;
+};
+
+/** The tab's live agent, null when it is not live, or `{ unknown }` when a remote host cannot tell (ADR-0049 §6). */
+const inspectTab = async (workspaceId: string, tabId: string): Promise<ILiveTab | { unknown: string } | null> => {
   const found = await findTab(workspaceId, tabId);
   if (!found || !isAgentPanelType(found.tab.panelType)) return null;
   const provider = getProviderByPanelType(found.tab.panelType);
@@ -221,12 +257,18 @@ const inspectLiveTab = async (workspaceId: string, tabId: string): Promise<ILive
   const sessionId = status.agentSessionId;
   if (!sessionId || !provider.isValidSessionId(sessionId)) return null;
 
-  const panes = await getAllPanesInfo();
-  const pane = panes.get(found.tab.sessionName);
-  if (!pane?.pid) return null;
-  if (!processMatchesPanelType(found.tab.panelType, pane.command)) return null;
-  const childPids = await getChildPids(pane.pid);
-  if (!await provider.isAgentRunning(pane.pid, childPids)) return null;
+  if (found.tab.host) {
+    const proof = await remoteAgentProof(found.tab, found.tab.host);
+    if (proof === 'not-live') return null;
+    if (proof !== 'present') return proof;
+  } else {
+    const panes = await getAllPanesInfo();
+    const pane = panes.get(found.tab.sessionName);
+    if (!pane?.pid) return null;
+    if (!processMatchesPanelType(found.tab.panelType, pane.command)) return null;
+    const childPids = await getChildPids(pane.pid);
+    if (!await provider.isAgentRunning(pane.pid, childPids)) return null;
+  }
 
   if (found.tab.panelType === 'codex-cli') {
     if (!runtimeGenerationFor(found.tab)) return null;
@@ -240,6 +282,14 @@ const inspectLiveTab = async (workspaceId: string, tabId: string): Promise<ILive
     sessionId,
     runtimeGeneration: runtimeGenerationFor(found.tab),
   };
+};
+
+/** The paste-time view of the bound tab (ADR-0049 §6): a remote host that cannot tell is `unknown`, never not live. */
+export const observeMissionTarget = async (workspaceId: string, tabId: string): Promise<TMissionTargetObservation> => {
+  const observed = await inspectTab(workspaceId, tabId);
+  if (observed === null) return { state: 'not-live' };
+  if ('unknown' in observed) return { state: 'unknown', reason: observed.unknown };
+  return { state: 'live', identity: missionIdentityFor(observed.tab, observed.providerId, observed.sessionId) };
 };
 
 export const resolveMissionTargetIdentity = async (
@@ -270,7 +320,9 @@ export const discoverMissionControlWorkspaces = async (): Promise<IMissionDiscov
       const status = statuses[tab.id];
       const pane = panes.get(tab.sessionName);
       let alive = false;
-      if (provider && pane?.pid && processMatchesPanelType(tab.panelType, pane.command)) {
+      // A remote tab: the poll's rule over this scan, no ssh of discovery's own (ADR-0049 §6); preflight proves it fresh.
+      if (tab.host) alive = tab.panelType === 'claude-code' && await getStatusManager().remoteAgentAlive(tab, pane).catch(() => false);
+      else if (provider && pane?.pid && processMatchesPanelType(tab.panelType, pane.command)) {
         const childPids = await getChildPids(pane.pid).catch(() => []);
         alive = await provider.isAgentRunning(pane.pid, childPids).catch(() => false);
         if (alive && tab.panelType === 'codex-cli') {
@@ -455,6 +507,7 @@ const defaultDeps: IMissionRuntimeDeps = {
   discover,
   workspaceViews,
   resolveIdentity: resolveMissionTargetIdentity,
+  observeTarget: observeMissionTarget,
   orchestratorTarget: resolveMissionOrchestratorTarget,
   withMappingRead: withOrchestrationMappingRead,
   inbox: {
@@ -739,7 +792,7 @@ export class MissionControlRuntime {
    * the row still waits on THIS item for THIS tab, the bound agent is the same live identity, and
    * last the row is claimed to `dispatching` and re-validated. `ok` means claimed for this paste.
    */
-  async preflight(item: IInboxItem): Promise<{ ok: true } | { ok: false; reason: string }> {
+  async preflight(item: IInboxItem): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }> {
     const store = this.deps.getStore();
     const marker = markerFor(item.id);
     const handoffs = store.listInboxHandoffs();
@@ -751,8 +804,13 @@ export class MissionControlRuntime {
     if (!binding || workspaceId !== item.targetWorkspaceId || binding.tabId !== item.targetTabId) {
       return { ok: false, reason: 'binding-tab-changed' };
     }
-    const identity = await this.deps.resolveIdentity(workspaceId, binding.tabId);
-    if (!identity) return { ok: false, reason: 'bound-agent-not-live' };
+    const observed: TMissionTargetObservation = this.deps.observeTarget
+      ? await this.deps.observeTarget(workspaceId, binding.tabId)
+      : await this.deps.resolveIdentity(workspaceId, binding.tabId).then((found) => (found ? { state: 'live' as const, identity: found } : { state: 'not-live' as const }));
+    // A remote host that cannot tell: nothing is claimed, and the inbox keeps the item and asks again (ADR-0049 §6).
+    if (observed.state === 'unknown') return { ok: false, retry: true, reason: `bound-agent-unknown:${observed.reason}` };
+    if (observed.state === 'not-live') return { ok: false, reason: 'bound-agent-not-live' };
+    const identity = observed.identity;
     if (!sameIdentity(binding, identity)) return { ok: false, reason: 'binding-identity-changed' };
 
     if (delivery) {
