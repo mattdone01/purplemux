@@ -1,7 +1,7 @@
 import type { ICaller } from '@/lib/caller';
 import { createHash } from 'crypto';
 import type { CoordinatorWindow } from '@/lib/coordinator-window';
-import { isRecoverableHold, type IEnqueueRequest } from '@/lib/inbox-store';
+import { aheadOf, isRecoverableHold, refusalWord, type IEnqueueRequest } from '@/lib/inbox-store';
 import { isNoteBounceReason, renderNotePointerLine, type TNoteEvent } from '@/lib/inbox-templates';
 import { NotePointBounds, type INotePointPort, type TPointerTyped } from '@/lib/note-pointer';
 import { createLogger } from '@/lib/logger';
@@ -47,7 +47,8 @@ import {
 } from '@/lib/notes-store';
 import type { IGrant } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
-import type { INote, INoteAdmission, INotePointerStamp, INoteReceipt, INotesState, INoteView, TNoteRoutingStatus } from '@/types/note';
+import type { INote, INoteAdmission, INotePointerStamp, INoteQueue, INoteReceipt, INotesState, INoteView, TNoteRoutingStatus } from '@/types/note';
+import type { TCliState } from '@/types/timeline';
 import { WorkerEventError } from '@/lib/worker-event-schema';
 import type { INoteEventRecord } from '@/types/worker-event';
 
@@ -104,7 +105,16 @@ export interface INotesDeps {
   alertPointerSpent?: (note: INote, outcome: 'stranded' | 'unverified', at: number) => Promise<void>;
   /** The ack, recorded for the sender as a `log` row in the ledger (never typed). Best effort. */
   recordAck?: (note: INote) => Promise<void>;
+  /** A fleet-config flag (ADR-0019) is `on`, read at call time. Absent, or a read that throws: off. */
+  flag?: (key: string) => Promise<boolean>;
+  /** NR-1: the recipient tab's CLI state for the queue view; null when not known. */
+  cliStateOf?: (workspaceId: string, tabId: string) => Promise<TCliState | null>;
 }
+
+/** NR-1: the send answer, `note show` and `note list --from-me` carry `receipt.queue` (ADR-0013 amendment). */
+export const SEND_QUEUE_RECEIPT_KEY = 'notes.send-queue-receipt';
+/** NR-2': `notes.list-hint.<recipient workspace id>`. */
+export const LIST_HINT_KEY_PREFIX = 'notes.list-hint.';
 
 /**
  * The answer to a typed pointer (G7). `notSubmitted` is set when the line may sit in the composer: still in the box
@@ -212,6 +222,10 @@ const isToMe = (n: INote, caller: ICaller): boolean => {
   return n.deliveredTo !== null && n.deliveredTo.workspaceId === caller.workspaceId && n.deliveredTo.tabId === caller.tabId;
 };
 
+/** A viewer outside the notice's target workspace (NR-1). The admin token and a human session see every inbox already. */
+const isForeignViewer = (viewer: ICaller | null, item: IInboxItem): boolean =>
+  viewer !== null && !viewer.admin && viewer.workspaceId !== item.targetWorkspaceId;
+
 export class NotesService {
   private operationTail: Promise<void> = Promise.resolve();
 
@@ -303,7 +317,7 @@ export class NotesService {
       : { status: 'undeliverable', reason: 'target-coordinator-unavailable' };
   }
 
-  private notice(note: INote, to: { workspaceId: string; tabId: string }, event: TNoteEvent): IEnqueueRequest<'note'> {
+  private notice(note: INote, to: { workspaceId: string; tabId: string }, event: TNoteEvent, listHint = false): IEnqueueRequest<'note'> {
     const reason = event === 'bounced' && isNoteBounceReason(note.routingReason) ? { reason: note.routingReason } : {};
     return {
       kind: 'note',
@@ -312,8 +326,18 @@ export class NotesService {
       dedupeKey: `note:${note.id}:${event}:${to.tabId}`,
       fields: { noteId: note.id, fromWorkspaceId: note.from.workspaceId, fromTabId: note.from.tabId,
         fromHuman: note.admission?.mode === 'human', fromOwner: note.admission?.mode === 'owner', sentAt: note.createdAt, event,
-        ...reason, ...(event === 'undelivered' ? { afterMinutes: Math.round(undeliveredNoticeMs(note) / 60_000) } : {}) },
+        ...reason, ...(event === 'undelivered' ? { afterMinutes: Math.round(undeliveredNoticeMs(note) / 60_000) } : {}),
+        ...(listHint ? { listHint: true } : {}) },
     };
+  }
+
+  /**
+   * NR-2': a recipient line (`delivered`, `reminder`) ends with the list command while `notes.list-hint.<wsId>` is on
+   * for the recipient's workspace. The flag is read here, at enqueue: a notice queued before a change keeps its line.
+   */
+  private async recipientNotice(note: INote, to: { workspaceId: string; tabId: string }, event: 'delivered' | 'reminder'): Promise<{ item: IInboxItem }> {
+    const listHint = await this.flagOn(`${LIST_HINT_KEY_PREFIX}${to.workspaceId}`);
+    return this.deps.enqueue(this.notice(note, to, event, listHint));
   }
 
   private async admissionFor(caller: ICaller, to: { epic: string | null; workspaceId: string | null }, now: number, r: IReads): Promise<INoteAdmission> {
@@ -375,12 +399,81 @@ export class NotesService {
     };
   }
 
-  private async views(notes: readonly INote[]): Promise<INoteView[]> {
-    const items = new Map((await this.deps.inboxItems()).map((item) => [item.id, item]));
-    return notes.map((note) => ({
-      ...viewOf(note, note.inboxItemId ? items.get(note.inboxItemId) ?? null : null),
-      receipt: this.receipt(note, items),
+  /**
+   * `viewer` is the caller the views answer: null for a human session or the server. With `notes.send-queue-receipt`
+   * off the views are exactly as before NR-1, whatever `options` asks.
+   */
+  private async views(notes: readonly INote[], viewer: ICaller | null, options: { queue?: boolean } = {}): Promise<INoteView[]> {
+    if (!(await this.flagOn(SEND_QUEUE_RECEIPT_KEY))) {
+      const items = new Map((await this.deps.inboxItems()).map((item) => [item.id, item]));
+      return notes.map((note) => ({
+        ...viewOf(note, note.inboxItemId ? items.get(note.inboxItemId) ?? null : null),
+        receipt: this.receipt(note, items),
+      }));
+    }
+    let all: IInboxItem[] | null;
+    try {
+      all = await this.deps.inboxItems();
+    } catch (err) {
+      log.warn(`note views: inbox unreadable: ${err instanceof Error ? err.message : err}`);
+      all = null;
+    }
+    const items = new Map((all ?? []).map((item) => [item.id, item]));
+    return Promise.all(notes.map(async (note) => {
+      const item = note.inboxItemId ? items.get(note.inboxItemId) ?? null : null;
+      const receipt = this.receipt(note, items);
+      // Consult C-1: the raw strings can carry another workspace's pane state or an error text.
+      if (receipt.notice && item && isForeignViewer(viewer, item)) {
+        receipt.notice = {
+          ...receipt.notice,
+          lastRefusal: refusalWord(receipt.notice.lastRefusal),
+          heldReason: receipt.notice.heldReason === null ? null : 'held',
+        };
+      }
+      if (options.queue && note.inboxItemId) {
+        if (all === null) receipt.queueUnavailable = 'inbox-unreadable';
+        else if (item && receipt.authorizedRecipient) {
+          try {
+            const queue = await this.queueOf(item, all);
+            if (queue) receipt.queue = queue;
+          } catch (err) {
+            log.warn(`note ${note.id} queue view: ${err instanceof Error ? err.message : err}`);
+            receipt.queueUnavailable = 'view-unreadable';
+          }
+        }
+      }
+      return { ...viewOf(note, item), receipt };
     }));
+  }
+
+  /** NR-1: where the notice waits at its tab now; null once it no longer waits to be typed. */
+  private async queueOf(item: IInboxItem, all: readonly IInboxItem[]): Promise<INoteQueue | null> {
+    const at = this.deps.now();
+    const ahead = aheadOf(all, item.id, at);
+    if (!ahead) return null;
+    const { targetWorkspaceId, targetTabId } = item;
+    const window = this.deps.window?.() ?? null;
+    const openAt = window && (await window.governs(targetWorkspaceId, targetTabId)) ? window.openAt(targetWorkspaceId, targetTabId) : null;
+    return {
+      at,
+      targetWorkspaceId,
+      targetTabId,
+      targetCliState: (await this.deps.cliStateOf?.(targetWorkspaceId, targetTabId)) ?? null,
+      ahead: ahead.ahead,
+      oldestAheadSince: ahead.oldestAheadSince,
+      windowOpensAt: openAt !== null && openAt > at ? openAt : null,
+      headRefusal: ahead.headRefusal,
+    };
+  }
+
+  private async flagOn(key: string): Promise<boolean> {
+    if (!this.deps.flag) return false;
+    try {
+      return await this.deps.flag(key);
+    } catch (err) {
+      log.warn(`fleet config ${key} unreadable, read as off: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
   }
 
   /** The inbox calls this under its dispatch lock immediately before a note line is pasted. */
@@ -449,7 +542,7 @@ export class NotesService {
     const decision = await this.recipientOf(note, r);
     if (decision.status === 'policyblocked') return policyBlocked(note, now, decision.reason);
     if (decision.status === 'undeliverable') return undeliverable(note, now, decision.reason);
-    const { item } = await this.deps.enqueue(this.notice(note, decision.recipient, 'delivered'));
+    const { item } = await this.recipientNotice(note, decision.recipient, 'delivered');
     return routed(note, decision.recipient, item.id, now);
   }
 
@@ -568,7 +661,7 @@ export class NotesService {
       let sent: string | null = null;
       try {
         if ((await r.tabState(next.deliveredTo.workspaceId, next.deliveredTo.tabId)) === 'live') {
-          sent = (await this.deps.enqueue(this.notice(next, next.deliveredTo, 'reminder'))).item.id;
+          sent = (await this.recipientNotice(next, next.deliveredTo, 'reminder')).item.id;
         }
       } catch (err) {
         log.warn(`note ${note.id} reminder not sent: ${err instanceof Error ? err.message : err}`);
@@ -793,7 +886,7 @@ export class NotesService {
       return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
     }));
     if (admission.mode === 'owner' && created) await this.auditOwnerNote(sent);
-    const view = (await this.views([sent]))[0];
+    const view = (await this.views([sent], caller, { queue: true }))[0];
     if (!sent.ownerItem) return view;
     // Not awaited: the first pointer attempt runs after the send's lock is released, and the answer does not wait on it.
     if (created) void this.pointOwnerItems().catch((err) => log.warn(`owner-item pointer failed: ${err instanceof Error ? err.message : err}`));
@@ -867,7 +960,7 @@ export class NotesService {
       const added = status ? [routedDelivery, status] : [routedDelivery];
       return { state: { notes: [...state.notes, ...added] }, value: { delivery: routedDelivery, status } };
     }));
-    const views = await this.views(result.status ? [result.delivery, result.status] : [result.delivery]);
+    const views = await this.views(result.status ? [result.delivery, result.status] : [result.delivery], caller);
     return { note: views[0], status: views[1] ?? null };
   }
 
@@ -922,7 +1015,7 @@ export class NotesService {
     const note = await this.find(id);
     const inSelection = scrumMasterWorkspaces.some((ws) => ws === recipientWorkspace(note) || ws === note.from.workspaceId);
     if (!canShow(note, caller) && !inSelection) throw new NoteError('forbidden', `note ${note.id} belongs to other workspaces`);
-    return { note: (await this.views([note]))[0], body: note.body };
+    return { note: (await this.views([note], caller, { queue: true }))[0], body: note.body };
   }
 
   async ack(caller: ICaller, id: unknown, comment: unknown): Promise<INoteView> {
@@ -975,7 +1068,7 @@ export class NotesService {
     if (newlyAcked && this.deps.recordAck) {
       await this.deps.recordAck(done).catch((err) => log.warn(`note ${done.id} ack record not written: ${err instanceof Error ? err.message : err}`));
     }
-    return (await this.views([done]))[0];
+    return (await this.views([done], caller))[0];
   }
 
   // ─── note point (G7 step 0) ─────────────────────────────────────────────
@@ -1328,7 +1421,7 @@ export class NotesService {
       .filter((n) => !filter.toMe || caller.admin || isToMe(n, caller))
       .filter((n) => !filter.epic || n.to.epic === filter.epic || n.from.epic === filter.epic)
       .sort((a, b) => a.createdAt - b.createdAt);
-    return this.views(visible);
+    return this.views(visible, caller, { queue: filter.fromMe === true });
   }
 
   private async find(id: unknown): Promise<INote> {
@@ -1343,7 +1436,7 @@ export class NotesService {
 export const NOTES_TICK_MS = 15_000;
 
 const defaultDeps = async (): Promise<INotesDeps> => {
-  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock, grantStore, coordinationAudit, coordinatorWindow] = await Promise.all([
+  const [leaseStore, leaseHttp, workspaceStore, tabLifecycle, inboxStore, mappingLock, grantStore, coordinationAudit, coordinatorWindow, fleetConfig] = await Promise.all([
     import('@/lib/lease-store'),
     import('@/lib/lease-http'),
     import('@/lib/workspace-store'),
@@ -1353,6 +1446,7 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     import('@/lib/grant-store'),
     import('@/lib/coordination-audit'),
     import('@/lib/coordinator-window'),
+    import('@/lib/fleet-config-store'),
   ]);
   const epicLease = async (slug: string) => {
     const now = Date.now();
@@ -1391,6 +1485,9 @@ const defaultDeps = async (): Promise<INotesDeps> => {
     ownerGrantOf: (tab) => grantStore.findActiveOwnerGrant(grantStore.grantsSnapshot('owner'), tab, Date.now()),
     audit: coordinationAudit.appendCoordinationAudit,
     window: coordinatorWindow.getCoordinatorWindow,
+    flag: async (key) => fleetConfig.valueOf(await fleetConfig.readFleetConfig(), key)?.value === 'on',
+    cliStateOf: async (_workspaceId, tabId) =>
+      (await import('@/lib/status-manager')).getStatusManager().getAllForClient()[tabId]?.cliState ?? null,
     alertUndelivered: async (note, _now, senderTold) => {
       // The portfolio Scrum Master seat hears it as one digest line, as a pool flag does. Its own note needs no copy: it
       // is the sender, told already, or the recipient that has not read it.

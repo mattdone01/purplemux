@@ -164,6 +164,21 @@ describe('purplemux lease — the installed CLI against the real lease routes', 
     expect(JSON.parse((await cli(['list', '--prefix', 'merge:', '--json'], tabB)).stdout).leases).toHaveLength(1);
   });
 
+  it('list --kind held: the shared browser and gate slot holders, with workspace, tab and expiry (NR-5b)', async () => {
+    await cli(['acquire', 'held:host-a/browser-9333', '--note', 'dev sign-in'], tabA);
+    await cli(['acquire', 'held:host-b/gate-2.run-1'], tabB);
+    await cli(['acquire', 'merge:x/y'], tabA);
+    const text = await cli(['list', '--kind', 'held'], tabA);
+    expect(text.code, text.stderr).toBe(0);
+    expect(text.stdout.trim().split('\n')).toHaveLength(2);
+    expect(text.stdout).toMatch(/^held:host-a\/browser-9333 {2}holder=ws-a \(Alpha\) \/ tab-a \(worker A\) {2}state=live {2}age=\d+s {2}expires-in=1[45]m.* note="dev sign-in"$/m);
+    expect(text.stdout).toMatch(/^held:host-b\/gate-2\.run-1 {2}holder=ws-b \(Beta\) \/ tab-b \(worker B\) /m);
+    expect((await cli(['list', '--kind'], tabA)).code).toBe(2);
+    const bad = await cli(['list', '--kind', 'held:'], tabA);
+    expect(bad.code).toBe(2);
+    expect(bad.stderr).toContain('lease-policy');
+  });
+
   it('renew and release-epic reach their routes; break needs --reason', async () => {
     await cli(['acquire', 'merge:x/y'], tabA);
     expect(JSON.parse((await cli(['renew', 'merge:x/y', '--ttl', '2h'], tabA)).stdout)).toMatchObject({ lease: { ttlSeconds: 7200 } });

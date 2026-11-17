@@ -146,6 +146,14 @@ describe('one budget per host at the measured sizes (vel-D4 AC 1)', () => {
     expect(place([md()], { kind: 'test-service', memGb: 0 }, full)).toMatchObject({ ok: false, refusal: 'no-budget' });
   });
 
+  it('NR-5b: a held record is not a pool slot: it takes no slot number, budget or memory', () => {
+    const slots = ['gate-1', 'build-1'].map((s) => lease(`pool:host-a/${s}`));
+    const records = ['held:host-a/gate-1.run-a', 'held:host-a/gate-2.run-b', 'held:host-a/browser-9333'].map((n) => lease(n, NOW - 60_000, 64));
+    expect(states([md()], [...slots, ...records])).toEqual(states([md()], slots));
+    expect(place([md()], { kind: 'mutation', memGb: 0 }, [...slots, ...records])).toEqual(place([md()], { kind: 'mutation', memGb: 0 }, slots));
+    expect(records.map((l) => parsePoolLeaseName(l.name))).toEqual([null, null, null]);
+  });
+
   it('memory is budgeted for a job\'s whole life: old leases count against the budget even when the read shows free memory', () => {
     const big = [1, 2, 3].map((n) => lease(`pool:host-b-lan/build-${n}`, NOW - 30 * 60_000, 100));
     const placed = place([ai({ memAvailableBytes: 350 * GIB })], { kind: 'gate', memGb: 20 }, big);

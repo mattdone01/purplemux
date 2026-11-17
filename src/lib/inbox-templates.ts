@@ -92,11 +92,15 @@ export const noteFromWords = (from: {
  * `fromTabId: null` is a workspace token with no tab.
  * `event` defaults to `delivered`; `reminder` goes to the recipient, `unacked`, `undelivered`, `expired` and `bounced`
  * to the sender. `reason` is required on `bounced` alone. `afterMinutes` is the `undelivered` notice's own delay (15
- * when absent). `ownerItem` marks a pointer line for a note its sender flagged as an owner item.
+ * when absent). `ownerItem` marks a pointer line for a note its sender flagged as an owner item. `listHint` (NR-2') ends a
+ * `delivered` or `reminder` line with the list command in place of the note's own show and ack commands.
  */
 export interface INoteFields { noteId: string; fromWorkspaceId: string | null; fromTabId: string | null;
   fromHuman?: boolean; fromOwner?: boolean; sentAt: number; event?: TNoteEvent; reason?: TNoteBounceReason;
-  afterMinutes?: number; ownerItem?: boolean }
+  afterMinutes?: number; ownerItem?: boolean; listHint?: boolean }
+
+/** NR-2' (design ruling E): the fixed tail of a recipient note line while `notes.list-hint.<wsId>` is on. */
+export const LIST_HINT_TAIL = 'run purplemux note list --open --to-me, then ack each';
 /** What a watch notice reports (ADR-0015). Every value is a server enum or a grammar-checked id. */
 export type TWatchNotice = 'merged' | 'closed' | 'head-moved' | 'checks-settled' | 'moved' | 'free' | 'signed-in' | 'failing' | 'expired';
 const WATCH_NOTICES: readonly TWatchNotice[] = ['merged', 'closed', 'head-moved', 'checks-settled', 'moved', 'free', 'signed-in', 'failing', 'expired'];
@@ -176,10 +180,13 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
       return `[purplemux note ${id}] you sent it at ${at}; it bounced (${f.reason}): ${NOTE_BOUNCE_REASONS[f.reason]}`
         + ` — it waits for a recipient until it expires; ${read}`;
     };
+    if (f.listHint !== undefined && typeof f.listHint !== 'boolean') throw new InboxFieldError('inbox field listHint must be boolean');
     if (event === 'bounced') return { recordId: id, line: bounced() };
+    // NR-2': one wake reads every waiting note, which is how a coordinator clears a burst the window spreads out.
+    const recipientTail = f.listHint ? LIST_HINT_TAIL : `${read}, then purplemux note ack ${id}`;
     const line = {
-      delivered: `[purplemux note ${id}] from ${from} at ${at} — ${read}, then purplemux note ack ${id}`,
-      reminder: `[purplemux note ${id}] from ${from} at ${at} is still unacked — ${read}, then purplemux note ack ${id}`,
+      delivered: `[purplemux note ${id}] from ${from} at ${at} — ${recipientTail}`,
+      reminder: `[purplemux note ${id}] from ${from} at ${at} is still unacked — ${recipientTail}`,
       unacked: `[purplemux note ${id}] you sent it at ${at}; it is still unacked after 60 min — ${read}`,
       undelivered: `[purplemux note ${id}] you sent it at ${at}; it has not reached its recipient's composer after`
         + ` ${f.afterMinutes === undefined ? 15 : count('afterMinutes', f.afterMinutes)} min — ${read}`,

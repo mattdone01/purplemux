@@ -212,3 +212,57 @@ APPROVE-WITH-CHANGES; the changes are in this amendment.
 - One coalesced line per target. Rejected: the receipt is per note.
 - A `PostToolUse` hook that returns `additionalContext`. This reaches the model without the composer, so it has no
   dialog race. It needs a server read on every tool call. It is the follow-up if the race shows up in measurements.
+
+## Amendment: the send answer says where the note waits (2026-11-17, NR-1, train A1)
+On 15 Nov one orchestrator sent 25 notes to a coordinator in 98 min. The coordinator window types one note line per
+10 min, so a sender saw its note `pending` for up to 33 min and could not tell why. The design check
+PMUX-NOTE-ROUTING-DESIGN (ask c) and its Opus 5.5 xhigh consult (ruling C, APPROVE-WITH-CHANGES) set this amendment.
+Fleet config `notes.send-queue-receipt` turns it on; unset, every answer is as before.
+
+**1. The queue view.** While the note's notice waits to be typed (queued, or held by a recoverable hold), the receipt
+carries `queue`: `at`, `targetWorkspaceId`, `targetTabId`, `targetCliState`, `ahead`, `oldestAheadSince`,
+`windowOpensAt` and `headRefusal`.
+- `ahead` counts the queued notices and the recoverable holds that the inbox types before this one at the same tab,
+  in the dispatcher's order (oldest first, a tie in store order). A hold that is not recoverable blocks nothing
+  (ADR-0012, 2026-10-08 amendment), so it is not counted.
+- `windowOpensAt` is set only when the coordinator window governs the target and is closed. It is the earliest time:
+  the digest can go first.
+- `headRefusal` is why the head of the tab's queue last waited, as one fixed word: `coordinator-window`,
+  `composer-not-ready` (every composer readiness refusal), `held` or `other`.
+- `at` stamps the snapshot. Nothing decides on it, because the dispatcher can drain the queue a second later.
+- The send answer, `note show` and `note list --from-me` carry it, read at call time. A plain `note list` does not.
+
+**2. A foreign viewer reads fixed words.** Before this amendment, `receipt.notice.lastRefusal` and `heldReason` went
+raw to any viewer, and a raw refusal can carry another workspace's pane state or an error text. With the flag on, a
+viewer outside the notice's target workspace reads `lastRefusal` as one of the words above and `heldReason` as
+`held`. The admin token and a human session see every inbox already, so they read the raw strings. The view carries
+counts, times, server enums and fixed words only: no other note id, subject, kind or raw refusal.
+
+**3. The view never fails the answer.** If the inbox cannot be read, the receipt carries `queueUnavailable:
+"inbox-unreadable"` in place of `queue`; if a later read (the window, the tab state) throws, `"view-unreadable"`.
+The send succeeds in both cases. A flag read that fails reads as off.
+
+**4. The sender is told at once, by the send itself.** After a send, the CLI prints one stderr line when `ahead` is
+above 0, the target reads `busy`, or the window is closed:
+`note n-… waits at ws-…/tab-…: 4 ahead, oldest since 22:11Z, window opens 23:02Z at the earliest, target busy`.
+It prints nothing when the line is likely to be typed at once. The line is the send's own answer, never an inbox
+notice: a notice to a coordinator sender would wait behind that sender's own window. The `undelivered` notice at
+15 min (5 min for an owner item) and the `bounced` notice stay as the backstops.
+
+Rejected: an inbox notice to the sender at queue time (it adds wakes and waits behind the sender's own window), and an
+earlier `undelivered` notice (still a wake, still late).
+
+## Amendment: the recipient line can end with the list command (2026-11-17, NR-2', train A1)
+The same design check proposed a "window drain" that typed every waiting note id in one line. The consult rejected it
+(ruling E): each note preflight holds the notes lock until the inbox records the outcome, so a second preflight in the
+same attempt waits for ever under the dispatch lock and stops the tick for every tab. The approved change is in the
+template only.
+- While fleet config `notes.list-hint.<wsId>` is on for the recipient's workspace, the `delivered` and `reminder`
+  lines end `— run purplemux note list --open --to-me, then ack each` in place of `— purplemux note show n-…, then
+  purplemux note ack n-…`. The id, the sender words and the time stay; the line still carries no caller text
+  (ADR-0012).
+- The flag is read when the notice is queued, so a notice queued before a change keeps its line.
+- The window still gives one wake per 10 min, and at that wake the coordinator reads every waiting note. That is how a
+  coordinator already cleared bursts (23 of 25 notes on 15 Nov were acked without their line typed).
+- No other line changes: the sender's `unacked`, `undelivered`, `expired` and `bounced` lines and every pointer line
+  are as before. No dispatcher change.

@@ -168,7 +168,9 @@ One host-wide register of held resources (ADR-0011). A name is \`<kind>:<resourc
 case: \`merge:<owner>/<repo>\`, \`dev-deploy:<owner>/<repo>\`, \`dev-write:<env>\`,
 \`deploy:<service>\` (admin token or the workspace's enabled orchestrator tab only),
 \`epic:<slug>\` (no expiry by default, \`none\` allowed, at most 7 d), \`num:<owner>/<repo>:<adr|migration>:<nnnn>\` (requires an
-epic; survives the tab), or any other kind (30 m default, 24 h max). A lease dies with its tab,
+epic; survives the tab), \`held:<host>/browser-9333\` or \`held:<host>/gate-<k>.<runid>\` (NR-5b: who holds the shared
+browser or one run's gate slot; 15 m, at most 15 m, renewed by its holder every 5 min; a record only, which nothing
+refuses on and the pool does not count), or any other kind (30 m default, 24 h max). A lease dies with its tab,
 by TTL, or 10 min after its agent goes inactive; \`num\` leases outlive the tab and end by TTL,
 release, release-epic or break.
 Any valid token may list and check; a mutation needs a tab (tab token, or PMUX_TOKEN plus
@@ -178,8 +180,9 @@ A lease view: { name, kind, resource, holder: { workspaceId, workspaceName, tabI
 verified, identity, admin }, epic, note, acquiredAt, renewedAt, expiresAt, ttlSeconds, survivesTab,
 ageSeconds, expiresInSeconds, holderState: live|agent-gone|closed|admin }.
 
-GET /api/cli/leases?prefix=&mine=1
-  Response: { "leases": [lease view, ...] }
+GET /api/cli/leases?prefix=&kind=&mine=1
+  Response: { "leases": [lease view, ...] }. "kind" is one exact kind, lower-cased (\`lease list --kind held\`);
+  a malformed kind is 400 lease-policy.
 
 GET /api/cli/leases/check?name=NAME
   Exact name only (a prefix would also match merge:x/y-z). 200 for any well-formed name
@@ -853,7 +856,9 @@ never falls back to a worker. When a note bounces (target-epic-unowned or target
 or later), the sender's live tab gets one line at once, "[purplemux note n-…] you sent it at <time>; it bounced
 (<reason>): …", and one line in its digest; the note waits for a recipient until it expires. The recipient's tab
 receives only the inbox's fixed line "[purplemux note n-…] from <ws>/<tab> at <time> — purplemux note
-show n-…, then purplemux note ack n-…" (from "owner (<ws>/<tab>)" for an owner note); the subject and
+show n-…, then purplemux note ack n-…" (from "owner (<ws>/<tab>)" for an owner note); while fleet config
+notes.list-hint.<recipient workspace id> is on (NR-2'), that line and the reminder end "— run purplemux note list
+--open --to-me, then ack each" instead, read when the notice is queued. The subject and
 body are never typed. Every note view carries fromLabel, the same server-made words after "from". If that tab closes
 before the line is delivered, the note re-routes. One reminder reaches the recipient 30 min after
 the line reached its composer, and one notice reaches the sender's tab (if live): at 15 min (an owner item: 5 min)
@@ -889,6 +894,23 @@ note's receipt: routing status/reason, authorized sender/recipient, and its own 
 last refusal, held reason, and composer delivery time. It never includes the recipient's inbox.
 Queued notices are revalidated immediately before paste; terminal, legacy-policy-blocked, or stale
 recipient notices are dropped.
+
+With fleet config notes.send-queue-receipt on (NR-1, ADR-0013 amendment), the receipt in the send answer,
+note show and note list --from-me also carries, while the notice waits to be typed:
+  "queue": { "at", "targetWorkspaceId", "targetTabId", "targetCliState", "ahead", "oldestAheadSince",
+    "windowOpensAt", "headRefusal" }
+"ahead" counts the queued notices and recoverable holds the inbox types before this one at that tab, and
+"oldestAheadSince" is the oldest of them (null when none). "windowOpensAt" is set only while the
+coordinator window governs the target and is closed: the earliest time, never a promise (the digest may
+go first). "headRefusal" is why the head of the tab's queue last waited: coordinator-window,
+composer-not-ready, held, other, or null. "at" stamps the snapshot; nothing decides on it. When the inbox
+or the view cannot be read, "queueUnavailable": "inbox-unreadable" | "view-unreadable" comes in its place,
+and the send itself still succeeds. Under the same flag, a viewer outside the recipient workspace (not the
+admin token, not a human session) reads notice.lastRefusal as one of those words and notice.heldReason as
+"held". The CLI prints one stderr line after a send whose notice waits behind others, at a busy tab or a
+closed window:
+  note <id> waits at <ws>/<tab>: <n> ahead[, oldest since HH:MMZ][, window opens HH:MMZ at the earliest][, target busy]
+and nothing otherwise.
 
 POST /api/cli/notes
   Any resolved caller. Body: { "toEpic"? , "toWorkspace"? (exactly one), "subject" (≤ 120, control
@@ -1264,6 +1286,17 @@ Keys in use:
                or unset, is on. alerts.flag-repeat-minutes, 1..10080 (default 60, decimals allowed),
                is the least time between two alerts for one flag. Admin token only (exit 3
                forbidden for a tab): they decide what reaches the owner's phone.
+  notes.send-queue-receipt
+               on, or unset (off). On, a note's receipt in the send answer, note show and note list
+               --from-me carries "queue" (NR-1, ADR-0013 amendment), and a viewer outside the
+               recipient workspace reads the notice's refusal and hold as fixed words. Read on each
+               call. Written by the admin token or an enabled orchestrator (ADR-0019).
+  notes.list-hint.<workspaceId>
+               on, or unset (off). On, the delivered and reminder note lines to a tab of that
+               workspace end "— run purplemux note list --open --to-me, then ack each" in place of
+               the note's own show and ack commands (NR-2'): one wake reads every waiting note. Read
+               when the notice is queued, so a notice queued earlier keeps its line. Written by the
+               admin token or an enabled orchestrator (ADR-0019).
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }

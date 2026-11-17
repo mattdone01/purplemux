@@ -157,6 +157,29 @@ describe('lease store', () => {
     await expect(renewLease('merge:x/y', 9 * 3600, tabA, authority)).rejects.toMatchObject({ code: 'lease-policy' });
   });
 
+  it('NR-5b: a held record lasts 15 min, is renewed by its holder only, never past 15 min, and ends with its tab', async () => {
+    const { acquireLease, renewLease, releaseTabLeases, findLease } = await store();
+    const name = 'held:host-a/gate-2.run-0700a';
+    const taken = await acquireLease({ name, note: 'acme/acme-ledger-api' }, tabA, authority);
+    expect(taken).toMatchObject({ outcome: 'acquired', lease: { kind: 'held', ttlSeconds: 900, survivesTab: false } });
+    expect(Date.parse(taken.lease.expiresAt!)).toBe(now + 900_000);
+    now += 5 * 60_000;
+    const renewed = await renewLease(name, undefined, tabA, authority);
+    expect(Date.parse(renewed.expiresAt!)).toBe(now + 900_000);
+    await expect(renewLease(name, undefined, tabB, authority)).rejects.toMatchObject({ code: 'lease-held-by-other' });
+    await expect(renewLease(name, 16 * 60, tabA, authority)).rejects.toMatchObject({ code: 'lease-policy' });
+    await expect(acquireLease({ name: 'held:host-a/gate-2.run-0705b', ttlSeconds: null }, tabA, authority)).rejects.toMatchObject({ code: 'lease-policy' });
+    // A second run on the same slot has its own name, so a record a killed run left never blocks it.
+    await acquireLease({ name: 'held:host-a/gate-2.run-0710c' }, tabB, authority);
+    // Its holder's tab closes: the record goes with it.
+    expect((await releaseTabLeases('tab-a', 'holder-tab-closed')).map((l) => l.name)).toEqual([name]);
+    expect(await findLease(name)).toBeNull();
+    // Not renewed: the record expires within 15 min.
+    now += 15 * 60_000;
+    expect(await findLease('held:host-a/gate-2.run-0710c', now - 1)).not.toBeNull();
+    expect(await findLease('held:host-a/gate-2.run-0710c', now)).toBeNull();
+  });
+
   it('finds by exact name only', async () => {
     const { acquireLease, findLease } = await store();
     await acquireLease({ name: 'merge:x/y' }, tabA, authority);

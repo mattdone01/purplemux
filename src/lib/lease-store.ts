@@ -4,7 +4,7 @@ import path from 'path';
 import { createLogger } from '@/lib/logger';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
 import { BREAK_REASON_MAX, actionReason, codePoints } from '@/lib/human-actions';
-import { LeasePolicyError, parseLeaseName, policyFor, resolveEpic, resolveNote, resolveTtl } from '@/lib/lease-policy';
+import { LeasePolicyError, parseLeaseKind, parseLeaseName, policyFor, resolveEpic, resolveNote, resolveTtl } from '@/lib/lease-policy';
 import type { ICaller } from '@/lib/caller';
 import type {
   ILease,
@@ -611,8 +611,6 @@ export const breakLease = async (
   return lease.value!;
 };
 
-const KIND = /^[a-z][a-z0-9-]{1,31}$/;
-
 /**
  * Release an epic's survives-tab claims. The `epic:<slug>` holder and admin
  * release all of them; a tab of a workspace holding claims releases only its
@@ -627,11 +625,7 @@ export const releaseEpicClaims = async (
   requireHolder(holder);
   const epic = resolveEpic('epic', rawEpic);
   if (!epic) throw new LeasePolicyError('release-epic needs an epic slug');
-  let kind: string | undefined;
-  if (rawKind !== undefined && rawKind !== null && rawKind !== '') {
-    kind = typeof rawKind === 'string' ? rawKind.trim().toLowerCase() : '';
-    if (!KIND.test(kind)) throw new LeasePolicyError(`kind "${String(rawKind)}" does not match ${KIND.source}`);
-  }
+  const kind = rawKind !== undefined && rawKind !== null && rawKind !== '' ? parseLeaseKind(rawKind) : undefined;
   const released = await transact(authority.now(), (state) => {
     const claims = epicClaims(state, epic, kind);
     if (claims.length === 0) return null;

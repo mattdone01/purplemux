@@ -36,6 +36,10 @@ export const LEASE_KINDS: Readonly<Record<string, IKindPolicy>> = Object.freeze(
   // A cancelled pool ask (vel-POOL-ENF): a late acquire with this ask token is refused while it lives; it holds no budget.
   'pool-cancel': { defaultTtlSeconds: 10 * MIN, maxTtlSeconds: 10 * MIN, survivesTab: false, requiresEpic: false, orchestratorOnly: false, resourcePattern: /^[a-z0-9][a-z0-9-]{15,63}$/, resourceForm: '<ask token: [a-z0-9][a-z0-9-]{15,63}>' },
   num: { defaultTtlSeconds: 14 * DAY, maxTtlSeconds: 30 * DAY, survivesTab: true, requiresEpic: true, orchestratorOnly: false, resourcePattern: /^[a-z0-9._-]+\/[a-z0-9._-]+:(adr|migration):[0-9]{1,6}$/, resourceForm: '<owner>/<repo>:<adr|migration>:<nnnn>' },
+  // NR-5b: who holds the shared browser or one run's gate slot. A record, not an admission: nothing refuses on it and
+  // the pool does not count it. A per-run gate name, because the store has no takeover and a slot record left by a
+  // killed run would block the next holder. The holder renews every 5 min, so a record past 15 min means it stopped.
+  held: { defaultTtlSeconds: 15 * MIN, maxTtlSeconds: 15 * MIN, survivesTab: false, requiresEpic: false, orchestratorOnly: false, resourcePattern: /^[a-z0-9._-]+\/(browser-9333|gate-[0-9]{1,3}\.[a-z0-9][a-z0-9_-]{0,63})$/, resourceForm: '<host>/browser-9333 or <host>/gate-<k>.<runid>' },
 });
 
 export const OTHER_KIND: IKindPolicy = Object.freeze({
@@ -43,6 +47,8 @@ export const OTHER_KIND: IKindPolicy = Object.freeze({
 });
 
 export const LEASE_NAME = /^[a-z][a-z0-9-]{1,31}:[a-z0-9._/@#:+-]{1,200}$/;
+/** The `<kind>` part of LEASE_NAME, on its own. */
+export const LEASE_KIND = /^[a-z][a-z0-9-]{1,31}$/;
 export const NOTE_MAX = 500;
 
 export const policyFor = (kind: string): IKindPolicy =>
@@ -73,6 +79,13 @@ export const parseLeaseName = (raw: unknown): IParsedLeaseName => {
     throw new LeasePolicyError(`${kind} lease resource "${resource}" must be ${policy.resourceForm}`);
   }
   return { name, kind, resource };
+};
+
+/** Lower-cases, then checks a kind on its own (`lease list --kind`, `release-epic --kind`). */
+export const parseLeaseKind = (raw: unknown): string => {
+  const kind = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!LEASE_KIND.test(kind)) throw new LeasePolicyError(`kind "${String(raw)}" does not match ${LEASE_KIND.source}`);
+  return kind;
 };
 
 const formatSeconds = (s: number): string =>

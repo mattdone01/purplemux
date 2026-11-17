@@ -31,6 +31,11 @@ vi.mock('@/lib/tmux', () => ({
   workspaceSessionName: (wsId: string, paneId: string, tabId: string) => `pt-${wsId}-${paneId}-${tabId}`,
 }));
 vi.mock('@/lib/sync-server', () => ({ broadcastSync: vi.fn() }));
+// NR-1 reads the recipient tab's CLI state; the real manager cannot load under the tmux mock above.
+const statuses = vi.hoisted(() => ({ value: {} as Record<string, { cliState: string }> }));
+vi.mock('@/lib/status-manager', () => ({
+  getStatusManager: () => ({ getAllForClient: () => statuses.value, routeTabEvent: async () => {} }),
+}));
 
 const ENTRY = path.resolve('bin/purplemux.js');
 const run = promisify(execFile);
@@ -103,6 +108,7 @@ describe('purplemux note — the installed CLI against the real note and lease r
   beforeEach(async () => {
     vi.resetModules();
     resetRouteGlobals();
+    statuses.value = {};
     mockHome.value = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-note-srv-'));
     cliHome = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-note-home-'));
     await writeFixture(mockHome.value, [
@@ -272,6 +278,45 @@ describe('purplemux note — the installed CLI against the real note and lease r
     expect(r.code).toBe(2);
     expect(r.stderr).toContain('16 KiB');
     expect(await inboxLines()).toEqual([]);
+  });
+
+  const setFlag = async (key: string) => {
+    const at = new Date().toISOString();
+    await fs.writeFile(path.join(mockHome.value, '.purplemux', 'fleet-config.json'), JSON.stringify({
+      values: { [key]: { value: 'on', version: 1, setBy: { workspaceId: null, tabId: null, admin: true }, setAt: at } },
+      versions: { [key]: 1 },
+      history: [],
+    }));
+  };
+
+  it('NR-1: with notes.send-queue-receipt on, a send that waits behind another notice prints one stderr line', async () => {
+    await setFlag('notes.send-queue-receipt');
+    const first = await cli(['note', 'send', '--to-workspace', 'ws-a', '--subject', 'first', '-f', bodyFile], tabC);
+    expect(first.code, first.stderr).toBe(0);
+    // The first note waits behind nothing: no line.
+    expect(first.stderr).toBe('');
+    expect(JSON.parse(first.stdout).note.receipt.queue).toMatchObject({ targetWorkspaceId: 'ws-a', targetTabId: 'tab-a', ahead: 0 });
+
+    const second = await cli(['note', 'send', '--to-workspace', 'ws-a', '--subject', 'second', '-f', bodyFile], tabB);
+    expect(second.code, second.stderr).toBe(0);
+    const { note } = JSON.parse(second.stdout);
+    const since = note.receipt.queue.oldestAheadSince as number;
+    const clock = `${new Date(since).toISOString().slice(11, 16)}Z`;
+    expect(second.stderr).toBe(`note ${note.id} waits at ws-a/tab-a: 1 ahead, oldest since ${clock}\n`);
+
+    // Nothing ahead, but the target reads busy: the line says so.
+    statuses.value = { 'tab-c': { cliState: 'busy' } };
+    const busy = await cli(['note', 'send', '--to-workspace', 'ws-c', '--subject', 'third', '-f', bodyFile], tabB);
+    expect(busy.code, busy.stderr).toBe(0);
+    expect(busy.stderr).toBe(`note ${JSON.parse(busy.stdout).note.id} waits at ws-c/tab-c: 0 ahead, target busy\n`);
+  });
+
+  it('NR-1: with the flag off, a send that waits prints nothing and its answer has no queue', async () => {
+    await cli(['note', 'send', '--to-workspace', 'ws-a', '--subject', 'first', '-f', bodyFile], tabC);
+    const second = await cli(['note', 'send', '--to-workspace', 'ws-a', '--subject', 'second', '-f', bodyFile], tabB);
+    expect(second.code, second.stderr).toBe(0);
+    expect(second.stderr).toBe('');
+    expect(JSON.parse(second.stdout).note.receipt).not.toHaveProperty('queue');
   });
 
   it('exit 3 for --from-epic the sender does not hold; exit 2 without exactly one target', async () => {
