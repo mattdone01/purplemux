@@ -13,6 +13,7 @@ import { ensureWorkspaceClaudeHome, workspaceDirectories, workspaceIdFromSession
 import { nearestWorkspaceDirectory } from '@/lib/workspace-trust';
 import { getWorkspaceToken } from '@/lib/workspace-token';
 import { ensureTabToken, type ITabIdentity } from '@/lib/tab-token';
+import { ghShimPaneEnv } from '@/lib/gh-shim';
 import { createLogger } from '@/lib/logger';
 import { isLinux } from '@/lib/platform';
 import { getProcessArgs, readProcChildren, type TStrictRuntimeObservation } from '@/lib/process-utils';
@@ -149,17 +150,20 @@ const workspaceEnv = async (sessionName: string, identity?: ITabIdentity, cwd?: 
  * cannot answer yet. A failure here costs the tab its verified identity, not
  * its workspace scope: the CLI falls back to `PMUX_TOKEN`.
  */
-const tabEnv = async (sessionName: string, identity?: ITabIdentity): Promise<Record<string, string>> => {
-  if (!identity) return {};
+export const tabEnv = async (sessionName: string, identity?: ITabIdentity): Promise<Record<string, string>> => {
+  // The gh shim first on a local pane's PATH, over the login floor.
+  const shim = ghShimPaneEnv();
+  if (!identity) return shim;
   try {
     return {
+      ...shim,
       PMUX_TAB_TOKEN: await ensureTabToken(identity, sessionName),
       PMUX_TAB_ID: identity.tabId,
       PMUX_WORKSPACE_ID: identity.workspaceId,
     };
   } catch (err) {
     log.error(`tab token for ${identity.tabId} failed, launching without tab identity: ${err instanceof Error ? err.message : err}`);
-    return {};
+    return shim;
   }
 };
 

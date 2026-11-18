@@ -24,6 +24,7 @@ import { startPortfolioRuntime, stopPortfolioRuntime } from './src/lib/portfolio
 import { startSpend, stopSpend } from './src/lib/spend/spend-service';
 import { startConstraintFinder, stopConstraintFinder } from './src/lib/constraint-tick';
 import { startFlagAlerts, stopFlagAlerts } from './src/lib/flag-alerts';
+import { startGithubUsage, stopGithubUsage } from './src/lib/github-usage-service';
 import { startLedgerRetention, stopLedgerRetention } from './src/lib/ledger-retention';
 import { startPoolPoller, stopPoolPoller } from './src/lib/pool-read';
 import { startCurator, stopCurator } from './src/lib/curator-service';
@@ -123,6 +124,7 @@ const shutdownWs = async () => {
   await stopAutoAnswerTick();
   await stopInbox();
   await stopFlagAlerts();
+  await stopGithubUsage();
   await stopConstraintFinder();
   await getMissionControlRuntime().stop();
   await stopSpend();
@@ -395,6 +397,8 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   registerLockCleanup();
 
   await Promise.all([initConfigStore(), initShellPath()]);
+  // Before any tab or agent launch: the gh shim and the 5-minute quota read.
+  await startGithubUsage();
 
   const credentials = await initAuthCredentials();
   if (credentials) {

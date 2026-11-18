@@ -25,6 +25,7 @@ const CLI_COMMANDS = new Set([
   'owner',
   'lease',
   'pool',
+  'github',
   'curator',
   'inbox',
   'note',

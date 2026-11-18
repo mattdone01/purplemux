@@ -2010,6 +2010,60 @@ const printPool = (view) => {
   if (tp) process.stdout.write(`plain creates: ${tp.advised} advised, ${tp.placedRemote} placed remote, ${tp.here} here (${tp.hereAtNoRoom} at no room)\n`);
 };
 
+const GITHUB_USAGE = 'usage: purplemux github usage [--json]';
+
+const githubReset = (reset) => new Date(reset * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+const githubRate = (w) => `${w.remaining}/${w.limit} (${Math.floor((w.remaining / w.limit) * 100)}%)`;
+
+const githubAccountRow = (a) => {
+  if (a.state === 'read') return [a.login, a.role, githubRate(a.core), githubReset(a.core.reset), githubRate(a.graphql), githubReset(a.graphql.reset)];
+  const text = a.state === 'unknown' ? `unknown (${a.reason})` : a.reason;
+  return [a.login, a.role, text, '', '', ''];
+};
+
+const githubOwnerRow = (o) => [
+  o.tabName ? `${o.tabName} (${o.tabId})` : o.tabId,
+  o.workspaceName || o.workspaceId,
+  o.source,
+  String(o.rest),
+  String(o.graphql),
+  o.top.map((t) => `${t.command} ${t.count}`).join(', '),
+];
+
+const printGithubUsage = (view) => {
+  const quota = view.quotaReadAt ? `quota read ${view.quotaReadAt}` : 'quota not read yet';
+  process.stdout.write(`github usage at ${view.at} (${quota})\n`);
+  if (view.accounts.length) {
+    writeTable([['ACCOUNT', 'ROLE', 'REST', 'REST RESET', 'GRAPHQL', 'GRAPHQL RESET'], ...view.accounts.map(githubAccountRow)]);
+  } else {
+    process.stdout.write('no account read yet\n');
+  }
+  if (view.quotaError) process.stdout.write(`note: ${view.quotaError}\n`);
+  for (const w of view.windows) {
+    process.stdout.write(`\nlast ${w.window}: ${w.total} calls (${w.rest} REST, ${w.graphql} GraphQL)\n`);
+    if (!w.owners.length) {
+      process.stdout.write('  no calls counted\n');
+      continue;
+    }
+    writeTable([['TAB', 'WORKSPACE', 'SOURCE', 'REST', 'GRAPHQL', 'TOP SUBCOMMANDS'], ...w.owners.map(githubOwnerRow)]);
+    if (w.ownersOmitted) process.stdout.write(`  (${w.ownersOmitted} more owners, counted in the totals)\n`);
+  }
+  process.stdout.write('\n');
+  for (const line of view.footer) process.stdout.write(`note: ${line}\n`);
+};
+
+// The GitHub quota per account and who spent the calls (server watches and the tabs' gh shim).
+const cmdGithub = async (args) => {
+  if (args[0] !== 'usage') die(GITHUB_USAGE);
+  const positional = stripBooleanFlags(args.slice(1), ['--json']);
+  if (positional.length) die(`unexpected argument: ${positional[0]} — ${GITHUB_USAGE}`);
+  requireEnv();
+  const { body } = await api('GET', '/api/cli/github-usage');
+  if (args.includes('--json')) return out(body);
+  return printGithubUsage(body);
+};
+
 const cmdPool = async (args) => {
   const sub = args[0];
   const rest = args.slice(1);
@@ -3937,6 +3991,14 @@ Commands:
                                            text; a re-send keeps its first id; a tab reads its own workspace's
   curator message -w WS ID [--json]        One owner message by its history id (a standing-order candidate
                                            names the id, never the text); a tab reads its own workspace's
+  github usage [--json]                    The GitHub quota per account and who spent the calls:
+                                           per account the REST (core) and GraphQL remaining, limit and reset,
+                                           read every 5 min for the fleet config github.agentAccounts only (any
+                                           other account: "not read (owner account)"); then the top owners of
+                                           the last 1 h and 24 h: tab, workspace, source (server: a watch; tab:
+                                           the gh shim on a local tab's PATH), REST and GraphQL calls and the top
+                                           3 subcommands; "-" is a call with no tab. The notes say when the
+                                           server ledger started and what is not counted
   pool show [--json]                       The compute pool (ADR-0039): per host threads, load, free memory, disk,
                                            GPU, kind counts, the one budget (workers, harness share, control-plane
                                            reserve) and the queue; an unknown host shows no figures, never 0.
@@ -4166,6 +4228,8 @@ const main = async () => {
       return cmdLease(args.slice(1));
     case 'pool':
       return cmdPool(args.slice(1));
+    case 'github':
+      return cmdGithub(args.slice(1));
     case 'curator':
       return cmdCurator(args.slice(1));
     case 'mission':

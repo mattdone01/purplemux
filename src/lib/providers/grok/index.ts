@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { isValidGrokEffort } from '@/lib/agent-effort';
 import { isValidModelName } from '@/lib/claude-command-shared';
+import { ghShimLaunchPrefix } from '@/lib/gh-shim';
 import { getDangerouslySkipPermissions } from '@/lib/config-store';
 import { GROK_BIN_PATH, grokSessionIdFromJsonlPath } from '@/lib/providers/grok/paths';
 import { checkGrokLogin, runGrokPreflight } from '@/lib/providers/grok/preflight';
@@ -81,7 +82,7 @@ export const composeGrokLaunchCommand = async (
   }
   if (resumeSessionId) parts.push('--resume', shellSingleQuote(resumeSessionId));
   else parts.push('--session-id', shellSingleQuote(randomUUID()));
-  return parts.join(' ');
+  return `${ghShimLaunchPrefix()}${parts.join(' ')}`;
 };
 
 const grokAgentPreflight = async (): Promise<IAgentPreflight> => {

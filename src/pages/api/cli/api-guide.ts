@@ -354,6 +354,41 @@ POST /api/cli/pool/release   Body: { "lease": "pool:<host>/<kind>-<n>" | "pool-q
   never by name. A lease view and a log show a token as its first 8 characters only.
   Response: { "released": [lease names], "cancelled": "<T>" }
 
+GET /api/cli/github-usage   (any valid scope)
+  \`purplemux github usage [--json]\`. Response: { "at", "coverage": [{ "login", "since", "counted",
+  "spent" }] per read agent account, "quotaReadAt": null | ISO,
+  "quotaError": null | text, "accounts": [{ "login", "role": "agent"|"owner"|"unset", "state":
+  "read"|"unknown"|"not-read", "core"/"graphql": { "remaining", "limit", "reset" (epoch s) } when read,
+  "reason" otherwise }], "windows": [{ "window": "1h"|"24h", "total", "rest", "graphql", "owners": [{
+  "source": "server"|"tab", "workspaceId", "workspaceName", "tabId", "tabName", "rest", "graphql",
+  "total", "top": [{ "command", "count" }] }] (top 10 by calls), "ownersOmitted" }],
+  "serverLedgerStartedAt", "tabLog": { "dir", "shimInstalled", "shimReason", "error", "skippedLines" },
+  "footer": [text] }. A rate_limit answer that does not parse is "unknown", never full.
+  Sources: "server" is the server's own gh calls (watches and the quota read), in memory since
+  serverLedgerStartedAt. "tab" is the gh shim: at start the server writes
+  ~/.local/share/purplemux/bin/gh (0755, directory 0700) with the real gh pinned by its absolute path
+  (no real gh on PATH: no shim, no PATH change). A local pane gets that directory first on PATH, and
+  every local claude, grok and codex launch starts through its pmux-gh-path wrapper, so the shim is
+  first after the shell rc too; the wrapper also sets BASH_ENV to bin/bash-env, which puts the shim
+  first again in an agent's bash tool shell, a login bash -lc included (an earlier BASH_ENV runs
+  first). Each call appends "<epoch> <tab> <ws> <w1> <w2>" to
+  \${XDG_STATE_HOME:-~/.local/state}/purplemux/gh-calls/<UTC YYYYMMDD>.log (0600): for gh api the kind
+  (rest|graphql) only, never the path; another word outside the allow-list is "?". The server reads
+  the last 2 days and removes older files. Not counted: a script that resets PATH, gh run by an
+  absolute path, a claude tab the web UI started (its command is built in the browser), an agent tool
+  shell that is not bash and whose rc puts another gh first, remote tabs, a gh process outside a tab
+  (a systemd unit, a cron job), and another host on the same account. A long poll (gh run watch,
+  gh pr checks --watch) is one line but spends one call per poll. "-" is a call with no tab. A caller
+  that cannot read a workspace sees its owners as "other".
+  Coverage: per read agent account, the REST calls counted from the start of its core window (one
+  hour before the reset) against the quota it spent (limit - remaining). The calls carry no account,
+  so "counted" holds every account's calls. Below half of "spent", the footer and the alert say most
+  calls are not counted: do not name a tab as the cause from the owner list alone.
+  Below 20 % of an agent account's core limit before its reset, one line per account per reset window
+  goes to the portfolio Scrum Master seat (kind flag, rule github-quota-low) with the coverage and the
+  top 3 counted owners of the last hour by REST calls; with no seat it is logged and tried again at the
+  next read.
+
 The engineering gate's keys map onto the pool (migration, ADR-0039 §6; gate.sh and remote-gate.sh
 do not change until they read the pool, and every key keeps working until then):
   gate.route=remote           gate.sh asks \`pool acquire --kind gate\` for a repository in
@@ -1329,6 +1364,14 @@ Keys in use:
                the note's own show and ack commands (NR-2'): one wake reads every waiting note. Read
                when the notice is queued, so a notice queued earlier keeps its line. Written by the
                admin token or an enabled orchestrator (ADR-0019).
+  github.agentAccounts
+               The GitHub logins, comma-separated, whose quota the server reads every 5 minutes:
+               \`gh api rate_limit\` with GH_TOKEN from \`gh auth token --user <login>\`
+               in the child env, never logged. Any other account \`gh auth status\` lists shows as "not
+               read (owner account)" and its token is never read; unset: every account shows "not read
+               (set github.agentAccounts)". The account list comes from \`gh auth status\`, which checks
+               each stored token with one GitHub call, so the server runs it at most once an hour. A
+               malformed login is dropped. Admin token only: a tab must not add the owner's account.
 
 GET /api/cli/fleet-config
   Any valid scope. Response: { "values": { "<key>": { "value", "version", "setAt", "setBy": { "workspaceId", "tabId", "admin" } } } }

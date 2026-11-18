@@ -68,10 +68,11 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
 /**
  * The admin token only: keys that decide where tabs run and where their tokens
  * are sent (ADR-0022), and fleet-wide keys any one workspace's orchestrator must
- * not set for every other workspace (ADR-0027 ruling R2). `standup.` stays here: since F6 no such key is read,
+ * not set for every other workspace (ADR-0027 ruling R2). `github.` names the accounts whose token the server reads:
+ * a tab must not add the owner's. `standup.` stays here: since F6 no such key is read,
  * and every write of one is refused.
  */
-export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end|ledger\.chain-holds)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end|ledger\.chain-holds|github)\./;
 
 const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|mutation|browser|test-service|tab)$/;
 
