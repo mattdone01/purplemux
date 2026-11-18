@@ -581,8 +581,10 @@ POST /api/cli/tabs/orphans   Body: { "reap": true, "host"?: "local" | H }
   GET lists, for any caller. POST reaps the first two kinds only, from a workspace token (the global
   token gets 403 forbidden): an unowned-tab process, or a duplicate agent of a workspace the caller
   may mutate (else refused "forbidden"). Refused: every target on a host whose pane tree could not be
-  read whole, a tmux failure or timeout, an unreadable process table, the walk's bound, or a process
-  under the tmux server that no pane holds ("tree-unreadable"; the scan's "tree" says why, and the
+  read whole: a tmux failure or timeout (only tmux's own "no server" is absence, and only while no
+  tmux process of the user still names the socket: "socket gone, server alive"), an unreadable
+  process table, the walk's bound, or a process under the tmux server that no pane holds
+  ("tree-unreadable"; the scan's "tree" says why, and the
   local reap reads the tree again before it signals); a process a live pane holds
   ("held-by-session"); one younger than 60 s ("too-young"); an unowned-tab process while any
   workspace's layout file is missing ("layout-missing"); a protected pid ("protected"); one whose

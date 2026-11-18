@@ -251,8 +251,24 @@ describe.skipIf(!supported)('remote orphan scripts fail closed when the pane tre
   it('a tmux error: the scan says the tree is unreadable, and the reap refuses every target', async () => {
     const env = fakeTmux("echo 'server exited unexpectedly' >&2; exit 1");
     expect(factsOf(await runScript(REMOTE_ORPHAN_SCAN_SCRIPT, ['sock', 'http://origin-test:1'], { env })).tree)
-      .toEqual({ complete: false, reason: 'tmux failed' });
+      .toEqual({ complete: false, reason: 'tmux failed: server exited unexpectedly' });
     await reapRefuses(REMOTE_ORPHAN_REAP_SCRIPT, env);
+  });
+
+  it.each([
+    'Permission denied',
+    'Too many open files',
+    'Resource temporarily unavailable',
+  ])('a connect error that is not absence (%s): the tree is unreadable with the reason, and the seat survives the reap', async (error) => {
+    const env = fakeTmux(`echo 'error connecting to /tmp/tmux-1000/sock (${error})' >&2; exit 1`);
+    expect(factsOf(await runScript(REMOTE_ORPHAN_SCAN_SCRIPT, ['sock', 'http://origin-test:1'], { env })).tree)
+      .toEqual({ complete: false, reason: `tmux failed: error connecting to /tmp/tmux-1000/sock (${error})` });
+    await reapRefuses(REMOTE_ORPHAN_REAP_SCRIPT, env);
+  });
+
+  it('a connect error naming a missing socket is absence, as tmux\'s own "no server" is', async () => {
+    const env = fakeTmux("echo 'error connecting to /tmp/tmux-1000/sock (No such file or directory)' >&2; exit 1");
+    expect(factsOf(await runScript(REMOTE_ORPHAN_SCAN_SCRIPT, ['sock', 'http://origin-test:1'], { env })).tree).toEqual({ complete: true });
   });
 
   it('tmux\'s own "no server running" is a complete, empty tree', async () => {
@@ -302,6 +318,38 @@ describe.skipIf(!supported)('remote orphan scripts fail closed when the pane tre
     } finally {
       await run('tmux', ['-L', sock, 'kill-server']).catch(() => {});
     }
+  });
+
+  it('a socket file deleted under a live server: "no server" is refused, the tree is unreadable, and the seat survives', async () => {
+    const sock = `pmux-orphgone-${process.pid}-${randomBytes(3).toString('hex')}`;
+    let server = 0;
+    try {
+      await run('tmux', ['-L', sock, '-f', '/dev/null', 'new-session', '-d', '-s', 'pt-ws-test1-pane-p1-tab-aaaa', '-x', '80', '-y', '24', `bash -c '${AGENT_LOOP}'`]);
+      server = Number((await run('tmux', ['-L', sock, 'display-message', '-p', '#{pid}'])).stdout.trim());
+      const pane = Number((await run('tmux', ['-L', sock, 'display-message', '-p', '-t', '=pt-ws-test1-pane-p1-tab-aaaa:', '#{pane_pid}'])).stdout.trim());
+      const socketPath = (await run('tmux', ['-L', sock, 'display-message', '-p', '#{socket_path}'])).stdout.trim();
+      fs.rmSync(socketPath);
+      const facts = factsOf(await runScript(REMOTE_ORPHAN_SCAN_SCRIPT, [sock, 'http://origin-test:1']));
+      expect(facts.tree).toEqual({ complete: false, reason: `socket gone, server alive (pid ${server})` });
+      const reap = parseRemoteOrphanReap(await runScript(REMOTE_ORPHAN_REAP_SCRIPT, [sock, `${pane}:${startOf(pane)}`]));
+      expect(reap).toEqual({ killed: [], survivors: [], refused: [{ pid: pane, refusal: 'tree-unreadable' }] });
+      expect(isAlive(pane)).toBe(true);
+    } finally {
+      if (server) try { process.kill(server, 'SIGKILL'); } catch { /* gone */ }
+    }
+  });
+
+  it('a socket gone with no server left: the normal no-server path, an empty tree, and the list still works', async () => {
+    const sock = `pmux-orphnone-${process.pid}-${randomBytes(3).toString('hex')}`;
+    const url = `http://origin-test-${randomBytes(3).toString('hex')}:1`;
+    const child = spawn('bash', ['-c', AGENT_LOOP], { detached: true, stdio: 'ignore', env: { ...CLEAN_ENV, PMUX_URL: url } });
+    children.push(child);
+    await vi.waitFor(() => expect(fs.readFileSync(`/proc/${child.pid}/cmdline`, 'utf-8').split('\0')[0]).toBe('claude'), { timeout: 5_000, interval: 50 });
+    const facts = factsOf(await runScript(REMOTE_ORPHAN_SCAN_SCRIPT, [sock, url]));
+    expect(facts.tree).toEqual({ complete: true });
+    expect(facts.sessions).toEqual([]);
+    expect(classifyOrphans('host-a', facts, { tabs: new Map() }).map((e) => (e.kind === 'unowned-session' ? e.kind : `${e.kind}:${e.process.pid}`)))
+      .toEqual([`unmarked-agent:${child.pid}`]);
   });
 
   it('a host without /proc answers unavailable, never ok with no orphans', async () => {

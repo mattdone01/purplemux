@@ -1,6 +1,7 @@
 import { execFile as execFileCb } from 'child_process';
 import fs from 'fs/promises';
 import { promisify } from 'util';
+import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
@@ -18,7 +19,7 @@ import { getProcessArgs, readProcChildren, type TStrictRuntimeObservation } from
 import { PASTE_END, PASTE_START, TYPED_CHUNK_GAP_MS, planTypedInput } from '@/lib/typed-input';
 import { defaultReaperDeps, reapTabForClose, type IReapResult } from '@/lib/tab-reaper';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
-import type { IOrphanHostFacts, IPaneRoot, TLocalTreeRead } from '@/lib/tab-orphans';
+import { defaultOrphanScanDeps, liveTmuxProcesses, type IOrphanHostFacts, type IPaneRoot, type TLocalTreeRead } from '@/lib/tab-orphans';
 import {
   REMOTE_SESSION_EXISTS_EXIT,
   RemoteHostError,
@@ -625,18 +626,38 @@ const readTmux = async (exec: TTmuxExec, args: string[]): Promise<TTmuxRead> => 
   }
 };
 
+/** The socket a tmux started with `-L purple` uses when no server answers to say where it is. */
+const defaultLocalSocketPath = (): string => path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${os.userInfo().uid}`, TMUX_SOCKET);
+
+/** This user's tmux processes that name the local socket, read from /proc; null when it cannot be read. */
+const liveLocalTmux = async (): Promise<number[] | null> => {
+  if (!isLinux) return null;
+  const deps = defaultOrphanScanDeps(defaultReaperDeps({ descendants: getDescendantPids, tmuxServerPid: async () => null }));
+  return liveTmuxProcesses(deps, TMUX_SOCKET, defaultLocalSocketPath());
+};
+
 /**
- * This server's tmux server pid and every pane root, read for the orphan sweep. tmux's own "no server" is a known
- * empty tree; any other failure or a timeout is `unreadable`, never an empty list (it would leave every live seat
- * unheld, and reapable).
+ * This server's tmux server pid and every pane root, read for the orphan sweep. "No server" is tmux's own answer
+ * (`TMUX_ABSENCE`) AND no tmux process of this user still naming the socket: a socket file deleted under a live
+ * server reads as "no server" while its seats run. Any other failure, a timeout, or a live server behind a missing
+ * socket is `unreadable`, never an empty list (it would leave every live seat unheld, and reapable).
  */
-export const readLocalTree = async (exec: TTmuxExec = tmuxExec): Promise<TLocalTreeRead> => {
+export const readLocalTree = async (
+  exec: TTmuxExec = tmuxExec,
+  liveTmux: () => Promise<number[] | null> = liveLocalTmux,
+): Promise<TLocalTreeRead> => {
+  const noServer = async (): Promise<TLocalTreeRead> => {
+    const live = await liveTmux();
+    if (live === null) return { readable: false, reason: 'no tmux server answered, and the process table cannot be read to prove none runs' };
+    if (live.length > 0) return { readable: false, reason: `socket gone, server alive (pid ${live.join(' ')})` };
+    return { readable: true, serverPid: null, panes: [] };
+  };
   const server = await readTmux(exec, ['display-message', '-p', '#{pid}']);
-  if (!server.ok) return server.absent ? { readable: true, serverPid: null, panes: [] } : { readable: false, reason: server.reason };
+  if (!server.ok) return server.absent ? noServer() : { readable: false, reason: server.reason };
   const serverPid = Number(server.stdout.trim());
   if (!Number.isInteger(serverPid) || serverPid <= 1) return { readable: false, reason: 'tmux server pid unreadable' };
   const listed = await readTmux(exec, ['list-panes', '-a', '-F', '#{pane_pid} #{session_created} #{session_name}']);
-  if (!listed.ok) return listed.absent ? { readable: true, serverPid: null, panes: [] } : { readable: false, reason: listed.reason };
+  if (!listed.ok) return listed.absent ? noServer() : { readable: false, reason: listed.reason };
   const now = Date.now();
   const panes: IPaneRoot[] = [];
   for (const line of listed.stdout.split('\n')) {

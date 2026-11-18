@@ -326,6 +326,25 @@ describe('the reap fails closed when the pane tree is not read', () => {
     expect(alive.has(110)).toBe(true);
   });
 
+  it('a socket gone under a live server: the tree is unreadable and the seat agent survives the reap', async () => {
+    const { facts, outcomes, alive, signals } = await seatSurvives({ readable: false, reason: 'socket gone, server alive (pid 100)' });
+    expect(facts.tree).toEqual({ complete: false, reason: 'socket gone, server alive (pid 100)' });
+    expect(outcomes.find((o) => o.pid === 102)).toMatchObject({ outcome: 'refused', refusal: 'tree-unreadable' });
+    expect(alive.has(102)).toBe(true);
+    expect(signals).toEqual([]);
+  });
+
+  it('a socket gone with no server left: the no-server path, and the list still works', async () => {
+    const procs = fleet();
+    delete procs[100];
+    procs[101].ppid = 1;
+    const noServer: TLocalTreeRead = { readable: true, serverPid: null, panes: [] };
+    const { facts } = await collect(procs, {}, noServer);
+    expect(facts.tree).toEqual({ complete: true });
+    expect(facts.sessions).toEqual([]);
+    expect(kindsOf(classifyOrphans(null, facts, owned))).toEqual(expect.arrayContaining(['unowned-tab:111', 'unmarked-agent:112']));
+  });
+
   it('a process under the tmux server that no listed pane holds is refused: the pane list missed it', async () => {
     const tree: TLocalTreeRead = { readable: true, serverPid: 100, panes: [] };
     const { facts, outcomes, alive } = await seatSurvives(tree);

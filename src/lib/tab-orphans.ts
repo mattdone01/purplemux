@@ -226,6 +226,56 @@ export type TLocalTreeRead =
   | { readable: true; serverPid: number | null; panes: IPaneRoot[] }
   | { readable: false; reason: string };
 
+/**
+ * Whether a tmux command line names this socket: `-L <name>` or `-S <path>`, alone, joined (`-L<name>`) or behind
+ * other flags (`-uL <name>`), before the command. The options that take a value are tmux's own: c, f, L, S, T.
+ */
+export const usesTmuxSocket = (argv: readonly string[], name: string, path: string | null): boolean => {
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--' || !arg.startsWith('-') || arg.length < 2) return false;
+    for (let j = 1; j < arg.length; j += 1) {
+      const flag = arg[j];
+      if (!'cfLST'.includes(flag)) continue;
+      const value = j + 1 < arg.length ? arg.slice(j + 1) : argv[(i += 1)];
+      if ((flag === 'L' && value === name) || (flag === 'S' && path !== null && value === path)) return true;
+      break;
+    }
+  }
+  return false;
+};
+
+export interface ITmuxProcessDeps {
+  listPids: () => Promise<number[]>;
+  ownerUid: (pid: number) => Promise<number | null>;
+  comm: (pid: number) => Promise<string | null>;
+  /** Read for `comm` tmux processes only. */
+  argv: (pid: number) => Promise<string[] | null>;
+  uid: number;
+}
+
+/**
+ * The user's tmux processes that still name this socket: a server whose socket file is gone answers "no server"
+ * while its panes run. Null when the process table cannot be read. Only tmux processes have their argv read.
+ */
+export const liveTmuxProcesses = async (deps: ITmuxProcessDeps, name: string, path: string | null): Promise<number[] | null> => {
+  let pids: number[];
+  try {
+    pids = await deps.listPids();
+  } catch {
+    return null;
+  }
+  const found: number[] = [];
+  for (const pid of pids) {
+    if ((await deps.ownerUid(pid)) !== deps.uid) continue;
+    const comm = await deps.comm(pid);
+    if (comm !== 'tmux' && !comm?.startsWith('tmux:')) continue;
+    const argv = await deps.argv(pid);
+    if (argv && usesTmuxSocket(argv, name, path)) found.push(pid);
+  }
+  return found.sort((a, b) => a - b);
+};
+
 export interface ILocalOrphanScope {
   /** PMUX_URL values that name this server. */
   urls: readonly string[];

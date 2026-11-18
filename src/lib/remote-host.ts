@@ -407,10 +407,14 @@ export const ORPHAN_TREE_BOUND = 8192;
  * of this server's tmux server, walked down from it through each thread's `children`: the session is the one whose
  * pane holds the process (`-` for none). `self_anc` is this script and its ancestors.
  *
- * `tree_bad` names why that walk cannot be trusted, with `REMOTE_PROVIDER_SCRIPT`'s rule: only tmux's own "no
- * server" is an empty tree; any other tmux failure, a server pid that is no number, a server or a walked process
- * whose `stat` or `children` cannot be read, or the walk's bound is a tree that was not read. A seat's agent then
- * looks unheld, so nothing on the host may be reaped.
+ * `tree_bad` names why that walk cannot be trusted. "No server" is the local `TMUX_ABSENCE` rule only, on tmux's
+ * non-zero exit: `no server running on`, or `error connecting to … (No such file or directory)`; and even then no
+ * tmux process of this user may still name this socket (`-L <name>` or `-S <path>`): a socket file deleted under a
+ * live server reads as "no server" while its seats still carry this server's PMUX_URL. Only `comm` tmux processes
+ * have their argv read, and only their pids are printed. Every other tmux failure (a connect error such as
+ * `(Permission denied)`), a server pid that is no number, a server or a walked process whose `stat` or `children`
+ * cannot be read, or the walk's bound is a tree that was not read. A seat's agent then looks unheld, so nothing on
+ * the host may be reaped.
  */
 const ORPHAN_SCRIPT_HELPERS = `statf() {
   s_line=
@@ -434,16 +438,23 @@ kids() {
   return 0
 }
 no_server() {
-  case "$1" in *"no server running"*|*"error connecting to"*|*"No such file or directory"*) return 0 ;; esac
-  return 1
+  printf '%s\\n' "$1" | grep -Eq '^[[:space:]]*(no server running on |error connecting to .*\\(No such file or directory\\))'
 }
+tmux_failed() {
+  tree_bad="tmux failed: $(printf '%s' "$1" | tr '\\t\\n' '  ' | cut -c1-200)"
+}
+uses_socket='NR == 1 { next }
+w != "" { if ((w == "L" && $0 == n) || (w == "S" && $0 == s)) { hit = 1; exit } w = ""; next }
+$0 == "--" || substr($0, 1, 1) != "-" || length($0) < 2 { exit }
+{ o = substr($0, 2); for (i = 1; i <= length(o); i++) { ch = substr(o, i, 1); if (index("cfLST", ch)) { r = substr(o, i + 1); if (r == "") w = ch; else if ((ch == "L" && r == n) || (ch == "S" && r == s)) { hit = 1; exit }; break } } }
+END { exit !hit }'
 tree_bad=
 srv=
 out=$(tmux -L "$sock" display-message -p '#{pid}' 2>&1)
 if [ $? -eq 0 ]; then
   case "$out" in ''|*[!0-9]*) tree_bad='tmux server pid unreadable' ;; *) srv=$out ;; esac
 elif ! no_server "$out"; then
-  tree_bad='tmux failed'
+  tmux_failed "$out"
 fi
 tab=$(printf '\\t')
 nl='
@@ -453,9 +464,21 @@ plist=
 if [ -n "$srv" ]; then
   plist=$(tmux -L "$sock" list-panes -a -F '#{pane_pid} #{session_created} #{session_name}' 2>&1)
   if [ $? -ne 0 ]; then
-    if no_server "$plist"; then srv=; else tree_bad='tmux failed'; fi
+    if no_server "$plist"; then srv=; else tmux_failed "$plist"; fi
     plist=
   fi
+fi
+spath=$(tmux -L "$sock" display-message -p '#{socket_path}' 2>/dev/null)
+[ -n "$spath" ] || spath="\${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$sock"
+if [ -z "$srv" ] && [ -z "$tree_bad" ]; then
+  live=
+  for d in /proc/[0-9]*; do
+    [ -O "$d" ] || continue
+    c=; { read -r c < "$d/comm"; } 2>/dev/null
+    case "$c" in tmux|tmux:*) ;; *) continue ;; esac
+    if tr '\\0' '\\n' 2>/dev/null < "$d/cmdline" | awk -v n="$sock" -v s="$spath" "$uses_socket"; then live="$live \${d#/proc/}"; fi
+  done
+  [ -n "$live" ] && tree_bad="socket gone, server alive (pid$live)"
 fi
 while read -r pp created sname; do
   [ -n "$pp" ] || continue
@@ -511,8 +534,6 @@ hz=$(getconf CLK_TCK 2>/dev/null); [ -n "$hz" ] || hz=100
 up=; { read -r up _ < /proc/uptime; } 2>/dev/null
 frac=\${up#*.}; frac=\${frac#0}; [ -n "$frac" ] || frac=0
 upms=$(( \${up%.*} * 1000 + frac * 10 ))
-spath=$(tmux -L "$sock" display-message -p '#{socket_path}' 2>/dev/null)
-[ -n "$spath" ] || spath="\${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$sock"
 seen=" "
 while read -r pp created sname; do
   [ -n "$sname" ] || continue
