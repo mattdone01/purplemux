@@ -72,6 +72,7 @@ describe('github usage runtime', () => {
       workspaces: async () => [{ id: 'ws-sm', orchestration: { enabled: true, orchestratorTabId: 'tab-sm' } } as never],
       routeTabEvent: async (event) => { routed.push(event.text); },
       topOwners: async () => [{ label: 'worker-1 (epic-a)', rest: 12 }],
+      countedRestSince: async () => 12,
     };
     await runGithubQuotaTick(undefined, alerts);
     await runGithubQuotaTick(undefined, alerts);

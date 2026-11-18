@@ -4,7 +4,7 @@ import { installGhShim, installedGhShimDir, withoutGhShimDir } from '@/lib/gh-sh
 import { GH_TIMEOUT_MS } from '@/lib/gh-api';
 import { GITHUB_AGENT_ACCOUNTS_KEY, QUOTA_READ_MS, readGithubQuotas, type IGhRun, type IQuotaDeps, type IQuotaRead } from '@/lib/github-quota';
 import { createQuotaAlertState, runQuotaAlerts, type IQuotaAlertDeps, type IQuotaAlertState } from '@/lib/github-quota-alert';
-import { buildGithubUsageView, topOwnersLastHour, type IGithubUsageView, type IUsageDeps, type IWorkspaceNames } from '@/lib/github-usage';
+import { buildGithubUsageView, countedRestSince, topOwnersLastHour, type IGithubUsageView, type IUsageDeps, type IWorkspaceNames } from '@/lib/github-usage';
 import { serverGhLedger } from '@/lib/github-usage-ledger';
 import { createLogger } from '@/lib/logger';
 
@@ -104,6 +104,7 @@ const alertDeps = (): IQuotaAlertDeps => ({
   workspaces: async () => (await (await import('@/lib/workspace-store')).getWorkspaces()).workspaces,
   routeTabEvent: async (event) => (await import('@/lib/status-manager')).getStatusManager().routeTabEvent(event),
   topOwners: () => topOwnersLastHour(usageDeps()),
+  countedRestSince: (from) => countedRestSince(usageDeps(), from),
 });
 
 /** One quota read and its alert step; skipped while the previous one runs. */

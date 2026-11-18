@@ -12,6 +12,8 @@ import {
 // `purplemux github usage` — the quota per account and the top owners of the calls.
 
 const NOW = Date.UTC(2026, 10, 18, 8, 0, 0);
+const RESET = Math.floor(NOW / 1000) + 40 * 60;
+const WINDOW_START = new Date(RESET * 1000 - HOUR_MS).toISOString();
 const MIN = 60_000;
 
 const count = (over: Partial<IGhCallCount>): IGhCallCount => ({
@@ -62,7 +64,7 @@ const deps = (over: Partial<IUsageDeps> = {}): IUsageDeps => {
     quota: () => ({
       at: NOW - MIN, error: null,
       accounts: [
-        { login: 'agent-bot', role: 'agent', state: 'read', readAt: NOW - MIN, core: { remaining: 4000, limit: 5000, reset: 1 }, graphql: { remaining: 4900, limit: 5000, reset: 2 } },
+        { login: 'agent-bot', role: 'agent', state: 'read', readAt: NOW - MIN, core: { remaining: 4000, limit: 5000, reset: RESET }, graphql: { remaining: 4900, limit: 5000, reset: 2 } },
         { login: 'mattdone01', role: 'owner', state: 'not-read', reason: 'not read (owner account)' },
       ],
     }),
@@ -81,7 +83,10 @@ describe('buildGithubUsageView', () => {
     expect(view.windows.map((w) => [w.window, w.total])).toEqual([['1h', 4], ['24h', 4]]);
     expect(view.windows[0].owners.map((o) => [o.source, o.tabName])).toEqual([['tab', 'worker-1'], ['server', 'runner']]);
     expect(view.serverLedgerStartedAt).toBe(new Date(NOW - 3 * HOUR_MS).toISOString());
+    expect(view.coverage).toEqual([{ login: 'agent-bot', since: WINDOW_START, counted: 3, spent: 1000 }]);
     expect(view.footer).toEqual([
+      `agent-bot: counted 3 REST calls (any account) of 1000 spent since ${WINDOW_START} (0%); most calls are not counted: `
+        + 'another process or host on the account, or a long poll such as gh run watch',
       `server ledger since ${new Date(NOW - 3 * HOUR_MS).toISOString()} (in memory: a restart starts it again)`,
       GITHUB_USAGE_RESIDUAL,
     ]);
@@ -89,6 +94,19 @@ describe('buildGithubUsageView', () => {
     expect(GITHUB_USAGE_RESIDUAL).toMatch(/rc puts another gh before the shim/);
     expect(GITHUB_USAGE_RESIDUAL).toMatch(/\/usr\/bin\/gh/);
     expect(GITHUB_USAGE_RESIDUAL).toMatch(/remote tabs are not counted/);
+    expect(GITHUB_USAGE_RESIDUAL).toMatch(/a systemd unit or a cron job/);
+    expect(GITHUB_USAGE_RESIDUAL).toMatch(/another host that uses the same account/);
+    expect(GITHUB_USAGE_RESIDUAL).toMatch(/gh run watch .* spends one call per poll/);
+  });
+
+  it('counts only the REST calls from the start of the core window, one hour before the reset', async () => {
+    const view = await buildGithubUsageView(deps({
+      tabCalls: async () => ({
+        counts: [count({ count: 5 }), count({ count: 50, at: NOW - 30 * MIN }), count({ kind: 'graphql', count: 9 })],
+        skippedLines: 0, pruned: [], error: null,
+      }),
+    }));
+    expect(view.coverage).toEqual([{ login: 'agent-bot', since: WINDOW_START, counted: 5, spent: 1000 }]);
   });
 
   it('says when no quota was read yet, the tab log is unreadable, or no shim is installed', async () => {

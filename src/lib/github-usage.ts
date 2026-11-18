@@ -1,5 +1,5 @@
 import type { ITabCallRead } from '@/lib/gh-tab-calls';
-import type { IOwnerCount } from '@/lib/github-quota-alert';
+import { coreWindowStart, coverageText, type IOwnerCount } from '@/lib/github-quota-alert';
 import type { IQuotaRead, TAccountQuota } from '@/lib/github-quota';
 import { DAY_MS, HOUR_MS, type GhCallLedger, type IGhCallCount, type TGhCallSource } from '@/lib/github-usage-ledger';
 
@@ -9,7 +9,9 @@ import { DAY_MS, HOUR_MS, type GhCallLedger, type IGhCallCount, type TGhCallSour
 export const GITHUB_USAGE_RESIDUAL = 'residual: a script that resets PATH, or one that runs gh by an absolute path such as '
   + '/usr/bin/gh, is not counted, so the count can be low; nor is a shell whose rc puts another gh before the shim '
   + '(a plain terminal tab, an agent the web UI started, or an agent tool shell that is not bash); remote tabs are '
-  + 'not counted';
+  + 'not counted; nor is a gh process outside a tab (a systemd unit or a cron job) or on another host that uses the '
+  + 'same account; a long poll such as gh run watch or gh pr checks --watch is one call in the log but spends one '
+  + 'call per poll. Compare the counted calls with the quota spent before naming an owner';
 
 export const OWNER_LIMIT = 10;
 const REDACTED = 'other';
@@ -44,8 +46,18 @@ export interface IUsageWindow {
   ownersOmitted: number;
 }
 
+/** Per read agent account: the REST calls counted since its core window began, against the quota it spent. */
+export interface IQuotaCoverage {
+  login: string;
+  since: string;
+  /** Every account's counted calls: the calls carry no account, so this is an upper bound for this one. */
+  counted: number;
+  spent: number;
+}
+
 export interface IGithubUsageView {
   at: string;
+  coverage: IQuotaCoverage[];
   quotaReadAt: string | null;
   quotaError: string | null;
   accounts: TAccountQuota[];
@@ -103,9 +115,25 @@ export const aggregateOwners = (counts: readonly IGhCallCount[], from: number, n
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-const footerOf = (deps: IUsageDeps, ledgerStart: number, quota: IQuotaRead | null, tabs: ITabCallRead): string[] => {
+const restSince = (counts: readonly IGhCallCount[], from: number): number =>
+  counts.reduce((n, c) => (c.kind === 'rest' && c.at >= from ? n + c.count : n), 0);
+
+const coverageOf = (accounts: readonly TAccountQuota[], counts: readonly IGhCallCount[]): IQuotaCoverage[] =>
+  accounts.flatMap((q) => (q.state === 'read'
+    ? [{
+      login: q.login, since: iso(coreWindowStart(q.core)),
+      counted: restSince(counts, coreWindowStart(q.core)), spent: Math.max(0, q.core.limit - q.core.remaining),
+    }]
+    : []));
+
+const footerOf = (
+  deps: IUsageDeps, ledgerStart: number, quota: IQuotaRead | null, tabs: ITabCallRead, counts: readonly IGhCallCount[],
+): string[] => {
   const shim = deps.shim();
   return [
+    ...(quota?.accounts ?? []).flatMap((q) => (q.state === 'read'
+      ? [`${q.login}: ${coverageText(q.core, restSince(counts, coreWindowStart(q.core)))}`]
+      : [])),
     `server ledger since ${iso(ledgerStart)} (in memory: a restart starts it again)`,
     ...(quota ? [] : ['quota: not read yet (the first read runs within 5 minutes of the start)']),
     ...(tabs.error ? [`tab calls: the log could not be read (${tabs.error}), so the tab counts are missing, not zero`] : []),
@@ -128,6 +156,7 @@ export const buildGithubUsageView = async (deps: IUsageDeps): Promise<IGithubUsa
   const shim = deps.shim();
   return {
     at: iso(now),
+    coverage: coverageOf(quota?.accounts ?? [], counts),
     quotaReadAt: quota ? iso(quota.at) : null,
     quotaError: quota?.error ?? null,
     accounts: quota?.accounts ?? [],
@@ -137,8 +166,14 @@ export const buildGithubUsageView = async (deps: IUsageDeps): Promise<IGithubUsa
     ],
     serverLedgerStartedAt: iso(ledgerStart),
     tabLog: { dir: deps.tabCallsDir(), shimInstalled: shim.installed, shimReason: shim.reason, error: tabs.error, skippedLines: tabs.skippedLines },
-    footer: footerOf(deps, ledgerStart, quota, tabs),
+    footer: footerOf(deps, ledgerStart, quota, tabs, counts),
   };
+};
+
+/** The REST calls counted from `from` on, both sources together, for the quota alert. */
+export const countedRestSince = async (deps: IUsageDeps, from: number): Promise<number> => {
+  const { counts } = await allCounts(deps, deps.now());
+  return restSince(counts, from);
 };
 
 /** The owners of the last hour by REST calls, both sources together, for the quota alert. */

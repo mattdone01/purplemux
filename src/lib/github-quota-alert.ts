@@ -5,8 +5,8 @@ import { classifyWake } from '@/lib/wake-class';
 import type { IPortfolioSelection } from '@/types/portfolio';
 import type { IWorkspace } from '@/types/terminal';
 
-// R2: when an agent account's core (REST) remaining is below 20 % of its limit before its reset,
-// the orchestrator gets one line per account per reset window, naming the top 3 owners of the last hour. The account
+// R2: when an agent account's core (REST) remaining is below 20 % of its limit before its reset, one line per
+// account per reset window names the counted calls against the quota spent, and the top 3 counted owners of the last hour. The account
 // belongs to no workspace, so the line goes where a fleet-level flag goes: the portfolio Scrum Master seat, through
 // the tab event router (the pool flag's path, SO-10).
 
@@ -36,15 +36,33 @@ export interface IQuotaAlertDeps {
   routeTabEvent: (event: ITabEventRoute) => Promise<unknown>;
   /** The owners of the last hour, most REST calls first. */
   topOwners: () => Promise<IOwnerCount[]>;
+  /** The REST calls counted (server ledger and tab log, any account) from `fromMs` on. */
+  countedRestSince: (fromMs: number) => Promise<number>;
 }
 
 const resetIso = (reset: number): string => new Date(reset * 1000).toISOString();
 
-export const quotaAlertText = (login: string, core: IRateWindow, owners: IOwnerCount[]): string => {
+/** GitHub's core window is one hour, so it began one hour before its reset. */
+export const coreWindowStart = (core: IRateWindow): number => core.reset * 1000 - 60 * 60_000;
+
+/**
+ * The counted calls beside the quota the account spent this window. A count below half of the spent quota says so: the
+ * top owners then explain a part only, and the rest came from outside the counted tabs.
+ */
+export const coverageText = (core: IRateWindow, counted: number): string => {
+  const spent = Math.max(0, core.limit - core.remaining);
+  const share = spent > 0 ? `${Math.floor((counted / spent) * 100)}%` : 'none spent';
+  const most = spent > 0 && counted * 2 < spent
+    ? '; most calls are not counted: another process or host on the account, or a long poll such as gh run watch'
+    : '';
+  return `counted ${counted} REST calls (any account) of ${spent} spent since ${new Date(coreWindowStart(core)).toISOString()} (${share})${most}`;
+};
+
+export const quotaAlertText = (login: string, core: IRateWindow, owners: IOwnerCount[], counted: number): string => {
   const pct = Math.floor((core.remaining / core.limit) * 100);
   const top = owners.slice(0, 3).map((o) => `${o.label} ${o.rest} REST`).join(', ') || 'none counted';
   return `GitHub REST quota low: ${login} core ${core.remaining}/${core.limit} (${pct}%), resets ${resetIso(core.reset)}; `
-    + `top owners, last hour: ${top}`;
+    + `${coverageText(core, counted)}; top counted owners, last hour: ${top}`;
 };
 
 const isLow = (q: TAccountQuota, now: number): q is Extract<TAccountQuota, { state: 'read' }> =>
@@ -93,8 +111,15 @@ export const runQuotaAlerts = async (
       }
       continue;
     }
+    let counted: number;
+    try {
+      counted = await deps.countedRestSince(coreWindowStart(q.core));
+    } catch (err) {
+      log.warn(`github quota alert for ${q.login} not sent: ${errorText(err)}`);
+      continue;
+    }
     const event: ITabEventRoute = {
-      workspaceId: target.workspaceId, tabId: target.tabId, kind: 'flag', text: quotaAlertText(q.login, q.core, owners),
+      workspaceId: target.workspaceId, tabId: target.tabId, kind: 'flag', text: quotaAlertText(q.login, q.core, owners, counted),
       class: classifyWake('flag', { severity: 'warn' }), rule: QUOTA_ALERT_RULE,
     };
     try {
