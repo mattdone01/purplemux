@@ -355,7 +355,7 @@ POST /api/cli/pool/release   Body: { "lease": "pool:<host>/<kind>-<n>" | "pool-q
   Response: { "released": [lease names], "cancelled": "<T>" }
 
 GET /api/cli/github-usage   (any valid scope)
-  \`purplemux github usage [--json]\` (engineering#810). Response: { "at", "quotaReadAt": null | ISO,
+  \`purplemux github usage [--json]\`. Response: { "at", "quotaReadAt": null | ISO,
   "quotaError": null | text, "accounts": [{ "login", "role": "agent"|"owner"|"unset", "state":
   "read"|"unknown"|"not-read", "core"/"graphql": { "remaining", "limit", "reset" (epoch s) } when read,
   "reason" otherwise }], "windows": [{ "window": "1h"|"24h", "total", "rest", "graphql", "owners": [{
@@ -1355,8 +1355,8 @@ Keys in use:
                when the notice is queued, so a notice queued earlier keeps its line. Written by the
                admin token or an enabled orchestrator (ADR-0019).
   github.agentAccounts
-               The GitHub logins, comma-separated, whose quota the server reads every 5 minutes
-               (engineering#810): \`gh api rate_limit\` with GH_TOKEN from \`gh auth token --user <login>\`
+               The GitHub logins, comma-separated, whose quota the server reads every 5 minutes:
+               \`gh api rate_limit\` with GH_TOKEN from \`gh auth token --user <login>\`
                in the child env, never logged. Any other account \`gh auth status\` lists shows as "not
                read (owner account)" and its token is never read; unset: every account shows "not read
                (set github.agentAccounts)". The account list comes from \`gh auth status\`, which checks

@@ -5,7 +5,7 @@ import { classifyWake } from '@/lib/wake-class';
 import type { IPortfolioSelection } from '@/types/portfolio';
 import type { IWorkspace } from '@/types/terminal';
 
-// R2 of engineering#810: when an agent account's core (REST) remaining is below 20 % of its limit before its reset,
+// R2: when an agent account's core (REST) remaining is below 20 % of its limit before its reset,
 // the orchestrator gets one line per account per reset window, naming the top 3 owners of the last hour. The account
 // belongs to no workspace, so the line goes where a fleet-level flag goes: the portfolio Scrum Master seat, through
 // the tab event router (the pool flag's path, SO-10).

@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { DAY_MS, GH_COMMAND_WORDS, GH_PLAIN_COMMANDS, kindOfWords, minuteOf, type IGhCallCount, type TGhKind } from '@/lib/github-usage-ledger';
 
-// The tab calls the gh shim logged (engineering#810): one file per UTC day, `<epoch> <tab> <ws> <w1> <w2>` a line.
+// The tab calls the gh shim logged: one file per UTC day, `<epoch> <tab> <ws> <w1> <w2>` a line.
 
 /** Where the shim writes, as the shim resolves it: `${XDG_STATE_HOME:-$HOME/.local/state}/purplemux/gh-calls`. */
 export const ghCallsDir = (env: Readonly<Record<string, string | undefined>> = process.env, home: string = os.homedir()): string =>

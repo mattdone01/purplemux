@@ -11,12 +11,12 @@ vi.mock('@/lib/logger', () => {
 const { QUOTA_ALERT_SHARE, createQuotaAlertState, quotaAlertText, runQuotaAlerts } = await import('@/lib/github-quota-alert');
 type IQuotaAlertDeps = import('@/lib/github-quota-alert').IQuotaAlertDeps;
 
-// engineering#810 R2: below 20 % of core, one line per agent account per reset window, to the orchestrator.
+// R2: below 20 % of core, one line per agent account per reset window, to the orchestrator.
 
 const NOW = Date.UTC(2026, 10, 18, 8, 0, 0);
 const RESET = Math.floor(NOW / 1000) + 40 * 60;
 
-const agent = (remaining: number, reset = RESET, login = 'mattdone-ai'): TAccountQuota => ({
+const agent = (remaining: number, reset = RESET, login = 'agent-bot'): TAccountQuota => ({
   login, role: 'agent', state: 'read', readAt: NOW,
   core: { remaining, limit: 5000, reset }, graphql: { remaining: 5000, limit: 5000, reset },
 });
@@ -56,11 +56,11 @@ describe('quota alert', () => {
     expect(routed).toHaveLength(1);
     expect(routed[0]).toMatchObject({ workspaceId: 'ws-sm', tabId: 'tab-sm', kind: 'flag', rule: 'github-quota-low' });
     expect(routed[0].text).toBe(
-      `GitHub REST quota low: mattdone-ai core 999/5000 (19%), resets ${new Date(RESET * 1000).toISOString()}; `
+      `GitHub REST quota low: agent-bot core 999/5000 (19%), resets ${new Date(RESET * 1000).toISOString()}; `
       + 'top owners, last hour: worker-1 (epic-a) 900 REST, runner (ci) 400 REST, worker-2 (epic-a) 120 REST',
     );
     expect(routed[0].text).not.toContain('quiet');
-    expect(result.sent).toEqual(['mattdone-ai']);
+    expect(result.sent).toEqual(['agent-bot']);
   });
 
   it('is quiet at or above 20 %', async () => {
@@ -84,7 +84,7 @@ describe('quota alert', () => {
   it('one line per account', async () => {
     const { d, routed } = deps();
     await runQuotaAlerts(d, createQuotaAlertState(), [agent(10), agent(20, RESET, 'bot-2')], NOW);
-    expect(routed.map((e) => e.text.split(' ')[4])).toEqual(['mattdone-ai', 'bot-2']);
+    expect(routed.map((e) => e.text.split(' ')[4])).toEqual(['agent-bot', 'bot-2']);
   });
 
   it('never alerts on an unknown, owner or unset account, nor past the reset', async () => {
@@ -100,9 +100,9 @@ describe('quota alert', () => {
   it('a line with no target, or one the router refuses, is tried again on the next read', async () => {
     const state = createQuotaAlertState();
     const none = deps({ scrumMaster: async () => null });
-    expect((await runQuotaAlerts(none.d, state, [agent(10)], NOW)).noTarget).toEqual(['mattdone-ai: no-scrum-master']);
+    expect((await runQuotaAlerts(none.d, state, [agent(10)], NOW)).noTarget).toEqual(['agent-bot: no-scrum-master']);
     const disabled = deps({ workspaces: async () => [workspace('ws-sm', 'tab-sm', false)] });
-    expect((await runQuotaAlerts(disabled.d, state, [agent(10)], NOW)).noTarget).toEqual(['mattdone-ai: orchestrator-disabled']);
+    expect((await runQuotaAlerts(disabled.d, state, [agent(10)], NOW)).noTarget).toEqual(['agent-bot: orchestrator-disabled']);
     const refused = deps({ routeTabEvent: async () => { throw new Error('tab gone'); } });
     expect((await runQuotaAlerts(refused.d, state, [agent(10)], NOW)).sent).toEqual([]);
     const ok = deps();

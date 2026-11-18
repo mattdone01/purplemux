@@ -151,7 +151,7 @@ const workspaceEnv = async (sessionName: string, identity?: ITabIdentity, cwd?: 
  * its workspace scope: the CLI falls back to `PMUX_TOKEN`.
  */
 export const tabEnv = async (sessionName: string, identity?: ITabIdentity): Promise<Record<string, string>> => {
-  // engineering#810: the gh shim first on a local pane's PATH, over the login floor.
+  // The gh shim first on a local pane's PATH, over the login floor.
   const shim = ghShimPaneEnv();
   if (!identity) return shim;
   try {

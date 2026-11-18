@@ -8,7 +8,7 @@ import { buildGithubUsageView, topOwnersLastHour, type IGithubUsageView, type IU
 import { serverGhLedger } from '@/lib/github-usage-ledger';
 import { createLogger } from '@/lib/logger';
 
-// The runtime of engineering#810: the shim installed at start, the quota read every 5 minutes with its alert, and the
+// The GitHub usage runtime: the shim installed at start, the quota read every 5 minutes with its alert, and the
 // usage view the CLI route serves. State is on globalThis: the custom server and the API routes are one process.
 
 const log = createLogger('github-usage');

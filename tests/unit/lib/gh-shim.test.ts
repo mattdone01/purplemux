@@ -18,7 +18,7 @@ import {
 } from '@/lib/gh-shim';
 import { LOGIN_SHELL_BASE_PATH } from '@/lib/shell-env';
 
-// engineering#810 R1 (a): the gh shim on a local tab's PATH writes one line per call, and never a path or a token.
+// R1 (a): the gh shim on a local tab's PATH writes one line per call, and never a path or a token.
 
 const run = promisify(execFile);
 

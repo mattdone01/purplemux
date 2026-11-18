@@ -8,7 +8,7 @@ import { createLogger } from '@/lib/logger';
 const log = createLogger('github-usage');
 
 /**
- * `purplemux github usage` (engineering#810): any valid CLI scope may read it. The owners in a workspace the caller
+ * `purplemux github usage`: any valid CLI scope may read it. The owners in a workspace the caller
  * cannot read show as `other`, with their counts kept; the admin token reads all.
  */
 const handler = async (req: NextApiRequest, res: NextApiResponse) => {

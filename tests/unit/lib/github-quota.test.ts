@@ -8,13 +8,13 @@ import {
   type IQuotaDeps,
 } from '@/lib/github-quota';
 
-// engineering#810, the lead's guard on item 3: rate_limit is read only for the agent accounts; the owner's
+// The owner-token guard: rate_limit is read only for the agent accounts; the owner's
 // token is never taken.
 
 const NOW = Date.UTC(2026, 10, 18, 8, 0, 0);
 
 const AUTH_STATUS = `github.com
-  ✓ Logged in to github.com account mattdone-ai (keyring)
+  ✓ Logged in to github.com account agent-bot (keyring)
   - Active account: true
   - Git operations protocol: ssh
   - Token: gho_************************************
@@ -61,12 +61,12 @@ describe('parsers', () => {
   });
 
   it('reads the logins gh auth status lists', () => {
-    expect(parseAuthStatusAccounts(AUTH_STATUS)).toEqual(['mattdone-ai', 'mattdone01']);
+    expect(parseAuthStatusAccounts(AUTH_STATUS)).toEqual(['agent-bot', 'mattdone01']);
     expect(parseAuthStatusAccounts('You are not logged into any GitHub hosts.')).toEqual([]);
   });
 
   it('reads the agent accounts key: comma-separated logins, a malformed one dropped', () => {
-    expect(parseAgentAccounts(' mattdone-ai, bot-2 ,,')).toEqual(['mattdone-ai', 'bot-2']);
+    expect(parseAgentAccounts(' agent-bot, bot-2 ,,')).toEqual(['agent-bot', 'bot-2']);
     expect(parseAgentAccounts('a b,$(x),ok')).toEqual(['ok']);
     expect(parseAgentAccounts(null)).toEqual([]);
   });
@@ -85,14 +85,14 @@ describe('parsers', () => {
 
 describe('readGithubQuotas', () => {
   it('reads only the agent account, with its token in the child env, and never asks for the owner token', async () => {
-    const { deps, calls } = fakeDeps('mattdone-ai');
+    const { deps, calls } = fakeDeps('agent-bot');
     const read = await readGithubQuotas(deps);
-    expect(calls.map((c) => c.args.join(' '))).toEqual(['auth status', 'auth token --user mattdone-ai', 'api rate_limit']);
+    expect(calls.map((c) => c.args.join(' '))).toEqual(['auth status', 'auth token --user agent-bot', 'api rate_limit']);
     expect(calls.some((c) => c.args.includes('mattdone01') && c.args[0] === 'auth' && c.args[1] === 'token')).toBe(false);
-    expect(calls[2].env).toEqual({ GH_TOKEN: 'gho_token_of_mattdone-ai' });
+    expect(calls[2].env).toEqual({ GH_TOKEN: 'gho_token_of_agent-bot' });
     expect(read.accounts).toEqual([
       {
-        login: 'mattdone-ai', role: 'agent', state: 'read', readAt: NOW,
+        login: 'agent-bot', role: 'agent', state: 'read', readAt: NOW,
         core: { remaining: 4200, limit: 5000, reset: 1_763_455_200 }, graphql: { remaining: 4990, limit: 5000, reset: 1_763_455_500 },
       },
       { login: 'mattdone01', role: 'owner', state: 'not-read', reason: 'not read (owner account)' },
@@ -105,22 +105,22 @@ describe('readGithubQuotas', () => {
     const read = await readGithubQuotas(deps);
     expect(calls.map((c) => c.args.join(' '))).toEqual(['auth status']);
     expect(read.accounts).toEqual([
-      { login: 'mattdone-ai', role: 'unset', state: 'not-read', reason: 'not read (set github.agentAccounts)' },
+      { login: 'agent-bot', role: 'unset', state: 'not-read', reason: 'not read (set github.agentAccounts)' },
       { login: 'mattdone01', role: 'unset', state: 'not-read', reason: 'not read (set github.agentAccounts)' },
     ]);
   });
 
   it('a rate_limit answer that does not parse is unknown, never full', async () => {
-    const { deps } = fakeDeps('mattdone-ai', { 'api rate_limit': { ok: true, stdout: '<html>' } });
+    const { deps } = fakeDeps('agent-bot', { 'api rate_limit': { ok: true, stdout: '<html>' } });
     const [agent] = (await readGithubQuotas(deps)).accounts;
-    expect(agent).toEqual({ login: 'mattdone-ai', role: 'agent', state: 'unknown', reason: 'rate_limit did not parse', readAt: NOW });
+    expect(agent).toEqual({ login: 'agent-bot', role: 'agent', state: 'unknown', reason: 'rate_limit did not parse', readAt: NOW });
   });
 
   it('a failed token read or a failed rate_limit call is unknown and names the step, never the token', async () => {
-    const noToken = fakeDeps('mattdone-ai', { 'auth token --user mattdone-ai': { ok: false, stdout: '', stderr: 'no oauth token found' } });
+    const noToken = fakeDeps('agent-bot', { 'auth token --user agent-bot': { ok: false, stdout: '', stderr: 'no oauth token found' } });
     expect((await readGithubQuotas(noToken.deps)).accounts[0]).toMatchObject({ state: 'unknown', reason: expect.stringContaining('gh auth token') });
     expect(noToken.calls.map((c) => c.args[0] + ' ' + c.args[1])).not.toContain('api rate_limit');
-    const failed = fakeDeps('mattdone-ai', { 'api rate_limit': { ok: false, stdout: '', stderr: 'HTTP 401: Bad credentials' } });
+    const failed = fakeDeps('agent-bot', { 'api rate_limit': { ok: false, stdout: '', stderr: 'HTTP 401: Bad credentials' } });
     expect((await readGithubQuotas(failed.deps)).accounts[0]).toMatchObject({ state: 'unknown', reason: expect.stringContaining('HTTP 401') });
   });
 

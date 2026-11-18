@@ -1,4 +1,4 @@
-// Every `gh` call the server makes, per owner tab (engineering#810). The tab calls the gh shim logs use the same
+// Every `gh` call the server makes, per owner tab. The tab calls the gh shim logs use the same
 // vocabulary (`gh-shim.ts` builds its allow-list from GH_COMMAND_WORDS), so both sources add up per owner.
 
 export const HOUR_MS = 60 * 60 * 1000;

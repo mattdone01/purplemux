@@ -397,7 +397,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   registerLockCleanup();
 
   await Promise.all([initConfigStore(), initShellPath()]);
-  // Before any tab or agent launch: the gh shim and the 5-minute quota read (engineering#810).
+  // Before any tab or agent launch: the gh shim and the 5-minute quota read.
   await startGithubUsage();
 
   const credentials = await initAuthCredentials();

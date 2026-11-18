@@ -2053,7 +2053,7 @@ const printGithubUsage = (view) => {
   for (const line of view.footer) process.stdout.write(`note: ${line}\n`);
 };
 
-// engineering#810: the GitHub quota per account and who spent the calls (server watches and the tabs' gh shim).
+// The GitHub quota per account and who spent the calls (server watches and the tabs' gh shim).
 const cmdGithub = async (args) => {
   if (args[0] !== 'usage') die(GITHUB_USAGE);
   const positional = stripBooleanFlags(args.slice(1), ['--json']);
@@ -3991,7 +3991,7 @@ Commands:
                                            text; a re-send keeps its first id; a tab reads its own workspace's
   curator message -w WS ID [--json]        One owner message by its history id (a standing-order candidate
                                            names the id, never the text); a tab reads its own workspace's
-  github usage [--json]                    The GitHub quota per account and who spent the calls (engineering#810):
+  github usage [--json]                    The GitHub quota per account and who spent the calls:
                                            per account the REST (core) and GraphQL remaining, limit and reset,
                                            read every 5 min for the fleet config github.agentAccounts only (any
                                            other account: "not read (owner account)"); then the top owners of

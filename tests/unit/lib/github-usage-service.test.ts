@@ -23,7 +23,7 @@ const { ghShimDir, installedGhShimDir } = await import('@/lib/gh-shim');
 const { serverGhLedger, HOUR_MS } = await import('@/lib/github-usage-ledger');
 type IQuotaAlertDeps = import('@/lib/github-quota-alert').IQuotaAlertDeps;
 
-// engineering#810: the runtime: the shim at start, the 5-minute quota read through the real gh, and the view.
+// The runtime: the shim at start, the 5-minute quota read through the real gh, and the view.
 
 let bin = '';
 let argvLog = '';

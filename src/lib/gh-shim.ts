@@ -5,7 +5,7 @@ import path from 'path';
 import { GH_COMMAND_WORDS, GH_PLAIN_COMMANDS } from '@/lib/github-usage-ledger';
 import { LOGIN_SHELL_BASE_PATH } from '@/lib/shell-env';
 
-// The gh shim (engineering#810, R1 (a)): a local tab's `gh` writes one line to the gh-calls log, then runs the real
+// The gh shim (R1 (a)): a local tab's `gh` writes one line to the gh-calls log, then runs the real
 // gh. The line holds the time, the tab, the workspace and two words of an allow-list, never a path, a query or a
 // token. A tab's login rc can put the real gh's directory before the shim (measured: ~/.local/bin), so every local
 // agent launch also starts through `pmux-gh-path`, which puts the shim first again after the rc (consult ruling B).
@@ -31,7 +31,7 @@ const commandCases = (): string[] => [
 /** The shim: a POSIX sh script with the real gh pinned by its absolute path. */
 export const ghShimScript = (realGh: string): string => [
   '#!/bin/sh',
-  '# purplemux gh shim (engineering#810): one line per call to the gh-calls log, then the real gh.',
+  '# purplemux gh shim: one line per call to the gh-calls log, then the real gh.',
   '# An api call records its kind only; any word outside the allow-list is "?". A failed write never stops the call.',
   `real=${shQuote(realGh)}`,
   '(',
@@ -60,7 +60,7 @@ export const ghPathExecScript = (dir: string): string => {
   const bashEnv = shQuote(path.join(dir, 'bash-env'));
   return [
     '#!/bin/sh',
-    '# purplemux (engineering#810): run a local agent with the gh shim first on PATH, after the shell rc.',
+    '# purplemux: run a local agent with the gh shim first on PATH, after the shell rc.',
     `PATH=${shQuote(dir)}:"$PATH"`,
     'export PATH',
     `if [ "\${BASH_ENV-}" != ${bashEnv} ]; then PMUX_GH_PREV_BASH_ENV=\${BASH_ENV-}; export PMUX_GH_PREV_BASH_ENV; fi`,
@@ -73,7 +73,7 @@ export const ghPathExecScript = (dir: string): string => {
 
 /** The bash-env file: the earlier BASH_ENV first, then the shim directory first on PATH unless it is first. */
 export const ghBashEnvScript = (dir: string): string => [
-  '# purplemux (engineering#810): a non-interactive bash reads this after the rc; it puts the gh shim first again.',
+  '# purplemux: a non-interactive bash reads this after the rc; it puts the gh shim first again.',
   'if [ -n "${PMUX_GH_PREV_BASH_ENV-}" ] && [ -r "$PMUX_GH_PREV_BASH_ENV" ]; then . "$PMUX_GH_PREV_BASH_ENV"; fi',
   `case "$PATH" in ${shQuote(`${dir}:`)}*) ;; *) PATH=${shQuote(dir)}:"$PATH"; export PATH ;; esac`,
   '',

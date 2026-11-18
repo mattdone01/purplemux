@@ -1,4 +1,4 @@
-// The GitHub quota per account (engineering#810, the lead's guard on item 3): `gh api rate_limit` is read only for the
+// The GitHub quota per account (the owner-token guard): `gh api rate_limit` is read only for the
 // agent accounts that fleet config `github.agentAccounts` names, each with its own token in the child env. The token
 // of any other account `gh auth status` lists is never read: that account is shown as "not read (owner account)".
 

@@ -6,7 +6,7 @@ import path from 'path';
 import { promisify } from 'util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// engineering#810: `purplemux github usage` through the installed entry point, against a stub server.
+// `purplemux github usage` through the installed entry point, against a stub server.
 
 const ENTRY = path.resolve('bin/purplemux.js');
 const run = promisify(execFile);
@@ -17,7 +17,7 @@ const VIEW = {
   quotaError: null,
   accounts: [
     {
-      login: 'mattdone-ai', role: 'agent', state: 'read', readAt: 1,
+      login: 'agent-bot', role: 'agent', state: 'read', readAt: 1,
       core: { remaining: 812, limit: 5000, reset: 1_763_454_000 }, graphql: { remaining: 4990, limit: 5000, reset: 1_763_455_500 },
     },
     { login: 'bot-2', role: 'agent', state: 'unknown', reason: 'rate_limit did not parse', readAt: 1 },
@@ -45,7 +45,7 @@ const VIEW = {
   ],
 };
 
-describe('purplemux github usage (engineering#810)', { timeout: 30_000 }, () => {
+describe('purplemux github usage', { timeout: 30_000 }, () => {
   let server: http.Server;
   let port = 0;
   let home = '';
@@ -88,7 +88,7 @@ describe('purplemux github usage (engineering#810)', { timeout: 30_000 }, () => 
     const lines = r.stdout.split('\n');
     expect(lines[0]).toBe('github usage at 2026-11-18T08:00:00.000Z (quota read 2026-11-18T07:58:00.000Z)');
     expect(r.stdout).toMatch(/^ACCOUNT\s+ROLE\s+REST\s+REST RESET\s+GRAPHQL\s+GRAPHQL RESET$/m);
-    expect(r.stdout).toMatch(/^mattdone-ai\s+agent\s+812\/5000 \(16%\)\s+2025-11-18T08:20:00Z\s+4990\/5000 \(99%\)\s+2025-11-18T08:45:00Z$/m);
+    expect(r.stdout).toMatch(/^agent-bot\s+agent\s+812\/5000 \(16%\)\s+2025-11-18T08:20:00Z\s+4990\/5000 \(99%\)\s+2025-11-18T08:45:00Z$/m);
     expect(r.stdout).toMatch(/^bot-2\s+agent\s+unknown \(rate_limit did not parse\)$/m);
     expect(r.stdout).toMatch(/^mattdone01\s+owner\s+not read \(owner account\)$/m);
     expect(r.stdout).toContain('last 1h: 130 calls (100 REST, 30 GraphQL)');

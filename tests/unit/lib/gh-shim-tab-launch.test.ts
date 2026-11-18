@@ -23,7 +23,7 @@ const { claudeCommand } = await import('@/lib/claude-command');
 const { ghPathExecPath, ghShimDir, installGhShim } = await import('@/lib/gh-shim');
 const { LOGIN_SHELL_BASE_PATH } = await import('@/lib/shell-env');
 
-// engineering#810, consult ruling B: a local tab's pane PATH starts with the shim directory, and every local agent
+// Consult ruling B: a local tab's pane PATH starts with the shim directory, and every local agent
 // launch puts it first again after the shell's own rc.
 
 const identity = { workspaceId: 'ws-1', tabId: 'tab-a' };

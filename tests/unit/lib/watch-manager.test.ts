@@ -128,7 +128,7 @@ describe('harness watches (ADR-0015)', () => {
     expect(hook).toMatchObject({ verified: false, identity: 'hook' });
   });
 
-  it('counts each GitHub read in the server ledger against the watch owner tab (engineering#810)', async () => {
+  it('counts each GitHub read in the server ledger against the watch owner tab', async () => {
     const before = serverGhLedger().counts(T0 - MIN, T0 + MIN).filter((c) => c.tabId === 'tab-b').reduce((n, c) => n + c.count, 0);
     f.answer('number=88', f.pull(false, 'open', SHA_A));
     await m.create(B, { kind: 'pr', target: 'o/r#88', until: 'merged' });

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ghCallsDir, parseGhCallLine, readTabGhCalls } from '@/lib/gh-tab-calls';
 import { HOUR_MS } from '@/lib/github-usage-ledger';
 
-// engineering#810: the tab calls the gh shim logged, read back for the 1 h and 24 h windows.
+// The tab calls the gh shim logged, read back for the 1 h and 24 h windows.
 
 const NOW = Date.UTC(2026, 10, 18, 8, 0, 0);
 const S = (ms: number) => Math.floor(ms / 1000);

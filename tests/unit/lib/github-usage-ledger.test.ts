@@ -9,7 +9,7 @@ import {
   ownerOfWatch,
 } from '@/lib/github-usage-ledger';
 
-// engineering#810: every `gh` call the server makes, counted per owner tab, REST or GraphQL.
+// Every `gh` call the server makes, counted per owner tab, REST or GraphQL.
 
 const T0 = 1_800_000_000_000;
 

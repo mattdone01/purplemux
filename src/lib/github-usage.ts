@@ -3,7 +3,7 @@ import type { IOwnerCount } from '@/lib/github-quota-alert';
 import type { IQuotaRead, TAccountQuota } from '@/lib/github-quota';
 import { DAY_MS, HOUR_MS, type GhCallLedger, type IGhCallCount, type TGhCallSource } from '@/lib/github-usage-ledger';
 
-// `purplemux github usage` (engineering#810): the quota per account, and who spent the calls in the last 1 h and
+// `purplemux github usage`: the quota per account, and who spent the calls in the last 1 h and
 // 24 h, from the server's own ledger and the tab calls the gh shim logged.
 
 export const GITHUB_USAGE_RESIDUAL = 'residual: a script that resets PATH, or one that runs gh by an absolute path such as '

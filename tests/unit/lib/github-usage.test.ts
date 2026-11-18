@@ -9,7 +9,7 @@ import {
   type IUsageDeps,
 } from '@/lib/github-usage';
 
-// engineering#810: `purplemux github usage` — the quota per account and the top owners of the calls.
+// `purplemux github usage` — the quota per account and the top owners of the calls.
 
 const NOW = Date.UTC(2026, 10, 18, 8, 0, 0);
 const MIN = 60_000;
@@ -62,7 +62,7 @@ const deps = (over: Partial<IUsageDeps> = {}): IUsageDeps => {
     quota: () => ({
       at: NOW - MIN, error: null,
       accounts: [
-        { login: 'mattdone-ai', role: 'agent', state: 'read', readAt: NOW - MIN, core: { remaining: 4000, limit: 5000, reset: 1 }, graphql: { remaining: 4900, limit: 5000, reset: 2 } },
+        { login: 'agent-bot', role: 'agent', state: 'read', readAt: NOW - MIN, core: { remaining: 4000, limit: 5000, reset: 1 }, graphql: { remaining: 4900, limit: 5000, reset: 2 } },
         { login: 'mattdone01', role: 'owner', state: 'not-read', reason: 'not read (owner account)' },
       ],
     }),
@@ -77,7 +77,7 @@ describe('buildGithubUsageView', () => {
   it('holds the accounts, both windows, the ledger start and the residual footer', async () => {
     const view = await buildGithubUsageView(deps());
     expect(view.at).toBe(new Date(NOW).toISOString());
-    expect(view.accounts.map((a) => [a.login, a.state])).toEqual([['mattdone-ai', 'read'], ['mattdone01', 'not-read']]);
+    expect(view.accounts.map((a) => [a.login, a.state])).toEqual([['agent-bot', 'read'], ['mattdone01', 'not-read']]);
     expect(view.windows.map((w) => [w.window, w.total])).toEqual([['1h', 4], ['24h', 4]]);
     expect(view.windows[0].owners.map((o) => [o.source, o.tabName])).toEqual([['tab', 'worker-1'], ['server', 'runner']]);
     expect(view.serverLedgerStartedAt).toBe(new Date(NOW - 3 * HOUR_MS).toISOString());

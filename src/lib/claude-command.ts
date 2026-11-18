@@ -26,7 +26,7 @@ interface IClaudeFlagOptions {
 }
 
 /** The one start of every local claude command: an evaluator's environment (ADR-0040), then `claude`. */
-/** A local claude launch (a remote one is `buildRemoteClaudeLaunch`): the gh shim wrapper first, when installed (engineering#810). */
+/** A local claude launch (a remote one is `buildRemoteClaudeLaunch`): the gh shim wrapper first, when installed. */
 export const claudeCommand = (rest: string, opts?: IClaudeFlagOptions): string => `${evaluatorEnvPrefix(opts)}${ghShimLaunchPrefix()}claude ${rest}`;
 
 export const buildClaudeFlags = async (workspaceId?: string, opts?: IClaudeFlagOptions): Promise<string> => {
