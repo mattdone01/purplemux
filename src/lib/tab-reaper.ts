@@ -92,7 +92,7 @@ const readText = async (file: string): Promise<string | null> => {
 };
 
 /** The parent pid (/proc/<pid>/stat field 4), or null. */
-const parentPid = async (pid: number): Promise<number | null> => {
+export const parentPid = async (pid: number): Promise<number | null> => {
   const raw = await readText(`/proc/${pid}/stat`);
   const ppid = raw ? Number(statFields(raw)[1]) : NaN;
   return Number.isInteger(ppid) ? ppid : null;
@@ -253,6 +253,34 @@ const waitGone = async (deps: ITabReaperDeps, targets: Map<number, ITarget>, pid
     alive = await aliveAmong(deps, targets, alive);
   }
   return alive;
+};
+
+export interface ITerminateTarget {
+  pid: number;
+  comm: string;
+  /** The start time the caller's scan read: a pid that no longer has it is a different process and is left alone. */
+  start: string;
+}
+
+/**
+ * The reap's kill steps for processes another scan chose: SIGTERM (+ SIGCONT), up to 3 s of grace, SIGKILL, then a
+ * settle. The caller has applied the guards; a pid whose start time changed is never signalled.
+ */
+export const terminateProcesses = async (
+  deps: ITabReaperDeps,
+  procs: readonly ITerminateTarget[],
+): Promise<{ killed: number[]; survivors: number[] }> => {
+  const targets = new Map<number, ITarget>(procs.map((p) => [p.pid, { entry: { pid: p.pid, comm: p.comm, args: '' }, start: p.start }]));
+  const pids = [...targets.keys()];
+  for (const pid of pids) {
+    await signalTarget(deps, pid, targets.get(pid)!, 'SIGTERM');
+    await signalTarget(deps, pid, targets.get(pid)!, 'SIGCONT');
+  }
+  for (const pid of await waitGone(deps, targets, pids, REAP_GRACE_MS)) {
+    await signalTarget(deps, pid, targets.get(pid)!, 'SIGKILL');
+  }
+  const stillAlive = new Set(await waitGone(deps, targets, pids, SETTLE_MS));
+  return { killed: pids.filter((pid) => !stillAlive.has(pid)), survivors: pids.filter((pid) => stillAlive.has(pid)) };
 };
 
 /**

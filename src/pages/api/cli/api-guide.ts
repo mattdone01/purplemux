@@ -569,6 +569,30 @@ POST /api/cli/tabs/<tabId>/restart?workspaceId=WS
   CLI: purplemux tab restart -w WS TAB_ID [--clear] [--interrupt] [--json]
        prints "ok TAB_ID restarted (resumed)" or "(fresh)".
 
+GET /api/cli/tabs/orphans[?host=local|H]
+POST /api/cli/tabs/orphans   Body: { "reap": true, "host"?: "local" | H }
+  The orphan sweep, per host: the local host and each remote.hosts host that owns a tab, or the one
+  host named. Four lists: "unowned-tab" (a process whose PMUX_TAB_ID names a tab in no layout),
+  "duplicate-agent" (an agent whose PMUX_TAB_ID names a layout tab, outside that tab's pane tree),
+  "unowned-session" (a tmux session on this server's socket that no layout owns) and
+  "unmarked-agent" (an agent with no PMUX_TAB_ID that carries this server's PMUX_URL or runs under its
+  tmux server). A marked process counts only when this server started it (its PMUX_URL, its socket
+  in TMUX, or its tmux server above it). No environ value but the tab id and no argv is returned.
+  GET lists, for any caller. POST reaps the first two kinds only, from a workspace token (the global
+  token gets 403 forbidden): an unowned-tab process, or a duplicate agent of a workspace the caller
+  may mutate (else refused "forbidden"). Refused: a process a live pane holds ("held-by-session"),
+  one younger than 60 s ("too-young"), a protected pid, or one whose start time changed. Each
+  signalled process (SIGTERM, 3 s, SIGKILL) appends one "tab-orphan-reap" line to
+  ~/.purplemux/audit/coordination.jsonl. Sessions and unmarked agents are listed, never signalled.
+  Response: { "hosts": [{ "host", "status": "ok" | "unreachable" | "unavailable", "error"?,
+              "orphans": [{ "kind", "pid"?, "ppid"?, "comm"?, "ageS", "cwd"?, "tabId"?, "session"? }],
+              "reaped"?: [{ "pid", "comm", "tabId", "kind", "outcome": "killed" | "survivor" | "refused" | "unknown",
+                            "refusal"? }] }] }
+  400 { "code": "remote-host-invalid" } (exit 2) for a host outside remote.hosts. 409 { "code":
+  "conflict" } (exit 3) when a layout cannot be read, or a reap finds no workspace. The watchdog
+  runs the list once an hour and sends each enabled orchestrator one "orphan-sweep" line.
+  CLI: purplemux tab orphans [--host H] [--reap] [--json]
+
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   Body: { "content": "...", "waitMs"?: 0..600000, "raw"?: boolean }
   Send text to the tab and press Enter. Typed into Claude Code, bracketed paste elsewhere.

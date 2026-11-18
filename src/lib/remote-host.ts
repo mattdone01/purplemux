@@ -3,6 +3,7 @@ import os from 'os';
 import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { readServerPort } from '@/lib/server-port';
 import type { IReapedProcess, IReapResult } from '@/lib/tab-reaper';
+import type { IOrphanHostFacts } from '@/lib/tab-orphans';
 import { SSH_CONNECT_TIMEOUT_S, remoteBudget, remoteTimeoutMs } from '@/lib/remote-timeouts';
 
 /**
@@ -398,6 +399,184 @@ if tmux -L "$sock" has-session -t "=$session" 2>/dev/null; then printf 'session\
 `;
 
 /**
+ * Shell helpers both orphan scripts share, builtins only where they run per process. `statf PID` reads
+ * /proc/PID/stat into `s_state`, `s_ppid` and `s_start`. `held_of` is " <pid>:<session> ..." for every descendant
+ * of this server's tmux server, walked down from it through each thread's `children`: the session is the one whose
+ * pane holds the process (`-` for none). `self_anc` is this script and its ancestors.
+ */
+const ORPHAN_SCRIPT_HELPERS = `statf() {
+  s_line=
+  { read -r s_line < "/proc/$1/stat"; } 2>/dev/null || return 1
+  [ -n "$s_line" ] || return 1
+  s_rest=\${s_line##*) }
+  set -- $s_rest
+  s_state=$1; s_ppid=$2; s_start=\${20}
+  [ -n "$s_start" ]
+}
+kids() {
+  k=
+  for f in /proc/"$1"/task/*/children; do r=; { read -r r < "$f"; } 2>/dev/null; k="$k $r"; done
+}
+srv=$(tmux -L "$sock" display-message -p '#{pid}' 2>/dev/null)
+case "$srv" in ''|*[!0-9]*) srv= ;; esac
+tab=$(printf '\\t')
+nl='
+'
+panes=" "
+plist=$(tmux -L "$sock" list-panes -a -F '#{pane_pid} #{session_created} #{session_name}' 2>/dev/null)
+while read -r pp created sname; do
+  [ -n "$pp" ] && panes="$panes$pp:$sname "
+done <<PMUX_PANES
+$plist
+PMUX_PANES
+held_of=" "
+if [ -n "$srv" ]; then
+  front="$srv:-"; count=0
+  while [ -n "$front" ] && [ $count -lt 8192 ]; do
+    next=
+    for item in $front; do
+      q=\${item%%:*}; lab=\${item#*:}
+      case "$panes" in *" $q:"*) lab=\${panes#*" $q:"}; lab=\${lab%% *} ;; esac
+      [ "$q" = "$srv" ] || held_of="$held_of$q:$lab "
+      kids "$q"
+      for c in $k; do next="$next $c:$lab"; count=$((count + 1)); done
+    done
+    front=$next
+  done
+fi
+self_anc=" $$ "
+a=; statf $$ && a=$s_ppid
+while [ -n "$a" ] && [ "$a" -gt 1 ] 2>/dev/null; do self_anc="$self_anc$a "; statf "$a" || break; a=$s_ppid; done
+`;
+
+/**
+ * The orphan scan on a remote host (one `sh -s -- SOCKET URL` run): facts only, judged by `classifyOrphans` on this
+ * server with the same rules as the local scan. The candidates are the user's processes that carry PMUX_TAB_ID,
+ * carry this server's PMUX_URL, or run under its tmux server; never this script, its ancestors, pid 1 or the tmux
+ * server. A marked one is reported when this server started it: its PMUX_URL, its socket in TMUX, or its tmux
+ * server above it. An unmarked one only when it is an agent; its environment is read for the presence of
+ * PMUX_TAB_ID and the PMUX_URL match, nothing else. No argv is printed. Output, one line each, then `end`:
+ * `session\t<age ms>\t<name>` and
+ * `proc\t<pid>\t<ppid>\t<start>\t<age ms>\t<agent 0|1>\t<-|=tab id>\t<url 0|1>\t<socket 0|1>\t<under 0|1>\t<held>\t<comm>\t<cwd>`.
+ */
+export const REMOTE_ORPHAN_SCAN_SCRIPT = `sock=$1; url=$2
+${ORPHAN_SCRIPT_HELPERS}now=$(date +%s)
+hz=$(getconf CLK_TCK 2>/dev/null); [ -n "$hz" ] || hz=100
+up=; { read -r up _ < /proc/uptime; } 2>/dev/null
+frac=\${up#*.}; frac=\${frac#0}; [ -n "$frac" ] || frac=0
+upms=$(( \${up%.*} * 1000 + frac * 10 ))
+spath=$(tmux -L "$sock" display-message -p '#{socket_path}' 2>/dev/null)
+[ -n "$spath" ] || spath="\${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$sock"
+seen=" "
+while read -r pp created sname; do
+  [ -n "$sname" ] || continue
+  case "$seen" in *" $sname "*) continue ;; esac
+  seen="$seen$sname "
+  printf 'session\\t%s\\t%s\\n' "$(( (now - created) * 1000 ))" "$sname"
+done <<PMUX_PANES
+$plist
+PMUX_PANES
+marked=$(grep -Hz '^PMUX_TAB_ID=' /proc/[0-9]*/environ 2>/dev/null | tr '\\n\\0' '?\\n' \\
+  | sed -n -e 's#^/proc/\\([0-9][0-9]*\\)/environ:PMUX_TAB_ID=\\([A-Za-z0-9_.-]\\{1,128\\}\\)$#\\1=\\2#p;t' \\
+    -e 's#^/proc/\\([0-9][0-9]*\\)/environ:PMUX_TAB_ID=.*#\\1=?#p')
+tabs=" $(printf '%s' "$marked" | tr '\\n' ' ') "
+urlpids=
+[ -n "$url" ] && urlpids=$(grep -lzxF "PMUX_URL=$url" /proc/[0-9]*/environ 2>/dev/null | sed -n 's#^/proc/\\([0-9][0-9]*\\)/environ$#\\1#p')
+urls=" $(printf '%s' "$urlpids" | tr '\\n' ' ') "
+socks=" "
+files=$(printf '%s\\n' "$marked" | sed -n 's#^\\([0-9][0-9]*\\)=.*#/proc/\\1/environ#p')
+if [ -n "$files" ]; then
+  esc=$(printf '%s' "$spath" | sed 's/[].[^$*\\\\]/\\\\&/g')
+  socks=" $(grep -lz "^TMUX=$esc," $files 2>/dev/null | sed -n 's#^/proc/\\([0-9][0-9]*\\)/environ$#\\1#p' | tr '\\n' ' ') "
+fi
+cands=$( { printf '%s\\n' "$marked" | sed 's/=.*//'; printf '%s\\n' "$urlpids"; for e in $held_of; do printf '%s\\n' "\${e%%:*}"; done; } | sort -un)
+for p in $cands; do
+  case "$p" in ''|*[!0-9]*|1|"$srv") continue ;; esac
+  case "$self_anc" in *" $p "*) continue ;; esac
+  [ -O "/proc/$p" ] || continue
+  statf "$p" || continue
+  [ "$s_ppid" = "$$" ] && continue
+  ppid=$s_ppid; start=$s_start
+  tabf=-
+  case "$tabs" in *" $p="*) v=\${tabs#*" $p="}; tabf="=\${v%% *}" ;; esac
+  urlf=0; case "$urls" in *" $p "*) urlf=1 ;; esac
+  sockf=0; case "$socks" in *" $p "*) sockf=1 ;; esac
+  under=0; held=
+  case "$held_of" in *" $p:"*) under=1; held=\${held_of#*" $p:"}; held=\${held%% *}; [ "$held" = - ] && held= ;; esac
+  if [ "$tabf" = - ]; then
+    [ $urlf = 1 ] || [ $under = 1 ] || continue
+  else
+    [ $urlf = 1 ] || [ $sockf = 1 ] || [ $under = 1 ] || continue
+  fi
+  comm=; { read -r comm < "/proc/$p/comm"; } 2>/dev/null
+  argv=$(tr '\\0' '\\n' 2>/dev/null < "/proc/$p/cmdline" | head -n 2)
+  argv0=\${argv%%"$nl"*}; entry=
+  case "$argv" in *"$nl"*) entry=\${argv#*"$nl"} ;; esac
+  exe=\${argv0##*/}
+  agent=0
+  case "$exe" in claude|codex|grok) agent=1 ;; esac
+  case "$comm" in claude|codex|grok) agent=1 ;; esac
+  case "$exe" in node|bun) case "$entry" in */claude.js|*/codex.js|*/grok.js|*/@anthropic-ai/claude-code/*|*/@openai/codex/*|*/grok-cli/*) agent=1 ;; esac ;; esac
+  [ "$tabf" = - ] && [ $agent = 0 ] && continue
+  case "$comm" in *"$tab"*) comm=$(printf '%s' "$comm" | tr '\\t' ' ') ;; esac
+  cwd=$(readlink "/proc/$p/cwd" 2>/dev/null)
+  case "$cwd" in *"$nl"*|*"$tab"*) cwd='?' ;; esac
+  age=$(( upms - start * 1000 / hz ))
+  [ $age -ge 0 ] || age=0
+  printf 'proc\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$p" "$ppid" "$start" "$age" "$agent" "$tabf" "$urlf" "$sockf" "$under" "$held" "$comm" "$cwd"
+done
+printf 'end\\n'
+`;
+
+/**
+ * The orphan reap on a remote host (one `sh -s -- SOCKET PID:START...` run) for the (i)/(ii) entries this server
+ * chose from a scan. Each pid is checked again first: never pid 0 or 1, this script or its ancestors, the tmux
+ * server, another user's process, a pid whose start time changed, or a process that a live pane holds. Then the
+ * reap's steps: SIGTERM (+ SIGCONT), up to 3 s of grace, SIGKILL, a settle. Output, one line each, then `end`:
+ * `killed\t<pid>`, `survivor\t<pid>` or `refused\t<pid>\t<protected|identity-changed|held-by-session>`.
+ */
+export const REMOTE_ORPHAN_REAP_SCRIPT = `sock=$1; shift
+${ORPHAN_SCRIPT_HELPERS}same() { statf "$1" && [ "$s_start" = "$2" ] && [ "$s_state" != Z ] && [ "$s_state" != X ]; }
+targets=""
+for t in "$@"; do
+  p=\${t%%:*}; want=\${t#*:}
+  case "$p" in ''|*[!0-9]*|0|1|"$srv") printf 'refused\\t%s\\tprotected\\n' "$p"; continue ;; esac
+  case "$self_anc" in *" $p "*) printf 'refused\\t%s\\tprotected\\n' "$p"; continue ;; esac
+  [ -O "/proc/$p" ] || { printf 'refused\\t%s\\tprotected\\n' "$p"; continue; }
+  same "$p" "$want" || { printf 'refused\\t%s\\tidentity-changed\\n' "$p"; continue; }
+  case "$held_of" in *" $p:"*) h=\${held_of#*" $p:"}; [ "\${h%% *}" = - ] || { printf 'refused\\t%s\\theld-by-session\\n' "$p"; continue; } ;; esac
+  targets="$targets $p:$want"
+done
+for t in $targets; do
+  p=\${t%%:*}; want=\${t#*:}
+  same "$p" "$want" && { kill -TERM "$p" 2>/dev/null; kill -CONT "$p" 2>/dev/null; }
+done
+left="$targets"; i=0
+while [ -n "$left" ] && [ $i -lt 30 ]; do
+  next=""
+  for t in $left; do same "\${t%%:*}" "\${t#*:}" && next="$next $t"; done
+  left=$next
+  [ -n "$left" ] && sleep 0.1
+  i=$((i + 1))
+done
+for t in $left; do same "\${t%%:*}" "\${t#*:}" && kill -KILL "\${t%%:*}" 2>/dev/null; done
+[ -n "$left" ] && sleep 0.3
+i=0
+while [ $i -lt 7 ]; do
+  next=""
+  for t in $left; do same "\${t%%:*}" "\${t#*:}" && next="$next $t"; done
+  left=$next
+  [ -n "$left" ] || break
+  sleep 0.1
+  i=$((i + 1))
+done
+for t in $targets; do
+  case " $left " in *" $t "*) printf 'survivor\\t%s\\n' "\${t%%:*}" ;; *) printf 'killed\\t%s\\n' "\${t%%:*}" ;; esac
+done
+printf 'end\\n'
+`;
+
+/**
  * The remote twin of `observeProviderProcess` (ADR-0021 strict identity,
  * ADR-0022 slice b), as one `sh -s -- SOCKET SESSION PROVIDER` run: the
  * session's one pane, then the pane's descendants (bounded at 512) for the
@@ -552,3 +731,73 @@ export const parseRemoteReap = (stdout: string): IRemoteReapResult => {
   }
   return result;
 };
+
+const intOf = (raw: string | undefined): number | null => {
+  const n = Number(raw);
+  return raw !== undefined && raw !== '' && Number.isInteger(n) ? n : null;
+};
+
+/** The facts of a remote orphan scan; null when the run ended before its `end` line. */
+export const parseRemoteOrphanScan = (stdout: string): IOrphanHostFacts | null => {
+  const lines = stdout.split('\n');
+  if (!lines.some((line) => line === 'end')) return null;
+  const facts: IOrphanHostFacts = { sessions: [], processes: [] };
+  for (const line of lines) {
+    const fields = line.split('\t');
+    if (fields[0] === 'session' && fields.length >= 3) {
+      const ageMs = intOf(fields[1]);
+      const name = fields.slice(2).join('\t');
+      if (ageMs !== null && name) facts.sessions.push({ name, ageMs: Math.max(0, ageMs) });
+    } else if (fields[0] === 'proc' && fields.length >= 13) {
+      const [, pidRaw, ppidRaw, start, ageRaw, agent, tab, url, sock, under, held, comm, ...cwd] = fields;
+      const pid = intOf(pidRaw);
+      const ageMs = intOf(ageRaw);
+      if (pid === null || pid <= 1 || ageMs === null || !/^\d+$/.test(start)) continue;
+      facts.processes.push({
+        pid,
+        ppid: intOf(ppidRaw) ?? 0,
+        comm,
+        ageMs,
+        cwd: cwd.join('\t') || null,
+        start,
+        tabId: tab.startsWith('=') ? tab.slice(1) || '?' : null,
+        urlMatch: url === '1',
+        socketMatch: sock === '1',
+        underServer: under === '1',
+        heldBy: held || null,
+        agent: agent === '1',
+      });
+    }
+  }
+  return facts;
+};
+
+export interface IRemoteOrphanReap {
+  killed: number[];
+  survivors: number[];
+  refused: Array<{ pid: number; refusal: 'protected' | 'identity-changed' | 'held-by-session' }>;
+}
+
+/** A remote orphan reap's answer; null when the run ended before its `end` line. */
+export const parseRemoteOrphanReap = (stdout: string): IRemoteOrphanReap | null => {
+  const lines = stdout.split('\n');
+  if (!lines.some((line) => line === 'end')) return null;
+  const result: IRemoteOrphanReap = { killed: [], survivors: [], refused: [] };
+  for (const line of lines) {
+    const [kind, pidRaw, reason] = line.split('\t');
+    const pid = intOf(pidRaw);
+    if (pid === null) continue;
+    if (kind === 'killed') result.killed.push(pid);
+    else if (kind === 'survivor') result.survivors.push(pid);
+    else if (kind === 'refused') {
+      result.refused.push({ pid, refusal: reason === 'identity-changed' || reason === 'held-by-session' ? reason : 'protected' });
+    }
+  }
+  return result;
+};
+
+export const orphanScanCommand = (url: string): string =>
+  ['sh', '-s', '--', remoteSocketName(), url].map(shQuote).join(' ');
+
+export const orphanReapCommand = (targets: ReadonlyArray<{ pid: number; start: string }>): string =>
+  ['sh', '-s', '--', remoteSocketName(), ...targets.map((t) => `${t.pid}:${t.start}`)].map(shQuote).join(' ');

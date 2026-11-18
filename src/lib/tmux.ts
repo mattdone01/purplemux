@@ -18,6 +18,7 @@ import { getProcessArgs, readProcChildren, type TStrictRuntimeObservation } from
 import { PASTE_END, PASTE_START, TYPED_CHUNK_GAP_MS, planTypedInput } from '@/lib/typed-input';
 import { defaultReaperDeps, reapTabForClose, type IReapResult } from '@/lib/tab-reaper';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
+import type { IOrphanHostFacts } from '@/lib/tab-orphans';
 import {
   REMOTE_SESSION_EXISTS_EXIT,
   RemoteHostError,
@@ -33,6 +34,13 @@ import {
   REMOTE_CAPTURE_SCRIPT,
   parseRemoteCaptures,
   REMOTE_REAP_SCRIPT,
+  REMOTE_ORPHAN_REAP_SCRIPT,
+  REMOTE_ORPHAN_SCAN_SCRIPT,
+  orphanReapCommand,
+  orphanScanCommand,
+  parseRemoteOrphanReap,
+  parseRemoteOrphanScan,
+  type IRemoteOrphanReap,
   parseRemoteProviderObservation,
   remoteSocketName,
   resolveCallbackUrl,
@@ -589,6 +597,70 @@ export const observeRemoteProviderProcess = async (
   const observed = parseRemoteProviderObservation(stdout);
   if (observed.state !== 'present') return observed;
   return { state: 'present', identity: `remote:${host}:${sessionName}:${observed.paneId}:${observed.panePid}:${observed.pid}:${observed.start}:${provider}` };
+};
+
+/** This server's tmux socket path, or null when its tmux server is not running. */
+export const getTmuxSocketPath = async (): Promise<string | null> => {
+  try {
+    const { stdout } = await execFile('tmux', ['-L', TMUX_SOCKET, 'display-message', '-p', '#{socket_path}'], { timeout: CMD_TIMEOUT });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+};
+
+export interface IPaneRoot {
+  session: string;
+  panePid: number;
+  /** How long ago the pane's session was created. */
+  ageMs: number;
+}
+
+/** Every local pane's root process and its session's age; empty when no tmux server runs. */
+export const listLocalPaneRoots = async (): Promise<IPaneRoot[]> => {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFile('tmux', ['-L', TMUX_SOCKET, 'list-panes', '-a', '-F', '#{pane_pid} #{session_created} #{session_name}'], { timeout: CMD_TIMEOUT }));
+  } catch {
+    return [];
+  }
+  const now = Date.now();
+  const roots: IPaneRoot[] = [];
+  for (const line of stdout.split('\n')) {
+    const m = line.match(/^(\d+) (\d+) (.+)$/);
+    if (!m || Number(m[1]) <= 1) continue;
+    roots.push({ session: m[3], panePid: Number(m[1]), ageMs: Math.max(0, now - Number(m[2]) * 1000) });
+  }
+  return roots;
+};
+
+/** A remote scan reads every process of the user once and runs no longer than a close's reap. */
+const REMOTE_ORPHAN_TIMEOUT = 20_000;
+
+/** The orphan facts of a remote host (one script run). Throws `RemoteHostError` when the host does not answer. */
+export const scanRemoteOrphans = async (host: string, callbackUrl: string): Promise<IOrphanHostFacts> => {
+  let stdout: string;
+  try {
+    ({ stdout } = await runSsh(host, orphanScanCommand(callbackUrl), { timeoutMs: REMOTE_ORPHAN_TIMEOUT, input: REMOTE_ORPHAN_SCAN_SCRIPT }));
+  } catch (err) {
+    throw new RemoteHostError(host, `the orphan scan on ${host} did not answer (${describeRemoteFailure(err)})`);
+  }
+  const facts = parseRemoteOrphanScan(stdout);
+  if (!facts) throw new RemoteHostError(host, `the orphan scan on ${host} ended before its last line`);
+  return facts;
+};
+
+/** Signal chosen orphans on a remote host; the script checks each pid again before it signals it. */
+export const reapRemoteOrphans = async (host: string, targets: ReadonlyArray<{ pid: number; start: string }>): Promise<IRemoteOrphanReap> => {
+  let stdout: string;
+  try {
+    ({ stdout } = await runSsh(host, orphanReapCommand(targets), { timeoutMs: REMOTE_ORPHAN_TIMEOUT, input: REMOTE_ORPHAN_REAP_SCRIPT }));
+  } catch (err) {
+    throw new RemoteHostError(host, `the orphan reap on ${host} did not answer (${describeRemoteFailure(err)}); its outcome is unknown`);
+  }
+  const reap = parseRemoteOrphanReap(stdout);
+  if (!reap) throw new RemoteHostError(host, `the orphan reap on ${host} ended before its last line; its outcome is unknown`);
+  return reap;
 };
 
 /**
