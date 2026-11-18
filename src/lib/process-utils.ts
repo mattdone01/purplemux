@@ -136,8 +136,27 @@ export type TStrictRuntimeObservation =
   | { state: 'absent'; reason: string }
   | { state: 'unknown'; reason: string; /** A remote proof: ssh itself failed or timed out, not an on-host doubt (ADR-0049 §6). */ sshFailed?: true };
 
+export type TAgentProvider = 'claude' | 'codex' | 'grok';
+
+const AGENT_PROVIDERS: readonly TAgentProvider[] = ['claude', 'codex', 'grok'];
+
+/** A provider's executable or `comm`, or its node/bun entrypoint (ADR-0021 strict identity). */
+export const matchesProviderProcess = (provider: TAgentProvider, argv: readonly string[], comm: string): boolean => {
+  const executable = argv[0]?.split('/').pop();
+  const entrypoint = argv[1] ?? '';
+  return executable === provider || comm === provider
+    || (['node', 'bun'].includes(executable ?? '') && (entrypoint.endsWith(`/${provider}.js`)
+      || provider === 'claude' && entrypoint.includes('/@anthropic-ai/claude-code/')
+      || provider === 'codex' && entrypoint.includes('/@openai/codex/')
+      || provider === 'grok' && entrypoint.includes('/grok-cli/')));
+};
+
+/** The agent provider a process runs, or null when it is none of them. */
+export const agentProviderOf = (argv: readonly string[], comm: string): TAgentProvider | null =>
+  AGENT_PROVIDERS.find((provider) => matchesProviderProcess(provider, argv, comm)) ?? null;
+
 /** Bounded process inventory: errors and unreadable argv are uncertainty, never death. */
-export const observeProviderProcess = async (rootPid: number, provider: 'claude' | 'codex' | 'grok'): Promise<TStrictRuntimeObservation> => {
+export const observeProviderProcess = async (rootPid: number, provider: TAgentProvider): Promise<TStrictRuntimeObservation> => {
   if (!isLinux) return { state: 'unknown', reason: 'strict process identity unavailable on this platform' };
   try {
     const { stdout } = await execFile('ps', ['-eo', 'pid=,ppid=,comm='], { timeout: 5000, maxBuffer: 4 * 1024 * 1024 });
@@ -154,14 +173,7 @@ export const observeProviderProcess = async (rootPid: number, provider: 'claude'
     for (const process of processes.filter((entry) => descendants.has(entry.pid))) {
       const argv = await getProcessArgv(process.pid);
       if (!argv) return { state: 'unknown', reason: 'process identity unreadable or changed' };
-      const executable = argv[0].split('/').pop();
-      const entrypoint = argv[1] ?? '';
-      const matches = executable === provider || process.command === provider
-        || (['node', 'bun'].includes(executable ?? '') && (entrypoint.endsWith(`/${provider}.js`)
-          || provider === 'claude' && entrypoint.includes('/@anthropic-ai/claude-code/')
-          || provider === 'codex' && entrypoint.includes('/@openai/codex/')
-          || provider === 'grok' && entrypoint.includes('/grok-cli/')));
-      if (matches) {
+      if (matchesProviderProcess(provider, argv, process.command)) {
         const stat = await fs.readFile(`/proc/${process.pid}/stat`, 'utf8');
         const started = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
         if (!started) return { state: 'unknown', reason: 'process start identity unavailable' };

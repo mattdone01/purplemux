@@ -1,6 +1,7 @@
 import { execFile as execFileCb } from 'child_process';
 import fs from 'fs/promises';
 import { promisify } from 'util';
+import os from 'os';
 import path from 'path';
 import { nanoid } from 'nanoid';
 import { PRISTINE_ENV } from '@/lib/pristine-env';
@@ -18,6 +19,7 @@ import { getProcessArgs, readProcChildren, type TStrictRuntimeObservation } from
 import { PASTE_END, PASTE_START, TYPED_CHUNK_GAP_MS, planTypedInput } from '@/lib/typed-input';
 import { defaultReaperDeps, reapTabForClose, type IReapResult } from '@/lib/tab-reaper';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
+import { defaultOrphanScanDeps, liveTmuxProcesses, type IOrphanHostFacts, type IPaneRoot, type TLocalTreeRead } from '@/lib/tab-orphans';
 import {
   REMOTE_SESSION_EXISTS_EXIT,
   RemoteHostError,
@@ -33,6 +35,13 @@ import {
   REMOTE_CAPTURE_SCRIPT,
   parseRemoteCaptures,
   REMOTE_REAP_SCRIPT,
+  REMOTE_ORPHAN_REAP_SCRIPT,
+  REMOTE_ORPHAN_SCAN_SCRIPT,
+  orphanReapCommand,
+  orphanScanCommand,
+  parseRemoteOrphanReap,
+  parseRemoteOrphanScan,
+  type IRemoteOrphanReap,
   parseRemoteProviderObservation,
   remoteSocketName,
   resolveCallbackUrl,
@@ -589,6 +598,104 @@ export const observeRemoteProviderProcess = async (
   const observed = parseRemoteProviderObservation(stdout);
   if (observed.state !== 'present') return observed;
   return { state: 'present', identity: `remote:${host}:${sessionName}:${observed.paneId}:${observed.panePid}:${observed.pid}:${observed.start}:${provider}` };
+};
+
+/** This server's tmux socket path, or null when its tmux server is not running. */
+export const getTmuxSocketPath = async (): Promise<string | null> => {
+  try {
+    const { stdout } = await execFile('tmux', ['-L', TMUX_SOCKET, 'display-message', '-p', '#{socket_path}'], { timeout: CMD_TIMEOUT });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+};
+
+type TTmuxExec = (args: string[]) => Promise<{ stdout: string }>;
+
+const tmuxExec: TTmuxExec = (args) => execFile('tmux', ['-L', TMUX_SOCKET, ...args], { timeout: CMD_TIMEOUT });
+
+type TTmuxRead = { ok: true; stdout: string } | { ok: false; absent: boolean; reason: string };
+
+const readTmux = async (exec: TTmuxExec, args: string[]): Promise<TTmuxRead> => {
+  try {
+    return { ok: true, stdout: (await exec(args)).stdout };
+  } catch (err) {
+    if (isTmuxAbsence(err)) return { ok: false, absent: true, reason: 'no tmux server' };
+    const e = err as { killed?: boolean };
+    return { ok: false, absent: false, reason: e.killed ? `tmux ${args[0]} timed out` : `tmux ${args[0]} failed (${describeRemoteFailure(err)})` };
+  }
+};
+
+/** The socket a tmux started with `-L purple` uses when no server answers to say where it is. */
+const defaultLocalSocketPath = (): string => path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${os.userInfo().uid}`, TMUX_SOCKET);
+
+/** This user's tmux processes that name the local socket, read from /proc; null when it cannot be read. */
+const liveLocalTmux = async (): Promise<number[] | null> => {
+  if (!isLinux) return null;
+  const deps = defaultOrphanScanDeps(defaultReaperDeps({ descendants: getDescendantPids, tmuxServerPid: async () => null }));
+  return liveTmuxProcesses(deps, TMUX_SOCKET, defaultLocalSocketPath());
+};
+
+/**
+ * This server's tmux server pid and every pane root, read for the orphan sweep. "No server" is tmux's own answer
+ * (`TMUX_ABSENCE`) AND no tmux process of this user still naming the socket: a socket file deleted under a live
+ * server reads as "no server" while its seats run. Any other failure, a timeout, or a live server behind a missing
+ * socket is `unreadable`, never an empty list (it would leave every live seat unheld, and reapable).
+ */
+export const readLocalTree = async (
+  exec: TTmuxExec = tmuxExec,
+  liveTmux: () => Promise<number[] | null> = liveLocalTmux,
+): Promise<TLocalTreeRead> => {
+  const noServer = async (): Promise<TLocalTreeRead> => {
+    const live = await liveTmux();
+    if (live === null) return { readable: false, reason: 'no tmux server answered, and the process table cannot be read to prove none runs' };
+    if (live.length > 0) return { readable: false, reason: `socket gone, server alive (pid ${live.join(' ')})` };
+    return { readable: true, serverPid: null, panes: [] };
+  };
+  const server = await readTmux(exec, ['display-message', '-p', '#{pid}']);
+  if (!server.ok) return server.absent ? noServer() : { readable: false, reason: server.reason };
+  const serverPid = Number(server.stdout.trim());
+  if (!Number.isInteger(serverPid) || serverPid <= 1) return { readable: false, reason: 'tmux server pid unreadable' };
+  const listed = await readTmux(exec, ['list-panes', '-a', '-F', '#{pane_pid} #{session_created} #{session_name}']);
+  if (!listed.ok) return listed.absent ? noServer() : { readable: false, reason: listed.reason };
+  const now = Date.now();
+  const panes: IPaneRoot[] = [];
+  for (const line of listed.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const m = line.match(/^(\d+) (\d+) (.+)$/);
+    if (!m || Number(m[1]) <= 1) return { readable: false, reason: 'tmux list-panes printed a line it should not' };
+    panes.push({ session: m[3], panePid: Number(m[1]), ageMs: Math.max(0, now - Number(m[2]) * 1000) });
+  }
+  return { readable: true, serverPid, panes };
+};
+
+/** A remote scan reads every process of the user once and runs no longer than a close's reap. */
+const REMOTE_ORPHAN_TIMEOUT = 20_000;
+
+/** The orphan facts of a remote host (one script run). Throws `RemoteHostError` when the host does not answer. */
+export const scanRemoteOrphans = async (host: string, callbackUrl: string): Promise<IOrphanHostFacts | 'unavailable'> => {
+  let stdout: string;
+  try {
+    ({ stdout } = await runSsh(host, orphanScanCommand(callbackUrl), { timeoutMs: REMOTE_ORPHAN_TIMEOUT, input: REMOTE_ORPHAN_SCAN_SCRIPT }));
+  } catch (err) {
+    throw new RemoteHostError(host, `the orphan scan on ${host} did not answer (${describeRemoteFailure(err)})`);
+  }
+  const facts = parseRemoteOrphanScan(stdout);
+  if (!facts) throw new RemoteHostError(host, `the orphan scan on ${host} ended before its last line`);
+  return facts;
+};
+
+/** Signal chosen orphans on a remote host; the script checks each pid again before it signals it. */
+export const reapRemoteOrphans = async (host: string, targets: ReadonlyArray<{ pid: number; start: string }>): Promise<IRemoteOrphanReap> => {
+  let stdout: string;
+  try {
+    ({ stdout } = await runSsh(host, orphanReapCommand(targets), { timeoutMs: REMOTE_ORPHAN_TIMEOUT, input: REMOTE_ORPHAN_REAP_SCRIPT }));
+  } catch (err) {
+    throw new RemoteHostError(host, `the orphan reap on ${host} did not answer (${describeRemoteFailure(err)}); its outcome is unknown`);
+  }
+  const reap = parseRemoteOrphanReap(stdout);
+  if (!reap) throw new RemoteHostError(host, `the orphan reap on ${host} ended before its last line; its outcome is unknown`);
+  return reap;
 };
 
 /**

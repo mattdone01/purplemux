@@ -20,6 +20,8 @@ describe('the wake-class table (AC 1)', () => {
     ['long-wait', 'digest'],
     ['stuck', 'digest'],
     ['probe-failed', 'digest'],
+    ['orphan-sweep', 'digest'],
+    ['orphan-suspect', 'urgent'],
     ['mission', 'urgent'],
     ['resume', 'urgent'],
     ['watch', 'urgent'],
@@ -115,7 +117,7 @@ describe('the wake-class table (AC 1)', () => {
       'ready-for-review', 'turn-ended', 'idle-no-end-line', 'long-wait', 'stuck', 'probe-failed', 'mission', 'resume', 'watch',
       'deploy', 'note', 'red-main', 'rotate', 'turn-marker', 'bg-completed', 'bg-failed', 'bg-exited-unknown', 'bg-died',
       'bg-host-unreachable', 'heartbeat', 'flag', 'alarm', 'tab-send', 'standing-order', 'curator-candidate',
-      'note-acked', 'note-pointer-spent']);
+      'note-acked', 'note-pointer-spent', 'orphan-sweep', 'orphan-suspect']);
     expect(new Set(Object.keys(WAKE_CLASS_TABLE))).toEqual(pinned);
     // PMUX-NOTE-DELIVERY: an ack is recorded, never typed; a pointer line that may sit in a composer wakes its sender.
     expect(classifyWake('note-acked')).toBe('log');

@@ -178,6 +178,11 @@ export interface ITab {
    * and never sends a sent one again.
    */
   watchdogTurnEnd?: import('@/types/status').ITurnEndRecord | null;
+  /**
+   * The orphan liveness guard holds this tab `unknown` for an unmarked agent that may be its own: the suspect's pid,
+   * the state the tab showed before and its launch stamp, so a restart keeps the hold instead of reading the tab idle.
+   */
+  orphanHold?: { pid: number; prevState: TCliState; launchedAt: number };
   webUrl?: string | null;
   terminalRatio?: number;
   terminalCollapsed?: boolean;

@@ -800,6 +800,15 @@ export const updateTabCliStatus = (
     return true;
   });
 
+/** Persist the orphan liveness hold (or clear it with null); unchanged content is not written. */
+export const updateTabOrphanHold = (sessionName: string, hold: ITab['orphanHold'] | null): Promise<void> =>
+  mutateTab(sessionName, (tab) => {
+    if (JSON.stringify(tab.orphanHold ?? null) === JSON.stringify(hold ?? null)) return false;
+    if (hold) tab.orphanHold = hold;
+    else delete tab.orphanHold;
+    return true;
+  });
+
 /** Persist the watchdog's stop record (or clear it with null); unchanged content is not written. */
 export const updateTabWatchdogTurnEnd = (
   sessionName: string,

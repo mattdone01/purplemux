@@ -47,7 +47,7 @@ State of the work in progress inside the Claude CLI. Only changed by determinist
 | `idle` | Response complete + acknowledged by user | `session-start` hook, synthetic `interrupt` event, or `dismissTab` |
 | `ready-for-review` | Response complete, awaiting user ack | `stop` hook |
 | `needs-input` | Permission prompt / awaiting user input | `notification` hook |
-| `unknown` | Was `busy` before a server restart, recovery not finished | Awaiting `resolveUnknown` |
+| `unknown` | Was `busy` before a server restart, recovery not finished; or held by an orphan suspect (below) | Awaiting `resolveUnknown`, or the poll's release of the hold |
 | `inactive` | Initial state when the Claude process is not running | Default on tab creation |
 | `startup-prompt` | The Claude process runs but waits at a startup dialog no hook reports: folder trust or external CLAUDE.md imports (D14). `startupPrompt` names it (`folder-trust` / `external-imports`) with `since` | The readiness pane probe (below). Runtime only: the layout stores `inactive` |
 | `cancelled` | User is deleting the tab | Client-only local state |
@@ -488,6 +488,21 @@ For agent tabs in any active state (`busy` / `idle` / `needs-input` / `ready-for
 3. **F2 — pane title is shell-style**: the title looks like `<cmd>|<path>` (i.e. tmux's `set-titles-string` default) or is empty. Agent CLIs override this to their own format, so a non-shell title is treated as "agent still owns the pane" and skips the transition. This blocks the false negative when an agent forks a transient child mid-poll.
 
 Together these guards keep the `cliState` stable through the boot/fork windows that previously caused indicator ping-pong, while still recognizing a clean exit (`/quit`, `/exit`) within one poll cycle.
+
+### Orphan Suspect Guard
+
+Before the transition above, the poll looks for an agent the tab cannot see: `findOrphanSuspects` scans the tab's host (local `/proc`, or one `REMOTE_ORPHAN_SCAN_SCRIPT` run over ssh) for agent processes with no `PMUX_TAB_ID` that carry this server's `PMUX_URL` or run under its tmux server. `suspectForTab` picks the one this tab answers for, if any:
+
+1. it shares the tab's cwd (the pane's path, else the tab's `cwd`);
+2. it started after the tab's `lastResumeOrStartedAt`;
+3. no other live session's pane holds it;
+4. of the agent tabs on that host that share the cwd, or whose cwd is unknown, this tab's launch is the latest before the process started, so one suspect holds at most one tab.
+
+The suspect's start is dated from a clock read before the scan, so scan or ssh time can only make it earlier.
+
+With a suspect the tab goes `unknown` (silent, no `inactive` nudge, no restart) and the orchestrator gets one `orphan-suspect` nudge naming the pid. `resolveUnknown` leaves a held tab alone. The hold is also written to the tab in the layout (`orphanHold`: pid, previous state, launch stamp), so a restart restores it with the launch stamp before `resolveUnknown` runs; a hold beside any other state is cleared. Each later poll checks again: when the agent is back in the pane or the suspect is gone, the tab takes its previous state back and is judged as above. With no suspect, a tab without a launch stamp or cwd, or a host that cannot be scanned, the answer is `inactive` exactly as before.
+
+The same scan runs once an hour as a list (`runOrphanSweep`, never a kill): a non-empty list sends each enabled orchestrator one `orphan-sweep` line with the entries of its workspace and those of no workspace. `purplemux tab orphans [--host H] [--reap]` shows the lists; `--reap` signals only marked processes of a tab in no layout and duplicate agents outside their tab's pane.
 
 ---
 

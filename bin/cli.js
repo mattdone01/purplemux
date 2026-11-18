@@ -2475,6 +2475,43 @@ const cmdTabRestart = async (args) => {
   process.stdout.write(`${lines.join('\n')}\n`);
 };
 
+// The orphan sweep: processes and sessions no tab can reach (a marked process of a closed tab, an agent outside
+// its tab's pane, a session no layout owns, an agent with no tab marker). Lists by default; --reap signals only the
+// first two kinds, and never a process a live pane holds.
+const orphanLine = (o) => {
+  const age = `age ${o.ageS}s`;
+  if (o.kind === 'unowned-session') return `  ${o.kind} ${o.session} ${age}`;
+  const where = o.cwd ? ` cwd ${o.cwd}` : '';
+  const tab = o.tabId ? ` tab ${o.tabId}` : '';
+  const held = o.session ? ` held-by ${o.session}` : '';
+  return `  ${o.kind} pid ${o.pid} ppid ${o.ppid} ${o.comm} ${age}${tab}${held}${where}`;
+};
+
+const cmdTabOrphans = async (args) => {
+  requireEnv();
+  const reap = args.includes('--reap');
+  const asJson = args.includes('--json');
+  const host = flagValue(args, '--host');
+  if (args.includes('--host') && !host) die('--host needs a value: local or a host of remote.hosts');
+  const rest = stripBooleanFlags(stripFlags(args, ['--host']), ['--reap', '--json']);
+  if (rest.length > 0) die(`unexpected argument: ${rest[0]}`);
+  const { body } = reap
+    ? await api('POST', '/api/cli/tabs/orphans', { reap: true, ...(host ? { host } : {}) })
+    : await api('GET', `/api/cli/tabs/orphans${host ? `?host=${encodeURIComponent(host)}` : ''}`);
+  if (asJson) return out(body);
+  const lines = [];
+  for (const h of Array.isArray(body?.hosts) ? body.hosts : []) {
+    const orphans = Array.isArray(h.orphans) ? h.orphans : [];
+    const unread = h.tree && h.tree.complete === false ? ` [pane tree unreadable: ${h.tree.reason}; nothing here is reaped]` : '';
+    lines.push(`${h.host}: ${h.status === 'ok' ? `${orphans.length} orphan${orphans.length === 1 ? '' : 's'}` : h.status}${h.error ? ` (${h.error})` : ''}${unread}`);
+    for (const o of orphans) lines.push(orphanLine(o));
+    for (const r of Array.isArray(h.reaped) ? h.reaped : []) {
+      lines.push(`  ${r.outcome} pid ${r.pid} ${r.comm} ${r.kind}${r.tabId ? ` tab ${r.tabId}` : ''}${r.refusal ? ` (${r.refusal})` : ''}`);
+    }
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+};
+
 // Liveness probes: the watchdog runs --cmd on an interval; its last non-empty
 // stdout line must be a numeric seconds-since-last-progress value. Above --stale-after, the orchestrator
 // gets a STALLED nudge and the human gets a push alert.
@@ -3708,6 +3745,14 @@ Commands:
                                            Prints "ok TAB_ID restarted (resumed|fresh)". web-browser, diff and
                                            agent-sessions tabs exit 2 (restart-unsupported); a process or session
                                            left after the reap exits 1 (restart-not-confirmed), nothing relaunched
+  tab orphans [--host H] [--reap] [--json]
+                                           List, per host (local and each remote.hosts host that owns a tab):
+                                           unowned-tab (PMUX_TAB_ID names a tab in no layout), duplicate-agent
+                                           (an agent of a layout tab outside its pane), unowned-session (a tmux
+                                           session no layout owns) and unmarked-agent (an agent with no
+                                           PMUX_TAB_ID, started by this server). --reap signals unowned-tab and
+                                           duplicate-agent only (SIGTERM, 3 s, SIGKILL; audited) and refuses a
+                                           process a live pane holds; a workspace token only. --host local|H
   tab probe set -w WS TAB_ID --cmd CMD --stale-after SECS
                                            Register a liveness probe on a tab's delegated work. The watchdog runs
              [--interval SECS] [--label L] CMD (default every 60s); its last non-empty stdout line must be only a
@@ -4163,6 +4208,7 @@ const main = async () => {
         case 'result': return cmdTabResult(rest);
         case 'close': return cmdTabClose(rest);
         case 'restart': return cmdTabRestart(rest);
+        case 'orphans': return cmdTabOrphans(rest);
         case 'probe': return cmdTabProbe(rest);
         case 'bg': return cmdTabBg(rest);
         case 'reports-to': return cmdTabReportsTo(rest);
