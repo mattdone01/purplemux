@@ -255,7 +255,7 @@ export interface IStandupUpdateMessage {
   standup: IWorkspaceStandup;
 }
 
-export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'idle-no-end-line' | 'long-wait' | 'api-error' | 'usage-limit' | 'auth-failure' | 'rate-limit' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-host-unreachable' | 'bg-died' | 'model-drift';
+export type TOrchestrationNudgeKind = 'needs-input' | 'ready-for-review' | 'turn-marker' | 'idle-no-end-line' | 'long-wait' | 'api-error' | 'usage-limit' | 'auth-failure' | 'rate-limit' | 'turn-ended' | 'inactive' | 'stuck' | 'heartbeat' | 'off-scope' | 'thrash' | 'stalled' | 'probe-failed' | 'bg-completed' | 'bg-failed' | 'bg-exited-unknown' | 'bg-host-unreachable' | 'bg-died' | 'model-drift' | 'orphan-sweep' | 'orphan-suspect';
 
 export interface IOrchestrationNudge {
   id: string;

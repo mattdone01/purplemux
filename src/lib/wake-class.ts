@@ -113,6 +113,8 @@ export const WAKE_CLASS_TABLE: Readonly<Record<TWakeKind, TRule>> = {
   inactive: 'urgent',
   stalled: 'urgent',
   'model-drift': 'urgent',
+  // A tab held unknown, not inactive, by an agent outside its pane: a respawn now would start a second agent.
+  'orphan-suspect': 'urgent',
   'bg-failed': byWaitingTab,
   'bg-exited-unknown': byWaitingTab,
   // Goes to the orchestrator, never the tab on the host that is down (D63): the host stops that worker.
@@ -125,6 +127,8 @@ export const WAKE_CLASS_TABLE: Readonly<Record<TWakeKind, TRule>> = {
   'long-wait': 'digest',
   stuck: 'digest',
   'probe-failed': 'digest',
+  // The hourly list: nothing was killed and nothing waits on it.
+  'orphan-sweep': 'digest',
   // The first beat of an idle episode is news; later beats of the same episode are unchanged.
   heartbeat: (detail) => ((detail.beat ?? 1) > 1 ? 'log' : 'digest'),
   mission: 'urgent',

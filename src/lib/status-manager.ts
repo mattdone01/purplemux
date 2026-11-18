@@ -62,6 +62,8 @@ import { readFleetConfig, valueOf } from '@/lib/fleet-config-store';
 import { enqueueNotice, onInboxHeld, withdrawNotice } from '@/lib/inbox-store';
 import type { IInboxItem } from '@/types/inbox';
 import { getLivenessManager } from '@/lib/liveness-manager';
+import { findOrphanSuspects, listOrphanEntries, orphanWorkspace, type IOrphanHostEntries } from '@/lib/tab-orphans-service';
+import { suspectForTab, viewOrphan, type IOrphanSuspect, type ISuspectPeer } from '@/lib/tab-orphans';
 import { jobHoldsWork } from '@/lib/background-job-state';
 import { readLivenessEvidence } from '@/lib/liveness-store';
 import { getLeaseSweeper, setLeaseAgentStateSource, type ITabAgentState } from '@/lib/lease-sweeper';
@@ -249,6 +251,11 @@ const TURN_ERROR_ALERT_LEAD: Readonly<Record<'api-error' | 'usage-limit' | 'auth
 };
 const PROCESS_START_CACHE_MS = 60_000;
 const AGENT_LAUNCH_GRACE_MS = 5_000;
+/** The orphan list runs once an hour, and first a few minutes after start so a restart does not skip it. */
+export const ORPHAN_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const ORPHAN_SWEEP_FIRST_MS = 5 * 60 * 1000;
+/** At most this many pids or sessions are named per kind in the hourly line. */
+const ORPHAN_LINE_NAMES = 5;
 // A Claude or Grok tab whose SessionStart hook never fired stays `inactive` with
 // its prompt up, and `tab send` refuses it (L8: W1, 2026-09-26 01:06Z). After this
 // long inactive with the agent running, the poll looks at the pane (story 17).
@@ -395,6 +402,36 @@ const PARK_IGNORED_LEASE_KINDS = new Set(['num', 'pool-cancel']);
 /** How far back an undelivered urgent event keeps a parked coordinator's heartbeat (ADR-0049 §5). */
 const PARK_UNDELIVERED_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+const ORPHAN_KIND_LABEL: Readonly<Record<string, string>> = {
+  'unowned-tab': 'marked for a tab in no layout',
+  'duplicate-agent': 'agent outside its tab\'s pane',
+  'unowned-session': 'session no layout owns',
+  'unmarked-agent': 'agent with no tab marker',
+};
+
+/** The hourly line for one workspace: its own entries and those of no workspace, per host and kind; null for none. */
+export const orphanSweepDetail = (hosts: readonly IOrphanHostEntries[], workspaceId: string): string | null => {
+  const parts: string[] = [];
+  for (const h of hosts) {
+    const byKind = new Map<string, string[]>();
+    for (const entry of h.entries) {
+      const owner = orphanWorkspace(entry);
+      if (owner !== null && owner !== workspaceId) continue;
+      const view = viewOrphan(entry);
+      const name = entry.kind === 'unowned-session' ? view.session! : `pid ${view.pid}${view.tabId ? ` (tab ${view.tabId})` : ''}`;
+      byKind.set(view.kind, [...(byKind.get(view.kind) ?? []), name]);
+    }
+    if (byKind.size === 0) continue;
+    const kinds = [...byKind].map(([kind, names]) => {
+      const shown = names.slice(0, ORPHAN_LINE_NAMES).join(', ');
+      return `${names.length} ${ORPHAN_KIND_LABEL[kind] ?? kind} (${shown}${names.length > ORPHAN_LINE_NAMES ? ', …' : ''})`;
+    });
+    parts.push(`${h.host}: ${kinds.join('; ')}`);
+  }
+  if (parts.length === 0) return null;
+  return `${parts.join(' | ')}. List: purplemux tab orphans [--host H]. Reap the first two kinds only: purplemux tab orphans --reap`;
+};
+
 export class StatusManager {
   private tabs = new Map<string, ITabStatusEntry>();
   private orchestrationPendingLaunches = new Set<string>();
@@ -504,6 +541,15 @@ export class StatusManager {
    * (PMUX-REMOTE-SEND). A later answered read that proves the agent still runs gives that state back.
    */
   private readonly probeInactive = new Map<string, IProbeInactive>();
+  /**
+   * Tabs held `unknown`, not `inactive`, because an unmarked agent outside their pane may be their own (the orphan
+   * liveness guard), with the suspect and the state they showed before. Nothing turns them inactive or restarts them
+   * while the suspect lives; once it is gone the tab takes its state back and the poll judges it again.
+   */
+  private readonly orphanHolds = new Map<string, { pid: number; prevState: TCliState }>();
+  /** The hourly orphan list (list only, never a kill): when it next runs, and whether one runs now. */
+  private orphanSweepDueAt = Date.now() + ORPHAN_SWEEP_FIRST_MS;
+  private orphanSweepRunning = false;
   /** Fleet outage mode (PMUX-REMOTE-RESILIENCE fix 2): N tabs failing with one key hold every such tab. */
   private readonly outages = new ProviderOutageTracker();
   /** A rate-limited tab's pending backoff resume. */
@@ -921,6 +967,8 @@ export class StatusManager {
   private async resolveUnknown(tabId: string): Promise<void> {
     const entry = this.tabs.get(tabId);
     if (!entry || entry.cliState !== 'unknown') return;
+    // Held by an orphan suspect: the poll releases it, never this resolution (it would read the absent agent as idle).
+    if (this.orphanHolds.has(tabId)) return;
 
     const provider = getProviderByPanelType(entry.panelType);
     const panes = await getAllPanesInfo();
@@ -1342,6 +1390,7 @@ export class StatusManager {
     const knownTabIds = new Set<string>();
     const tabsBeforePoll = new Set(this.tabs.keys());
     const proofRequests: IRemoteProofRequest[] = [];
+    const suspectScans = new Map<string, Promise<IOrphanSuspect[] | null>>();
     const now = Date.now();
     for (const [tabId, retirement] of this.retiredTabs) {
       if (retirement.until <= now) this.retiredTabs.delete(tabId);
@@ -1612,6 +1661,22 @@ export class StatusManager {
           }
         }
 
+        const hold = this.orphanHolds.get(tab.id);
+        if (hold && existing.cliState === 'unknown') {
+          const running = await agentRunningNow();
+          current();
+          const suspect = running === false ? await this.orphanSuspect(tab, existing, paneInfo, panesInfo, suspectScans) : null;
+          current();
+          // The agent is back in its pane, or the suspect is gone: the tab takes its state back and is judged below.
+          if (running !== null && !suspect) {
+            log.info({ tabId: tab.id, pid: hold.pid, running }, 'orphan hold released');
+            this.orphanHolds.delete(tab.id);
+            existing.cliState = hold.prevState;
+            this.persistToLayout(existing);
+            this.broadcastUpdate(tab.id, existing);
+          }
+        }
+
         if (provider && AGENT_GUARDED_STATES.has(existing.cliState)) {
           const stamp = existing.lastResumeOrStartedAt;
           const inGrace = stamp !== undefined && now - stamp < AGENT_LAUNCH_GRACE_MS;
@@ -1619,6 +1684,12 @@ export class StatusManager {
             const title = existing.paneTitle ?? '';
             const titleShellStyle = !!title && SHELL_TITLE_RE.test(title);
             if ((!title || titleShellStyle) && (await agentRunningNow()) === false) {
+              const suspect = await this.orphanSuspect(tab, existing, paneInfo, panesInfo, suspectScans);
+              current();
+              if (suspect) {
+                this.holdForOrphan(tab, existing, suspect);
+                continue;
+              }
               log.info({ tabId: tab.id, prevState: existing.cliState, host: tab.host }, 'agent process gone — transitioning to inactive');
               const prevState = existing.cliState;
               const prevReadyForReviewAt = existing.readyForReviewAt ?? null;
@@ -1713,6 +1784,7 @@ export class StatusManager {
         this.inactiveSince.delete(tabId);
         this.unreadInactive.delete(tabId);
         this.probeInactive.delete(tabId);
+        this.orphanHolds.delete(tabId);
         this.pollBoundSessions.delete(tabId);
         this.sessionBindingEpoch.delete(tabId);
         this.processStartCache.delete(tabId);
@@ -1736,6 +1808,8 @@ export class StatusManager {
     await this.runOrchestratorKeeper().catch((err) => {
       log.warn(`orchestrator keeper failed: ${err instanceof Error ? err.message : err}`);
     });
+    // Not awaited: a remote host's scan takes seconds, and the list kills nothing. Only a started server sweeps.
+    if (this.initialized) void this.runOrphanSweep(Date.now());
 
     current();
     await getLivenessManager().tick((event) => {
@@ -1993,6 +2067,86 @@ export class StatusManager {
     const nudge = await this.sendNudge(workspaceId, targetTabId, tabId, tabName, kind, message, { toWaitingTab: targetTabId === tabId });
     log.info({ tabId, kind, targetTabId, delivered: nudge.delivered, wakeClass: nudge.wakeClass }, 'liveness nudge');
     return nudge.delivered;
+  }
+
+  /**
+   * The orphan liveness guard: before a tab whose agent reads as gone turns inactive, the unmarked agent on its host
+   * that it answers `unknown` for (`suspectForTab`), or null for `absent`. A host that cannot be scanned is absent,
+   * as before. No scan runs for a tab without a launch stamp or a cwd: no suspect could match it.
+   */
+  private async orphanSuspect(
+    tab: ITab,
+    entry: ITabStatusEntry,
+    paneInfo: IPaneInfo | undefined,
+    panes: Map<string, IPaneInfo>,
+    scans: Map<string, Promise<IOrphanSuspect[] | null>>,
+  ): Promise<IOrphanSuspect | null> {
+    const cwd = paneInfo?.path || tab.cwd || null;
+    if (entry.lastResumeOrStartedAt === undefined || !cwd) return null;
+    const host = tab.host ?? null;
+    const key = host ?? '';
+    if (!scans.has(key)) scans.set(key, findOrphanSuspects(host));
+    const suspects = await scans.get(key)!;
+    if (!suspects || suspects.length === 0) return null;
+    const peers: ISuspectPeer[] = [];
+    for (const [tabId, other] of this.tabs) {
+      if ((other.host ?? null) !== host || !isAgentPanelType(other.panelType)) continue;
+      const otherCwd = tabId === tab.id ? cwd : panes.get(other.tmuxSession)?.path || null;
+      peers.push({ tabId, sessionName: other.tmuxSession, cwd: otherCwd, launchedAt: other.lastResumeOrStartedAt ?? null });
+    }
+    return suspectForTab(tab.id, peers, suspects);
+  }
+
+  /** `unknown`, not `inactive`: nothing restarts the tab, and its orchestrator hears once which pid holds it. */
+  private holdForOrphan(tab: ITab, entry: ITabStatusEntry, suspect: IOrphanSuspect): void {
+    const prevState = entry.cliState;
+    log.info({ tabId: tab.id, host: tab.host, pid: suspect.pid }, 'agent gone from its pane, but an unmarked agent may be its own — unknown, not inactive');
+    this.applyCliState(tab.id, entry, 'unknown', { silent: true, nudge: null });
+    this.orphanHolds.set(tab.id, { pid: suspect.pid, prevState });
+    this.persistToLayout(entry);
+    this.broadcastUpdate(tab.id, entry);
+    const where = tab.host ? `on ${tab.host}` : 'on this host';
+    const detail = `its agent is not in its pane, but pid ${suspect.pid} (${suspect.comm || 'unknown'}) ${where}, an agent with no tab marker, `
+      + `started after the tab's last launch in the tab's cwd${suspect.heldBy ? ` inside its own pane (${suspect.heldBy})` : ', and no other pane holds it'}. `
+      + `See it with: purplemux tab orphans --host ${tab.host ?? 'local'}`;
+    this.nudgeOrchestrator(tab.id, entry, 'orphan-suspect', detail, `orphan:${suspect.pid}`).catch((err) => {
+      log.warn(`orphan suspect nudge failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  /**
+   * The hourly orphan list (never a kill): a non-empty list sends each workspace orchestrator one line naming what
+   * is its own (a duplicate agent of its tab, a session named for its workspace) and what belongs to no workspace.
+   */
+  private async runOrphanSweep(now: number): Promise<void> {
+    if (this.orphanSweepRunning || now < this.orphanSweepDueAt) return;
+    this.orphanSweepRunning = true;
+    this.orphanSweepDueAt = now + ORPHAN_SWEEP_INTERVAL_MS;
+    try {
+      const hosts = await listOrphanEntries();
+      await this.reportOrphanSweep(hosts);
+    } catch (err) {
+      log.warn(`orphan sweep failed: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      this.orphanSweepRunning = false;
+    }
+  }
+
+  private async reportOrphanSweep(hosts: readonly IOrphanHostEntries[]): Promise<void> {
+    const total = hosts.reduce((n, h) => n + h.entries.length, 0);
+    log.info({ total, hosts: hosts.map((h) => ({ host: h.host, status: h.status, orphans: h.entries.length })) }, 'orphan sweep');
+    if (total === 0) return;
+    const workspaceData = await getWorkspacesCached();
+    for (const ws of workspaceData?.workspaces ?? []) {
+      const orch = ws.orchestration;
+      if (!orch?.enabled || !orch.orchestratorTabId) continue;
+      const entry = this.tabs.get(orch.orchestratorTabId);
+      if (!entry) continue;
+      const detail = orphanSweepDetail(hosts, ws.id);
+      if (!detail) continue;
+      const message = buildNudgeMessage('orphan-sweep', orch.orchestratorTabId, entry.tabName, ws.id, detail);
+      await this.sendNudge(ws.id, orch.orchestratorTabId, orch.orchestratorTabId, entry.tabName, 'orphan-sweep', message, {});
+    }
   }
 
   // 워커는 상태 전환 훅이 깨워주지만, 워커가 하나도 없을 때 orchestrator가
@@ -2304,6 +2458,7 @@ export class StatusManager {
     // Out of unknown by any other path than its resolution (a hook, the mid-turn read): the inactive it stood for is gone.
     if (prevState === 'unknown' && newState !== 'unknown') this.unreadInactive.delete(tabId);
     if (newState !== 'inactive') this.probeInactive.delete(tabId);
+    if (newState !== 'unknown') this.orphanHolds.delete(tabId);
     entry.cliState = newState;
     entry.startupPrompt = newState === 'startup-prompt' ? opts.startupPrompt ?? null : null;
     // The agent process is gone: its halt went with it, and a resume would be typed into its shell.

@@ -156,6 +156,10 @@ export const buildNudgeMessage = (
       return `${NUDGE_PREFIX} ${who} BACKGROUND JOB EXITED: ${detail ?? 'a legacy background-job notification did not record a reliable outcome'}. ${capture} — Inspect its artifacts and logs before deciding whether it succeeded or failed. Do not restart blindly.`;
     case 'model-drift':
       return `${NUDGE_PREFIX} ${who} MODEL POLICY MISMATCH: ${detail ?? 'the worker model or settings do not match its assignment'}. Automated dispatch is held. Inspect recorded model/settings and restore the assigned model before resuming; do not restart a running task blindly.`;
+    case 'orphan-suspect':
+      return `${NUDGE_PREFIX} ${who} reads UNKNOWN, not inactive: ${detail ?? 'an agent outside its pane may be its own'}. Nothing was restarted or killed. Do NOT respawn it until that process is accounted for: a respawn starts a second agent beside it.`;
+    case 'orphan-sweep':
+      return `${NUDGE_PREFIX} ORPHANS (hourly list; nothing was killed): ${detail ?? 'see purplemux tab orphans'}`;
     case 'heartbeat':
       return buildHeartbeatMessage(0, workspaceId);
   }
