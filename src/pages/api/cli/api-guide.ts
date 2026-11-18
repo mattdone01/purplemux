@@ -576,15 +576,21 @@ POST /api/cli/tabs/orphans   Body: { "reap": true, "host"?: "local" | H }
   "duplicate-agent" (an agent whose PMUX_TAB_ID names a layout tab, outside that tab's pane tree),
   "unowned-session" (a tmux session on this server's socket that no layout owns) and
   "unmarked-agent" (an agent with no PMUX_TAB_ID that carries this server's PMUX_URL or runs under its
-  tmux server). A marked process counts only when this server started it (its PMUX_URL, its socket
+  tmux server; in a pane a layout owns, every agent but that pane's own agent and its sub-agents). A marked process counts only when this server started it (its PMUX_URL, its socket
   in TMUX, or its tmux server above it). No environ value but the tab id and no argv is returned.
   GET lists, for any caller. POST reaps the first two kinds only, from a workspace token (the global
   token gets 403 forbidden): an unowned-tab process, or a duplicate agent of a workspace the caller
-  may mutate (else refused "forbidden"). Refused: a process a live pane holds ("held-by-session"),
-  one younger than 60 s ("too-young"), a protected pid, or one whose start time changed. Each
+  may mutate (else refused "forbidden"). Refused: every target on a host whose pane tree could not be
+  read whole, a tmux failure or timeout, an unreadable process table, the walk's bound, or a process
+  under the tmux server that no pane holds ("tree-unreadable"; the scan's "tree" says why, and the
+  local reap reads the tree again before it signals); a process a live pane holds
+  ("held-by-session"); one younger than 60 s ("too-young"); an unowned-tab process while any
+  workspace's layout file is missing ("layout-missing"); a protected pid ("protected"); one whose
+  start time changed ("identity-changed"). Each
   signalled process (SIGTERM, 3 s, SIGKILL) appends one "tab-orphan-reap" line to
   ~/.purplemux/audit/coordination.jsonl. Sessions and unmarked agents are listed, never signalled.
-  Response: { "hosts": [{ "host", "status": "ok" | "unreachable" | "unavailable", "error"?,
+  Response: { "hosts": [{ "host", "status": "ok" | "unreachable" | "unavailable" (no /proc), "error"?,
+              "tree"?: { "complete": true } | { "complete": false, "reason" },
               "orphans": [{ "kind", "pid"?, "ppid"?, "comm"?, "ageS", "cwd"?, "tabId"?, "session"? }],
               "reaped"?: [{ "pid", "comm", "tabId", "kind", "outcome": "killed" | "survivor" | "refused" | "unknown",
                             "refusal"? }] }] }

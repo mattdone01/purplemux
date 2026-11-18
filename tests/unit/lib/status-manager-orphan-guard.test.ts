@@ -40,9 +40,18 @@ vi.mock('@/lib/layout-store', async (importOriginal) => ({
   resolveLayoutFile: () => '/nonexistent/layout.json',
   readLayoutFile: vi.fn(async () => ({ root: {} })),
   collectAllTabs: () => state.tabs,
-  updateTabCliStatus: vi.fn(async () => {}),
   updateTabAgentSummary: vi.fn(async () => {}),
   updateTabWatchdogTurnEnd: vi.fn(async () => {}),
+  updateTabOrphanHold: vi.fn(async (session: string, hold: ITab['orphanHold'] | null) => {
+    const tab = state.tabs.find((t) => t.sessionName === session);
+    if (!tab) return;
+    if (hold) tab.orphanHold = hold;
+    else delete tab.orphanHold;
+  }),
+  updateTabCliStatus: vi.fn(async (session: string, cliState: ITab['cliState']) => {
+    const tab = state.tabs.find((t) => t.sessionName === session);
+    if (tab) tab.cliState = cliState;
+  }),
 }));
 vi.mock('@/lib/liveness-manager', () => ({
   getLivenessManager: () => ({
@@ -210,10 +219,53 @@ describe('the orphan liveness guard', () => {
   });
 });
 
+describe('the orphan hold across a server restart', () => {
+  it('the layout keeps the hold: after a restart the tab stays unknown, is never read idle, and is judged once the suspect is gone', async () => {
+    const now = Date.now();
+    state.suspects = [orphan(now - 2 * MIN)];
+    const first = await setup({ w: now - 10 * MIN });
+    await first.manager.poll();
+    expect(first.entries.w.cliState).toBe('unknown');
+    const persisted = state.tabs.find((t) => t.id === 'w')!;
+    await vi.waitFor(() => expect(persisted.orphanHold).toEqual({ pid: 4747, prevState: 'idle', launchedAt: now - 10 * MIN }));
+    expect(persisted.cliState).toBe('unknown');
+
+    // A new server reads the same layout: the launch stamp lived only in the old one's memory.
+    vi.resetModules();
+    const { StatusManager } = await import('@/lib/status-manager');
+    const tabEvents = memoryTabEvents();
+    const restarted = new StatusManager(undefined, vi.fn(async () => true), vi.fn(async () => {}), tabEvents, memoryLedgerTables()[1]);
+    (restarted as unknown as { dispatchAlert: () => Promise<void> }).dispatchAlert = vi.fn(async () => {});
+    const internals = restarted as unknown as { scanAllTabs: () => Promise<void>; tabs: Map<string, ITabStatusEntry> };
+    await internals.scanAllTabs();
+    const entry = internals.tabs.get('w')!;
+    expect(entry.cliState).toBe('unknown');
+    expect(entry.lastResumeOrStartedAt).toBe(now - 10 * MIN);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(entry.cliState).toBe('unknown');
+    await restarted.poll();
+    expect(internals.tabs.get('w')!.cliState).toBe('unknown');
+
+    state.suspects = [];
+    await restarted.poll();
+    expect(internals.tabs.get('w')!.cliState).toBe('inactive');
+    await vi.waitFor(() => expect(persisted.orphanHold).toBeUndefined());
+  });
+
+  it('without a persisted hold the same restart reads the tab as before (the hold is what keeps it unknown)', async () => {
+    state.tabs = [{ ...tab('w'), cliState: 'unknown' }];
+    const { StatusManager } = await import('@/lib/status-manager');
+    const restarted = new StatusManager(undefined, vi.fn(async () => true), vi.fn(async () => {}), memoryTabEvents(), memoryLedgerTables()[1]);
+    const internals = restarted as unknown as { scanAllTabs: () => Promise<void>; tabs: Map<string, ITabStatusEntry> };
+    await internals.scanAllTabs();
+    await vi.waitFor(() => expect(internals.tabs.get('w')!.cliState).not.toBe('unknown'));
+  });
+});
+
 describe('the hourly orphan list', () => {
   const internals = (manager: unknown) => manager as { runOrphanSweep: (now: number) => Promise<void>; orphanSweepDueAt: number };
   const fact = (pid: number, tabId: string | null) => ({
-    pid, ppid: 1, comm: 'claude', ageMs: 10 * MIN, cwd: '/work/shared', start: '1', tabId, urlMatch: true, socketMatch: false, underServer: false, heldBy: null, agent: true,
+    pid, ppid: 1, comm: 'claude', ageMs: 10 * MIN, cwd: '/work/shared', start: '1', tabId, urlMatch: true, socketMatch: false, underServer: false, heldBy: null, heldKnown: true, agentAbove: false, agent: true,
   });
 
   it('a non-empty list sends the orchestrator one line, names its own and unattributed entries, and kills nothing', async () => {

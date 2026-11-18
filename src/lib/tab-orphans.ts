@@ -7,11 +7,15 @@ import { parentPid, terminateProcesses, type ITabReaperDeps } from '@/lib/tab-re
 //   unowned-tab      a process whose PMUX_TAB_ID names a tab in no layout of this server;
 //   duplicate-agent  an agent whose PMUX_TAB_ID names a layout tab, outside that tab's current pane tree;
 //   unowned-session  a tmux session on this server's socket that no layout owns;
-//   unmarked-agent   an agent with no PMUX_TAB_ID that carries this server's PMUX_URL or runs under its tmux server.
+//   unmarked-agent   an agent with no PMUX_TAB_ID that carries this server's PMUX_URL or runs under its tmux server,
+//                    except the one agent of a pane a layout owns (and that agent's own sub-agents).
 // A marked process counts only when this server started it (its PMUX_URL, its tmux socket in TMUX, or its tmux
 // server above it): another purplemux on the same host and account has its own tabs, and they are never ours.
 // An unmarked process's environment is read for key presence only, and for whether PMUX_URL names this server:
 // no other value is kept. No argv leaves the scan; it is read only to recognise an agent.
+//
+// Which pane holds a process is read from tmux and the process table. When that read fails or is cut short, a
+// process no pane seems to hold may be a live seat's agent: the reap then refuses everything on the host.
 
 export type TOrphanKind = 'unowned-tab' | 'duplicate-agent' | 'unowned-session' | 'unmarked-agent';
 
@@ -37,6 +41,10 @@ export interface IOrphanProcessFact {
   underServer: boolean;
   /** The session whose pane tree holds the process; null when no live pane holds it. */
   heldBy: string | null;
+  /** The walk from this process up its parents finished; false when a parent could not be read. */
+  heldKnown: boolean;
+  /** An agent held by a pane: another agent sits between it and the pane (a sub-agent). */
+  agentAbove: boolean;
   agent: boolean;
 }
 
@@ -45,7 +53,11 @@ export interface IOrphanSessionFact {
   ageMs: number;
 }
 
+/** Whether the scan read every pane and every process under this server's tmux server. */
+export type TOrphanTree = { complete: true } | { complete: false; reason: string };
+
 export interface IOrphanHostFacts {
+  tree: TOrphanTree;
   sessions: IOrphanSessionFact[];
   processes: IOrphanProcessFact[];
 }
@@ -108,9 +120,20 @@ const isAttributable = (p: IOrphanProcessFact): boolean => p.urlMatch || p.socke
 export const unmarkedAgents = (facts: IOrphanHostFacts): IOrphanProcessFact[] =>
   facts.processes.filter((p) => p.tabId === null && p.agent && (p.urlMatch || p.underServer));
 
+const oldestFirst = (a: IOrphanProcessFact, b: IOrphanProcessFact): number => b.ageMs - a.ageMs || a.pid - b.pid;
+
+/**
+ * The agent a pane's own tab runs, of the agents in that pane that no other agent spawned: its own marked agent,
+ * else the oldest unmarked one (a tab created before the marker). Null when the pane runs none.
+ */
+const paneAgentOf = (facts: IOrphanHostFacts, session: string, tabId: string | null): IOrphanProcessFact | null => {
+  const top = facts.processes.filter((p) => p.agent && p.heldBy === session && !p.agentAbove).sort(oldestFirst);
+  return top.find((p) => tabId !== null && p.tabId === tabId) ?? top.find((p) => p.tabId === null) ?? null;
+};
+
 /** The four lists for one host (`null`: this server's own host). */
 export const classifyOrphans = (host: string | null, facts: IOrphanHostFacts, owned: IOrphanOwnership): IOrphanEntry[] => {
-  const ownedSessions = new Set([...owned.tabs.values()].filter((t) => t.host === host).map((t) => t.sessionName));
+  const sessionTab = new Map([...owned.tabs].filter(([, t]) => t.host === host).map(([id, t]) => [t.sessionName, id]));
   const entries: IOrphanEntry[] = [];
   for (const p of facts.processes) {
     if (p.tabId === null || !isAttributable(p)) continue;
@@ -125,22 +148,34 @@ export const classifyOrphans = (host: string | null, facts: IOrphanHostFacts, ow
     }
   }
   for (const session of facts.sessions) {
-    if (!ownedSessions.has(session.name)) entries.push({ kind: 'unowned-session', session });
+    if (!sessionTab.has(session.name)) entries.push({ kind: 'unowned-session', session });
   }
+  const paneAgents = new Map<string, IOrphanProcessFact | null>();
   for (const p of unmarkedAgents(facts)) {
-    if (p.heldBy !== null && ownedSessions.has(p.heldBy)) continue;
+    if (p.heldBy !== null && sessionTab.has(p.heldBy)) {
+      // In a pane a layout owns: its tab's agent and that agent's sub-agents are the tab's; any other agent is not.
+      if (p.agentAbove) continue;
+      if (!paneAgents.has(p.heldBy)) paneAgents.set(p.heldBy, paneAgentOf(facts, p.heldBy, sessionTab.get(p.heldBy)!));
+      if (paneAgents.get(p.heldBy)?.pid === p.pid) continue;
+    }
     entries.push({ kind: 'unmarked-agent', process: p });
   }
   return entries;
 };
 
-export type TOrphanRefusal = 'not-reapable' | 'held-by-session' | 'too-young' | 'protected' | 'identity-changed' | 'forbidden';
+export type TOrphanRefusal =
+  | 'not-reapable' | 'tree-unreadable' | 'held-by-session' | 'too-young' | 'layout-missing' | 'protected' | 'identity-changed' | 'forbidden';
 
-/** Why `--reap` leaves this entry alone, or null. Only kinds (i) and (ii) are ever signalled. */
-export const reapRefusal = (entry: IOrphanEntry): TOrphanRefusal | null => {
+/**
+ * Why `--reap` leaves this entry alone, or null. Only kinds (i) and (ii) are ever signalled, and only when the scan
+ * read the whole pane tree: a process under the tmux server that no pane seems to hold is a read that went wrong.
+ */
+export const reapRefusal = (entry: IOrphanEntry, tree: TOrphanTree): TOrphanRefusal | null => {
   if (entry.kind !== 'unowned-tab' && entry.kind !== 'duplicate-agent') return 'not-reapable';
-  if (entry.process.heldBy !== null) return 'held-by-session';
-  if (entry.process.ageMs < ORPHAN_MIN_AGE_MS) return 'too-young';
+  const p = entry.process;
+  if (!tree.complete || !p.heldKnown || (p.underServer && p.heldBy === null)) return 'tree-unreadable';
+  if (p.heldBy !== null) return 'held-by-session';
+  if (p.ageMs < ORPHAN_MIN_AGE_MS) return 'too-young';
   return null;
 };
 
@@ -176,13 +211,27 @@ export interface IOrphanScanDeps extends ITabReaperDeps {
   ageMs: (pid: number) => Promise<number | null>;
 }
 
+export interface IPaneRoot {
+  session: string;
+  panePid: number;
+  /** How long ago the pane's session was created. */
+  ageMs: number;
+}
+
+/**
+ * This server's tmux as one read: its server pid (null when no server runs) and every pane, or `unreadable` when
+ * tmux failed or timed out. Never an empty list for a read that failed.
+ */
+export type TLocalTreeRead =
+  | { readable: true; serverPid: number | null; panes: IPaneRoot[] }
+  | { readable: false; reason: string };
+
 export interface ILocalOrphanScope {
   /** PMUX_URL values that name this server. */
   urls: readonly string[];
   /** This server's tmux socket path. */
   socketPath: string | null;
-  tmuxServerPid: number | null;
-  panes: ReadonlyArray<{ session: string; panePid: number; ageMs: number }>;
+  tree: TLocalTreeRead;
 }
 
 const readText = async (file: string): Promise<string | null> => {
@@ -223,29 +272,62 @@ export const defaultOrphanScanDeps = (base: ITabReaperDeps): IOrphanScanDeps => 
 const MAX_DEPTH = 128;
 const SCAN_BATCH = 64;
 
-/**
- * The local host's facts, read from /proc through `deps` (a fake /proc in tests). Null without /proc. The server,
- * its ancestors and descendants and the tmux server are never facts: nothing here may ever be signalled.
- */
-export const collectLocalOrphanFacts = async (deps: IOrphanScanDeps, scope: ILocalOrphanScope): Promise<IOrphanHostFacts | null> => {
-  if (!(await deps.procAvailable())) return null;
-  const excluded = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
-  if (scope.tmuxServerPid) excluded.add(scope.tmuxServerPid);
-  const paneSession = new Map(scope.panes.map((p) => [p.panePid, p.session]));
+interface IHolding {
+  heldBy: string | null;
+  underServer: boolean;
+  /** The walk reached pid 1 or this server's tmux server. */
+  known: boolean;
+  /** The pids between the process (exclusive) and its pane (inclusive); empty when no pane holds it. */
+  above: number[];
+}
+
+/** Where a process sits under this server's tmux: one walk up its parents, every parent read cached. */
+const holdingReader = (deps: IOrphanScanDeps, serverPid: number | null, panes: readonly IPaneRoot[]) => {
+  const paneSession = new Map(panes.map((p) => [p.panePid, p.session]));
   const parents = new Map<number, number | null>();
   const parentOf = async (pid: number): Promise<number | null> => {
     if (!parents.has(pid)) parents.set(pid, await deps.parentPid(pid));
     return parents.get(pid)!;
   };
-  const holder = async (pid: number): Promise<{ heldBy: string | null; underServer: boolean }> => {
+  const holding = async (pid: number): Promise<IHolding> => {
     let heldBy: string | null = null;
+    const above: number[] = [];
+    const path: number[] = [];
     let current: number | null = pid;
-    for (let depth = 0; current !== null && current > 1 && depth < MAX_DEPTH; depth += 1) {
-      if (current === scope.tmuxServerPid) return { heldBy, underServer: true };
-      heldBy ??= paneSession.get(current) ?? null;
+    for (let depth = 0; depth < MAX_DEPTH; depth += 1) {
+      if (current === null) return { heldBy, underServer: false, known: false, above };
+      if (current <= 1) return { heldBy, underServer: false, known: true, above };
+      if (current === serverPid) return { heldBy, underServer: true, known: true, above };
+      if (heldBy === null && paneSession.has(current)) {
+        heldBy = paneSession.get(current)!;
+        above.push(...path.slice(1), ...(current === pid ? [] : [current]));
+      }
+      path.push(current);
       current = await parentOf(current);
     }
-    return { heldBy, underServer: false };
+    return { heldBy, underServer: false, known: false, above };
+  };
+  return { holding, parentOf };
+};
+
+/**
+ * The local host's facts, read from /proc through `deps` (a fake /proc in tests). Null without /proc. The server,
+ * its ancestors and descendants and the tmux server are never facts: nothing here may ever be signalled. A tmux read
+ * that failed leaves the tree incomplete: every process is listed as found, and none of them can be reaped.
+ */
+export const collectLocalOrphanFacts = async (deps: IOrphanScanDeps, scope: ILocalOrphanScope): Promise<IOrphanHostFacts | null> => {
+  if (!(await deps.procAvailable())) return null;
+  const serverPid = scope.tree.readable ? scope.tree.serverPid : null;
+  const panes = scope.tree.readable ? scope.tree.panes : [];
+  const excluded = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
+  if (serverPid) excluded.add(serverPid);
+  const { holding, parentOf } = holdingReader(deps, serverPid, panes);
+  const agents = new Map<number, Promise<boolean>>();
+  const isAgent = (pid: number): Promise<boolean> => {
+    if (!agents.has(pid)) {
+      agents.set(pid, Promise.all([deps.argv(pid), deps.comm(pid)]).then(([argv, comm]) => !!argv && agentProviderOf(argv, comm ?? '') !== null));
+    }
+    return agents.get(pid)!;
   };
 
   const scanOne = async (pid: number): Promise<IOrphanProcessFact | null> => {
@@ -253,14 +335,20 @@ export const collectLocalOrphanFacts = async (deps: IOrphanScanDeps, scope: ILoc
     const environ = await deps.readEnviron(pid);
     if (!environ) return null;
     const marks = readEnvironMarks(environ, scope.urls, scope.socketPath);
-    const { heldBy, underServer } = await holder(pid);
-    if (marks.tabId === null && !marks.urlMatch && !underServer) return null;
-    const [argv, comm] = await Promise.all([deps.argv(pid), deps.comm(pid)]);
-    const agent = !!argv && agentProviderOf(argv, comm ?? '') !== null;
+    const held = await holding(pid);
+    if (marks.tabId === null && !marks.urlMatch && !held.underServer) return null;
+    const agent = await isAgent(pid);
     if (marks.tabId === null && !agent) return null;
-    const [start, ageMs, cwd, ppid] = await Promise.all([deps.startTime(pid), deps.ageMs(pid), deps.cwd(pid), parentOf(pid)]);
+    let agentAbove = false;
+    if (agent && held.heldBy !== null) {
+      for (const above of held.above) if (await isAgent(above)) agentAbove = true;
+    }
+    const [start, ageMs, cwd, ppid, comm] = await Promise.all([deps.startTime(pid), deps.ageMs(pid), deps.cwd(pid), parentOf(pid), deps.comm(pid)]);
     if (start === null || ageMs === null) return null;
-    return { pid, ppid: ppid ?? 0, comm: comm ?? '', ageMs, cwd, start, ...marks, underServer, heldBy, agent };
+    return {
+      pid, ppid: ppid ?? 0, comm: comm ?? '', ageMs, cwd, start, ...marks,
+      underServer: held.underServer, heldBy: held.heldBy, heldKnown: held.known, agentAbove, agent,
+    };
   };
 
   const processes: IOrphanProcessFact[] = [];
@@ -269,8 +357,9 @@ export const collectLocalOrphanFacts = async (deps: IOrphanScanDeps, scope: ILoc
     for (const fact of await Promise.all(pids.slice(i, i + SCAN_BATCH).map(scanOne))) if (fact) processes.push(fact);
   }
   processes.sort((a, b) => a.pid - b.pid);
-  const sessions = [...new Map(scope.panes.map((p) => [p.session, { name: p.session, ageMs: p.ageMs }])).values()];
-  return { sessions, processes };
+  const sessions = [...new Map(panes.map((p) => [p.session, { name: p.session, ageMs: p.ageMs }])).values()];
+  const tree: TOrphanTree = scope.tree.readable ? { complete: true } : { complete: false, reason: scope.tree.reason };
+  return { tree, sessions, processes };
 };
 
 export interface IOrphanReapTarget {
@@ -290,23 +379,48 @@ export interface IOrphanReapOutcome {
 /**
  * Signal the chosen (i)/(ii) entries on this host with the reap's own steps and guards: never pid 0 or 1, the
  * server, its ancestors or descendants, or the tmux server; a pid whose start time changed is a different process.
+ * The pane tree is read again first, as the remote reap does: a read that fails refuses every target, and a target
+ * that a pane now holds, or that sits under the tmux server, is refused.
  */
 export const reapLocalOrphans = async (
-  deps: ITabReaperDeps,
+  deps: IOrphanScanDeps,
   targets: readonly IOrphanReapTarget[],
-  tmuxServerPid: number | null,
+  scanTree: TOrphanTree,
+  readTree: () => Promise<TLocalTreeRead>,
 ): Promise<IOrphanReapOutcome[]> => {
-  const protectedSet = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
-  if (tmuxServerPid) protectedSet.add(tmuxServerPid);
   const outcomes: IOrphanReapOutcome[] = [];
-  const chosen: Array<{ pid: number; comm: string; start: string; target: IOrphanReapTarget }> = [];
-  for (const target of targets) {
+  const refuse = (target: IOrphanReapTarget, refusal: TOrphanRefusal) => {
     const p = target.entry.process;
-    const base = { pid: p.pid, comm: printable(p.comm), tabId: p.tabId, kind: target.entry.kind };
-    const refusal = reapRefusal(target.entry)
-      ?? (p.pid <= 1 || protectedSet.has(p.pid) ? 'protected' : null)
-      ?? ((await deps.startTime(p.pid)) !== p.start ? 'identity-changed' : null);
-    if (refusal) outcomes.push({ ...base, outcome: 'refused', refusal });
+    outcomes.push({ pid: p.pid, comm: printable(p.comm), tabId: p.tabId, kind: target.entry.kind, outcome: 'refused', refusal });
+  };
+  const candidates = targets.filter((target) => {
+    const refusal = reapRefusal(target.entry, scanTree);
+    if (refusal) refuse(target, refusal);
+    return !refusal;
+  });
+  if (candidates.length === 0) return outcomes;
+  const tree = await readTree();
+  if (!tree.readable) {
+    for (const target of candidates) refuse(target, 'tree-unreadable');
+    return outcomes;
+  }
+  const protectedSet = new Set<number>([deps.selfPid, ...(await deps.protectedPids()), ...(await deps.serverDescendants())]);
+  if (tree.serverPid) protectedSet.add(tree.serverPid);
+  const { holding } = holdingReader(deps, tree.serverPid, tree.panes);
+  const chosen: Array<{ pid: number; comm: string; start: string; target: IOrphanReapTarget }> = [];
+  for (const target of candidates) {
+    const p = target.entry.process;
+    if (p.pid <= 1 || protectedSet.has(p.pid)) {
+      refuse(target, 'protected');
+      continue;
+    }
+    if ((await deps.startTime(p.pid)) !== p.start) {
+      refuse(target, 'identity-changed');
+      continue;
+    }
+    const now = await holding(p.pid);
+    if (!now.known) refuse(target, 'tree-unreadable');
+    else if (now.heldBy !== null || now.underServer) refuse(target, 'held-by-session');
     else chosen.push({ pid: p.pid, comm: p.comm, start: p.start, target });
   }
   if (chosen.length === 0) return outcomes;
@@ -333,6 +447,7 @@ export const orphanReapAudit = (host: string, outcome: IOrphanReapOutcome): Reco
 export interface ISuspectPeer {
   tabId: string;
   sessionName: string;
+  /** The tab's cwd; null when unknown, which makes it a possible match for any suspect. */
   cwd: string | null;
   /** The tab's last agent launch (ms); null when unknown. */
   launchedAt: number | null;
@@ -351,8 +466,9 @@ const samePath = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.
 /**
  * The liveness guard: the unmarked agent a tab whose agent reads as gone answers `unknown` for, or null (`absent`).
  * The agent (a) shares the tab's cwd, (b) started after the tab's last launch and (c) no other live session's pane
- * holds it; and of the tabs on the host that share that cwd, this tab's launch is the latest before the agent
- * started. One suspect therefore holds at most one tab.
+ * holds it; and of the tabs on the host that may share that cwd (a tab whose cwd is unknown may), this tab's launch
+ * is the latest before the agent started. One suspect therefore holds at most one tab, and a suspect that may be
+ * another tab's holds none it cannot be sure of.
  */
 export const suspectForTab = (tabId: string, peers: readonly ISuspectPeer[], suspects: readonly IOrphanSuspect[]): IOrphanSuspect | null => {
   const self = peers.find((p) => p.tabId === tabId);
@@ -363,13 +479,16 @@ export const suspectForTab = (tabId: string, peers: readonly ISuspectPeer[], sus
     if (suspect.startedAt <= self.launchedAt) continue;
     if (suspect.heldBy !== null && suspect.heldBy !== self.sessionName) continue;
     const match = peers
-      .filter((p) => p.cwd && samePath(p.cwd, suspect.cwd!) && p.launchedAt !== null && p.launchedAt < suspect.startedAt)
+      .filter((p) => (p.cwd === null || samePath(p.cwd, suspect.cwd!)) && p.launchedAt !== null && p.launchedAt < suspect.startedAt)
       .sort((a, b) => b.launchedAt! - a.launchedAt! || a.tabId.localeCompare(b.tabId))[0];
     if (match?.tabId === tabId) return suspect;
   }
   return null;
 };
 
-/** A host's unmarked agents as liveness suspects, dated by this server's clock. */
+/**
+ * A host's unmarked agents as liveness suspects. `now` is read BEFORE the scan: a scan or ssh that takes time then
+ * moves a start time earlier, never later, so it can only make a suspect older than a launch.
+ */
 export const suspectsOf = (facts: IOrphanHostFacts, now: number): IOrphanSuspect[] =>
   unmarkedAgents(facts).map((p) => ({ pid: p.pid, comm: printable(p.comm), cwd: p.cwd, startedAt: now - p.ageMs, heldBy: p.heldBy }));

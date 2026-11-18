@@ -1,7 +1,7 @@
 import { acknowledgeOrchestrationActivity } from '@/lib/orchestration-activity';
 import { WebSocket } from 'ws';
 import { getWorkspaces, getWorkspaceByIdCached, getWorkspacesCached } from '@/lib/workspace-store';
-import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd, findTabBySessionName } from '@/lib/layout-store';
+import { readLayoutFile, resolveLayoutFile, collectAllTabs, updateTabCliStatus, updateTabAgentSummary, updateTabAgentState, parseSessionName, clearReportsTo, updateTabWatchdogTurnEnd, updateTabOrphanHold, findTabBySessionName } from '@/lib/layout-store';
 import { HOOK_REPLAY_WINDOW_MS, HOOK_SPOOL_DIR, type IHookSpoolDrainResult } from '@/lib/hook-spool';
 import { HookFloorStore } from '@/lib/hook-floors';
 import { onTabClosed, onTabClosing, onTabRestart, RESTART_WINDOW_MS, type ITabRestartEvent } from '@/lib/tab-lifecycle';
@@ -426,7 +426,8 @@ export const orphanSweepDetail = (hosts: readonly IOrphanHostEntries[], workspac
       const shown = names.slice(0, ORPHAN_LINE_NAMES).join(', ');
       return `${names.length} ${ORPHAN_KIND_LABEL[kind] ?? kind} (${shown}${names.length > ORPHAN_LINE_NAMES ? ', …' : ''})`;
     });
-    parts.push(`${h.host}: ${kinds.join('; ')}`);
+    const unread = h.tree && !h.tree.complete ? ` [pane tree unreadable (${h.tree.reason}): nothing there can be reaped]` : '';
+    parts.push(`${h.host}: ${kinds.join('; ')}${unread}`);
   }
   if (parts.length === 0) return null;
   return `${parts.join(' | ')}. List: purplemux tab orphans [--host H]. Reap the first two kinds only: purplemux tab orphans --reap`;
@@ -956,6 +957,7 @@ export class StatusManager {
           eventSeq: 0,
         });
         this.applyRestoredStop(tab, this.tabs.get(tab.id)!);
+        this.restoreOrphanHold(tab, this.tabs.get(tab.id)!);
         this.reconcileJsonlWatch(tab.id, this.tabs.get(tab.id)!);
         if (cliState === 'unknown') {
           this.resolveUnknown(tab.id).catch((err) => log.warn('resolveUnknown failed: %s', err));
@@ -1496,6 +1498,7 @@ export class StatusManager {
             eventSeq: 0,
           };
           this.applyRestoredStop(tab, entry);
+          this.restoreOrphanHold(tab, entry);
           this.tabs.set(tab.id, entry);
           this.persistPolledSession(tab.id, tab, provider, detected.jsonlPath);
           this.reconcileJsonlWatch(tab.id, entry);
@@ -1671,6 +1674,7 @@ export class StatusManager {
           if (running !== null && !suspect) {
             log.info({ tabId: tab.id, pid: hold.pid, running }, 'orphan hold released');
             this.orphanHolds.delete(tab.id);
+            updateTabOrphanHold(tab.sessionName, null).catch(() => {});
             existing.cliState = hold.prevState;
             this.persistToLayout(existing);
             this.broadcastUpdate(tab.id, existing);
@@ -2070,6 +2074,21 @@ export class StatusManager {
   }
 
   /**
+   * A hold the layout kept across a restart: the tab stays `unknown` with its launch stamp, so `resolveUnknown` does
+   * not read the absent agent as idle and the poll judges the suspect again. A hold beside any other state is stale.
+   */
+  private restoreOrphanHold(tab: ITab, entry: ITabStatusEntry): void {
+    const hold = tab.orphanHold;
+    if (!hold) return;
+    if (entry.cliState !== 'unknown') {
+      updateTabOrphanHold(tab.sessionName, null).catch(() => {});
+      return;
+    }
+    this.orphanHolds.set(tab.id, { pid: hold.pid, prevState: hold.prevState });
+    entry.lastResumeOrStartedAt ??= hold.launchedAt;
+  }
+
+  /**
    * The orphan liveness guard: before a tab whose agent reads as gone turns inactive, the unmarked agent on its host
    * that it answers `unknown` for (`suspectForTab`), or null for `absent`. A host that cannot be scanned is absent,
    * as before. No scan runs for a tab without a launch stamp or a cwd: no suspect could match it.
@@ -2104,6 +2123,10 @@ export class StatusManager {
     this.applyCliState(tab.id, entry, 'unknown', { silent: true, nudge: null });
     this.orphanHolds.set(tab.id, { pid: suspect.pid, prevState });
     this.persistToLayout(entry);
+    if (entry.lastResumeOrStartedAt !== undefined) {
+      updateTabOrphanHold(entry.tmuxSession, { pid: suspect.pid, prevState, launchedAt: entry.lastResumeOrStartedAt })
+        .catch((err) => log.warn(`orphan hold not persisted for ${tab.id}: ${err instanceof Error ? err.message : err}`));
+    }
     this.broadcastUpdate(tab.id, entry);
     const where = tab.host ? `on ${tab.host}` : 'on this host';
     const detail = `its agent is not in its pane, but pid ${suspect.pid} (${suspect.comm || 'unknown'}) ${where}, an agent with no tab marker, `
@@ -2458,7 +2481,7 @@ export class StatusManager {
     // Out of unknown by any other path than its resolution (a hook, the mid-turn read): the inactive it stood for is gone.
     if (prevState === 'unknown' && newState !== 'unknown') this.unreadInactive.delete(tabId);
     if (newState !== 'inactive') this.probeInactive.delete(tabId);
-    if (newState !== 'unknown') this.orphanHolds.delete(tabId);
+    if (newState !== 'unknown' && this.orphanHolds.delete(tabId)) updateTabOrphanHold(entry.tmuxSession, null).catch(() => {});
     entry.cliState = newState;
     entry.startupPrompt = newState === 'startup-prompt' ? opts.startupPrompt ?? null : null;
     // The agent process is gone: its halt went with it, and a resume would be typed into its shell.

@@ -91,6 +91,12 @@ describe('purplemux tab orphans', { timeout: 30_000 }, () => {
     expect(result.stdout).toContain('  refused pid 302 claude duplicate-agent tab tab-aaaa (held-by-session)');
   });
 
+  it('a host whose pane tree was not read says so, and that nothing there is reaped', async () => {
+    reply = { status: 200, body: { hosts: [{ host: 'host-a', status: 'ok', tree: { complete: false, reason: 'tmux failed' }, orphans: [] }] } };
+    const result = await cli(['tab', 'orphans', '--host', 'host-a']);
+    expect(result.stdout).toBe('host-a: 0 orphans [pane tree unreadable: tmux failed; nothing here is reaped]\n');
+  });
+
   it('--json prints the server answer', async () => {
     expect(JSON.parse((await cli(['tab', 'orphans', '--json'])).stdout)).toEqual(ANSWER);
   });

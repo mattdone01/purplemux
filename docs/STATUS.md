@@ -496,9 +496,11 @@ Before the transition above, the poll looks for an agent the tab cannot see: `fi
 1. it shares the tab's cwd (the pane's path, else the tab's `cwd`);
 2. it started after the tab's `lastResumeOrStartedAt`;
 3. no other live session's pane holds it;
-4. of the agent tabs on that host that share the cwd, this tab's launch is the latest before the process started, so one suspect holds at most one tab.
+4. of the agent tabs on that host that share the cwd, or whose cwd is unknown, this tab's launch is the latest before the process started, so one suspect holds at most one tab.
 
-With a suspect the tab goes `unknown` (silent, no `inactive` nudge, no restart) and the orchestrator gets one `orphan-suspect` nudge naming the pid. `resolveUnknown` leaves a held tab alone. Each later poll checks again: when the agent is back in the pane or the suspect is gone, the tab takes its previous state back and is judged as above. With no suspect, a tab without a launch stamp or cwd, or a host that cannot be scanned, the answer is `inactive` exactly as before.
+The suspect's start is dated from a clock read before the scan, so scan or ssh time can only make it earlier.
+
+With a suspect the tab goes `unknown` (silent, no `inactive` nudge, no restart) and the orchestrator gets one `orphan-suspect` nudge naming the pid. `resolveUnknown` leaves a held tab alone. The hold is also written to the tab in the layout (`orphanHold`: pid, previous state, launch stamp), so a restart restores it with the launch stamp before `resolveUnknown` runs; a hold beside any other state is cleared. Each later poll checks again: when the agent is back in the pane or the suspect is gone, the tab takes its previous state back and is judged as above. With no suspect, a tab without a launch stamp or cwd, or a host that cannot be scanned, the answer is `inactive` exactly as before.
 
 The same scan runs once an hour as a list (`runOrphanSweep`, never a kill): a non-empty list sends each enabled orchestrator one `orphan-sweep` line with the entries of its workspace and those of no workspace. `purplemux tab orphans [--host H] [--reap]` shows the lists; `--reap` signals only marked processes of a tab in no layout and duplicate agents outside their tab's pane.
 

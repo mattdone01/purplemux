@@ -2502,7 +2502,8 @@ const cmdTabOrphans = async (args) => {
   const lines = [];
   for (const h of Array.isArray(body?.hosts) ? body.hosts : []) {
     const orphans = Array.isArray(h.orphans) ? h.orphans : [];
-    lines.push(`${h.host}: ${h.status === 'ok' ? `${orphans.length} orphan${orphans.length === 1 ? '' : 's'}` : h.status}${h.error ? ` (${h.error})` : ''}`);
+    const unread = h.tree && h.tree.complete === false ? ` [pane tree unreadable: ${h.tree.reason}; nothing here is reaped]` : '';
+    lines.push(`${h.host}: ${h.status === 'ok' ? `${orphans.length} orphan${orphans.length === 1 ? '' : 's'}` : h.status}${h.error ? ` (${h.error})` : ''}${unread}`);
     for (const o of orphans) lines.push(orphanLine(o));
     for (const r of Array.isArray(h.reaped) ? h.reaped : []) {
       lines.push(`  ${r.outcome} pid ${r.pid} ${r.comm} ${r.kind}${r.tabId ? ` tab ${r.tabId}` : ''}${r.refusal ? ` (${r.refusal})` : ''}`);

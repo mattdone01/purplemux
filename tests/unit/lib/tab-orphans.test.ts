@@ -6,14 +6,17 @@ import {
   orphanReapAudit,
   readEnvironMarks,
   reapLocalOrphans,
+  reapRefusal,
   suspectForTab,
   suspectsOf,
   viewOrphan,
   type ILocalOrphanScope,
   type IOrphanEntry,
   type IOrphanOwnership,
+  type IOrphanReapTarget,
   type IOrphanScanDeps,
   type ISuspectPeer,
+  type TLocalTreeRead,
 } from '@/lib/tab-orphans';
 
 const SECRET = 'planted-secret-value-7f3a';
@@ -34,7 +37,7 @@ interface IFakeProc {
 
 const env = (...entries: string[]) => Buffer.from(entries.join('\0') + '\0');
 
-const fakeProc = (procs: Record<number, IFakeProc>, opts: { protectedPids?: number[]; serverDescendants?: number[] } = {}) => {
+const fakeProc = (procs: Record<number, IFakeProc>, opts: { protectedPids?: number[]; serverDescendants?: number[]; unreadableParents?: number[] } = {}) => {
   const alive = new Set(Object.keys(procs).map(Number));
   const starts = new Map([...alive].map((pid) => [pid, `start-${pid}`]));
   const signals: string[] = [];
@@ -59,7 +62,7 @@ const fakeProc = (procs: Record<number, IFakeProc>, opts: { protectedPids?: numb
     now: () => clock,
     selfPid: 2,
     uid: 1000,
-    parentPid: async (pid) => (alive.has(pid) || procs[pid] ? procs[pid]?.ppid ?? null : null),
+    parentPid: async (pid) => (opts.unreadableParents?.includes(pid) ? null : alive.has(pid) || procs[pid] ? procs[pid]?.ppid ?? null : null),
     comm: async (pid) => (alive.has(pid) ? procs[pid].comm ?? 'sh' : null),
     argv: async (pid) => (alive.has(pid) ? procs[pid].argv ?? [procs[pid].comm ?? 'sh'] : null),
     cwd: async (pid) => (alive.has(pid) ? procs[pid].cwd ?? '/work/a' : null),
@@ -73,15 +76,15 @@ const tmuxEnv = (pane: number) => `TMUX=${SOCKET},${pane},0`;
 
 // The tmux server is 100. Session pt-ws-test1-pane-p1-tab-aaaa has pane 101 (tab-aaaa's agent 102 runs in it).
 // Session pt-ws-test1-pane-p2-tab-zzzz has pane 120: no layout owns it.
-const scope: ILocalOrphanScope = {
-  urls: [URL_OURS],
-  socketPath: SOCKET,
-  tmuxServerPid: 100,
+const TREE: TLocalTreeRead = {
+  readable: true,
+  serverPid: 100,
   panes: [
     { session: 'pt-ws-test1-pane-p1-tab-aaaa', panePid: 101, ageMs: 30 * MIN },
     { session: 'pt-ws-test1-pane-p2-tab-zzzz', panePid: 120, ageMs: 30 * MIN },
   ],
 };
+const scopeOf = (tree: TLocalTreeRead = TREE): ILocalOrphanScope => ({ urls: [URL_OURS], socketPath: SOCKET, tree });
 
 const owned: IOrphanOwnership = {
   tabs: new Map([
@@ -112,14 +115,17 @@ const fleet = (): Record<number, IFakeProc> => ({
   121: { ppid: 120, comm: 'node', argv: ['node', '/opt/lib/node_modules/@anthropic-ai/claude-code/cli.js'], environ: ['HOME=/h'] },
 });
 
-const collect = async (procs = fleet(), extra: { protectedPids?: number[]; serverDescendants?: number[] } = {}) => {
+const collect = async (procs = fleet(), extra: Parameters<typeof fakeProc>[1] = {}, tree: TLocalTreeRead = TREE) => {
   const fake = fakeProc(procs, extra);
-  const facts = await collectLocalOrphanFacts(fake.deps, scope);
+  const facts = await collectLocalOrphanFacts(fake.deps, scopeOf(tree));
   return { ...fake, facts: facts! };
 };
 
 const kindsOf = (entries: IOrphanEntry[]) =>
   entries.map((e) => (e.kind === 'unowned-session' ? `${e.kind}:${e.session.name}` : `${e.kind}:${e.process.pid}`)).sort();
+
+const targetsOf = (entries: IOrphanEntry[]): IOrphanReapTarget[] =>
+  entries.filter((e): e is IOrphanReapTarget['entry'] => e.kind === 'unowned-tab' || e.kind === 'duplicate-agent').map((entry) => ({ entry }));
 
 describe('readEnvironMarks (the environ guard)', () => {
   it('keeps the tab id, compares PMUX_URL, and reads TMUX only for a marked process', () => {
@@ -139,6 +145,7 @@ describe('readEnvironMarks (the environ guard)', () => {
 describe('collectLocalOrphanFacts and classifyOrphans (fake /proc)', () => {
   it('lists the four kinds, and only what this server started', async () => {
     const { facts } = await collect();
+    expect(facts.tree).toEqual({ complete: true });
     expect(kindsOf(classifyOrphans(null, facts, owned))).toEqual([
       'duplicate-agent:110',
       'unmarked-agent:112',
@@ -148,17 +155,35 @@ describe('collectLocalOrphanFacts and classifyOrphans (fake /proc)', () => {
     ]);
   });
 
-  it('an unmarked agent in a session no layout owns is listed; one in an owned pane is its tab\'s', async () => {
-    const procs = fleet();
-    const { facts } = await collect(procs);
+  it('an unmarked agent in a session no layout owns is listed; the one agent of an owned pane is its tab\'s', async () => {
+    const { facts } = await collect();
     const ownsZ: IOrphanOwnership = {
       tabs: new Map([...owned.tabs, ['tab-zzzz', { workspaceId: 'ws-test1', sessionName: 'pt-ws-test1-pane-p2-tab-zzzz', host: null }]]),
     };
     const unmarked = facts.processes.find((p) => p.pid === 121)!;
-    expect(unmarked).toMatchObject({ tabId: null, underServer: true, heldBy: 'pt-ws-test1-pane-p2-tab-zzzz', agent: true });
+    expect(unmarked).toMatchObject({ tabId: null, underServer: true, heldBy: 'pt-ws-test1-pane-p2-tab-zzzz', agent: true, agentAbove: false });
     expect(kindsOf(classifyOrphans(null, facts, owned))).toContain('unmarked-agent:121');
     expect(kindsOf(classifyOrphans(null, facts, ownsZ))).not.toContain('unmarked-agent:121');
     expect(kindsOf(classifyOrphans(null, facts, ownsZ))).not.toContain('unowned-session:pt-ws-test1-pane-p2-tab-zzzz');
+  });
+
+  it('an unmarked agent in a pane a layout owns that is not that pane\'s agent is listed, and never reaped', async () => {
+    const procs = fleet();
+    // In tab-aaaa's pane: its marked agent 102, an unmarked sibling agent 130, and 131, a sub-agent of 102.
+    procs[130] = { ppid: 101, ...claude, environ: ['HOME=/h'], ageMs: 5 * MIN };
+    procs[131] = { ppid: 102, ...claude, environ: ['HOME=/h'], ageMs: 2 * MIN };
+    // In tab-zzzz's pane (a tab from before the marker, all unmarked): 121 is its agent; 140 a younger sibling.
+    procs[140] = { ppid: 120, ...claude, environ: ['HOME=/h'], ageMs: MIN };
+    const { facts } = await collect(procs);
+    expect(facts.processes.find((p) => p.pid === 131)).toMatchObject({ agentAbove: true, heldBy: 'pt-ws-test1-pane-p1-tab-aaaa' });
+    const ownsZ: IOrphanOwnership = {
+      tabs: new Map([...owned.tabs, ['tab-zzzz', { workspaceId: 'ws-test1', sessionName: 'pt-ws-test1-pane-p2-tab-zzzz', host: null }]]),
+    };
+    const entries = classifyOrphans(null, facts, ownsZ);
+    const unmarked = kindsOf(entries).filter((k) => k.startsWith('unmarked-agent'));
+    expect(unmarked).toEqual(['unmarked-agent:112', 'unmarked-agent:130', 'unmarked-agent:140']);
+    const sibling = entries.find((e) => e.kind === 'unmarked-agent' && e.process.pid === 130)!;
+    expect(reapRefusal(sibling, facts.tree)).toBe('not-reapable');
   });
 
   it('the agent in its own tab\'s pane is no duplicate; a registered job of the tab is none either', async () => {
@@ -200,11 +225,12 @@ describe('collectLocalOrphanFacts and classifyOrphans (fake /proc)', () => {
 });
 
 describe('reapLocalOrphans', () => {
+  const readable = async () => TREE;
+
   it('the duplicate case: only the agent outside the current pane tree is signalled; the agent in it stays', async () => {
     const { facts, deps, signals, alive } = await collect();
-    const entries = classifyOrphans(null, facts, owned);
-    const targets = entries.filter((e): e is Extract<IOrphanEntry, { process: unknown }> => e.kind === 'duplicate-agent').map((entry) => ({ entry }));
-    const outcomes = await reapLocalOrphans(deps, targets, 100);
+    const targets = targetsOf(classifyOrphans(null, facts, owned)).filter((t) => t.entry.kind === 'duplicate-agent');
+    const outcomes = await reapLocalOrphans(deps, targets, facts.tree, readable);
     expect(outcomes).toEqual([{ pid: 110, comm: 'claude', tabId: 'tab-aaaa', kind: 'duplicate-agent', outcome: 'killed' }]);
     expect(alive.has(110)).toBe(false);
     expect(alive.has(102)).toBe(true);
@@ -214,14 +240,24 @@ describe('reapLocalOrphans', () => {
   it('refuses a process a live pane holds, even when it reaches the reap', async () => {
     const { facts, deps, alive, signals } = await collect();
     const inTree = facts.processes.find((p) => p.pid === 102)!;
-    const outcomes = await reapLocalOrphans(deps, [{ entry: { kind: 'duplicate-agent', process: inTree } }], 100);
+    const outcomes = await reapLocalOrphans(deps, [{ entry: { kind: 'duplicate-agent', process: inTree } }], facts.tree, readable);
     expect(outcomes).toEqual([{ pid: 102, comm: 'claude', tabId: 'tab-aaaa', kind: 'duplicate-agent', outcome: 'refused', refusal: 'held-by-session' }]);
     expect(alive.has(102)).toBe(true);
     expect(signals).toEqual([]);
   });
 
-  it('refuses an unmarked agent and an unowned session\'s kind, a young process, a protected pid and a reused pid', async () => {
-    const { facts, deps, alive, starts, signals } = await collect(fleet(), {});
+  it('reads the tree again before it signals: a target a pane holds now is refused', async () => {
+    const { facts, deps, alive, signals } = await collect();
+    const outside = facts.processes.find((p) => p.pid === 110)!;
+    const nowHeld: TLocalTreeRead = { ...TREE, panes: [...TREE.panes, { session: 'pt-ws-test1-pane-p3-tab-aaaa', panePid: 110, ageMs: MIN }] };
+    const outcomes = await reapLocalOrphans(deps, [{ entry: { kind: 'duplicate-agent', process: outside } }], facts.tree, async () => nowHeld);
+    expect(outcomes[0]).toMatchObject({ pid: 110, outcome: 'refused', refusal: 'held-by-session' });
+    expect(alive.has(110)).toBe(true);
+    expect(signals).toEqual([]);
+  });
+
+  it('refuses an unmarked agent, a young process, a protected pid and a reused pid', async () => {
+    const { facts, deps, alive, starts, signals } = await collect();
     const p = (pid: number) => facts.processes.find((f) => f.pid === pid)!;
     starts.set(111, 'start-reused');
     const young = { ...p(110), ageMs: ORPHAN_MIN_AGE_MS - 1 };
@@ -230,9 +266,8 @@ describe('reapLocalOrphans', () => {
       { entry: { kind: 'duplicate-agent', process: young } },
       { entry: { kind: 'unowned-tab', process: p(111) } },
       { entry: { kind: 'unowned-tab', process: { ...p(111), pid: 1 } } },
-      { entry: { kind: 'unowned-tab', process: { ...p(111), pid: 100, heldBy: null } } },
-    ], 100);
-    expect(outcomes.map((o) => o.refusal)).toEqual(['not-reapable', 'too-young', 'identity-changed', 'protected', 'protected']);
+    ] as IOrphanReapTarget[], facts.tree, readable);
+    expect(outcomes.map((o) => o.refusal)).toEqual(['not-reapable', 'too-young', 'identity-changed', 'protected']);
     expect(signals).toEqual([]);
     expect([110, 111, 112].every((pid) => alive.has(pid))).toBe(true);
   });
@@ -241,13 +276,62 @@ describe('reapLocalOrphans', () => {
     const procs = fleet();
     procs[111].ignoresTerm = true;
     const { facts, deps, signals } = await collect(procs);
-    const entry = classifyOrphans(null, facts, owned).find((e) => e.kind === 'unowned-tab')! as Extract<IOrphanEntry, { kind: 'unowned-tab' }>;
-    const [outcome] = await reapLocalOrphans(deps, [{ entry }], 100);
+    const targets = targetsOf(classifyOrphans(null, facts, owned)).filter((t) => t.entry.kind === 'unowned-tab');
+    const [outcome] = await reapLocalOrphans(deps, targets, facts.tree, readable);
     expect(outcome.outcome).toBe('killed');
     expect(signals).toEqual(['SIGTERM:111', 'SIGCONT:111', 'SIGKILL:111']);
     const audit = orphanReapAudit('local', outcome);
     expect(audit).toEqual({ event: 'tab-orphan-reap', host: 'local', pid: 111, comm: 'sleep', tabId: 'tab-gone', reason: 'unowned-tab', outcome: 'killed' });
     expect(JSON.stringify(audit)).not.toContain(SECRET);
+  });
+});
+
+describe('the reap fails closed when the pane tree is not read', () => {
+  const seatSurvives = async (tree: TLocalTreeRead, killTimeTree: TLocalTreeRead = tree, extra: Parameters<typeof fakeProc>[1] = {}) => {
+    const { facts, deps, alive, signals } = await collect(fleet(), extra, tree);
+    const entries = classifyOrphans(null, facts, owned);
+    const outcomes = await reapLocalOrphans(deps, targetsOf(entries), facts.tree, async () => killTimeTree);
+    return { facts, entries, outcomes, alive, signals };
+  };
+
+  it('a tmux error: the live seat agent reads unheld, is listed, and every target is refused tree-unreadable', async () => {
+    const { facts, entries, outcomes, alive, signals } = await seatSurvives({ readable: false, reason: 'tmux list-panes failed (exit 1: server exited unexpectedly)' });
+    expect(facts.tree).toEqual({ complete: false, reason: 'tmux list-panes failed (exit 1: server exited unexpectedly)' });
+    expect(kindsOf(entries)).toContain('duplicate-agent:102');
+    expect(outcomes.find((o) => o.pid === 102)).toMatchObject({ outcome: 'refused', refusal: 'tree-unreadable' });
+    expect(outcomes.every((o) => o.outcome === 'refused' && o.refusal === 'tree-unreadable')).toBe(true);
+    expect(alive.has(102)).toBe(true);
+    expect(signals).toEqual([]);
+  });
+
+  it('a timeout: the same, with the reason named', async () => {
+    const { outcomes, alive, signals } = await seatSurvives({ readable: false, reason: 'tmux display-message timed out' });
+    expect(outcomes.find((o) => o.pid === 102)?.refusal).toBe('tree-unreadable');
+    expect(alive.has(102)).toBe(true);
+    expect(signals).toEqual([]);
+  });
+
+  it('a tree read whole at the scan but not at the kill refuses every target', async () => {
+    const { outcomes, alive, signals } = await seatSurvives(TREE, { readable: false, reason: 'tmux list-panes timed out' });
+    expect(outcomes.length).toBeGreaterThan(0);
+    expect(outcomes.every((o) => o.refusal === 'tree-unreadable')).toBe(true);
+    expect(alive.has(110)).toBe(true);
+    expect(signals).toEqual([]);
+  });
+
+  it('a parent that cannot be read leaves that process unheld-unknown, and it is refused', async () => {
+    const { facts, outcomes, alive } = await seatSurvives(TREE, TREE, { unreadableParents: [110] });
+    expect(facts.processes.find((p) => p.pid === 110)).toMatchObject({ heldKnown: false });
+    expect(outcomes.find((o) => o.pid === 110)).toMatchObject({ outcome: 'refused', refusal: 'tree-unreadable' });
+    expect(alive.has(110)).toBe(true);
+  });
+
+  it('a process under the tmux server that no listed pane holds is refused: the pane list missed it', async () => {
+    const tree: TLocalTreeRead = { readable: true, serverPid: 100, panes: [] };
+    const { facts, outcomes, alive } = await seatSurvives(tree);
+    expect(facts.processes.find((p) => p.pid === 102)).toMatchObject({ underServer: true, heldBy: null });
+    expect(outcomes.find((o) => o.pid === 102)).toMatchObject({ refusal: 'tree-unreadable' });
+    expect(alive.has(102)).toBe(true);
   });
 });
 
@@ -265,6 +349,13 @@ describe('suspectForTab (the liveness guard)', () => {
     const between = suspect(T0 + 5 * MIN);
     expect(suspectForTab('tab-aaaa', peers, [between])).toEqual(between);
     expect(suspectForTab('tab-bbbb', peers, [between])).toBeNull();
+  });
+
+  it('a peer whose cwd is unknown is a possible match: the judged tab does not win a suspect that may be the peer\'s', () => {
+    const unknownCwd = [peer('tab-aaaa', T0), peer('tab-cccc', T0 + 10 * MIN, null)];
+    expect(suspectForTab('tab-aaaa', unknownCwd, [suspect(T0 + 20 * MIN)])).toBeNull();
+    // Launched after the suspect started, the unknown-cwd peer cannot be its tab.
+    expect(suspectForTab('tab-aaaa', unknownCwd, [suspect(T0 + 5 * MIN)])).not.toBeNull();
   });
 
   it('an orphan older than the tab\'s launch makes nothing unknown', () => {
@@ -286,7 +377,7 @@ describe('suspectForTab (the liveness guard)', () => {
     expect(suspectForTab('tab-aaaa', [peer('tab-aaaa', T0, null)], [suspect(T0 + MIN)])).toBeNull();
   });
 
-  it('suspectsOf dates each unmarked agent by this server\'s clock and keeps no marked process', async () => {
+  it('suspectsOf dates each unmarked agent from the given clock and keeps no marked process', async () => {
     const { facts } = await collect();
     expect(suspectsOf(facts, T0)).toEqual([
       { pid: 112, comm: 'claude', cwd: '/work/a', startedAt: T0 - 10 * MIN, heldBy: null },

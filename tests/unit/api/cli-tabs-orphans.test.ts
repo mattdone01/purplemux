@@ -41,7 +41,7 @@ const call = async (method: string, query: Record<string, string> = {}, body: un
 };
 
 const fact = (pid: number, tabId: string): IOrphanProcessFact => ({
-  pid, ppid: 1, comm: 'claude', ageMs: 600_000, cwd: '/w', start: '1', tabId, urlMatch: true, socketMatch: false, underServer: false, heldBy: null, agent: true,
+  pid, ppid: 1, comm: 'claude', ageMs: 600_000, cwd: '/w', start: '1', tabId, urlMatch: true, socketMatch: false, underServer: false, heldBy: null, heldKnown: true, agentAbove: false, agent: true,
 });
 
 describe('/api/cli/tabs/orphans', () => {

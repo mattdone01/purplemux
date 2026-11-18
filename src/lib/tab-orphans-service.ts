@@ -21,9 +21,11 @@ import {
   type IOrphanSuspect,
   type IOrphanView,
   type IOwnedTab,
+  type TOrphanRefusal,
+  type TOrphanTree,
 } from '@/lib/tab-orphans';
 import { defaultReaperDeps } from '@/lib/tab-reaper';
-import { getDescendantPids, getTmuxServerPid, getTmuxSocketPath, listLocalPaneRoots, reapRemoteOrphans, scanRemoteOrphans } from '@/lib/tmux';
+import { getDescendantPids, getTmuxServerPid, getTmuxSocketPath, readLocalTree, reapRemoteOrphans, scanRemoteOrphans } from '@/lib/tmux';
 import { workspaceIdFromSessionName } from '@/lib/workspace-home';
 import { getWorkspaces } from '@/lib/workspace-store';
 import type { ILayoutData } from '@/types/terminal';
@@ -43,21 +45,29 @@ export class OrphanSweepError extends Error {
 export interface IOwnership {
   tabs: Map<string, IOwnedTab>;
   workspaces: number;
+  /** Workspaces whose layout file does not exist: their tabs, if any run, are unknown. */
+  missingLayouts: string[];
 }
 
 /**
  * Every tab of every layout. A layout that exists but cannot be read throws: read as empty, its tabs would all be
- * orphans and a reap would end them.
+ * orphans and a reap would end them. A layout file that does not exist is named in `missingLayouts`: a workspace may
+ * have no layout yet, but one that has live tabs and lost its file would make them all orphans, so a reap refuses
+ * every unowned-tab process while one is missing.
  */
 export const readOwnership = async (): Promise<IOwnership> => {
   const { workspaces } = await getWorkspaces();
   const tabs = new Map<string, IOwnedTab>();
+  const missingLayouts: string[] = [];
   for (const ws of workspaces) {
     let raw: string;
     try {
       raw = await fs.readFile(resolveLayoutFile(ws.id), 'utf-8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        missingLayouts.push(ws.id);
+        continue;
+      }
       throw new OrphanSweepError('conflict', `the layout of ${ws.id} is unreadable; no orphan is judged without it`);
     }
     let layout: ILayoutData;
@@ -69,7 +79,7 @@ export const readOwnership = async (): Promise<IOwnership> => {
     if (!layout?.root) continue;
     for (const tab of collectAllTabs(layout.root)) tabs.set(tab.id, { workspaceId: ws.id, sessionName: tab.sessionName, host: tab.host ?? null });
   }
-  return { tabs, workspaces: workspaces.length };
+  return { tabs, workspaces: workspaces.length, missingLayouts };
 };
 
 /** The local host, then each host of remote.hosts that owns a tab; or the one host named. */
@@ -95,23 +105,22 @@ const localUrls = async (): Promise<string[]> => {
   return [...new Set(urls)];
 };
 
-interface IHostScan {
-  facts: IOrphanHostFacts | null;
-  tmuxServerPid: number | null;
-}
-
-/** One host's facts; null facts without /proc. Throws when a remote host does not answer. */
-const scanHost = async (host: string): Promise<IHostScan> => {
-  if (host !== LOCAL_HOST) return { facts: await scanRemoteOrphans(host, await resolveCallbackUrl(host)), tmuxServerPid: null };
-  const [tmuxServerPid, socketPath, panes, urls] = await Promise.all([getTmuxServerPid(), getTmuxSocketPath(), listLocalPaneRoots(), localUrls()]);
-  const facts = await collectLocalOrphanFacts(localScanDeps(), { urls, socketPath, tmuxServerPid, panes });
-  return { facts, tmuxServerPid };
+/** One host's facts; null without /proc. Throws when a remote host does not answer. */
+const scanHost = async (host: string): Promise<IOrphanHostFacts | null> => {
+  if (host !== LOCAL_HOST) {
+    const facts = await scanRemoteOrphans(host, await resolveCallbackUrl(host));
+    return facts === 'unavailable' ? null : facts;
+  }
+  const [tree, socketPath, urls] = await Promise.all([readLocalTree(), getTmuxSocketPath(), localUrls()]);
+  return collectLocalOrphanFacts(localScanDeps(), { urls, socketPath, tree });
 };
 
 export interface IOrphanHostReport {
   host: string;
   /** `unavailable`: no /proc on this host; `unreachable`: the remote host did not answer. */
   status: 'ok' | 'unreachable' | 'unavailable';
+  /** `ok` only: whether the pane tree was read whole. When it was not, nothing on the host is reaped. */
+  tree?: TOrphanTree;
   error?: string;
   orphans: IOrphanView[];
   reaped?: IOrphanReapOutcome[];
@@ -120,6 +129,7 @@ export interface IOrphanHostReport {
 export interface IOrphanHostEntries {
   host: string;
   status: IOrphanHostReport['status'];
+  tree?: TOrphanTree;
   entries: IOrphanEntry[];
 }
 
@@ -130,28 +140,31 @@ const printableError = (err: unknown): string => (err instanceof Error ? err.mes
 
 const reapHost = async (
   host: string,
+  facts: IOrphanHostFacts,
   entries: readonly IOrphanEntry[],
-  tmuxServerPid: number | null,
+  ownership: IOwnership,
   mayReap: TMayReap,
 ): Promise<{ outcomes: IOrphanReapOutcome[]; error?: string }> => {
   const outcomes: IOrphanReapOutcome[] = [];
   const targets: IOrphanReapTarget[] = [];
+  const outcomeOf = (t: IOrphanReapTarget, outcome: IOrphanReapOutcome['outcome'], refusal?: TOrphanRefusal): IOrphanReapOutcome => ({
+    pid: t.entry.process.pid, comm: viewOrphan(t.entry).comm ?? '', tabId: t.entry.process.tabId, kind: t.entry.kind, outcome, ...(refusal ? { refusal } : {}),
+  });
   for (const entry of entries) {
     if (entry.kind !== 'unowned-tab' && entry.kind !== 'duplicate-agent') continue;
-    const p = entry.process;
-    const refusal = reapRefusal(entry) ?? ((await mayReap(entry)) ? null : 'forbidden');
-    if (refusal) outcomes.push({ pid: p.pid, comm: viewOrphan(entry).comm ?? '', tabId: p.tabId, kind: entry.kind, outcome: 'refused', refusal });
-    else targets.push({ entry });
+    const target = { entry };
+    const refusal = reapRefusal(entry, facts.tree)
+      ?? (entry.kind === 'unowned-tab' && ownership.missingLayouts.length > 0 ? 'layout-missing' : null)
+      ?? ((await mayReap(entry)) ? null : 'forbidden');
+    if (refusal) outcomes.push(outcomeOf(target, 'refused', refusal));
+    else targets.push(target);
   }
   if (targets.length === 0) return { outcomes };
   let error: string | undefined;
   let signalled: IOrphanReapOutcome[];
   if (host === LOCAL_HOST) {
-    signalled = await reapLocalOrphans(localScanDeps(), targets, tmuxServerPid);
+    signalled = await reapLocalOrphans(localScanDeps(), targets, facts.tree, () => readLocalTree());
   } else {
-    const outcomeOf = (t: IOrphanReapTarget, outcome: IOrphanReapOutcome['outcome'], refusal?: IOrphanReapOutcome['refusal']): IOrphanReapOutcome => ({
-      pid: t.entry.process.pid, comm: viewOrphan(t.entry).comm ?? '', tabId: t.entry.process.tabId, kind: t.entry.kind, outcome, ...(refusal ? { refusal } : {}),
-    });
     try {
       const reap = await reapRemoteOrphans(host, targets.map((t) => ({ pid: t.entry.process.pid, start: t.entry.process.start })));
       const killed = new Set(reap.killed);
@@ -174,22 +187,29 @@ const reapHost = async (
   return { outcomes: [...outcomes, ...signalled], ...(error ? { error } : {}) };
 };
 
+interface IHostSweep {
+  status: IOrphanHostReport['status'];
+  error?: string;
+  facts: IOrphanHostFacts | null;
+  entries: IOrphanEntry[];
+}
+
 const scanAndClassify = async (
   host: string,
   ownership: IOwnership,
   registered: ReadonlyArray<{ pid: number; host?: string | null }>,
-): Promise<{ status: IOrphanHostReport['status']; error?: string; entries: IOrphanEntry[]; tmuxServerPid: number | null }> => {
-  let scan: IHostScan;
+): Promise<IHostSweep> => {
+  let facts: IOrphanHostFacts | null;
   try {
-    scan = await scanHost(host);
+    facts = await scanHost(host);
   } catch (err) {
-    return { status: 'unreachable', error: printableError(err), entries: [], tmuxServerPid: null };
+    return { status: 'unreachable', error: printableError(err), facts: null, entries: [] };
   }
-  if (!scan.facts) return { status: 'unavailable', entries: [], tmuxServerPid: scan.tmuxServerPid };
+  if (!facts) return { status: 'unavailable', facts: null, entries: [] };
   const remote = host === LOCAL_HOST ? null : host;
   // A job saved before jobs named their host may run on either: it counts on both.
   const registeredPids = new Set(registered.filter((j) => j.host === undefined || (j.host ?? null) === remote).map((j) => j.pid));
-  return { status: 'ok', entries: classifyOrphans(remote, scan.facts, { tabs: ownership.tabs, registeredPids }), tmuxServerPid: scan.tmuxServerPid };
+  return { status: 'ok', facts, entries: classifyOrphans(remote, facts, { tabs: ownership.tabs, registeredPids }) };
 };
 
 const registeredJobs = async () => (await readAllLiveness()).jobs;
@@ -209,9 +229,15 @@ export const sweepOrphans = async (opts: { host?: string; mayReap?: TMayReap } =
   const reports: IOrphanHostReport[] = [];
   for (const host of hosts) {
     const scan = await scanAndClassify(host, ownership, jobs);
-    const report: IOrphanHostReport = { host, status: scan.status, ...(scan.error ? { error: scan.error } : {}), orphans: scan.entries.map(viewOrphan) };
-    if (opts.mayReap && scan.status === 'ok') {
-      const reap = await reapHost(host, scan.entries, scan.tmuxServerPid, opts.mayReap);
+    const report: IOrphanHostReport = {
+      host,
+      status: scan.status,
+      ...(scan.facts ? { tree: scan.facts.tree } : {}),
+      ...(scan.error ? { error: scan.error } : {}),
+      orphans: scan.entries.map(viewOrphan),
+    };
+    if (opts.mayReap && scan.facts) {
+      const reap = await reapHost(host, scan.facts, scan.entries, ownership, opts.mayReap);
       report.reaped = reap.outcomes;
       if (reap.error) report.error = reap.error;
     }
@@ -228,7 +254,7 @@ export const listOrphanEntries = async (): Promise<IOrphanHostEntries[]> => {
   const result: IOrphanHostEntries[] = [];
   for (const host of hosts) {
     const scan = await scanAndClassify(host, ownership, jobs);
-    result.push({ host, status: scan.status, entries: scan.entries });
+    result.push({ host, status: scan.status, ...(scan.facts ? { tree: scan.facts.tree } : {}), entries: scan.entries });
   }
   return result;
 };
@@ -240,11 +266,15 @@ export const orphanWorkspace = (entry: IOrphanEntry): string | null => {
   return null;
 };
 
-/** The liveness guard's input: a host's unmarked agents; null when the host could not be read. */
+/**
+ * The liveness guard's input: a host's unmarked agents; null when the host could not be read. The clock is read
+ * before the scan, so the scan's own time can only date a suspect earlier.
+ */
 export const findOrphanSuspects = async (host: string | null): Promise<IOrphanSuspect[] | null> => {
+  const now = Date.now();
   try {
-    const scan = await scanHost(host ?? LOCAL_HOST);
-    return scan.facts ? suspectsOf(scan.facts, Date.now()) : null;
+    const facts = await scanHost(host ?? LOCAL_HOST);
+    return facts ? suspectsOf(facts, now) : null;
   } catch {
     return null;
   }

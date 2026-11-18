@@ -7,11 +7,11 @@ import type { IOrphanHostFacts, IOrphanProcessFact } from '@/lib/tab-orphans';
 const state = vi.hoisted(() => ({
   dir: '',
   workspaces: [] as Array<{ id: string }>,
-  facts: { sessions: [], processes: [] } as IOrphanHostFacts,
+  facts: { tree: { complete: true }, sessions: [], processes: [] } as IOrphanHostFacts | 'unavailable',
   jobs: [] as Array<{ pid: number; host?: string | null }>,
 }));
 const tmux = vi.hoisted(() => ({
-  scanRemoteOrphans: vi.fn(async (_host: string, _url: string) => state.facts),
+  scanRemoteOrphans: vi.fn(async (_host: string, _url: string): Promise<IOrphanHostFacts | 'unavailable'> => state.facts),
   reapRemoteOrphans: vi.fn(async (_host: string, targets: ReadonlyArray<{ pid: number; start: string }>) => ({
     killed: targets.map((t) => t.pid), survivors: [] as number[], refused: [] as Array<{ pid: number; refusal: 'protected' }>,
   })),
@@ -30,21 +30,21 @@ vi.mock('@/lib/tmux', () => ({
   getDescendantPids: vi.fn(async () => []),
   getTmuxServerPid: vi.fn(async () => null),
   getTmuxSocketPath: vi.fn(async () => null),
-  listLocalPaneRoots: vi.fn(async () => []),
+  readLocalTree: vi.fn(async () => ({ readable: true, serverPid: null, panes: [] })),
 }));
 vi.mock('@/lib/liveness-store', () => ({ readAllLiveness: vi.fn(async () => ({ probes: [], jobs: state.jobs })) }));
 vi.mock('@/lib/coordination-audit', () => audit);
 // The local host's scan is tested over a fake /proc in tab-orphans.test.ts; here it reads nothing of this host.
 vi.mock('@/lib/tab-orphans', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/tab-orphans')>()),
-  collectLocalOrphanFacts: vi.fn(async () => ({ sessions: [], processes: [] })),
+  collectLocalOrphanFacts: vi.fn(async () => ({ tree: { complete: true }, sessions: [], processes: [] })),
 }));
 
 const SECRET = 'planted-secret-value-91c2';
 
 const fact = (pid: number, over: Partial<IOrphanProcessFact> = {}): IOrphanProcessFact => ({
   pid, ppid: 1, comm: 'claude', ageMs: 10 * 60_000, cwd: '/work/a', start: `s${pid}`, tabId: null,
-  urlMatch: true, socketMatch: false, underServer: false, heldBy: null, agent: true, ...over,
+  urlMatch: true, socketMatch: false, underServer: false, heldBy: null, heldKnown: true, agentAbove: false, agent: true, ...over,
 });
 
 const writeLayout = async (wsId: string, content: string) => {
@@ -66,6 +66,7 @@ beforeEach(async () => {
     { id: 'tab-dddd', sessionName: 'pt-ws-test1-pane-p1-tab-dddd' },
   ]));
   state.facts = {
+    tree: { complete: true },
     sessions: [{ name: 'pt-ws-test1-pane-p1-tab-aaaa', ageMs: 600_000 }],
     processes: [
       fact(301, { tabId: 'tab-gone', agent: false, comm: 'sleep' }),
@@ -82,10 +83,11 @@ afterEach(async () => {
 });
 
 describe('readOwnership', () => {
-  it('reads every layout; a missing one owns nothing', async () => {
+  it('reads every layout; a missing one owns nothing and is named', async () => {
     const { readOwnership } = await import('@/lib/tab-orphans-service');
     const owned = await readOwnership();
     expect(owned.workspaces).toBe(2);
+    expect(owned.missingLayouts).toEqual(['ws-test2']);
     expect([...owned.tabs.keys()].sort()).toEqual(['tab-aaaa', 'tab-dddd']);
     expect(owned.tabs.get('tab-aaaa')).toEqual({ workspaceId: 'ws-test1', sessionName: 'pt-ws-test1-pane-p1-tab-aaaa', host: 'host-a' });
   });
@@ -122,6 +124,7 @@ describe('sweepOrphans', () => {
   });
 
   it('--reap signals only kinds (i) and (ii), refuses the young and the forbidden, and audits each kill without environ values', async () => {
+    await writeLayout('ws-test2', layoutWith([]));
     const { sweepOrphans } = await import('@/lib/tab-orphans-service');
     const { hosts } = await sweepOrphans({ host: 'host-a', mayReap: (entry) => entry.kind === 'unowned-tab' });
     expect(tmux.reapRemoteOrphans).toHaveBeenCalledWith('host-a', [{ pid: 301, start: 's301' }]);
@@ -136,6 +139,7 @@ describe('sweepOrphans', () => {
   });
 
   it('a reap whose host stops answering reports each target unknown and audits it', async () => {
+    await writeLayout('ws-test2', layoutWith([]));
     tmux.reapRemoteOrphans.mockRejectedValueOnce(new Error('the orphan reap on host-a did not answer (timed out); its outcome is unknown'));
     const { sweepOrphans } = await import('@/lib/tab-orphans-service');
     const { hosts } = await sweepOrphans({ host: 'host-a', mayReap: () => true });
@@ -151,9 +155,59 @@ describe('sweepOrphans', () => {
     expect(hosts[0].orphans.map((o) => o.pid)).not.toContain(302);
   });
 
+  it('a workspace whose layout file is missing: no unowned-tab process is reaped, its tabs may be live', async () => {
+    const { sweepOrphans } = await import('@/lib/tab-orphans-service');
+    const { hosts } = await sweepOrphans({ host: 'host-a', mayReap: () => true });
+    expect(hosts[0].reaped?.filter((r) => r.kind === 'unowned-tab').map((r) => [r.pid, r.outcome, r.refusal]))
+      .toEqual([[301, 'refused', 'layout-missing'], [305, 'refused', 'too-young']]);
+    expect(tmux.reapRemoteOrphans).toHaveBeenCalledWith('host-a', [{ pid: 302, start: 's302' }]);
+  });
+
+  it('a scan whose pane tree was not read: every target is refused tree-unreadable and nothing reaches the host', async () => {
+    await writeLayout('ws-test2', layoutWith([]));
+    state.facts = { ...(state.facts as IOrphanHostFacts), tree: { complete: false, reason: 'process table unreadable' } };
+    const { sweepOrphans } = await import('@/lib/tab-orphans-service');
+    const { hosts } = await sweepOrphans({ host: 'host-a', mayReap: () => true });
+    expect(hosts[0].tree).toEqual({ complete: false, reason: 'process table unreadable' });
+    expect(hosts[0].reaped?.every((r) => r.outcome === 'refused' && r.refusal === 'tree-unreadable')).toBe(true);
+    expect(tmux.reapRemoteOrphans).not.toHaveBeenCalled();
+    expect(audit.appendCoordinationAudit).not.toHaveBeenCalled();
+  });
+
+  it('a remote host without /proc is unavailable, never ok with no orphans', async () => {
+    state.facts = 'unavailable';
+    const { sweepOrphans } = await import('@/lib/tab-orphans-service');
+    const { hosts } = await sweepOrphans({ host: 'host-a', mayReap: () => true });
+    expect(hosts).toEqual([{ host: 'host-a', status: 'unavailable', orphans: [] }]);
+  });
+
   it('no workspace read: a reap is refused, since every marked process would read as an orphan', async () => {
     state.workspaces = [];
     const { sweepOrphans } = await import('@/lib/tab-orphans-service');
     await expect(sweepOrphans({ mayReap: () => true })).rejects.toMatchObject({ code: 'conflict' });
+  });
+});
+
+describe('findOrphanSuspects', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('dates a suspect from the clock read before the scan: a slow scan or ssh never moves a start later', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const T0 = 1_700_000_000_000;
+    vi.setSystemTime(T0);
+    tmux.scanRemoteOrphans.mockImplementationOnce(async () => {
+      vi.setSystemTime(T0 + 30_000);
+      return { tree: { complete: true }, sessions: [], processes: [fact(304, { ageMs: 60_000 })] };
+    });
+    const { findOrphanSuspects } = await import('@/lib/tab-orphans-service');
+    expect(await findOrphanSuspects('host-a')).toEqual([{ pid: 304, comm: 'claude', cwd: '/work/a', startedAt: T0 - 60_000, heldBy: null }]);
+  });
+
+  it('a host that cannot be read gives no suspects (null), and one without /proc none either', async () => {
+    const { findOrphanSuspects } = await import('@/lib/tab-orphans-service');
+    tmux.scanRemoteOrphans.mockRejectedValueOnce(new Error('the orphan scan on host-a did not answer (timed out)'));
+    expect(await findOrphanSuspects('host-a')).toBeNull();
+    tmux.scanRemoteOrphans.mockResolvedValueOnce('unavailable');
+    expect(await findOrphanSuspects('host-a')).toBeNull();
   });
 });

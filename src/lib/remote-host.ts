@@ -398,11 +398,19 @@ done
 if tmux -L "$sock" has-session -t "=$session" 2>/dev/null; then printf 'session\\tpresent\\n'; else printf 'session\\tgone\\n'; fi
 `;
 
+/** At most this many processes are walked down from the tmux server before the tree counts as unread. */
+export const ORPHAN_TREE_BOUND = 8192;
+
 /**
  * Shell helpers both orphan scripts share, builtins only where they run per process. `statf PID` reads
  * /proc/PID/stat into `s_state`, `s_ppid` and `s_start`. `held_of` is " <pid>:<session> ..." for every descendant
  * of this server's tmux server, walked down from it through each thread's `children`: the session is the one whose
  * pane holds the process (`-` for none). `self_anc` is this script and its ancestors.
+ *
+ * `tree_bad` names why that walk cannot be trusted, with `REMOTE_PROVIDER_SCRIPT`'s rule: only tmux's own "no
+ * server" is an empty tree; any other tmux failure, a server pid that is no number, a server or a walked process
+ * whose `stat` or `children` cannot be read, or the walk's bound is a tree that was not read. A seat's agent then
+ * looks unheld, so nothing on the host may be reaped.
  */
 const ORPHAN_SCRIPT_HELPERS = `statf() {
   s_line=
@@ -415,31 +423,65 @@ const ORPHAN_SCRIPT_HELPERS = `statf() {
 }
 kids() {
   k=
-  for f in /proc/"$1"/task/*/children; do r=; { read -r r < "$f"; } 2>/dev/null; k="$k $r"; done
+  for f in /proc/"$1"/task/*/children; do
+    if [ ! -r "$f" ]; then
+      [ -e /proc/"$1" ] && return 1
+      continue
+    fi
+    r=; { read -r r < "$f"; } 2>/dev/null
+    k="$k $r"
+  done
+  return 0
 }
-srv=$(tmux -L "$sock" display-message -p '#{pid}' 2>/dev/null)
-case "$srv" in ''|*[!0-9]*) srv= ;; esac
+no_server() {
+  case "$1" in *"no server running"*|*"error connecting to"*|*"No such file or directory"*) return 0 ;; esac
+  return 1
+}
+tree_bad=
+srv=
+out=$(tmux -L "$sock" display-message -p '#{pid}' 2>&1)
+if [ $? -eq 0 ]; then
+  case "$out" in ''|*[!0-9]*) tree_bad='tmux server pid unreadable' ;; *) srv=$out ;; esac
+elif ! no_server "$out"; then
+  tree_bad='tmux failed'
+fi
 tab=$(printf '\\t')
 nl='
 '
 panes=" "
-plist=$(tmux -L "$sock" list-panes -a -F '#{pane_pid} #{session_created} #{session_name}' 2>/dev/null)
+plist=
+if [ -n "$srv" ]; then
+  plist=$(tmux -L "$sock" list-panes -a -F '#{pane_pid} #{session_created} #{session_name}' 2>&1)
+  if [ $? -ne 0 ]; then
+    if no_server "$plist"; then srv=; else tree_bad='tmux failed'; fi
+    plist=
+  fi
+fi
 while read -r pp created sname; do
-  [ -n "$pp" ] && panes="$panes$pp:$sname "
+  [ -n "$pp" ] || continue
+  case "$pp$created" in *[!0-9]*) tree_bad='tmux list-panes unreadable'; continue ;; esac
+  panes="$panes$pp:$sname "
 done <<PMUX_PANES
 $plist
 PMUX_PANES
 held_of=" "
 if [ -n "$srv" ]; then
+  [ -r /proc/"$srv"/stat ] && [ -r /proc/"$srv"/task/"$srv"/children ] || tree_bad='process table unreadable'
+fi
+if [ -n "$srv" ] && [ -z "$tree_bad" ]; then
   front="$srv:-"; count=0
-  while [ -n "$front" ] && [ $count -lt 8192 ]; do
+  while [ -n "$front" ] && [ -z "$tree_bad" ]; do
     next=
     for item in $front; do
       q=\${item%%:*}; lab=\${item#*:}
       case "$panes" in *" $q:"*) lab=\${panes#*" $q:"}; lab=\${lab%% *} ;; esac
       [ "$q" = "$srv" ] || held_of="$held_of$q:$lab "
-      kids "$q"
-      for c in $k; do next="$next $c:$lab"; count=$((count + 1)); done
+      kids "$q" || { tree_bad='process table unreadable'; break; }
+      for c in $k; do
+        count=$((count + 1))
+        [ $count -gt ${ORPHAN_TREE_BOUND} ] && { tree_bad='process inventory bound exceeded'; break; }
+        next="$next $c:$lab"
+      done
     done
     front=$next
   done
@@ -451,16 +493,20 @@ while [ -n "$a" ] && [ "$a" -gt 1 ] 2>/dev/null; do self_anc="$self_anc$a "; sta
 
 /**
  * The orphan scan on a remote host (one `sh -s -- SOCKET URL` run): facts only, judged by `classifyOrphans` on this
- * server with the same rules as the local scan. The candidates are the user's processes that carry PMUX_TAB_ID,
- * carry this server's PMUX_URL, or run under its tmux server; never this script, its ancestors, pid 1 or the tmux
- * server. A marked one is reported when this server started it: its PMUX_URL, its socket in TMUX, or its tmux
- * server above it. An unmarked one only when it is an agent; its environment is read for the presence of
- * PMUX_TAB_ID and the PMUX_URL match, nothing else. No argv is printed. Output, one line each, then `end`:
+ * server with the same rules as the local scan. A host without a readable /proc answers `unavailable`. The
+ * candidates are the user's processes that carry PMUX_TAB_ID, carry this server's PMUX_URL, or run under its tmux
+ * server; never this script, its ancestors, pid 1 or the tmux server. A marked one is reported when this server
+ * started it: its PMUX_URL, its socket in TMUX, or its tmux server above it. An unmarked one only when it is an
+ * agent; its environment is read for the presence of PMUX_TAB_ID and the PMUX_URL match, nothing else. No argv is
+ * printed. Output, one line each, then `end`: `tree\tcomplete` or `tree\tunreadable\t<reason>`,
  * `session\t<age ms>\t<name>` and
- * `proc\t<pid>\t<ppid>\t<start>\t<age ms>\t<agent 0|1>\t<-|=tab id>\t<url 0|1>\t<socket 0|1>\t<under 0|1>\t<held>\t<comm>\t<cwd>`.
+ * `proc\t<pid>\t<ppid>\t<start>\t<age ms>\t<agent 0|1>\t<-|=tab id>\t<url 0|1>\t<socket 0|1>\t<under 0|1>\t<held>\t<above 0|1>\t<comm>\t<cwd>`,
+ * where `above` is 1 when another agent sits between a held agent and its pane.
  */
 export const REMOTE_ORPHAN_SCAN_SCRIPT = `sock=$1; url=$2
-${ORPHAN_SCRIPT_HELPERS}now=$(date +%s)
+if [ ! -r /proc/self/stat ] || [ ! -r /proc/uptime ]; then printf 'unavailable\\nend\\n'; exit 0; fi
+${ORPHAN_SCRIPT_HELPERS}if [ -n "$tree_bad" ]; then printf 'tree\\tunreadable\\t%s\\n' "$tree_bad"; else printf 'tree\\tcomplete\\n'; fi
+now=$(date +%s)
 hz=$(getconf CLK_TCK 2>/dev/null); [ -n "$hz" ] || hz=100
 up=; { read -r up _ < /proc/uptime; } 2>/dev/null
 frac=\${up#*.}; frac=\${frac#0}; [ -n "$frac" ] || frac=0
@@ -470,12 +516,24 @@ spath=$(tmux -L "$sock" display-message -p '#{socket_path}' 2>/dev/null)
 seen=" "
 while read -r pp created sname; do
   [ -n "$sname" ] || continue
+  case "$pp$created" in *[!0-9]*) continue ;; esac
   case "$seen" in *" $sname "*) continue ;; esac
   seen="$seen$sname "
   printf 'session\\t%s\\t%s\\n' "$(( (now - created) * 1000 ))" "$sname"
 done <<PMUX_PANES
 $plist
 PMUX_PANES
+agentof() {
+  agent=0
+  a_comm=; { read -r a_comm < "/proc/$1/comm"; } 2>/dev/null
+  a_argv=$(tr '\\0' '\\n' 2>/dev/null < "/proc/$1/cmdline" | head -n 2)
+  a_argv0=\${a_argv%%"$nl"*}; a_entry=
+  case "$a_argv" in *"$nl"*) a_entry=\${a_argv#*"$nl"} ;; esac
+  a_exe=\${a_argv0##*/}
+  case "$a_exe" in claude|codex|grok) agent=1 ;; esac
+  case "$a_comm" in claude|codex|grok) agent=1 ;; esac
+  case "$a_exe" in node|bun) case "$a_entry" in */claude.js|*/codex.js|*/grok.js|*/@anthropic-ai/claude-code/*|*/@openai/codex/*|*/grok-cli/*) agent=1 ;; esac ;; esac
+}
 marked=$(grep -Hz '^PMUX_TAB_ID=' /proc/[0-9]*/environ 2>/dev/null | tr '\\n\\0' '?\\n' \\
   | sed -n -e 's#^/proc/\\([0-9][0-9]*\\)/environ:PMUX_TAB_ID=\\([A-Za-z0-9_.-]\\{1,128\\}\\)$#\\1=\\2#p;t' \\
     -e 's#^/proc/\\([0-9][0-9]*\\)/environ:PMUX_TAB_ID=.*#\\1=?#p')
@@ -508,35 +566,46 @@ for p in $cands; do
   else
     [ $urlf = 1 ] || [ $sockf = 1 ] || [ $under = 1 ] || continue
   fi
-  comm=; { read -r comm < "/proc/$p/comm"; } 2>/dev/null
-  argv=$(tr '\\0' '\\n' 2>/dev/null < "/proc/$p/cmdline" | head -n 2)
-  argv0=\${argv%%"$nl"*}; entry=
-  case "$argv" in *"$nl"*) entry=\${argv#*"$nl"} ;; esac
-  exe=\${argv0##*/}
-  agent=0
-  case "$exe" in claude|codex|grok) agent=1 ;; esac
-  case "$comm" in claude|codex|grok) agent=1 ;; esac
-  case "$exe" in node|bun) case "$entry" in */claude.js|*/codex.js|*/grok.js|*/@anthropic-ai/claude-code/*|*/@openai/codex/*|*/grok-cli/*) agent=1 ;; esac ;; esac
+  agentof "$p"
   [ "$tabf" = - ] && [ $agent = 0 ] && continue
+  isagent=$agent; comm=$a_comm
+  above=0
+  if [ $isagent = 1 ] && [ -n "$held" ]; then
+    w=$ppid; n=0
+    while [ -n "$w" ] && [ "$w" -gt 1 ] 2>/dev/null && [ $n -lt 128 ]; do
+      agentof "$w"; [ $agent = 1 ] && { above=1; break; }
+      case "$panes" in *" $w:"*) break ;; esac
+      statf "$w" || break
+      w=$s_ppid; n=$((n + 1))
+    done
+  fi
   case "$comm" in *"$tab"*) comm=$(printf '%s' "$comm" | tr '\\t' ' ') ;; esac
   cwd=$(readlink "/proc/$p/cwd" 2>/dev/null)
   case "$cwd" in *"$nl"*|*"$tab"*) cwd='?' ;; esac
   age=$(( upms - start * 1000 / hz ))
   [ $age -ge 0 ] || age=0
-  printf 'proc\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$p" "$ppid" "$start" "$age" "$agent" "$tabf" "$urlf" "$sockf" "$under" "$held" "$comm" "$cwd"
+  printf 'proc\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$p" "$ppid" "$start" "$age" "$isagent" "$tabf" "$urlf" "$sockf" "$under" "$held" "$above" "$comm" "$cwd"
 done
 printf 'end\\n'
 `;
 
 /**
  * The orphan reap on a remote host (one `sh -s -- SOCKET PID:START...` run) for the (i)/(ii) entries this server
- * chose from a scan. Each pid is checked again first: never pid 0 or 1, this script or its ancestors, the tmux
- * server, another user's process, a pid whose start time changed, or a process that a live pane holds. Then the
- * reap's steps: SIGTERM (+ SIGCONT), up to 3 s of grace, SIGKILL, a settle. Output, one line each, then `end`:
- * `killed\t<pid>`, `survivor\t<pid>` or `refused\t<pid>\t<protected|identity-changed|held-by-session>`.
+ * chose from a scan. The pane tree is read again first: when it cannot be read (`tree_bad`), every target is refused
+ * `tree-unreadable` and nothing is signalled. Then each pid is checked again: never pid 0 or 1, this script or its
+ * ancestors, the tmux server, another user's process, a pid whose start time changed, a process a live pane holds
+ * (`held-by-session`), or one under the tmux server that no pane holds (`tree-unreadable`). Then the reap's steps:
+ * SIGTERM (+ SIGCONT), up to 3 s of grace, SIGKILL, a settle. Output, one line each, then `end`: `killed\t<pid>`,
+ * `survivor\t<pid>` or `refused\t<pid>\t<protected|identity-changed|held-by-session|tree-unreadable>`.
  */
 export const REMOTE_ORPHAN_REAP_SCRIPT = `sock=$1; shift
+if [ ! -r /proc/self/stat ]; then for t in "$@"; do printf 'refused\\t%s\\ttree-unreadable\\n' "\${t%%:*}"; done; printf 'end\\n'; exit 0; fi
 ${ORPHAN_SCRIPT_HELPERS}same() { statf "$1" && [ "$s_start" = "$2" ] && [ "$s_state" != Z ] && [ "$s_state" != X ]; }
+if [ -n "$tree_bad" ]; then
+  for t in "$@"; do printf 'refused\\t%s\\ttree-unreadable\\n' "\${t%%:*}"; done
+  printf 'end\\n'
+  exit 0
+fi
 targets=""
 for t in "$@"; do
   p=\${t%%:*}; want=\${t#*:}
@@ -544,7 +613,11 @@ for t in "$@"; do
   case "$self_anc" in *" $p "*) printf 'refused\\t%s\\tprotected\\n' "$p"; continue ;; esac
   [ -O "/proc/$p" ] || { printf 'refused\\t%s\\tprotected\\n' "$p"; continue; }
   same "$p" "$want" || { printf 'refused\\t%s\\tidentity-changed\\n' "$p"; continue; }
-  case "$held_of" in *" $p:"*) h=\${held_of#*" $p:"}; [ "\${h%% *}" = - ] || { printf 'refused\\t%s\\theld-by-session\\n' "$p"; continue; } ;; esac
+  case "$held_of" in *" $p:"*)
+    h=\${held_of#*" $p:"}
+    if [ "\${h%% *}" = - ]; then printf 'refused\\t%s\\ttree-unreadable\\n' "$p"; else printf 'refused\\t%s\\theld-by-session\\n' "$p"; fi
+    continue ;;
+  esac
   targets="$targets $p:$want"
 done
 for t in $targets; do
@@ -737,19 +810,25 @@ const intOf = (raw: string | undefined): number | null => {
   return raw !== undefined && raw !== '' && Number.isInteger(n) ? n : null;
 };
 
-/** The facts of a remote orphan scan; null when the run ended before its `end` line. */
-export const parseRemoteOrphanScan = (stdout: string): IOrphanHostFacts | null => {
+/**
+ * The facts of a remote orphan scan: `unavailable` for a host without /proc; null when the run ended before its
+ * `end` line. A run that never said its tree was complete counts as a tree that was not read.
+ */
+export const parseRemoteOrphanScan = (stdout: string): IOrphanHostFacts | 'unavailable' | null => {
   const lines = stdout.split('\n');
   if (!lines.some((line) => line === 'end')) return null;
-  const facts: IOrphanHostFacts = { sessions: [], processes: [] };
+  if (lines.some((line) => line === 'unavailable')) return 'unavailable';
+  const facts: IOrphanHostFacts = { tree: { complete: false, reason: 'the scan reported no tree' }, sessions: [], processes: [] };
   for (const line of lines) {
     const fields = line.split('\t');
-    if (fields[0] === 'session' && fields.length >= 3) {
+    if (fields[0] === 'tree') {
+      facts.tree = fields[1] === 'complete' ? { complete: true } : { complete: false, reason: fields.slice(2).join(' ') || 'tree unreadable' };
+    } else if (fields[0] === 'session' && fields.length >= 3) {
       const ageMs = intOf(fields[1]);
       const name = fields.slice(2).join('\t');
       if (ageMs !== null && name) facts.sessions.push({ name, ageMs: Math.max(0, ageMs) });
-    } else if (fields[0] === 'proc' && fields.length >= 13) {
-      const [, pidRaw, ppidRaw, start, ageRaw, agent, tab, url, sock, under, held, comm, ...cwd] = fields;
+    } else if (fields[0] === 'proc' && fields.length >= 14) {
+      const [, pidRaw, ppidRaw, start, ageRaw, agent, tab, url, sock, under, held, above, comm, ...cwd] = fields;
       const pid = intOf(pidRaw);
       const ageMs = intOf(ageRaw);
       if (pid === null || pid <= 1 || ageMs === null || !/^\d+$/.test(start)) continue;
@@ -765,6 +844,8 @@ export const parseRemoteOrphanScan = (stdout: string): IOrphanHostFacts | null =
         socketMatch: sock === '1',
         underServer: under === '1',
         heldBy: held || null,
+        heldKnown: true,
+        agentAbove: above === '1',
         agent: agent === '1',
       });
     }
@@ -772,11 +853,15 @@ export const parseRemoteOrphanScan = (stdout: string): IOrphanHostFacts | null =
   return facts;
 };
 
+export type TRemoteOrphanRefusal = 'protected' | 'identity-changed' | 'held-by-session' | 'tree-unreadable';
+
 export interface IRemoteOrphanReap {
   killed: number[];
   survivors: number[];
-  refused: Array<{ pid: number; refusal: 'protected' | 'identity-changed' | 'held-by-session' }>;
+  refused: Array<{ pid: number; refusal: TRemoteOrphanRefusal }>;
 }
+
+const REMOTE_REFUSALS: ReadonlySet<string> = new Set(['identity-changed', 'held-by-session', 'tree-unreadable']);
 
 /** A remote orphan reap's answer; null when the run ended before its `end` line. */
 export const parseRemoteOrphanReap = (stdout: string): IRemoteOrphanReap | null => {
@@ -789,9 +874,7 @@ export const parseRemoteOrphanReap = (stdout: string): IRemoteOrphanReap | null 
     if (pid === null) continue;
     if (kind === 'killed') result.killed.push(pid);
     else if (kind === 'survivor') result.survivors.push(pid);
-    else if (kind === 'refused') {
-      result.refused.push({ pid, refusal: reason === 'identity-changed' || reason === 'held-by-session' ? reason : 'protected' });
-    }
+    else if (kind === 'refused') result.refused.push({ pid, refusal: REMOTE_REFUSALS.has(reason) ? reason as TRemoteOrphanRefusal : 'protected' });
   }
   return result;
 };
