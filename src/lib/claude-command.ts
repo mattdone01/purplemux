@@ -5,6 +5,7 @@ import { getClaudePromptPath, writeClaudePromptFile } from '@/lib/claude-prompt'
 import { createLogger } from '@/lib/logger';
 import { isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
 import { evaluatorClaudeFlags, evaluatorEnvPrefix } from '@/lib/tab-role';
+import { ghShimLaunchPrefix } from '@/lib/gh-shim';
 import type { TTabRole } from '@/types/terminal';
 
 export { CLAUDE_EFFORT_LEVELS, isValidClaudeEffort, isValidModelName } from '@/lib/claude-command-shared';
@@ -25,7 +26,8 @@ interface IClaudeFlagOptions {
 }
 
 /** The one start of every local claude command: an evaluator's environment (ADR-0040), then `claude`. */
-export const claudeCommand = (rest: string, opts?: IClaudeFlagOptions): string => `${evaluatorEnvPrefix(opts)}claude ${rest}`;
+/** A local claude launch (a remote one is `buildRemoteClaudeLaunch`): the gh shim wrapper first, when installed (engineering#810). */
+export const claudeCommand = (rest: string, opts?: IClaudeFlagOptions): string => `${evaluatorEnvPrefix(opts)}${ghShimLaunchPrefix()}claude ${rest}`;
 
 export const buildClaudeFlags = async (workspaceId?: string, opts?: IClaudeFlagOptions): Promise<string> => {
   // An evaluator's allow-list restricts nothing under bypass permissions (ADR-0040).

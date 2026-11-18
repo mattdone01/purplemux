@@ -2,6 +2,7 @@ import os from 'os';
 import { SsoConfigError, findSsoProfile, readSsoToken, type TSsoTokenState } from '@/lib/aws-sso-cache';
 import type { ICaller } from '@/lib/caller';
 import { RATE_LIMIT_MAX_HOLD_MS, boundRetryAt, runGhApi, type IGhRate, type TGhResult } from '@/lib/gh-api';
+import { ownerOfWatch, serverGhLedger } from '@/lib/github-usage-ledger';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import type { IWatchFields } from '@/lib/inbox-templates';
 import { createLogger } from '@/lib/logger';
@@ -215,6 +216,7 @@ export class WatchManager {
     const now = this.deps.now();
     // Pruned on every push, not only when read: the log holds one hour of reads, whatever reads it (r2 #4).
     this.spend.push({ at: now, owner });
+    serverGhLedger().record(ownerOfWatch(owner), args, now);
     this.spend = this.spend.filter((e) => now - e.at < SPEND_WINDOW_MS);
     if (r.rate) {
       this.budgets.set(r.rate.resource, r.rate);

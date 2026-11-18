@@ -34,7 +34,7 @@ const FORCED_OVERRIDES: Record<string, string> = {
 // 하고 재배치를 건너뛰어 실제 터미널과 순서가 어긋난다(shim이 standalone보다 앞섬).
 // 따라서 펜 셸에는 최소 floor만 주고 셸이 직접 쌓게 한다. macOS는 path_helper가, Linux는
 // /etc/profile이 이 위에 base를 보정한다.
-const LOGIN_SHELL_BASE_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+export const LOGIN_SHELL_BASE_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 
 const collectShellEnv = (): Record<string, string> => {
   const env: Record<string, string> = {};

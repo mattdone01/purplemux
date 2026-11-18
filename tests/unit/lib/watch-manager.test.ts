@@ -3,6 +3,7 @@ import type { ICaller } from '@/lib/caller';
 import type { IEnqueueRequest } from '@/lib/inbox-store';
 import { renderInboxLine } from '@/lib/inbox-templates';
 import { RESUME_MARGIN_MS, RESUME_STAGGER_MS, WatchManager, classifyGhError, settleChecks, type IWatchDeps, type TGhResult } from '@/lib/watch-manager';
+import { serverGhLedger } from '@/lib/github-usage-ledger';
 import { WATCH_DEFAULT_TTL_S, WATCH_GITHUB_CAP, WATCH_TAB_CAP, WatchError, checkSpec, isDue } from '@/lib/watch-store';
 import type { IInboxItem } from '@/types/inbox';
 import type { IWatchesState } from '@/types/watch';
@@ -125,6 +126,15 @@ describe('harness watches (ADR-0015)', () => {
   it('records how the owner was named beside verified (story 36)', async () => {
     const hook = await m.create({ ...B, verified: false, identity: 'hook' } as ICaller, { kind: 'lease', target: 'merge:acme/x', until: 'free' });
     expect(hook).toMatchObject({ verified: false, identity: 'hook' });
+  });
+
+  it('counts each GitHub read in the server ledger against the watch owner tab (engineering#810)', async () => {
+    const before = serverGhLedger().counts(T0 - MIN, T0 + MIN).filter((c) => c.tabId === 'tab-b').reduce((n, c) => n + c.count, 0);
+    f.answer('number=88', f.pull(false, 'open', SHA_A));
+    await m.create(B, { kind: 'pr', target: 'o/r#88', until: 'merged' });
+    const after = serverGhLedger().counts(T0 - MIN, T0 + MIN).filter((c) => c.tabId === 'tab-b');
+    expect(after.reduce((n, c) => n + c.count, 0) - before).toBe(1);
+    expect(after.find((c) => c.w1 === 'api')).toMatchObject({ source: 'server', workspaceId: 'ws-b', kind: 'graphql', w2: 'graphql' });
   });
 
   it('merged false then true: exactly one notice reaches the owner tab and the watch is gone', async () => {

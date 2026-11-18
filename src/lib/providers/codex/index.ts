@@ -4,6 +4,7 @@ import path from 'path';
 import { isValidCodexEffort } from '@/lib/agent-effort';
 import { isValidModelName } from '@/lib/claude-command-shared';
 import { getDangerouslySkipPermissions } from '@/lib/config-store';
+import { ghShimLaunchPrefix } from '@/lib/gh-shim';
 import { createLogger } from '@/lib/logger';
 import { buildCodexHookFlags } from '@/lib/providers/codex/hook-config';
 import { runCodexPreflight } from '@/lib/providers/codex/preflight';
@@ -311,7 +312,7 @@ const composeLaunchCommand = async (
   if (resumeSessionId) parts.push('--resume-session-id', shellSingleQuote(resumeSessionId));
   if (options.model) parts.push('--model', shellSingleQuote(options.model));
   if (options.effort) parts.push('--effort', shellSingleQuote(options.effort));
-  return parts.join(' ');
+  return `${ghShimLaunchPrefix()}${parts.join(' ')}`;
 };
 
 export const buildManagedCodexLaunchCommand = async (identity: {
@@ -321,7 +322,7 @@ export const buildManagedCodexLaunchCommand = async (identity: {
   generation: string;
 }): Promise<string> => {
   const scriptPath = await ensureCodexLauncherScript();
-  return [
+  return ghShimLaunchPrefix() + [
     'node',
     shellSingleQuote(scriptPath),
     '--generation',
