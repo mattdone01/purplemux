@@ -8,7 +8,8 @@ import { DAY_MS, HOUR_MS, type GhCallLedger, type IGhCallCount, type TGhCallSour
 
 export const GITHUB_USAGE_RESIDUAL = 'residual: a script that resets PATH, or one that runs gh by an absolute path such as '
   + '/usr/bin/gh, is not counted, so the count can be low; nor is a shell whose rc puts another gh before the shim '
-  + '(a plain terminal tab, or an agent the web UI started); remote tabs are not counted';
+  + '(a plain terminal tab, an agent the web UI started, or an agent tool shell that is not bash); remote tabs are '
+  + 'not counted';
 
 export const OWNER_LIMIT = 10;
 const REDACTED = 'other';

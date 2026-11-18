@@ -5,6 +5,7 @@ import path from 'path';
 import { promisify } from 'util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  ghBashEnvPath,
   ghPathExecPath,
   ghShimDir,
   ghShimLaunchPrefix,
@@ -184,5 +185,52 @@ describe('the shim on a local tab', () => {
     expect(prefix).toBe(`'${ghPathExecPath(home())}' `);
     const { stdout } = await run('sh', ['-c', `${prefix}sh -c 'command -v gh'`], { env: { NODE_ENV: 'test', PATH: '/usr/bin:/bin', HOME: home() } });
     expect(stdout.trim()).toBe(ghShimPath(home()));
+  });
+
+  describe('an agent tool shell that is a login bash (the #97 CONFIRM concern)', () => {
+    // The login rc puts another gh first, as ~/.profile does on the agent hosts (measured: bash -lc gave ~/.local/bin/gh).
+    const rcGh = () => path.join(home(), 'rcbin', 'gh');
+    const launch = async (inner: string, env: Record<string, string> = {}) => {
+      await installGhShim({ home: home(), pathEnv: path.dirname(fakeGh) });
+      await writeExec(rcGh(), '#!/bin/sh\necho rc-gh\n');
+      await fs.writeFile(path.join(home(), '.profile'), 'PATH="$HOME/rcbin:$PATH"\nexport PATH\n');
+      const { stdout } = await run('sh', ['-c', `${ghShimLaunchPrefix(home())}${inner}`], {
+        env: { NODE_ENV: 'test', PATH: '/usr/bin:/bin', HOME: home(), ...env },
+      });
+      return stdout.trim();
+    };
+
+    it('without BASH_ENV the rc wins: the control the fix answers', async () => {
+      expect(await launch(`env -u BASH_ENV bash -lc 'command -v gh'`)).toBe(rcGh());
+    });
+
+    it('bash -lc under the wrapper finds the shim first, after the rc', async () => {
+      expect(await launch(`bash -lc 'command -v gh'`)).toBe(ghShimPath(home()));
+    });
+
+    it('bash -c under the wrapper finds the shim first', async () => {
+      expect(await launch(`bash -c 'command -v gh'`)).toBe(ghShimPath(home()));
+    });
+
+    it('sources an earlier BASH_ENV first, and a nested launch keeps it', async () => {
+      const prev = path.join(root, 'prev-env.sh');
+      await fs.writeFile(prev, 'PMUX_TEST_MARK=prev\n');
+      const prefix = `'${ghPathExecPath(home())}' `;
+      expect(await launch(`${prefix}bash -lc 'echo "$PMUX_TEST_MARK $(command -v gh)"'`, { BASH_ENV: prev }))
+        .toBe(`prev ${ghShimPath(home())}`);
+    });
+
+    it('adds the shim once when it is first already', async () => {
+      const out = await launch(`bash -c 'echo "$PATH"'`);
+      expect(out.split(':').filter((e) => e === ghShimDir(home()))).toHaveLength(1);
+    });
+
+    it('installs the bash-env file, and removes it with the shim', async () => {
+      await installGhShim({ home: home(), pathEnv: path.dirname(fakeGh) });
+      await expect(fs.access(ghBashEnvPath(home()))).resolves.toBeUndefined();
+      await installGhShim({ home: home(), pathEnv: path.join(root, 'empty') });
+      await expect(fs.access(ghBashEnvPath(home()))).rejects.toThrow();
+      expect(installedGhShimDir(home())).toBeNull();
+    });
   });
 });

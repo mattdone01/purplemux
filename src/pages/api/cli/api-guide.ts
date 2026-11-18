@@ -368,12 +368,13 @@ GET /api/cli/github-usage   (any valid scope)
   ~/.local/share/purplemux/bin/gh (0755, directory 0700) with the real gh pinned by its absolute path
   (no real gh on PATH: no shim, no PATH change). A local pane gets that directory first on PATH, and
   every local claude, grok and codex launch starts through its pmux-gh-path wrapper, so the shim is
-  first after the shell rc too. Each call appends "<epoch> <tab> <ws> <w1> <w2>" to
+  first after the shell rc too; the wrapper also sets BASH_ENV to bin/bash-env, which puts the shim
+  first again in an agent's bash tool shell, a login bash -lc included (an earlier BASH_ENV runs first). Each call appends "<epoch> <tab> <ws> <w1> <w2>" to
   \${XDG_STATE_HOME:-~/.local/state}/purplemux/gh-calls/<UTC YYYYMMDD>.log (0600): for gh api the kind
   (rest|graphql) only, never the path; another word outside the allow-list is "?". The server reads
   the last 2 days and removes older files. Not counted: a script that resets PATH, gh run by an
-  absolute path, a claude tab the web UI started (its command is built in the browser), and remote
-  tabs. "-" is a call with no tab. A caller that cannot read a workspace sees its owners as "other".
+  absolute path, a claude tab the web UI started (its command is built in the browser), an agent tool
+  shell that is not bash and whose rc puts another gh first, and remote tabs. "-" is a call with no tab. A caller that cannot read a workspace sees its owners as "other".
   Below 20 % of an agent account's core limit before its reset, one line per account per reset window
   goes to the portfolio Scrum Master seat (kind flag, rule github-quota-low) with the top 3 owners of
   the last hour by REST calls; with no seat it is logged and tried again at the next read.

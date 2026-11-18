@@ -13,6 +13,7 @@ import { LOGIN_SHELL_BASE_PATH } from '@/lib/shell-env';
 export const ghShimDir = (home: string = os.homedir()): string => path.join(home, '.local', 'share', 'purplemux', 'bin');
 export const ghShimPath = (home: string = os.homedir()): string => path.join(ghShimDir(home), 'gh');
 export const ghPathExecPath = (home: string = os.homedir()): string => path.join(ghShimDir(home), 'pmux-gh-path');
+export const ghBashEnvPath = (home: string = os.homedir()): string => path.join(ghShimDir(home), 'bash-env');
 
 const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
@@ -49,13 +50,32 @@ export const ghShimScript = (realGh: string): string => [
   '',
 ].join('\n');
 
-/** The launch wrapper: the shim directory first on PATH, then the command. */
-export const ghPathExecScript = (dir: string): string => [
-  '#!/bin/sh',
-  '# purplemux (engineering#810): run a local agent with the gh shim first on PATH, after the shell rc.',
-  `PATH=${shQuote(dir)}:"$PATH"`,
-  'export PATH',
-  'exec "$@"',
+/**
+ * The launch wrapper: the shim directory first on PATH, and BASH_ENV set to the bash-env file, then the command.
+ * An agent's tool shell can be a login bash (`bash -lc`) that runs the rc again and puts another gh first; bash
+ * reads BASH_ENV after the rc in every non-interactive shell, so the bash-env file puts the shim first again. An
+ * earlier BASH_ENV is kept in PMUX_GH_PREV_BASH_ENV and sourced first; a nested launch keeps the first one.
+ */
+export const ghPathExecScript = (dir: string): string => {
+  const bashEnv = shQuote(path.join(dir, 'bash-env'));
+  return [
+    '#!/bin/sh',
+    '# purplemux (engineering#810): run a local agent with the gh shim first on PATH, after the shell rc.',
+    `PATH=${shQuote(dir)}:"$PATH"`,
+    'export PATH',
+    `if [ "\${BASH_ENV-}" != ${bashEnv} ]; then PMUX_GH_PREV_BASH_ENV=\${BASH_ENV-}; export PMUX_GH_PREV_BASH_ENV; fi`,
+    `BASH_ENV=${bashEnv}`,
+    'export BASH_ENV',
+    'exec "$@"',
+    '',
+  ].join('\n');
+};
+
+/** The bash-env file: the earlier BASH_ENV first, then the shim directory first on PATH unless it is first. */
+export const ghBashEnvScript = (dir: string): string => [
+  '# purplemux (engineering#810): a non-interactive bash reads this after the rc; it puts the gh shim first again.',
+  'if [ -n "${PMUX_GH_PREV_BASH_ENV-}" ] && [ -r "$PMUX_GH_PREV_BASH_ENV" ]; then . "$PMUX_GH_PREV_BASH_ENV"; fi',
+  `case "$PATH" in ${shQuote(`${dir}:`)}*) ;; *) PATH=${shQuote(dir)}:"$PATH"; export PATH ;; esac`,
   '',
 ].join('\n');
 
@@ -100,7 +120,7 @@ const writeExecutable = async (file: string, content: string): Promise<void> => 
 };
 
 /**
- * Write the shim and the launch wrapper (0755) in a 0700 directory, with the real gh resolved once from PATH. With
+ * Write the shim, the launch wrapper and the bash-env file (0755) in a 0700 directory, with the real gh resolved once from PATH. With
  * no real gh, nothing is installed and an earlier shim is removed, so no tab PATH changes.
  */
 export const installGhShim = async (opts: { home?: string; pathEnv?: string } = {}): Promise<TGhShimInstall> => {
@@ -108,21 +128,23 @@ export const installGhShim = async (opts: { home?: string; pathEnv?: string } = 
   const dir = ghShimDir(home);
   const realGh = await resolveRealGh(opts.pathEnv ?? process.env.PATH ?? '', dir);
   if (!realGh) {
-    await Promise.all([ghShimPath(home), ghPathExecPath(home)].map((file) => fs.rm(file, { force: true })));
+    await Promise.all([ghShimPath(home), ghPathExecPath(home), ghBashEnvPath(home)].map((file) => fs.rm(file, { force: true })));
     return { installed: false, reason: 'no gh on PATH outside the shim directory' };
   }
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   await fs.chmod(dir, 0o700);
+  await writeExecutable(ghBashEnvPath(home), ghBashEnvScript(dir));
   await writeExecutable(ghPathExecPath(home), ghPathExecScript(dir));
   await writeExecutable(ghShimPath(home), ghShimScript(realGh));
   return { installed: true, dir, realGh };
 };
 
-/** The shim directory when both scripts are installed and executable; null otherwise. */
+/** The shim directory when the three files are installed and executable; null otherwise. */
 export const installedGhShimDir = (home: string = os.homedir()): string | null => {
   try {
     accessSync(ghShimPath(home), fsConstants.X_OK);
     accessSync(ghPathExecPath(home), fsConstants.X_OK);
+    accessSync(ghBashEnvPath(home), fsConstants.R_OK);
     return ghShimDir(home);
   } catch {
     return null;
