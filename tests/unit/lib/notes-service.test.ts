@@ -1482,3 +1482,75 @@ describe('the list hint on a recipient note line (NR-2\', design ruling E)', () 
     expect(f.sent[0].fields).not.toHaveProperty('listHint');
   });
 });
+
+describe('note supersede and the delivery field (RULING.md design 11, 13)', () => {
+  let f: Fakes;
+  let svc: NotesService;
+
+  beforeEach(() => {
+    f = new Fakes();
+    svc = new NotesService(f.deps());
+  });
+
+  it('note-supersede-unacked: a newer note with the same key refuses the older unacked one; its notice fails the preflight', async () => {
+    const older = await svc.send(W, { toWorkspace: 'ws-2', subject: 'taken', body: 'I take PR 12', supersedeKey: 'pr-12' });
+    const olderItem = f.inbox.get(older.inboxItemId!)!;
+    const newer = await svc.send(W, { toWorkspace: 'ws-2', subject: 'released', body: 'PR 12 is free', supersedeKey: 'pr-12' });
+    expect(f.note(older.id)).toMatchObject({ state: 'undeliverable', supersededBy: newer.id, supersedeKey: 'pr-12' });
+    const verdict = await svc.preflight({ ...olderItem, state: 'queued' } as IInboxItem);
+    expect(verdict.ok).toBe(false);
+    const shown = await svc.show(B, older.id);
+    expect(shown.body).toBe('I take PR 12');
+    expect(shown.note).toMatchObject({ supersededBy: newer.id, delivery: 'refused' });
+    expect(f.note(newer.id).state).toBe('delivered');
+  });
+
+  it('never touches an acked note, and never re-routes or expires-notifies a superseded one', async () => {
+    const acked = await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b', supersedeKey: 'k' });
+    f.deliverInbox(acked.inboxItemId!);
+    await svc.ack(B, acked.id, 'done');
+    const middle = await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b2', supersedeKey: 'k' });
+    await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b3', supersedeKey: 'k' });
+    expect(f.note(acked.id).state).toBe('acked');
+    expect(f.note(middle.id).state).toBe('undeliverable');
+    const sentBefore = f.sent.length;
+    f.now += NOTE_EXPIRE_MS + NOTE_EXPIRE_NOTICE_GRACE_MS + MIN;
+    await svc.tick();
+    expect(f.note(middle.id)).toMatchObject({ state: 'undeliverable', supersededBy: expect.any(String) });
+    expect(f.sent.slice(sentBefore).filter((s) => s.fields.noteId === middle.id)).toEqual([]);
+  });
+
+  it('a superseded note is not open: it leaves the sender cap and the open list', async () => {
+    const older = await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b', supersedeKey: 'k' });
+    await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b2', supersedeKey: 'k' });
+    const open = await svc.list(B, { open: true });
+    expect(open.map((n) => n.id)).not.toContain(older.id);
+  });
+
+  it('keeps supersede inside one sender, one recipient route and one key', async () => {
+    const otherKey = await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b', supersedeKey: 'j' });
+    const otherRoute = await svc.send(W, { toWorkspace: 'ws-1', subject: 's', body: 'b', supersedeKey: 'k' }).catch(() => null);
+    const otherSender = await svc.send(B, { toWorkspace: 'ws-2', subject: 's', body: 'b', supersedeKey: 'k' });
+    const noKey = await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b' });
+    await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'new', supersedeKey: 'k' });
+    for (const n of [otherKey, otherSender, noKey, otherRoute].filter((x) => x !== null)) {
+      expect(f.note(n!.id).supersededBy).toBeUndefined();
+    }
+  });
+
+  it('refuses a bad key, and a key from a sender with no tab', async () => {
+    await expectCode(svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b', supersedeKey: 'a b' }), 'note-invalid');
+    await expectCode(svc.send({ ...W, tabId: null } as ICaller, { toWorkspace: 'ws-2', subject: 's', body: 'b', supersedeKey: 'k' }), 'note-invalid');
+  });
+
+  it('delivery-state-mapping (the note half): queued/pending → queued, delivered/acked → delivered, held → held', async () => {
+    const pending = await svc.send(W, { toWorkspace: 'ws-2', subject: 's', body: 'b' });
+    expect(pending).toMatchObject({ state: 'pending', delivery: 'queued' });
+    f.inbox.set(pending.inboxItemId!, { ...f.inbox.get(pending.inboxItemId!)!, state: 'held' } as IInboxItem);
+    expect((await svc.show(B, pending.id)).note).toMatchObject({ state: 'held', delivery: 'held' });
+    f.deliverInbox(pending.inboxItemId!);
+    expect((await svc.show(B, pending.id)).note).toMatchObject({ state: 'delivered', delivery: 'delivered' });
+    await svc.ack(B, pending.id, null);
+    expect((await svc.show(B, pending.id)).note).toMatchObject({ state: 'acked', delivery: 'delivered' });
+  });
+});

@@ -6,7 +6,7 @@ import { brandCodedError } from '@/lib/coded-error';
 import { NOTE_BODY_MAX_BYTES, NOTE_SUBJECT_MAX } from '@/lib/human-actions';
 import { EPIC_SLUG } from '@/lib/lease-policy';
 import { noteFromWords } from '@/lib/inbox-templates';
-import type { IInboxItem } from '@/types/inbox';
+import type { IInboxItem, TDeliveryState } from '@/types/inbox';
 import type { INote, INoteAdmission, INoteParty, INotePointerStamp, INoteTarget, INotesState, INoteView, TNoteErrorCode, TNoteViewState } from '@/types/note';
 
 // Notes with acknowledgement (ADR-0013). Pure state transitions first, then the
@@ -48,6 +48,8 @@ export const NOTE_EXPIRE_NOTICE_GRACE_MS = DAY;
 export const NOTE_PRUNE_MS = 14 * DAY;
 
 export const OPEN_STATES = new Set(['queued', 'delivered', 'undeliverable']);
+/** Open: an open state, and not superseded (ADR-0050). A superseded note is `undeliverable` and final. */
+export const isOpenNote = (note: Pick<INote, 'state' | 'supersededBy'>): boolean => OPEN_STATES.has(note.state) && !note.supersededBy;
 /** Open notes one sender may have at a time (queued, delivered or undeliverable). */
 export const NOTE_OPEN_PER_SENDER = 50;
 const WORKSPACE_ID = /^ws-[A-Za-z0-9_-]{1,32}$/;
@@ -243,7 +245,16 @@ export const viewOf = (note: INote, notice: Pick<IInboxItem, 'state'> | null): I
     human: note.admission?.mode === 'human',
     owner: note.admission?.mode === 'owner',
   });
-  return { ...rest, state: presentedState(note, notice), bodyBytes: Buffer.byteLength(body, 'utf8'), fromLabel };
+  const state = presentedState(note, notice);
+  return { ...rest, state, delivery: noteDelivery(state), bodyBytes: Buffer.byteLength(body, 'utf8'), fromLabel };
+};
+
+/** ADR-0050: queued and pending read queued; delivered and acked read delivered; undeliverable reads refused. */
+export const noteDelivery = (state: TNoteViewState): TDeliveryState => {
+  if (state === 'queued' || state === 'pending') return 'queued';
+  if (state === 'delivered' || state === 'acked') return 'delivered';
+  if (state === 'undeliverable') return 'refused';
+  return state;
 };
 
 // ─── the file store ───────────────────────────────────────────────────────

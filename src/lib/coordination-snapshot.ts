@@ -39,7 +39,7 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
       const [{ notes: all }, inbox] = await Promise.all([notes.readNotesState(), readInboxState()]);
       const notices = new Map(inbox.items.map((item) => [item.id, item]));
       return all
-        .filter((n) => notes.OPEN_STATES.has(n.state))
+        .filter((n) => notes.isOpenNote(n))
         .map((n) => ({
           ...notes.viewOf(n, n.inboxItemId ? notices.get(n.inboxItemId) ?? null : null),
           ageSeconds: Math.max(0, Math.floor((now - n.createdAt) / 1000)),
