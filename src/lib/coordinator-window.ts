@@ -22,8 +22,11 @@ export const INBOX_HEADS_TTL_MS = 10_000;
 /** The `lastRefusal` prefix of an inbox item deferred by the window: no refusal budget is spent on it. */
 export const WINDOW_DEFERRAL = 'coordinator-window:';
 
-/** Inbox kinds that skip the window: the owner's answer and a turn a usage limit interrupted (ruling, Q1). */
-export const WINDOW_EXEMPT_INBOX_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['mission', 'resume']);
+/**
+ * Inbox kinds that skip the window: the owner's answer and a turn a usage limit interrupted (ruling, Q1), and a queued
+ * `tab send`, which was typed at once before it could be queued (ADR-0050).
+ */
+export const WINDOW_EXEMPT_INBOX_KINDS: ReadonlySet<TInboxKind> = new Set<TInboxKind>(['mission', 'resume', 'message']);
 
 /** Inbox kinds whose delivery to a coordinator went through the window, and so starts the next one. */
 export const WINDOWED_INBOX_KINDS: readonly TInboxKind[] = ['note', 'watch', 'deploy'];

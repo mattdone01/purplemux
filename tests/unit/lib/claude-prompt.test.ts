@@ -35,4 +35,16 @@ describe('the workspace prompt (story 15, AC 2)', () => {
     expect(body).toContain('claude-code | codex-cli | grok-cli | agent-sessions');
     expect(body).toContain('`terminal` / `claude-code` / `codex-cli` / `grok-cli` tabs');
   });
+
+  it('seat-prompt-address-line: holds the tab address line exactly once, after the tab send line (ADR-0050)', async () => {
+    const body = await written();
+    const line = 'purplemux tab address -w WS TAB_ID   # a Claude seat\'s SendMessage address; on any refusal or failed send use tab send (it queues); never message a socket you did not get here';
+    expect(body.split(line)).toHaveLength(2);
+    expect(body.indexOf(line)).toBeGreaterThan(body.indexOf('purplemux tab send -w'));
+  });
+
+  it('says once that only a lead looks up another workspace\'s lead, and that every other seat uses a note (ADR-0050)', async () => {
+    const body = await written();
+    expect(body.match(/A lead may look up another workspace's lead with `purplemux tab address`; any other seat uses a note across workspaces\./g)).toHaveLength(1);
+  });
 });

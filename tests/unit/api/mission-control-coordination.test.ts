@@ -26,6 +26,7 @@ vi.mock('@/lib/lease-http', () => ({ viewsOf: m.leases }));
 vi.mock('@/lib/notes-store', () => ({
   readNotesState: m.notes,
   OPEN_STATES: new Set(['queued', 'delivered', 'undeliverable']),
+  isOpenNote: (n: { state: string; supersededBy?: string }) => ['queued', 'delivered', 'undeliverable'].includes(n.state) && !n.supersededBy,
   viewOf: (n: Record<string, unknown>) => ({ ...n }),
 }));
 vi.mock('@/lib/watch-manager', () => ({ getWatchManager: async () => ({ list: m.watches }) }));

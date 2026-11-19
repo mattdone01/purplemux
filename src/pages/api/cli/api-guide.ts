@@ -158,6 +158,12 @@ to an exit code through one table:
      5  not ready (note point, G7)               note-point-not-ready (a prompt, a halt,    yes, bounded
                                                  a policy refusal or text in the
                                                  composer; nothing typed)
+     3  refused by state (tab send, ADR-0050)    message-queue-full (20 messages queued     after one is delivered,
+                                                 for the tab)                               or with --supersede KEY
+     3  refused (tab address, ADR-0050)          address-not-claude, address-unknown,       no: use tab send (it
+                                                 address-stale, address-other-host,         queues); between
+                                                 address-class-mismatch, address-disabled,  workspaces, a note
+                                                 address-not-lead-pair
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -602,7 +608,19 @@ POST /api/cli/tabs/orphans   Body: { "reap": true, "host"?: "local" | H }
   CLI: purplemux tab orphans [--host H] [--reap] [--json]
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
-  Body: { "content": "...", "waitMs"?: 0..600000, "raw"?: boolean }
+  Body: { "content": "...", "waitMs"?: 0..600000, "raw"?: boolean, "noQueue"?: boolean,
+          "supersede"?: "[A-Za-z0-9._:-]{1,64}", "ttlMin"?: 1..1440 }
+  ADR-0050: a claude-code tab of the caller's own workspace that is busy (not waiting at its prompt), not
+  ready by waitMs, or that already holds a queued message, QUEUES the text as an inbox item of kind
+  "message": 200 { "status": "queued", "submitted": false, "messageId": "i-…", "delivery": "queued" }
+  (exit 0), nothing typed. The inbox types a fixed header line "[purplemux message <id> from <ws>/<tab>,
+  queued <time>]" and the body, unchanged, once the composer reads empty (busy included; never a dialog,
+  a startup prompt, a compaction or a halt). Read its state with GET /api/cli/inbox/<id>. It expires
+  after ttlMin (default 120) minutes; supersede refuses the sender tab's older queued message to this tab
+  with the same key (it needs a sender tab, else 400 invalid-request); a 21st queued message answers
+  409 { "code": "message-queue-full", "tabId" } (exit 3). noQueue, or the fleet switch tab-send.queue off,
+  keeps the wait and the exit 5 below for the call. A sender of another workspace, codex-cli, grok-cli and
+  terminal tabs keep the path below. A typed claude-code send adds "delivery": "delivered" | "held".
   Send text to the tab and press Enter. Typed into Claude Code, bracketed paste elsewhere.
   For an agent tab (claude-code / codex-cli / grok-cli) the send waits until the tab can
   accept a turn, up to waitMs (default 60000). A booting agent swallows the Enter after a
@@ -653,6 +671,26 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
     typed. The error says "saw N lines; expected one shell command line". A multi-line command (a
     heredoc, a quoted multi-line string, a backslash continuation) needs raw: true (--raw); prose
     belongs in an agent tab.
+
+GET /api/cli/tabs/<tabId>/address?workspaceId=WS   (CLI: tab address [-w WS] TAB_ID)
+  ADR-0050 (S1): a Claude tab's SendMessage address, as its status hook registered it (the session's
+  CLAUDE_CODE_MESSAGING_SOCKET, forwarded at session-start, prompt-submit and notification; kept in server
+  memory only). 200 { "tabId", "workspaceId", "address": "uds:<path>", "permissionMode": "<mode>" |
+  "unknown", "registeredAt", "lastSeenAt" }. Admitted exactly where tab send from the same caller passes
+  the drive guard (the caller's own workspace, or the selected Scrum Master), and, between workspaces, from
+  one workspace's verified, enabled orchestrator tab to another workspace's orchestrator (the owner's
+  ruling of 20 Nov 2026; tab-address.lead-pair). Refusals, each with "hint": "use \`purplemux tab send\`;
+  it queues" (between workspaces: "use \`purplemux note send\`; a note is the route between workspaces"):
+  403 forbidden (no workspace token), 409 address-disabled (tab-address or tab-address.lead-pair off),
+  409 caller-unresolved (the caller is not a resolved Claude tab), 403 address-not-lead-pair, 404
+  tab-not-found, 409 address-not-claude, 409 address-other-host, 409 session-not-running (exit 4),
+  409 address-unknown (no registration yet), 409 address-stale (the socket file is gone, its pid is dead,
+  the agent session changed or the agent is inactive; the entry is cleared), 409 address-class-mismatch
+  (the target skips permission prompts, the caller is known not to). The stale check only stats the file
+  and signals the pid; the server never connects to a socket. Each lookup writes one "address-lookup"
+  coordination audit line (caller, target, scope same-workspace | scrum-master | lead-pair, outcome); no
+  message body ever reaches the server. After ENOENT on a SendMessage: one fresh lookup, one retry, then
+  tab send.
 
 POST /api/cli/tabs/<tabId>/steer?workspaceId=WS
   Body: { "content": "...", "interrupt"?: boolean, "reason"?: "1..500 chars", "raw"?: boolean }
@@ -864,6 +902,14 @@ GET /api/cli/inbox?workspaceId=WS[&all=1]   (CLI: inbox list -w WS [--all] [--co
     "items": [{ "id", "kind", "targetWorkspaceId", "targetTabId", "dedupeKey",
     "line", "state", "attempts", "lastRefusal", "notBefore", "createdAt", "deliveredAt", "heldReason",
     "droppedReason", "expiresAt", "transitionAt", ... }] }
+
+GET /api/cli/inbox/<id>   (CLI: inbox show ID)
+  Read scope of the item's target workspace. { "item": { ...the fields above, "delivery": "queued" |
+  "delivered" | "held" | "refused" | "expired", "message"?: { "fromWorkspaceId", "fromTabId",
+  "targetSessionName", "supersedeKey", "claimedAt", "bodyBytes" } } }. A message's body is never served,
+  here or in inbox list. refused names its droppedReason: superseded-by:<id>, target-tab-closed,
+  target-changed, policy:<…>, workspace-mismatch, queue-off. 404 { "code": "inbox-not-found" } (exit 7)
+  for an unknown id and for an item outside the caller's read scope.
 
 POST /api/cli/inbox/<id>/retry   { "reason"? }
   The target workspace's own token, the workspace that sent the note the item carries, or the
@@ -1163,6 +1209,15 @@ Keys in use:
   hook.stop-payload
                on (unset) or off. On, the Claude stop's own last_assistant_message is the turn's tail; off, the
                transcript tail is read again (F6). Admin token only.
+  tab-send.queue
+               on (unset) or off (ADR-0050). On, a busy claude-code tab queues a tab send as an inbox
+               message. Off, the route never queues (exit 5, as before) and the next inbox tick refuses
+               each queued message queue-off; set it off first when rolling back. Admin token only.
+  tab-address  tab-address.lead-pair
+               on (unset) or off (ADR-0050). tab-address off refuses every tab address lookup
+               (address-disabled); tab-address.lead-pair off refuses only the lookup between two
+               workspaces' orchestrators. An unreadable store refuses lookups. Neither touches the queue.
+               Admin token only.
   fleet-status.stall-minutes  fleet-status.waiting-long-minutes  fleet-status.unanswered-minutes
   fleet-status.composer-minutes
                The fleet flag thresholds (ADR-0023), in minutes (0, 10080], decimals allowed:

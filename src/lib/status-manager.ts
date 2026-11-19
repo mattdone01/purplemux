@@ -79,6 +79,7 @@ import { TabEventRouter, type ITabEventRoute, type ITabEventRouteResult } from '
 import { WINDOWED_INBOX_KINDS, configureCoordinatorWindow, getCoordinatorWindow } from '@/lib/coordinator-window';
 import { StopGate, type IStopPayload } from '@/lib/stop-gate';
 import { STOP_PAYLOAD_CONFIG_KEY, TURN_END_SOURCE_CONFIG_KEY, resolveTurnEnd, synthesizeLine, tailMarker, type TStopDecision } from '@/lib/turn-end-row';
+import { clearAddress } from '@/lib/messaging-directory';
 import type { TurnEndsTable } from '@/lib/turn-ends-store';
 import type { ITurnEndTab } from '@/lib/turn-end-service';
 import { classifyWake, lastTurnMarker, type IWakeDetail } from '@/lib/wake-class';
@@ -2490,6 +2491,8 @@ export class StatusManager {
     entry.busySince = newState === 'busy' ? Date.now() : null;
     if (newState === 'inactive') this.inactiveSince.set(tabId, Date.now());
     else this.inactiveSince.delete(tabId);
+    // The agent process is gone, and its messaging socket with it (ADR-0050).
+    if (newState === 'inactive') clearAddress(entry.workspaceId, tabId);
     if (newState === 'busy') entry.dismissedAt = null;
     if (prevState === 'needs-input' && newState !== 'needs-input' && entry.permissionRequest) {
       entry.permissionRequest = null;
@@ -3854,6 +3857,14 @@ export class StatusManager {
       if (entry.tmuxSession === tmuxSession) return tabId;
     }
     return undefined;
+  }
+
+  /** The tab a hook's tmux session belongs to, as the messaging directory records it (ADR-0050); null when none. */
+  tabForTmuxSession(tmuxSession: string): { tabId: string; workspaceId: string; panelType: TPanelType | undefined; host: string | null; agentSessionId: string | null } | null {
+    const tabId = this.findTabIdBySession(tmuxSession);
+    const entry = tabId ? this.tabs.get(tabId) : undefined;
+    if (!tabId || !entry) return null;
+    return { tabId, workspaceId: entry.workspaceId, panelType: entry.panelType, host: entry.host ?? null, agentSessionId: entry.agentSessionId ?? null };
   }
 
   /** The agent session a tab's pane is bound to, or null when none is bound (or no tab owns the pane). */

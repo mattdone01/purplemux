@@ -9,6 +9,7 @@ import { processGrokHookPayload, shouldEmitGrokHookEvent } from '@/lib/providers
 import { grokHookEvent, parseGrokToolActivity } from '@/lib/providers/grok/hook-payload';
 import { grokHookEvents } from '@/lib/providers/grok/hook-events';
 import { handleRemoteClaudeHook } from '@/lib/remote-hook';
+import { registerAddress } from '@/lib/messaging-directory';
 import {
   withReplayedCodexHookGeneration,
   withValidatedCodexHookGeneration,
@@ -80,17 +81,43 @@ const handleClaudeStopHook = async ({ query, body, replayedAt, occurredAt }: IHo
   return { status: 200, body: {} };
 };
 
+/** The generic events whose payload may carry the session's messaging address (ADR-0050, S1). */
+const ADDRESS_EVENTS: ReadonlySet<string> = new Set(['session-start', 'prompt-submit', 'notification']);
+
+/**
+ * Store a Claude tab's messaging address after the grammar check (`registerAddress` refuses anything else). A
+ * replayed event is skipped: its process may be gone, and the next live event registers again.
+ */
+const registerClaudeAddress = (event: string, session: string, payload: Record<string, unknown>): void => {
+  if (!ADDRESS_EVENTS.has(event) || typeof payload.socket !== 'string') return;
+  const tab = getStatusManager().tabForTmuxSession(session);
+  if (!tab || tab.panelType !== 'claude-code') return;
+  registerAddress({
+    tabId: tab.tabId,
+    workspaceId: tab.workspaceId,
+    socketPath: payload.socket,
+    agentSessionId: tab.agentSessionId,
+    host: tab.host,
+    permissionMode: typeof payload.permissionMode === 'string' ? payload.permissionMode : null,
+  });
+};
+
 const handleClaudeHook = ({ body, replayedAt, occurredAt }: IHookDelivery): IHookOutcome => {
-  const { event, session, notificationType, source } = bodyRecord(body);
+  const payload = bodyRecord(body);
+  const { event, session, notificationType, source } = payload;
   if (typeof event === 'string' && event !== 'poll' && typeof session === 'string' && session) {
     const type = typeof notificationType === 'string' && notificationType ? notificationType : undefined;
     log.debug({ event, session, notificationType: type, source, replayedAt }, `received ${event}${type ? `(${type})` : ''}${typeof source === 'string' ? `(source=${source})` : ''}`);
-    const workEvent = translateClaudeHookEvent(event, type, source);
+    // ADR-0050 (D8): a message from another session fires prompt-submit too. It shows a running turn and is neither
+    // submit evidence for a tab send nor a new turn for `purplemux done`, which is what `fromTool` already means.
+    const translated = translateClaudeHookEvent(event, type, source);
+    const workEvent = translated?.kind === 'prompt-submit' && payload.crossSession === true ? { ...translated, fromTool: true as const } : translated;
     if (workEvent) {
       getStatusManager().handleProviderEvent('claude', session, workEvent, replayedAt ?? occurredAt, { replayed: replayedAt !== undefined });
     } else {
       log.debug({ event, session, notificationType: type }, 'unknown claude hook event, ignoring');
     }
+    if (replayedAt === undefined) registerClaudeAddress(event, session, payload);
   } else if (replayedAt === undefined) {
     log.debug({ body }, 'poll trigger');
     getStatusManager().poll().catch((err) => {

@@ -1,5 +1,5 @@
 import { isNoteBounceReason } from '@/lib/inbox-templates';
-import { OPEN_STATES, readNotesState } from '@/lib/notes-store';
+import { isOpenNote, readNotesState } from '@/lib/notes-store';
 import type { ITabEventRoute } from '@/lib/tab-event-router';
 import type { INote } from '@/types/note';
 
@@ -16,7 +16,7 @@ const NOTE_ID = /^n-[A-Za-z0-9_-]{4,32}$/;
 
 /** The open notes routed to this tab: exactly what `note list --open --to-me` lists for it. */
 export const pendingNotesFor = (notes: readonly INote[], workspaceId: string, tabId: string): { count: number; oldestAt: number | null } => {
-  const mine = notes.filter((n) => OPEN_STATES.has(n.state) && n.deliveredTo !== null
+  const mine = notes.filter((n) => isOpenNote(n) && n.deliveredTo !== null
     && n.deliveredTo.workspaceId === workspaceId && n.deliveredTo.tabId === tabId);
   return { count: mine.length, oldestAt: mine.length ? Math.min(...mine.map((n) => n.createdAt)) : null };
 };

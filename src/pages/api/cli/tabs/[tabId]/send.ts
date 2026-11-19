@@ -22,6 +22,11 @@ import { appendDelivered } from '@/lib/tab-event-router';
 import { createLogger } from '@/lib/logger';
 import { startupPromptFix, startupPromptLabel } from '@/lib/startup-prompt';
 import { parseRawFlag, rawRefusalText, terminalInputRefusal } from '@/lib/terminal-command-line';
+import { resolveCaller } from '@/lib/caller';
+import { messageQueueOn } from '@/lib/delivery-switches';
+import { InboxError, readInboxState } from '@/lib/inbox-store';
+import { MESSAGE_TTL_DEFAULT_MIN, MESSAGE_TTL_MAX_MIN, SUPERSEDE_KEY, enqueueMessage, hasQueuedMessageFor } from '@/lib/inbox-messages';
+import type { TDeliveryState } from '@/types/inbox';
 
 const log = createLogger('tab-send');
 
@@ -37,6 +42,34 @@ interface ITyped {
   sessionName: string;
   request: ISubmitConfirmRequest | null;
 }
+
+/** A message queued inside the lock found one ahead of it: nothing was typed, and the send queues behind it. */
+interface IQueueBehind {
+  queueBehind: true;
+  sessionName: string;
+}
+
+/** The sending tab: a tab token names it; a workspace token names it through its pane's session (ADR-0010). */
+const senderTab = async (req: NextApiRequest, scope: { tabId?: string }): Promise<string | null> => {
+  if (scope.tabId) return scope.tabId;
+  if (typeof req.headers?.['x-pmux-session'] !== 'string') return null;
+  return (await resolveCaller(req))?.tabId ?? null;
+};
+
+const invalid = (res: NextApiResponse, error: string) => res.status(400).json({ error, code: 'invalid-request' });
+
+/** The queue fields of the body (ADR-0050); a string is the refusal. */
+const parseQueueFields = (body: Record<string, unknown>): { noQueue: boolean; supersede: string | null; ttlMin: number } | string => {
+  const { noQueue, supersede, ttlMin } = body;
+  if (noQueue !== undefined && typeof noQueue !== 'boolean') return 'noQueue must be a boolean';
+  if (supersede !== undefined && (typeof supersede !== 'string' || !SUPERSEDE_KEY.test(supersede))) {
+    return `supersede must match ${SUPERSEDE_KEY.source}`;
+  }
+  if (ttlMin !== undefined && (typeof ttlMin !== 'number' || !Number.isInteger(ttlMin) || ttlMin < 1 || ttlMin > MESSAGE_TTL_MAX_MIN)) {
+    return `ttlMin must be a whole number of minutes between 1 and ${MESSAGE_TTL_MAX_MIN}`;
+  }
+  return { noQueue: noQueue === true, supersede: typeof supersede === 'string' ? supersede : null, ttlMin: typeof ttlMin === 'number' ? ttlMin : MESSAGE_TTL_DEFAULT_MIN };
+};
 
 /**
  * Deliver a prompt to a tab.
@@ -78,12 +111,15 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(400).json({ error: 'workspaceId is required' });
   }
 
-  if (!(await authorizeWorkspaceInput(req, res, workspaceId))) return;
+  const scope = await authorizeWorkspaceInput(req, res, workspaceId);
+  if (!scope) return;
 
   const { content, waitMs, raw: rawFlag } = (req.body ?? {}) as { content?: string; waitMs?: unknown; raw?: unknown };
   if (!content) {
     return res.status(400).json({ error: 'content is required' });
   }
+  const queueFields = parseQueueFields((req.body ?? {}) as Record<string, unknown>);
+  if (typeof queueFields === 'string') return invalid(res, queueFields);
   const raw = parseRawFlag(rawFlag);
   if (raw === null) return res.status(400).json({ error: rawRefusalText(rawFlag), code: 'invalid-request' });
   const timeoutMs = resolveSendWaitMs(waitMs);
@@ -111,6 +147,39 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     });
   }
 
+  // ADR-0050: a busy Claude tab queues the text as an inbox `message`. A body is queued only inside the sender's own
+  // workspace (the ADR-0012 amendment), so a sender the drive guard admits from another workspace keeps today's path.
+  const senderTabId = await senderTab(req, scope);
+  if (queueFields.supersede !== null && !senderTabId) {
+    return invalid(res, 'supersede needs a sender tab: send from a purplemux tab (PMUX_TAB_TOKEN, or PMUX_TOKEN with X-Pmux-Session)');
+  }
+  // Asked only for a claude-code target, so every other send keeps today's path with no extra read.
+  const mayQueue = !queueFields.noQueue && scope.workspaceId === workspaceId;
+  let switchOn: boolean | null = null;
+  const queueable = async (panelType: string | undefined): Promise<boolean> =>
+    mayQueue && panelType === 'claude-code' && (switchOn ??= await messageQueueOn());
+  const queue = async (sessionName: string) => {
+    try {
+      const { item, superseded } = await enqueueMessage({
+        targetWorkspaceId: workspaceId,
+        targetTabId: tabId,
+        targetSessionName: sessionName,
+        fromWorkspaceId: workspaceId,
+        fromTabId: senderTabId,
+        body: content,
+        supersedeKey: queueFields.supersede,
+        ttlMs: queueFields.ttlMin * 60_000,
+      });
+      log.info({ id: item.id, tabId, superseded: superseded.map((i) => i.id) }, 'tab send queued');
+      return res.status(200).json({ status: 'queued', submitted: false, messageId: item.id, delivery: 'queued' satisfies TDeliveryState });
+    } catch (err) {
+      if (err instanceof InboxError && err.code === 'message-queue-full') {
+        return res.status(409).json({ error: err.message, code: err.code, tabId });
+      }
+      throw err;
+    }
+  };
+
   const readiness = await awaitSendReadiness(
     {
       findTarget: async (wsId, id) => {
@@ -133,11 +202,18 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     // `composer-ready`, not `live-session`: this is the unattended dispatch
     // path, where a paste that beats the TUI's boot is silently swallowed. The
     // cookie-authed route a person types into does NOT wait — see TSendGate.
-    { workspaceId, tabId, timeoutMs, gate: 'composer-ready' },
+    {
+      workspaceId, tabId, timeoutMs, gate: 'composer-ready',
+      ...(mayQueue ? {
+        queueWhen: async (target) => await queueable(target.panelType)
+          && ((target.cliState === 'busy' && target.waitingAtPrompt !== true) || hasQueuedMessageFor(await readInboxState(), workspaceId, tabId)),
+      } : {}),
+    },
   );
 
   if (!readiness.ok) {
     if (readiness.reason === 'tab-not-found') return res.status(404).json(TAB_NOT_FOUND_BODY);
+    if (readiness.reason === 'queue') return queue(readiness.target.sessionName);
     if (readiness.reason === 'startup-prompt') {
       // At once, with nothing typed: a paste would answer the dialog (D14).
       return res.status(409).json({
@@ -149,6 +225,11 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
         startupPromptLabel: startupPromptLabel(readiness.startupPrompt),
         detail: startupPromptFix(readiness.startupPrompt),
       });
+    }
+    if (mayQueue && readiness.reason === 'readiness-timeout') {
+      const latest = await findTab(workspaceId, tabId);
+      if (!latest) return res.status(404).json(TAB_NOT_FOUND_BODY);
+      if (await queueable(latest.tab.panelType)) return queue(latest.tab.sessionName);
     }
     return res.status(409).json({
       error: 'agent-not-ready',
@@ -166,7 +247,7 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
   }
   // The typing runs inside the dispatch lock; the proof wait runs after it, inside the tab's send gate only
   // (CONFIRM r2): a Codex hook applies inside the same lock, so a wait under it would lock out its own proof.
-  const delivered = await withAgentDispatchThen(workspaceId, current.tab, async (checkPolicy): Promise<ITyped | null> => {
+  const delivered = await withAgentDispatchThen(workspaceId, current.tab, async (checkPolicy): Promise<ITyped | IQueueBehind | null> => {
     const latest = await findTab(workspaceId, tabId);
     if (!latest || latest.tab.sessionName !== readiness.target.sessionName) {
       res.status(409).json(targetChangedBody(tabId));
@@ -192,6 +273,8 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
       await deliverPrompt(sessionName, content);
       return { sessionName, request: null };
     }
+    // A message the inbox has not typed yet goes first (FIFO per target tab): this send queues behind it.
+    if (await queueable(panelType) && hasQueuedMessageFor(await readInboxState(), workspaceId, tabId)) return { queueBehind: true, sessionName };
     // Inside the lock and the send gate, which every dispatch takes first (the inbox and automated dispatchers,
     // steer, restart and the cookie route): no other dispatch types into this composer, or starts its turn, until
     // this send has its proof or its deadline.
@@ -214,8 +297,9 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
         ...(remoteBudgetMs !== undefined ? { remoteTimeoutMs: remoteBudgetMs } : {}),
       },
     };
-  }, async (typed): Promise<IDelivered | null> => {
+  }, async (typed): Promise<IDelivered | IQueueBehind | null> => {
     if (!typed) return null;
+    if ('queueBehind' in typed) return typed;
     if (!typed.request) return { submit: null };
     const { sessionName } = typed;
     const screens: Partial<Record<TScreenRead, number>> = {};
@@ -234,6 +318,7 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     return { submit, screens };
   });
   if (!delivered) return;
+  if ('queueBehind' in delivered) return queue(delivered.sessionName);
   try {
     appendDelivered(getLedgerStore().tabEvents, { workspaceId, tabId, kind: 'tab-send', text: content, class: 'urgent' }, Date.now());
   } catch (err) {
@@ -245,7 +330,9 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
     if (!submit.submitted || submit.resubmitted) {
       log.warn({ tabId, ...submit, screens }, submit.submitted ? 'tab send: submitted after one more Enter' : `tab send: ${submit.notSubmitted}`);
     }
-    // HTTP 200 either way: the text was typed (ADR-0004, additive). The CLI exits 1 on `notSubmitted`.
+    // HTTP 200 either way: the text was typed (ADR-0004, additive). The CLI exits 1 on `notSubmitted`. A Claude tab
+    // names the delivery state as a queued send does (ADR-0050): typed and proven, or typed and unproven.
+    const delivery: TDeliveryState = submit.submitted ? 'delivered' : 'held';
     return res.status(200).json({
       status: 'sent',
       submitted: submit.submitted,
@@ -253,6 +340,7 @@ const send = async (req: NextApiRequest, res: NextApiResponse) => {
       confirmation: submit.submitted ? submit.confirmation : null,
       resubmitted: submit.resubmitted,
       ...(submit.submitted ? {} : { notSubmitted: submit.notSubmitted }),
+      ...(readiness.target.panelType === 'claude-code' ? { delivery } : {}),
     });
   }
 

@@ -32,6 +32,7 @@ purplemux tab create -w ${ws.id} [-n NAME] [-t TYPE]  # create a tab (type: term
                     [--reports-to TAB_ID]              # its watchdog nudges go to TAB_ID, not the workspace orchestrator
                     [--report-on MARKERS]              # forward only these end lines, e.g. DONE,BLOCKED,NEEDS-DECISION (default: all five)
 purplemux tab send -w ${ws.id} TAB_ID CONTENT...      # send input to a tab
+purplemux tab address -w WS TAB_ID   # a Claude seat's SendMessage address; on any refusal or failed send use tab send (it queues); never message a socket you did not get here
 purplemux tab status -w ${ws.id} TAB_ID               # tab status
 purplemux tab result -w ${ws.id} TAB_ID               # capture current pane content
 purplemux tab close -w ${ws.id} TAB_ID                # close a tab
@@ -52,6 +53,7 @@ purplemux so list                                      # the owner's standing or
 
 At turn start, run \`purplemux note list --open --to-me\` and ack each note you applied (\`purplemux note ack ID --comment ...\`).
 To wait for GitHub state or a lease, use \`purplemux watch\`, not a shell poller: it survives your turn, ends with your tab, and tells you once.
+A lead may look up another workspace's lead with \`purplemux tab address\`; any other seat uses a note across workspaces.
 
 The watchdog reads the LAST line of your turn: \`DONE:\`, \`BLOCKED:\`, \`NEEDS-DECISION:\`,
 \`READY-TO-MERGE:\` or \`CHECKPOINTED:\` reaches your orchestrator verbatim. A turn that ends with no such line while

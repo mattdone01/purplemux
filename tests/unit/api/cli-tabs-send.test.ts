@@ -86,6 +86,8 @@ vi.mock('@/lib/remote-timeouts', async (importOriginal) => {
 vi.mock('@/lib/tmux', () => Object.assign(tmux, { hasSessionOrUnreachable: tmux.hasSession }));
 vi.mock('@/lib/agent-prompt-delivery', () => delivery);
 vi.mock('@/lib/cli-utils', () => cliUtils);
+// The queue switch is off, so no send here queues (ADR-0050): these tests pin today's path; the queue has its own file.
+vi.mock('@/lib/delivery-switches', () => ({ messageQueueOn: async () => false }));
 vi.mock('@/lib/status-manager', () => ({
   getStatusManager: () => ({
     getAllForClient: () => live.entries,
@@ -189,7 +191,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'run the tests' });
 
     expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false, delivery: 'delivered' });
     expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'run the tests');
     expect(ledger.store.tabEvents.list(WORKSPACE_ID, { since: 0, limit: 5 })).toEqual([
       expect.objectContaining({ tabId: TAB_ID, kind: 'tab-send', text: 'run the tests', class: 'urgent', deliveredAt: expect.any(Number) }),
@@ -289,7 +291,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.body).toEqual({
-        status: 'sent', submitted: false, cliState: 'idle', confirmation: null, resubmitted: true, notSubmitted: 'typed-not-submitted',
+        status: 'sent', submitted: false, cliState: 'idle', confirmation: null, resubmitted: true, notSubmitted: 'typed-not-submitted', delivery: 'held',
       });
       expect(tmux.pressEnter).toHaveBeenCalledTimes(1);
       expect(tmux.pressEnter).toHaveBeenCalledWith(SESSION_NAME);
@@ -308,7 +310,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
       const response = await callToDeadline({ content: 'run the tests' });
 
-      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: true });
+      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: true, delivery: 'delivered' });
     });
 
     it('a failed probe is not proof: submit-unconfirmed', async () => {
@@ -421,7 +423,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
 
       const response = await call({ content: 'here is your brief', waitMs: 5_000 });
 
-      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
+      expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false, delivery: 'delivered' });
       expect(delivery.deliverPrompt).toHaveBeenCalledTimes(1);
       expect(tmux.capturePaneContent.mock.calls[0]).toEqual([SESSION_NAME, { escapes: true }]);
     });
@@ -521,7 +523,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'here is your brief', waitMs: 40 });
 
     expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false });
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'idle', confirmation: 'prompt-submit', resubmitted: false, delivery: 'delivered' });
     expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'here is your brief');
   });
 
@@ -545,7 +547,7 @@ describe('POST /api/cli/tabs/[tabId]/send', () => {
     const response = await call({ content: 'gate r2 is green; merge it', waitMs: 30 });
 
     expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'busy', confirmation: 'prompt-submit', resubmitted: false });
+    expect(response.body).toEqual({ status: 'sent', submitted: true, cliState: 'busy', confirmation: 'prompt-submit', resubmitted: false, delivery: 'delivered' });
     expect(delivery.deliverPrompt).toHaveBeenCalledWith(SESSION_NAME, 'gate r2 is green; merge it');
   });
 
