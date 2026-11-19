@@ -46,3 +46,10 @@ Measured on ws-5TO0NJ tab-v76BaE: `i-eM-pO-dHKa` reached `held composer-not-empt
 - **A refusal-budget hold is recoverable.** A hold whose reason ends in `(N refusals)` stays a delivery candidate until the item's `expiresAt`. This applies to the `note`, `watch` and `deploy` kinds only. The dispatcher probes the hold again `HELD_REPROBE_MS` (5 min) after its last attempt. It probes earlier when the tab is at its prompt and its turn ended after that attempt (`turnEnd.at`), or after a state refusal as before. The hold stays at the head of its tab's queue, so notices queued behind it wait and arrive in order. A refused probe keeps the item `held` and updates its count and reason. A probe does not fire `onInboxHeld` again.
 - **Not recoverable:** `transport-uncertain`, `stranded-in-composer`, `target-not-agent`, a 24 h hold, and a stranded re-probe. Typing any of them again could double the line. A held `resume` is not recoverable either: its orchestrator was told and may resume the tab by hand, and `resume` has no paste-time preflight. A held `mission` is not recoverable, because its row is closed and its preflight would reject the item. A hold that is not recoverable no longer blocks the queue behind it.
 - **Retry by the sender.** `inbox retry` also accepts the workspace that sent the note whose notice (or reminder) the item carries. The note preflight still decides at paste time whether the line is typed.
+
+## Amendment — a same-workspace `message` body (2026-11-20, ADR-0050)
+The kind `message` carries a `tab send` body queued for a busy Claude tab. It is typed below a fixed header line only
+when its sender workspace is its target workspace; the route, the store at enqueue and the dispatcher before the paste
+each check it. No reader serves the body, and the store blanks it once the item can never be typed again. Every
+other kind keeps its fixed server line. ADR-0050 also records that, for SendMessage between two
+lead tabs only, a sender's text enters another workspace's turn without passing through the server.
