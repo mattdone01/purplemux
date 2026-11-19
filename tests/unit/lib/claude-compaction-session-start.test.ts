@@ -50,7 +50,9 @@ describe('SessionStart source (L30)', () => {
       // The hook POSTs its payload on stdin (ADR-0020).
       fs.writeFileSync(path.join(bin, 'curl'), `#!/bin/sh\ncase "$*" in *api/status/hook*) cat > '${captured}' ;; esac\n`, { mode: 0o755 });
       fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\necho pt-ws-1-pane-a-tab-w\n', { mode: 0o755 });
-      const r = spawnSync('sh', [script, event], { input: stdin, env: { ...process.env, HOME: home, PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf-8' });
+      // A run inside a Claude session inherits its messaging socket, which the script forwards (ADR-0050): not here.
+      const { CLAUDE_CODE_MESSAGING_SOCKET: _socket, ...env } = process.env;
+      const r = spawnSync('sh', [script, event], { input: stdin, env: { ...env, HOME: home, PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf-8' });
       expect(r.status).toBe(0);
       return JSON.parse(fs.readFileSync(captured, 'utf-8'));
     };

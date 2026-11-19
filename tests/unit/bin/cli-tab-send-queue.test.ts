@@ -111,3 +111,82 @@ describe('purplemux tab send: the busy-tab queue flags (ADR-0050)', { timeout: 3
     expect(requests[0].body).toEqual({ subject: 'released', body: 'PR 12 is free', toWorkspace: 'ws-A', supersedeKey: 'pr-12' });
   });
 });
+
+describe('purplemux tab address (ADR-0050, S1)', { timeout: 30_000 }, () => {
+  let server: http.Server;
+  let port = 0;
+  let home = '';
+  let requests: IRequest[] = [];
+  let reply: { status: number; body: unknown } = { status: 200, body: {} };
+
+  beforeEach(async () => {
+    requests = [];
+    home = await fs.mkdtemp(path.join(os.tmpdir(), 'pmux-cli-address-'));
+    server = http.createServer((req, res) => {
+      requests.push({ method: req.method ?? '', url: req.url ?? '', body: null });
+      res.writeHead(reply.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(reply.body));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as { port: number }).port;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await fs.rm(home, { recursive: true, force: true });
+  });
+
+  const cli = async (args: string[], extraEnv: Record<string, string> = {}) => {
+    try {
+      const { stdout, stderr } = await run(process.execPath, [ENTRY, ...args], {
+        env: { NODE_ENV: 'test', PATH: process.env.PATH ?? '', HOME: home, NO_UPDATE_NOTIFIER: '1', PMUX_PORT: String(port), PMUX_TOKEN: 'ws-token', ...extraEnv },
+      });
+      return { code: 0, stdout, stderr };
+    } catch (err) {
+      const f = err as { code?: number; stdout?: string; stderr?: string };
+      return { code: f.code ?? -1, stdout: f.stdout ?? '', stderr: f.stderr ?? '' };
+    }
+  };
+
+  it('prints the address and exits 0', async () => {
+    reply = { status: 200, body: { tabId: 'tab-2', workspaceId: 'ws-A', address: 'uds:/run/user/1000/cc-socks/1.sock', permissionMode: 'bypassPermissions', registeredAt: 1, lastSeenAt: 2 } };
+    const result = await cli(['tab', 'address', '-w', 'ws-A', 'tab-2']);
+    expect(result.code).toBe(0);
+    expect(requests).toEqual([{ method: 'GET', url: '/api/cli/tabs/tab-2/address?workspaceId=ws-A', body: null }]);
+    expect(JSON.parse(result.stdout)).toMatchObject({ address: 'uds:/run/user/1000/cc-socks/1.sock' });
+  });
+
+  it('takes the workspace from PMUX_WORKSPACE_ID when -w is absent', async () => {
+    reply = { status: 200, body: { address: 'uds:/x.sock' } };
+    await cli(['tab', 'address', 'tab-2'], { PMUX_WORKSPACE_ID: 'ws-A' });
+    expect(requests[0].url).toBe('/api/cli/tabs/tab-2/address?workspaceId=ws-A');
+  });
+
+  it.each([
+    ['caller-unresolved', 409, 3],
+    ['address-not-claude', 409, 3],
+    ['address-unknown', 409, 3],
+    ['address-stale', 409, 3],
+    ['address-other-host', 409, 3],
+    ['address-class-mismatch', 409, 3],
+    ['address-disabled', 409, 3],
+    ['address-audit-failed', 409, 3],
+    ['address-not-lead-pair', 403, 3],
+    ['forbidden', 403, 3],
+    ['tab-not-found', 404, 4],
+    ['session-not-running', 409, 4],
+  ])('address-refusals: %s exits %s, and stderr carries the fallback', async (code, status, exit) => {
+    const hint = code === 'address-not-lead-pair' ? 'use `purplemux note send`; a note is the route between workspaces' : 'use `purplemux tab send`; it queues';
+    reply = { status, body: { error: `refused: ${code}`, code, hint } };
+    const result = await cli(['tab', 'address', '-w', 'ws-A', 'tab-2']);
+    expect(result.code).toBe(exit);
+    expect(result.stderr).toContain(code);
+    if (code.startsWith('address-') || code === 'caller-unresolved') expect(result.stderr).toContain(code === 'address-not-lead-pair' ? 'note send' : 'tab send');
+  });
+
+  it('refuses a missing tab id with exit 2', async () => {
+    const result = await cli(['tab', 'address', '-w', 'ws-A']);
+    expect(result.code).toBe(2);
+    expect(requests).toEqual([]);
+  });
+});

@@ -160,6 +160,10 @@ to an exit code through one table:
                                                  composer; nothing typed)
      3  refused by state (tab send, ADR-0050)    message-queue-full (20 messages queued     after one is delivered,
                                                  for the tab)                               or with --supersede KEY
+     3  refused (tab address, ADR-0050)          address-not-claude, address-unknown,       no: use tab send (it
+                                                 address-stale, address-other-host,         queues); between
+                                                 address-class-mismatch, address-disabled,  workspaces, a note
+                                                 address-not-lead-pair, address-audit-failed
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -615,8 +619,11 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
   after ttlMin (default 120) minutes; supersede refuses the sender tab's older queued message to this tab
   with the same key (it needs a sender tab, else 400 invalid-request); a 21st queued message answers
   409 { "code": "message-queue-full", "tabId" } (exit 3). noQueue, or the fleet switch tab-send.queue off,
-  keeps the wait and the exit 5 below for the call. A sender of another workspace, codex-cli, grok-cli and
-  terminal tabs keep the path below. A typed claude-code send adds "delivery": "delivered" | "held".
+  keeps the wait and the exit 5 below for the call; so does a config store the route cannot read. A sender
+  of another workspace, codex-cli, grok-cli and terminal tabs keep the path below. A typed claude-code send
+  adds "delivery": "delivered" | "held". A text that starts with "<cross-session-message from=" is read by
+  the status hook as a message from another session, so its prompt-submit proves nothing: the send answers
+  notSubmitted (exit 1) although it was typed. Do not start a send with that wrapper.
   Send text to the tab and press Enter. Typed into Claude Code, bracketed paste elsewhere.
   For an agent tab (claude-code / codex-cli / grok-cli) the send waits until the tab can
   accept a turn, up to waitMs (default 60000). A booting agent swallows the Enter after a
@@ -667,6 +674,27 @@ POST /api/cli/tabs/<tabId>/send?workspaceId=WS
     typed. The error says "saw N lines; expected one shell command line". A multi-line command (a
     heredoc, a quoted multi-line string, a backslash continuation) needs raw: true (--raw); prose
     belongs in an agent tab.
+
+GET /api/cli/tabs/<tabId>/address?workspaceId=WS   (CLI: tab address [-w WS] TAB_ID)
+  ADR-0050 (S1): a Claude tab's SendMessage address, as its status hook registered it (the session's
+  CLAUDE_CODE_MESSAGING_SOCKET, forwarded at session-start, prompt-submit and notification; kept in server
+  memory only). 200 { "tabId", "workspaceId", "address": "uds:<path>", "permissionMode": "<mode>" |
+  "unknown", "registeredAt", "lastSeenAt" }. Admitted exactly where tab send from the same caller passes
+  the drive guard (the caller's own workspace, or the selected Scrum Master), and, between workspaces, from
+  one workspace's verified, enabled orchestrator tab to another workspace's orchestrator (the owner's
+  ruling of 20 Nov 2026; tab-address.lead-pair). Refusals, each with "hint": "use \`purplemux tab send\`;
+  it queues" (between workspaces: "use \`purplemux note send\`; a note is the route between workspaces"):
+  403 forbidden (no workspace token), 409 address-disabled (tab-address or tab-address.lead-pair off),
+  409 caller-unresolved (the caller is not a resolved Claude tab), 403 address-not-lead-pair, 404
+  tab-not-found, 409 address-not-claude, 409 address-other-host, 409 session-not-running (exit 4),
+  409 address-unknown (no registration yet), 409 address-stale (the socket file is gone, its pid is dead,
+  the agent session changed or the agent is inactive; the entry is cleared), 409 address-class-mismatch
+  (the target skips permission prompts, the caller is known not to). The stale check only stats the file
+  and signals the pid; the server never connects to a socket. Each lookup writes one "address-lookup"
+  coordination audit line (caller, target, scope same-workspace | scrum-master | lead-pair, outcome), a
+  failed or refused lookup included; when that line cannot be written, an admitted lookup is refused 409
+  address-audit-failed (exit 3). No message body ever reaches the server. After ENOENT on a SendMessage: one fresh lookup, one retry, then
+  tab send.
 
 POST /api/cli/tabs/<tabId>/steer?workspaceId=WS
   Body: { "content": "...", "interrupt"?: boolean, "reason"?: "1..500 chars", "raw"?: boolean }
@@ -1192,6 +1220,11 @@ Keys in use:
                each message not yet typed (queued, or held with no claim) queue-off, which blanks its body;
                set it off first when rolling back. An unreadable store reads off at the route and on at
                the inbox tick. Admin token only.
+  tab-address  tab-address.lead-pair
+               on (unset) or off (ADR-0050). tab-address off refuses every tab address lookup
+               (address-disabled); tab-address.lead-pair off refuses only the lookup between two
+               workspaces' orchestrators. An unreadable store refuses lookups. Neither touches the queue.
+               Admin token only.
   fleet-status.stall-minutes  fleet-status.waiting-long-minutes  fleet-status.unanswered-minutes
   fleet-status.composer-minutes
                The fleet flag thresholds (ADR-0023), in minutes (0, 10080], decimals allowed:

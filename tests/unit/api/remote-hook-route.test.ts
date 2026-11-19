@@ -77,6 +77,16 @@ describe('remote Claude hooks on /api/status/hook (ADR-0022)', () => {
     ]);
   });
 
+  it('D8 on a remote tab: a prompt-submit whose prompt is a message from another session applies as fromTool (review N4)', async () => {
+    await post({ remote: 'claude', event: 'prompt-submit', session: R }, 'tok-r',
+      { prompt: '<cross-session-message from="uds:/run/user/1000/cc-socks/1.sock" from-name="a" from-mode="bypass">\nhi\n</cross-session-message>' });
+    await post({ remote: 'claude', event: 'prompt-submit', session: R }, 'tok-r', { prompt: 'a typed prompt that quotes <cross-session-message from="x">' });
+    expect(sm.handleProviderEvent.mock.calls.map((c) => c[2])).toEqual([
+      { kind: 'prompt-submit', fromTool: true },
+      { kind: 'prompt-submit' },
+    ]);
+  });
+
   it('feeds tool activity to the signal engine, not the work state', async () => {
     await post({ remote: 'claude', event: 'post-tool', kind: 'tool', session: R }, 'tok-r', { tool_name: 'Bash', tool_input: { command: 'ls' } });
     expect(sm.handleProviderEvent).not.toHaveBeenCalled();

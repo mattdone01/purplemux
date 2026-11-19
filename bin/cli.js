@@ -233,6 +233,14 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'steer-reason-invalid': EXIT.USAGE,
   'terminal-not-command-line': EXIT.USAGE,
   'message-queue-full': EXIT.CONFLICT,
+  'address-not-claude': EXIT.CONFLICT,
+  'address-unknown': EXIT.CONFLICT,
+  'address-stale': EXIT.CONFLICT,
+  'address-other-host': EXIT.CONFLICT,
+  'address-class-mismatch': EXIT.CONFLICT,
+  'address-disabled': EXIT.CONFLICT,
+  'address-not-lead-pair': EXIT.CONFLICT,
+  'address-audit-failed': EXIT.CONFLICT,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -380,6 +388,8 @@ const failFromResponse = (resp, body) => {
   if (Array.isArray(body.defects) && body.defects.length) process.stderr.write(`question defects:\n${defectLines(body.defects)}\n`);
   const code = typeof body.code === 'string' ? body.code : legacyCode(body);
   const message = typeof body.error === 'string' ? body.error : `HTTP ${resp.status}`;
+  // A refusal that names its fallback (ADR-0050: "use `purplemux tab send`; it queues") prints it on its own line.
+  if (typeof body.hint === 'string' && body.hint) process.stderr.write(`hint: ${body.hint}\n`);
   return fail(code, code ? message : `${message} (HTTP ${resp.status})`, body);
 };
 
@@ -2422,6 +2432,19 @@ const cmdTabSend = async (args) => {
   }
 };
 
+// ADR-0050 (S1): a Claude seat's SendMessage address, where `tab send` from the same caller would pass the drive
+// guard, or between two workspaces' orchestrators. Every refusal prints its fallback.
+const cmdTabAddress = async (args) => {
+  requireEnv();
+  const rest = stripFlags(args, ['--workspace', '-w']);
+  const wsId = flagValue(args, '--workspace') || flagValue(args, '-w') || process.env.PMUX_WORKSPACE_ID || null;
+  if (!wsId) die('--workspace is required (or PMUX_WORKSPACE_ID)');
+  const tabId = rest[0];
+  if (!tabId || rest.length !== 1) die('usage: tab address [-w WS] TAB_ID');
+  const { body } = await api('GET', `/api/cli/tabs/${tabId}/address?workspaceId=${encodeURIComponent(wsId)}`);
+  out(body);
+};
+
 const cmdTabStatus = async (args) => {
   requireEnv();
   const rest = stripFlags(args, ['--workspace', '-w']);
@@ -3729,6 +3752,15 @@ Commands:
                   [--clear] [--on MARKERS] restores the workspace orchestrator. Cleared when TARGET closes.
                                            --on MARKERS (alone or with a target) forwards only those end lines,
                                            e.g. --on DONE,BLOCKED,NEEDS-DECISION; --on all lifts the filter
+  tab address [-w WS] TAB_ID               A Claude tab's SendMessage address (ADR-0050): {address: "uds:...",
+                                           permissionMode, registeredAt, lastSeenAt}, for a tab of your own
+                                           workspace (or the selected Scrum Master's), or from one workspace's
+                                           orchestrator to another's. Each lookup is audited. Refusals exit 3
+                                           (address-unknown, address-stale, address-other-host, address-class-
+                                           mismatch, address-not-claude, address-disabled, caller-unresolved,
+                                           address-not-lead-pair, forbidden) or 4 (tab-not-found, session-not-
+                                           running); each prints its fallback: tab send, which queues, or a note
+                                           between workspaces
   tab steer -w WS TAB_ID CONTENT...        Send CONTENT as a mid-turn correction. From an agent tab (claude-code,
            [--interrupt --reason TEXT]     codex-cli, grok-cli) the default does NOT interrupt: the text waits for
            [--no-interrupt] [--raw]        the turn to end. --interrupt --reason TEXT stops the turn first (Escape);
@@ -4243,6 +4275,7 @@ const main = async () => {
         case 'create': return cmdTabCreate(rest);
         case 'count': return cmdTabCount(rest);
         case 'send': return cmdTabSend(rest);
+        case 'address': return cmdTabAddress(rest);
         case 'steer': return cmdTabSteer(rest);
         case 'status': return cmdTabStatus(rest);
         case 'result': return cmdTabResult(rest);
