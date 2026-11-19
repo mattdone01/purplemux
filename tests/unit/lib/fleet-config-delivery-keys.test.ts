@@ -57,3 +57,37 @@ describe('delivery switches (ADR-0050)', () => {
     await expect(putValue(orchestrator, 'tab-send.queue', { value: 'off' }, authority)).rejects.toMatchObject({ code: 'forbidden' });
   });
 });
+
+describe('the address switches (ADR-0050, S1)', () => {
+  it('tab-address and tab-address.lead-pair read on when unset and off once set off, each alone', async () => {
+    const { putValue } = await import('@/lib/fleet-config-http');
+    const { addressLookupOn, leadPairLookupOn } = await import('@/lib/delivery-switches');
+    expect([await addressLookupOn(), await leadPairLookupOn()]).toEqual([true, true]);
+    await putValue(admin, 'tab-address.lead-pair', { value: 'off' }, authority);
+    expect([await addressLookupOn(), await leadPairLookupOn()]).toEqual([true, false]);
+    await putValue(admin, 'tab-address', { value: 'off' }, authority);
+    expect(await addressLookupOn()).toBe(false);
+  });
+
+  it('an unreadable store refuses lookups: an address is a drive capability, and tab send still queues', async () => {
+    fs.mkdirSync(path.join(directory, '.purplemux'), { recursive: true });
+    fs.writeFileSync(path.join(directory, '.purplemux', 'fleet-config.json'), '{not json');
+    const { addressLookupOn, leadPairLookupOn } = await import('@/lib/delivery-switches');
+    expect([await addressLookupOn(), await leadPairLookupOn()]).toEqual([false, false]);
+  });
+
+  it('a workspace orchestrator cannot set an address switch; a bad key or value is refused', async () => {
+    const { putValue } = await import('@/lib/fleet-config-http');
+    await expect(putValue(orchestrator, 'tab-address', { value: 'off' }, authority)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(putValue(orchestrator, 'tab-address.lead-pair', { value: 'off' }, authority)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(putValue(admin, 'tab-address.other', { value: 'on' }, authority)).rejects.toMatchObject({ code: 'config-invalid' });
+    await expect(putValue(admin, 'tab-address', { value: 'maybe' }, authority)).rejects.toMatchObject({ code: 'config-invalid' });
+  });
+
+  it('address-switch-off: tab-address off leaves the queue switch on', async () => {
+    const { putValue } = await import('@/lib/fleet-config-http');
+    const { messageQueueOn } = await import('@/lib/delivery-switches');
+    await putValue(admin, 'tab-address', { value: 'off' }, authority);
+    expect(await messageQueueOn()).toBe(true);
+  });
+});

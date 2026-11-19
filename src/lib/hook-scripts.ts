@@ -230,16 +230,40 @@ if [ "$EVENT" = "stop" ]; then
   exit 0
 fi
 
+# The three events that may carry the session's messaging address (ADR-0050) read the hook's JSON once.
+HOOK_INPUT=""
+case "$EVENT" in session-start|prompt-submit|notification) HOOK_INPUT=$(cat) ;; esac
+
 NOTIFICATION_TYPE=""
 if [ "$EVENT" = "notification" ]; then
-  NOTIFICATION_TYPE=$(sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+  NOTIFICATION_TYPE=$(printf '%s\n' "$HOOK_INPUT" | sed -n 's/.*"notification_type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
 fi
 
 # SessionStart names why the session (re)started; after an auto-compaction it is
 # "compact", which is not a turn end (L30). Only a plain word is forwarded.
 SOURCE=""
 if [ "$EVENT" = "session-start" ]; then
-  SOURCE=$(sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\\([a-z]*\\)".*/\\1/p' | head -n 1)
+  SOURCE=$(printf '%s\n' "$HOOK_INPUT" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\\([a-z]*\\)".*/\\1/p' | head -n 1)
+fi
+
+# The session's messaging socket (ADR-0050, S1): a Claude seat's SendMessage address, which the server stores for
+# \`purplemux tab address\`. Only a path of the grammar ^/[A-Za-z0-9._/-]{1,106}\\.sock$ is forwarded, and the
+# permission mode only as a plain word. The session's messaging token is never read.
+SOCKET=""
+PERMISSION_MODE=""
+case "$EVENT" in session-start|prompt-submit|notification)
+  SOCKET="\${CLAUDE_CODE_MESSAGING_SOCKET:-}"
+  case "$SOCKET" in /?*.sock) ;; *) SOCKET="" ;; esac
+  case "$SOCKET" in *[!A-Za-z0-9._/-]*) SOCKET="" ;; esac
+  [ \${#SOCKET} -ge 7 ] && [ \${#SOCKET} -le 112 ] || SOCKET=""
+  PERMISSION_MODE=$(printf '%s\n' "$HOOK_INPUT" | sed -n 's/.*"permission_mode"[[:space:]]*:[[:space:]]*"\\([A-Za-z]\\{1,32\\}\\)".*/\\1/p' | head -n 1)
+  ;;
+esac
+# A message another session sent by SendMessage also fires UserPromptSubmit, with the prompt wrapped in
+# <cross-session-message …> (measured on Claude Code 2.1.329). It is no turn a send started (ADR-0050, D8).
+CROSS_SESSION=""
+if [ "$EVENT" = "prompt-submit" ]; then
+  case "$HOOK_INPUT" in *'"prompt":"<cross-session-message from='*) CROSS_SESSION="true" ;; esac
 fi
 
 PAYLOAD="{\\"event\\":\\"\${EVENT}\\",\\"session\\":\\"\${SESSION}\\""
@@ -248,6 +272,15 @@ if [ -n "$NOTIFICATION_TYPE" ]; then
 fi
 if [ -n "$SOURCE" ]; then
   PAYLOAD="\${PAYLOAD},\\"source\\":\\"\${SOURCE}\\""
+fi
+if [ -n "$SOCKET" ]; then
+  PAYLOAD="\${PAYLOAD},\\"socket\\":\\"\${SOCKET}\\""
+fi
+if [ -n "$PERMISSION_MODE" ]; then
+  PAYLOAD="\${PAYLOAD},\\"permissionMode\\":\\"\${PERMISSION_MODE}\\""
+fi
+if [ -n "$CROSS_SESSION" ]; then
+  PAYLOAD="\${PAYLOAD},\\"crossSession\\":true"
 fi
 PAYLOAD="\${PAYLOAD}}"
 

@@ -72,7 +72,7 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * not set for every other workspace (ADR-0027 ruling R2). `standup.` stays here: since F6 no such key is read,
  * and every write of one is refused.
  */
-export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end|ledger\.chain-holds|tab-send)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end|ledger\.chain-holds|tab-send)\.|^tab-address(\.|$)/;
 
 const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|mutation|browser|test-service|tab)$/;
 
