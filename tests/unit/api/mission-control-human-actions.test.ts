@@ -230,6 +230,20 @@ describe('POST /api/mission-control/inbox/{id}/retry (ADR-0029 §7, consult Q1)'
     }
   });
 
+  it('no-body-in-retry: a held, unclaimed message is retried with its view, never its body (review B2)', async () => {
+    const inbox = await import('@/lib/inbox-store');
+    const { enqueueMessage, MESSAGE_TTL_DEFAULT_MS } = await import('@/lib/inbox-messages');
+    const { item } = await enqueueMessage({
+      targetWorkspaceId: 'ws-other', targetTabId: 'tab-o', targetSessionName: 'pt-o', fromWorkspaceId: 'ws-other', fromTabId: 'tab-p',
+      body: 'words of another workspace', supersedeKey: null, ttlMs: MESSAGE_TTL_DEFAULT_MS,
+    });
+    await inbox.mutateInbox((state) => ({ state: inbox.holdInState(state, item.id, 'composer-not-empty (30 refusals)', Date.now()), value: null }));
+    const r = await call('inbox/retry', await human(), undefined, { id: item.id });
+    expect(r.statusCode).toBe(200);
+    expect(JSON.stringify(r.body)).not.toContain('words of another workspace');
+    expect(r.body.item).toMatchObject({ id: item.id, state: 'queued', delivery: 'queued' });
+  });
+
   it('answers 404 inbox-not-found for an unknown id', async () => {
     const r = await call('inbox/retry', await human(), undefined, { id: 'i-nothere00' });
     expect(r).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });

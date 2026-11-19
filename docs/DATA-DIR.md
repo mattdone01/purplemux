@@ -313,7 +313,7 @@ someone repairs the file or moves it aside.
 | `leases.json` | `src/lib/lease-store.ts` | `{ leases: ILease[] }` (ADR-0011) | a lease ends with its tab, its TTL or a release; malformed: every lease call refused |
 | `notes.json` | `src/lib/notes-store.ts` | `{ notes: INote[] }` (ADR-0013) | an open note expires after 14 days; an acked or expired note is pruned 14 days after its last state change |
 | `watches.json` | `src/lib/watch-store.ts` | `{ watches: IWatch[] }` (ADR-0015) | a watch ends by its TTL (default 24 h, at most 7 days) |
-| `inbox.json` | `src/lib/inbox-store.ts` | `{ items: IInboxItem[] }` (ADR-0012) | an item that is not `queued` is pruned 7 days after its last state change |
+| `inbox.json` | `src/lib/inbox-store.ts` | `{ items: IInboxItem[] }` (ADR-0012); a `message` item also holds the queued `tab send` body (ADR-0050), blanked once the item can never be typed again | an item that is not `queued` is pruned 7 days after its last state change; a queued `message` expires at its TTL (default 120 min) |
 | `fleet-config.json` | `src/lib/fleet-config-store.ts` | `{ values: {key: {value, version, setAt, setBy}}, versions: {key: n}, history: change[] }` (ADR-0019) | history keeps the last 200 changes; malformed: every key read refused |
 | `deploy-announcements.json` | `src/lib/deploy-announce.ts` | `{ announcements: IDeployAnnouncement[] }` (ADR-0017) | kept 7 days |
 | `tab-tokens.json` | `src/lib/tab-token.ts` | `{ [tabId]: { token, workspaceId, sessionName, createdAt, origin?, injectedAt?, presentedAt? } }` | a token ends with its tab; malformed: moved to `tab-tokens.json.unreadable-<ms>` and the server starts empty |

@@ -232,6 +232,7 @@ const CODE_EXIT = Object.freeze(Object.assign(Object.create(null), {
   'so-proposal-refused': EXIT.CONFLICT,
   'steer-reason-invalid': EXIT.USAGE,
   'terminal-not-command-line': EXIT.USAGE,
+  'message-queue-full': EXIT.CONFLICT,
 }));
 
 // Where the class alone does not tell the caller what happened.
@@ -255,6 +256,7 @@ const CODE_HINT = Object.freeze(Object.assign(Object.create(null), {
   'pool-no-pinned-host': 'the pin names no pool host this work may use — a configuration refusal: fix the pin (--pin-host, --pin-gate-host, pool.gate-host.<host>), never wait on it',
   'pool-ask-cancelled': 'this ask token was cancelled by `pool release --ask` — the late ask takes nothing; ask again with a fresh token',
   'pool-ask-mismatch': 'the lease was not taken by this ask token — nothing was released; release only the lease your own ask took',
+  'message-queue-full': '20 messages already wait for this tab — wait for them to be delivered (purplemux inbox show ID), or replace one with --supersede KEY',
 }));
 
 const exitFor = (code) => (code && Object.hasOwn(CODE_EXIT, code) ? CODE_EXIT[code] : EXIT.UNEXPECTED);
@@ -1550,6 +1552,12 @@ const cmdInbox = async (args) => {
       if (args.includes('--counts')) return process.stdout.write(inboxCountLines(body.counts));
       return out(body);
     }
+    case 'show': {
+      const id = rest[0];
+      if (!id || !/^i-[A-Za-z0-9_-]{1,32}$/.test(id)) die('usage: inbox show ID (an i-… inbox item id, e.g. the messageId of a queued tab send)');
+      const { body } = await api('GET', `/api/cli/inbox/${id}`);
+      return out(body);
+    }
     case 'retry': {
       const id = rest[0];
       if (!id || !/^i-[A-Za-z0-9_-]{1,32}$/.test(id)) die('usage: inbox retry ID [--reason TEXT] (an i-… inbox item id)');
@@ -1558,7 +1566,7 @@ const cmdInbox = async (args) => {
       return out(body);
     }
     default:
-      die('usage: inbox list -w WS [--all] [--counts] | inbox retry ID [--reason TEXT]');
+      die('usage: inbox list -w WS [--all] [--counts] | inbox show ID | inbox retry ID [--reason TEXT]');
   }
 };
 
@@ -1576,9 +1584,11 @@ const inboxCountLines = (counts) => {
 
 // Notes (ADR-0013): a body the recipient pulls; only the inbox's fixed line is typed.
 const NOTE_BODY_MAX_BYTES = 16 * 1024;
-const NOTE_USAGE = 'usage: note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG] [--owner-item]'
+const NOTE_USAGE = 'usage: note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG] [--owner-item] [--supersede KEY]'
   + ' | note list [--open] [--to-me] [--from-me] [--epic SLUG] | note show ID | note ack ID [--comment TEXT] | note point ID';
-const NOTE_VALUE_FLAGS = ['--to-epic', '--to-workspace', '--subject', '--file', '-f', '--from-epic', '--epic', '--comment'];
+const NOTE_VALUE_FLAGS = ['--to-epic', '--to-workspace', '--subject', '--file', '-f', '--from-epic', '--epic', '--comment', '--supersede'];
+// ADR-0050: a newer note or message of the same sender, target and key replaces an older one not yet read.
+const SUPERSEDE_KEY = /^[A-Za-z0-9._:-]{1,64}$/;
 const NOTE_BOOL_FLAGS = ['--open', '--to-me', '--from-me', '--owner-item'];
 const NOTE_ID = /^n-[A-Za-z0-9_-]{4,32}$/;
 
@@ -1627,6 +1637,11 @@ const cmdNote = async (args) => {
       const fromEpic = flagValue(rest, '--from-epic');
       if (fromEpic !== null) data.fromEpic = fromEpic;
       if (rest.includes('--owner-item')) data.ownerItem = true;
+      const supersede = flagValue(rest, '--supersede');
+      if (supersede !== null) {
+        if (!SUPERSEDE_KEY.test(supersede)) die(`--supersede: saw ${JSON.stringify(supersede)}; expected 1..64 of A-Z a-z 0-9 . _ : -`);
+        data.supersedeKey = supersede;
+      }
       requireEnv();
       const { body: resp } = await api('POST', '/api/cli/notes', data);
       out(resp);
@@ -2354,12 +2369,22 @@ const cmdTabSteer = async (args) => {
 // send that does not wait can report success over an agent that never starts.
 const MAX_CLI_WAIT_MS = 240_000;
 
+const MAX_TTL_MIN = 1440;
+
 const cmdTabSend = async (args) => {
   requireEnv();
   const parsed = parseLeadingArgs(args, {
-    values: ['--workspace', '-w', '--file', '-f', '--wait-ms'],
-    booleans: ['--no-wait', '--raw'],
+    values: ['--workspace', '-w', '--file', '-f', '--wait-ms', '--supersede', '--ttl-min'],
+    booleans: ['--no-wait', '--raw', '--no-queue'],
   });
+  const supersede = parsed.value('--supersede');
+  if (parsed.has('--supersede') && (supersede === null || !SUPERSEDE_KEY.test(supersede))) {
+    die(`--supersede: saw ${supersede === null ? 'no value' : JSON.stringify(supersede)}; expected 1..64 of A-Z a-z 0-9 . _ : -`);
+  }
+  const ttlMin = parsed.value('--ttl-min');
+  if (parsed.has('--ttl-min') && (ttlMin === null || !/^\d{1,4}$/.test(ttlMin) || Number(ttlMin) < 1 || Number(ttlMin) > MAX_TTL_MIN)) {
+    die(`--ttl-min: saw ${ttlMin === null ? 'no value' : JSON.stringify(ttlMin)}; expected whole minutes 1..${MAX_TTL_MIN}`);
+  }
   const noWait = parsed.has('--no-wait');
   const waitMsGiven = parsed.has('--wait-ms');
   const waitMs = parsed.value('--wait-ms');
@@ -2385,6 +2410,9 @@ const cmdTabSend = async (args) => {
       content,
       ...(noWait ? { waitMs: 0 } : waitMs ? { waitMs: Number(waitMs) } : {}),
       ...(parsed.has('--raw') ? { raw: true } : {}),
+      ...(parsed.has('--no-queue') ? { noQueue: true } : {}),
+      ...(supersede !== null ? { supersede } : {}),
+      ...(ttlMin !== null ? { ttlMin: Number(ttlMin) } : {}),
     },
   );
   out(body);
@@ -3714,7 +3742,16 @@ Commands:
   tab send -w WS TAB_ID CONTENT...         Send input to a tab and press Enter. Waits up to 60s
                                            for an agent tab to be able to accept a turn; --wait-ms N (max
                                            240000) changes the budget, --no-wait answers immediately. On timeout nothing is
-                                           pasted and the call exits 5 (readiness-timeout). An agent at a
+                                           pasted and the call exits 5 (readiness-timeout). A Claude tab of your own
+                                           workspace that is busy, or not ready in time, QUEUES the text instead
+                                           (ADR-0050): exit 0, {status: queued, messageId, delivery: queued}; the server
+                                           types it with a header line once the composer is empty, mid-turn included.
+                                           Read its state with inbox show ID: queued, delivered, held, refused, expired.
+           [--no-queue]                    Today's wait and exit 5 for this call, never a queue
+           [--supersede KEY]               Replace your older queued message to this tab with the same KEY
+                                           (1..64 of A-Z a-z 0-9 . _ : -; needs a sender tab, else exit 2)
+           [--ttl-min N]                   A queued message expires after N minutes (1..1440, default 120)
+                                           A full queue (20) exits 3 (message-queue-full). An agent at a
                                            Claude Code startup prompt (folder trust, external imports) is
                                            refused at once with exit 5 (startup-prompt): answer the prompt.
                                            Exit 4 (tab-not-found, session-not-running, target-changed) means
@@ -3978,11 +4015,14 @@ Commands:
                                            for WS's tabs; --all adds delivered and dropped (kept 7 days). The JSON
                                            carries counts (per state, held by reason, per tab) of every retained item;
                                            --counts prints them alone, one line per state, then one per tab
+  inbox show ID                            One item of an inbox you may read, with its delivery state (queued, delivered,
+                                           held, refused, expired); a message's body is never shown. Exit 7 inbox-not-found
   inbox retry ID [--reason TEXT]           Re-queue a held notice once (the target workspace, the note's sender, or admin;
                                            the Portfolio Scrum Master's verified tab for a workspace in its selection,
                                            with --reason, audited, ADR-0047).
                                            Exit 3 inbox-not-held, 7 inbox-not-found
   note send (--to-epic SLUG | --to-workspace WS) --subject TEXT (-f FILE | -f -) [--from-epic SLUG] [--owner-item]
+           [--supersede KEY]               Refuse your older unacked note to the same route with the same KEY (ADR-0050)
                                            A local note to the live epic holder, or a cross-workspace note between
                                            verified current orchestrators; body <= 16 KiB (exit 2). Only a fixed line is typed
                                            into the recipient; it pulls the body. --from-epic needs that epic lease (3).

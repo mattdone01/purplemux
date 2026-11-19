@@ -1,5 +1,5 @@
 import { isAgentPanelType } from '@/lib/agent-panel-types';
-import { checkComposerReady } from '@/lib/composer-readiness';
+import { checkComposerReady, readComposerScreen } from '@/lib/composer-readiness';
 import { type CoordinatorWindow, WINDOW_DEFERRAL, WINDOW_EXEMPT_INBOX_KINDS, getCoordinatorWindow } from '@/lib/coordinator-window';
 import {
   deferInState,
@@ -14,6 +14,7 @@ import {
   windowHeads,
   withdrawInState,
 } from '@/lib/inbox-store';
+import { claimMessageInState, holdClaimedMessagesInState, isUntypedMessage, refuseUntypedMessagesInState, unclaimMessageInState } from '@/lib/inbox-messages';
 import { createLogger } from '@/lib/logger';
 import { classifyWake } from '@/lib/wake-class';
 import type { TAgentDispatchPolicyCheck } from '@/lib/agent-dispatch-policy';
@@ -78,6 +79,10 @@ export interface IInboxDispatcherDeps {
   recordDelivered?: (item: IInboxItem) => void;
   /** F6 change 3: the coordinator window shared with the digest router; absent or null, nothing is deferred. */
   window?: () => CoordinatorWindow | null;
+  /** Press Enter once in the pane: a message whose text is still in the composer gets one more (ADR-0050). */
+  pressEnter?: (sessionName: string) => Promise<void>;
+  /** The fleet switch `tab-send.queue` (ADR-0050); off, every queued message is refused `queue-off`. Absent: on. */
+  messageQueueEnabled?: () => Promise<boolean>;
 }
 
 type TAttempt = (
@@ -116,26 +121,44 @@ export class InboxDispatcher {
 
   /**
    * Early wake: the tab is ready now, and either the last refusal was its state or (for a held
-   * item) a turn ended after the last attempt — a sent turn also clears the composer.
+   * item) a turn ended after the last attempt — a sent turn also clears the composer. A queued message also wakes on
+   * a busy tab, and on a turn end after its last attempt: Claude Code submits typed text that waited at its turn end.
    */
   private wake = (item: IInboxItem): boolean => {
+    const turnEndAt = this.deps.status(item.targetTabId)?.turnEnd?.at;
+    const turnEndedSince = typeof turnEndAt === 'number' && turnEndAt > (item.lastAttemptAt ?? 0);
+    if (item.kind === 'message') {
+      if (!isMessageReadyState(this.deps.status(item.targetTabId))) return false;
+      return (item.lastRefusal ?? '').startsWith(STATE_REFUSAL) || turnEndedSince;
+    }
     if (!this.isReadyState(item.targetTabId)) return false;
     if ((item.lastRefusal ?? '').startsWith(STATE_REFUSAL)) return true;
-    const turnEndAt = this.deps.status(item.targetTabId)?.turnEnd?.at;
-    return item.state === 'held' && typeof turnEndAt === 'number' && turnEndAt > (item.lastAttemptAt ?? 0);
+    return item.state === 'held' && turnEndedSince;
   };
 
   async tick(): Promise<void> {
     if (this.running) return;
     const run = (async () => {
       const now = this.deps.now();
-      const due = await this.deps.mutate((state) => {
+      const { due, messagesQueued } = await this.deps.mutate((state) => {
         const swept = sweepInState(state, now);
         // The router reads which tab's inbox item has waited longer than its digest (F6 ruling, change 3).
         this.deps.window?.()?.setInboxHeads(windowHeads(swept, now));
-        return { state: swept, value: dueItems(swept, now, this.wake) };
+        return {
+          state: swept,
+          value: { due: dueItems(swept, now, this.wake), messagesQueued: swept.items.some(isUntypedMessage) },
+        };
       });
-      for (const item of due) await this.attemptAndRecord(item);
+      let todo = due;
+      if (messagesQueued && this.deps.messageQueueEnabled && !(await this.deps.messageQueueEnabled().catch(() => true))) {
+        const refused = await this.deps.mutate((state) => {
+          const result = refuseUntypedMessagesInState(state, 'queue-off', this.deps.now());
+          return { state: result.state, value: result.refused };
+        });
+        if (refused.length) log.info({ refused: refused.map((i) => i.id) }, 'inbox: tab-send.queue is off; queued messages refused');
+        todo = due.filter((item) => item.kind !== 'message');
+      }
+      for (const item of todo) await this.attemptAndRecord(item);
     })();
     this.running = run;
     try {
@@ -207,7 +230,76 @@ export class InboxDispatcher {
       : { outcome: 'refused', reason: 'target-unresolved' };
   }
 
+  /**
+   * The boot pass for messages: an item claimed when the server stopped may already be on the screen, so it is held
+   * `transport-uncertain`, never typed again blind (ADR-0050).
+   */
+  async holdClaimedMessages(): Promise<IInboxItem[]> {
+    const now = this.deps.now();
+    return this.deps.mutate((state) => {
+      const result = holdClaimedMessagesInState(state, now);
+      return { state: result.state, value: result.held };
+    });
+  }
+
+  /**
+   * A queued `tab send` (ADR-0050). The gate admits a busy tab, unlike a notice's: Claude Code holds typed text and
+   * reads it mid-turn or at its turn end. It never types into a dialog, a startup prompt, a compaction, a halted tab or
+   * a composer that holds text. Inside the dispatch lock: the claim, the workspace check again, then the header line
+   * and the body; one more Enter when the text is still in the composer.
+   */
+  private async attemptMessage(item: IInboxItem): Promise<TAttempt> {
+    const message = item.message;
+    if (!message) return { outcome: 'rejected', reason: 'message-malformed' };
+    const found = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
+    if (!found) return this.missing(item);
+    if (!isAgentPanelType(found.panelType)) return { outcome: 'held', reason: 'target-not-agent' };
+    if (found.sessionName !== message.targetSessionName) return { outcome: 'rejected', reason: 'target-changed' };
+    if (!(await this.deps.hasSession(found.sessionName))) return { outcome: 'refused', reason: 'session-not-running' };
+    try {
+      return await this.deps.withDispatchLock<TAttempt>(item.targetWorkspaceId, found, async (checkPolicy) => {
+        const current = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
+        if (!current) return this.missing(item);
+        if (current.sessionName !== message.targetSessionName) return { outcome: 'rejected', reason: 'target-changed' };
+        const policy = await checkPolicy();
+        if (!policy.ok) return { outcome: 'rejected', reason: `policy:${policy.error ?? 'refused'}` };
+        if (this.deps.halted(item.targetTabId)) return { outcome: 'refused', reason: 'usage-limit-halt' };
+        const status = this.deps.status(item.targetTabId);
+        const refusal = messageStateRefusal(status);
+        if (refusal) return { outcome: 'refused', reason: refusal };
+        const screen = readComposerScreen(current.panelType, await this.deps.capture(current.sessionName).catch(() => null));
+        if (!screen.ok) return { outcome: 'refused', reason: screen.reason };
+        const claimed = await this.deps.mutate((state) => {
+          const result = claimMessageInState(state, item.id, this.deps.now());
+          return { state: result.state, value: result.claimed };
+        });
+        if (!claimed) return { outcome: 'withdrawn' };
+        // The claim waited on the inbox lock: a dialog may have opened since the screen read. Nothing is typed yet, so
+        // the claim is released and the item waits as for any state refusal (review N3).
+        const late = this.deps.halted(item.targetTabId) ? 'usage-limit-halt' : messageStateRefusal(this.deps.status(item.targetTabId));
+        if (late) {
+          await this.deps.mutate((state) => ({ state: unclaimMessageInState(state, item.id), value: null }));
+          return { outcome: 'refused', reason: late };
+        }
+        if (message.fromWorkspaceId !== item.targetWorkspaceId) return { outcome: 'rejected', reason: 'workspace-mismatch' };
+        const text = `${item.line}\n${message.body}`;
+        try {
+          await this.deps.deliver(current.sessionName, text);
+        } catch (err) {
+          return { outcome: 'held', reason: `transport-uncertain:${err instanceof Error ? err.message : String(err)}` };
+        }
+        const pending = () => this.deps.isPending(current.sessionName, text).catch(() => false);
+        if (!(await pending())) return { outcome: 'delivered' };
+        await this.deps.pressEnter?.(current.sessionName).catch(() => {});
+        return (await pending()) ? { outcome: 'held', reason: 'stranded-in-composer' } : { outcome: 'delivered' };
+      });
+    } catch (err) {
+      return { outcome: 'refused', reason: `dispatch-error:${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   private async attempt(item: IInboxItem): Promise<TAttempt> {
+    if (item.kind === 'message') return this.attemptMessage(item);
     const found = await this.deps.findTab(item.targetWorkspaceId, item.targetTabId);
     if (!found) return this.missing(item);
     if (!isAgentPanelType(found.panelType)) return { outcome: 'held', reason: 'target-not-agent' };
@@ -295,6 +387,20 @@ export class InboxDispatcher {
   }
 }
 
+/** The states a message is typed in: a notice's, and a plain `busy` (ADR-0050). */
+const isMessageReadyState = (status: IClientTabStatusEntry | undefined): boolean =>
+  !!status && (status.cliState === 'idle' || status.cliState === 'ready-for-review' || status.cliState === 'busy');
+
+/** Why a message may not be typed now, from the tab's status alone; null when only the screen remains to read. */
+const messageStateRefusal = (status: IClientTabStatusEntry | undefined): string | null => {
+  if (!status) return 'status-unavailable';
+  if (status.permissionRequest) return 'native-prompt-active';
+  if (status.startupPrompt) return `${STATE_REFUSAL}startup-prompt`;
+  if (typeof status.compactingSince === 'number') return `${STATE_REFUSAL}compacting`;
+  if (!isMessageReadyState(status)) return `${STATE_REFUSAL}${status.cliState}`;
+  return null;
+};
+
 // ─── the server's instance ───────────────────────────────────────────────
 
 interface IInboxRuntime {
@@ -316,7 +422,7 @@ const g = globalThis as unknown as { __ptInboxRuntime?: IInboxRuntime };
 
 /** The server's dispatcher dependencies (exported for the wiring test). */
 export const defaultInboxDeps = async (): Promise<IInboxDispatcherDeps> => {
-  const [{ readLayoutFile, resolveLayoutFile, collectAllTabs }, { hasSession, isContentPendingInComposer }, { getStatusManager }, { capturePaneAtWidth }, { withAgentDispatchLock }, { deliverPrompt }, { getLedgerStore }, { appendDelivered }] = await Promise.all([
+  const [{ readLayoutFile, resolveLayoutFile, collectAllTabs }, { hasSession, isContentPendingInComposer, pressEnter }, { getStatusManager }, { capturePaneAtWidth }, { withAgentDispatchLock }, { deliverPrompt }, { getLedgerStore }, { appendDelivered }, { messageQueueOn }] = await Promise.all([
     import('@/lib/layout-store'),
     import('@/lib/tmux'),
     import('@/lib/status-manager'),
@@ -325,6 +431,7 @@ export const defaultInboxDeps = async (): Promise<IInboxDispatcherDeps> => {
     import('@/lib/agent-prompt-delivery'),
     import('@/lib/ledger-store'),
     import('@/lib/tab-event-router'),
+    import('@/lib/delivery-switches'),
   ]);
   return {
     now: () => Date.now(),
@@ -351,11 +458,15 @@ export const defaultInboxDeps = async (): Promise<IInboxDispatcherDeps> => {
     withDispatchLock: (workspaceId, tab, work) => withAgentDispatchLock(workspaceId, tab, work),
     deliver: deliverPrompt,
     isPending: isContentPendingInComposer,
-    // Inbox notices keep their own delivery and receipts (consult ruling 3); the log records each with its class.
-    recordDelivered: (item) => appendDelivered(getLedgerStore().tabEvents, {
-      workspaceId: item.targetWorkspaceId, tabId: item.targetTabId, kind: item.kind, text: item.line, class: classifyWake(item.kind),
-    }, Date.now()),
+    // Inbox notices keep their own delivery and receipts (consult ruling 3); the log records each with its class. A
+    // queued `tab send` is recorded as the send it replaces, with its header.
+    recordDelivered: (item) => appendDelivered(getLedgerStore().tabEvents, item.kind === 'message' && item.message
+      ? { workspaceId: item.targetWorkspaceId, tabId: item.targetTabId, kind: 'tab-send', text: `${item.line}\n${item.message.body}`, class: 'urgent' }
+      : { workspaceId: item.targetWorkspaceId, tabId: item.targetTabId, kind: item.kind, text: item.line, class: classifyWake(item.kind) },
+    Date.now()),
     window: getCoordinatorWindow,
+    pressEnter,
+    messageQueueEnabled: messageQueueOn,
   };
 };
 
@@ -404,6 +515,12 @@ export const startInbox = async (options: IStartInboxOptions = {}): Promise<void
     if (dropped.length) log.info({ dropped: dropped.map((i) => i.id) }, 'inbox boot pass: target tabs closed while down');
   } catch (err) {
     log.warn(`inbox boot pass skipped: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    const held = await dispatcher.holdClaimedMessages();
+    if (held.length) log.info({ held: held.map((i) => i.id) }, 'inbox boot pass: messages claimed before the stop are held');
+  } catch (err) {
+    log.warn(`inbox boot pass for messages skipped: ${err instanceof Error ? err.message : err}`);
   }
   if (g.__ptInboxRuntime !== runtime) return;
   let gateOpen = !options.firstTickAfter;

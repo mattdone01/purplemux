@@ -33,6 +33,8 @@ const promptSubmit = (): void => {
 };
 
 vi.mock('@/lib/workspace-store', () => ({ getWorkspaceById: async () => ({ id: 'ws-lock', orchestration: { enabled: false } }) }));
+// The queue switch is off: this file pins today's send path against the inbox lock (ADR-0050 has its own tests).
+vi.mock('@/lib/delivery-switches', () => ({ messageQueueOn: async () => false }));
 vi.mock('@/lib/cli-utils', () => ({
   findTab: async (_ws: string, id: string) => (id === 'tab-1' ? { workspaceId: 'ws-lock', paneId: 'pane-1', tab: { id: 'tab-1', sessionName: 'pt-ws-lock-pane-1-tab-1', name: 'worker', order: 0, panelType: 'claude-code', cliState: 'idle' } } : null),
   authorizeWorkspaceInput: async () => ({ type: 'workspace', workspaceId: 'ws-lock' }),

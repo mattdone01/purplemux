@@ -1,7 +1,7 @@
 import type { IDeployAnnouncement } from '@/types/deploy';
 import type { IFleetView } from '@/types/fleet-status';
 import type { IGrant, IGrantRefusal } from '@/types/grant';
-import type { IInboxItem } from '@/types/inbox';
+import type { TInboxItemView } from '@/types/inbox';
 import type { ILeaseView } from '@/types/lease';
 import type { INoteView } from '@/types/note';
 import type { IWatchView } from '@/types/watch';
@@ -96,7 +96,7 @@ export interface ICoordinationSnapshot {
   notes: TSection<INoteRow>;
   watches: TSection<IWatchView>;
   grants: TGrantsSection;
-  inboxHeld: TSection<IInboxItem>;
+  inboxHeld: TSection<TInboxItemView>;
   orchestrators: TSection<IOrchestratorPresenceIssue>;
   host: THostMetrics;
   signals: THostSignals;

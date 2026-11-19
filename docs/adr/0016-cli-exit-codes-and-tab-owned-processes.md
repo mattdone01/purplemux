@@ -54,6 +54,7 @@ A second defect sat in front of the CLI. The installed entry point, `bin/purplem
 | 3 | refused by state (`note point`, G7) | `note-point-too-soon`: the note, or the target tab, took a pointer less than 10 min ago | after 10 min |
 | 3 | refused by state (`note point`, PMUX-NOTE-DELIVERY) | `note-point-spent`: the note already took its one pointer line on its current route | no: the note must re-route first |
 | 1 | typed, not confirmed (`note point`, PMUX-NOTE-DELIVERY) | `not-verified`: the screen could not confirm the line as submitted, so no receipt; the line may sit in the composer | **never resend**: inspect the tab |
+| 3 | refused by state (`tab send`, ADR-0050) | `message-queue-full`: 20 messages already wait in the inbox for the target Claude tab; nothing was queued | after one is delivered, or with `--supersede KEY` |
 | 5 | not ready (`note point`, G7) | `note-point-not-ready`: the target orchestrator shows a prompt, an option list or text in its composer, is halted by a usage limit or is in the needs-input or startup-prompt state, or its dispatch policy refused; nothing was typed and no bound was spent | yes, bounded |
 
 3. stderr names the code and its class, e.g. `error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found`. A `readiness-timeout` names the waited milliseconds.

@@ -158,6 +158,8 @@ to an exit code through one table:
      5  not ready (note point, G7)               note-point-not-ready (a prompt, a halt,    yes, bounded
                                                  a policy refusal or text in the
                                                  composer; nothing typed)
+     3  refused by state (tab send, ADR-0050)    message-queue-full (20 messages queued     after one is delivered,
+                                                 for the tab)                               or with --supersede KEY
 
 The CLI writes the code and its class to stderr, e.g.
   error: tab-not-found (permanent — the tab is closed; do not retry) — Tab not found
@@ -602,7 +604,19 @@ POST /api/cli/tabs/orphans   Body: { "reap": true, "host"?: "local" | H }
   CLI: purplemux tab orphans [--host H] [--reap] [--json]
 
 POST /api/cli/tabs/<tabId>/send?workspaceId=WS
-  Body: { "content": "...", "waitMs"?: 0..600000, "raw"?: boolean }
+  Body: { "content": "...", "waitMs"?: 0..600000, "raw"?: boolean, "noQueue"?: boolean,
+          "supersede"?: "[A-Za-z0-9._:-]{1,64}", "ttlMin"?: 1..1440 }
+  ADR-0050: a claude-code tab of the caller's own workspace that is busy (not waiting at its prompt), not
+  ready by waitMs, or that already holds a queued message, QUEUES the text as an inbox item of kind
+  "message": 200 { "status": "queued", "submitted": false, "messageId": "i-…", "delivery": "queued" }
+  (exit 0), nothing typed. The inbox types a fixed header line "[purplemux message <id> from <ws>/<tab>,
+  queued <time>]" and the body, unchanged, once the composer reads empty (busy included; never a dialog,
+  a startup prompt, a compaction or a halt). Read its state with GET /api/cli/inbox/<id>. It expires
+  after ttlMin (default 120) minutes; supersede refuses the sender tab's older queued message to this tab
+  with the same key (it needs a sender tab, else 400 invalid-request); a 21st queued message answers
+  409 { "code": "message-queue-full", "tabId" } (exit 3). noQueue, or the fleet switch tab-send.queue off,
+  keeps the wait and the exit 5 below for the call. A sender of another workspace, codex-cli, grok-cli and
+  terminal tabs keep the path below. A typed claude-code send adds "delivery": "delivered" | "held".
   Send text to the tab and press Enter. Typed into Claude Code, bracketed paste elsewhere.
   For an agent tab (claude-code / codex-cli / grok-cli) the send waits until the tab can
   accept a turn, up to waitMs (default 60000). A booting agent swallows the Enter after a
@@ -864,6 +878,15 @@ GET /api/cli/inbox?workspaceId=WS[&all=1]   (CLI: inbox list -w WS [--all] [--co
     "items": [{ "id", "kind", "targetWorkspaceId", "targetTabId", "dedupeKey",
     "line", "state", "attempts", "lastRefusal", "notBefore", "createdAt", "deliveredAt", "heldReason",
     "droppedReason", "expiresAt", "transitionAt", ... }] }
+
+GET /api/cli/inbox/<id>   (CLI: inbox show ID)
+  Read scope of the item's target workspace. { "item": { ...the fields above, "delivery": "queued" |
+  "delivered" | "held" | "refused" | "expired", "message"?: { "fromWorkspaceId", "fromTabId",
+  "targetSessionName", "supersedeKey", "claimedAt", "bodyBytes" } } }. A message's body is never served,
+  here, in inbox list, in inbox retry or in the Mission Control views. The stored body is blanked once the item
+  can never be typed again (delivered, refused, expired, or held after its claim), so bodyBytes then reads 0. refused names its droppedReason: superseded-by:<id>, target-tab-closed,
+  target-changed, policy:<…>, workspace-mismatch, queue-off. 404 { "code": "inbox-not-found" } (exit 7)
+  for an unknown id and for an item outside the caller's read scope.
 
 POST /api/cli/inbox/<id>/retry   { "reason"? }
   The target workspace's own token, the workspace that sent the note the item carries, or the
@@ -1163,6 +1186,12 @@ Keys in use:
   hook.stop-payload
                on (unset) or off. On, the Claude stop's own last_assistant_message is the turn's tail; off, the
                transcript tail is read again (F6). Admin token only.
+  tab-send.queue
+               on (unset) or off (ADR-0050). On, a busy claude-code tab queues a tab send as an inbox
+               message. Off, the route never queues (exit 5, as before) and the next inbox tick refuses
+               each message not yet typed (queued, or held with no claim) queue-off, which blanks its body;
+               set it off first when rolling back. An unreadable store reads off at the route and on at
+               the inbox tick. Admin token only.
   fleet-status.stall-minutes  fleet-status.waiting-long-minutes  fleet-status.unanswered-minutes
   fleet-status.composer-minutes
                The fleet flag thresholds (ADR-0023), in minutes (0, 10080], decimals allowed:

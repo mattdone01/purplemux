@@ -228,7 +228,7 @@ describe('inbox store — human retry (ADR-0029 §7, consult Q1)', () => {
 
   it('names every hold reason inbox-dispatcher.ts writes, so a new one fails here until it is classified', async () => {
     const source = await fs.readFile(path.join(process.cwd(), 'src/lib/inbox-dispatcher.ts'), 'utf-8');
-    const written = [...source.matchAll(/outcome: 'held', reason: [`']([a-z-]+)/g)].map((m) => m[1]).sort();
+    const written = [...new Set([...source.matchAll(/outcome: 'held', reason: [`']([a-z-]+)/g)].map((m) => m[1]))].sort();
     expect(written).toEqual(['stranded-in-composer', 'target-not-agent', 'transport-uncertain']);
   });
 

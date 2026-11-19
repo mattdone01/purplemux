@@ -19,13 +19,14 @@ const PANEL_CALLER = {
 } as ICaller;
 
 export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoordinationSnapshot> => {
-  const [{ listLeases }, { viewsOf }, notes, { getWatchManager }, grantStore, { readInboxState }, { readHostMetrics }, { hostSignalsView }, { getOrchestratorPresenceMonitor }, { readFleetView }, deploy] = await Promise.all([
+  const [{ listLeases }, { viewsOf }, notes, { getWatchManager }, grantStore, { readInboxState }, { inboxItemView }, { readHostMetrics }, { hostSignalsView }, { getOrchestratorPresenceMonitor }, { readFleetView }, deploy] = await Promise.all([
     import('@/lib/lease-store'),
     import('@/lib/lease-http'),
     import('@/lib/notes-store'),
     import('@/lib/watch-manager'),
     import('@/lib/grant-store'),
     import('@/lib/inbox-store'),
+    import('@/lib/inbox-messages'),
     import('@/lib/host-metrics'),
     import('@/lib/host-signals'),
     import('@/lib/orchestrator-presence'),
@@ -39,7 +40,7 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
       const [{ notes: all }, inbox] = await Promise.all([notes.readNotesState(), readInboxState()]);
       const notices = new Map(inbox.items.map((item) => [item.id, item]));
       return all
-        .filter((n) => notes.OPEN_STATES.has(n.state))
+        .filter((n) => notes.isOpenNote(n))
         .map((n) => ({
           ...notes.viewOf(n, n.inboxItemId ? notices.get(n.inboxItemId) ?? null : null),
           ageSeconds: Math.max(0, Math.floor((now - n.createdAt) / 1000)),
@@ -52,7 +53,8 @@ export const readCoordinationSnapshot = async (now = Date.now()): Promise<ICoord
       if (!listed.ok) return { ok: false, error: listed.error };
       return { ok: true, items: listed.grants.filter((g) => grantStore.isActive(g, now)), refused: listed.refused };
     })().catch((err): TGrantsSection => ({ ok: false, error: err instanceof Error ? err.message : String(err) })),
-    section(async () => (await readInboxState()).items.filter((i) => i.state === 'held')),
+    // Views: a held message's body is never served (ADR-0050).
+    section(async () => (await readInboxState()).items.filter((i) => i.state === 'held').map(inboxItemView)),
     readHostMetrics().catch((err) => ({ available: false as const, reason: err instanceof Error ? err.message : String(err) })),
     readFleetView(now).then(
       (view): TFleetSection => ({ ok: true, view }),

@@ -18,6 +18,7 @@ const GRAMMAR = {
   watchId: /^w-[A-Za-z0-9_-]{4,32}$/,
   deployId: /^d-[A-Za-z0-9_-]{4,32}$/,
   resumeId: /^r-[A-Za-z0-9_-]{4,32}$/,
+  messageId: /^i-[A-Za-z0-9_-]{1,32}$/,
   sha: /^[0-9a-f]{7,40}$/,
   // Server-made only: a UUID (answer ids) or a deterministic `<prefix>-<32 hex>`.
   // Producer-chosen Mission Control item ids ("question-1") are text, not ids.
@@ -136,6 +137,11 @@ export type IMissionFields =
   | { event?: 'answer'; answerId: string; workspaceId: string; readyAt: number }
   | { event: 'bootstrap'; bootstrapKey: string; workspaceId: string };
 export interface IResumeFields { resumeId: string }
+/**
+ * The header of a queued `tab send` (ADR-0050): server-made fields only. The body is typed below it, unchanged, and only
+ * inside the sender's own workspace (the ADR-0012 amendment); it is never part of this line.
+ */
+export interface IMessageFields { messageId: string; fromWorkspaceId: string; fromTabId: string | null; queuedAt: number }
 
 export interface IInboxFields {
   note: INoteFields;
@@ -143,6 +149,7 @@ export interface IInboxFields {
   deploy: IDeployFields;
   mission: IMissionFields;
   resume: IResumeFields;
+  message: IMessageFields;
 }
 
 /** The checked id and the sender words every note line starts with (ADR-0013). */
@@ -237,6 +244,12 @@ const TEMPLATES: { [K in TInboxKind]: TRenderer<K> } = {
   resume: (f) => {
     const id = field('resumeId', f.resumeId, 'resumeId');
     return { recordId: id, line: `[purplemux resume ${id}] the last turn ended on an API error — continue from where it was cut off` };
+  },
+  message: (f) => {
+    const id = field('messageId', f.messageId, 'messageId');
+    const ws = field('fromWorkspaceId', f.fromWorkspaceId, 'workspaceId');
+    const tab = f.fromTabId === null ? 'workspace' : field('fromTabId', f.fromTabId, 'tabId');
+    return { recordId: id, line: `[purplemux message ${id} from ${ws}/${tab}, queued ${time('queuedAt', f.queuedAt)}]` };
   },
 };
 

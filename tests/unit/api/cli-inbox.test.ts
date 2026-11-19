@@ -22,6 +22,8 @@ vi.mock('os', async (importOriginal) => {
 });
 vi.mock('@/lib/workspace-token', () => ({ resolveCliScope: () => auth.scope }));
 vi.mock('@/lib/cli-utils', () => ({
+  canAccessWorkspace: async (scope: { type: string; workspaceId?: string }, workspaceId: string) =>
+    scope.type === 'admin' || scope.workspaceId === workspaceId,
   authorizeWorkspace: async (_req: unknown, res: NextApiResponse) => {
     if (auth.allowRead) return auth.scope;
     res.status(403).json({ error: 'Forbidden', code: 'forbidden' });
@@ -146,5 +148,66 @@ describe('inbox routes (ADR-0012)', () => {
     expect(await retry(ids.h)).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });
     auth.scope = null;
     expect(await retry(ids.h)).toMatchObject({ statusCode: 403 });
+  });
+
+  describe('inbox show and the delivery field (ADR-0050)', () => {
+    const show = async (id: string) => {
+      const { state, res } = fakeResponse();
+      const { default: handler } = await import('@/pages/api/cli/inbox/[id]');
+      await handler({ method: 'GET', query: { id } } as unknown as NextApiRequest, res);
+      return state;
+    };
+    const queueMessage = async () => {
+      const { enqueueMessage, MESSAGE_TTL_DEFAULT_MS } = await import('@/lib/inbox-messages');
+      return (await enqueueMessage({
+        targetWorkspaceId: 'ws-1', targetTabId: 'tab-a', targetSessionName: 'pt-x', fromWorkspaceId: 'ws-1', fromTabId: 'tab-b',
+        body: 'the secret plan', supersedeKey: null, ttlMs: MESSAGE_TTL_DEFAULT_MS,
+      })).item;
+    };
+
+    it('shows one item with its delivery state and the body size, never the body', async () => {
+      const item = await queueMessage();
+      const shown = await show(item.id);
+      expect(shown.statusCode).toBe(200);
+      expect(shown.body).toMatchObject({ item: { id: item.id, kind: 'message', delivery: 'queued', message: { bodyBytes: 15, fromTabId: 'tab-b' } } });
+      expect(JSON.stringify(shown.body)).not.toContain('secret plan');
+      const listed = await list({ workspaceId: 'ws-1' });
+      expect(JSON.stringify(listed.body)).not.toContain('secret plan');
+      expect((listed.body as { items: Array<{ delivery: string }> }).items[0].delivery).toBe('queued');
+    });
+
+    it('answers another workspace\'s item and a missing one alike, 404 inbox-not-found; no token is 403', async () => {
+      const item = await queueMessage();
+      auth.scope = { type: 'workspace', workspaceId: 'ws-2' };
+      expect(await show(item.id)).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });
+      expect(await show('i-missing123')).toMatchObject({ statusCode: 404, body: { code: 'inbox-not-found' } });
+      auth.scope = null;
+      expect((await show(item.id)).statusCode).toBe(403);
+    });
+
+    it('no-body-in-retry: inbox retry of a held, unclaimed message answers its view, never its body, to the target and to admin (review B2)', async () => {
+      const store = await import('@/lib/inbox-store');
+      for (const scope of [{ type: 'workspace', workspaceId: 'ws-1' }, { type: 'admin' }] as const) {
+        auth.scope = { type: 'workspace', workspaceId: 'ws-1' };
+        const item = await queueMessage();
+        await store.mutateInbox((state) => ({ state: store.holdInState(state, item.id, 'target-not-agent', Date.now()), value: null }));
+        auth.scope = scope;
+        const retried = await retry(item.id);
+        expect(retried.statusCode).toBe(200);
+        expect(JSON.stringify(retried.body)).not.toContain('secret plan');
+        expect(retried.body).toMatchObject({ item: { id: item.id, state: 'queued', delivery: 'queued', message: { bodyBytes: 15 } } });
+      }
+    });
+
+    it('spent-body-blanked on disk: a delivered message keeps no body in inbox.json; a queued one keeps it for its paste (review B3)', async () => {
+      const store = await import('@/lib/inbox-store');
+      const kept = await queueMessage();
+      const spent = await queueMessage();
+      await store.mutateInbox((state) => ({ state: store.deliverInState(state, spent.id, Date.now()), value: null }));
+      const raw = await fs.readFile(path.join(mockHome.value, '.purplemux', 'inbox.json'), 'utf-8');
+      const items = (JSON.parse(raw) as { items: Array<{ id: string; message: { body: string } }> }).items;
+      expect(items.find((i) => i.id === spent.id)!.message.body).toBe('');
+      expect(items.find((i) => i.id === kept.id)!.message.body).toBe('the secret plan');
+    });
   });
 });

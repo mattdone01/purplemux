@@ -12,6 +12,7 @@ const VALID: IInboxFields = {
   deploy: { deployId: 'd-abcd12', restartAt: AT, inMinutes: 10 },
   mission: MISSION_ANSWER,
   resume: { resumeId: 'r-abcd12' },
+  message: { messageId: 'i-AbC123', fromWorkspaceId: 'ws-A', fromTabId: 'tab-1', queuedAt: AT },
 };
 
 // Everything a sender might try to smuggle into a typed user turn.
