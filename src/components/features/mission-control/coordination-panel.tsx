@@ -10,7 +10,7 @@ import { hostWarnings } from '@/lib/host-warnings';
 import { humanRetryRefusal, postHumanAction } from '@/lib/human-actions';
 import { cn } from '@/lib/utils';
 import type { ICoordinationSnapshot, IDeployRow, TGrantsSection, THostSignals, TSection } from '@/types/coordination';
-import type { IInboxItem } from '@/types/inbox';
+import type { TInboxItemView } from '@/types/inbox';
 import type { ILeaseView } from '@/types/lease';
 
 // Mission Control coordination panel (story 20): leases, open notes, watches,
@@ -123,7 +123,7 @@ export const deployRecipients = (r: IDeployRow['recipients']): string => {
 
 /** The actions the container wires; without them the rows render read-only. */
 export interface ICoordinationActions {
-  onRetry: (item: IInboxItem) => void;
+  onRetry: (item: TInboxItemView) => void;
   onBreak: (lease: ILeaseView) => void;
   onSendNote: () => void;
   /** Held notices whose retry is in flight: their button is disabled. */
@@ -344,9 +344,9 @@ const CoordinationPanel = () => {
   const [noteOpen, setNoteOpen] = useState(false);
   const [breaking, setBreaking] = useState<ILeaseView | null>(null);
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
-  const retry = async (item: IInboxItem) => {
+  const retry = async (item: TInboxItemView) => {
     setBusy((b) => new Set(b).add(item.id));
-    const outcome = await postHumanAction<{ item: IInboxItem }>(`/api/mission-control/inbox/${encodeURIComponent(item.id)}/retry`);
+    const outcome = await postHumanAction<{ item: TInboxItemView }>(`/api/mission-control/inbox/${encodeURIComponent(item.id)}/retry`);
     setBusy((b) => { const next = new Set(b); next.delete(item.id); return next; });
     toastOutcome(outcome, () => 'Notice re-queued; the inbox types it when the tab is ready');
     void refresh();

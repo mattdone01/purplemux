@@ -114,7 +114,7 @@ describe('the wake-class table (AC 1)', () => {
 
   it('every kind of the table has a pinned class, and a kind outside it is urgent, never held', () => {
     const pinned = new Set(['needs-input', 'off-scope', 'thrash', 'api-error', 'usage-limit', 'auth-failure', 'rate-limit', 'inactive', 'stalled', 'model-drift',
-      'ready-for-review', 'turn-ended', 'idle-no-end-line', 'long-wait', 'stuck', 'probe-failed', 'mission', 'resume', 'watch',
+      'ready-for-review', 'turn-ended', 'idle-no-end-line', 'long-wait', 'stuck', 'probe-failed', 'mission', 'resume', 'message', 'watch',
       'deploy', 'note', 'red-main', 'rotate', 'turn-marker', 'bg-completed', 'bg-failed', 'bg-exited-unknown', 'bg-died',
       'bg-host-unreachable', 'heartbeat', 'flag', 'alarm', 'tab-send', 'standing-order', 'curator-candidate',
       'note-acked', 'note-pointer-spent', 'orphan-sweep', 'orphan-suspect']);
@@ -122,6 +122,8 @@ describe('the wake-class table (AC 1)', () => {
     // PMUX-NOTE-DELIVERY: an ack is recorded, never typed; a pointer line that may sit in a composer wakes its sender.
     expect(classifyWake('note-acked')).toBe('log');
     expect(classifyWake('note-pointer-spent')).toBe('urgent');
+    // ADR-0050: a queued tab send keeps the class of the send it replaces.
+    expect(classifyWake('message')).toBe('urgent');
     // F6 change 2: the standup due line is deleted, so its kind is no longer in the table.
     expect(Object.prototype.hasOwnProperty.call(WAKE_CLASS_TABLE, 'standup-due')).toBe(false);
     expect(classifyWake('something-new')).toBe('urgent');

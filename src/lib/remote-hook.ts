@@ -1,6 +1,7 @@
 import { createLogger } from '@/lib/logger';
 import { getStatusManager } from '@/lib/status-manager';
 import { translateClaudeHookEvent } from '@/lib/providers/claude/hook-handler';
+import { isCrossSessionPrompt } from '@/lib/messaging-directory';
 import { parseClaudeToolActivity } from '@/lib/providers/claude/tool-activity';
 import { bindRemoteTranscript, isValidRemoteTranscriptPath, syncRemoteTranscript } from '@/lib/remote-transcript';
 import { sessionHostOf } from '@/lib/session-host';
@@ -74,7 +75,9 @@ export const handleRemoteClaudeHook = async (delivery: IRemoteHookDelivery): Pro
 
   const notificationType = typeof payload.notification_type === 'string' && payload.notification_type ? payload.notification_type : undefined;
   const source = typeof payload.source === 'string' && /^[a-z]+$/.test(payload.source) ? payload.source : undefined;
-  const workEvent = translateClaudeHookEvent(event, notificationType, source);
+  const translated = translateClaudeHookEvent(event, notificationType, source);
+  // ADR-0050 (D8), as on the local path: a message from another session is neither submit evidence nor a new turn.
+  const workEvent = translated?.kind === 'prompt-submit' && isCrossSessionPrompt(payload.prompt) ? { ...translated, fromTool: true as const } : translated;
   if (!workEvent) {
     log.debug({ event, session }, 'unknown remote claude hook event, ignoring');
     return { status: 204 };

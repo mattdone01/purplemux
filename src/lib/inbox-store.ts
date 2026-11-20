@@ -52,6 +52,7 @@ export const enqueueInState = <K extends TInboxKind>(
   if (typeof req.dedupeKey !== 'string' || !req.dedupeKey || req.dedupeKey.length > 200) {
     throw new InboxError('inbox-field-invalid', 'inbox dedupeKey must be 1-200 characters');
   }
+  if (req.kind === 'message') throw new InboxError('inbox-field-invalid', 'a message is queued by enqueueMessageInState, which stores its body');
   const { line } = renderInboxLine(req.kind, req.fields);
   // Per target: one key may be queued once for each recipient (a broadcast).
   const existing = state.items.find((i) => i.state === 'queued' && i.dedupeKey === req.dedupeKey
@@ -104,8 +105,41 @@ export const isRecoverableHold = (item: IInboxItem, now: number): boolean =>
   item.state === 'held' && RECOVERABLE_KINDS.has(item.kind) && REFUSAL_BUDGET_HOLD.test(item.heldReason ?? '') && now < item.expiresAt;
 
 /** Queued, or a recoverable hold: the item may still be typed. */
-const awaitsDelivery = (item: IInboxItem, now: number): boolean =>
+export const awaitsDelivery = (item: IInboxItem, now: number): boolean =>
   item.state === 'queued' || isRecoverableHold(item, now);
+
+/**
+ * Per target tab, a `message` waits only behind messages and a notice only behind notices (ADR-0050): a note waits for
+ * a ready tab, a message is typed into a busy one, so neither may hold the other back.
+ */
+const laneOf = (item: IInboxItem): string =>
+  `${item.targetWorkspaceId}/${item.targetTabId}/${item.kind === 'message' ? 'message' : 'notice'}`;
+
+/** A message claimed for its paste: never typed again, whatever happens to the attempt (ADR-0050). */
+const isClaimedMessage = (item: IInboxItem): boolean => item.kind === 'message' && typeof item.message?.claimedAt === 'number';
+
+/** Longer than any one message attempt (the typing, two Enters and the reads): a claim this old was never recorded. */
+export const CLAIM_STALE_MS = 120_000;
+
+/** A `transport-uncertain` hold names a paste whose outcome is unknown; this one says why. */
+export const TRANSPORT_UNCERTAIN = 'transport-uncertain:';
+
+/**
+ * A message body is kept only while the item may still be typed: queued, or held without a claim (a retry may queue
+ * it again). Every final state and every claimed hold keeps an empty body (ADR-0050), so no reader, and no older
+ * release after a rollback, can serve words that will never be typed. The same object comes back when nothing changed.
+ */
+export const blankSpentBodies = (state: IInboxState): IInboxState => {
+  let changed = false;
+  const items = state.items.map((item) => {
+    if (item.kind !== 'message' || !item.message || item.message.body === '') return item;
+    const typable = item.state === 'queued' || (item.state === 'held' && item.message.claimedAt === null);
+    if (typable) return item;
+    changed = true;
+    return { ...item, message: { ...item.message, body: '' } };
+  });
+  return changed ? { items } : state;
+};
 
 /** The refusals `checkComposerReady` gives (composer-readiness.ts): each one says the composer was not ready. */
 const COMPOSER_REFUSALS = ['composer-not-ready:', 'composer-not-empty', 'composer-unreadable', 'interactive-prompt-active',
@@ -134,8 +168,7 @@ export const aheadOf = (items: readonly IInboxItem[], id: string, now: number): 
   const index = items.findIndex((i) => i.id === id);
   const mine = items[index];
   if (!mine || !awaitsDelivery(mine, now)) return null;
-  const before = items.filter((i, k) => k !== index && i.targetWorkspaceId === mine.targetWorkspaceId
-    && i.targetTabId === mine.targetTabId && awaitsDelivery(i, now)
+  const before = items.filter((i, k) => k !== index && laneOf(i) === laneOf(mine) && awaitsDelivery(i, now)
     && (i.createdAt < mine.createdAt || (i.createdAt === mine.createdAt && k < index)));
   const head = before.reduce<IInboxItem>((first, i) => (i.createdAt < first.createdAt ? i : first), before[0] ?? mine);
   return {
@@ -145,14 +178,18 @@ export const aheadOf = (items: readonly IInboxItem[], id: string, now: number): 
   };
 };
 
-/** One refusal: back off, or hold after the 30th refusal or past 24 h. A recoverable hold stays held. */
+/**
+ * One refusal: back off, or hold after the 30th refusal or past 24 h. A recoverable hold stays held. A claimed message
+ * is held `transport-uncertain`: its paste may have run. A message past its TTL is left for the sweep to expire.
+ */
 export const refuseInState = (state: IInboxState, id: string, reason: string, now: number): IInboxState =>
   replace(state, id, (item) => {
     if (!awaitsDelivery(item, now)) return item;
     const attempts = item.attempts + 1;
     const refused = { ...item, attempts, lastAttemptAt: now, lastRefusal: reason, notBefore: now + backoffAfter(attempts) };
+    if (isClaimedMessage(item)) return hold(refused, `${TRANSPORT_UNCERTAIN}${reason}`, now);
     if (attempts >= INBOX_MAX_REFUSALS) return hold(refused, `${reason} (${attempts} refusals)`, now);
-    if (now >= item.expiresAt) return hold(refused, `${reason} (undelivered after 24 h)`, now);
+    if (item.kind !== 'message' && now >= item.expiresAt) return hold(refused, `${reason} (undelivered after 24 h)`, now);
     return refused;
   });
 
@@ -196,7 +233,8 @@ export const dropForTabInState = (
 };
 
 /**
- * Queued or held items past their `staleAt` are dropped (their line is no longer true); queued items
+ * Queued or held items past their `staleAt` are dropped (their line is no longer true); a queued message past its TTL
+ * is dropped `expired` (a stale instruction typed hours later causes double work, ADR-0050); other queued items
  * past 24 h become held; terminal items 7 days after their last transition are pruned. The same state
  * object comes back when nothing changed, so a quiet tick writes nothing.
  */
@@ -211,6 +249,22 @@ export const sweepInState = (state: IInboxState, now: number): IInboxState => {
     if ((item.state === 'queued' || item.state === 'held') && typeof item.staleAt === 'number' && now >= item.staleAt) {
       changed = true;
       items.push({ ...item, state: 'dropped', droppedReason: 'stale', transitionAt: now });
+      continue;
+    }
+    // A claim outlives its attempt only when the outcome write failed: the text may be on the screen (ADR-0050).
+    if (item.state === 'queued' && isClaimedMessage(item) && now - item.message!.claimedAt! >= CLAIM_STALE_MS) {
+      changed = true;
+      items.push(hold(item, `${TRANSPORT_UNCERTAIN}outcome-unrecorded`, now));
+      continue;
+    }
+    if (item.state === 'queued' && item.kind === 'message' && now >= item.expiresAt) {
+      // A claimed message is never expired: it is held above once its claim is stale.
+      if (isClaimedMessage(item)) {
+        items.push(item);
+        continue;
+      }
+      changed = true;
+      items.push({ ...item, state: 'dropped', droppedReason: 'expired', transitionAt: now });
       continue;
     }
     if (item.state === 'queued' && now >= item.expiresAt) {
@@ -262,6 +316,7 @@ export const retryInState = (state: IInboxState, id: string, now: number): { sta
   const item = state.items.find((i) => i.id === id);
   if (!item) throw new InboxError('inbox-not-found', `inbox item ${id} not found`);
   if (item.state !== 'held') throw new InboxError('inbox-not-held', `inbox item ${id} is ${item.state}, not held`);
+  if (isClaimedMessage(item)) throw new InboxError('inbox-not-held', `message ${id} was claimed for typing; it is never typed again`);
   const newer = state.items.find((i) => i.id !== id && i.state === 'queued' && i.dedupeKey === item.dedupeKey
     && i.targetWorkspaceId === item.targetWorkspaceId && i.targetTabId === item.targetTabId);
   if (newer) throw new InboxError('inbox-not-held', `a newer notice with this key is already queued: ${newer.id}`);
@@ -271,7 +326,7 @@ export const retryInState = (state: IInboxState, id: string, now: number): { sta
     attempts: 0,
     notBefore: now,
     heldReason: null,
-    expiresAt: now + INBOX_MAX_AGE_MS,
+    expiresAt: now + (item.kind === 'message' ? item.expiresAt - item.createdAt : INBOX_MAX_AGE_MS),
     transitionAt: now,
   };
   return { state: replace(state, id, () => next), item: next };
@@ -289,14 +344,14 @@ export const retryHumanInState = (state: IInboxState, id: string, now: number): 
 };
 
 /**
- * The next item per target tab, oldest first, a recoverable hold included: due by its backoff (a
+ * The next item per target tab and lane, oldest first, a recoverable hold included: due by its backoff (a
  * hold: `HELD_REPROBE_MS` after its last attempt), or woken early by `wake`.
  */
 export const dueItems = (state: IInboxState, now: number, wake: (item: IInboxItem) => boolean): IInboxItem[] => {
   const byTab = new Map<string, IInboxItem>();
   const waiting = state.items.filter((i) => awaitsDelivery(i, now)).sort((a, b) => a.createdAt - b.createdAt);
   for (const item of waiting) {
-    const key = `${item.targetWorkspaceId}/${item.targetTabId}`;
+    const key = laneOf(item);
     const head = byTab.get(key);
     // Per tab, strictly in order: a later notice never overtakes a waiting one, with one exception (F6 ruling,
     // change 6): a kind that skips a coordinator's window overtakes a head that waits only on that window.
@@ -415,7 +470,8 @@ const writeInboxState = async (state: IInboxState): Promise<void> => {
 export const mutateInbox = async <T>(fn: (state: IInboxState) => { state: IInboxState; value: T }): Promise<T> =>
   withLock(async () => {
     const before = await readInboxState();
-    const { state, value } = fn(before);
+    const { state: next, value } = fn(before);
+    const state = blankSpentBodies(next);
     if (state !== before) {
       await writeInboxState(state);
       notifyHeld(before, state);

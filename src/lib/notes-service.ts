@@ -15,6 +15,7 @@ import {
   OWNER_ITEMS_ARMED_PER_SENDER,
   bounceNotified,
   OPEN_STATES,
+  isOpenNote,
   acked,
   canAck,
   canShow,
@@ -45,6 +46,7 @@ import {
   undeliveredNoticeMs,
   viewOf,
 } from '@/lib/notes-store';
+import { SUPERSEDE_KEY } from '@/lib/inbox-messages';
 import type { IGrant } from '@/types/grant';
 import type { IInboxItem } from '@/types/inbox';
 import type { INote, INoteAdmission, INotePointerStamp, INoteQueue, INoteReceipt, INotesState, INoteView, TNoteRoutingStatus } from '@/types/note';
@@ -191,6 +193,8 @@ export interface ISendInput {
   externalKey?: string;
   /** `true` flags an owner item; only the verified current orchestrator of the sender's workspace may set it. */
   ownerItem?: unknown;
+  /** ADR-0050: a newer note of the same sender tab, route and key refuses an older one the recipient has not acked. */
+  supersedeKey?: unknown;
 }
 
 export interface IEventNoteInput {
@@ -499,7 +503,7 @@ export class NotesService {
         // An `undelivered` notice is stale once the line reached the recipient's composer; a `bounced` one once the
         // note has a recipient again.
         const valid = event === 'expired'
-          ? note.state === 'expired' || (OPEN_STATES.has(note.state) && this.deps.now() - note.createdAt >= NOTE_EXPIRE_MS)
+          ? note.state === 'expired' || (isOpenNote(note) && this.deps.now() - note.createdAt >= NOTE_EXPIRE_MS)
           : event === 'bounced'
             ? isBounce(note)
             : note.state === 'delivered' && (event === 'unacked' || note.deliveredAt === null);
@@ -535,6 +539,25 @@ export class NotesService {
       release();
       throw err;
     }
+  }
+
+  /**
+   * ADR-0050: the notes of the same sender tab, recipient route and key that the recipient has not acked become
+   * `undeliverable`, `supersededBy` the new note. Their waiting lines are withdrawn; a line the inbox picks first fails
+   * the paste preflight, which reads the note's state. `note show` still serves an old body and the newer id.
+   */
+  private async supersede(notes: readonly INote[], newer: INote, now: number): Promise<Map<string, INote>> {
+    const out = new Map<string, INote>();
+    for (const n of notes) {
+      if (n.supersedeKey !== newer.supersedeKey || !isOpenNote(n) || n.from.workspaceId !== newer.from.workspaceId
+        || n.from.tabId !== newer.from.tabId || n.from.humanActor !== newer.from.humanActor
+        || JSON.stringify(n.to) !== JSON.stringify(newer.to)) continue;
+      for (const id of [n.inboxItemId, n.reminderItemId]) {
+        if (id) await this.deps.withdraw(id, `note-superseded:${newer.id}`).catch(() => false);
+      }
+      out.set(n.id, { ...undeliverable(n, now, 'superseded'), supersededBy: newer.id });
+    }
+    return out;
   }
 
   /** Route a queued or undeliverable note: enqueue its line for the live recipient, or mark it undeliverable. */
@@ -602,6 +625,8 @@ export class NotesService {
    * done, so a later failure in the same pass never repeats an earlier notice (review round 1).
    */
   private async advance(note: INote, now: number, r: IReads): Promise<INote> {
+    // Superseded (ADR-0050): final. It is never routed again, reminded or expired, and its sender is told nothing more.
+    if (note.supersededBy) return note;
     if (OPEN_STATES.has(note.state) && now - note.createdAt >= NOTE_EXPIRE_MS) {
       let expiring = note;
       const item = note.inboxItemId ? await r.inboxItem(note.inboxItemId) : null;
@@ -803,6 +828,13 @@ export class NotesService {
       throw new NoteError('note-invalid', 'ownerItem is true or absent');
     }
     const ownerItem = input.ownerItem === true;
+    const supersedeKey = input.supersedeKey === undefined || input.supersedeKey === null ? null : input.supersedeKey;
+    if (supersedeKey !== null && (typeof supersedeKey !== 'string' || !SUPERSEDE_KEY.test(supersedeKey))) {
+      throw new NoteError('note-invalid', `supersedeKey must match ${SUPERSEDE_KEY.source}`);
+    }
+    if (supersedeKey !== null && (!caller || caller.admin || !caller.tabId)) {
+      throw new NoteError('note-invalid', 'supersedeKey needs a sender tab: send from a purplemux tab');
+    }
     const externalKey = input.externalKey;
     if (externalKey !== undefined && !/^portfolio:(action|checkpoint|resolved):[A-Za-z0-9_-]{1,128}$/.test(externalKey)) {
       throw new NoteError('note-invalid', 'invalid portfolio note key');
@@ -851,6 +883,7 @@ export class NotesService {
     );
     if (externalKey) note.externalKey = externalKey;
     if (ownerItem) note.ownerItem = true;
+    if (supersedeKey !== null) note.supersedeKey = supersedeKey;
     let created = false;
     const sent = await this.withOperation(() => this.deps.mutate(async (state) => {
       const existing = externalKey ? state.notes.find((n) => n.id === note.id) : null;
@@ -863,7 +896,9 @@ export class NotesService {
         }
         return { state, value: existing };
       }
-      const mine = state.notes.filter((n) => OPEN_STATES.has(n.state)
+      const superseded = supersedeKey === null ? new Map<string, INote>() : await this.supersede(state.notes, note, now);
+      const current = superseded.size ? state.notes.map((n) => superseded.get(n.id) ?? n) : state.notes;
+      const mine = current.filter((n) => isOpenNote(n)
         && n.from.workspaceId === note.from.workspaceId && n.from.tabId === note.from.tabId
         && n.from.humanActor === note.from.humanActor).length;
       if (mine >= NOTE_OPEN_PER_SENDER) {
@@ -883,7 +918,7 @@ export class NotesService {
       // A failed notice never fails the send: the note stays unmarked and the next pass tells the sender.
       const routedNote = owesBounceNotice(bounced) ? await this.tellBounced(bounced, now, reads) : bounced;
       created = true;
-      return { state: { notes: [...state.notes, routedNote] }, value: routedNote };
+      return { state: { notes: [...current, routedNote] }, value: routedNote };
     }));
     if (admission.mode === 'owner' && created) await this.auditOwnerNote(sent);
     const view = (await this.views([sent], caller, { queue: true }))[0];
@@ -929,7 +964,7 @@ export class NotesService {
           `this event was already sent as note ${earlier.id} (${said}); it is not delivered twice — it may be sent again once that note expires unacked`,
           { noteId: earlier.id, noteState: earlier.state });
       }
-      const mine = state.notes.filter((n) => OPEN_STATES.has(n.state)
+      const mine = state.notes.filter((n) => isOpenNote(n)
         && n.from.workspaceId === sender.workspaceId && n.from.tabId === sender.tabId && n.from.humanActor === undefined).length;
       const needed = input.status ? 2 : 1;
       if (mine + needed > NOTE_OPEN_PER_SENDER) {
@@ -1416,7 +1451,7 @@ export class NotesService {
     const { notes } = await this.deps.read();
     const visible = notes
       .filter((n) => canShow(n, caller))
-      .filter((n) => !filter.open || OPEN_STATES.has(n.state))
+      .filter((n) => !filter.open || isOpenNote(n))
       .filter((n) => !filter.fromMe || (!caller.admin && n.from.workspaceId === caller.workspaceId))
       .filter((n) => !filter.toMe || caller.admin || isToMe(n, caller))
       .filter((n) => !filter.epic || n.to.epic === filter.epic || n.from.epic === filter.epic)

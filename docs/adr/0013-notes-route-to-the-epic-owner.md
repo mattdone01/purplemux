@@ -266,3 +266,11 @@ template only.
   coordinator already cleared bursts (23 of 25 notes on 15 Nov were acked without their line typed).
 - No other line changes: the sender's `unacked`, `undelivered`, `expired` and `bounced` lines and every pointer line
   are as before. No dispatcher change.
+
+## Amendment: supersede, the delivery field, and lead-pair SendMessage (2026-11-20, ADR-0050)
+- `note send --supersede KEY` refuses an older note of the same sender tab, recipient route and key that the recipient
+  has not acked: `undeliverable`, `supersededBy`, final and no longer open. `note show` still serves its body. An acked
+  note is never touched. A note view gains `delivery` (`queued`, `delivered`, `held`, `refused`, `expired`).
+- Notes stay the route between workspaces, with one exception by the owner's ruling of 20 Nov 2026: two workspaces'
+  lead tabs may message each other by SendMessage after `purplemux tab address`. That body does not pass through the
+  server; the wall there is policy plus audit (ADR-0050).

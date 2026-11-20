@@ -26,6 +26,7 @@ vi.mock('@/lib/lease-http', () => ({ viewsOf: m.leases }));
 vi.mock('@/lib/notes-store', () => ({
   readNotesState: m.notes,
   OPEN_STATES: new Set(['queued', 'delivered', 'undeliverable']),
+  isOpenNote: (n: { state: string; supersededBy?: string }) => ['queued', 'delivered', 'undeliverable'].includes(n.state) && !n.supersededBy,
   viewOf: (n: Record<string, unknown>) => ({ ...n }),
 }));
 vi.mock('@/lib/watch-manager', () => ({ getWatchManager: async () => ({ list: m.watches }) }));
@@ -135,6 +136,14 @@ describe('GET /api/mission-control/coordination', () => {
     expect(r.body.fleet.ok).toBe(true);
   });
 
+  it('no-body-in-snapshot: a held message reaches the human panel as a view, never with its body (review B2)', async () => {
+    m.inbox.mockResolvedValue({ items: [{ id: 'i-m', kind: 'message', state: 'held', droppedReason: null,
+      message: { fromWorkspaceId: 'ws-a', fromTabId: 'tab-a', body: 'words of a seat', targetSessionName: 's', supersedeKey: null, claimedAt: null } }] });
+    const r = await call({ cookie: 'session-token=good-session' });
+    expect(JSON.stringify(r.body)).not.toContain('words of a seat');
+    expect(r.body.inboxHeld.items).toEqual([expect.objectContaining({ id: 'i-m', delivery: 'held', message: expect.objectContaining({ bodyBytes: 15 }) })]);
+  });
+
   it('serves every section to a human: closed lease kept, open notes with age, active grants, held deliveries', async () => {
     const r = await call({ cookie: 'session-token=good-session' });
     expect(r.status).toBe(200);
@@ -142,7 +151,7 @@ describe('GET /api/mission-control/coordination', () => {
     expect(r.body.notes.items).toEqual([expect.objectContaining({ id: 'n-1', ageSeconds: expect.any(Number) })]);
     expect(r.body.watches.items).toHaveLength(1);
     expect(r.body.grants.items).toEqual([expect.objectContaining({ id: 'g-1' })]);
-    expect(r.body.inboxHeld.items).toEqual([{ id: 'i-1', state: 'held' }]);
+    expect(r.body.inboxHeld.items).toEqual([{ id: 'i-1', state: 'held', delivery: 'held' }]);
     expect(r.body.host).toEqual({ available: false, reason: 'test host' });
     expect(r.body.signals).toEqual({ state: 'not-configured' });
     // The watch list is read for every workspace (admin view).

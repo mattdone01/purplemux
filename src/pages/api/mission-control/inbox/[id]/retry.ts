@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import { inboxItemView } from '@/lib/inbox-messages';
 import { InboxError, mutateInbox, retryHumanInState } from '@/lib/inbox-store';
 import { requireMissionHumanMutation, sendMissionError, setMissionHeaders } from '@/lib/mission-control-http';
 
@@ -24,7 +25,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
       const result = retryHumanInState(state, String(id ?? ''), Date.now());
       return { state: result.state, value: result.item };
     });
-    return res.status(200).json({ item });
+    // A view: a message body is never served back, to any caller (ADR-0050).
+    return res.status(200).json({ item: inboxItemView(item) });
   } catch (err) {
     if (err instanceof InboxError) {
       return res.status(err.code === 'inbox-not-found' ? 404 : 409)

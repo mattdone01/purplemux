@@ -1,6 +1,7 @@
 import type { TCallerIdentity } from '@/types/identity';
 import type { TCliState } from '@/types/timeline';
 import type { INoteEventRecord } from '@/types/worker-event';
+import type { TDeliveryState } from '@/types/inbox';
 
 // Notes with acknowledgement (ADR-0013): a body the recipient pulls. Only the
 // inbox's fixed one-line notice is ever typed into the recipient's tab.
@@ -93,6 +94,10 @@ export interface INote {
    * pointer), so a note is typed at most once per route, a restart included. A re-queue clears it.
    */
   pointer?: INotePointerStamp | null;
+  /** The sender's supersede key (ADR-0050): a newer note of the same sender, route and key refuses this one unacked. */
+  supersedeKey?: string;
+  /** The newer note that superseded this one: it is `undeliverable`, final, and no longer open. */
+  supersededBy?: string;
 }
 
 /** What became of the one pointer line on a route. `typing` is the stamp written before typing. */
@@ -167,6 +172,8 @@ export type TNoteViewState = TNoteState | 'pending' | 'held';
 /** A note without its body: what `note list` returns. */
 export type INoteView = Omit<INote, 'body' | 'state'> & {
   state: TNoteViewState;
+  /** The five delivery states of ADR-0050, read from `state`, which keeps its meaning. */
+  delivery: TDeliveryState;
   bodyBytes: number;
   /** Server-made: the words after "from" in the note's inbox line, e.g. `owner (<ws>/<tab>)` (ADR-0029). */
   fromLabel: string;

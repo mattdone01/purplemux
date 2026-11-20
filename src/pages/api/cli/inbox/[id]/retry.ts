@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { appendCoordinationAudit } from '@/lib/coordination-audit';
 import { ACTION_REASON_MAX, actionReason } from '@/lib/human-actions';
 import { InboxError, mutateInbox, readInboxState, retryInState } from '@/lib/inbox-store';
+import { inboxItemView } from '@/lib/inbox-messages';
 import { noticeSenderWorkspace, readNotesState } from '@/lib/notes-store';
 import { scrumMasterSnapshot, selectionStillHolds, type IScrumMasterSnapshot } from '@/lib/scrum-master-access';
 import { resolveCliScope } from '@/lib/workspace-token';
@@ -69,7 +70,8 @@ const handler = async (req: NextApiRequest, res: NextApiResponse) => {
           managerWorkspaceId: scrumMaster.selection.managerWorkspaceId, managerTabId: scrumMaster.selection.managerTabId },
       });
     }
-    return res.status(200).json({ item: retried });
+    // A view: a message body is never served back, to any caller (ADR-0050).
+    return res.status(200).json({ item: inboxItemView(retried) });
   } catch (err) {
     if (err instanceof SelectionChanged) {
       return res.status(403).json({ error: 'the portfolio selection changed while the notice was retried; nothing was retried (ADR-0047)', code: 'selection-changed' });

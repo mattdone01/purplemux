@@ -20,6 +20,7 @@ import { CHAIN_HOLDS_PREFIX, chainHoldsPathError } from '@/lib/chain-down-quiet'
 import { LEDGER_WAIT_REASONS } from '@/lib/ledger';
 import { leaseAuthority } from '@/lib/lease-http';
 import { createLogger } from '@/lib/logger';
+import { DELIVERY_SWITCH_KEYS, DELIVERY_SWITCH_PREFIXES } from '@/lib/delivery-switches';
 import { POOL_MODE_KEY, POOL_TAB_PLACE_MODES, TAB_PLACE_KEY, isPoolMode, isPoolNumberKey, isTabPlaceMode, poolNumberRefusal } from '@/lib/pool';
 import { currentScrumMasterSelection, sameSelection, scrumMasterSnapshot, type IScrumMasterSnapshot } from '@/lib/scrum-master-access';
 import type { IFleetConfigChange, IFleetConfigSetter, IFleetConfigState, IFleetConfigValue } from '@/types/fleet-config';
@@ -71,7 +72,7 @@ const setterOf = (caller: ICaller): IFleetConfigSetter => ({
  * not set for every other workspace (ADR-0027 ruling R2). `standup.` stays here: since F6 no such key is read,
  * and every write of one is refused.
  */
-export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end|ledger\.chain-holds)\./;
+export const ADMIN_ONLY_KEYS = /^(remote|tabs|attention|alerts|mission|pool|curator|standup|hook|turn-end|ledger\.chain-holds|tab-send)\.|^tab-address(\.|$)/;
 
 const POOL_SLOTS_KEY = /^pool\.slots\.[a-z0-9._-]+\.(gate|build|mutation|browser|test-service|tab)$/;
 
@@ -277,6 +278,13 @@ const checkTurnEndValue = (key: string, value: string): void => {
   if (!allowed.includes(value.trim())) {
     throw new FleetConfigError('config-invalid', `${key} must be ${allowed.join(' or ')}, got ${JSON.stringify(value)}`);
   }
+};
+
+/** The delivery switches (ADR-0050): admin token only, `on` or `off`; unset means on. */
+const checkDeliverySwitchValue = (key: string, value: string): void => {
+  if (!DELIVERY_SWITCH_PREFIXES.some((prefix) => key === prefix || key.startsWith(`${prefix}.`))) return;
+  if (!DELIVERY_SWITCH_KEYS.includes(key)) throw new FleetConfigError('config-invalid', `${key} is not a key: ${DELIVERY_SWITCH_KEYS.join(' or ')}`);
+  if (value.trim() !== 'on' && value.trim() !== 'off') throw new FleetConfigError('config-invalid', `${key} must be on or off, got ${JSON.stringify(value)}`);
 };
 
 /** The alarm keys (ADR-HFL-03 decision 1): a route table parses whole; a threshold names a producer reason and holds minutes or `off`. */
@@ -488,6 +496,7 @@ const setChecked = async (
     checkCuratorValue(key, value);
     checkStandupValue(key, value);
     checkTurnEndValue(key, value);
+    checkDeliverySwitchValue(key, value);
     return setValue(s, { key, value, expectedVersion, ...(writer.reason ? { reason: writer.reason } : {}) }, writer.setter, authority.now());
   });
   const stored = valueOf(state, key)!;

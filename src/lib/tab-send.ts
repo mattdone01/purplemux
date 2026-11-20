@@ -158,12 +158,19 @@ export interface ISendReadinessRequest {
   timeoutMs: number;
 
   gate: TSendGate;
+
+  /**
+   * Asked once per look, after the tab and its session are found and before the composer is read: true answers
+   * `queue` at once (ADR-0050: a busy Claude tab, or one with a queued message ahead of this send).
+   */
+  queueWhen?: (target: ITabSendTarget) => Promise<boolean>;
 }
 
 export type TSendReadiness =
   /** `screenEmpty`: the gate read an empty composer on the screen just before it answered. */
   | { ok: true; target: ITabSendTarget; screenEmpty: boolean }
   | { ok: false; reason: 'tab-not-found' }
+  | { ok: false; reason: 'queue'; target: ITabSendTarget }
   | { ok: false; reason: 'session-not-running'; cliState: TCliState | null }
   | { ok: false; reason: 'readiness-timeout'; cliState: TCliState | null; waitedMs: number; screen?: TComposerScreenRefusal }
   | { ok: false; reason: 'startup-prompt'; cliState: TCliState | null; startupPrompt: TStartupPrompt | null };
@@ -238,6 +245,13 @@ export const awaitSendReadiness = async (
     if (request.gate === 'live-session' || !isAgentPanelType(target.panelType)) {
       return { ok: true, target, screenEmpty: false };
     }
+    // A startup dialog (folder trust, external imports) never clears on its own: a wait would trade an
+    // immediate diagnosis for a deadline's worth of silence, and a paste would answer the dialog (D14). It is checked
+    // before the queue, so a message queued ahead never turns this refusal into a `queued` answer (ADR-0050).
+    if (target.cliState === 'startup-prompt') {
+      return { ok: false, reason: 'startup-prompt', cliState: target.cliState, startupPrompt: target.startupPrompt ?? null };
+    }
+    if (request.queueWhen && await request.queueWhen(target)) return { ok: false, reason: 'queue', target };
     if (isComposerReadyCliState(target.cliState) || target.waitingAtPrompt === true) {
       if (!deps.readScreen || !screensComposer(target)) return { ok: true, target, screenEmpty: false };
       if (target.host && !remoteDeadlineSet) {
@@ -250,11 +264,6 @@ export const awaitSendReadiness = async (
       screen = read.reason;
     }
 
-    // A startup dialog (folder trust, external imports) never clears on its own: a wait would trade an
-    // immediate diagnosis for a deadline's worth of silence, and a paste would answer the dialog (D14).
-    if (target.cliState === 'startup-prompt') {
-      return { ok: false, reason: 'startup-prompt', cliState: target.cliState, startupPrompt: target.startupPrompt ?? null };
-    }
 
     const waitedMs = now() - startedAt;
     const remainingMs = deadlineMs - waitedMs;
@@ -311,7 +320,7 @@ export const performTabSend = async (
     // has no composer check, so a refusal here is always a dead session.
     return {
       status: 409,
-      body: { error: 'agent-not-ready', cliState: readiness.cliState, detail: 'session-not-running' },
+      body: { error: 'agent-not-ready', cliState: 'cliState' in readiness ? readiness.cliState : readiness.target.cliState, detail: 'session-not-running' },
     };
   }
 

@@ -133,6 +133,8 @@ export const WAKE_CLASS_TABLE: Readonly<Record<TWakeKind, TRule>> = {
   heartbeat: (detail) => ((detail.beat ?? 1) > 1 ? 'log' : 'digest'),
   mission: 'urgent',
   resume: 'urgent',
+  // A queued `tab send` (ADR-0050): the send it replaces was urgent.
+  message: 'urgent',
   watch: 'urgent',
   deploy: 'urgent',
   note: 'digest',

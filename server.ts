@@ -16,6 +16,7 @@ import { getStatusManager } from './src/lib/status-manager';
 import { getMissionControlRuntime } from './src/lib/mission-control-runtime';
 import { startAutoAnswerTick, stopAutoAnswerTick } from './src/lib/mission-control-auto-answer-tick';
 import { startInbox, stopInbox } from './src/lib/inbox-dispatcher';
+import { startMessagingDirectory } from './src/lib/messaging-directory';
 import { startNotes, stopNotes } from './src/lib/notes-service';
 import { startGrants, stopGrants } from './src/lib/grant-service';
 import { startHostSignals, stopHostSignals } from './src/lib/host-signals';
@@ -438,6 +439,7 @@ export const start = async (opts?: IStartOptions): Promise<IStartResult> => {
   // Note paste-time policy must be registered before the inbox can drain legacy notices.
   await startNotes();
   await startInbox({ firstTickAfter: getStatusManager().bootHookSpoolDrained() });
+  await startMessagingDirectory();
   await startWatches();
   startPortfolioRuntime();
 

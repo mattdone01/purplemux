@@ -73,6 +73,13 @@ export const deriveStateFromEvent = (event: ILastEvent | null, fallback: TCliSta
 
 **Exception**: if `prevState === 'cancelled'`, the state stays `cancelled` even when a hook arrives.
 
+**Messaging address** (ADR-0050): a move to `inactive` clears the tab's entry in the messaging directory, because
+the agent's messaging socket died with its process. The entry comes back at the next `session-start`, `prompt-submit`
+or `notification` hook that carries the socket path.
+A message another session sends by SendMessage fires `prompt-submit` too; the hook marks it `crossSession`, and it
+applies as a `fromTool` prompt-submit: the tab reads `busy`, but it is neither submit evidence for a `tab send` nor a
+new turn for `purplemux done`.
+
 **`inactive` handling**: it is just a default value, not a non-overwritable state. Even when a new tab starts in `inactive`, the first `session-start` hook promotes it to `idle`. (Previously both `inactive` and `cancelled` blocked transitions, which caused a bug where "start new conversation" would be stuck on `Creating new conversation...`. The `inactive` block was removed for that reason.)
 
 ### Releasing `ready-for-review`
